@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="warm-dark" data-animations="on">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>猫猫云梯 · CatCloud</title>
+    <link rel="icon" type="image/png" href="./icons/icon_b_sunset_catcloud.png" />
+    <script>
+      (function () {
+        try {
+          var root = document.documentElement;
+          if (window.location.hash === "#capsule") {
+            root.setAttribute("data-window", "capsule");
+          }
+          var raw = window.localStorage.getItem("catcloud.ui.prefs.v1");
+          var prefs = raw ? JSON.parse(raw) : null;
+          var mode = (prefs && prefs.theme_mode) || "auto_time";
+          var resolved = "warm-dark";
+          if (mode === "light") {
+            resolved = "light";
+          } else if (mode === "warm_dark") {
+            resolved = "warm-dark";
+          } else if (mode === "midnight_blue") {
+            resolved = "midnight-blue";
+          } else {
+            var now = new Date();
+            var bjt = (now.getUTCHours() * 60 + now.getUTCMinutes() + 480) % 1440;
+            if (bjt >= 420 && bjt < 1110) {
+              resolved = "light";
+            } else if (bjt >= 1110 && bjt < 1350) {
+              resolved = "warm-dark";
+            } else {
+              resolved = "midnight-blue";
+            }
+          }
+          root.setAttribute("data-theme", resolved);
+          if (prefs && prefs.animations_enabled === false) {
+            root.setAttribute("data-animations", "off");
+          }
+        } catch (_e) {
+          /* ignore storage access errors */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

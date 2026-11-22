@@ -1,0 +1,40 @@
+[package]
+name = "catcloud-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "catcloud_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+catcloud-core = { path = "../crates/catcloud-core" }
+tauri.workspace = true
+tauri-plugin-updater.workspace = true
+tauri-plugin-autostart.workspace = true
+tauri-plugin-os.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-global-shortcut.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sha2.workspace = true
+hex.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

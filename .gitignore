@@ -1,0 +1,58 @@
+# CatCloud — Strict Public Repository Ignore Rules
+
+# Local planning, review ledgers & scratch (never push private dev notes)
+/plans/
+/plans_agy/
+/scratch/
+/backups/
+*.local.*
+
+# User runtime data, subscriptions, pre-acceleration secrets & portable state
+/data/
+*.mmrelay.json
+*secret*.json
+*secret*.yaml
+*secret*.yml
+*.key
+*.pem
+*.crt
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.log
+
+# Downloaded / sidecar proxy binaries (fetched or bundled during release CI)
+/src-tauri/binaries/mihomo*
+/src-tauri/binaries/catcloud-mihomo*
+/src-tauri/resources/bin/
+/src-tauri/resources/geoip.*
+/src-tauri/resources/geosite.*
+/src-tauri/resources/country.mmdb
+/src-tauri/resources/GeoLite2-ASN.mmdb
+
+# Local Cargo host-throttling config
+/.cargo/config.toml
+
+# Rust / Cargo build outputs
+/target/
+/src-tauri/target/
+/src-tauri/gen/
+**/*.rs.bk
+
+# Node / Vite / Frontend build outputs
+node_modules/
+/ui/dist/
+/dist/
+.vite/
+.pnpm-store/
+
+# OS & IDE junk
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.tmp
+*.tmp.*
+*.bak

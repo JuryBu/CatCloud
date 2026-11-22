@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "CatCloud",
+  "version": "0.1.0",
+  "identifier": "io.github.jurybu.catcloud",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "猫猫云梯 · CatCloud",
+        "width": 1200,
+        "height": 780,
+        "minWidth": 920,
+        "minHeight": 620,
+        "center": true,
+        "resizable": true
+      },
+      {
+        "label": "capsule",
+        "title": "CatCloud Capsule",
+        "url": "index.html#capsule",
+        "create": false,
+        "width": 300,
+        "height": 64,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "resizable": false,
+        "skipTaskbar": true,
+        "alwaysOnTop": true,
+        "visible": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser"
+      }
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}

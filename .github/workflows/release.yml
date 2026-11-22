@@ -1,0 +1,517 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version override (e.g. 0.1.0); defaults to tauri.conf.json"
+        required: false
+        default: ""
+        type: string
+      dry_run:
+        description: "Dry run (skips GitHub Release upload and forces createUpdaterArtifacts=false)"
+        required: false
+        default: true
+        type: boolean
+      mihomo_version:
+        description: "Pinned official MetaCubeX/mihomo release tag"
+        required: false
+        default: "v1.19.16"
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  preflight:
+    name: Preflight Gate & Prebuild Frontend
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      dry_run: ${{ steps.meta.outputs.dry_run }}
+      mihomo_version: ${{ steps.meta.outputs.mihomo_version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Run public sanitization gate
+        run: node scripts/ci/check_public_sanitization.mjs
+
+      - name: Verify release scripts syntax
+        run: |
+          for f in scripts/release/*.mjs; do
+            node --check "$f"
+          done
+
+      - name: Resolve release version and mode
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONF_VER="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("src-tauri/tauri.conf.json","utf8")).version)')"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            VER="${TAG#v}"
+            DRY_RUN="false"
+            MIHOMO_VER="v1.19.16"
+            if [[ "$VER" != "$CONF_VER" ]]; then
+              echo "ERROR: Git tag version ($VER) does not match src-tauri/tauri.conf.json ($CONF_VER)." >&2
+              exit 1
+            fi
+          else
+            VER="${{ inputs.version }}"
+            if [[ -z "$VER" ]]; then
+              VER="$CONF_VER"
+            fi
+            VER="${VER#v}"
+            TAG="v${VER}"
+            DRY_RUN="${{ inputs.dry_run }}"
+            MIHOMO_VER="${{ inputs.mihomo_version }}"
+          fi
+          if [[ "$VER" == "0.0.0" ]]; then
+            echo "ERROR: Version 0.0.0 is forbidden." >&2
+            exit 1
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "dry_run=${DRY_RUN}" >> "$GITHUB_OUTPUT"
+          echo "mihomo_version=${MIHOMO_VER}" >> "$GITHUB_OUTPUT"
+          echo "Resolved release: tag=${TAG}, version=${VER}, dry_run=${DRY_RUN}, mihomo=${MIHOMO_VER}"
+
+      - name: Install dependencies and build frontend once
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          node scripts/release/extract_release_notes.mjs \
+            --version "${{ steps.meta.outputs.version }}" \
+            --allow-fallback \
+            --output release-notes.md
+
+      - name: Upload prebuilt frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: ui/dist
+          retention-days: 2
+
+      - name: Upload extracted release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 2
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: [preflight]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download prebuilt frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ui/dist
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install workspace CLI devDependencies (for tauri CLI)
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows-${{ matrix.arch }}
+
+      - name: Fetch and verify official Mihomo binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/release/fetch_mihomo.mjs `
+            --target "${{ matrix.target }}" `
+            --version "${{ needs.preflight.outputs.mihomo_version }}"
+
+      - name: Build Tauri bundles (MSI & NSIS)
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $isDryRun = "${{ needs.preflight.outputs.dry_run }}" -eq "true"
+          $hasKey = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)
+          $enableUpdater = (-not $isDryRun) -and $hasKey
+          $overridePath = Join-Path $env:RUNNER_TEMP "tauri-release-override.json"
+          $overrideObj = @{
+            bundle = @{
+              createUpdaterArtifacts = $enableUpdater
+              resources = @{
+                "resources/bin/mihomo.exe" = "resources/bin/mihomo.exe"
+              }
+            }
+          }
+          $overrideObj | ConvertTo-Json -Depth 6 | Set-Content -Path $overridePath -Encoding UTF8
+          Write-Host "createUpdaterArtifacts=$enableUpdater (dry_run=$isDryRun, signing_key_configured=$hasKey)"
+          pnpm exec tauri build `
+            --target "${{ matrix.target }}" `
+            --bundles msi,nsis `
+            --config src-tauri/tauri.prebuilt-frontend.conf.json `
+            --config $overridePath
+
+      - name: Build headless catcloud CLI
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
+
+      - name: Stage Windows artifacts (MSI, NSIS, Portable ZIP, CLI ZIP)
+        run: |
+          node scripts/release/stage_windows.mjs `
+            --target "${{ matrix.target }}" `
+            --version "${{ needs.preflight.outputs.version }}" `
+            --out-dir release-assets
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows-${{ matrix.arch }}
+          path: release-assets/*
+          retention-days: 5
+
+  build-macos:
+    name: Build macOS (${{ matrix.arch }})
+    needs: [preflight]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: aarch64
+          - target: x86_64-apple-darwin
+            arch: x64
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download prebuilt frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ui/dist
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install workspace CLI devDependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-macos-${{ matrix.arch }}
+
+      - name: Fetch and verify official Mihomo binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/release/fetch_mihomo.mjs \
+            --target "${{ matrix.target }}" \
+            --version "${{ needs.preflight.outputs.mihomo_version }}"
+
+      - name: Build Tauri bundles (.app & .dmg)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ENABLE_UPDATER="false"
+          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            ENABLE_UPDATER="true"
+          fi
+          OVERRIDE_PATH="${RUNNER_TEMP}/tauri-release-override.json"
+          cat > "$OVERRIDE_PATH" <<EOF
+          {
+            "bundle": {
+              "createUpdaterArtifacts": ${ENABLE_UPDATER},
+              "resources": {
+                "resources/bin/mihomo": "resources/bin/mihomo"
+              }
+            }
+          }
+          EOF
+          echo "createUpdaterArtifacts=${ENABLE_UPDATER}"
+          pnpm exec tauri build \
+            --target "${{ matrix.target }}" \
+            --bundles app,dmg \
+            --config src-tauri/tauri.prebuilt-frontend.conf.json \
+            --config "$OVERRIDE_PATH"
+
+      - name: Build headless catcloud CLI
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
+
+      - name: Stage macOS artifacts (.dmg, .app.tar.gz, CLI .tar.gz)
+        run: |
+          node scripts/release/stage_macos.mjs \
+            --target "${{ matrix.target }}" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --out-dir release-assets
+
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-macos-${{ matrix.arch }}
+          path: release-assets/*
+          retention-days: 5
+
+  build-linux:
+    name: Build Linux (x86_64)
+    needs: [preflight]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download prebuilt frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ui/dist
+
+      - name: Install Linux Tauri & packaging dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libxdo-dev \
+            pkg-config \
+            rpm \
+            squashfs-tools \
+            file
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install workspace CLI devDependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-linux-x86_64
+
+      - name: Fetch and verify official Mihomo binary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          node scripts/release/fetch_mihomo.mjs \
+            --target "x86_64-unknown-linux-gnu" \
+            --version "${{ needs.preflight.outputs.mihomo_version }}"
+
+      - name: Build Tauri bundles (AppImage, DEB, RPM)
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          ENABLE_UPDATER="false"
+          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            ENABLE_UPDATER="true"
+          fi
+          OVERRIDE_PATH="${RUNNER_TEMP}/tauri-release-override.json"
+          cat > "$OVERRIDE_PATH" <<EOF
+          {
+            "bundle": {
+              "createUpdaterArtifacts": ${ENABLE_UPDATER},
+              "resources": {
+                "resources/bin/mihomo": "resources/bin/mihomo"
+              }
+            }
+          }
+          EOF
+          echo "createUpdaterArtifacts=${ENABLE_UPDATER}"
+          pnpm exec tauri build \
+            --target x86_64-unknown-linux-gnu \
+            --bundles appimage,deb,rpm \
+            --config src-tauri/tauri.prebuilt-frontend.conf.json \
+            --config "$OVERRIDE_PATH"
+
+      - name: Build headless catcloud CLI
+        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p catcloud-cli --bin catcloud
+
+      - name: Assert zero GTK/WebKit dependencies on Linux headless CLI
+        run: |
+          LDD_OUT="$(ldd ./target/x86_64-unknown-linux-gnu/release/catcloud)"
+          echo "$LDD_OUT"
+          if echo "$LDD_OUT" | grep -iE 'libgtk|libwebkit|libgdk|libjavascriptcore|libappindicator|libayatana'; then
+            echo "ERROR: Linux headless catcloud CLI linked against forbidden GUI/WebKit libraries." >&2
+            exit 1
+          fi
+          echo "PASS: Linux headless catcloud CLI has zero GTK/WebKit dependencies."
+
+      - name: Stage Linux artifacts (AppImage, DEB, RPM, CLI .tar.gz)
+        run: |
+          node scripts/release/stage_linux.mjs \
+            --target "x86_64-unknown-linux-gnu" \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --out-dir release-assets
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-linux-x86_64
+          path: release-assets/*
+          retention-days: 5
+
+  publish-release:
+    name: Checksums, Updater Manifest & Draft Release
+    needs: [preflight, build-windows, build-macos, build-linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-assets-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Download extracted release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: .
+
+      - name: Generate deterministic SHA256SUMS.txt
+        run: |
+          set -euo pipefail
+          (cd release-assets && find . -maxdepth 1 -type f -printf '%f\0' | sort -z | xargs -0 sha256sum) > SHA256SUMS.txt
+          test -s SHA256SUMS.txt
+          if grep -qE '  (\./|release-assets/)' SHA256SUMS.txt; then
+            echo "ERROR: SHA256SUMS.txt must contain flat basenames without directory prefixes." >&2
+            exit 1
+          fi
+          cat SHA256SUMS.txt
+
+      - name: Build latest.json updater manifest
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          EXTRA_ARGS=()
+          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+            EXTRA_ARGS+=(--require-signatures)
+          fi
+          node scripts/release/build_latest_json.mjs \
+            --version "${{ needs.preflight.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --assets-dir release-assets \
+            --checksums SHA256SUMS.txt \
+            --notes-file release-notes.md \
+            --output latest.json \
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+          cat latest.json
+
+      - name: Upload consolidated release summary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-manifest-${{ needs.preflight.outputs.tag }}
+          path: |
+            SHA256SUMS.txt
+            latest.json
+            release-notes.md
+          retention-days: 14
+
+      - name: Create or update Draft GitHub Release
+        if: needs.preflight.outputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.preflight.outputs.tag }}"
+          TITLE="CatCloud ${TAG}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists; uploading/overwriting assets."
+            gh release upload "$TAG" release-assets/* SHA256SUMS.txt latest.json --clobber
+            gh release edit "$TAG" --title "$TITLE" --notes-file release-notes.md
+          else
+            gh release create "$TAG" \
+              release-assets/* SHA256SUMS.txt latest.json \
+              --draft \
+              --title "$TITLE" \
+              --notes-file release-notes.md
+          fi

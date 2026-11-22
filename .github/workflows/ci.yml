@@ -1,0 +1,155 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  sanitization-gate:
+    name: Public Sanitization & Script Syntax Gate
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run public repository sanitization gate
+        run: node scripts/ci/check_public_sanitization.mjs
+
+      - name: Syntax check release scripts
+        run: |
+          for f in scripts/release/*.mjs; do
+            echo "Checking $f"
+            node --check "$f"
+          done
+
+      - name: Smoke-test Mihomo fetcher dry-run
+        run: |
+          node scripts/release/fetch_mihomo.mjs --dry-run --target x86_64-unknown-linux-gnu
+          node scripts/release/fetch_mihomo.mjs --dry-run --target x86_64-pc-windows-msvc
+          node scripts/release/fetch_mihomo.mjs --dry-run --target aarch64-apple-darwin
+
+  frontend-build:
+    name: Frontend Typecheck & Production Build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: pnpm
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and build UI bundle
+        run: pnpm build
+
+      - name: Upload prebuilt frontend dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-frontend-dist
+          path: ui/dist
+          retention-days: 1
+
+  rust-workspace-tests:
+    name: Rust Workspace Tests (${{ matrix.os }})
+    needs: [frontend-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download prebuilt frontend dist
+        uses: actions/download-artifact@v4
+        with:
+          name: ci-frontend-dist
+          path: ui/dist
+
+      - name: Install Linux desktop build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev \
+            libxdo-dev \
+            pkg-config
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-workspace-${{ matrix.os }}
+
+      - name: Run cargo test across workspace
+        run: cargo test --workspace --locked
+
+  linux-headless-cli-gate:
+    name: Linux Headless CLI Build & Zero-GUI Gate
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts (headless CLI)
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux-headless-cli
+
+      - name: Build headless catcloud CLI without GUI libraries installed
+        run: cargo build --release --locked -p catcloud-cli --bin catcloud
+
+      - name: Verify headless CLI JSON status output
+        run: |
+          TMP_DATA="$(mktemp -d)"
+          trap 'rm -rf "$TMP_DATA"' EXIT
+          OUT="$(./target/release/catcloud --data-dir "$TMP_DATA" status --json)"
+          echo "$OUT"
+          node -e 'const d = JSON.parse(process.argv[1]); if (!d.ok) process.exit(1);' "$OUT"
+
+      - name: Assert zero GTK/WebKit shared library dependencies via ldd
+        run: |
+          LDD_OUT="$(ldd ./target/release/catcloud)"
+          echo "$LDD_OUT"
+          if echo "$LDD_OUT" | grep -iE 'libgtk|libwebkit|libgdk|libjavascriptcore|libappindicator|libayatana'; then
+            echo "ERROR: Headless catcloud CLI unexpectedly links against GTK/WebKit/GUI libraries." >&2
+            exit 1
+          fi
+          echo "PASS: catcloud CLI is strictly headless (0 GTK/WebKit dependencies)."

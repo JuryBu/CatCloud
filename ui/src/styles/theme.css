@@ -1,0 +1,322 @@
+@import "tailwindcss";
+
+/* ============================================================================
+ * CatCloud Theme Engine (3 Beijing-Time Presets + Wallpaper + Controlled Glass)
+ * 07:00 - 18:30 -> light (Warm Paper)
+ * 18:30 - 22:30 -> warm-dark (Deep Moss Warm Gold)
+ * 22:30 - 07:00 -> midnight-blue (Midnight Starlight)
+ * ============================================================================ */
+
+:root {
+  --font-sans: "Inter", "HarmonyOS Sans SC", "MiSans", "PingFang SC", "Microsoft YaHei UI", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", "Consolas", ui-monospace, SFMono-Regular, monospace;
+
+  /* Wallpaper & controlled local glassmorphism variables (zero overhead when off) */
+  --wallpaper-image: none;
+  --wallpaper-opacity: 0;
+  --surface-alpha: 1;
+  --card-alpha: 1;
+  --glass-blur: 0px;
+
+  /* Default fallback tokens = Deep Moss Warm Gold */
+  --bg: #111313;
+  --bg-elevated: #151818;
+  --surface: #191c1c;
+  --surface-rgb: 25, 28, 28;
+  --card: #202424;
+  --card-rgb: 32, 36, 36;
+  --card-hover: #272c2c;
+  --line: #3a403e;
+  --line-strong: #4e5653;
+  --text: #e2e5de;
+  --text-secondary: #c1c8bf;
+  --muted: #9ba49c;
+  --accent: #dfb782;
+  --accent-soft: rgba(223, 183, 130, 0.15);
+  --accent-strong: #eccca0;
+  --accent-ink: #1b1711;
+  --green: #a4bf9f;
+  --green-soft: rgba(164, 191, 159, 0.16);
+  --red: #e6a398;
+  --red-soft: rgba(230, 163, 152, 0.16);
+  --amber: #e7b86e;
+  --amber-soft: rgba(231, 184, 110, 0.16);
+  --sky: #74b9ec;
+  --sky-soft: rgba(116, 185, 236, 0.18);
+  --coral: #f08a6c;
+  --coral-soft: rgba(240, 138, 108, 0.18);
+  --shadow-card: 0 2px 10px rgba(0, 0, 0, 0.28);
+  --shadow-popover: 0 10px 28px rgba(0, 0, 0, 0.44);
+  --scrollbar-thumb: rgba(155, 164, 156, 0.28);
+  --scrollbar-thumb-hover: rgba(223, 183, 130, 0.48);
+
+  color-scheme: dark;
+}
+
+/* 07:00 - 18:30: Warm Paper Light */
+[data-theme="light"] {
+  --bg: #f6f3ec;
+  --bg-elevated: #efeae0;
+  --surface: #fbf9f4;
+  --surface-rgb: 251, 249, 244;
+  --card: #ffffff;
+  --card-rgb: 255, 255, 255;
+  --card-hover: #f7f3ea;
+  --line: #e2dacb;
+  --line-strong: #cfc4b0;
+  --text: #27231e;
+  --text-secondary: #534b40;
+  --muted: #7d7365;
+  --accent: #c4843d;
+  --accent-soft: rgba(196, 132, 61, 0.14);
+  --accent-strong: #a86a27;
+  --accent-ink: #ffffff;
+  --green: #3f7d58;
+  --green-soft: rgba(63, 125, 88, 0.13);
+  --red: #c9584a;
+  --red-soft: rgba(201, 88, 74, 0.13);
+  --amber: #c9862b;
+  --amber-soft: rgba(201, 134, 43, 0.14);
+  --sky: #2f7ec4;
+  --sky-soft: rgba(47, 126, 196, 0.15);
+  --coral: #de6f52;
+  --coral-soft: rgba(222, 111, 82, 0.15);
+  --shadow-card: 0 1px 2px rgba(52, 41, 27, 0.05), 0 6px 18px rgba(52, 41, 27, 0.04);
+  --shadow-popover: 0 10px 26px rgba(45, 34, 21, 0.14);
+  --scrollbar-thumb: rgba(125, 115, 101, 0.28);
+  --scrollbar-thumb-hover: rgba(196, 132, 61, 0.5);
+
+  color-scheme: light;
+}
+
+/* 18:30 - 22:30: Deep Moss Warm Gold (Exact signature palette) */
+[data-theme="warm-dark"] {
+  --bg: #111313;
+  --bg-elevated: #151818;
+  --surface: #191c1c;
+  --surface-rgb: 25, 28, 28;
+  --card: #202424;
+  --card-rgb: 32, 36, 36;
+  --card-hover: #272c2c;
+  --line: #3a403e;
+  --line-strong: #4e5653;
+  --text: #e2e5de;
+  --text-secondary: #c1c8bf;
+  --muted: #9ba49c;
+  --accent: #dfb782;
+  --accent-soft: rgba(223, 183, 130, 0.15);
+  --accent-strong: #eccca0;
+  --accent-ink: #1b1711;
+  --green: #a4bf9f;
+  --green-soft: rgba(164, 191, 159, 0.16);
+  --red: #e6a398;
+  --red-soft: rgba(230, 163, 152, 0.16);
+  --amber: #e7b86e;
+  --amber-soft: rgba(231, 184, 110, 0.16);
+  --sky: #74b9ec;
+  --sky-soft: rgba(116, 185, 236, 0.18);
+  --coral: #f08a6c;
+  --coral-soft: rgba(240, 138, 108, 0.18);
+  --shadow-card: 0 2px 10px rgba(0, 0, 0, 0.28);
+  --shadow-popover: 0 10px 28px rgba(0, 0, 0, 0.44);
+  --scrollbar-thumb: rgba(155, 164, 156, 0.28);
+  --scrollbar-thumb-hover: rgba(223, 183, 130, 0.48);
+
+  color-scheme: dark;
+}
+
+/* 22:30 - 07:00: Midnight Starlight Blue */
+[data-theme="midnight-blue"] {
+  --bg: #0f172a;
+  --bg-elevated: #121c33;
+  --surface: #16213e;
+  --surface-rgb: 22, 33, 62;
+  --card: #1c294a;
+  --card-rgb: 28, 41, 74;
+  --card-hover: #23335b;
+  --line: #2d3e66;
+  --line-strong: #3e5384;
+  --text: #e8eef9;
+  --text-secondary: #c4d1ea;
+  --muted: #8ea1c4;
+  --accent: #dfb782;
+  --accent-soft: rgba(223, 183, 130, 0.16);
+  --accent-strong: #60a5fa;
+  --accent-ink: #0f172a;
+  --green: #7dd3a8;
+  --green-soft: rgba(125, 211, 168, 0.16);
+  --red: #f49797;
+  --red-soft: rgba(244, 151, 151, 0.16);
+  --amber: #efc17a;
+  --amber-soft: rgba(239, 193, 122, 0.16);
+  --sky: #60a5fa;
+  --sky-soft: rgba(96, 165, 250, 0.18);
+  --coral: #fb9274;
+  --coral-soft: rgba(251, 146, 116, 0.18);
+  --shadow-card: 0 4px 16px rgba(4, 9, 22, 0.42);
+  --shadow-popover: 0 12px 32px rgba(4, 9, 22, 0.56);
+  --scrollbar-thumb: rgba(142, 161, 196, 0.28);
+  --scrollbar-thumb-hover: rgba(96, 165, 250, 0.52);
+
+  color-scheme: dark;
+}
+
+/* ============================================================================
+ * Base Layout & Typography
+ * ============================================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  font-family: var(--font-sans);
+  background-color: var(--bg);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  user-select: none;
+}
+
+/* Floating capsule transparent window mode */
+[data-window="capsule"],
+[data-window="capsule"] body,
+[data-window="capsule"] #root {
+  background: transparent !important;
+  overflow: hidden;
+}
+
+.cc-selectable {
+  user-select: text;
+}
+
+.cc-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.cc-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.cc-pixelated {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
+/* ============================================================================
+ * Wallpaper & Controlled Local Glassmorphism Surfaces
+ * ============================================================================ */
+
+.cc-wallpaper-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image: var(--wallpaper-image);
+  background-size: cover;
+  background-position: center;
+  background-repeat: no-repeat;
+  opacity: var(--wallpaper-opacity);
+}
+
+.cc-surface {
+  background-color: rgba(var(--surface-rgb), var(--surface-alpha));
+  border-color: var(--line);
+}
+
+.cc-card {
+  background-color: rgba(var(--card-rgb), var(--card-alpha));
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-card);
+  transition: border-color 140ms ease, background-color 140ms ease, transform 140ms ease;
+}
+
+.cc-card-interactive:hover {
+  border-color: var(--line-strong);
+  background-color: var(--card-hover);
+}
+
+/* Only allocate GPU backdrop layers when wallpaper + glass are explicitly enabled */
+[data-wallpaper="on"][data-glass="on"] .cc-glass {
+  backdrop-filter: blur(var(--glass-blur)) saturate(1.12);
+  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.12);
+}
+
+/* Status pulse dot (automatically disabled when animations are off) */
+@keyframes cc-pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.55;
+    transform: scale(0.92);
+  }
+}
+
+.cc-pulse-dot {
+  animation: cc-pulse-soft 2.4s ease-in-out infinite;
+}
+
+/* ============================================================================
+ * Zero-Animation Accessibility & Low-Power Mode
+ * ============================================================================ */
+
+[data-animations="off"] *,
+[data-animations="off"] *::before,
+[data-animations="off"] *::after {
+  animation-duration: 0.001ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.001ms !important;
+  scroll-behavior: auto !important;
+}
+
+[data-animations="off"] .cc-pulse-dot {
+  animation: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .cc-pulse-dot {
+    animation: none !important;
+  }
+}
+
+/* ============================================================================
+ * Scrollbar Styling
+ * ============================================================================ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
