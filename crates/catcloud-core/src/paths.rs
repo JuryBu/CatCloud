@@ -2,6 +2,27 @@ use crate::error::{CatError, CatResult};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+/// Strip Windows extended-length verbatim path prefix (`\\?\`) produced by
+/// `std::fs::canonicalize`, preventing compatibility failures in Go subprocesses
+/// (such as Mihomo `-d`/`-f`) and WebView2 user-data directories.
+pub fn normalize_os_path(path: &Path) -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy();
+        if let Some(unc) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{unc}"));
+        }
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+        path.to_path_buf()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_path_buf()
+    }
+}
+
 /// Resolved runtime directory layout supporting CLI `--data-dir`, env `CATCLOUD_DATA_DIR`,
 /// `portable.flag`, sibling `data/`, and standard OS app data fallback.
 #[derive(Debug, Clone)]
@@ -87,7 +108,9 @@ impl AppPaths {
 
     pub fn from_data_dir(root_data_dir: PathBuf, is_portable: bool) -> CatResult<Self> {
         std::fs::create_dir_all(&root_data_dir)?;
-        let canonical = std::fs::canonicalize(&root_data_dir).unwrap_or(root_data_dir.clone());
+        let canonical = normalize_os_path(
+            &std::fs::canonicalize(&root_data_dir).unwrap_or(root_data_dir.clone()),
+        );
         let mut hasher = Sha256::new();
         hasher.update(canonical.to_string_lossy().to_lowercase().as_bytes());
         let digest = hex::encode(hasher.finalize());
@@ -167,5 +190,36 @@ impl AppPaths {
         }
         std::fs::rename(&tmp_path, path)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_os_path_strips_windows_verbatim_prefix() {
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                normalize_os_path(Path::new(r"\\?\C:\Users\Public\CatCloud\data")),
+                PathBuf::from(r"C:\Users\Public\CatCloud\data")
+            );
+            assert_eq!(
+                normalize_os_path(Path::new(r"\\?\UNC\server\share\catcloud")),
+                PathBuf::from(r"\\server\share\catcloud")
+            );
+            assert_eq!(
+                normalize_os_path(Path::new(r"C:\Users\Public\CatCloud\data")),
+                PathBuf::from(r"C:\Users\Public\CatCloud\data")
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(
+                normalize_os_path(Path::new("/var/lib/catcloud")),
+                PathBuf::from("/var/lib/catcloud")
+            );
+        }
     }
 }

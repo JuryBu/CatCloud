@@ -122,13 +122,26 @@ impl Default for ProxyNode {
 }
 
 impl ProxyNode {
+    /// Returns true for UDP/QUIC-only proxy transports (such as Hysteria2, TUIC, WireGuard)
+    /// that must not be wrapped by TCP-only `:443` domestic relays by default.
+    pub fn is_udp_only_transport(&self) -> bool {
+        matches!(
+            self.protocol.trim().to_ascii_lowercase().as_str(),
+            "hysteria2" | "hy2" | "hysteria" | "tuic" | "wireguard"
+        )
+    }
+
     /// Resolve whether domestic pre-acceleration should wrap this node.
-    /// Per-node `preaccel_override` takes precedence over global `skip_443_native`.
+    /// Per-node `preaccel_override` takes precedence over global `skip_443_native`
+    /// and automatic UDP-only transport exclusion.
     pub fn should_apply_preaccel(&self, global_skip_443_native: bool) -> bool {
         if let Some(forced) = self.preaccel_override {
             return forced;
         }
         if !self.preaccel_eligible {
+            return false;
+        }
+        if self.is_udp_only_transport() {
             return false;
         }
         if global_skip_443_native && self.is_443_native {

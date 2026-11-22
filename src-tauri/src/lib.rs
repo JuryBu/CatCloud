@@ -157,15 +157,27 @@ pub fn run_with_paths(paths: AppPaths) {
     let exit_guard_ref = Arc::clone(&instance_guard_slot);
     let exit_job_ref = Arc::clone(&job_guard);
 
-    let app = tauri::Builder::default()
+    let has_updater_plugin_cfg = context
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .is_some_and(|v| v.is_object());
+
+    let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--silent"]),
         ))
-        .plugin(shortcuts::build_plugin())
+        .plugin(shortcuts::build_plugin());
+
+    if has_updater_plugin_cfg {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    }
+
+    let app = builder
         .manage(WindowLifecycleState::new(destroy_on_close))
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
@@ -464,6 +476,27 @@ pub fn run_with_paths(paths: AppPaths) {
 
             if silent_start {
                 lifecycle::enter_pure_windowless_mode(&handle);
+            }
+
+            // Asynchronously start the managed proxy core when nodes & core binary are present.
+            // Does not alter OS system proxy or TUN unless explicitly enabled in config.
+            {
+                let auto_handle = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(st) = auto_handle.try_state::<AppState>() {
+                        let has_nodes = st
+                            .storage
+                            .lock()
+                            .ok()
+                            .and_then(|db| db.list_nodes().ok())
+                            .is_some_and(|n| !n.is_empty());
+                        if has_nodes {
+                            if let Err(err) = commands::start_core_internal(&auto_handle, &st).await {
+                                tracing::info!("auto-start core skipped: {err}");
+                            }
+                        }
+                    }
+                });
             }
 
             Ok(())

@@ -512,11 +512,15 @@ impl IsolatedProbeCore {
             Err(_) => Stdio::null(),
         };
 
-        let mut cmd = Command::new(mihomo_bin);
+        let norm_bin = crate::paths::normalize_os_path(mihomo_bin);
+        let norm_work = crate::paths::normalize_os_path(&work_dir);
+        let norm_cfg = crate::paths::normalize_os_path(&config_path);
+
+        let mut cmd = Command::new(&norm_bin);
         cmd.arg("-d")
-            .arg(&work_dir)
+            .arg(&norm_work)
             .arg("-f")
-            .arg(&config_path)
+            .arg(&norm_cfg)
             .env("GOMEMLIMIT", ISOLATED_CORE_GOMEMLIMIT)
             .env("GOGC", ISOLATED_CORE_GOGC)
             .stdin(Stdio::null())

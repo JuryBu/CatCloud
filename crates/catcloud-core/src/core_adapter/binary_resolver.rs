@@ -234,8 +234,9 @@ pub fn resolve_mihomo_binary_with_exe_dir(
     for (candidate, source) in ordered_candidates {
         checked.push(candidate.clone());
         if candidate.is_file() {
-            let resolved_path =
-                std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
+            let resolved_path = crate::paths::normalize_os_path(
+                &std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone()),
+            );
             let sha256 = if compute_sha256 {
                 Some(compute_file_sha256(&resolved_path)?)
             } else {
@@ -416,7 +417,7 @@ mod tests {
         assert_eq!(r_mac1.source, BinarySource::BundledResourcesBin);
         assert_eq!(
             r_mac1.path.unwrap(),
-            std::fs::canonicalize(&mac_res_nested).unwrap()
+            crate::paths::normalize_os_path(&std::fs::canonicalize(&mac_res_nested).unwrap())
         );
 
         std::fs::remove_file(&mac_res_nested).unwrap();
@@ -427,7 +428,7 @@ mod tests {
         assert_eq!(r_mac2.source, BinarySource::BundledResourcesBin);
         assert_eq!(
             r_mac2.path.unwrap(),
-            std::fs::canonicalize(&mac_res_flat).unwrap()
+            crate::paths::normalize_os_path(&std::fs::canonicalize(&mac_res_flat).unwrap())
         );
 
         // 2. Linux package layout: usr/bin -> ../lib/CatCloud/resources/bin/mihomo
@@ -450,7 +451,7 @@ mod tests {
         assert_eq!(r_linux.source, BinarySource::BundledResourcesBin);
         assert_eq!(
             r_linux.path.unwrap(),
-            std::fs::canonicalize(&linux_lib_bin).unwrap()
+            crate::paths::normalize_os_path(&std::fs::canonicalize(&linux_lib_bin).unwrap())
         );
 
         // 3. Passing a Tauri resource_dir directory via extra_candidates resolves resources/bin/mihomo
@@ -473,7 +474,7 @@ mod tests {
         assert_eq!(r_extra_dir.source, BinarySource::CandidatePath);
         assert_eq!(
             r_extra_dir.path.unwrap(),
-            std::fs::canonicalize(&tauri_res_bin).unwrap()
+            crate::paths::normalize_os_path(&std::fs::canonicalize(&tauri_res_bin).unwrap())
         );
 
         let _ = std::fs::remove_dir_all(&root);

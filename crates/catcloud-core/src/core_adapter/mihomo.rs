@@ -200,11 +200,15 @@ impl MihomoAdapter {
         let gomemlimit = req.config.resolve_gomemlimit(req.node_count, req.rule_count);
         let gogc = req.config.core_runtime.gogc.to_string();
 
-        let mut cmd = Command::new(&req.binary_path);
+        let norm_bin = crate::paths::normalize_os_path(&req.binary_path);
+        let norm_work = crate::paths::normalize_os_path(&req.working_dir);
+        let norm_cfg = crate::paths::normalize_os_path(&req.config_path);
+
+        let mut cmd = Command::new(&norm_bin);
         cmd.arg("-d")
-            .arg(&req.working_dir)
+            .arg(&norm_work)
             .arg("-f")
-            .arg(&req.config_path)
+            .arg(&norm_cfg)
             .env("GOMEMLIMIT", gomemlimit)
             .env("GOGC", &gogc)
             .stdin(Stdio::null())
@@ -835,12 +839,16 @@ pub async fn verify_config_with_binary(
         )));
     }
 
-    let mut cmd = Command::new(binary_path);
+    let norm_bin = crate::paths::normalize_os_path(binary_path);
+    let norm_work = crate::paths::normalize_os_path(working_dir);
+    let norm_cfg = crate::paths::normalize_os_path(config_path);
+
+    let mut cmd = Command::new(&norm_bin);
     cmd.arg("-t")
         .arg("-d")
-        .arg(working_dir)
+        .arg(&norm_work)
         .arg("-f")
-        .arg(config_path)
+        .arg(&norm_cfg)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
