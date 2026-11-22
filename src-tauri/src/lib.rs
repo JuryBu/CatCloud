@@ -528,13 +528,56 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
             let mut up_total: u64 = 0;
             let mut down_total: u64 = 0;
             let mut core_mem_bytes: u64 = 0;
+            let mut active_connections: usize = 0;
+            let mut last_up_bps: u64 = 0;
+            let mut last_down_bps: u64 = 0;
             let mut last_tray_sync = Instant::now();
+            let mut conn_poll = tokio::time::interval(Duration::from_secs(2));
+            conn_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
+                    _ = conn_poll.tick() => {
+                        let win = lifecycle::window_mode_snapshot(&app_h);
+                        if !win.main_open && !win.capsule_open {
+                            continue;
+                        }
+                        if let Some(st) = app_h.try_state::<AppState>() {
+                            if st.adapter.has_live_controller().await {
+                                use catcloud_core::core_adapter::CoreAdapter;
+                                if let Ok(snap) = st.adapter.list_connections().await {
+                                    active_connections = snap.connections.len();
+                                    if snap.memory > 0 {
+                                        core_mem_bytes = snap.memory;
+                                    }
+                                    if snap.upload_total > up_total {
+                                        up_total = snap.upload_total;
+                                    }
+                                    if snap.download_total > down_total {
+                                        down_total = snap.download_total;
+                                    }
+                                    if let Ok(mut m) = st.cached_metrics.write() {
+                                        m.core_mem_bytes = core_mem_bytes;
+                                    }
+                                    let payload = TrafficEventPayload {
+                                        up_bps: last_up_bps,
+                                        down_bps: last_down_bps,
+                                        up_total_bytes: up_total,
+                                        down_total_bytes: down_total,
+                                        active_connections,
+                                        core_memory_mb: (core_mem_bytes as f64) / (1024.0 * 1024.0),
+                                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                    };
+                                    let _ = app_h.emit(commands::EVENT_TRAFFIC, payload);
+                                }
+                            }
+                        }
+                    }
                     res = rx_memory.recv() => match res {
                         Ok(mem) => {
-                            core_mem_bytes = mem.inuse;
+                            if mem.inuse > 0 {
+                                core_mem_bytes = mem.inuse;
+                            }
                             if let Some(st) = app_h.try_state::<AppState>() {
                                 if let Ok(mut m) = st.cached_metrics.write() {
                                     m.core_mem_bytes = core_mem_bytes;
@@ -546,6 +589,8 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                     },
                     res = rx_traffic.recv() => match res {
                         Ok(tick) => {
+                            last_up_bps = tick.up;
+                            last_down_bps = tick.down;
                             up_total = up_total.saturating_add(tick.up);
                             down_total = down_total.saturating_add(tick.down);
                             if let Some(st) = app_h.try_state::<AppState>() {
@@ -559,7 +604,7 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                     down_bps: tick.down,
                                     up_total_bytes: up_total,
                                     down_total_bytes: down_total,
-                                    active_connections: 0,
+                                    active_connections,
                                     core_memory_mb: (core_mem_bytes as f64) / (1024.0 * 1024.0),
                                     timestamp_ms: tick.timestamp_ms,
                                 };

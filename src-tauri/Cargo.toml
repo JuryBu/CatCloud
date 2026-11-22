@@ -9,6 +9,9 @@ rust-version.workspace = true
 name = "catcloud_desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build.workspace = true
 

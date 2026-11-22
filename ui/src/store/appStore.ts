@@ -643,7 +643,14 @@ export const appStore = {
     });
 
     disposeRuntime = catcloudApi.subscribeRuntimeUpdate((info) => {
+      const becameRunning = !state.runtime.running && info.running;
       setState((prev) => ({ ...prev, runtime: info }));
+      if (becameRunning) {
+        void catcloudApi
+          .getExitIpInfo()
+          .then((exitIp) => setState((prev) => ({ ...prev, exitIp })))
+          .catch(() => {});
+      }
     });
 
     void hydrateFromBackend().catch((err) => {
