@@ -8,7 +8,6 @@ import {
   Copy,
   FileCode2,
   Filter,
-  Globe,
   Layers,
   Loader2,
   Pencil,
@@ -40,7 +39,15 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
+import {
+  type ContinentId,
+  buildContinentRegionStats,
+  getRegionLabel,
+  nodeMatchesContinentAndRegion,
+  resolveNodeRegionCode,
+} from "../utils/regions";
 
 /* ============================================================================
  * Constants & Human-Friendly Presets
@@ -55,7 +62,7 @@ const FORMULA_MAX_PERF =
 const DEFAULT_MISSING_PING_MS = 9999;
 const EPSILON_ZERO = 1e-12;
 const EPSILON_EQ = 1e-9;
-const NODE_PAGE_SIZE = 120;
+const NODE_PAGE_SIZE_OPTIONS = [24, 48, 96] as const;
 
 const FRIENDLY_GROUP_NAME_MAP: Record<string, string> = {
   流媒体与下载受控均衡: "影音下载均衡组",
@@ -65,27 +72,6 @@ const FRIENDLY_GROUP_NAME_MAP: Record<string, string> = {
 function formatGroupDisplayName(name: string): string {
   return FRIENDLY_GROUP_NAME_MAP[name] ?? name;
 }
-
-const REGION_LABELS: Record<string, string> = {
-  JP: "日本",
-  SG: "新加坡",
-  US: "美国",
-  TW: "台湾",
-  HK: "香港",
-  UK: "英国",
-  GB: "英国",
-  DE: "德国",
-  KR: "韩国",
-  NL: "荷兰",
-  CA: "加拿大",
-  AU: "澳大利亚",
-  FR: "法国",
-  IN: "印度",
-  TR: "土耳其",
-  MY: "马来西亚",
-  TH: "泰国",
-  UNK: "其他",
-};
 
 type CreateTemplateId = "manual" | "ai" | "download";
 
@@ -391,20 +377,128 @@ function formatMatchRuleChip(rule: string): { display: string; tag: string | nul
   return { display: trimmed, tag: null };
 }
 
-function normalizeUserMatchRule(raw: string): string {
+const KNOWN_MATCH_RULE_TYPES = new Set<string>([
+  "DOMAIN",
+  "DOMAIN-SUFFIX",
+  "DOMAIN-KEYWORD",
+  "DOMAIN-REGEX",
+  "DOMAIN-WILDCARD",
+  "GEOSITE",
+  "GEOIP",
+  "IP-CIDR",
+  "IP-CIDR6",
+  "IP-SUFFIX",
+  "IP-ASN",
+  "SRC-IP-CIDR",
+  "SRC-PORT",
+  "DST-PORT",
+  "PROCESS-NAME",
+  "PROCESS-NAME-REGEX",
+  "PROCESS-PATH",
+  "PROCESS-PATH-REGEX",
+  "RULE-SET",
+  "NETWORK",
+  "UID",
+  "IN-TYPE",
+  "IN-USER",
+  "IN-NAME",
+  "SUB-RULE",
+  "AND",
+  "OR",
+  "NOT",
+]);
+
+const BARE_RULE_KEYWORDS = new Set<string>([
+  ...KNOWN_MATCH_RULE_TYPES,
+  "MATCH",
+  "FINAL",
+  "DIRECT",
+  "REJECT",
+  "PROXY",
+]);
+
+const DOMAIN_LIKE_RE =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i;
+
+const INVALID_MATCH_RULE_MSG = "请输入域名或完整规则（如 anthropic.com）";
+
+function normalizeSingleMatchRule(raw: string): { rule: string | null; invalid: boolean } {
   const trimmed = raw.trim();
-  if (!trimmed) return "";
-  if (trimmed.includes(",")) {
-    return trimmed;
+  if (!trimmed) return { rule: null, invalid: false };
+
+  const commaIdx = trimmed.indexOf(",");
+  if (commaIdx !== -1) {
+    const ruleType = trimmed.slice(0, commaIdx).trim().toUpperCase();
+    const restRaw = trimmed.slice(commaIdx + 1).trim();
+    if (!KNOWN_MATCH_RULE_TYPES.has(ruleType) || !restRaw) {
+      return { rule: null, invalid: true };
+    }
+    if (ruleType === "AND" || ruleType === "OR" || ruleType === "NOT") {
+      return { rule: `${ruleType},${restRaw}`, invalid: false };
+    }
+    const restParts = restRaw
+      .split(",")
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+    if (restParts.length === 0) {
+      return { rule: null, invalid: true };
+    }
+    const primaryVal = restParts[0];
+    if (BARE_RULE_KEYWORDS.has(primaryVal.toUpperCase())) {
+      return { rule: null, invalid: true };
+    }
+    if (
+      (ruleType === "DOMAIN" || ruleType === "DOMAIN-SUFFIX") &&
+      !DOMAIN_LIKE_RE.test(primaryVal)
+    ) {
+      return { rule: null, invalid: true };
+    }
+    return { rule: `${ruleType},${restParts.join(",")}`, invalid: false };
   }
+
+  if (BARE_RULE_KEYWORDS.has(trimmed.toUpperCase())) {
+    return { rule: null, invalid: true };
+  }
+
   const cleaned = trimmed
     .replace(/^https?:\/\//i, "")
     .replace(/\/.*$/, "")
     .replace(/:\d+$/, "")
     .replace(/^\.+/, "")
+    .replace(/\.+$/, "")
     .trim();
-  if (!cleaned) return "";
-  return `DOMAIN-SUFFIX,${cleaned}`;
+
+  if (!cleaned || BARE_RULE_KEYWORDS.has(cleaned.toUpperCase()) || !DOMAIN_LIKE_RE.test(cleaned)) {
+    return { rule: null, invalid: true };
+  }
+
+  return { rule: `DOMAIN-SUFFIX,${cleaned.toLowerCase()}`, invalid: false };
+}
+
+function parseUserMatchRules(rawInput: string): { rules: string[]; invalidTokens: string[] } {
+  // Never split by comma `,` — rules like "DOMAIN-SUFFIX,anthropic.com" contain commas.
+  const segments = rawInput
+    .split(/[\r\n;；]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  const rules: string[] = [];
+  const invalidTokens: string[] = [];
+  const seen = new Set<string>();
+
+  for (const seg of segments) {
+    const { rule, invalid } = normalizeSingleMatchRule(seg);
+    if (invalid || !rule) {
+      invalidTokens.push(seg);
+      continue;
+    }
+    if (!seen.has(rule)) {
+      seen.add(rule);
+      rules.push(rule);
+    }
+  }
+
+  return { rules, invalidTokens };
 }
 
 function normalizeGroupForBackend(group: MultiGroup, meta: TriggerMeta): MultiGroup {
@@ -1115,10 +1209,12 @@ export function MultiGroupPage() {
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [selectedSubId, setSelectedSubId] = useState<string>("all");
-  const [selectedRegion, setSelectedRegion] = useState<string>("all");
+  const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
+  const [filterRegion, setFilterRegion] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [viewMode, setViewMode] = useState<NodeViewMode>("all");
-  const [visibleCount, setVisibleCount] = useState(NODE_PAGE_SIZE);
+  const [nodePage, setNodePage] = useState(1);
+  const [nodePageSize, setNodePageSize] = useState(24);
   const [confirmClearMembers, setConfirmClearMembers] = useState(false);
   const [switchingNext, setSwitchingNext] = useState(false);
   const [selectingNodeId, setSelectingNodeId] = useState<string | null>(null);
@@ -1196,6 +1292,7 @@ export function MultiGroupPage() {
     () => groups.find((g) => g.id === selectedId) ?? groups[0] ?? null,
     [groups, selectedId]
   );
+  const selectedGroupId = selectedGroup?.id ?? null;
 
   // Refresh pinned display ordering when switching groups or changing view/filters
   useEffect(() => {
@@ -1208,13 +1305,12 @@ export function MultiGroupPage() {
     setEditingName(false);
     setConfirmClearMembers(false);
     setEvalReport(null);
-    setVisibleCount(NODE_PAGE_SIZE);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedGroup?.id, viewMode]);
 
   useEffect(() => {
-    setVisibleCount(NODE_PAGE_SIZE);
-  }, [selectedSubId, selectedRegion, searchQuery]);
+    setNodePage(1);
+  }, [selectedGroupId, viewMode, searchQuery, selectedSubId, filterContinent, filterRegion]);
 
   // Debounced backend authoritative formula validation in Tauri runtime (only when advanced panel is open or dirty)
   const currentFormulaExpr = selectedGroup?.formula_expr ?? "";
@@ -1304,21 +1400,27 @@ export function MultiGroupPage() {
 
   const enabledNodes = useMemo(() => nodes.filter((n) => n.enabled), [nodes]);
 
-  const regionOptions = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const n of enabledNodes) {
-      if (selectedSubId !== "all" && (n.sub_id || "__unknown__") !== selectedSubId) continue;
-      const code = (n.region_code || "UNK").toUpperCase();
-      counts.set(code, (counts.get(code) ?? 0) + 1);
-    }
-    return Array.from(counts.entries())
-      .map(([code, count]) => ({
-        code,
-        label: REGION_LABELS[code] ? `${code} ${REGION_LABELS[code]}` : code,
-        count,
-      }))
-      .sort((a, b) => b.count - a.count);
+  const subScopedNodes = useMemo(() => {
+    if (selectedSubId === "all") return enabledNodes;
+    return enabledNodes.filter((n) => (n.sub_id || "__unknown__") === selectedSubId);
   }, [enabledNodes, selectedSubId]);
+
+  const regionStats = useMemo(
+    () => buildContinentRegionStats(subScopedNodes),
+    [subScopedNodes]
+  );
+
+  useEffect(() => {
+    if (filterContinent !== "all" && regionStats.continentCounts[filterContinent] === 0) {
+      setFilterContinent("all");
+    }
+    if (
+      filterRegion !== "all" &&
+      !regionStats.allRegions.some((r) => r.code === filterRegion)
+    ) {
+      setFilterRegion("all");
+    }
+  }, [regionStats, filterContinent, filterRegion]);
 
   const memberIdSet = useMemo(
     () => new Set(selectedGroup?.member_node_ids ?? []),
@@ -1331,7 +1433,6 @@ export function MultiGroupPage() {
   const memberActiveId =
     viewMode === "members" ? (selectedGroup?.active_node_id ?? null) : null;
   const memberSortProbes = viewMode === "members" ? probes : null;
-  const selectedGroupId = selectedGroup?.id ?? null;
 
   // Filter & stably sort nodes for the main grid
   const filteredNodes = useMemo(() => {
@@ -1339,13 +1440,15 @@ export function MultiGroupPage() {
     const list = enabledNodes.filter((node) => {
       if (memberFilterSet && !memberFilterSet.has(node.id)) return false;
       if (selectedSubId !== "all" && (node.sub_id || "__unknown__") !== selectedSubId) return false;
-      if (selectedRegion !== "all" && (node.region_code || "UNK").toUpperCase() !== selectedRegion) {
+      if (!nodeMatchesContinentAndRegion(node, filterContinent, filterRegion)) {
         return false;
       }
       if (q) {
         const subName = (subNameById.get(node.sub_id) ?? "").toLowerCase();
-        const regionCn = (REGION_LABELS[(node.region_code || "").toUpperCase()] ?? "").toLowerCase();
-        const hay = `${node.name} ${node.region_code} ${regionCn} ${node.protocol} ${subName}`.toLowerCase();
+        const resolvedCode = resolveNodeRegionCode(node);
+        const regionCn = getRegionLabel(resolvedCode).toLowerCase();
+        const hay =
+          `${node.name} ${node.region_code} ${resolvedCode} ${regionCn} ${node.protocol} ${subName}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       return true;
@@ -1382,7 +1485,8 @@ export function MultiGroupPage() {
     viewMode,
     memberFilterSet,
     selectedSubId,
-    selectedRegion,
+    filterContinent,
+    filterRegion,
     searchQuery,
     subNameById,
     pinnedOrder,
@@ -1391,9 +1495,16 @@ export function MultiGroupPage() {
     memberSortProbes,
   ]);
 
-  const displayedNodes = useMemo(
-    () => filteredNodes.slice(0, visibleCount),
-    [filteredNodes, visibleCount]
+  const totalNodePages = Math.max(1, Math.ceil(filteredNodes.length / nodePageSize));
+  const safeNodePage = Math.min(Math.max(1, nodePage), totalNodePages);
+
+  const pagedFilteredNodes = useMemo(
+    () =>
+      filteredNodes.slice(
+        (safeNodePage - 1) * nodePageSize,
+        safeNodePage * nodePageSize
+      ),
+    [filteredNodes, safeNodePage, nodePageSize]
   );
 
   // Count how many nodes in current filter are not yet in the active group
@@ -1933,11 +2044,33 @@ export function MultiGroupPage() {
   const handleAddMatchRule = (ev: FormEvent) => {
     ev.preventDefault();
     if (!selectedGroup) return;
-    const normalized = normalizeUserMatchRule(newRuleInput);
-    if (!normalized) return;
-    if (!selectedGroup.match_rules.includes(normalized)) {
-      updateSelectedGroup((g) => ({ ...g, match_rules: [...g.match_rules, normalized] }));
+    const raw = newRuleInput.trim();
+    if (!raw) return;
+
+    const { rules, invalidTokens } = parseUserMatchRules(raw);
+    if (rules.length === 0) {
+      appActions.showToast(INVALID_MATCH_RULE_MSG, "warn");
+      return;
     }
+
+    const existing = new Set(selectedGroup.match_rules);
+    const toAdd = rules.filter((r) => !existing.has(r));
+    if (toAdd.length > 0) {
+      updateSelectedGroup((g) => ({
+        ...g,
+        match_rules: [...g.match_rules, ...toAdd],
+      }));
+    }
+
+    if (invalidTokens.length > 0) {
+      appActions.showToast(
+        `已忽略无效条目（${invalidTokens.join("、")}），${INVALID_MATCH_RULE_MSG}`,
+        "warn"
+      );
+      setNewRuleInput(invalidTokens.join("; "));
+      return;
+    }
+
     setNewRuleInput("");
   };
 
@@ -2406,7 +2539,7 @@ export function MultiGroupPage() {
 
           {/* Spacious Two-Row Filter, Legend & Batch Action Bar */}
           <div className="cc-card cc-glass space-y-2.5 rounded-2xl px-4 py-3">
-            {/* Row 1: Wide Search Box + Source & Region Filter Dropdowns */}
+            {/* Row 1: Wide Search Box + Source & Two-Tier Continent/Region Filter Dropdowns */}
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative min-w-[200px] flex-1">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
@@ -2415,7 +2548,7 @@ export function MultiGroupPage() {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   placeholder="搜索节点名、地区或来源..."
-                  className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  className="h-9 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                 />
                 {searchQuery && (
                   <button
@@ -2436,7 +2569,7 @@ export function MultiGroupPage() {
                   value={selectedSubId}
                   onChange={(e) => setSelectedSubId(e.target.value)}
                   aria-label="按来源筛选"
-                  className="max-w-[190px] rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  className="h-9 max-w-[190px] rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                 >
                   <option value="all">全部来源 ({enabledNodes.length})</option>
                   {providerTabs.map((sub) => (
@@ -2447,23 +2580,21 @@ export function MultiGroupPage() {
                 </select>
               </div>
 
-              {/* Region dropdown */}
-              <div className="relative shrink-0">
-                <Globe className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-                <select
-                  value={selectedRegion}
-                  onChange={(e) => setSelectedRegion(e.target.value)}
-                  aria-label="按地区筛选"
-                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                >
-                  <option value="all">全部地区</option>
-                  {regionOptions.map((r) => (
-                    <option key={r.code} value={r.code}>
-                      {r.label} ({r.count})
-                    </option>
-                  ))}
-                </select>
-              </div>
+              {/* TAG-style two-tier Continent -> Country/Region filter */}
+              <ContinentRegionFilter
+                variant="select"
+                stats={regionStats}
+                continent={filterContinent}
+                region={filterRegion}
+                onContinentChange={(c) => {
+                  setFilterContinent(c);
+                  setNodePage(1);
+                }}
+                onRegionChange={(r) => {
+                  setFilterRegion(r);
+                  setNodePage(1);
+                }}
+              />
             </div>
 
             {/* Row 2: View Mode Switch + Solid Color Legend + Batch Actions */}
@@ -2511,9 +2642,7 @@ export function MultiGroupPage() {
                   </span>
                   <span className="cc-mono text-[11px] text-[var(--muted)]">
                     · 匹配 {filteredNodes.length} 个
-                    {filteredNodes.length > displayedNodes.length
-                      ? `（展示 ${displayedNodes.length} 个）`
-                      : ""}
+                    {totalNodePages > 1 ? `（第 ${safeNodePage}/${totalNodePages} 页）` : ""}
                   </span>
                 </div>
               </div>
@@ -2550,13 +2679,30 @@ export function MultiGroupPage() {
 
           {/* Responsive Node Card Grid Container (Stretches to align bottom edge with left & right columns) */}
           <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl p-3">
-          {displayedNodes.length > 0 ? (
+          {totalNodePages > 1 && (
+            <PaginationBar
+              currentPage={safeNodePage}
+              totalPages={totalNodePages}
+              totalItems={filteredNodes.length}
+              pageSize={nodePageSize}
+              pageSizeOptions={NODE_PAGE_SIZE_OPTIONS}
+              onPageChange={setNodePage}
+              onPageSizeChange={(s) => {
+                setNodePageSize(s);
+                setNodePage(1);
+              }}
+              compact
+              className="mb-2.5 border-b border-[var(--line)]/60 pb-2"
+            />
+          )}
+
+          {pagedFilteredNodes.length > 0 ? (
             <div
               className={`grid grid-cols-1 gap-2.5 sm:grid-cols-2 ${
                 drawerOpen ? "2xl:grid-cols-3" : "xl:grid-cols-3 2xl:grid-cols-4"
               }`}
             >
-              {displayedNodes.map((node) => {
+              {pagedFilteredNodes.map((node) => {
                 const isActive = selectedGroup.active_node_id === node.id;
                 const isLiveActive = isActive && isRuntimeActiveGroup;
                 const isMember = memberIdSet.has(node.id);
@@ -2565,7 +2711,7 @@ export function MultiGroupPage() {
                 const isProbing = Boolean(probingNodeIds[node.id]);
                 const isSelecting = selectingNodeId === node.id;
                 const gateEval = assessNodeAgainstGates(node, snap, selectedGroup.hard_gates);
-                const regionCode = (node.region_code || "UNK").toUpperCase();
+                const regionCode = resolveNodeRegionCode(node);
                 const isHighMult = node.multiplier > 1.05;
                 const isLowMult = node.multiplier < 0.95;
 
@@ -2590,7 +2736,10 @@ export function MultiGroupPage() {
                     {/* Top row: region badge + node name + membership badge */}
                     <div className="flex items-start justify-between gap-2">
                       <div className="flex min-w-0 items-center gap-1.5">
-                        <span className="cc-mono shrink-0 rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-secondary)]">
+                        <span
+                          title={getRegionLabel(regionCode)}
+                          className="cc-mono shrink-0 rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-secondary)]"
+                        >
                           {regionCode}
                         </span>
                         <span
@@ -2756,40 +2905,43 @@ export function MultiGroupPage() {
                   切到「全部节点」挑选加入
                 </button>
               )}
-              {viewMode === "all" && (searchQuery || selectedSubId !== "all" || selectedRegion !== "all") && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearchQuery("");
-                    setSelectedSubId("all");
-                    setSelectedRegion("all");
-                  }}
-                  className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                >
-                  重置全部筛选
-                </button>
-              )}
+              {viewMode === "all" &&
+                (searchQuery ||
+                  selectedSubId !== "all" ||
+                  filterContinent !== "all" ||
+                  filterRegion !== "all") && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchQuery("");
+                      setSelectedSubId("all");
+                      setFilterContinent("all");
+                      setFilterRegion("all");
+                      setNodePage(1);
+                    }}
+                    className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                  >
+                    重置全部筛选
+                  </button>
+                )}
             </div>
           )}
 
-          {/* On-demand pagination footer for 430+ node lists */}
-          {filteredNodes.length > visibleCount && (
-            <div className="mt-3 flex items-center justify-center gap-2 pt-1">
-              <button
-                type="button"
-                onClick={() => setVisibleCount((c) => c + NODE_PAGE_SIZE)}
-                className="rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-4 py-2 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-              >
-                加载更多节点（还有 {filteredNodes.length - visibleCount} 个）
-              </button>
-              <button
-                type="button"
-                onClick={() => setVisibleCount(filteredNodes.length)}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--text)]"
-              >
-                全部展开
-              </button>
-            </div>
+          {/* Pagination bar with page-size switcher & direct page jump */}
+          {filteredNodes.length > 0 && (
+            <PaginationBar
+              currentPage={safeNodePage}
+              totalPages={totalNodePages}
+              totalItems={filteredNodes.length}
+              pageSize={nodePageSize}
+              pageSizeOptions={NODE_PAGE_SIZE_OPTIONS}
+              onPageChange={setNodePage}
+              onPageSizeChange={(s) => {
+                setNodePageSize(s);
+                setNodePage(1);
+              }}
+              className="mt-3 border-t border-[var(--line)]/60 pt-2.5"
+            />
           )}
           </div>
         </section>
@@ -3271,7 +3423,7 @@ export function MultiGroupPage() {
                   </button>
                 </form>
                 <div className="text-[10px] text-[var(--muted)]">
-                  直接填域名会自动匹配子域名；输入完整规则（含逗号）也会原样保留。
+                  直接填域名会自动匹配子域名；完整规则（如 DOMAIN-SUFFIX,anthropic.com）会原样保留，多条请用分号或换行分隔。
                 </div>
               </div>
 

@@ -1,4 +1,5 @@
-import { Suspense, lazy } from "react";
+import { X } from "lucide-react";
+import { Suspense, lazy, useState } from "react";
 import { Sidebar } from "./components/Sidebar";
 import { type NavRouteId, useAppSelector } from "./store/appStore";
 
@@ -64,6 +65,9 @@ export function App() {
   const windowMode = useAppSelector((s) => s.windowMode);
   const activeNav = useAppSelector((s) => s.activeNav);
   const toast = useAppSelector((s) => s.toast);
+  const [dismissedToastId, setDismissedToastId] = useState<number | null>(null);
+
+  const visibleToast = toast && toast.id !== dismissedToastId ? toast : null;
 
   if (windowMode === "capsule") {
     return (
@@ -88,23 +92,34 @@ export function App() {
         </div>
       </main>
 
-      {toast && (
-        <div
-          role="status"
-          className="fixed left-1/2 top-4 z-50 -translate-x-1/2 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2 text-xs text-[var(--text)] shadow-lg"
-        >
-          <span
-            className="mr-2 inline-block h-2 w-2 rounded-full"
-            style={{
-              backgroundColor:
-                toast.tone === "warn"
-                  ? "var(--amber)"
-                  : toast.tone === "ok"
-                    ? "var(--green)"
-                    : "var(--accent)",
-            }}
-          />
-          {toast.text}
+      {visibleToast && (
+        <div className="pointer-events-none fixed inset-x-4 top-4 z-50 flex justify-center">
+          <div
+            role="status"
+            className="pointer-events-auto flex max-w-lg items-start gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2.5 text-xs leading-relaxed text-[var(--text)] shadow-lg"
+          >
+            <span
+              className="mt-1.5 inline-block h-2 w-2 shrink-0 rounded-full"
+              style={{
+                backgroundColor:
+                  visibleToast.tone === "warn"
+                    ? "var(--amber)"
+                    : visibleToast.tone === "ok"
+                      ? "var(--green)"
+                      : "var(--accent)",
+              }}
+            />
+            <span className="min-w-0 flex-1 break-words">{visibleToast.text}</span>
+            <button
+              type="button"
+              onClick={() => setDismissedToastId(visibleToast.id)}
+              className="-mr-1 -mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
+              aria-label="关闭提示"
+              title="关闭提示"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
       )}
     </div>

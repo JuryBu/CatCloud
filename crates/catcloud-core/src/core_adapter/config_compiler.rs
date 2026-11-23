@@ -129,31 +129,167 @@ pub fn build_default_ai_routing_rules(target_group: &str) -> Vec<String> {
         .collect()
 }
 
+/// Built-in whitelist of standard Mihomo rule types accepted during rule expansion and validation.
+const VALID_MIHOMO_RULE_TYPES: &[&str] = &[
+    "DOMAIN",
+    "DOMAIN-SUFFIX",
+    "DOMAIN-KEYWORD",
+    "DOMAIN-REGEX",
+    "DOMAIN-WILDCARD",
+    "GEOSITE",
+    "GEOIP",
+    "IP-CIDR",
+    "IP-CIDR6",
+    "IP-SUFFIX",
+    "IP-ASN",
+    "SRC-IP-CIDR",
+    "DST-PORT",
+    "SRC-PORT",
+    "PROCESS-NAME",
+    "PROCESS-NAME-REGEX",
+    "PROCESS-PATH",
+    "PROCESS-PATH-REGEX",
+    "NETWORK",
+    "UID",
+    "IN-TYPE",
+    "IN-USER",
+    "IN-NAME",
+    "SUB-RULE",
+    "RULE-SET",
+    "AND",
+    "OR",
+    "NOT",
+    "MATCH",
+];
+
+fn is_valid_mihomo_rule_type(raw: &str) -> bool {
+    let upper = raw.trim().to_ascii_uppercase();
+    VALID_MIHOMO_RULE_TYPES.contains(&upper.as_str())
+}
+
+fn normalize_bare_domain_candidate(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || is_valid_mihomo_rule_type(trimmed) {
+        return None;
+    }
+    let candidate = trimmed
+        .strip_prefix("*.")
+        .or_else(|| trimmed.strip_prefix("+."))
+        .unwrap_or(trimmed);
+    if candidate.is_empty()
+        || !candidate.contains('.')
+        || candidate.starts_with('.')
+        || candidate.ends_with('.')
+        || candidate.starts_with('-')
+        || candidate.ends_with('-')
+        || candidate.contains("..")
+        || candidate.parse::<Ipv4Addr>().is_ok()
+    {
+        return None;
+    }
+    if candidate
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        && candidate.chars().any(|c| c.is_ascii_alphabetic())
+    {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn is_plausible_global_rule(rule: &str) -> bool {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    let rule_type = parts[0];
+    if !is_valid_mihomo_rule_type(rule_type) {
+        return false;
+    }
+    if rule_type.eq_ignore_ascii_case("MATCH") {
+        return parts.len() == 2 && !parts[1].is_empty();
+    }
+    parts.len() >= 3 && parts.iter().all(|p| !p.is_empty())
+}
+
 /// Expand a multi-group match rule into one or more Mihomo rule strings.
 ///
 /// - `@ai_domains` or `PRESET:AI` expands into `DEFAULT_AI_ROUTING_DOMAINS` bound to `group_name`.
-/// - 2-part shorthand rules (`DOMAIN-SUFFIX,openai.com`) automatically append `,group_name`.
-/// - 3-part CIDR rules ending in `no-resolve` (`IP-CIDR,203.0.113.0/24,no-resolve`) insert `group_name`
-///   before `no-resolve`.
-/// - Full rules already carrying an explicit target are kept intact.
+/// - Single-segment bare Mihomo rule type names (e.g. `"DOMAIN-SUFFIX"`) or malformed strings
+///   are safely ignored (empty `Vec`) instead of breaking `mihomo -t`.
+/// - Single-segment valid domains (e.g. `"anthropic.com"`) auto-expand to `DOMAIN-SUFFIX,<domain>,<group>`.
+/// - 2-part shorthand rules (`DOMAIN-SUFFIX,openai.com`) with a valid non-`MATCH` rule type
+///   and non-empty payload expand to `{RULE_TYPE_UPPER},{payload},{group_name}`.
+/// - 3-part rules ending in `no-resolve` insert `group_name` before `no-resolve`; otherwise
+///   kept only when `rule_type` is valid and all 3 segments are non-empty.
 pub fn expand_group_match_rule(rule: &str, group_name: &str) -> Vec<String> {
     let trimmed = rule.trim();
-    if trimmed.is_empty() {
+    let target = group_name.trim();
+    if trimmed.is_empty() || target.is_empty() {
         return Vec::new();
     }
     if trimmed.eq_ignore_ascii_case("@ai_domains") || trimmed.eq_ignore_ascii_case("PRESET:AI") {
-        return build_default_ai_routing_rules(group_name);
+        return build_default_ai_routing_rules(target);
     }
 
     let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
     match parts.as_slice() {
-        [rule_type, payload] if !rule_type.eq_ignore_ascii_case("MATCH") => {
-            vec![format!("{rule_type},{payload},{group_name}")]
+        [single] => {
+            if let Some(domain) = normalize_bare_domain_candidate(single) {
+                vec![format!("DOMAIN-SUFFIX,{domain},{target}")]
+            } else {
+                Vec::new()
+            }
         }
-        [rule_type, payload, third] if third.eq_ignore_ascii_case("no-resolve") => {
-            vec![format!("{rule_type},{payload},{group_name},no-resolve")]
+        [rule_type, payload] => {
+            if is_valid_mihomo_rule_type(rule_type)
+                && !rule_type.eq_ignore_ascii_case("MATCH")
+                && !payload.is_empty()
+            {
+                vec![format!(
+                    "{},{payload},{target}",
+                    rule_type.to_ascii_uppercase()
+                )]
+            } else {
+                Vec::new()
+            }
         }
-        _ => vec![trimmed.to_string()],
+        [rule_type, payload, third] => {
+            if !is_valid_mihomo_rule_type(rule_type)
+                || rule_type.eq_ignore_ascii_case("MATCH")
+                || payload.is_empty()
+                || third.is_empty()
+            {
+                return Vec::new();
+            }
+            let rt = rule_type.to_ascii_uppercase();
+            if third.eq_ignore_ascii_case("no-resolve") {
+                vec![format!("{rt},{payload},{target},no-resolve")]
+            } else {
+                vec![format!("{rt},{payload},{third}")]
+            }
+        }
+        [rule_type, payload, third, fourth] => {
+            if is_valid_mihomo_rule_type(rule_type)
+                && !rule_type.eq_ignore_ascii_case("MATCH")
+                && !payload.is_empty()
+                && !third.is_empty()
+                && !fourth.is_empty()
+            {
+                vec![format!(
+                    "{},{payload},{third},{fourth}",
+                    rule_type.to_ascii_uppercase()
+                )]
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -636,13 +772,13 @@ pub fn compile_mihomo_config(input: &CompileInput<'_>) -> CatResult<CompiledCore
     }
     for r in input.extra_prepend_rules {
         let trimmed = r.trim();
-        if !trimmed.is_empty() {
+        if is_plausible_global_rule(trimmed) {
             push_unique(&mut rules, trimmed.to_string());
         }
     }
     for r in &cfg.rules_override.global_prepend_rules {
         let trimmed = r.trim();
-        if !trimmed.is_empty() {
+        if is_plausible_global_rule(trimmed) {
             push_unique(&mut rules, trimmed.to_string());
         }
     }
@@ -663,7 +799,7 @@ pub fn compile_mihomo_config(input: &CompileInput<'_>) -> CatResult<CompiledCore
     }
     for r in &cfg.rules_override.global_append_rules {
         let trimmed = r.trim();
-        if !trimmed.is_empty() {
+        if is_plausible_global_rule(trimmed) {
             push_unique(&mut rules, trimmed.to_string());
         }
     }
@@ -2098,5 +2234,81 @@ rules:
         let rules = compiled.value["rules"].as_sequence().expect("rules seq");
         let last = rules.last().and_then(|v| v.as_str()).unwrap_or("");
         assert_eq!(last, "MATCH,Second-Group");
+    }
+
+    #[test]
+    fn expand_group_match_rule_sanitizes_malformed_and_bare_domain_entries() {
+        // Bare rule types or malformed tokens must be safely dropped instead of breaking `mihomo -t`.
+        assert!(expand_group_match_rule("DOMAIN-SUFFIX", "G").is_empty());
+        assert!(expand_group_match_rule("  domain-suffix  ", "G").is_empty());
+        assert!(expand_group_match_rule("MATCH", "G").is_empty());
+        assert!(expand_group_match_rule("MATCH,DIRECT", "G").is_empty());
+        assert!(expand_group_match_rule("DOMAIN-SUFFIX,", "G").is_empty());
+        assert!(expand_group_match_rule("UNKNOWN-TYPE,anthropic.com", "G").is_empty());
+        assert!(expand_group_match_rule("https://anthropic.com/v1", "G").is_empty());
+
+        // Bare valid domains auto-complete to DOMAIN-SUFFIX,<domain>,<group>.
+        assert_eq!(
+            expand_group_match_rule("anthropic.com", "G"),
+            vec!["DOMAIN-SUFFIX,anthropic.com,G".to_string()]
+        );
+        assert_eq!(
+            expand_group_match_rule("*.openai.com", "G"),
+            vec!["DOMAIN-SUFFIX,openai.com,G".to_string()]
+        );
+
+        // Valid 2-part / 3-part / 4-part rules expand and normalize cleanly.
+        assert_eq!(
+            expand_group_match_rule("domain-suffix,claude.ai", "G"),
+            vec!["DOMAIN-SUFFIX,claude.ai,G".to_string()]
+        );
+        assert_eq!(
+            expand_group_match_rule("IP-CIDR,203.0.113.0/24,no-resolve", "G"),
+            vec!["IP-CIDR,203.0.113.0/24,G,no-resolve".to_string()]
+        );
+        assert_eq!(
+            expand_group_match_rule("DOMAIN,example.com,DIRECT", "G"),
+            vec!["DOMAIN,example.com,DIRECT".to_string()]
+        );
+
+        // Global prepend/append rules also drop bare broken tokens like `"DOMAIN-SUFFIX"`.
+        let mut cfg = AppConfig::default();
+        cfg.rules_override.global_prepend_rules = vec![
+            "DOMAIN-SUFFIX".to_string(),
+            "DOMAIN,ok.example,DIRECT".to_string(),
+        ];
+        cfg.rules_override.global_append_rules = vec!["GEOIP".to_string()];
+        let node = sample_node("n1", "Node-JP", 443, true);
+        let group = MultiGroup {
+            id: "g-ai".to_string(),
+            name: "AI".to_string(),
+            match_rules: vec!["DOMAIN-SUFFIX".to_string(), "anthropic.com".to_string()],
+            member_node_ids: vec!["n1".to_string()],
+            ..Default::default()
+        };
+        let ports = sample_ports();
+        let empty = HashMap::new();
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &[node],
+            groups: &[group],
+            relays: &[],
+            controller_secret: "secret",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile ok");
+        let compiled_rules: Vec<&str> = compiled.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!compiled_rules.contains(&"DOMAIN-SUFFIX"));
+        assert!(!compiled_rules.contains(&"GEOIP"));
+        assert!(compiled_rules.contains(&"DOMAIN,ok.example,DIRECT"));
+        assert!(compiled_rules.contains(&"DOMAIN-SUFFIX,anthropic.com,AI"));
     }
 }

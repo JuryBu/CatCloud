@@ -7,12 +7,9 @@ import {
   Check,
   CheckCircle2,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   ChevronUp,
   Clock,
   Filter,
-  Globe,
   Layers,
   Play,
   Plus,
@@ -49,8 +46,16 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
 import { MascotSprite } from "../components/MascotSprite";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
+import {
+  type ContinentId,
+  buildContinentRegionStats,
+  getRegionLabel,
+  nodeMatchesContinentAndRegion,
+  resolveNodeRegionCode,
+} from "../utils/regions";
 
 type SpeedTestTier = "latency" | "unlock" | "full";
 
@@ -245,42 +250,6 @@ const UNLOCK_PRESETS: ReadonlyArray<{
   },
 ];
 
-const REGION_LABELS: Record<string, string> = {
-  JP: "日本",
-  SG: "新加坡",
-  US: "美国",
-  TW: "台湾",
-  HK: "香港",
-  UK: "英国",
-  GB: "英国",
-  DE: "德国",
-  KR: "韩国",
-  NL: "荷兰",
-  CA: "加拿大",
-  AU: "澳大利亚",
-  FR: "法国",
-  IN: "印度",
-  TR: "土耳其",
-  AR: "阿根廷",
-  MY: "马来西亚",
-  TH: "泰国",
-  VN: "越南",
-  PH: "菲律宾",
-  ID: "印尼",
-  RU: "俄罗斯",
-  BR: "巴西",
-  CH: "瑞士",
-  SE: "瑞典",
-  FI: "芬兰",
-  PL: "波兰",
-  IE: "爱尔兰",
-  IT: "意大利",
-  ES: "西班牙",
-  AE: "阿联酋",
-  MO: "澳门",
-  UNK: "其他",
-};
-
 const TIER_LABELS: Record<SpeedTestTier, string> = {
   latency: "快速测延迟",
   unlock: "测地区与 AI 解锁",
@@ -299,19 +268,6 @@ type SortKey =
   | "unlocks";
 
 type SortDir = "asc" | "desc";
-
-function formatRegionShort(code: string): string {
-  const upper = code.trim().toUpperCase();
-  if (!upper) return "其他";
-  return REGION_LABELS[upper] ?? upper;
-}
-
-function formatRegionOption(code: string): string {
-  const upper = code.trim().toUpperCase();
-  if (!upper) return "其他";
-  const zh = REGION_LABELS[upper];
-  return zh ? `${zh} (${upper})` : upper;
-}
 
 function getProbeDisplayInfo(probe: ProbeItem): { title: string; desc: string } {
   const mapped = FRIENDLY_BUILTIN_PROBES[probe.id];
@@ -552,6 +508,7 @@ export function SpeedTestPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState<string>("all");
   const [groupFilter, setGroupFilter] = useState<string>("all");
+  const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
   const [regionFilter, setRegionFilter] = useState<string>("all");
   const [onlyTested, setOnlyTested] = useState(false);
   const [onlyGoogleClean, setOnlyGoogleClean] = useState(false);
@@ -878,15 +835,6 @@ export function SpeedTestPage() {
     return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
   }, [subscriptions, nodes]);
 
-  const regionOptions = useMemo(() => {
-    const codes = new Set<string>();
-    for (const node of nodes) {
-      const code = (node.region_code || "UNK").trim().toUpperCase();
-      codes.add(code);
-    }
-    return Array.from(codes).sort((a, b) => a.localeCompare(b));
-  }, [nodes]);
-
   // Pre-build O(1) lookup structures per group: Map<groupId, Set<nodeId>> & compiled dynamic filters
   const groupMemberSetById = useMemo(() => {
     const map = new Map<string, Set<string>>();
@@ -916,6 +864,43 @@ export function SpeedTestPage() {
     ? (groupDynamicFilterById.get(selectedGroupObj.id) ?? null)
     : null;
 
+  const nodesScopedForRegion = useMemo(() => {
+    return nodes.filter((node) => {
+      if (sourceFilter !== "all" && node.sub_id !== sourceFilter) return false;
+      if (
+        selectedGroupObj &&
+        !nodeBelongsToGroup(
+          node,
+          selectedGroupMemberSet,
+          selectedGroupDynamicFilter,
+          probes
+        )
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }, [nodes, sourceFilter, selectedGroupObj, selectedGroupMemberSet, selectedGroupDynamicFilter, probes]);
+
+  const regionStats = useMemo(
+    () => buildContinentRegionStats(nodesScopedForRegion),
+    [nodesScopedForRegion]
+  );
+
+  useEffect(() => {
+    if (filterContinent !== "all" && regionStats.continentCounts[filterContinent] === 0) {
+      setFilterContinent("all");
+      setRegionFilter("all");
+      return;
+    }
+    if (
+      regionFilter !== "all" &&
+      !(regionStats.regionsByContinent[filterContinent] ?? []).some((r) => r.code === regionFilter)
+    ) {
+      setRegionFilter("all");
+    }
+  }, [regionStats, filterContinent, regionFilter]);
+
   const nodeIdSet = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes]);
 
   const validSelectedIds = useMemo(() => {
@@ -932,8 +917,8 @@ export function SpeedTestPage() {
       .map((node) => {
         const snap = probes[node.id];
         const sourceName = subNameById.get(node.sub_id) ?? node.sub_id;
-        const regionCode = (node.region_code || "UNK").trim().toUpperCase();
-        const regionLabel = formatRegionShort(regionCode);
+        const regionCode = resolveNodeRegionCode(node);
+        const regionLabel = getRegionLabel(regionCode);
         const unlocks = {
           gemini: snap?.unlocked_sites.gemini ?? snap?.unlocked_sites.google_ai ?? false,
           chatgpt: snap?.unlocked_sites.chatgpt ?? false,
@@ -984,7 +969,7 @@ export function SpeedTestPage() {
         ) {
           return false;
         }
-        if (regionFilter !== "all" && row.regionCode !== regionFilter) return false;
+        if (!nodeMatchesContinentAndRegion(row.node, filterContinent, regionFilter)) return false;
         if (onlyTested && !row.snap) return false;
         if (onlyGoogleClean && row.snap?.google_clean !== true) return false;
         return true;
@@ -1068,6 +1053,7 @@ export function SpeedTestPage() {
     selectedGroupObj,
     selectedGroupMemberSet,
     selectedGroupDynamicFilter,
+    filterContinent,
     regionFilter,
     onlyTested,
     onlyGoogleClean,
@@ -1103,6 +1089,7 @@ export function SpeedTestPage() {
     searchQuery.trim().length > 0 ||
     sourceFilter !== "all" ||
     groupFilter !== "all" ||
+    filterContinent !== "all" ||
     regionFilter !== "all" ||
     onlyTested ||
     onlyGoogleClean;
@@ -1275,6 +1262,7 @@ export function SpeedTestPage() {
     setSearchQuery("");
     setSourceFilter("all");
     setGroupFilter("all");
+    setFilterContinent("all");
     setRegionFilter("all");
     setOnlyTested(false);
     setOnlyGoogleClean(false);
@@ -1778,10 +1766,10 @@ export function SpeedTestPage() {
       <section className="cc-card cc-glass rounded-2xl p-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]">
+            <div className="flex min-h-[76px] min-w-[76px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1">
               <MascotSprite
                 state="searching"
-                scale={1}
+                scale={2}
                 animationsEnabled={isRunning}
                 title={isRunning ? "猫咪正在逐条测速中" : "独立测速通道已就绪"}
               />
@@ -2304,25 +2292,20 @@ export function SpeedTestPage() {
             </select>
           </div>
 
-          <div className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
-            <Globe className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-            <select
-              aria-label="按地区筛选"
-              value={regionFilter}
-              onChange={(e) => {
-                setRegionFilter(e.target.value);
-                setPage(1);
-              }}
-              className="bg-transparent text-xs text-[var(--text)] outline-none"
-            >
-              <option value="all">全部地区</option>
-              {regionOptions.map((code) => (
-                <option key={code} value={code}>
-                  {formatRegionOption(code)}
-                </option>
-              ))}
-            </select>
-          </div>
+          <ContinentRegionFilter
+            variant="select"
+            stats={regionStats}
+            continent={filterContinent}
+            region={regionFilter}
+            onContinentChange={(c) => {
+              setFilterContinent(c);
+              setPage(1);
+            }}
+            onRegionChange={(r) => {
+              setRegionFilter(r);
+              setPage(1);
+            }}
+          />
 
           <button
             type="button"
@@ -2772,57 +2755,19 @@ export function SpeedTestPage() {
 
         {/* Clean Pagination Footer */}
         {totalFiltered > 0 && (
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--muted)]">
-            <div className="flex flex-wrap items-center gap-2 cc-tabular">
-              <span>
-                显示第 {pageStartIdx + 1}–{Math.min(pageStartIdx + pageSize, totalFiltered)} 条，共{" "}
-                {totalFiltered} 条
-              </span>
-              <span className="opacity-40">|</span>
-              <label className="inline-flex items-center gap-1.5">
-                <span>每页</span>
-                <select
-                  aria-label="每页显示条数"
-                  value={pageSize}
-                  onChange={(e) => {
-                    setPageSize(Number(e.target.value) || 50);
-                    setPage(1);
-                  }}
-                  className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                >
-                  {PAGE_SIZE_OPTIONS.map((sz) => (
-                    <option key={sz} value={sz}>
-                      {sz} 条
-                    </option>
-                  ))}
-                </select>
-              </label>
-            </div>
-
-            <div className="flex items-center gap-1.5 cc-tabular">
-              <button
-                type="button"
-                disabled={safePage <= 1}
-                onClick={() => setPage(Math.max(1, safePage - 1))}
-                className="inline-flex items-center gap-0.5 rounded-lg border border-[var(--line-strong)]/80 bg-[var(--bg-elevated)] px-2.5 py-1 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
-              >
-                <ChevronLeft className="h-3.5 w-3.5" />
-                <span>上一页</span>
-              </button>
-              <span className="px-2 text-xs font-medium text-[var(--text)]">
-                {safePage} / {totalPages}
-              </span>
-              <button
-                type="button"
-                disabled={safePage >= totalPages}
-                onClick={() => setPage(Math.min(totalPages, safePage + 1))}
-                className="inline-flex items-center gap-0.5 rounded-lg border border-[var(--line-strong)]/80 bg-[var(--bg-elevated)] px-2.5 py-1 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
-              >
-                <span>下一页</span>
-                <ChevronRight className="h-3.5 w-3.5" />
-              </button>
-            </div>
-          </div>
+          <PaginationBar
+            currentPage={safePage}
+            totalPages={totalPages}
+            totalItems={filteredRows.length}
+            pageSize={pageSize}
+            pageSizeOptions={PAGE_SIZE_OPTIONS}
+            onPageChange={setPage}
+            onPageSizeChange={(s) => {
+              setPageSize(s);
+              setPage(1);
+            }}
+            className="mt-3"
+          />
         )}
       </section>
     </div>

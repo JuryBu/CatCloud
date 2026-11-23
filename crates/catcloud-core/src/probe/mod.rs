@@ -19,11 +19,13 @@ pub use external::{
     parse_command_tokens, parse_external_probe_output, run_external_probe,
 };
 pub use isolated_runner::{
-    DEFAULT_PROBE_NAMESERVERS, DEFAULT_READY_TIMEOUT, ISOLATED_BIND_HOST, ISOLATED_CORE_GOGC,
-    ISOLATED_CORE_GOMEMLIMIT, IsolatedProbeCore, IsolatedProxyScheme, NodeProbeBinding,
-    allocate_ephemeral_ports, build_direct_no_proxy_client, build_isolated_http_client,
+    CMP_ACCEL_PROXY_NAME, CMP_DIRECT_PROXY_NAME, CMP_RELAY_PROXY_NAME, DEFAULT_PROBE_NAMESERVERS,
+    DEFAULT_READY_TIMEOUT, ISOLATED_BIND_HOST, ISOLATED_CORE_GOGC, ISOLATED_CORE_GOMEMLIMIT,
+    IsolatedProbeCore, IsolatedProxyScheme, NodeProbeBinding, allocate_ephemeral_ports,
+    build_direct_no_proxy_client, build_isolated_http_client,
     build_isolated_http_client_with_options, build_isolated_probe_yaml,
-    generate_controller_secret, isolated_proxy_url, resolve_unique_proxy_names,
+    generate_controller_secret, generate_preaccel_comparison_yaml, isolated_proxy_url,
+    resolve_unique_proxy_names,
 };
 pub use registry::{
     DEFAULT_DOWNLOAD_PAYLOAD_BYTES, DEFAULT_UPLOAD_PAYLOAD_BYTES, FunnelTier, MAX_PAYLOAD_BYTES,

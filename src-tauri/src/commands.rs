@@ -39,7 +39,9 @@ use catcloud_core::preaccel::campus::{
     CampusBypassTracker, CampusPortalState, probe_campus_portal_with_fallback,
 };
 use catcloud_core::probe::{
-    FunnelOptions, FunnelTier, IsolatedProbeCore, ProbeRegistry, run_funnel_for_node,
+    DEFAULT_READY_TIMEOUT, FunnelOptions, FunnelTier, IsolatedProbeCore, ProbeRegistry,
+    ThroughputProbeConfig, build_isolated_http_client, run_download_probe_with_config,
+    run_funnel_for_node, run_latency_probe, run_upload_probe_with_config,
 };
 use catcloud_core::process_guard::JobGuard;
 use catcloud_core::storage::Storage;
@@ -1031,15 +1033,138 @@ fn sync_autostart_if_changed(old: &AppConfig, cfg: &AppConfig) {
     }
 }
 
+fn extract_logfmt_msg(line: &str) -> Option<String> {
+    let idx = line.find("msg=")?;
+    let rest = &line[idx + 4..];
+    if let Some(quoted) = rest.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = quoted.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if c == '"' {
+                break;
+            } else {
+                out.push(c);
+            }
+        }
+        let trimmed = out.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    } else {
+        let trimmed = rest.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn strip_config_file_test_failed_prefix(msg: &str) -> String {
+    let lower = msg.to_ascii_lowercase();
+    if let Some(pos) = lower.rfind("test failed:") {
+        let after = msg[pos + "test failed:".len()..].trim();
+        if !after.is_empty() {
+            return after.to_string();
+        }
+    }
+    msg.trim().to_string()
+}
+
+fn extract_rule_snippet(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("rules[")?;
+    let after_rules = &text[start + "rules[".len()..];
+    let close_idx = after_rules.find(']')?;
+    let rest = after_rules[close_idx + 1..].trim_start();
+    if let Some(inner) = rest.strip_prefix('[') {
+        if let Some(end) = inner.find(']') {
+            let snippet = inner[..end].trim();
+            if !snippet.is_empty() {
+                return Some(snippet.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Condense verbose Mihomo `-t` / core stderr output into a concise, readable Chinese message
+/// suitable for UI toasts (extracting `level=error msg="..."` and stripping `time=... level=info`
+/// log prefixes as well as temporary `.tmp` absolute file paths).
+fn format_mihomo_error_for_user(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "核心配置校验未通过，请检查节点与分流规则配置".to_string();
+    }
+
+    let mut extracted_msg: Option<String> = None;
+    for line in trimmed.lines() {
+        let l = line.trim();
+        let lower = l.to_ascii_lowercase();
+        if lower.contains("level=error") || lower.contains("level=fatal") {
+            if let Some(msg) = extract_logfmt_msg(l) {
+                extracted_msg = Some(msg);
+            }
+        }
+    }
+
+    let core_detail = if let Some(msg) = extracted_msg {
+        msg
+    } else if let Some(idx) = trimmed.to_ascii_lowercase().rfind("test failed:") {
+        trimmed[idx + "test failed:".len()..].trim().to_string()
+    } else if let Some((_, after)) = trimmed.split_once("Mihomo `-t` pre-flight check failed:") {
+        let after_trimmed = after.trim();
+        after_trimmed
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.to_ascii_lowercase().contains("level=info"))
+            .map(|l| extract_logfmt_msg(l).unwrap_or_else(|| l.to_string()))
+            .unwrap_or_else(|| after_trimmed.to_string())
+    } else if trimmed.to_ascii_lowercase().contains("`mihomo -t` verification timed out") {
+        return "代理核心配置校验超时，请稍后重试".to_string();
+    } else {
+        return trimmed.to_string();
+    };
+
+    let cleaned = strip_config_file_test_failed_prefix(&core_detail);
+    let lower = cleaned.to_ascii_lowercase();
+
+    if lower.contains("rules[") && lower.contains("format invalid") {
+        if let Some(rule_snippet) = extract_rule_snippet(&cleaned) {
+            return format!("分流规则格式无效（{rule_snippet}），请检查多选组或自定义规则后重试");
+        }
+        return "分流规则格式无效，请检查多选组或自定义规则后重试".to_string();
+    }
+    if lower.contains("rules[") && lower.contains("not found") {
+        return format!("分流规则引用了不存在的策略组：{cleaned}");
+    }
+    if lower.contains("proxy") && lower.contains("not found") {
+        return format!("配置引用了不存在的代理节点或分组：{cleaned}");
+    }
+    if lower.contains("address already in use") || lower.contains("bind:") {
+        return format!("本地代理端口已被占用，请在设置中更换端口或开启端口自动避让（{cleaned}）");
+    }
+    if lower.contains("timed out") {
+        return "代理核心配置校验超时，请稍后重试".to_string();
+    }
+    if cleaned.is_empty() {
+        return "代理核心配置校验未通过，请检查节点与分流规则".to_string();
+    }
+    format!("代理核心配置校验未通过：{cleaned}")
+}
+
 /// Start the managed Mihomo core subprocess (if not running) and attach background telemetry streams.
 pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<CoreRuntimeInfoDto, String> {
     let cfg = state.snapshot_config();
     let extra_candidates = state.extra_binary_candidates();
     let resolution = resolve_mihomo_binary(&cfg, &state.paths, &extra_candidates, false)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("查找代理核心失败：{e}"))?;
     let binary_path = resolution.path.ok_or_else(|| {
-        "mihomo core binary not found; please place mihomo in bin/ or configure custom_binary_path"
-            .to_string()
+        "未找到 Mihomo 代理核心文件，请将内核放入 bin 目录或在设置中指定内核路径".to_string()
     })?;
 
     let (nodes, groups, relays) = {
@@ -1070,7 +1195,7 @@ pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<Co
         cfg.dns_listen_port,
         cfg.port_guard_auto_shift,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| format!("分配本地代理端口失败：{e}"))?;
 
     let secret = cfg
         .controller_secret
@@ -1092,7 +1217,8 @@ pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<Co
         extra_fake_ip_filters: &extra_filters,
         group_filtered_members: &empty_filter,
     };
-    let compiled = compile_mihomo_config(&input).map_err(|e| e.to_string())?;
+    let compiled = compile_mihomo_config(&input)
+        .map_err(|e| format_mihomo_error_for_user(&format!("生成代理配置失败：{e}")))?;
     if !compiled.validation.ok {
         let summary = compiled
             .validation
@@ -1100,8 +1226,8 @@ pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<Co
             .iter()
             .map(|i| i.message.as_str())
             .collect::<Vec<_>>()
-            .join("; ");
-        return Err(format!("compiled config failed static validation: {summary}"));
+            .join("；");
+        return Err(format!("代理配置静态预检未通过：{summary}"));
     }
 
     let runtime_yaml = state.hot_reload.runtime_yaml_path();
@@ -1114,7 +1240,7 @@ pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<Co
         .await
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp_yaml);
-            e.to_string()
+            format_mihomo_error_for_user(&e.to_string())
         })?;
     std::fs::rename(&tmp_yaml, &runtime_yaml).map_err(|e| e.to_string())?;
 
@@ -1144,7 +1270,7 @@ pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<Co
         .adapter
         .start(start_req)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format_mihomo_error_for_user(&format!("启动代理核心失败：{e}")))?;
 
     state
         .hot_reload
@@ -1281,9 +1407,10 @@ pub async fn apply_system_proxy_internal(
         let outcome = trigger_reload_if_running(app, state, true).await;
         if let Some(o) = outcome {
             if o.rejected {
-                return Err(o
+                let raw_err = o
                     .error
-                    .unwrap_or_else(|| "disk config pre-flight reload rejected".to_string()));
+                    .unwrap_or_else(|| "配置预检未通过，已保持原配置运行".to_string());
+                return Err(format_mihomo_error_for_user(&raw_err));
             }
         }
     }
@@ -1452,6 +1579,8 @@ pub async fn select_group_node_internal(
                 if outcome.rejected {
                     let detail = outcome
                         .error
+                        .as_deref()
+                        .map(format_mihomo_error_for_user)
                         .unwrap_or_else(|| "未知原因".to_string());
                     return Err(format!(
                         "已将节点「{}」加入分组「{}」，但重载核心配置失败：{detail}",
@@ -1774,11 +1903,16 @@ pub async fn reload_core_config(
     if let Ok(mut guard) = state.config.write() {
         *guard = disk_cfg.clone();
     }
-    if let Some(outcome) = trigger_reload_if_running(&app, &state, force).await {
+    if let Some(mut outcome) = trigger_reload_if_running(&app, &state, force).await {
+        if outcome.rejected {
+            if let Some(err) = outcome.error.take() {
+                outcome.error = Some(format_mihomo_error_for_user(&err));
+            }
+        }
         return Ok(outcome);
     }
     // Core is stopped: still validate & compile candidate YAML so agents get real pre-flight feedback.
-    let outcome = state
+    let mut outcome = state
         .hot_reload
         .apply_disk_reload(DiskReloadOptions {
             force,
@@ -1787,6 +1921,11 @@ pub async fn reload_core_config(
             ..DiskReloadOptions::default()
         })
         .await;
+    if outcome.rejected {
+        if let Some(err) = outcome.error.take() {
+            outcome.error = Some(format_mihomo_error_for_user(&err));
+        }
+    }
     sync_app_side_effects(&app, &state, &disk_cfg);
     Ok(outcome)
 }
@@ -3131,6 +3270,395 @@ pub async fn test_preaccel_relays(
     Ok(serde_json::Value::Array(results))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PreAccelSideSpeedDto {
+    ok: bool,
+    latency_ms: Option<f64>,
+    up_mbps: Option<f64>,
+    down_mbps: Option<f64>,
+    error: Option<String>,
+}
+
+fn is_info_placeholder_node(node: &ProxyNode) -> bool {
+    const HINTS: &[&str] = &[
+        "剩余流量",
+        "剩餘流量",
+        "过期时间",
+        "過期時間",
+        "到期",
+        "套餐",
+        "官网",
+        "官網",
+        "重置",
+        "距离下次",
+        "更新订阅",
+    ];
+    HINTS.iter().any(|h| node.name.contains(h))
+}
+
+fn select_comparison_overseas_node(
+    groups: &[MultiGroup],
+    nodes: &[ProxyNode],
+    active_group_id: Option<&str>,
+    requested_node_id: Option<&str>,
+) -> Result<ProxyNode, String> {
+    if let Some(nid) = requested_node_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let node = nodes
+            .iter()
+            .find(|n| n.id == nid)
+            .cloned()
+            .ok_or_else(|| "未找到指定的海外节点，请刷新节点列表后重试".to_string())?;
+        if node.is_udp_only_transport() {
+            return Err(
+                "所选海外节点为纯 UDP 协议（Hysteria2/TUIC/WireGuard），暂不支持走国内 TCP 中转对比，请改选 VLESS/Trojan/SS/VMess 节点"
+                    .to_string(),
+            );
+        }
+        return Ok(node);
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ordered: Vec<&ProxyNode> = Vec::with_capacity(nodes.len());
+
+    let primary_group = active_group_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|gid| groups.iter().find(|g| g.id == gid))
+        .or_else(|| groups.first());
+
+    if let Some(group) = primary_group {
+        if let Some(ref aid) = group.active_node_id {
+            if let Some(n) = nodes.iter().find(|n| &n.id == aid) {
+                if seen.insert(n.id.as_str()) {
+                    ordered.push(n);
+                }
+            }
+        }
+        for mid in &group.member_node_ids {
+            if let Some(n) = nodes.iter().find(|n| &n.id == mid) {
+                if seen.insert(n.id.as_str()) {
+                    ordered.push(n);
+                }
+            }
+        }
+    }
+    for n in nodes {
+        if seen.insert(n.id.as_str()) {
+            ordered.push(n);
+        }
+    }
+
+    let tcp_enabled: Vec<&ProxyNode> = ordered
+        .into_iter()
+        .filter(|n| n.enabled && !n.is_udp_only_transport())
+        .collect();
+
+    if let Some(n) = tcp_enabled
+        .iter()
+        .find(|n| !n.is_443_native && !is_info_placeholder_node(n))
+    {
+        return Ok((*n).clone());
+    }
+    if let Some(n) = tcp_enabled.iter().find(|n| !n.is_443_native) {
+        return Ok((*n).clone());
+    }
+    if let Some(n) = tcp_enabled.iter().find(|n| !is_info_placeholder_node(n)) {
+        return Ok((*n).clone());
+    }
+    if let Some(n) = tcp_enabled.first() {
+        return Ok((*n).clone());
+    }
+
+    Err("暂无可用于对比测速的海外节点（请先导入至少 1 个已启用的非纯 UDP 海外节点）".to_string())
+}
+
+fn calc_boost_ratio(accel: Option<f64>, direct: Option<f64>) -> Option<f64> {
+    let a = accel?;
+    let d = direct?;
+    if !a.is_finite() || !d.is_finite() || a <= 0.0 || d <= 0.01 {
+        return None;
+    }
+    Some(((a / d) * 100.0).round() / 100.0)
+}
+
+async fn run_preaccel_comparison_side(
+    proxy_port: u16,
+    node_id: &str,
+    label: &str,
+) -> PreAccelSideSpeedDto {
+    let side_fut = async {
+        let client = match build_isolated_http_client(proxy_port, Duration::from_secs(6)) {
+            Ok(c) => c,
+            Err(e) => {
+                return PreAccelSideSpeedDto {
+                    ok: false,
+                    latency_ms: None,
+                    up_mbps: None,
+                    down_mbps: None,
+                    error: Some(format!("{label}初始化测速通道失败：{e}")),
+                };
+            }
+        };
+
+        let latency_def = ProbeDefinition {
+            id: "preaccel_cmp_latency".to_string(),
+            name: "Comparison Latency".to_string(),
+            kind: catcloud_core::models::ProbeKind::Latency,
+            target_url: "https://cp.cloudflare.com/generate_204".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(204),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 2500,
+            builtin: false,
+        };
+        let lat_rec = match tokio::time::timeout(
+            Duration::from_secs(4),
+            run_latency_probe(&client, node_id, &latency_def, 2),
+        )
+        .await
+        {
+            Ok(rec) => rec,
+            Err(_) => {
+                return PreAccelSideSpeedDto {
+                    ok: false,
+                    latency_ms: None,
+                    up_mbps: None,
+                    down_mbps: None,
+                    error: Some(format!("{label}延迟探测超时")),
+                };
+            }
+        };
+        if !lat_rec.ok {
+            return PreAccelSideSpeedDto {
+                ok: false,
+                latency_ms: lat_rec.latency_ms,
+                up_mbps: None,
+                down_mbps: None,
+                error: Some(format!("{label}连通测试失败，请检查中转或海外节点是否可用")),
+            };
+        }
+
+        let tp_cfg = ThroughputProbeConfig {
+            fuse_bytes: 512 * 1024,
+            fuse_min_mbps: 0.2,
+            max_payload_bytes: 2 * 1024 * 1024,
+        };
+
+        let upload_def = ProbeDefinition {
+            id: "preaccel_cmp_upload".to_string(),
+            name: "Comparison Upload".to_string(),
+            kind: catcloud_core::models::ProbeKind::Upload,
+            target_url: "https://speed.cloudflare.com/__up".to_string(),
+            method: "POST".to_string(),
+            expected_status: Some(200),
+            body_regex: None,
+            payload_bytes: Some(2 * 1024 * 1024),
+            timeout_ms: 4000,
+            builtin: false,
+        };
+        let up_mbps = match tokio::time::timeout(
+            Duration::from_millis(9000),
+            run_upload_probe_with_config(&client, node_id, &upload_def, &tp_cfg),
+        )
+        .await
+        {
+            Ok(rec) => {
+                if rec.ok {
+                    rec.up_mbps
+                } else {
+                    rec.up_mbps.filter(|&v| v > 0.0)
+                }
+            }
+            Err(_) => None,
+        };
+
+        let download_def = ProbeDefinition {
+            id: "preaccel_cmp_download".to_string(),
+            name: "Comparison Download".to_string(),
+            kind: catcloud_core::models::ProbeKind::Download,
+            target_url: "https://speed.cloudflare.com/__down?bytes=2097152".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(200),
+            body_regex: None,
+            payload_bytes: Some(2 * 1024 * 1024),
+            timeout_ms: 3500,
+            builtin: false,
+        };
+        let down_mbps = match tokio::time::timeout(
+            Duration::from_secs(8),
+            run_download_probe_with_config(&client, node_id, &download_def, &tp_cfg),
+        )
+        .await
+        {
+            Ok(rec) => {
+                if rec.ok {
+                    rec.down_mbps
+                } else {
+                    rec.down_mbps.filter(|&v| v > 0.0)
+                }
+            }
+            Err(_) => None,
+        };
+
+        let ok = up_mbps.is_some() || down_mbps.is_some();
+        let error = if ok {
+            None
+        } else {
+            Some(format!("{label}上下行测速均超时，线路可能限速较严"))
+        };
+
+        PreAccelSideSpeedDto {
+            ok,
+            latency_ms: lat_rec.latency_ms,
+            up_mbps,
+            down_mbps,
+            error,
+        }
+    };
+
+    match tokio::time::timeout(Duration::from_secs(20), side_fut).await {
+        Ok(res) => res,
+        Err(_) => PreAccelSideSpeedDto {
+            ok: false,
+            latency_ms: None,
+            up_mbps: None,
+            down_mbps: None,
+            error: Some(format!("{label}测速超过 20 秒已自动中止")),
+        },
+    }
+}
+
+#[tauri::command]
+pub async fn benchmark_preaccel_comparison(
+    state: State<'_, AppState>,
+    relay_id: Option<String>,
+    node_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    if state
+        .probe_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("当前已有测速任务正在进行，请等待完成或先暂停后再开始对比测速".to_string());
+    }
+    let _running_guard = ProbeRunningGuard {
+        running: Arc::clone(&state.probe_running),
+        cancel_tx: Arc::clone(&state.probe_cancel_tx),
+    };
+
+    let cfg = state.snapshot_config();
+    let extra_candidates = state.extra_binary_candidates();
+    let resolution = resolve_mihomo_binary(&cfg, &state.paths, &extra_candidates, false)
+        .map_err(|e| format!("查找代理核心失败：{e}"))?;
+    let Some(mihomo_bin) = resolution.path else {
+        return Err("未找到 Mihomo 核心文件，无法执行国内提速对比测速".to_string());
+    };
+
+    let (relay, target_node) = {
+        let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let relay = if let Some(rid) = relay_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        {
+            db.get_preaccel_relay(rid)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "未找到指定的国内中转节点，请刷新页面后重试".to_string())?
+        } else {
+            let enabled_relays = db.list_preaccel_relays(true).map_err(|e| e.to_string())?;
+            if enabled_relays.is_empty() {
+                return Err(
+                    "暂无已启用的国内中转节点，请先添加并启用至少 1 个国内中转".to_string(),
+                );
+            }
+            cfg.preaccel
+                .active_relay_id
+                .as_deref()
+                .and_then(|aid| enabled_relays.iter().find(|r| r.id == aid).cloned())
+                .unwrap_or_else(|| enabled_relays[0].clone())
+        };
+
+        if relay.server.trim().is_empty() || relay.port == 0 {
+            return Err("所选国内中转缺少有效的服务器地址或端口".to_string());
+        }
+
+        let groups = db.list_multi_groups().map_err(|e| e.to_string())?;
+        let nodes = db.list_nodes().map_err(|e| e.to_string())?;
+        let target_node = select_comparison_overseas_node(
+            &groups,
+            &nodes,
+            cfg.active_group_id.as_deref(),
+            node_id.as_deref(),
+        )?;
+        (relay, target_node)
+    };
+
+    // Best-effort direct TCP handshake latency to the domestic relay itself.
+    let relay_tcp_ms = {
+        let host = relay.server.trim();
+        let addr = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]:{}", relay.port)
+        } else {
+            format!("{host}:{}", relay.port)
+        };
+        let started = Instant::now();
+        match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
+            Ok(Ok(_)) => Some((started.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0),
+            _ => None,
+        }
+    };
+
+    let temp_root = state.paths.runtime_dir.join("probe_sandbox");
+    std::fs::create_dir_all(&temp_root).map_err(|e| format!("创建隔离测速目录失败：{e}"))?;
+
+    let (probe_core, accel_port, direct_port) = IsolatedProbeCore::spawn_for_preaccel_comparison(
+        &mihomo_bin,
+        &temp_root,
+        &state.job_guard,
+        &relay,
+        &target_node,
+        &cfg.dns.proxy_server_nameserver,
+        DEFAULT_READY_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format_mihomo_error_for_user(&format!("启动隔离对比测速核心失败：{e}")))?;
+
+    // Run sequentially so accelerated and direct sides do not compete for local uplink bandwidth.
+    let accelerated =
+        run_preaccel_comparison_side(accel_port, &target_node.id, "国内提速通道").await;
+    let direct = run_preaccel_comparison_side(direct_port, &target_node.id, "普通直连通道").await;
+
+    let _ = probe_core.shutdown().await;
+
+    let recorded_relay_ms = relay_tcp_ms
+        .or(accelerated.latency_ms)
+        .or(relay.last_probe_ms);
+    let recorded_up_mbps = accelerated.up_mbps.or(relay.last_mbps);
+    if recorded_relay_ms.is_some() || recorded_up_mbps.is_some() {
+        if let Ok(db) = state.storage.lock() {
+            let _ = db.update_preaccel_probe_metrics(
+                &relay.id,
+                recorded_relay_ms,
+                recorded_up_mbps,
+            );
+        }
+    }
+
+    let up_boost_ratio = calc_boost_ratio(accelerated.up_mbps, direct.up_mbps);
+    let down_boost_ratio = calc_boost_ratio(accelerated.down_mbps, direct.down_mbps);
+
+    Ok(serde_json::json!({
+        "ok": accelerated.ok || direct.ok,
+        "relay_id": relay.id,
+        "relay_name": relay.name,
+        "node_id": target_node.id,
+        "node_name": target_node.name,
+        "accelerated": accelerated,
+        "direct": direct,
+        "up_boost_ratio": up_boost_ratio,
+        "down_boost_ratio": down_boost_ratio,
+        "tested_at": Utc::now().to_rfc3339()
+    }))
+}
+
 #[tauri::command]
 pub async fn check_campus_portal(
     app: AppHandle,
@@ -4127,5 +4655,78 @@ mod tests {
             parse_controller_endpoint_and_secret("http://127.0.0.1:9090/"),
             ("http://127.0.0.1:9090/proxies".to_string(), None)
         );
+    }
+
+    #[test]
+    fn mihomo_error_formatter_extracts_clean_chinese_message() {
+        let verbose = concat!(
+            "Mihomo `-t` pre-flight check failed: ",
+            "time=\"2026-11-23T09:10:12+08:00\" level=info msg=\"Start initial configuration in progress\"\n",
+            "time=\"2026-11-23T09:10:12+08:00\" level=error msg=\"configuration file ",
+            "C:\\\\Users\\\\Stardust\\\\runtime.yaml.tmp test failed: rules[18] [DOMAIN-SUFFIX] error: format invalid\""
+        );
+        let formatted = format_mihomo_error_for_user(verbose);
+        assert!(formatted.contains("分流规则格式无效（DOMAIN-SUFFIX）"));
+        assert!(!formatted.contains("level=info"));
+        assert!(!formatted.contains("runtime.yaml.tmp"));
+        assert!(!formatted.contains("time="));
+
+        let missing_proxy = "time=\"2026-11-23T09:10:12+08:00\" level=error msg=\"configuration file C:\\\\tmp\\\\runtime-candidate.yaml test failed: proxy group Ghost not found\"";
+        let formatted2 = format_mihomo_error_for_user(missing_proxy);
+        assert!(formatted2.contains("不存在的代理节点或分组"));
+        assert!(!formatted2.contains("runtime-candidate.yaml"));
+    }
+
+    #[test]
+    fn select_comparison_overseas_node_prefers_non443_tcp_and_skips_udp_only() {
+        let udp_node = ProxyNode {
+            id: "n-hy2".to_string(),
+            name: "🇯🇵 HY2".to_string(),
+            protocol: "hysteria2".to_string(),
+            port: 8443,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let native_443 = ProxyNode {
+            id: "n-443".to_string(),
+            name: "🇸🇬 Trojan 443".to_string(),
+            protocol: "trojan".to_string(),
+            port: 443,
+            is_443_native: true,
+            enabled: true,
+            ..Default::default()
+        };
+        let high_port_tcp = ProxyNode {
+            id: "n-8443".to_string(),
+            name: "🇯🇵 VLESS 8443".to_string(),
+            protocol: "vless".to_string(),
+            port: 8443,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+
+        let chosen = select_comparison_overseas_node(
+            &[],
+            &[udp_node.clone(), native_443.clone(), high_port_tcp.clone()],
+            None,
+            None,
+        )
+        .expect("should pick non-443 TCP node");
+        assert_eq!(chosen.id, "n-8443");
+
+        // Fallback to 443 TCP node when no non-443 TCP node exists
+        let fallback = select_comparison_overseas_node(
+            &[],
+            &[udp_node.clone(), native_443.clone()],
+            None,
+            None,
+        )
+        .expect("should fallback to 443 TCP node");
+        assert_eq!(fallback.id, "n-443");
+
+        // Reject UDP-only when explicitly requested
+        assert!(select_comparison_overseas_node(&[], &[udp_node], None, Some("n-hy2")).is_err());
     }
 }

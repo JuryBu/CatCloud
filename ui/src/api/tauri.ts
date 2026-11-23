@@ -456,6 +456,27 @@ export interface PreAccelTestResult {
   error: string | null;
 }
 
+export interface PreAccelSideSpeed {
+  ok: boolean;
+  latency_ms: number | null;
+  up_mbps: number | null;
+  down_mbps: number | null;
+  error: string | null;
+}
+
+export interface PreAccelComparisonResult {
+  ok: boolean;
+  relay_id: string;
+  relay_name: string;
+  node_id: string;
+  node_name: string;
+  accelerated: PreAccelSideSpeed;
+  direct: PreAccelSideSpeed;
+  up_boost_ratio: number | null;
+  down_boost_ratio: number | null;
+  tested_at: string;
+}
+
 export interface CampusPortalStatus {
   captive_portal_required: boolean;
   status_code: number | null;
@@ -1905,6 +1926,51 @@ export const catcloudApi = {
       latency_ms: r.last_probe_ms ?? 22,
       error: null,
     }));
+  },
+
+  async benchmarkPreAccelComparison(
+    relayId?: string | null,
+    nodeId?: string | null
+  ): Promise<PreAccelComparisonResult> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<PreAccelComparisonResult>("benchmark_preaccel_comparison", {
+        relayId: relayId ?? null,
+        nodeId: nodeId ?? null,
+      });
+    }
+    const chosenRelay =
+      (relayId ? mockRelays.find((r) => r.id === relayId) : null) ??
+      mockRelays.find((r) => r.enabled) ??
+      mockRelays[0];
+    const chosenNode =
+      (nodeId ? mockNodes.find((n) => n.id === nodeId) : null) ??
+      mockNodes.find((n) => n.enabled && !n.is_443_native) ??
+      mockNodes.find((n) => n.enabled) ??
+      mockNodes[0];
+    return {
+      ok: true,
+      relay_id: chosenRelay?.id ?? "relay-cn-east",
+      relay_name: chosenRelay?.name ?? "CN-East-443 Primary",
+      node_id: chosenNode?.id ?? "node-sg-02",
+      node_name: chosenNode?.name ?? "SG-Edge-02 · 1x",
+      accelerated: {
+        ok: true,
+        latency_ms: 48,
+        up_mbps: 28.4,
+        down_mbps: 146.2,
+        error: null,
+      },
+      direct: {
+        ok: true,
+        latency_ms: 82,
+        up_mbps: 3.1,
+        down_mbps: 64.8,
+        error: null,
+      },
+      up_boost_ratio: 9.2,
+      down_boost_ratio: 2.3,
+      tested_at: new Date().toISOString(),
+    };
   },
 
   async checkCampusPortal(): Promise<CampusPortalStatus> {

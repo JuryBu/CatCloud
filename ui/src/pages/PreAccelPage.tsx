@@ -27,6 +27,7 @@ import {
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   type AppConfig,
+  type PreAccelComparisonResult,
   type PreAccelRelay,
   catcloudApi,
   formatErrorMessage,
@@ -407,17 +408,6 @@ function formatClockStamp(isoOrNow?: string): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
-interface BenchmarkMetrics {
-  port443UpMbps: number | null;
-  port443DownMbps: number | null;
-  port443RetransPct: number | null;
-  non443UpMbps: number | null;
-  non443DownMbps: number | null;
-  non443RetransPct: number | null;
-  testedAt: string;
-  isPreviewDemo?: boolean;
-}
-
 const INPUT_CLS =
   "w-full rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-xs text-[var(--text)] outline-none transition-colors focus:border-[var(--accent)]";
 
@@ -426,7 +416,6 @@ export function PreAccelPage() {
   const runtime = useAppSelector((s) => s.runtime);
   const storeRelays = useAppSelector((s) => s.preAccelRelays);
   const nodes = useAppSelector((s) => s.nodes);
-  const probes = useAppSelector((s) => s.probes);
   const initialized = useAppSelector((s) => s.initialized);
   const inTauri = isTauriEnv();
 
@@ -470,30 +459,12 @@ export function PreAccelPage() {
   const [showGuideModal, setShowGuideModal] = useState(false);
   const [copiedGuide, setCopiedGuide] = useState(false);
 
-  // Speed Comparison Card
+  // Real Pre-Accel vs Direct Speed Comparison Card
   const [benchmarking, setBenchmarking] = useState(false);
-  const [benchmark, setBenchmark] = useState<BenchmarkMetrics>(() =>
-    inTauri
-      ? {
-          port443UpMbps: null,
-          port443DownMbps: null,
-          port443RetransPct: null,
-          non443UpMbps: null,
-          non443DownMbps: null,
-          non443RetransPct: null,
-          testedAt: "尚未测速",
-        }
-      : {
-          port443UpMbps: 184.6,
-          port443DownMbps: 242.0,
-          port443RetransPct: 0.2,
-          non443UpMbps: 3.1,
-          non443DownMbps: 46.8,
-          non443RetransPct: 4.8,
-          testedAt: "演示数据",
-          isPreviewDemo: true,
-        }
-  );
+  const [selectedCompareNodeId, setSelectedCompareNodeId] = useState<string>("");
+  const [comparison, setComparison] = useState<PreAccelComparisonResult | null>(null);
+  const [comparisonError, setComparisonError] = useState<string | null>(null);
+  const [comparisonIsDemo, setComparisonIsDemo] = useState(false);
 
   // Campus Network Auth Check Card
   const [checkingPortal, setCheckingPortal] = useState(false);
@@ -630,6 +601,41 @@ export function PreAccelPage() {
     }
     return sortedRelays.find((r) => r.enabled)?.id ?? null;
   }, [sortedRelays, runtime.preaccel_relay_name]);
+
+  const benchmarkableNodes = useMemo(() => {
+    const isUdpOnlyProto = (proto: string) => {
+      const p = proto.trim().toLowerCase();
+      return p === "hysteria2" || p === "hy2" || p === "hysteria" || p === "tuic" || p === "wireguard";
+    };
+    const isInfoPlaceholder = (name: string) =>
+      /剩余流量|过期时间|到期时间|重置|套餐|官网|发布页|续费地址|使用前|更新订阅/i.test(name);
+    const enabledList = nodes.filter(
+      (n) => n.enabled && !isUdpOnlyProto(n.protocol) && !isInfoPlaceholder(n.name)
+    );
+    const base =
+      enabledList.length > 0
+        ? enabledList
+        : nodes.filter((n) => !isUdpOnlyProto(n.protocol) && !isInfoPlaceholder(n.name));
+    return [...base].sort((a, b) => {
+      const aNon443 = a.is_443_native ? 0 : 1;
+      const bNon443 = b.is_443_native ? 0 : 1;
+      if (aNon443 !== bNon443) return bNon443 - aNon443;
+      const aActive = a.id === runtime.active_node_id ? 1 : 0;
+      const bActive = b.id === runtime.active_node_id ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      return a.name.localeCompare(b.name);
+    });
+  }, [nodes, runtime.active_node_id]);
+
+  const resolvedCompareNodeId = useMemo(() => {
+    if (
+      selectedCompareNodeId &&
+      benchmarkableNodes.some((n) => n.id === selectedCompareNodeId)
+    ) {
+      return selectedCompareNodeId;
+    }
+    return "";
+  }, [benchmarkableNodes, selectedCompareNodeId]);
 
   const openAddModal = (tab: AddModalTab = "manual") => {
     setAddModalTab(tab);
@@ -1093,94 +1099,97 @@ export function PreAccelPage() {
 
   const handleRunBenchmark = async () => {
     if (benchmarking) return;
-    setBenchmarking(true);
-    if (!inTauri) {
-      scheduleTimer(() => {
-        setBenchmark({
-          port443UpMbps: 184.6,
-          port443DownMbps: 242.0,
-          port443RetransPct: 0.2,
-          non443UpMbps: 3.1,
-          non443DownMbps: 46.8,
-          non443RetransPct: 4.8,
-          testedAt: `${formatClockStamp()}（演示）`,
-          isPreviewDemo: true,
-        });
-        setBenchmarking(false);
-        appActions.showToast("演示模式：已完成中转连通与延迟检测", "info");
-      }, 420);
+    if (inTauri && enabledRelayCount === 0) {
+      appActions.showToast("请先添加并启用至少一条国内中转线路，再进行提速对比", "warn");
+      return;
+    }
+    if (inTauri && benchmarkableNodes.length === 0) {
+      appActions.showToast("还没有可对比的海外节点，请先在「节点与订阅」中导入节点", "warn");
       return;
     }
 
+    setBenchmarking(true);
+    setComparisonError(null);
+
     try {
-      const results = await catcloudApi.testPreAccelRelays(null);
-      const [latestRelays, latestProbes] = await Promise.all([
-        catcloudApi.listPreAccelRelays(),
-        catcloudApi.listProbeSnapshots(),
-      ]);
-      setRelays(latestRelays);
-      appActions.syncPreAccelRelays(latestRelays);
-      appActions.syncProbes(latestProbes);
-
-      const node443Ups: number[] = [];
-      const node443Downs: number[] = [];
-      const nodeNon443Ups: number[] = [];
-      const nodeNon443Downs: number[] = [];
-
-      for (const node of nodes) {
-        const snap = latestProbes[node.id] ?? probes[node.id];
-        if (!snap) continue;
-        if (node.is_443_native) {
-          if (snap.up_mbps !== null) node443Ups.push(snap.up_mbps);
-          if (snap.down_mbps !== null) node443Downs.push(snap.down_mbps);
+      // 1) Test domestic relay connectivity first so relay cards show fresh latency
+      try {
+        const relayResults = await catcloudApi.testPreAccelRelays(null);
+        if (inTauri) {
+          const latestRelays = await catcloudApi.listPreAccelRelays();
+          setRelays(latestRelays);
+          appActions.syncPreAccelRelays(latestRelays);
         } else {
-          if (snap.up_mbps !== null) nodeNon443Ups.push(snap.up_mbps);
-          if (snap.down_mbps !== null) nodeNon443Downs.push(snap.down_mbps);
+          const resultMap = new Map(relayResults.map((r) => [r.relay_id, r]));
+          setRelays((prev) => {
+            const next = prev.map((r) => {
+              const matched = resultMap.get(r.id);
+              return matched ? { ...r, last_probe_ms: matched.latency_ms } : r;
+            });
+            appActions.syncPreAccelRelays(next);
+            return next;
+          });
+        }
+      } catch {
+        /* continue to real comparison benchmark even if relay pre-check fails */
+      }
+
+      // 2) Run real accelerated vs direct upload/download speed comparison
+      const result = await catcloudApi.benchmarkPreAccelComparison(
+        primaryRelayId ?? null,
+        resolvedCompareNodeId || null
+      );
+      setComparison(result);
+      setComparisonIsDemo(!inTauri);
+      if (inTauri) {
+        try {
+          const latestRelays = await catcloudApi.listPreAccelRelays();
+          setRelays(latestRelays);
+          appActions.syncPreAccelRelays(latestRelays);
+        } catch {
+          /* ignore secondary relay refresh failure */
         }
       }
-      const relayMbps = latestRelays
-        .map((r) => r.last_mbps)
-        .filter((v): v is number => v !== null && v > 0);
-      if (relayMbps.length > 0) {
-        node443Ups.push(...relayMbps);
-      }
 
-      const avg = (arr: number[]) =>
-        arr.length > 0
-          ? Number((arr.reduce((a, b) => a + b, 0) / arr.length).toFixed(1))
-          : null;
+      const accUp = result.accelerated.up_mbps;
+      const dirUp = result.direct.up_mbps;
+      const ratio =
+        result.up_boost_ratio ??
+        (accUp !== null && dirUp !== null && dirUp > 0 ? accUp / dirUp : null);
 
-      const up443 = avg(node443Ups);
-      const down443 = avg(node443Downs);
-      const upNon443 = avg(nodeNon443Ups);
-      const downNon443 = avg(nodeNon443Downs);
-
-      setBenchmark({
-        port443UpMbps: up443,
-        port443DownMbps: down443,
-        port443RetransPct: null,
-        non443UpMbps: upNon443,
-        non443DownMbps: downNon443,
-        non443RetransPct: null,
-        testedAt: formatClockStamp(),
-      });
-
-      const okCount = results.filter((r) => r.ok).length;
-      if (results.length === 0) {
-        appActions.showToast("还没有可检测的中转线路，请先添加国内中转", "info");
-      } else if (up443 === null && upNon443 === null) {
+      if (!inTauri) {
         appActions.showToast(
-          `中转检测完成（${okCount}/${results.length} 条可用）；上下行速度参考需先到「节点测速」测试`,
-          okCount > 0 ? "ok" : "warn"
+          ratio !== null
+            ? `演示模式：走国内中转上传提速约 ${ratio.toFixed(1)} 倍`
+            : "演示模式：已完成提速效果对比",
+          "info"
+        );
+      } else if (result.ok && result.accelerated.ok && result.direct.ok) {
+        appActions.showToast(
+          ratio !== null && ratio >= 1.1 && accUp !== null
+            ? `实测完成：走国内中转上传 ${accUp.toFixed(1)} Mbps（提速 ${ratio.toFixed(1)} 倍）`
+            : accUp !== null
+              ? `实测对比完成：走国内中转上传 ${accUp.toFixed(1)} Mbps`
+              : "提速效果实测对比完成",
+          "ok"
         );
       } else {
+        const errParts: string[] = [];
+        if (!result.accelerated.ok) {
+          errParts.push(`走中转失败（${result.accelerated.error ?? "连接超时"}）`);
+        }
+        if (!result.direct.ok) {
+          errParts.push(`普通直连失败（${result.direct.error ?? "连接超时"}）`);
+        }
         appActions.showToast(
-          `中转连通与延迟检测完成（${okCount}/${results.length} 条可用），已同步最新节点速度参考`,
-          okCount > 0 ? "ok" : "warn"
+          errParts.length > 0 ? errParts.join("；") : "本次对比测速未全部成功，请检查中转与节点状态",
+          "warn"
         );
       }
     } catch (err) {
-      appActions.showToast(`中转连通检测失败：${formatErrorMessage(err)}`, "warn");
+      const msg = formatErrorMessage(err);
+      setComparisonError(msg);
+      appActions.showToast(`提速效果对比测速失败：${msg}`, "warn");
     } finally {
       setBenchmarking(false);
     }
@@ -1235,12 +1244,49 @@ export function PreAccelPage() {
     }
   };
 
-  const speedupRatio =
-    benchmark.port443UpMbps !== null &&
-    benchmark.non443UpMbps !== null &&
-    benchmark.non443UpMbps > 0
-      ? (benchmark.port443UpMbps / benchmark.non443UpMbps).toFixed(1)
-      : "--";
+  const effectiveUpRatio = useMemo(() => {
+    if (!comparison) return null;
+    if (
+      comparison.up_boost_ratio !== null &&
+      Number.isFinite(comparison.up_boost_ratio) &&
+      comparison.up_boost_ratio > 0
+    ) {
+      return comparison.up_boost_ratio;
+    }
+    const accUp = comparison.accelerated.up_mbps;
+    const dirUp = comparison.direct.up_mbps;
+    if (accUp !== null && dirUp !== null && dirUp > 0) {
+      return accUp / dirUp;
+    }
+    return null;
+  }, [comparison]);
+
+  const effectiveDownRatio = useMemo(() => {
+    if (!comparison) return null;
+    if (
+      comparison.down_boost_ratio !== null &&
+      Number.isFinite(comparison.down_boost_ratio) &&
+      comparison.down_boost_ratio > 0
+    ) {
+      return comparison.down_boost_ratio;
+    }
+    const accDown = comparison.accelerated.down_mbps;
+    const dirDown = comparison.direct.down_mbps;
+    if (accDown !== null && dirDown !== null && dirDown > 0) {
+      return accDown / dirDown;
+    }
+    return null;
+  }, [comparison]);
+
+  const maxCompareUpMbps = useMemo(() => {
+    if (!comparison) return 100;
+    return Math.max(comparison.accelerated.up_mbps ?? 0, comparison.direct.up_mbps ?? 0, 10);
+  }, [comparison]);
+
+  const maxCompareDownMbps = useMemo(() => {
+    if (!comparison) return 100;
+    return Math.max(comparison.accelerated.down_mbps ?? 0, comparison.direct.down_mbps ?? 0, 10);
+  }, [comparison]);
 
   const manualPortNum = Number.parseInt(manualPort.trim() || "443", 10);
   const manualShowNon443Hint =
@@ -1652,34 +1698,35 @@ export function PreAccelPage() {
 
       {/* 3. 底部两张实用卡片：提速前后测速对比 + 校园网认证检测 */}
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-        {/* 中转连通检测与速度参考 */}
+        {/* 提速效果实测对比 */}
         <div className="cc-card cc-glass rounded-2xl p-5 lg:col-span-7">
-          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-            <div>
+          <div className="mb-4 flex flex-wrap items-start justify-between gap-2.5">
+            <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
-                <Gauge className="h-4 w-4 text-[var(--accent)]" />
+                <Gauge className="h-4 w-4 shrink-0 text-[var(--accent)]" />
                 <h2 className="text-sm font-semibold text-[var(--text)]">
-                  中转连通检测与速度参考
+                  提速效果实测对比
                 </h2>
               </div>
-              <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                一键检测中转线路连通性与延迟；下方上下行速度汇总自「节点测速」的已有记录
+              <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted)]">
+                选一个海外节点，现场对比「走国内中转」和「普通直连」的真实上传、下载速度
               </p>
             </div>
             <button
               type="button"
               disabled={benchmarking}
               onClick={() => void handleRunBenchmark()}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${benchmarking ? "animate-spin" : ""}`} />
-              <span>{benchmarking ? "检测中..." : "一键检测中转连通与延迟"}</span>
+              <span>{benchmarking ? "正在实测对比（约 5～10 秒）…" : "一键对比提速效果"}</span>
             </button>
           </div>
 
+          {/* 中转连通概况 + 对照海外节点选择器 */}
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[11px]">
             <span className="text-[var(--text-secondary)]">
-              当前已启用中转{" "}
+              已启用中转{" "}
               <strong className="cc-mono text-[var(--text)]">
                 {relayLatencyStats.enabledTotal}
               </strong>{" "}
@@ -1688,118 +1735,315 @@ export function PreAccelPage() {
                 {relayLatencyStats.probedCount}
               </strong>{" "}
               条
-            </span>
-            <span className="cc-mono text-[var(--muted)]">
-              {relayLatencyStats.bestMs !== null
-                ? `最快延迟 ${Math.round(relayLatencyStats.bestMs)} ms`
-                : "点击右侧按钮立即检测延迟"}
-            </span>
-          </div>
-
-          <div className="space-y-3">
-            {/* 提速通道 */}
-            <div className="rounded-xl border border-[var(--green)]/35 bg-[var(--bg-elevated)] p-3.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-[var(--text)]">
-                  开启国内提速（443 高速通道）
+              {relayLatencyStats.bestMs !== null && (
+                <span className="cc-mono text-[var(--muted)]">
+                  {" "}
+                  · 最快 {Math.round(relayLatencyStats.bestMs)} ms
                 </span>
-                <span className="cc-mono text-[11px] text-[var(--green)]">
-                  {benchmark.port443RetransPct !== null
-                    ? `丢包重传 ${benchmark.port443RetransPct}%`
-                    : "提速通道"}
-                </span>
-              </div>
-              <div className="mt-2.5 space-y-2">
-                <div>
-                  <div className="mb-1 flex justify-between text-[11px]">
-                    <span className="text-[var(--muted)]">上传速度</span>
-                    <span className="cc-mono cc-tabular font-semibold text-[var(--green)]">
-                      {benchmark.port443UpMbps !== null
-                        ? `${benchmark.port443UpMbps.toFixed(1)} Mbps`
-                        : "--"}
-                    </span>
-                  </div>
-                  <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                    <div
-                      className="h-full rounded-full bg-[var(--green)] transition-all duration-300"
-                      style={{
-                        width:
-                          benchmark.port443UpMbps !== null
-                            ? `${Math.min(100, (benchmark.port443UpMbps / 250) * 100)}%`
-                            : "0%",
-                      }}
-                    />
-                  </div>
-                </div>
-                <div className="flex justify-between text-[11px] text-[var(--muted)]">
-                  <span>下载速度</span>
-                  <span className="cc-mono text-[var(--sky)]">
-                    {benchmark.port443DownMbps !== null
-                      ? `${benchmark.port443DownMbps.toFixed(1)} Mbps`
-                      : "--"}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* 普通直连 */}
-            <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3.5">
-              <div className="flex items-center justify-between text-xs">
-                <span className="font-semibold text-[var(--text)]">普通线路直连</span>
-                <span className="cc-mono text-[11px] text-[var(--amber)]">
-                  {benchmark.non443RetransPct !== null
-                    ? `丢包重传 ${benchmark.non443RetransPct}%`
-                    : "直连基线"}
-                </span>
-              </div>
-              <div className="mt-2.5 space-y-2">
-                <div>
-                  <div className="mb-1 flex justify-between text-[11px]">
-                    <span className="text-[var(--muted)]">上传速度</span>
-                    <span className="cc-mono cc-tabular font-semibold text-[var(--amber)]">
-                      {benchmark.non443UpMbps !== null
-                        ? `${benchmark.non443UpMbps.toFixed(1)} Mbps`
-                        : "--"}
-                    </span>
-                  </div>
-                  <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                    <div
-                      className="h-full rounded-full bg-[var(--amber)] transition-all duration-300"
-                      style={{
-                        width:
-                          benchmark.non443UpMbps !== null
-                            ? `${Math.max(3, Math.min(100, (benchmark.non443UpMbps / 250) * 100))}%`
-                            : "0%",
-                      }}
-                    />
-                  </div>
-                </div>
-                <div className="flex justify-between text-[11px] text-[var(--muted)]">
-                  <span>下载速度</span>
-                  <span className="cc-mono text-[var(--text-secondary)]">
-                    {benchmark.non443DownMbps !== null
-                      ? `${benchmark.non443DownMbps.toFixed(1)} Mbps`
-                      : "--"}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[11px]">
-            <span className="text-[var(--text-secondary)]">
-              {speedupRatio !== "--" ? (
-                <>
-                  已有记录中上传速度约提升{" "}
-                  <strong className="cc-mono text-[var(--accent)]">{speedupRatio} 倍</strong>
-                  {benchmark.isPreviewDemo ? "（演示数据）" : "，建议保持开启国内提速。"}
-                </>
-              ) : (
-                "点击「一键检测中转连通与延迟」验证中转延迟；前往「节点测速」完成上下行测速后此处将自动汇总参考。"
               )}
             </span>
-            <span className="cc-mono text-[var(--muted)]">时间：{benchmark.testedAt}</span>
+
+            <div className="flex items-center gap-1.5">
+              <label
+                htmlFor="preaccel-compare-node"
+                className="shrink-0 text-[11px] text-[var(--muted)]"
+              >
+                对照节点
+              </label>
+              {benchmarkableNodes.length > 0 ? (
+                <select
+                  id="preaccel-compare-node"
+                  value={resolvedCompareNodeId}
+                  disabled={benchmarking}
+                  onChange={(e) => setSelectedCompareNodeId(e.target.value)}
+                  className="max-w-[190px] truncate rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none transition-colors focus:border-[var(--accent)] disabled:opacity-60"
+                >
+                  <option value="">自动推荐海外节点</option>
+                  {benchmarkableNodes.map((node) => (
+                    <option key={node.id} value={node.id}>
+                      {node.name}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <span className="text-[11px] text-[var(--muted)]">暂未导入海外节点</span>
+              )}
+            </div>
           </div>
+
+          {!comparison ? (
+            <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-[var(--line-strong)] bg-[var(--bg-elevated)]/65 px-5 py-9 text-center">
+              {benchmarking ? (
+                <>
+                  <RefreshCw className="h-6 w-6 animate-spin text-[var(--accent)]" />
+                  <p className="mt-3 text-xs font-semibold text-[var(--text)]">
+                    正在实测对比（约 5～10 秒）…
+                  </p>
+                  <p className="mt-1 max-w-md text-[11px] leading-relaxed text-[var(--muted)]">
+                    正在依次检测中转连通性，并对所选海外节点实测「走国内中转」与「普通直连」的上传、下载速度
+                  </p>
+                </>
+              ) : (
+                <>
+                  <span className="inline-flex h-10 w-10 items-center justify-center rounded-2xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                    <Gauge className="h-5 w-5" />
+                  </span>
+                  <p className="mt-3 text-xs font-semibold text-[var(--text)]">
+                    点击右上角按钮，立刻实测走中转能快多少
+                  </p>
+                  <p className="mt-1 max-w-md text-[11px] leading-relaxed text-[var(--muted)]">
+                    系统会用同一海外节点现场对比「开启国内提速（走国内中转）」与「普通线路直连」的真实上下行速度，平时零后台流量。
+                  </p>
+                </>
+              )}
+
+              {comparisonError && (
+                <div className="mt-3.5 flex items-center gap-1.5 rounded-xl border border-[var(--red)]/40 bg-[var(--red-soft)] px-3 py-2 text-left text-[11px] text-[var(--red)]">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                  <span>{comparisonError}</span>
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
+              {/* 本次实测对照组合 + 提速倍数徽章 */}
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--accent)]/35 bg-[var(--accent-soft)]/35 px-3.5 py-2 text-[11px]">
+                <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[var(--text-secondary)]">
+                  <span className="shrink-0 text-[var(--muted)]">本次对照：</span>
+                  <span className="truncate font-semibold text-[var(--text)]">
+                    {comparison.relay_name}
+                  </span>
+                  <span className="text-[var(--muted)]">+</span>
+                  <span className="truncate font-semibold text-[var(--text)]">
+                    {comparison.node_name}
+                  </span>
+                  {comparisonIsDemo && (
+                    <span className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                      演示数据
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {effectiveUpRatio !== null && (
+                    <span
+                      className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
+                        effectiveUpRatio >= 1.1
+                          ? "bg-[var(--green)] text-[var(--accent-ink)]"
+                          : "border border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)]"
+                      }`}
+                    >
+                      <Zap className="h-3 w-3" />
+                      <span>
+                        {effectiveUpRatio >= 1.1
+                          ? `上传提速 ${effectiveUpRatio.toFixed(1)} 倍`
+                          : `上传约 ${effectiveUpRatio.toFixed(1)} 倍`}
+                      </span>
+                    </span>
+                  )}
+                  {effectiveDownRatio !== null && effectiveDownRatio >= 1.1 && (
+                    <span className="rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--accent)]">
+                      下载 {effectiveDownRatio.toFixed(1)} 倍
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div className="space-y-3">
+                {/* 走国内中转 */}
+                <div className="rounded-xl border border-[var(--green)]/35 bg-[var(--bg-elevated)] p-3.5">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-[var(--text)]">
+                      开启国内提速（走国内中转）
+                    </span>
+                    <span
+                      className={`cc-mono text-[11px] ${
+                        comparison.accelerated.ok ? "text-[var(--green)]" : "text-[var(--red)]"
+                      }`}
+                    >
+                      {comparison.accelerated.ok
+                        ? comparison.accelerated.latency_ms !== null
+                          ? `延迟 ${Math.round(comparison.accelerated.latency_ms)} ms`
+                          : "测速成功"
+                        : "测速失败"}
+                    </span>
+                  </div>
+                  <div className="mt-2.5 space-y-2">
+                    <div>
+                      <div className="mb-1 flex justify-between text-[11px]">
+                        <span className="text-[var(--muted)]">上传速度</span>
+                        <span className="cc-mono cc-tabular font-semibold text-[var(--green)]">
+                          {comparison.accelerated.up_mbps !== null
+                            ? `${comparison.accelerated.up_mbps.toFixed(1)} Mbps`
+                            : "测速失败"}
+                        </span>
+                      </div>
+                      <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                        <div
+                          className="h-full rounded-full bg-[var(--green)] transition-all duration-300"
+                          style={{
+                            width:
+                              comparison.accelerated.up_mbps !== null &&
+                              comparison.accelerated.up_mbps > 0
+                                ? `${Math.max(
+                                    3,
+                                    Math.min(
+                                      100,
+                                      (comparison.accelerated.up_mbps / maxCompareUpMbps) * 100
+                                    )
+                                  )}%`
+                                : "0%",
+                          }}
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-1 flex justify-between text-[11px]">
+                        <span className="text-[var(--muted)]">下载速度</span>
+                        <span className="cc-mono cc-tabular font-medium text-[var(--sky)]">
+                          {comparison.accelerated.down_mbps !== null
+                            ? `${comparison.accelerated.down_mbps.toFixed(1)} Mbps`
+                            : "测速失败"}
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                        <div
+                          className="h-full rounded-full bg-[var(--sky)] transition-all duration-300"
+                          style={{
+                            width:
+                              comparison.accelerated.down_mbps !== null &&
+                              comparison.accelerated.down_mbps > 0
+                                ? `${Math.max(
+                                    3,
+                                    Math.min(
+                                      100,
+                                      (comparison.accelerated.down_mbps / maxCompareDownMbps) * 100
+                                    )
+                                  )}%`
+                                : "0%",
+                          }}
+                        />
+                      </div>
+                    </div>
+                    {!comparison.accelerated.ok && comparison.accelerated.error && (
+                      <p className="text-[11px] text-[var(--red)]">
+                        失败原因：{comparison.accelerated.error}
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                {/* 普通直连 */}
+                <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3.5">
+                  <div className="flex items-center justify-between gap-2 text-xs">
+                    <span className="font-semibold text-[var(--text)]">普通线路直连</span>
+                    <span
+                      className={`cc-mono text-[11px] ${
+                        comparison.direct.ok ? "text-[var(--amber)]" : "text-[var(--red)]"
+                      }`}
+                    >
+                      {comparison.direct.ok
+                        ? comparison.direct.latency_ms !== null
+                          ? `延迟 ${Math.round(comparison.direct.latency_ms)} ms`
+                          : "测速成功"
+                        : "测速失败"}
+                    </span>
+                  </div>
+                  <div className="mt-2.5 space-y-2">
+                    <div>
+                      <div className="mb-1 flex justify-between text-[11px]">
+                        <span className="text-[var(--muted)]">上传速度</span>
+                        <span className="cc-mono cc-tabular font-semibold text-[var(--amber)]">
+                          {comparison.direct.up_mbps !== null
+                            ? `${comparison.direct.up_mbps.toFixed(1)} Mbps`
+                            : "测速失败"}
+                        </span>
+                      </div>
+                      <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                        <div
+                          className="h-full rounded-full bg-[var(--amber)] transition-all duration-300"
+                          style={{
+                            width:
+                              comparison.direct.up_mbps !== null &&
+                              comparison.direct.up_mbps > 0
+                                ? `${Math.max(
+                                    3,
+                                    Math.min(
+                                      100,
+                                      (comparison.direct.up_mbps / maxCompareUpMbps) * 100
+                                    )
+                                  )}%`
+                                : "0%",
+                          }}
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <div className="mb-1 flex justify-between text-[11px]">
+                        <span className="text-[var(--muted)]">下载速度</span>
+                        <span className="cc-mono cc-tabular font-medium text-[var(--text-secondary)]">
+                          {comparison.direct.down_mbps !== null
+                            ? `${comparison.direct.down_mbps.toFixed(1)} Mbps`
+                            : "测速失败"}
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                        <div
+                          className="h-full rounded-full bg-[var(--text-secondary)]/65 transition-all duration-300"
+                          style={{
+                            width:
+                              comparison.direct.down_mbps !== null &&
+                              comparison.direct.down_mbps > 0
+                                ? `${Math.max(
+                                    3,
+                                    Math.min(
+                                      100,
+                                      (comparison.direct.down_mbps / maxCompareDownMbps) * 100
+                                    )
+                                  )}%`
+                                : "0%",
+                          }}
+                        />
+                      </div>
+                    </div>
+                    {!comparison.direct.ok && comparison.direct.error && (
+                      <p className="text-[11px] text-[var(--red)]">
+                        失败原因：{comparison.direct.error}
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {comparisonError && (
+                <div className="mt-3 flex items-center gap-1.5 rounded-xl border border-[var(--red)]/40 bg-[var(--red-soft)] px-3 py-2 text-[11px] text-[var(--red)]">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                  <span>上次重新测速出错：{comparisonError}</span>
+                </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[11px]">
+                <span className="text-[var(--text-secondary)]">
+                  {effectiveUpRatio !== null && effectiveUpRatio >= 1.1 ? (
+                    <>
+                      实测走国内中转上传速度提升{" "}
+                      <strong className="cc-mono text-[var(--accent)]">
+                        {effectiveUpRatio.toFixed(1)} 倍
+                      </strong>
+                      {comparisonIsDemo ? "（演示数据）" : "，建议保持开启国内提速。"}
+                    </>
+                  ) : comparison.accelerated.ok && comparison.direct.ok ? (
+                    "当前所选节点直连表现良好，可换一个普通海外节点再次对比。"
+                  ) : (
+                    "部分测速未通过，可切换其他中转或海外节点重试。"
+                  )}
+                </span>
+                <span className="cc-mono text-[var(--muted)]">
+                  实测时间：{formatClockStamp(comparison.tested_at)}
+                </span>
+              </div>
+            </>
+          )}
         </div>
 
         {/* 校园网认证检测 */}

@@ -130,6 +130,12 @@ pub fn run_with_paths(paths: AppPaths) {
     let exit_guard_ref = Arc::clone(&instance_guard_slot);
     let exit_job_ref = Arc::clone(&job_guard);
 
+    // Best-effort cleanup of any stale ephemeral probe sandboxes left by prior hard crashes.
+    let stale_sandbox_dir = paths.runtime_dir.join("probe_sandbox");
+    if stale_sandbox_dir.exists() {
+        let _ = std::fs::remove_dir_all(&stale_sandbox_dir);
+    }
+
     let has_updater_plugin_cfg = context
         .config()
         .plugins
@@ -199,6 +205,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::select_preaccel_relay,
             commands::failover_preaccel,
             commands::test_preaccel_relays,
+            commands::benchmark_preaccel_comparison,
             commands::check_campus_portal,
             commands::get_exit_ip_info,
             commands::check_quick_sites,

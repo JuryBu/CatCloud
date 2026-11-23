@@ -42,7 +42,18 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import {
+  ContinentRegionFilter,
+  PaginationBar,
+} from "../components/ContinentRegionFilter";
 import { appActions, useAppSelector } from "../store/appStore";
+import {
+  type ContinentId,
+  buildContinentRegionStats,
+  getRegionLabel,
+  nodeMatchesContinentAndRegion,
+  resolveNodeRegionCode,
+} from "../utils/regions";
 
 /* ============================================================================
  * Domain Types & Demo Presets
@@ -128,21 +139,6 @@ const SUB_KIND_LABELS: Record<SubscriptionRecord["kind"], string> = {
   file: "本地文件",
   migrated: "已有软件导入",
   process_adapter: "软件抓取",
-};
-
-const REGION_LABELS: Record<string, string> = {
-  JP: "日本",
-  SG: "新加坡",
-  US: "美国",
-  TW: "台湾",
-  HK: "香港",
-  UK: "英国",
-  DE: "德国",
-  KR: "韩国",
-  NL: "荷兰",
-  CA: "加拿大",
-  AU: "澳大利亚",
-  UNK: "其他",
 };
 
 const KNOWN_CLIENT_SPECS: Array<{
@@ -1449,8 +1445,11 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                         </div>
                       </div>
                       <div className="flex shrink-0 items-center gap-1.5 cc-mono text-[10px]">
-                        <span className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[var(--text-secondary)]">
-                          {node.region_code}
+                        <span
+                          title={getRegionLabel(resolveNodeRegionCode(node))}
+                          className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[var(--text-secondary)]"
+                        >
+                          {resolveNodeRegionCode(node)}
                         </span>
                         <span className="rounded bg-[var(--accent-soft)] px-1.5 py-0.5 text-[var(--accent)]">
                           {node.multiplier}x
@@ -2253,6 +2252,7 @@ export function NodesSubsPage() {
   // Multi-dimensional node filters & pagination
   const [keyword, setKeyword] = useState("");
   const [filterSubId, setFilterSubId] = useState<string>("all");
+  const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
   const [filterRegion, setFilterRegion] = useState<string>("all");
   const [filterMultiplier, setFilterMultiplier] =
     useState<MultiplierRange>("all");
@@ -2264,7 +2264,7 @@ export function NodesSubsPage() {
     aiUnlocked: false,
   });
   const [showMoreFilters, setShowMoreFilters] = useState(false);
-  const [pageSize, setPageSize] = useState<30 | 50 | 100>(30);
+  const [pageSize, setPageSize] = useState<number>(30);
   const [currentPage, setCurrentPage] = useState<number>(1);
 
   // Cross-subscription batch selection & target multi-group
@@ -2305,6 +2305,7 @@ export function NodesSubsPage() {
   }, [
     keyword,
     filterSubId,
+    filterContinent,
     filterRegion,
     filterMultiplier,
     filterProtocol,
@@ -2340,14 +2341,42 @@ export function NodesSubsPage() {
     return map;
   }, [groups]);
 
-  const regionStats = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const n of nodes) {
-      const code = n.region_code || "UNK";
-      counts.set(code, (counts.get(code) ?? 0) + 1);
+  const nodesForRegionStats = useMemo(
+    () =>
+      filterSubId === "all"
+        ? nodes
+        : nodes.filter((n) => n.sub_id === filterSubId),
+    [nodes, filterSubId]
+  );
+
+  const continentRegionStats = useMemo(
+    () => buildContinentRegionStats(nodesForRegionStats),
+    [nodesForRegionStats]
+  );
+
+  // Clear stale continent/region filter if switching source leaves zero nodes in that bucket
+  useEffect(() => {
+    if (nodesForRegionStats.length === 0) return;
+    if (
+      filterContinent !== "all" &&
+      continentRegionStats.continentCounts[filterContinent] === 0
+    ) {
+      setFilterContinent("all");
+      if (filterRegion !== "all") setFilterRegion("all");
+      return;
     }
-    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-  }, [nodes]);
+    if (
+      filterRegion !== "all" &&
+      !continentRegionStats.allRegions.some((r) => r.code === filterRegion)
+    ) {
+      setFilterRegion("all");
+    }
+  }, [
+    nodesForRegionStats.length,
+    continentRegionStats,
+    filterContinent,
+    filterRegion,
+  ]);
 
   const protocolStats = useMemo(() => {
     const counts = new Map<string, number>();
@@ -2367,7 +2396,7 @@ export function NodesSubsPage() {
     const kw = keyword.trim().toLowerCase();
     return nodes.filter((node) => {
       if (filterSubId !== "all" && node.sub_id !== filterSubId) return false;
-      if (filterRegion !== "all" && node.region_code !== filterRegion) {
+      if (!nodeMatchesContinentAndRegion(node, filterContinent, filterRegion)) {
         return false;
       }
       if (
@@ -2404,11 +2433,14 @@ export function NodesSubsPage() {
 
       if (kw) {
         const subName = (subNameMap.get(node.sub_id) ?? "").toLowerCase();
+        const regionCode = resolveNodeRegionCode(node);
+        const regionLabel = getRegionLabel(regionCode).toLowerCase();
         const hit =
           node.name.toLowerCase().includes(kw) ||
           node.server.toLowerCase().includes(kw) ||
           node.protocol.toLowerCase().includes(kw) ||
-          node.region_code.toLowerCase().includes(kw) ||
+          regionCode.toLowerCase().includes(kw) ||
+          regionLabel.includes(kw) ||
           subName.includes(kw) ||
           node.tags.some((t) => t.toLowerCase().includes(kw));
         if (!hit) return false;
@@ -2420,6 +2452,7 @@ export function NodesSubsPage() {
     nodes,
     keyword,
     filterSubId,
+    filterContinent,
     filterRegion,
     filterProtocol,
     filterMultiplier,
@@ -2458,6 +2491,7 @@ export function NodesSubsPage() {
   const hasActiveFilters =
     keyword.trim().length > 0 ||
     filterSubId !== "all" ||
+    filterContinent !== "all" ||
     filterRegion !== "all" ||
     advancedFilterCount > 0;
 
@@ -3100,6 +3134,7 @@ export function NodesSubsPage() {
   const resetAllFilters = () => {
     setKeyword("");
     setFilterSubId("all");
+    setFilterContinent("all");
     setFilterRegion("all");
     setFilterMultiplier("all");
     setFilterProtocol("all");
@@ -3613,67 +3648,51 @@ export function NodesSubsPage() {
 
         {/* Filter Rows */}
         <div className="space-y-2 text-[11px]">
-          {/* Row A: Subscription Source & Region */}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[var(--muted)]">来源</span>
+          {/* Row A: Subscription Source */}
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-[var(--muted)]">来源</span>
+            <button
+              type="button"
+              onClick={() => setFilterSubId("all")}
+              className={`rounded-lg border px-2 py-0.5 transition-colors ${
+                filterSubId === "all"
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+              }`}
+            >
+              全部
+            </button>
+            {subscriptions.map((sub) => (
               <button
+                key={sub.id}
                 type="button"
-                onClick={() => setFilterSubId("all")}
+                onClick={() => setFilterSubId(sub.id)}
                 className={`rounded-lg border px-2 py-0.5 transition-colors ${
-                  filterSubId === "all"
+                  filterSubId === sub.id
                     ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
                     : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
                 }`}
               >
-                全部
+                {sub.name} ({subNodeCountMap.get(sub.id) ?? 0})
               </button>
-              {subscriptions.map((sub) => (
-                <button
-                  key={sub.id}
-                  type="button"
-                  onClick={() => setFilterSubId(sub.id)}
-                  className={`rounded-lg border px-2 py-0.5 transition-colors ${
-                    filterSubId === sub.id
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  {sub.name} ({subNodeCountMap.get(sub.id) ?? 0})
-                </button>
-              ))}
-            </div>
-
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[var(--muted)]">地区</span>
-              <button
-                type="button"
-                onClick={() => setFilterRegion("all")}
-                className={`rounded-lg border px-2 py-0.5 transition-colors ${
-                  filterRegion === "all"
-                    ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                }`}
-              >
-                全部
-              </button>
-              {regionStats.map(([code, count]) => (
-                <button
-                  key={code}
-                  type="button"
-                  onClick={() => setFilterRegion(code)}
-                  className={`rounded-lg border px-2 py-0.5 cc-mono transition-colors ${
-                    filterRegion === code
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                  }`}
-                  title={REGION_LABELS[code] ?? code}
-                >
-                  {code} {REGION_LABELS[code] ? `· ${REGION_LABELS[code]}` : ""} ({count})
-                </button>
-              ))}
-            </div>
+            ))}
           </div>
+
+          {/* Row A2: Two-Tier Continent -> Country/Region Filter */}
+          <ContinentRegionFilter
+            variant="pills"
+            stats={continentRegionStats}
+            continent={filterContinent}
+            region={filterRegion}
+            onContinentChange={(c) => {
+              setFilterContinent(c);
+              setCurrentPage(1);
+            }}
+            onRegionChange={(r) => {
+              setFilterRegion(r);
+              setCurrentPage(1);
+            }}
+          />
 
           {/* Collapsible Row B: Multiplier Range, Protocol, Direct 443 & Health Checks */}
           {showMoreFilters && (
@@ -3919,51 +3938,19 @@ export function NodesSubsPage() {
        * ==================================================================== */}
       <section className="cc-card cc-glass overflow-hidden rounded-2xl">
         {filteredNodes.length > 0 && (
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 px-4 py-2 text-[11px] text-[var(--muted)]">
-            <span className="cc-mono">
-              显示第 {pageStartIndex + 1}-{Math.min(pageStartIndex + pageSize, filteredNodes.length)} 条，共 {filteredNodes.length} 个节点
-            </span>
-            <div className="flex items-center gap-2">
-              <div className="inline-flex items-center gap-1">
-                <span>每页</span>
-                {([30, 50, 100] as const).map((size) => (
-                  <button
-                    key={size}
-                    type="button"
-                    onClick={() => setPageSize(size)}
-                    className={`cc-mono rounded-md border px-1.5 py-0.5 text-[11px] transition-colors ${
-                      pageSize === size
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
-                        : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
-                    }`}
-                  >
-                    {size}
-                  </button>
-                ))}
-              </div>
-              <div className="flex items-center gap-1">
-                <button
-                  type="button"
-                  disabled={safePage <= 1}
-                  onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
-                  className="rounded-md border border-[var(--line-strong)] bg-[var(--card)] px-2 py-0.5 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
-                >
-                  上一页
-                </button>
-                <span className="cc-mono px-1 text-[var(--text-secondary)]">
-                  {safePage}/{totalPages}
-                </span>
-                <button
-                  type="button"
-                  disabled={safePage >= totalPages}
-                  onClick={() => setCurrentPage(Math.min(totalPages, safePage + 1))}
-                  className="rounded-md border border-[var(--line-strong)] bg-[var(--card)] px-2 py-0.5 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
-                >
-                  下一页
-                </button>
-              </div>
-            </div>
-          </div>
+          <PaginationBar
+            currentPage={safePage}
+            totalPages={totalPages}
+            totalItems={filteredNodes.length}
+            pageSize={pageSize}
+            pageSizeOptions={[30, 50, 100]}
+            onPageChange={setCurrentPage}
+            onPageSizeChange={(s) => {
+              setPageSize(s);
+              setCurrentPage(1);
+            }}
+            className="border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 px-4 py-2"
+          />
         )}
         <div className="overflow-x-auto">
           <table className="w-full min-w-[980px] border-collapse text-left text-xs">
@@ -4017,6 +4004,8 @@ export function NodesSubsPage() {
                   const subName = subNameMap.get(node.sub_id) ?? node.sub_id;
                   const memberGroups = nodeGroupMembership.get(node.id) ?? [];
                   const inTargetGroup = targetGroupMemberSet.has(node.id);
+                  const regionCode = resolveNodeRegionCode(node);
+                  const regionLabel = getRegionLabel(regionCode);
 
                   const effectiveGlobalPreAccel =
                     globalPreAccel.enabled &&
@@ -4074,8 +4063,11 @@ export function NodesSubsPage() {
                       {/* Region, Multiplier, Protocol & Direct 443 */}
                       <td className="min-w-[168px] px-3 py-3 align-middle">
                         <div className="flex flex-wrap items-center gap-1.5 cc-mono text-[11px]">
-                          <span className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-medium text-[var(--text)]">
-                            {node.region_code}
+                          <span
+                            title={regionLabel}
+                            className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-medium text-[var(--text)]"
+                          >
+                            {regionCode}
                           </span>
                           <span
                             className={`rounded-md px-1.5 py-0.5 font-medium ${
@@ -4252,55 +4244,19 @@ export function NodesSubsPage() {
 
         {/* Pagination Bar */}
         {filteredNodes.length > 0 && (
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] bg-[var(--bg-elevated)]/60 px-4 py-2.5 text-xs">
-            <div className="flex flex-wrap items-center gap-3 text-[11px] text-[var(--muted)]">
-              <span className="cc-mono">
-                第 {pageStartIndex + 1} -{" "}
-                {Math.min(pageStartIndex + pageSize, filteredNodes.length)} 条，共{" "}
-                {filteredNodes.length} 个节点
-              </span>
-              <div className="inline-flex items-center gap-1">
-                <span>每页</span>
-                {([30, 50, 100] as const).map((size) => (
-                  <button
-                    key={size}
-                    type="button"
-                    onClick={() => setPageSize(size)}
-                    className={`cc-mono rounded-md border px-2 py-0.5 text-[11px] transition-colors ${
-                      pageSize === size
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
-                        : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
-                    }`}
-                  >
-                    {size}
-                  </button>
-                ))}
-                <span>条</span>
-              </div>
-            </div>
-
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                disabled={safePage <= 1}
-                onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
-                className="rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
-              >
-                上一页
-              </button>
-              <span className="cc-mono px-2 text-[11px] text-[var(--text-secondary)]">
-                第 {safePage} / {totalPages} 页
-              </span>
-              <button
-                type="button"
-                disabled={safePage >= totalPages}
-                onClick={() => setCurrentPage(Math.min(totalPages, safePage + 1))}
-                className="rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
-              >
-                下一页
-              </button>
-            </div>
-          </div>
+          <PaginationBar
+            currentPage={safePage}
+            totalPages={totalPages}
+            totalItems={filteredNodes.length}
+            pageSize={pageSize}
+            pageSizeOptions={[30, 50, 100]}
+            onPageChange={setCurrentPage}
+            onPageSizeChange={(s) => {
+              setPageSize(s);
+              setCurrentPage(1);
+            }}
+            className="border-t border-[var(--line)] bg-[var(--bg-elevated)]/60 px-4 py-2.5"
+          />
         )}
       </section>
 

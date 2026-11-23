@@ -1058,13 +1058,13 @@ export function HomePage() {
                       : "idle"
                   )
                 }
-                className="hidden shrink-0 flex-col items-center justify-center rounded-2xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-center transition-colors hover:border-[var(--line-strong)] sm:flex"
+                className="hidden min-w-[84px] shrink-0 flex-col items-center justify-center rounded-2xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-center transition-colors hover:border-[var(--line-strong)] sm:flex"
                 title="点击切换奶油猫饼待机与工作形态"
               >
-                <div className="flex h-11 w-12 items-center justify-center">
+                <div className="flex h-[68px] w-[68px] items-end justify-center pb-0.5">
                   <MascotSprite state={effectiveMascotState} scale={2} />
                 </div>
-                <div className="mt-0.5 text-[10px] text-[var(--muted)]">
+                <div className="mt-1.5 whitespace-nowrap leading-none text-[10px] text-[var(--muted)]">
                   {MASCOT_STATE_LABELS[effectiveMascotState]}
                 </div>
               </button>

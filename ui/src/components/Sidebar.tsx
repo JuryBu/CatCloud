@@ -183,9 +183,9 @@ export function Sidebar() {
   return (
     <aside className="cc-surface cc-glass relative z-20 flex h-full w-[236px] shrink-0 flex-col border-r border-[var(--line)] px-3 py-3.5">
       {/* Brand header with animated cream-cat MascotSprite & theme/wallpaper popover */}
-      <div className="mb-3 flex items-center justify-between gap-2 px-1">
-        <div className="flex min-w-0 items-center gap-2">
-          <div className="relative flex h-10 w-11 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)]">
+      <div className="mb-3 flex items-center justify-between gap-1.5 px-0.5">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <div className="relative flex h-10 w-[62px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)] px-0.5">
             <MascotSprite state="idle" scale={2} title="猫猫云梯 · 奶油猫饼" />
             <span
               className="cc-pulse-dot absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[var(--surface)]"
@@ -210,7 +210,7 @@ export function Sidebar() {
             onClick={() => setThemeMenuOpen((open) => !open)}
             aria-expanded={themeMenuOpen}
             aria-haspopup="dialog"
-            className={`inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-lg border px-2 text-[11px] transition-colors ${
+            className={`inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-lg border px-1.5 text-[11px] transition-colors ${
               themeMenuOpen
                 ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text)]"
                 : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"

@@ -177,83 +177,188 @@ pub fn extract_multiplier(name: &str) -> f64 {
     1.0
 }
 
+/// Decode any standard Unicode Regional Indicator flag emoji pair (e.g. `🇰🇭` -> `"KH"`,
+/// `🇳🇿` -> `"NZ"`, `🇬🇧` -> `"UK"`) into a two-letter uppercase ISO region code.
+fn extract_flag_region_code(name: &str) -> Option<String> {
+    let mut prev: Option<u8> = None;
+    for ch in name.chars() {
+        if ('\u{1F1E6}'..='\u{1F1FF}').contains(&ch) {
+            let letter = b'A' + ((ch as u32 - 0x1F1E6) as u8);
+            if let Some(first) = prev {
+                let pair = [first, letter];
+                let code = std::str::from_utf8(&pair).ok()?;
+                return Some(if code == "GB" {
+                    "UK".to_string()
+                } else {
+                    code.to_string()
+                });
+            }
+            prev = Some(letter);
+        } else {
+            prev = None;
+        }
+    }
+    None
+}
+
 /// Infer a two-letter ISO region code from a node display name (defaults to `"UNK"`).
 pub fn detect_region_code(name: &str) -> String {
-    // 1. Flag emojis (unambiguous, highest priority)
-    const FLAG_RULES: &[(&str, &str)] = &[
-        ("🇹🇼", "TW"),
-        ("🇭🇰", "HK"),
-        ("🇲🇴", "MO"),
-        ("🇯🇵", "JP"),
-        ("🇸🇬", "SG"),
-        ("🇰🇷", "KR"),
-        ("🇺🇸", "US"),
-        ("🇬🇧", "UK"),
-        ("🇩🇪", "DE"),
-        ("🇫🇷", "FR"),
-        ("🇳🇱", "NL"),
-        ("🇨🇦", "CA"),
-        ("🇦🇺", "AU"),
-        ("🇮🇳", "IN"),
-        ("🇹🇷", "TR"),
-        ("🇲🇾", "MY"),
-        ("🇹🇭", "TH"),
-        ("🇻🇳", "VN"),
-        ("🇵🇭", "PH"),
-        ("🇷🇺", "RU"),
-        ("🇦🇷", "AR"),
-        ("🇧🇷", "BR"),
-        ("🇨🇭", "CH"),
-        ("🇸🇪", "SE"),
-        ("🇮🇹", "IT"),
-        ("🇪🇸", "ES"),
-        ("🇮🇪", "IE"),
-    ];
-    for &(flag, code) in FLAG_RULES {
-        if name.contains(flag) {
-            return code.to_string();
-        }
+    // 1. Universal Unicode Regional Indicator flag emoji pair decoder (highest priority, covers 240+ flags)
+    if let Some(code) = extract_flag_region_code(name) {
+        return code;
     }
 
     let upper = name.to_ascii_uppercase();
 
-    // 2. Chinese and full English place names (low false-positive rate)
+    // 2. Chinese and full English place names (low false-positive rate; more specific names placed first)
     const PHRASE_RULES: &[(&[&str], &str)] = &[
+        // East & Southeast Asia
         (&["台湾", "台灣", "台北", "臺北", "新北", "彰化", "高雄", "TAIWAN", "TAIPEI"], "TW"),
         (&["香港", "HONG KONG", "HONGKONG"], "HK"),
         (&["澳门", "澳門", "MACAU", "MACAO"], "MO"),
         (&["日本", "东京", "東京", "大阪", "埼玉", "名古屋", "JAPAN", "TOKYO", "OSAKA"], "JP"),
         (&["新加坡", "狮城", "獅城", "SINGAPORE"], "SG"),
         (&["韩国", "韓國", "首尔", "首爾", "春川", "KOREA", "SEOUL"], "KR"),
+        (&["马来西亚", "馬來西亞", "吉隆坡", "MALAYSIA"], "MY"),
+        (&["泰国", "泰國", "曼谷", "THAILAND", "BANGKOK"], "TH"),
+        (&["越南", "河内", "胡志明", "VIETNAM"], "VN"),
+        (&["菲律宾", "菲律賓", "马尼拉", "PHILIPPINES", "MANILA"], "PH"),
+        (&["印度尼西亚", "印度尼西亞", "印尼", "雅加达", "INDONESIA", "JAKARTA"], "ID"),
+        (&["柬埔寨", "金边", "CAMBODIA"], "KH"),
+        (&["缅甸", "緬甸", "仰光", "MYANMAR", "BURMA"], "MM"),
+        (&["老挝", "寮国", "寮國", "LAOS"], "LA"),
+        (&["文莱", "汶莱", "汶萊", "BRUNEI"], "BN"),
+        (&["东帝汶", "東帝汶", "TIMOR-LESTE", "EAST TIMOR"], "TL"),
+        // South & Central Asia
+        (&["印度", "孟买", "孟買", "新德里", "班加罗尔", "INDIA", "MUMBAI"], "IN"),
+        (&["巴基斯坦", "PAKISTAN"], "PK"),
+        (&["孟加拉", "BANGLADESH"], "BD"),
+        (&["尼泊尔", "尼泊爾", "NEPAL"], "NP"),
+        (&["斯里兰卡", "斯里蘭卡", "SRI LANKA"], "LK"),
+        (&["不丹", "BHUTAN"], "BT"),
+        (&["蒙古", "MONGOLIA"], "MN"),
+        (&["哈萨克斯坦", "哈薩克斯坦", "哈萨克", "KAZAKHSTAN"], "KZ"),
+        (&["乌兹别克斯坦", "烏茲別克斯坦", "UZBEKISTAN"], "UZ"),
+        (&["吉尔吉斯斯坦", "KYRGYZSTAN"], "KG"),
+        (&["塔吉克斯坦", "TAJIKISTAN"], "TJ"),
+        (&["土库曼斯坦", "TURKMENISTAN"], "TM"),
+        (&["阿富汗", "AFGHANISTAN"], "AF"),
+        // Middle East & Caucasus
+        (&["阿联酋", "阿聯酋", "阿拉伯联合酋长国", "迪拜", "杜拜", "阿布扎比", "UNITED ARAB EMIRATES", "DUBAI"], "AE"),
+        (&["沙特", "沙乌地", "沙烏地", "利雅得", "SAUDI ARABIA", "SAUDI"], "SA"),
+        (&["以色列", "特拉维夫", "ISRAEL"], "IL"),
+        (&["巴勒斯坦", "PALESTINE"], "PS"),
+        (&["土耳其", "伊斯坦布尔", "TURKEY", "TURKIYE", "ISTANBUL"], "TR"),
+        (&["卡塔尔", "卡達", "多哈", "QATAR"], "QA"),
+        (&["科威特", "KUWAIT"], "KW"),
+        (&["巴林", "BAHRAIN"], "BH"),
+        (&["罗马尼亚", "羅馬尼亞", "布加勒斯特", "ROMANIA"], "RO"),
+        (&["阿曼", "OMAN"], "OM"),
+        (&["约旦", "約旦", "JORDAN"], "JO"),
+        (&["黎巴嫩", "LEBANON"], "LB"),
+        (&["伊拉克", "IRAQ"], "IQ"),
+        (&["也门", "葉門", "YEMEN"], "YE"),
+        (&["亚美尼亚", "亞美尼亞", "ARMENIA"], "AM"),
+        (&["阿塞拜疆", "AZERBAIJAN"], "AZ"),
+        (&["格鲁吉亚", "喬治亞", "GEORGIA"], "GE"),
+        // Europe (place compound names before substrings: 罗马尼亚>罗马, 都柏林>柏林, 白俄罗斯>俄罗斯)
+        (&["爱尔兰", "愛爾蘭", "都柏林", "IRELAND", "DUBLIN"], "IE"),
+        (&["英国", "英國", "伦敦", "倫敦", "UNITED KINGDOM", "BRITAIN", "LONDON"], "UK"),
+        (&["德国", "德國", "法兰克福", "法蘭克福", "柏林", "GERMANY", "FRANKFURT"], "DE"),
+        (&["法国", "法國", "巴黎", "马赛", "FRANCE", "PARIS"], "FR"),
+        (&["荷兰", "荷蘭", "阿姆斯特丹", "NETHERLANDS", "AMSTERDAM"], "NL"),
+        (&["瑞士", "苏黎世", "蘇黎世", "SWITZERLAND", "ZURICH"], "CH"),
+        (&["瑞典", "斯德哥尔摩", "SWEDEN", "STOCKHOLM"], "SE"),
+        (&["意大利", "義大利", "米兰", "米蘭", "罗马", "ITALY", "MILAN"], "IT"),
+        (&["西班牙", "马德里", "馬德里", "巴塞罗那", "SPAIN", "MADRID"], "ES"),
+        (&["白俄罗斯", "白俄羅斯", "BELARUS"], "BY"),
+        (&["俄罗斯", "俄羅斯", "莫斯科", "圣彼得堡", "RUSSIA", "MOSCOW"], "RU"),
+        (&["丹麦", "丹麥", "哥本哈根", "DENMARK"], "DK"),
+        (&["挪威", "奥斯陆", "NORWAY", "OSLO"], "NO"),
+        (&["芬兰", "芬蘭", "赫尔辛基", "FINLAND", "HELSINKI"], "FI"),
+        (&["冰岛", "冰島", "雷克雅未克", "ICELAND"], "IS"),
+        (&["捷克", "布拉格", "CZECH", "PRAGUE"], "CZ"),
+        (&["希腊", "希臘", "雅典", "GREECE", "ATHENS"], "GR"),
+        (&["波兰", "波蘭", "华沙", "華沙", "POLAND", "WARSAW"], "PL"),
+        (&["乌克兰", "烏克蘭", "基辅", "UKRAINE", "KYIV"], "UA"),
+        (&["匈牙利", "布达佩斯", "HUNGARY", "BUDAPEST"], "HU"),
+        (&["卢森堡", "盧森堡", "LUXEMBOURG"], "LU"),
+        (&["奥地利", "奧地利", "维也纳", "AUSTRIA", "VIENNA"], "AT"),
+        (&["比利时", "比利時", "布鲁塞尔", "BELGIUM", "BRUSSELS"], "BE"),
+        (&["立陶宛", "维尔纽斯", "LITHUANIA"], "LT"),
+        (&["葡萄牙", "里斯本", "PORTUGAL", "LISBON"], "PT"),
+        (&["保加利亚", "保加利亞", "索非亚", "BULGARIA"], "BG"),
+        (&["克罗地亚", "克羅地亞", "克罗埃西亚", "CROATIA"], "HR"),
+        (&["塞尔维亚", "塞爾維亞", "贝尔格莱德", "SERBIA"], "RS"),
+        (&["斯洛伐克", "SLOVAKIA"], "SK"),
+        (&["斯洛文尼亚", "斯洛維尼亞", "SLOVENIA"], "SI"),
+        (&["爱沙尼亚", "愛沙尼亞", "塔林", "ESTONIA"], "EE"),
+        (&["拉脱维亚", "拉脫維亞", "里加", "LATVIA"], "LV"),
+        (&["摩尔多瓦", "摩爾多瓦", "MOLDOVA"], "MD"),
+        (&["阿尔巴尼亚", "阿爾巴尼亞", "ALBANIA"], "AL"),
+        (&["北马其顿", "北馬其頓", "马其顿", "NORTH MACEDONIA", "MACEDONIA"], "MK"),
+        (&["波黑", "波斯尼亚", "波士尼亞", "BOSNIA"], "BA"),
+        (&["塞浦路斯", "賽普勒斯", "CYPRUS"], "CY"),
+        (&["马耳他", "馬爾他", "MALTA"], "MT"),
+        (&["安道尔", "安道爾", "ANDORRA"], "AD"),
+        (&["科索沃", "KOSOVO"], "XK"),
+        (&["摩纳哥", "摩納哥", "MONACO"], "MC"),
+        (&["圣马力诺", "聖馬利諾", "SAN MARINO"], "SM"),
+        (&["直布罗陀", "直布羅陀", "GIBRALTAR"], "GI"),
+        // North America
         (
             &[
                 "美国", "美國", "洛杉矶", "洛杉磯", "圣何塞", "聖何塞", "西雅图", "西雅圖",
                 "硅谷", "矽谷", "纽约", "紐約", "芝加哥", "达拉斯", "達拉斯", "凤凰城",
+                "迈阿密", "亚特兰大", "华盛顿", "波士顿", "阿什本",
                 "UNITED STATES", "AMERICA", "LOS ANGELES", "SAN JOSE", "SEATTLE", "NEW YORK",
-                "SILICON VALLEY", "DALLAS", "CHICAGO",
+                "SILICON VALLEY", "DALLAS", "CHICAGO", "MIAMI", "ASHBURN",
             ],
             "US",
         ),
-        (&["英国", "英國", "伦敦", "倫敦", "UNITED KINGDOM", "BRITAIN", "LONDON"], "UK"),
-        (&["德国", "德國", "法兰克福", "法蘭克福", "GERMANY", "FRANKFURT"], "DE"),
-        (&["法国", "法國", "巴黎", "FRANCE", "PARIS"], "FR"),
-        (&["荷兰", "荷蘭", "阿姆斯特丹", "NETHERLANDS", "AMSTERDAM"], "NL"),
-        (&["加拿大", "多伦多", "多倫多", "温哥华", "溫哥華", "CANADA", "TORONTO", "VANCOUVER"], "CA"),
-        (&["澳大利亚", "澳大利亞", "澳洲", "悉尼", "墨尔本", "AUSTRALIA", "SYDNEY"], "AU"),
-        (&["印度", "孟买", "孟買", "INDIA", "MUMBAI"], "IN"),
-        (&["土耳其", "伊斯坦布尔", "TURKEY", "ISTANBUL"], "TR"),
-        (&["马来西亚", "馬來西亞", "吉隆坡", "MALAYSIA"], "MY"),
-        (&["泰国", "泰國", "曼谷", "THAILAND", "BANGKOK"], "TH"),
-        (&["越南", "河内", "胡志明", "VIETNAM"], "VN"),
-        (&["菲律宾", "菲律賓", "马尼拉", "PHILIPPINES"], "PH"),
-        (&["俄罗斯", "俄羅斯", "莫斯科", "RUSSIA", "MOSCOW"], "RU"),
-        (&["阿根廷", "ARGENTINA"], "AR"),
-        (&["巴西", "圣保罗", "BRAZIL"], "BR"),
-        (&["瑞士", "苏黎世", "SWITZERLAND", "ZURICH"], "CH"),
-        (&["瑞典", "斯德哥尔摩", "SWEDEN"], "SE"),
-        (&["意大利", "義大利", "米兰", "ITALY"], "IT"),
-        (&["西班牙", "马德里", "SPAIN"], "ES"),
-        (&["爱尔兰", "愛爾蘭", "都柏林", "IRELAND"], "IE"),
+        (&["加拿大", "多伦多", "多倫多", "温哥华", "溫哥華", "蒙特利尔", "CANADA", "TORONTO", "VANCOUVER"], "CA"),
+        (&["墨西哥", "MEXICO"], "MX"),
+        (&["格陵兰", "格陵蘭", "GREENLAND"], "GL"),
+        (&["巴拿马", "巴拿馬", "PANAMA"], "PA"),
+        (&["哥斯达黎加", "哥斯大黎加", "COSTA RICA"], "CR"),
+        (&["牙买加", "牙買加", "JAMAICA"], "JM"),
+        (&["波多黎各", "PUERTO RICO"], "PR"),
+        (&["百慕大", "BERMUDA"], "BM"),
+        (&["巴哈马", "巴哈馬", "BAHAMAS"], "BS"),
+        (&["古巴", "CUBA"], "CU"),
+        // South America
+        (&["阿根廷", "布宜诺斯艾利斯", "ARGENTINA"], "AR"),
+        (&["巴西", "圣保罗", "聖保羅", "BRAZIL"], "BR"),
+        (&["智利", "圣地亚哥", "CHILE"], "CL"),
+        (&["哥伦比亚", "哥倫比亞", "波哥大", "COLOMBIA"], "CO"),
+        (&["秘鲁", "秘魯", "利马", "PERU"], "PE"),
+        (&["乌拉圭", "烏拉圭", "URUGUAY"], "UY"),
+        (&["厄瓜多尔", "厄瓜多爾", "ECUADOR"], "EC"),
+        (&["委内瑞拉", "委內瑞拉", "VENEZUELA"], "VE"),
+        (&["巴拉圭", "PARAGUAY"], "PY"),
+        (&["玻利维亚", "玻利維亞", "BOLIVIA"], "BO"),
+        // Oceania
+        (&["澳大利亚", "澳大利亞", "澳洲", "悉尼", "墨尔本", "墨爾本", "AUSTRALIA", "SYDNEY", "MELBOURNE"], "AU"),
+        (&["新西兰", "紐西蘭", "新西蘭", "奥克兰", "奧克蘭", "NEW ZEALAND", "AUCKLAND"], "NZ"),
+        (&["关岛", "關島", "GUAM"], "GU"),
+        (&["斐济", "斐濟", "FIJI"], "FJ"),
+        (&["巴布亚新几内亚", "巴布亞紐幾內亞", "PAPUA NEW GUINEA"], "PG"),
+        // Africa
+        (&["南非", "约翰内斯堡", "开普敦", "SOUTH AFRICA", "JOHANNESBURG"], "ZA"),
+        (&["埃及", "开罗", "EGYPT", "CAIRO"], "EG"),
+        (&["尼日利亚", "奈及利亞", "拉各斯", "NIGERIA", "LAGOS"], "NG"),
+        (&["肯尼亚", "肯亞", "内罗毕", "KENYA"], "KE"),
+        (&["摩洛哥", "MOROCCO"], "MA"),
+        (&["突尼斯", "突尼西亞", "TUNISIA"], "TN"),
+        (&["阿尔及利亚", "阿爾及利亞", "ALGERIA"], "DZ"),
+        (&["加纳", "迦納", "GHANA"], "GH"),
+        (&["安哥拉", "ANGOLA"], "AO"),
+        (&["埃塞俄比亚", "衣索比亞", "ETHIOPIA"], "ET"),
+        (&["毛里求斯", "模里西斯", "MAURITIUS"], "MU"),
+        (&["坦桑尼亚", "坦尚尼亞", "TANZANIA"], "TZ"),
+        (&["乌干达", "烏干達", "UGANDA"], "UG"),
+        // Special / Other
+        (&["南极洲", "南極洲", "南极", "南極", "ANTARCTICA"], "AQ"),
     ];
     for &(patterns, code) in PHRASE_RULES {
         for &pat in patterns {
@@ -301,6 +406,51 @@ pub fn detect_region_code(name: &str) -> String {
         ("IT", "IT"),
         ("ES", "ES"),
         ("IE", "IE"),
+        ("KH", "KH"),
+        ("MM", "MM"),
+        ("NZ", "NZ"),
+        ("DK", "DK"),
+        ("FI", "FI"),
+        ("CZ", "CZ"),
+        ("GR", "GR"),
+        ("PL", "PL"),
+        ("UA", "UA"),
+        ("HU", "HU"),
+        ("LU", "LU"),
+        ("BE", "BE"),
+        ("LT", "LT"),
+        ("PT", "PT"),
+        ("BG", "BG"),
+        ("HR", "HR"),
+        ("RO", "RO"),
+        ("RS", "RS"),
+        ("SK", "SK"),
+        ("LV", "LV"),
+        ("IL", "IL"),
+        ("AE", "AE"),
+        ("SA", "SA"),
+        ("QA", "QA"),
+        ("KW", "KW"),
+        ("BH", "BH"),
+        ("JO", "JO"),
+        ("KZ", "KZ"),
+        ("UZ", "UZ"),
+        ("PK", "PK"),
+        ("BD", "BD"),
+        ("NP", "NP"),
+        ("LK", "LK"),
+        ("MN", "MN"),
+        ("MX", "MX"),
+        ("CL", "CL"),
+        ("ZA", "ZA"),
+        ("EG", "EG"),
+        ("NG", "NG"),
+        ("KE", "KE"),
+        ("XK", "XK"),
+        ("BN", "BN"),
+        ("TL", "TL"),
+        ("GL", "GL"),
+        ("AQ", "AQ"),
     ];
     for &(token, code) in TOKEN_RULES {
         if contains_ascii_token(&upper, token) {
@@ -2002,5 +2152,44 @@ fn hex_val(b: u8) -> Option<u8> {
         b'a'..=b'f' => Some(b - b'a' + 10),
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_region_code_universal_flags_and_global_chinese_names() {
+        // Universal Unicode Regional Indicator flag decoding
+        assert_eq!(detect_region_code("🇰🇭 柬埔寨丨3x KH"), "KH");
+        assert_eq!(detect_region_code("🇳🇿 新西兰"), "NZ");
+        assert_eq!(detect_region_code("🇵🇱 波兰"), "PL");
+        assert_eq!(detect_region_code("🇩🇰 丹麦 01"), "DK");
+        assert_eq!(detect_region_code("🇦🇪 阿联酋 迪拜"), "AE");
+        assert_eq!(detect_region_code("🇮🇱 以色列"), "IL");
+        assert_eq!(detect_region_code("🇽🇰 科索沃"), "XK");
+        // GB flag stays mapped to UK for backwards compatibility
+        assert_eq!(detect_region_code("🇬🇧 London 01"), "UK");
+
+        // Flagless Chinese place names (including Belarus vs Russia & Indonesia vs India ordering)
+        assert_eq!(detect_region_code("格陵兰 01"), "GL");
+        assert_eq!(detect_region_code("东帝汶 线路"), "TL");
+        assert_eq!(detect_region_code("文莱 2x"), "BN");
+        assert_eq!(detect_region_code("南极洲 科研站"), "AQ");
+        assert_eq!(detect_region_code("墨西哥 节点"), "MX");
+        assert_eq!(detect_region_code("智利 圣地亚哥"), "CL");
+        assert_eq!(detect_region_code("阿联酋 迪拜"), "AE");
+        assert_eq!(detect_region_code("缅甸 仰光"), "MM");
+        assert_eq!(detect_region_code("新西兰 奥克兰"), "NZ");
+        assert_eq!(detect_region_code("柬埔寨 金边"), "KH");
+        assert_eq!(detect_region_code("白俄罗斯 明斯克"), "BY");
+        assert_eq!(detect_region_code("印度尼西亚 雅加达"), "ID");
+        assert_eq!(detect_region_code("印度 孟买"), "IN");
+
+        // Non-geographic custom names must remain UNK
+        assert_eq!(detect_region_code("Node-Custom-01"), "UNK");
+        assert_eq!(detect_region_code("Dedicated-Edge-02"), "UNK");
+        assert_eq!(detect_region_code("Custom-Relay-01"), "UNK");
     }
 }
