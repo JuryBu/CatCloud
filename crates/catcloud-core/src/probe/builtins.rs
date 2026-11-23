@@ -44,6 +44,7 @@ const CLAUDE_TRACE_URL: &str = "https://claude.ai/cdn-cgi/trace";
 const CLAUDE_API_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CHATGPT_TRACE_URL: &str = "https://chatgpt.com/cdn-cgi/trace";
 const CHATGPT_API_MODELS_URL: &str = "https://api.openai.com/v1/models";
+const CHATGPT_AB_URL: &str = "https://ab.chatgpt.com/v1/rgstr";
 const GEMINI_API_MODELS_CHECK_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/models?key=catcloud_probe_check";
 
@@ -111,11 +112,62 @@ pub fn compute_latency_stats(samples_ms: &[Option<f64>]) -> LatencyStats {
 }
 
 /// Execute an L0 latency/jitter/loss probe with `samples` HTTP attempts (default 3).
+///
+/// For non-loopback targets with `samples >= 2`, performs one warmup request first to establish
+/// the SOCKS5/TCP/TLS connection and drain the response body so subsequent samples measure true
+/// hot keep-alive RTT without cold-handshake inflation.
 pub async fn run_latency_probe(
     client: &reqwest::Client,
     node_id: &str,
     def: &ProbeDefinition,
     samples: usize,
+) -> ProbeResultRecord {
+    let target_url = def.target_url.trim();
+    let sample_count = samples.max(1);
+    let do_warmup = sample_count >= 2 && !is_loopback_url(target_url);
+    run_latency_probe_with_warmup(client, node_id, def, sample_count, do_warmup).await
+}
+
+async fn execute_single_latency_attempt(
+    client: &reqwest::Client,
+    method: Method,
+    target_url: &str,
+    expected_status: Option<u16>,
+    timeout: Duration,
+) -> Result<f64, String> {
+    let started = Instant::now();
+    match client
+        .request(method, target_url)
+        .timeout(timeout)
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+            // Drain small response body so keep-alive connections can be reused cleanly.
+            let _ = drain_capped_body(resp, 16 * 1024).await;
+
+            let status_ok = match expected_status {
+                Some(exp) => status == exp,
+                None => status < 500,
+            };
+            if status_ok {
+                Ok(elapsed_ms)
+            } else {
+                Err(format!("unexpected HTTP status {status}"))
+            }
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn run_latency_probe_with_warmup(
+    client: &reqwest::Client,
+    node_id: &str,
+    def: &ProbeDefinition,
+    samples: usize,
+    do_warmup: bool,
 ) -> ProbeResultRecord {
     let sample_count = samples.max(1);
     let timeout = Duration::from_millis(def.timeout_ms.max(200));
@@ -125,70 +177,139 @@ pub async fn run_latency_probe(
             return failed_record(node_id, &def.id, format!("invalid method: {err}"));
         }
     };
+    let target_url = def.target_url.trim();
 
-    let mut timings: Vec<Option<f64>> = Vec::with_capacity(sample_count);
+    let mut warmup_ok_ms: Option<f64> = None;
     let mut last_error: Option<String> = None;
 
-    for _ in 0..sample_count {
-        let started = Instant::now();
-        match client
-            .request(method.clone(), def.target_url.trim())
-            .timeout(timeout)
-            .send()
-            .await
+    if do_warmup {
+        match execute_single_latency_attempt(
+            client,
+            method.clone(),
+            target_url,
+            def.expected_status,
+            timeout,
+        )
+        .await
         {
-            Ok(resp) => {
-                let status = resp.status().as_u16();
-                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-                // Drain small response body so keep-alive connections can be reused cleanly.
-                let _ = drain_capped_body(resp, 16 * 1024).await;
-
-                let status_ok = match def.expected_status {
-                    Some(exp) => status == exp,
-                    None => status < 500,
-                };
-                if status_ok {
-                    timings.push(Some(elapsed_ms));
-                } else {
-                    timings.push(None);
-                    last_error = Some(format!("unexpected HTTP status {status}"));
-                }
+            Ok(ms) => {
+                warmup_ok_ms = Some(ms);
             }
             Err(err) => {
+                // Never abort on warmup failure; proceed to full sample attempts.
+                last_error = Some(err);
+            }
+        }
+    }
+
+    // When warmup succeeded and `samples >= 3`, measuring `sample_count - 1` (minimum 2) hot
+    // keep-alive requests keeps total HTTP round-trips identical to `samples` while yielding
+    // accurate hot RTT and adjacent jitter.
+    let measured_count = if warmup_ok_ms.is_some() && sample_count >= 3 {
+        (sample_count - 1).max(2)
+    } else {
+        sample_count
+    };
+
+    let mut timings: Vec<Option<f64>> = Vec::with_capacity(measured_count);
+    for _ in 0..measured_count {
+        match execute_single_latency_attempt(
+            client,
+            method.clone(),
+            target_url,
+            def.expected_status,
+            timeout,
+        )
+        .await
+        {
+            Ok(ms) => timings.push(Some(ms)),
+            Err(err) => {
                 timings.push(None);
-                last_error = Some(err.to_string());
+                last_error = Some(err);
             }
         }
     }
 
     let stats = compute_latency_stats(&timings);
-    let ok = stats.ok_count > 0;
-    let detail = if ok {
-        Some(format!(
-            "samples={}/{}, latency_ms={:.2}, jitter_ms={:.2}, loss_pct={:.1}",
-            stats.ok_count,
-            stats.total_count,
-            stats.latency_ms.unwrap_or(0.0),
-            stats.jitter_ms.unwrap_or(0.0),
-            stats.loss_pct
-        ))
-    } else {
-        Some(format!(
-            "all {} samples failed: {}",
-            stats.total_count,
-            last_error.unwrap_or_else(|| "request failed".to_string())
-        ))
-    };
+    if stats.ok_count > 0 {
+        let detail = if do_warmup {
+            if let Some(w_ms) = warmup_ok_ms {
+                format!(
+                    "warmup_ms={:.2}, samples={}/{}, latency_ms={:.2}, jitter_ms={:.2}, loss_pct={:.1}",
+                    round2(w_ms),
+                    stats.ok_count,
+                    stats.total_count,
+                    stats.latency_ms.unwrap_or(0.0),
+                    stats.jitter_ms.unwrap_or(0.0),
+                    stats.loss_pct
+                )
+            } else {
+                format!(
+                    "warmup=failed, samples={}/{}, latency_ms={:.2}, jitter_ms={:.2}, loss_pct={:.1}",
+                    stats.ok_count,
+                    stats.total_count,
+                    stats.latency_ms.unwrap_or(0.0),
+                    stats.jitter_ms.unwrap_or(0.0),
+                    stats.loss_pct
+                )
+            }
+        } else {
+            format!(
+                "samples={}/{}, latency_ms={:.2}, jitter_ms={:.2}, loss_pct={:.1}",
+                stats.ok_count,
+                stats.total_count,
+                stats.latency_ms.unwrap_or(0.0),
+                stats.jitter_ms.unwrap_or(0.0),
+                stats.loss_pct
+            )
+        };
+
+        return ProbeResultRecord {
+            node_id: node_id.to_string(),
+            probe_id: def.id.clone(),
+            tested_at: now_rfc3339(),
+            ok: true,
+            latency_ms: stats.latency_ms,
+            jitter_ms: stats.jitter_ms,
+            loss_pct: Some(stats.loss_pct),
+            detail: Some(detail),
+            ..Default::default()
+        };
+    }
+
+    // All measured hot samples failed: fall back to the warmup timing if warmup succeeded.
+    if let Some(w_ms) = warmup_ok_ms {
+        let total_attempts = measured_count + 1;
+        let loss_pct = round2((measured_count as f64 / total_attempts as f64) * 100.0);
+        let fallback_ms = round2(w_ms);
+        return ProbeResultRecord {
+            node_id: node_id.to_string(),
+            probe_id: def.id.clone(),
+            tested_at: now_rfc3339(),
+            ok: true,
+            latency_ms: Some(fallback_ms),
+            jitter_ms: Some(0.0),
+            loss_pct: Some(loss_pct),
+            detail: Some(format!(
+                "warmup_fallback=true, samples=1/{total_attempts}, latency_ms={fallback_ms:.2}, jitter_ms=0.00, loss_pct={loss_pct:.1}"
+            )),
+            ..Default::default()
+        };
+    }
 
     ProbeResultRecord {
         node_id: node_id.to_string(),
         probe_id: def.id.clone(),
         tested_at: now_rfc3339(),
-        ok,
-        latency_ms: stats.latency_ms,
-        jitter_ms: stats.jitter_ms,
+        ok: false,
+        latency_ms: None,
+        jitter_ms: None,
         loss_pct: Some(stats.loss_pct),
-        detail,
+        detail: Some(format!(
+            "all {} samples failed: {}",
+            stats.total_count,
+            last_error.unwrap_or_else(|| "request failed".to_string())
+        )),
         ..Default::default()
     }
 }
@@ -913,10 +1034,34 @@ fn evaluate_claude_semantic_unlock(
     (unlocked, detail)
 }
 
+const CHATGPT_AB_BLOCK_MARKERS: &[&str] = &[
+    "unsupported_country_region_territory",
+    "unsupported_country",
+    "not available in your country",
+    "not available in your region",
+    "just a moment",
+    "attention required",
+    "cf-challenge",
+    "challenge-platform",
+    "enable javascript and cookies",
+    "sorry, you have been blocked",
+];
+
+#[allow(dead_code)]
 fn evaluate_chatgpt_semantic_unlock(
     trace_loc: Option<&str>,
     api_status: Option<u16>,
     api_body: Option<&str>,
+) -> (bool, String) {
+    evaluate_chatgpt_semantic_unlock_with_ab(trace_loc, api_status, api_body, Some(200), None)
+}
+
+fn evaluate_chatgpt_semantic_unlock_with_ab(
+    trace_loc: Option<&str>,
+    api_status: Option<u16>,
+    api_body: Option<&str>,
+    ab_status: Option<u16>,
+    ab_body: Option<&str>,
 ) -> (bool, String) {
     let normalized_loc = trace_loc.and_then(normalize_country_code);
     let trace_blocked = normalized_loc
@@ -942,9 +1087,33 @@ fn evaluate_chatgpt_semantic_unlock(
         None => (false, "request_failed".to_string()),
     };
 
-    let unlocked = !trace_blocked && api_ok;
+    let (ab_ok, ab_reason) = match ab_status {
+        Some(status) => {
+            let body_lower = ab_body.unwrap_or("").to_ascii_lowercase();
+            let geo_blocked = CHATGPT_AB_BLOCK_MARKERS
+                .iter()
+                .any(|marker| body_lower.contains(marker));
+            if status == 451 || geo_blocked {
+                (
+                    false,
+                    format!("blocked(status={status},geo={geo_blocked})"),
+                )
+            } else if status == 429 {
+                (false, "rate_limited(status=429)".to_string())
+            } else if status >= 500 {
+                (false, format!("server_error(status={status})"))
+            } else if (200..500).contains(&status) {
+                (true, format!("ok(status={status})"))
+            } else {
+                (false, format!("unexpected_status({status})"))
+            }
+        }
+        None => (false, "request_failed".to_string()),
+    };
+
+    let unlocked = !trace_blocked && api_ok && ab_ok;
     let detail = format!(
-        "semantic_chatgpt: unlocked={unlocked}, trace_loc={}, trace_blocked={trace_blocked}, api={api_reason}",
+        "semantic_chatgpt: unlocked={unlocked}, trace_loc={}, trace_blocked={trace_blocked}, api={api_reason}, ab={ab_reason}",
         normalized_loc.as_deref().unwrap_or("NONE"),
     );
     (unlocked, detail)
@@ -1070,12 +1239,26 @@ async fn run_builtin_ai_semantic_unlock_probe(
                     Err(_) => (None, None, None),
                 }
             };
+            let ab_fut = async {
+                match client.get(CHATGPT_AB_URL).timeout(timeout).send().await {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let bytes = drain_capped_body(resp, 16 * 1024).await.unwrap_or_default();
+                        let body = String::from_utf8_lossy(&bytes).into_owned();
+                        (Some(status), Some(body))
+                    }
+                    Err(_) => (None, None),
+                }
+            };
 
-            let (trace_loc, (api_status, api_body, api_ms)) = tokio::join!(trace_fut, api_fut);
-            let (ok, detail) = evaluate_chatgpt_semantic_unlock(
+            let (trace_loc, (api_status, api_body, api_ms), (ab_status, ab_body)) =
+                tokio::join!(trace_fut, api_fut, ab_fut);
+            let (ok, detail) = evaluate_chatgpt_semantic_unlock_with_ab(
                 trace_loc.as_deref(),
                 api_status,
                 api_body.as_deref(),
+                ab_status,
+                ab_body.as_deref(),
             );
             (ok, api_ms, detail)
         }
@@ -2157,6 +2340,99 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_semantic_unlock_with_ab_enforces_ab_reachability_and_geo_blocks() {
+        let valid_api_body = Some(r#"{"error":{"message":"You didn't provide an API key."}}"#);
+
+        // 1. ab.chatgpt.com timeout / EOF (`None`) -> MUST fail even when trace & api are clean.
+        let (ok, detail) = evaluate_chatgpt_semantic_unlock_with_ab(
+            Some("US"),
+            Some(401),
+            valid_api_body,
+            None,
+            None,
+        );
+        assert!(!ok);
+        assert!(detail.contains("ab=request_failed"), "detail={detail}");
+
+        // 2. ab.chatgpt.com returns 404 / 405 / 400 / 200 (typical Statsig GET responses) -> unlocked.
+        for status in [200u16, 202, 204, 400, 401, 404, 405] {
+            let (ok, detail) = evaluate_chatgpt_semantic_unlock_with_ab(
+                Some("TW"),
+                Some(401),
+                valid_api_body,
+                Some(status),
+                Some("Method Not Allowed"),
+            );
+            assert!(ok, "ab status {status} should pass, detail={detail}");
+            assert!(
+                detail.contains(&format!("ab=ok(status={status})")),
+                "detail={detail}"
+            );
+        }
+
+        // 3. ab.chatgpt.com returns 403 from Envoy/Statsig origin without WAF/geo block -> pass.
+        for origin_403 in [
+            r#"{"error":"Missing statsig-api-key"}"#,
+            "RBAC: access denied",
+        ] {
+            let (ok, detail) = evaluate_chatgpt_semantic_unlock_with_ab(
+                Some("TW"),
+                Some(401),
+                valid_api_body,
+                Some(403),
+                Some(origin_403),
+            );
+            assert!(
+                ok,
+                "origin 403 `{origin_403}` proves ab.chatgpt.com reachability, detail={detail}"
+            );
+        }
+
+        // 4. ab.chatgpt.com returns 451 -> MUST fail.
+        let (ok, detail) = evaluate_chatgpt_semantic_unlock_with_ab(
+            Some("SG"),
+            Some(401),
+            valid_api_body,
+            Some(451),
+            Some("Unavailable For Legal Reasons"),
+        );
+        assert!(!ok);
+        assert!(detail.contains("ab=blocked(status=451"), "detail={detail}");
+
+        // 5. ab.chatgpt.com returns 5xx -> MUST fail.
+        let (ok, detail) = evaluate_chatgpt_semantic_unlock_with_ab(
+            Some("US"),
+            Some(401),
+            valid_api_body,
+            Some(502),
+            Some("Bad Gateway"),
+        );
+        assert!(!ok);
+        assert!(detail.contains("ab=server_error(status=502)"), "detail={detail}");
+
+        // 6. ab.chatgpt.com returns 403/400 with geo-block or Cloudflare WAF challenge -> MUST fail.
+        for blocked_body in [
+            "<!DOCTYPE html><title>Just a moment...</title>",
+            "Attention Required! | Cloudflare",
+            r#"{"error":{"code":"unsupported_country"}}"#,
+            r#"{"error":{"code":"unsupported_country_region_territory"}}"#,
+        ] {
+            let (ok, detail) = evaluate_chatgpt_semantic_unlock_with_ab(
+                Some("US"),
+                Some(401),
+                valid_api_body,
+                Some(403),
+                Some(blocked_body),
+            );
+            assert!(
+                !ok,
+                "ab body `{blocked_body}` must fail unlock, detail={detail}"
+            );
+            assert!(detail.contains("ab=blocked(status=403,geo=true)"), "detail={detail}");
+        }
+    }
+
+    #[test]
     fn parsers_extract_cf_loc_youtube_gl_and_stage_download_url() {
         let trace = "fl=123f\nh=cp.cloudflare.com\nloc=TW\ntls=TLSv1.3\n";
         assert_eq!(parse_cloudflare_trace_loc(trace).as_deref(), Some("TW"));
@@ -2209,6 +2485,177 @@ mod tests {
         let drained = drain_capped_body(resp, 1024).await.unwrap();
         assert_eq!(drained.len(), 1024);
         assert!(drained.iter().all(|&b| b == b'A'));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn latency_probe_warmup_excludes_cold_handshake_and_handles_failures() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted_conns = Arc::new(AtomicUsize::new(0));
+        let warm_hits = Arc::new(AtomicUsize::new(0));
+        let warmup_fail_hits = Arc::new(AtomicUsize::new(0));
+        let fallback_hits = Arc::new(AtomicUsize::new(0));
+
+        let c_conns = Arc::clone(&accepted_conns);
+        let c_warm = Arc::clone(&warm_hits);
+        let c_wf = Arc::clone(&warmup_fail_hits);
+        let c_fb = Arc::clone(&fallback_hits);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                c_conns.fetch_add(1, Ordering::SeqCst);
+                let c_warm = Arc::clone(&c_warm);
+                let c_wf = Arc::clone(&c_wf);
+                let c_fb = Arc::clone(&c_fb);
+
+                tokio::spawn(async move {
+                    let mut tmp = [0u8; 2048];
+                    loop {
+                        let mut req_buf = Vec::with_capacity(512);
+                        let mut eof = false;
+                        while !req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = socket.read(&mut tmp).await.unwrap_or(0);
+                            if n == 0 {
+                                eof = true;
+                                break;
+                            }
+                            req_buf.extend_from_slice(&tmp[..n]);
+                            if req_buf.len() > 16 * 1024 {
+                                eof = true;
+                                break;
+                            }
+                        }
+                        if eof && req_buf.is_empty() {
+                            break;
+                        }
+                        let req = String::from_utf8_lossy(&req_buf);
+                        let first_line = req.lines().next().unwrap_or_default();
+                        let path = first_line.split_whitespace().nth(1).unwrap_or("/");
+
+                        let resp: &[u8] = match path {
+                            "/cold_then_hot" => {
+                                let idx = c_warm.fetch_add(1, Ordering::SeqCst);
+                                if idx == 0 {
+                                    // Simulate expensive cold SOCKS5 + TLS handshake (160ms)
+                                    sleep(Duration::from_millis(160)).await;
+                                } else {
+                                    // Simulate fast hot keep-alive RTT (~8ms)
+                                    sleep(Duration::from_millis(8)).await;
+                                }
+                                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                            }
+                            "/warmup_fail_then_ok" => {
+                                let idx = c_wf.fetch_add(1, Ordering::SeqCst);
+                                if idx == 0 {
+                                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                } else {
+                                    sleep(Duration::from_millis(5)).await;
+                                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                }
+                            }
+                            "/warmup_ok_then_fail" => {
+                                let idx = c_fb.fetch_add(1, Ordering::SeqCst);
+                                if idx == 0 {
+                                    sleep(Duration::from_millis(12)).await;
+                                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                } else {
+                                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                }
+                            }
+                            _ => {
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            }
+                        };
+
+                        if socket.write_all(resp).await.is_err() {
+                            break;
+                        }
+                        if path == "/all_fail" {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        // 1. Cold handshake (160ms) stripped; 2 hot samples measured on reused keep-alive socket.
+        let def_warm = ProbeDefinition {
+            id: "latency_warm".to_string(),
+            target_url: format!("http://127.0.0.1:{port}/cold_then_hot"),
+            method: "GET".to_string(),
+            expected_status: Some(204),
+            timeout_ms: 2000,
+            ..Default::default()
+        };
+        let conns_before = accepted_conns.load(Ordering::SeqCst);
+        let rec_warm = run_latency_probe_with_warmup(&client, "n1", &def_warm, 3, true).await;
+        assert!(rec_warm.ok, "detail={:?}", rec_warm.detail);
+        assert_eq!(warm_hits.load(Ordering::SeqCst), 3); // 1 warmup + 2 hot samples
+        assert_eq!(
+            accepted_conns.load(Ordering::SeqCst) - conns_before,
+            1,
+            "warmup and measured samples must reuse the same keep-alive connection"
+        );
+        let rtt = rec_warm.latency_ms.expect("latency_ms present");
+        assert!(
+            rtt < 80.0,
+            "cold 160ms warmup must be excluded from hot RTT, got {rtt}ms (detail={:?})",
+            rec_warm.detail
+        );
+        assert_eq!(rec_warm.loss_pct, Some(0.0));
+
+        // 2. Warmup failure must NOT abort; proceeds with full `sample_count` (3) attempts.
+        let def_wf = ProbeDefinition {
+            id: "latency_wf".to_string(),
+            target_url: format!("http://127.0.0.1:{port}/warmup_fail_then_ok"),
+            ..def_warm.clone()
+        };
+        let rec_wf = run_latency_probe_with_warmup(&client, "n1", &def_wf, 3, true).await;
+        assert!(rec_wf.ok, "detail={:?}", rec_wf.detail);
+        assert_eq!(warmup_fail_hits.load(Ordering::SeqCst), 4); // 1 failed warmup + 3 ok samples
+        assert_eq!(rec_wf.loss_pct, Some(0.0));
+
+        // 3. Warmup succeeds, all hot samples fail -> falls back to warmup timing with honest loss%.
+        let def_fb = ProbeDefinition {
+            id: "latency_fb".to_string(),
+            target_url: format!("http://127.0.0.1:{port}/warmup_ok_then_fail"),
+            ..def_warm.clone()
+        };
+        let rec_fb = run_latency_probe_with_warmup(&client, "n1", &def_fb, 3, true).await;
+        assert!(rec_fb.ok, "detail={:?}", rec_fb.detail);
+        assert!(rec_fb.latency_ms.unwrap_or(0.0) >= 5.0);
+        assert_eq!(rec_fb.loss_pct, Some(66.67));
+        assert!(
+            rec_fb
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("warmup_fallback=true")
+        );
+
+        // 4. Warmup and all samples fail -> ok=false, loss_pct=100.0.
+        let def_fail = ProbeDefinition {
+            id: "latency_fail".to_string(),
+            target_url: format!("http://127.0.0.1:{port}/all_fail"),
+            ..def_warm
+        };
+        let rec_fail = run_latency_probe_with_warmup(&client, "n1", &def_fail, 3, true).await;
+        assert!(!rec_fail.ok);
+        assert!(rec_fail.latency_ms.is_none());
+        assert_eq!(rec_fail.loss_pct, Some(100.0));
 
         server.abort();
     }

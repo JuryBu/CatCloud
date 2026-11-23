@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Current SQLite schema version tracked via `PRAGMA user_version`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// SQLite persistence layer backed by bundled `rusqlite` in WAL mode.
 pub struct Storage {
@@ -110,8 +110,16 @@ impl Storage {
         self.in_transaction(|tx| {
             if current < 1 {
                 tx.execute_batch(SCHEMA_V1_SQL)?;
-                tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION as i64)?;
             }
+            if current < 2 {
+                ensure_column_exists(
+                    tx,
+                    "multi_groups",
+                    "independent_routing",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION as i64)?;
             Ok(())
         })
     }
@@ -784,10 +792,11 @@ impl Storage {
                 dynamic_filter_json, primary_probe_id, hard_gates_json,
                 trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
                 escalated_since, recover_probe_interval_sec, switch_mode,
-                cooldown_sec, hysteresis_pct, active_node_id, state
+                cooldown_sec, hysteresis_pct, active_node_id, state,
+                independent_routing
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
             )
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
@@ -807,7 +816,8 @@ impl Storage {
                 cooldown_sec = excluded.cooldown_sec,
                 hysteresis_pct = excluded.hysteresis_pct,
                 active_node_id = excluded.active_node_id,
-                state = excluded.state
+                state = excluded.state,
+                independent_routing = excluded.independent_routing
             ",
             params![
                 group.id,
@@ -829,6 +839,7 @@ impl Storage {
                 group.hysteresis_pct,
                 group.active_node_id,
                 group.state.as_str(),
+                bool_to_int(group.independent_routing),
             ],
         )?;
         Ok(())
@@ -842,7 +853,8 @@ impl Storage {
                        dynamic_filter_json, primary_probe_id, hard_gates_json,
                        trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
                        escalated_since, recover_probe_interval_sec, switch_mode,
-                       cooldown_sec, hysteresis_pct, active_node_id, state
+                       cooldown_sec, hysteresis_pct, active_node_id, state,
+                       independent_routing
                 FROM multi_groups
                 WHERE id = ?1
                 ",
@@ -860,7 +872,8 @@ impl Storage {
                    dynamic_filter_json, primary_probe_id, hard_gates_json,
                    trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
                    escalated_since, recover_probe_interval_sec, switch_mode,
-                   cooldown_sec, hysteresis_pct, active_node_id, state
+                   cooldown_sec, hysteresis_pct, active_node_id, state,
+                   independent_routing
             FROM multi_groups
             ORDER BY name ASC, id ASC
             ",
@@ -1129,7 +1142,8 @@ CREATE TABLE IF NOT EXISTS multi_groups (
     cooldown_sec INTEGER NOT NULL DEFAULT 60,
     hysteresis_pct REAL NOT NULL DEFAULT 20.0,
     active_node_id TEXT,
-    state TEXT NOT NULL DEFAULT 'idle'
+    state TEXT NOT NULL DEFAULT 'idle',
+    independent_routing INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS preaccel_relays (
@@ -1354,6 +1368,7 @@ fn row_to_multi_group(row: &Row<'_>) -> rusqlite::Result<MultiGroup> {
     let switch_str: String = row.get(14)?;
     let cooldown_sec: i64 = row.get(15)?;
     let state_str: String = row.get(18)?;
+    let independent_routing: i64 = row.get(19)?;
 
     let dynamic_filter: Option<DynamicFilterSpec> = dynamic_filter_str
         .as_deref()
@@ -1381,7 +1396,35 @@ fn row_to_multi_group(row: &Row<'_>) -> rusqlite::Result<MultiGroup> {
         hysteresis_pct: row.get(16)?,
         active_node_id: row.get(17)?,
         state: MultiGroupState::from_db_str(&state_str),
+        independent_routing: independent_routing != 0,
     })
+}
+
+fn ensure_column_exists(
+    tx: &Transaction<'_>,
+    table: &str,
+    column: &str,
+    col_def: &str,
+) -> CatResult<()> {
+    let mut stmt = tx.prepare(&format!("PRAGMA table_info({table});"))?;
+    let mut rows = stmt.query([])?;
+    let mut exists = false;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name.eq_ignore_ascii_case(column) {
+            exists = true;
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    if !exists {
+        tx.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {col_def};"),
+            [],
+        )?;
+    }
+    Ok(())
 }
 
 fn row_to_preaccel_relay(row: &Row<'_>) -> rusqlite::Result<PreAccelRelay> {
@@ -1633,10 +1676,15 @@ mod tests {
             hysteresis_pct: 20.0,
             active_node_id: Some("n1".to_string()),
             state: MultiGroupState::Healthy,
+            independent_routing: true,
         };
         storage.upsert_multi_group(&group).unwrap();
         let loaded_group = storage.get_multi_group("grp-ai").unwrap().unwrap();
         assert_eq!(loaded_group, group);
+        assert!(loaded_group.independent_routing);
+        let listed_groups = storage.list_multi_groups().unwrap();
+        assert_eq!(listed_groups.len(), 1);
+        assert!(listed_groups[0].independent_routing);
 
         storage
             .update_multi_group_runtime(
@@ -2075,5 +2123,85 @@ mod tests {
             storage.get_probe_definition("builtin_unlock_chatgpt").unwrap(),
             Some(custom_non_builtin_chatgpt)
         );
+    }
+
+    #[test]
+    fn migrates_v1_multi_groups_table_adding_independent_routing_column() {
+        let dir = std::env::temp_dir().join(format!("catcloud-db-mig-v2-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("legacy-v1.sqlite");
+
+        // Build a legacy v1 SQLite database whose `multi_groups` table lacks `independent_routing`.
+        {
+            let conn = Connection::open(&db_path).expect("create legacy v1 sqlite");
+            conn.execute_batch(
+                "
+                CREATE TABLE multi_groups (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    match_rules_json TEXT NOT NULL DEFAULT '[]',
+                    member_node_ids_json TEXT NOT NULL DEFAULT '[]',
+                    dynamic_filter_json TEXT,
+                    primary_probe_id TEXT,
+                    hard_gates_json TEXT NOT NULL DEFAULT '[]',
+                    trigger_rules_json TEXT NOT NULL DEFAULT '[]',
+                    formula_expr TEXT NOT NULL,
+                    fallback_policy TEXT NOT NULL,
+                    fallback_pool_id TEXT,
+                    escalated_since TEXT,
+                    recover_probe_interval_sec INTEGER NOT NULL DEFAULT 120,
+                    switch_mode TEXT NOT NULL,
+                    cooldown_sec INTEGER NOT NULL DEFAULT 60,
+                    hysteresis_pct REAL NOT NULL DEFAULT 20.0,
+                    active_node_id TEXT,
+                    state TEXT NOT NULL DEFAULT 'idle'
+                );
+                INSERT INTO multi_groups (
+                    id, name, mode, match_rules_json, member_node_ids_json,
+                    formula_expr, fallback_policy, switch_mode, state
+                ) VALUES (
+                    'grp-legacy', 'Legacy AI', 'sticky_best', '[\"@ai_domains\"]', '[]',
+                    'up_mbps', 'degrade_best_warn', 'force_close_old', 'healthy'
+                );
+                PRAGMA user_version = 1;
+                ",
+            )
+            .expect("seed legacy v1 schema");
+        }
+
+        // Opening via `Storage::open` must idempotently migrate v1 -> v2 without losing rows
+        // and default existing rows to `independent_routing = false`.
+        {
+            let storage = Storage::open(&db_path).expect("open & migrate v1 db");
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let mut migrated = storage
+                .get_multi_group("grp-legacy")
+                .unwrap()
+                .expect("legacy row preserved");
+            assert_eq!(migrated.name, "Legacy AI");
+            assert!(!migrated.independent_routing);
+
+            migrated.independent_routing = true;
+            storage.upsert_multi_group(&migrated).unwrap();
+            assert!(
+                storage
+                    .get_multi_group("grp-legacy")
+                    .unwrap()
+                    .unwrap()
+                    .independent_routing
+            );
+        }
+
+        // Re-opening migrated database must remain idempotent and retain `independent_routing = true`.
+        {
+            let storage = Storage::open(&db_path).expect("reopen migrated v2 db");
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let groups = storage.list_multi_groups().unwrap();
+            assert_eq!(groups.len(), 1);
+            assert!(groups[0].independent_routing);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

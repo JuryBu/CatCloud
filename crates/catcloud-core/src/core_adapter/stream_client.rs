@@ -237,6 +237,15 @@ impl CoreTelemetryStore {
             .unwrap_or_default()
     }
 
+    pub fn clear_traffic(&self) {
+        if let Ok(mut guard) = self.traffic.write() {
+            guard.clear();
+        }
+        if let Ok(mut guard) = self.memory.write() {
+            guard.clear();
+        }
+    }
+
     pub fn memory_snapshot(&self) -> Vec<MemoryTick> {
         self.memory
             .read()

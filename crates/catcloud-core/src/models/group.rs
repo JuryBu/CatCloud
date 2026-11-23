@@ -202,6 +202,11 @@ pub struct MultiGroup {
     pub hysteresis_pct: f64,
     pub active_node_id: Option<String>,
     pub state: MultiGroupState,
+    /// When `true`, this group's `match_rules` remain active for split routing even if it is not
+    /// the currently selected active home group. Defaults to `false` to prevent unselected groups
+    /// from silently hijacking traffic.
+    #[serde(default)]
+    pub independent_routing: bool,
 }
 
 impl Default for MultiGroup {
@@ -226,6 +231,7 @@ impl Default for MultiGroup {
             hysteresis_pct: 20.0,
             active_node_id: None,
             state: MultiGroupState::Idle,
+            independent_routing: false,
         }
     }
 }
@@ -301,5 +307,27 @@ impl Default for MmRelayBundleV1 {
             role: MMRELAY_ROLE_DOMESTIC_PRE_ACCEL.to_string(),
             relays: Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_group_independent_routing_defaults_false_and_deserializes_legacy_json() {
+        let def = MultiGroup::default();
+        assert!(!def.independent_routing);
+
+        let legacy: MultiGroup =
+            serde_json::from_str(r#"{"id":"grp-legacy","name":"Legacy AI"}"#).unwrap();
+        assert_eq!(legacy.id, "grp-legacy");
+        assert!(!legacy.independent_routing);
+
+        let enabled: MultiGroup = serde_json::from_str(
+            r#"{"id":"grp-split","name":"Split AI","independent_routing":true}"#,
+        )
+        .unwrap();
+        assert!(enabled.independent_routing);
     }
 }

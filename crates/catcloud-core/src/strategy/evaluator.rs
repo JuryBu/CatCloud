@@ -374,7 +374,7 @@ pub fn evaluate_group_candidates(
 
         pool_node_ids.insert(node.id.as_str());
 
-        let failed_gates = evaluate_hard_gates(&hard_gates, &ctx)?;
+        let failed_gates = evaluate_hard_gates(&hard_gates, &ctx, snap)?;
         let passed_hard_gates = failed_gates.is_empty();
         let score = score_formula.eval_f64(&ctx)?;
 
@@ -410,9 +410,9 @@ pub fn evaluate_group_candidates(
         }
     }
 
-    gate_passed.sort_by(compare_candidates_desc);
-    healthy_candidates.sort_by(compare_candidates_desc);
-    gate_rejected.sort_by(compare_candidates_desc);
+    gate_passed.sort_by(|a, b| compare_candidates_with_snapshots_desc(a, b, snapshots));
+    healthy_candidates.sort_by(|a, b| compare_candidates_with_snapshots_desc(a, b, snapshots));
+    gate_rejected.sort_by(|a, b| compare_candidates_with_snapshots_desc(a, b, snapshots));
 
     let active_assessment = match group.active_node_id.as_deref().map(str::trim) {
         Some(active_id) if !active_id.is_empty() => Some(assess_active_node(
@@ -465,10 +465,22 @@ pub(crate) fn score_node_with_group_formula(
 fn evaluate_hard_gates(
     hard_gates: &[(String, FormulaExpr)],
     ctx: &EvalContext,
+    snapshot: Option<&ProbeSnapshot>,
 ) -> CatResult<Vec<String>> {
+    let keepalive_untested = snapshot.and_then(|s| s.keepalive_60s_ok).is_none();
     let mut failed = Vec::new();
     for (raw, expr) in hard_gates {
-        if !expr.eval_bool(ctx)? {
+        let passed = if keepalive_untested && expr.uses_keepalive_ok() {
+            // Node has never been tested for 60s keep-alive (`keepalive_60s_ok == None`):
+            // treat `keepalive_ok` as pass within hard gates so untested nodes are not falsely
+            // eliminated while still enforcing all other predicates in compound expressions.
+            let mut gate_ctx = ctx.clone();
+            gate_ctx.keepalive_ok = true;
+            expr.eval_bool(&gate_ctx)?
+        } else {
+            expr.eval_bool(ctx)?
+        };
+        if !passed {
             failed.push(raw.clone());
         }
     }
@@ -506,7 +518,7 @@ fn assess_active_node(
 
     let snap = snapshots.get(&node.id);
     let ctx = build_eval_context_for_probe(node, snap, primary_probe);
-    let failed_hard_gates = evaluate_hard_gates(hard_gates, &ctx)?;
+    let failed_hard_gates = evaluate_hard_gates(hard_gates, &ctx, snap)?;
     let passed_hard_gates = failed_hard_gates.is_empty();
     let score = score_formula.eval_f64(&ctx)?;
     let is_disconnected = !ctx.ok;
@@ -559,15 +571,342 @@ fn assess_active_node(
     })
 }
 
-/// Descending score comparator: finite scores rank above non-finite/NaN, ties break by `node_id` ascending.
+fn has_probe_data(snap: Option<&ProbeSnapshot>) -> bool {
+    let Some(s) = snap else {
+        return false;
+    };
+    !s.tested_at.trim().is_empty()
+        || s.ok
+        || s.latency_ms.is_some()
+        || s.up_mbps.is_some()
+        || s.down_mbps.is_some()
+        || s.google_clean.is_some()
+        || s.keepalive_60s_ok.is_some()
+        || !s.per_probe_ok.is_empty()
+        || !s.unlocked_sites.is_empty()
+}
+
+fn compare_candidates_with_snapshots_desc(
+    a: &EvaluatedCandidate,
+    b: &EvaluatedCandidate,
+    snapshots: &HashMap<String, ProbeSnapshot>,
+) -> Ordering {
+    let a_probed = has_probe_data(snapshots.get(&a.node_id));
+    let b_probed = has_probe_data(snapshots.get(&b.node_id));
+    b.meets_thresholds
+        .cmp(&a.meets_thresholds)
+        .then_with(|| b.ok.cmp(&a.ok))
+        .then_with(|| b_probed.cmp(&a_probed))
+        .then_with(|| compare_candidates_desc(a, b))
+}
+
+/// Descending candidate comparator:
+/// 1. `meets_thresholds == true` before `false`
+/// 2. healthy (`ok == true`) before failed/untested (`ok == false`)
+/// 3. finite higher scores before lower scores (non-finite/NaN last)
+/// 4. deterministic `node_id` ascending tie-break.
 pub(crate) fn compare_candidates_desc(a: &EvaluatedCandidate, b: &EvaluatedCandidate) -> Ordering {
-    match (a.score.is_finite(), b.score.is_finite()) {
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        (false, false) => a.node_id.cmp(&b.node_id),
-        (true, true) => b
-            .score
-            .total_cmp(&a.score)
-            .then_with(|| a.node_id.cmp(&b.node_id)),
+    b.meets_thresholds
+        .cmp(&a.meets_thresholds)
+        .then_with(|| b.ok.cmp(&a.ok))
+        .then_with(|| match (a.score.is_finite(), b.score.is_finite()) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => Ordering::Equal,
+            (true, true) => b.score.total_cmp(&a.score),
+        })
+        .then_with(|| a.node_id.cmp(&b.node_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{FallbackPolicy, MultiGroup, MultiGroupMode, ProbeSnapshot, ProxyNode, TriggerRule};
+
+    fn test_node(id: &str, name: &str, region: &str) -> ProxyNode {
+        ProxyNode {
+            id: id.to_string(),
+            sub_id: "sub-test".to_string(),
+            name: name.to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.10".to_string(),
+            port: 443,
+            region_code: region.to_string(),
+            multiplier: 1.0,
+            is_443_native: true,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn keepalive_hard_gate_allows_untested_none_and_rejects_explicit_false() {
+        let nodes = vec![
+            test_node("tw-untested-clean", "TW-Untested-Clean", "TW"),
+            test_node("tw-tested-ok", "TW-Tested-Ok", "TW"),
+            test_node("tw-tested-fail", "TW-Tested-Fail", "TW"),
+            test_node("tw-untested-dirty", "TW-Untested-Dirty", "TW"),
+        ];
+
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "tw-untested-clean".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-untested-clean".to_string(),
+                tested_at: "2026-11-23T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(40.0),
+                up_mbps: Some(25.0),
+                down_mbps: Some(150.0),
+                google_clean: Some(true),
+                keepalive_60s_ok: None,
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "tw-tested-ok".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-tested-ok".to_string(),
+                tested_at: "2026-11-23T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(50.0),
+                up_mbps: Some(15.0),
+                down_mbps: Some(120.0),
+                google_clean: Some(true),
+                keepalive_60s_ok: Some(true),
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "tw-tested-fail".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-tested-fail".to_string(),
+                tested_at: "2026-11-23T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(25.0),
+                up_mbps: Some(50.0),
+                down_mbps: Some(200.0),
+                google_clean: Some(true),
+                keepalive_60s_ok: Some(false),
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "tw-untested-dirty".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-untested-dirty".to_string(),
+                tested_at: "2026-11-23T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(30.0),
+                up_mbps: Some(40.0),
+                down_mbps: Some(180.0),
+                google_clean: Some(false),
+                keepalive_60s_ok: None,
+                ..Default::default()
+            },
+        );
+
+        let group = MultiGroup {
+            id: "grp-tw".to_string(),
+            name: "测试多选组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec![
+                "tw-untested-clean".to_string(),
+                "tw-tested-ok".to_string(),
+                "tw-tested-fail".to_string(),
+                "tw-untested-dirty".to_string(),
+            ],
+            hard_gates: vec![
+                "keepalive_ok == 1".to_string(),
+                "google_clean == 1 && keepalive_ok == 1".to_string(),
+            ],
+            active_node_id: Some("tw-untested-clean".to_string()),
+            ..Default::default()
+        };
+
+        let report = evaluate_group_candidates(&group, &nodes, &snaps).unwrap();
+        assert!(!report.all_failed_hard_gates);
+        let passed_ids: Vec<&str> = report.gate_passed.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(passed_ids, vec!["tw-untested-clean", "tw-tested-ok"]);
+        assert_eq!(report.healthy_candidates.len(), 2);
+        assert_eq!(report.healthy_candidates[0].node_id, "tw-untested-clean");
+
+        // Explicit keepalive_60s_ok == Some(false) and compound google_clean == false must be rejected.
+        let rejected_fail = report
+            .gate_rejected
+            .iter()
+            .find(|c| c.node_id == "tw-tested-fail")
+            .expect("explicit Some(false) must be rejected");
+        assert!(rejected_fail
+            .failed_hard_gates
+            .iter()
+            .any(|g| g == "keepalive_ok == 1"));
+
+        let rejected_dirty = report
+            .gate_rejected
+            .iter()
+            .find(|c| c.node_id == "tw-untested-dirty")
+            .expect("google_clean == false must still fail compound keepalive gate");
+        assert!(rejected_dirty
+            .failed_hard_gates
+            .iter()
+            .any(|g| g == "google_clean == 1 && keepalive_ok == 1"));
+
+        // Active node assessment must match candidate evaluation semantics.
+        let active = report.active_assessment.as_ref().expect("active assessment");
+        assert!(active.passed_hard_gates);
+
+        let group_active_fail = MultiGroup {
+            active_node_id: Some("tw-tested-fail".to_string()),
+            ..group
+        };
+        let report_active_fail =
+            evaluate_group_candidates(&group_active_fail, &nodes, &snaps).unwrap();
+        assert!(
+            !report_active_fail
+                .active_assessment
+                .as_ref()
+                .expect("active assessment")
+                .passed_hard_gates
+        );
+    }
+
+    #[test]
+    fn fallback_and_rejected_rankings_prioritize_healthy_then_probed_then_score() {
+        let nodes = vec![
+            // Lexicographically smallest ID to prove ordering is driven by probe presence, not tie-break.
+            test_node("a-unprobed", "Unprobed", "JP"),
+            test_node("n-failed-probed", "Failed-Probed", "JP"),
+            test_node("n-ok-low", "Ok-Low", "JP"),
+            test_node("n-ok-high", "Ok-High", "JP"),
+        ];
+
+        let mut snaps = HashMap::new();
+        // Healthy with lower (negative) score from latency penalty alone.
+        snaps.insert(
+            "n-ok-low".to_string(),
+            ProbeSnapshot {
+                node_id: "n-ok-low".to_string(),
+                tested_at: "2026-11-23T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(200.0),
+                up_mbps: Some(0.0),
+                down_mbps: Some(0.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+        // Healthy with high score.
+        snaps.insert(
+            "n-ok-high".to_string(),
+            ProbeSnapshot {
+                node_id: "n-ok-high".to_string(),
+                tested_at: "2026-11-23T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(40.0),
+                up_mbps: Some(12.0),
+                down_mbps: Some(100.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+        // Probed but failed (`ok == false`); even with `latency_ms = Some(0.0)` yielding a
+        // higher raw numeric score (0.0) than `n-ok-low` (-16.0), it MUST rank behind healthy nodes,
+        // and MUST rank ahead of `a-unprobed` despite lexicographically larger ID.
+        snaps.insert(
+            "n-failed-probed".to_string(),
+            ProbeSnapshot {
+                node_id: "n-failed-probed".to_string(),
+                tested_at: "2026-11-23T00:00:00Z".to_string(),
+                ok: false,
+                latency_ms: Some(0.0),
+                up_mbps: Some(0.0),
+                down_mbps: Some(0.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+        // `a-unprobed` intentionally omitted from `snaps`.
+
+        // 1. Trigger fallback (`healthy_candidates` empty): `gate_passed` must still rank
+        //    healthy high -> healthy low -> probed failed -> unprobed.
+        let fallback_group = MultiGroup {
+            id: "grp-fallback".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec![
+                "a-unprobed".to_string(),
+                "n-failed-probed".to_string(),
+                "n-ok-low".to_string(),
+                "n-ok-high".to_string(),
+            ],
+            trigger_rules: vec![TriggerRule {
+                expr: "up_mbps < 100.0".to_string(),
+                consecutive_failures: 1,
+                bypass_cooldown_on_disconnect: true,
+            }],
+            fallback_policy: FallbackPolicy::DegradeBestWarn,
+            ..Default::default()
+        };
+
+        let rep = evaluate_group_candidates(&fallback_group, &nodes, &snaps).unwrap();
+        assert!(rep.healthy_candidates.is_empty());
+        assert!(rep.all_below_threshold);
+        let passed_order: Vec<&str> = rep.gate_passed.iter().map(|c| c.node_id.as_str()).collect();
+        assert_eq!(
+            passed_order,
+            vec!["n-ok-high", "n-ok-low", "n-failed-probed", "a-unprobed"]
+        );
+
+        // 2. When all candidates fail hard gates, `gate_rejected` follows the exact same ranking.
+        let strict_group = MultiGroup {
+            hard_gates: vec!["site_unlocked(\"nonexistent\") == 1".to_string()],
+            ..fallback_group
+        };
+        let strict_rep = evaluate_group_candidates(&strict_group, &nodes, &snaps).unwrap();
+        assert!(strict_rep.all_failed_hard_gates);
+        let rejected_order: Vec<&str> = strict_rep
+            .gate_rejected
+            .iter()
+            .map(|c| c.node_id.as_str())
+            .collect();
+        assert_eq!(
+            rejected_order,
+            vec!["n-ok-high", "n-ok-low", "n-failed-probed", "a-unprobed"]
+        );
+    }
+
+    #[test]
+    fn legacy_probe_up_trigger_rule_uses_generic_snapshot_fallback() {
+        let nodes = vec![test_node("n-tw", "TW-Gold", "TW")];
+        let mut snaps = HashMap::new();
+        let mut snap = ProbeSnapshot {
+            node_id: "n-tw".to_string(),
+            tested_at: "2026-11-23T00:00:00Z".to_string(),
+            ok: true,
+            latency_ms: Some(45.0),
+            up_mbps: Some(16.0),
+            down_mbps: Some(150.0),
+            google_clean: Some(true),
+            ..Default::default()
+        };
+        snap.per_probe_up_mbps.insert("builtin_upload".to_string(), 16.0);
+        snaps.insert("n-tw".to_string(), snap);
+
+        let group = MultiGroup {
+            id: "grp-legacy".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-tw".to_string()],
+            trigger_rules: vec![TriggerRule {
+                expr: r#"probe_up("antigravity") < 2.0"#.to_string(),
+                consecutive_failures: 2,
+                bypass_cooldown_on_disconnect: true,
+            }],
+            ..Default::default()
+        };
+
+        let rep = evaluate_group_candidates(&group, &nodes, &snaps).unwrap();
+        assert_eq!(rep.healthy_candidates.len(), 1);
+        assert!(rep.healthy_candidates[0].meets_thresholds);
+        assert!(rep.healthy_candidates[0].triggered_rule_indices.is_empty());
     }
 }

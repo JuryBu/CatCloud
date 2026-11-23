@@ -3,12 +3,13 @@ pub mod lifecycle;
 pub mod shortcuts;
 pub mod tray;
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use catcloud_core::config;
-use catcloud_core::models::ProxyMode;
+use catcloud_core::models::{MultiGroup, MultiGroupMode, ProxyMode, RouteTargetMode};
 use catcloud_core::platform::default_platform;
 use catcloud_core::process_guard::{
     AcquireOutcome, JobGuard, SingleInstanceGuard, spawn_detached_self,
@@ -219,6 +220,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::close_group_connections,
             commands::close_all_connections,
             commands::get_recent_logs,
+            commands::get_traffic_history,
             commands::list_agent_docs,
             commands::export_agent_docs,
             commands::validate_formula_expr,
@@ -265,6 +267,8 @@ pub fn run_with_paths(paths: AppPaths) {
             spawn_telemetry_forwarders(&handle, &state);
             // Spawn background Windows ProxyGuard watchdog preventing third-party proxy hijacking.
             spawn_proxy_guard(&handle);
+            // Spawn background multi-group health watchdog driving automatic failover for StickyBest/ConditionalPool.
+            spawn_group_strategy_watchdog(&handle);
 
             let initial_menu = commands::build_tray_menu_state(&handle, &state);
             let initial_visual = commands::build_tray_visual_state(&state);
@@ -588,19 +592,323 @@ fn spawn_proxy_guard(app: &tauri::AppHandle) {
     });
 }
 
+fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
+    let app_h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let Ok(http_client) = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(3))
+            .timeout(Duration::from_secs(6))
+            .build()
+        else {
+            tracing::warn!("failed to initialize multi-group strategy watchdog HTTP client");
+            return;
+        };
+
+        let mut consecutive_fail_counts: HashMap<String, u32> = HashMap::new();
+        let mut last_auto_switch_at: HashMap<String, Instant> = HashMap::new();
+        let mut last_checked_node: HashMap<String, String> = HashMap::new();
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+
+            let Some(st) = app_h.try_state::<AppState>() else {
+                break;
+            };
+            if st.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+            // Skip health checks while isolated speed probes are saturating local bandwidth.
+            if st.probe_running.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            let cfg = st.snapshot_config();
+            if cfg.route_mode != RouteTargetMode::Group || cfg.proxy_mode == ProxyMode::Direct {
+                consecutive_fail_counts.clear();
+                continue;
+            }
+
+            if !st.adapter.has_live_controller().await {
+                consecutive_fail_counts.clear();
+                continue;
+            }
+            let rt = st.adapter.runtime_status().await;
+            if !rt.running {
+                consecutive_fail_counts.clear();
+                continue;
+            }
+            let secret = st.adapter.controller_secret().await;
+
+            // Snapshot groups & nodes under a brief sync lock; NEVER hold across `.await`.
+            let snapshot_res = st.storage.lock().ok().map(|db| {
+                (
+                    db.list_multi_groups().unwrap_or_default(),
+                    db.list_nodes().unwrap_or_default(),
+                )
+            });
+            let Some((groups, nodes)) = snapshot_res else {
+                continue;
+            };
+            if groups.is_empty() || nodes.is_empty() {
+                continue;
+            }
+
+            let primary_gid = cfg
+                .active_group_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|aid| groups.iter().find(|g| g.id == aid).map(|g| g.id.clone()))
+                .or_else(|| groups.first().map(|g| g.id.clone()));
+
+            let mut target_groups: Vec<(MultiGroup, bool)> = Vec::new();
+            for g in &groups {
+                let is_primary = primary_gid.as_deref() == Some(g.id.as_str());
+                if !(is_primary || g.independent_routing) {
+                    continue;
+                }
+                if !matches!(
+                    g.mode,
+                    MultiGroupMode::StickyBest | MultiGroupMode::ConditionalPool
+                ) {
+                    continue;
+                }
+                if commands::count_enabled_group_members(g, &nodes) < 2 {
+                    continue;
+                }
+                if !target_groups.iter().any(|(existing, _)| existing.id == g.id) {
+                    target_groups.push((g.clone(), is_primary));
+                }
+            }
+
+            consecutive_fail_counts
+                .retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
+            last_auto_switch_at.retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
+            last_checked_node.retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
+
+            if target_groups.is_empty() {
+                continue;
+            }
+
+            let ctrl_host = match rt.controller_host.trim() {
+                "" | "0.0.0.0" | "::" => "127.0.0.1".to_string(),
+                h if h.contains(':') && !h.starts_with('[') => format!("[{h}]"),
+                h => h.to_string(),
+            };
+
+            for (group, is_primary) in target_groups {
+                if st.shutting_down.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some(active_node) = commands::resolve_valid_group_active_node(&group, &nodes)
+                else {
+                    continue;
+                };
+                if last_checked_node.get(&group.id).map(String::as_str)
+                    != Some(active_node.id.as_str())
+                {
+                    consecutive_fail_counts.remove(&group.id);
+                    last_checked_node.insert(group.id.clone(), active_node.id.clone());
+                }
+
+                let compiled_proxy =
+                    st.resolve_compiled_proxy_name(&active_node.id, &active_node.name);
+                let encoded_proxy = commands::percent_encode_path_segment(&compiled_proxy);
+                let delay_url = format!(
+                    "http://{ctrl_host}:{}/proxies/{encoded_proxy}/delay?url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=4500",
+                    rt.controller_port
+                );
+
+                let mut req = http_client.get(&delay_url);
+                if !secret.trim().is_empty() {
+                    req = req.bearer_auth(&secret);
+                }
+
+                let healthy = match req.send().await {
+                    Ok(resp) if resp.status().is_success() => resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("delay").and_then(|d| d.as_u64()))
+                        .is_some_and(|delay| delay > 0),
+                    _ => false,
+                };
+
+                if healthy {
+                    // Healthy active node: reset failure counter and stay sticky (zero IP drift).
+                    consecutive_fail_counts.remove(&group.id);
+                    continue;
+                }
+
+                let fail_count = {
+                    let entry = consecutive_fail_counts.entry(group.id.clone()).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                    *entry
+                };
+                let required_failures = commands::group_watchdog_failure_threshold(&group);
+                let cooldown = Duration::from_secs(group.cooldown_sec.max(45));
+                let cooldown_elapsed = last_auto_switch_at
+                    .get(&group.id)
+                    .is_none_or(|last| last.elapsed() >= cooldown);
+
+                if fail_count < required_failures || !cooldown_elapsed {
+                    tracing::debug!(
+                        group = %group.name,
+                        node = %active_node.name,
+                        fail_count,
+                        required_failures,
+                        cooldown_elapsed,
+                        "group strategy watchdog recorded probe failure (holding)"
+                    );
+                    continue;
+                }
+
+                // Re-read latest group, nodes, and probe snapshots under a brief sync lock before switching.
+                let switch_plan = st.storage.lock().ok().and_then(|db| {
+                    let latest_group = db.get_multi_group(&group.id).ok().flatten()?;
+                    let latest_nodes = db.list_nodes().ok()?;
+                    let latest_active =
+                        commands::resolve_valid_group_active_node(&latest_group, &latest_nodes)?;
+                    if latest_active.id != active_node.id {
+                        return None;
+                    }
+                    let node_ids: Vec<String> =
+                        latest_nodes.iter().map(|n| n.id.clone()).collect();
+                    let snaps = db
+                        .get_probe_snapshots_batch(
+                            &node_ids,
+                            latest_group.primary_probe_id.as_deref(),
+                        )
+                        .unwrap_or_default();
+                    let next_id = commands::pick_best_group_candidate(
+                        &latest_group,
+                        &latest_nodes,
+                        &snaps,
+                        Some(&active_node.id),
+                    )?;
+                    let next_name = latest_nodes
+                        .iter()
+                        .find(|n| n.id == next_id)
+                        .map(|n| n.name.clone())
+                        .unwrap_or_else(|| next_id.clone());
+                    Some((latest_group.id, latest_group.name, next_id, next_name))
+                });
+
+                let Some((gid, gname, next_id, next_name)) = switch_plan else {
+                    continue;
+                };
+
+                // Re-check latest user config right before failover: if user switched to Single
+                // node mode or Direct mode during the 4.5s probe window, abort silently.
+                // Always switch in-place (`activate_group = false`) so background failover never
+                // hijacks the user's selected route mode or primary active group.
+                let latest_cfg = st.snapshot_config();
+                if latest_cfg.route_mode != RouteTargetMode::Group
+                    || latest_cfg.proxy_mode == ProxyMode::Direct
+                {
+                    continue;
+                }
+                let _ = is_primary;
+                let switch_res = commands::select_group_node_in_place_internal(
+                    &app_h,
+                    &st,
+                    gid.clone(),
+                    next_id.clone(),
+                    Some(true),
+                    Some(active_node.name.clone()),
+                )
+                .await;
+
+                match switch_res {
+                    Ok(_) => {
+                        consecutive_fail_counts.remove(&gid);
+                        last_auto_switch_at.insert(gid.clone(), Instant::now());
+                        last_checked_node.insert(gid.clone(), next_id.clone());
+                        let reason = format!(
+                            "原节点连续 {fail_count} 次健康探活失败，已自动切换至最优备用节点"
+                        );
+                        tracing::info!(
+                            group = %gname,
+                            from = %active_node.name,
+                            to = %next_name,
+                            fail_count,
+                            "group strategy watchdog auto-switched unhealthy active node"
+                        );
+                        let _ = app_h.emit(
+                            commands::EVENT_STRATEGY_SWITCH,
+                            serde_json::json!({
+                                "group_name": gname,
+                                "from_node": active_node.name,
+                                "to_node": next_name,
+                                "reason": reason,
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            group = %gname,
+                            from = %active_node.name,
+                            to = %next_name,
+                            "group strategy watchdog failover failed: {err}"
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
+struct TelemetryForwarderState {
+    observed_gen: u64,
+    auth_up_total: u64,
+    auth_down_total: u64,
+    delta_up_since_snap: u64,
+    delta_down_since_snap: u64,
+    core_mem_bytes: u64,
+    active_connections: usize,
+    last_traffic_at: Option<Instant>,
+}
+
+impl TelemetryForwarderState {
+    fn new(observed_gen: u64) -> Self {
+        Self {
+            observed_gen,
+            auth_up_total: 0,
+            auth_down_total: 0,
+            delta_up_since_snap: 0,
+            delta_down_since_snap: 0,
+            core_mem_bytes: 0,
+            active_connections: 0,
+            last_traffic_at: None,
+        }
+    }
+
+    fn reset_if_gen_changed(&mut self, cur_gen: u64) {
+        if cur_gen != self.observed_gen {
+            self.observed_gen = cur_gen;
+            self.auth_up_total = 0;
+            self.auth_down_total = 0;
+            self.delta_up_since_snap = 0;
+            self.delta_down_since_snap = 0;
+            self.core_mem_bytes = 0;
+            self.active_connections = 0;
+            self.last_traffic_at = None;
+        }
+    }
+}
+
 fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
     // 1. Traffic & memory forwarder -> emits `catcloud://traffic` and updates throttled tray tooltip.
     {
         let app_h = app.clone();
         let mut rx_traffic = state.telemetry.subscribe_traffic();
         let mut rx_memory = state.telemetry.subscribe_memory();
-        let mut observed_gen: u64 = state.core_session_generation();
+        let initial_gen: u64 = state.core_session_generation();
         tauri::async_runtime::spawn(async move {
-            let mut up_total: u64 = 0;
-            let mut down_total: u64 = 0;
-            let mut core_mem_bytes: u64 = 0;
-            let mut active_connections: usize = 0;
-            let mut last_traffic_at: Option<Instant> = None;
+            // Track Mihomo's authoritative cumulative totals from `/connections` separately from
+            // intra-poll 1Hz `/traffic` deltas so the two sources NEVER double-count each other.
+            let mut session = TelemetryForwarderState::new(initial_gen);
             let mut last_tray_sync = Instant::now();
             let mut conn_poll = tokio::time::interval(Duration::from_secs(2));
             conn_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -610,16 +918,9 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                     _ = conn_poll.tick() => {
                         let win = lifecycle::window_mode_snapshot(&app_h);
                         if let Some(st) = app_h.try_state::<AppState>() {
-                            let cur_gen = st.core_session_generation();
-                            if cur_gen != observed_gen {
-                                observed_gen = cur_gen;
-                                up_total = 0;
-                                down_total = 0;
-                                core_mem_bytes = 0;
-                                active_connections = 0;
-                                last_traffic_at = None;
-                            }
-                            let traffic_quiet = last_traffic_at
+                            session.reset_if_gen_changed(st.core_session_generation());
+                            let traffic_quiet = session
+                                .last_traffic_at
                                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
                             if !win.main_open && !win.capsule_open {
                                 if traffic_quiet {
@@ -640,30 +941,34 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                 }
                                 continue;
                             }
-                            if st.adapter.has_live_controller().await {
+                            if st.adapter.has_live_controller().await && st.snapshot_runtime().running {
+                                let req_gen = st.core_session_generation();
                                 if let Ok(snap) = st.adapter.list_connections().await {
-                                    let cur_gen_after = st.core_session_generation();
-                                    if cur_gen_after != observed_gen {
-                                        observed_gen = cur_gen_after;
-                                        up_total = 0;
-                                        down_total = 0;
-                                        core_mem_bytes = 0;
-                                        last_traffic_at = None;
+                                    let cur_gen = st.core_session_generation();
+                                    if cur_gen != req_gen || !st.snapshot_runtime().running {
+                                        session.reset_if_gen_changed(cur_gen);
+                                        continue;
                                     }
-                                    active_connections = snap.connections.len();
+                                    session.reset_if_gen_changed(cur_gen);
+                                    session.active_connections = snap.connections.len();
                                     if snap.memory > 0 {
-                                        core_mem_bytes = snap.memory;
+                                        session.core_mem_bytes = snap.memory;
                                     }
-                                    if snap.upload_total > up_total {
-                                        up_total = snap.upload_total;
+                                    // Reconcile strictly to Mihomo's authoritative session totals and reset
+                                    // the intra-poll delta accumulator to prevent double-counting drift.
+                                    if snap.upload_total >= session.auth_up_total {
+                                        session.auth_up_total = snap.upload_total;
                                     }
-                                    if snap.download_total > down_total {
-                                        down_total = snap.download_total;
+                                    if snap.download_total >= session.auth_down_total {
+                                        session.auth_down_total = snap.download_total;
                                     }
-                                    let quiet_now = last_traffic_at
+                                    session.delta_up_since_snap = 0;
+                                    session.delta_down_since_snap = 0;
+                                    let quiet_now = session
+                                        .last_traffic_at
                                         .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
                                     if let Ok(mut m) = st.cached_metrics.write() {
-                                        m.core_mem_bytes = core_mem_bytes;
+                                        m.core_mem_bytes = session.core_mem_bytes;
                                         if quiet_now {
                                             m.up_bps = 0;
                                             m.down_bps = 0;
@@ -675,10 +980,10 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                         let payload = TrafficEventPayload {
                                             up_bps: 0,
                                             down_bps: 0,
-                                            up_total_bytes: up_total,
-                                            down_total_bytes: down_total,
-                                            active_connections,
-                                            core_memory_mb: (core_mem_bytes as f64) / (1024.0 * 1024.0),
+                                            up_total_bytes: session.auth_up_total,
+                                            down_total_bytes: session.auth_down_total,
+                                            active_connections: session.active_connections,
+                                            core_memory_mb: (session.core_mem_bytes as f64) / (1024.0 * 1024.0),
                                             timestamp_ms: chrono::Utc::now().timestamp_millis(),
                                         };
                                         let _ = app_h.emit(commands::EVENT_TRAFFIC, payload);
@@ -697,23 +1002,15 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                     res = rx_memory.recv() => match res {
                         Ok(mem) => {
                             if let Some(st) = app_h.try_state::<AppState>() {
-                                let cur_gen = st.core_session_generation();
-                                if cur_gen != observed_gen {
-                                    observed_gen = cur_gen;
-                                    up_total = 0;
-                                    down_total = 0;
-                                    core_mem_bytes = 0;
-                                    active_connections = 0;
-                                    last_traffic_at = None;
-                                }
+                                session.reset_if_gen_changed(st.core_session_generation());
                                 if mem.inuse > 0 {
-                                    core_mem_bytes = mem.inuse;
+                                    session.core_mem_bytes = mem.inuse;
                                 }
                                 if let Ok(mut m) = st.cached_metrics.write() {
-                                    m.core_mem_bytes = core_mem_bytes;
+                                    m.core_mem_bytes = session.core_mem_bytes;
                                 }
                             } else if mem.inuse > 0 {
-                                core_mem_bytes = mem.inuse;
+                                session.core_mem_bytes = mem.inuse;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -722,29 +1019,25 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                     res = rx_traffic.recv() => match res {
                         Ok(tick) => {
                             if let Some(st) = app_h.try_state::<AppState>() {
-                                let cur_gen = st.core_session_generation();
-                                if cur_gen != observed_gen {
-                                    observed_gen = cur_gen;
-                                    up_total = 0;
-                                    down_total = 0;
-                                    core_mem_bytes = 0;
-                                    active_connections = 0;
+                                session.reset_if_gen_changed(st.core_session_generation());
+                                if !st.snapshot_runtime().running {
+                                    continue;
                                 }
-                                last_traffic_at = Some(Instant::now());
-                                up_total = up_total.saturating_add(tick.up);
-                                down_total = down_total.saturating_add(tick.down);
+                                session.last_traffic_at = Some(Instant::now());
+                                session.delta_up_since_snap = session.delta_up_since_snap.saturating_add(tick.up);
+                                session.delta_down_since_snap = session.delta_down_since_snap.saturating_add(tick.down);
                                 if let Ok(mut m) = st.cached_metrics.write() {
                                     m.up_bps = tick.up;
                                     m.down_bps = tick.down;
-                                    m.core_mem_bytes = core_mem_bytes;
+                                    m.core_mem_bytes = session.core_mem_bytes;
                                 }
                                 let payload = TrafficEventPayload {
                                     up_bps: tick.up,
                                     down_bps: tick.down,
-                                    up_total_bytes: up_total,
-                                    down_total_bytes: down_total,
-                                    active_connections,
-                                    core_memory_mb: (core_mem_bytes as f64) / (1024.0 * 1024.0),
+                                    up_total_bytes: session.auth_up_total.saturating_add(session.delta_up_since_snap),
+                                    down_total_bytes: session.auth_down_total.saturating_add(session.delta_down_since_snap),
+                                    active_connections: session.active_connections,
+                                    core_memory_mb: (session.core_mem_bytes as f64) / (1024.0 * 1024.0),
                                     timestamp_ms: tick.timestamp_ms,
                                 };
                                 let _ = app_h.emit(commands::EVENT_TRAFFIC, payload);

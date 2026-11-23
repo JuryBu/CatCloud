@@ -72,14 +72,14 @@ const DEFAULT_QUICK_SITES: ReadonlyArray<SiteCheckItem> = [
   {
     id: "site-youtube",
     name: "YouTube",
-    url: "https://www.youtube.com",
+    url: "https://www.youtube.com/generate_204",
     latency_ms: null,
     ok: null,
   },
   {
     id: "site-chatgpt",
     name: "OpenAI",
-    url: "https://chatgpt.com",
+    url: "https://chatgpt.com/cdn-cgi/trace",
     latency_ms: null,
     ok: null,
   },
@@ -291,6 +291,17 @@ export function HomePage() {
   }, [groups, runtime.active_group_id]);
 
   const activeGroupId = activeGroup?.id ?? runtime.active_group_id ?? "";
+
+  const otherIndependentGroups = useMemo(
+    () =>
+      groups.filter(
+        (g) =>
+          g.id !== activeGroupId &&
+          Boolean(g.independent_routing) &&
+          g.match_rules.length > 0
+      ),
+    [groups, activeGroupId]
+  );
 
   const groupCandidateNodes = useMemo<ProxyNode[]>(() => {
     if (nodes.length === 0) return [];
@@ -508,11 +519,16 @@ export function HomePage() {
   };
 
   const persistQuickSites = async (nextSites: SiteCheckItem[]): Promise<boolean> => {
-    const payload = nextSites.map((s) => ({
-      id: s.id,
-      name: s.name,
-      url: s.url,
-    }));
+    const payload = nextSites.map((s) => {
+      const lowerUrl = s.url.trim().toLowerCase();
+      const expectedStatus = lowerUrl.includes("generate_204") ? 204 : 200;
+      return {
+        id: s.id,
+        name: s.name,
+        url: s.url,
+        expected_status: expectedStatus,
+      };
+    });
     try {
       await catcloudApi.saveExtendedSettings({ core_runtime: { quick_check_sites: payload } });
       appActions.syncQuickSites(nextSites);
@@ -979,7 +995,7 @@ export function HomePage() {
                     type="button"
                     onClick={() => appActions.setNav("nodes")}
                     className="group flex w-full items-center justify-between gap-3 rounded-2xl border border-[var(--green)]/45 bg-[var(--bg-elevated)] px-3.5 py-3 text-left transition-all hover:border-[var(--green)] hover:bg-[var(--green-soft)]/30"
-                    title="点击前往「节点与订阅」挑选单个节点"
+                    title="点击前往「节点与测速」挑选单个节点"
                   >
                     <div className="min-w-0 flex-1">
                       <div className="flex flex-wrap items-center gap-2">
@@ -1200,6 +1216,37 @@ export function HomePage() {
                           />
                         </button>
                       </div>
+
+                      {/* Transparent notice when other groups have independent site routing enabled */}
+                      {otherIndependentGroups.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNodeMenuOpen(false);
+                            appActions.setNav("groups");
+                          }}
+                          className="flex w-full items-center justify-between gap-2 rounded-b-2xl border-t border-[var(--amber)]/25 bg-[var(--amber-soft)]/45 px-3.5 py-1.5 text-left text-[11px] transition-colors hover:bg-[var(--amber-soft)]/70"
+                          title="点击前往「智能多选组」查看或管理独立分流组"
+                        >
+                          <span className="flex min-w-0 items-center gap-1.5 text-[var(--text-secondary)]">
+                            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]" />
+                            <span className="truncate">
+                              另有{" "}
+                              <strong className="cc-mono font-semibold text-[var(--amber)]">
+                                {otherIndependentGroups.length}
+                              </strong>{" "}
+                              个独立分流组生效：
+                              <span className="font-medium text-[var(--text)]">
+                                {otherIndependentGroups.map((g) => g.name).join("、")}
+                              </span>
+                            </span>
+                          </span>
+                          <span className="inline-flex shrink-0 items-center gap-0.5 font-medium text-[var(--amber)]">
+                            <span>查看</span>
+                            <ArrowRight className="h-3 w-3" />
+                          </span>
+                        </button>
+                      )}
                     </div>
 
                     {/* In-Group Node Quick Picker Popover */}

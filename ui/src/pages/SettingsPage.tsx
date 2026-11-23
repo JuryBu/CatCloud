@@ -221,9 +221,8 @@ const HOTKEY_LABELS: Record<string, string> = {
 const STARTUP_PAGE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
   { value: "overview", label: "总览" },
   { value: "groups", label: "智能多选组" },
-  { value: "speedtest", label: "节点测速" },
+  { value: "nodes", label: "节点与测速" },
   { value: "preaccel", label: "国内提速" },
-  { value: "nodes", label: "节点与订阅" },
   { value: "rules", label: "分流与连接" },
   { value: "logs", label: "运行日志" },
   { value: "settings", label: "设置" },
@@ -486,8 +485,12 @@ function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
       : "",
     overrideScriptPath: rules?.override_script_path ?? "",
     startupScriptPath: cr?.startup_script_path ?? "",
-    startupPage:
-      !beh?.startup_page || beh.startup_page === "home" ? "overview" : beh.startup_page,
+    startupPage: (() => {
+      const raw = beh?.startup_page?.trim().toLowerCase();
+      if (!raw || raw === "home") return "overview";
+      if (raw === "speedtest") return "nodes";
+      return raw;
+    })(),
     trayClickAction: beh?.tray_click_action ?? "toggle_main_window",
     closeToWindowless: beh?.minimize_to_tray_on_close ?? true,
     hotkeys: {

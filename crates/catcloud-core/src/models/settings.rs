@@ -603,7 +603,7 @@ impl Default for CoreRuntimeConfig {
                 QuickCheckSite {
                     id: "openai".to_string(),
                     name: "OpenAI".to_string(),
-                    url: "https://chatgpt.com".to_string(),
+                    url: "https://chatgpt.com/cdn-cgi/trace".to_string(),
                     expected_status: Some(200),
                 },
             ],
@@ -980,6 +980,15 @@ mod tests {
 
         assert!(cfg.rules_override.block_quic_udp_443);
         assert!(cfg.rules_override.domestic_direct_enabled);
+
+        let openai_site = cfg
+            .core_runtime
+            .quick_check_sites
+            .iter()
+            .find(|s| s.id == "openai")
+            .expect("default openai quick check site");
+        assert_eq!(openai_site.url, "https://chatgpt.com/cdn-cgi/trace");
+        assert_eq!(openai_site.expected_status, Some(200));
 
         // Legacy JSON missing newly added fields must populate defaults via serde attributes.
         let legacy: AppConfig = serde_json::from_str(r#"{"dns":{},"rules_override":{}}"#).unwrap();

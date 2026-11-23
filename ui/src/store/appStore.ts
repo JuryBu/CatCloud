@@ -57,11 +57,11 @@ export interface ToastNotice {
   tone: "info" | "ok" | "warn";
 }
 
-export const TRAFFIC_HISTORY_CAPACITY = 300;
+export const TRAFFIC_HISTORY_CAPACITY = 600;
 const UI_PREFS_STORAGE_KEY = "catcloud.ui.prefs.v1";
 
 /**
- * Fixed-length 300-point Float64Array ring buffer (2s x 300 = 10 minutes).
+ * Fixed-length 600-point Float64Array ring buffer (1s x 600 = full 10 minutes).
  * Zero allocations on push; zero GC churn during steady-state streaming.
  */
 export class TrafficRingBuffer {
@@ -198,8 +198,9 @@ const VALID_ROUTES = new Set<NavRouteId>([
 
 function detectNavFromHash(): NavRouteId {
   if (typeof window === "undefined") return "overview";
-  const raw = window.location.hash.replace(/^#\/?/, "").toLowerCase() as NavRouteId;
-  return VALID_ROUTES.has(raw) ? raw : "overview";
+  const raw = window.location.hash.replace(/^#\/?/, "").toLowerCase();
+  if (raw === "speedtest") return "nodes";
+  return VALID_ROUTES.has(raw as NavRouteId) ? (raw as NavRouteId) : "overview";
 }
 
 function hasExplicitRouteHash(): boolean {
@@ -430,6 +431,7 @@ export interface AppState {
   windowMode: WindowMode;
   activeNav: NavRouteId;
   settingsTabHint: "system" | "appearance" | "dns" | "core" | "updates" | null;
+  nodesTabHint: { tab: "nodes" | "subs"; subId?: string | null } | null;
   config: AppConfig;
   resolvedTheme: ResolvedTheme;
   wallpaperPreviewUrl: string | null;
@@ -498,7 +500,7 @@ const EMPTY_TRAFFIC: TrafficSample = {
 let initialTraffic: TrafficSample = EMPTY_TRAFFIC;
 let initialTrafficVersion = 0;
 if (!runningInTauri) {
-  const seedSamples = generateSeedTrafficSamples(75, 2000);
+  const seedSamples = generateSeedTrafficSamples(300, 1000);
   for (const s of seedSamples) {
     trafficBuffer.push(s.up_bps, s.down_bps, s.timestamp_ms);
   }
@@ -649,6 +651,7 @@ let state: AppState = {
   windowMode: initialWindowMode,
   activeNav: detectNavFromHash(),
   settingsTabHint: null,
+  nodesTabHint: null,
   config: initialConfig,
   resolvedTheme: initialResolvedTheme,
   wallpaperPreviewUrl: null,
@@ -699,7 +702,11 @@ let toastTimer: number | null = null;
 let mascotResetTimer: number | null = null;
 let toastSeq = 0;
 
-function pushToast(text: string, tone: ToastNotice["tone"] = "info"): void {
+function pushToast(
+  text: string,
+  tone: ToastNotice["tone"] = "info",
+  durationMs = 3000
+): void {
   toastSeq += 1;
   const id = toastSeq;
   setState((prev) => ({ ...prev, toast: { id, text, tone } }));
@@ -709,7 +716,7 @@ function pushToast(text: string, tone: ToastNotice["tone"] = "info"): void {
   toastTimer = window.setTimeout(() => {
     toastTimer = null;
     setState((prev) => (prev.toast?.id === id ? { ...prev, toast: null } : prev));
-  }, 3000);
+  }, durationMs);
 }
 
 let bootStarted = false;
@@ -719,6 +726,7 @@ let personalizationReqSeq = 0;
 let disposeTraffic: (() => void) | null = null;
 let disposeRuntime: (() => void) | null = null;
 let disposeProbeProgress: (() => void) | null = null;
+let disposeStrategySwitch: (() => void) | null = null;
 let disposeTunNeedsAdmin: (() => void) | null = null;
 let themeClockTimer: number | null = null;
 
@@ -838,11 +846,71 @@ async function hydrateFromBackend(): Promise<void> {
     fullCfgRes.value
   ) {
     const rawStartup = fullCfgRes.value.behavior?.startup_page?.trim().toLowerCase();
-    if (rawStartup && VALID_ROUTES.has(rawStartup as NavRouteId)) {
-      startupNav = rawStartup as NavRouteId;
+    const mappedStartup = rawStartup === "speedtest" ? "nodes" : rawStartup;
+    if (mappedStartup && VALID_ROUTES.has(mappedStartup as NavRouteId)) {
+      startupNav = mappedStartup as NavRouteId;
     }
   }
   startupPageApplied = true;
+
+  const resolvedRuntime = runtimeRes.status === "fulfilled" ? runtimeRes.value : state.runtime;
+
+  // Backfill up to 10 minutes of buffered 1Hz telemetry from CoreTelemetryStore whenever the
+  // main window opens/reopens while the core is running. Merge by timestamp_ms so early live
+  // ticks arriving via `subscribeTraffic` before IPC returns never cause history to be dropped.
+  if (inDesktop && resolvedRuntime.running) {
+    try {
+      const history = await catcloudApi.getTrafficHistory();
+      if (history.length > 0) {
+        const merged = new Map<number, { up: number; down: number; ts: number }>();
+        for (const pt of history) {
+          if (pt.timestamp_ms > 0) {
+            merged.set(pt.timestamp_ms, {
+              up: pt.up_bps,
+              down: pt.down_bps,
+              ts: pt.timestamp_ms,
+            });
+          }
+        }
+        const existingLen = trafficBuffer.length;
+        for (let i = 0; i < existingLen; i++) {
+          const ts = trafficBuffer.tsAt(i);
+          if (ts > 0) {
+            merged.set(ts, {
+              up: trafficBuffer.upAt(i),
+              down: trafficBuffer.downAt(i),
+              ts,
+            });
+          }
+        }
+        const sorted = Array.from(merged.values()).sort((a, b) => a.ts - b.ts);
+        const tailSlice =
+          sorted.length > TRAFFIC_HISTORY_CAPACITY
+            ? sorted.slice(sorted.length - TRAFFIC_HISTORY_CAPACITY)
+            : sorted;
+        trafficBuffer.clear();
+        for (const pt of tailSlice) {
+          trafficBuffer.push(pt.up, pt.down, pt.ts);
+        }
+        const lastHist = history[history.length - 1];
+        const newest = tailSlice[tailSlice.length - 1];
+        state = {
+          ...state,
+          latestTraffic: {
+            ...state.latestTraffic,
+            up_bps: newest ? newest.up : state.latestTraffic.up_bps,
+            down_bps: newest ? newest.down : state.latestTraffic.down_bps,
+            memory_mb: state.latestTraffic.memory_mb || lastHist.memory_mb,
+            timestamp_ms: newest ? newest.ts : state.latestTraffic.timestamp_ms,
+          },
+          trafficVersion: state.trafficVersion + 1,
+        };
+        emitTraffic();
+      }
+    } catch {
+      /* ignore optional history backfill failure on older backend */
+    }
+  }
 
   setState((prev) => ({
     ...prev,
@@ -850,7 +918,7 @@ async function hydrateFromBackend(): Promise<void> {
     activeNav: startupNav ?? prev.activeNav,
     config: mergedConfig,
     resolvedTheme: resolved,
-    runtime: runtimeRes.status === "fulfilled" ? runtimeRes.value : prev.runtime,
+    runtime: resolvedRuntime,
     groups: groupsRes.status === "fulfilled" ? groupsRes.value : prev.groups,
     nodes: nodesRes.status === "fulfilled" ? nodesRes.value : prev.nodes,
     probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
@@ -924,6 +992,36 @@ export const appStore = {
     });
 
     disposeRuntime = catcloudApi.subscribeRuntimeUpdate((info) => {
+      const wasRunning = state.runtime.running;
+      if (wasRunning && !info.running) {
+        // Core stopped: append a clean 0 B/s landing sample & zero live speeds so curve drops naturally
+        const stopTs = Date.now();
+        if (trafficBuffer.length > 0) {
+          trafficBuffer.push(0, 0, stopTs);
+        }
+        state = {
+          ...state,
+          latestTraffic: {
+            ...state.latestTraffic,
+            up_bps: 0,
+            down_bps: 0,
+            connections: 0,
+            memory_mb: 0,
+            timestamp_ms: stopTs,
+          },
+          trafficVersion: state.trafficVersion + 1,
+        };
+        emitTraffic();
+      } else if (!wasRunning && info.running) {
+        // Fresh core session started: clear previous session's stale buffer so new timeline starts clean
+        trafficBuffer.clear();
+        state = {
+          ...state,
+          latestTraffic: { ...EMPTY_TRAFFIC, timestamp_ms: Date.now() },
+          trafficVersion: state.trafficVersion + 1,
+        };
+        emitTraffic();
+      }
       setState((prev) => ({ ...prev, runtime: info }));
     });
 
@@ -948,6 +1046,45 @@ export const appStore = {
             cancelled: ev.cancelled,
           },
         };
+      });
+    });
+
+    disposeStrategySwitch = catcloudApi.subscribeStrategySwitch((ev) => {
+      const groupLabel = ev.group_name?.trim() || "当前多选组";
+      const toLabel = ev.to_node?.trim() || "最优节点";
+      const reasonText = ev.reason?.trim();
+      const fromLabel = ev.from_node?.trim();
+      const detail = reasonText
+        ? reasonText
+        : fromLabel
+          ? `原节点 ${fromLabel} 异常`
+          : "检测到原节点异常";
+
+      pushToast(
+        `智能策略已生效：「${groupLabel}」${detail}，已自动切换至 ${toLabel}`,
+        "info",
+        5000
+      );
+
+      void Promise.allSettled([
+        catcloudApi.getRuntimeInfo(),
+        catcloudApi.listGroups(),
+      ]).then(([rtRes, groupsRes]) => {
+        if (!bootStarted) return;
+        setState((prev) => {
+          const nextRuntime = rtRes.status === "fulfilled" ? rtRes.value : prev.runtime;
+          const nextGroups = groupsRes.status === "fulfilled" ? groupsRes.value : prev.groups;
+          const activeNodeChanged =
+            nextRuntime.active_node_id !== prev.runtime.active_node_id;
+          return {
+            ...prev,
+            runtime: nextRuntime,
+            groups: nextGroups,
+            exitIp: activeNodeChanged
+              ? buildPendingExitIp(nextRuntime.running)
+              : prev.exitIp,
+          };
+        });
       });
     });
 
@@ -1013,6 +1150,8 @@ export const appStore = {
     disposeRuntime = null;
     disposeProbeProgress?.();
     disposeProbeProgress = null;
+    disposeStrategySwitch?.();
+    disposeStrategySwitch = null;
     disposeTunNeedsAdmin?.();
     disposeTunNeedsAdmin = null;
     if (typeof window !== "undefined") {
@@ -1039,14 +1178,27 @@ export const appStore = {
 
 export const appActions = {
   setNav(nav: NavRouteId): void {
+    const normalized: NavRouteId = nav === "speedtest" ? "nodes" : nav;
     userNavigatedManually = true;
     if (typeof window !== "undefined" && state.windowMode === "main") {
-      const targetHash = `#${nav}`;
+      const targetHash = `#${normalized}`;
       if (window.location.hash !== targetHash) {
         window.history.replaceState(null, "", targetHash);
       }
     }
-    setState((prev) => (prev.activeNav === nav ? prev : { ...prev, activeNav: nav }));
+    setState((prev) => (prev.activeNav === normalized ? prev : { ...prev, activeNav: normalized }));
+  },
+
+  openNodesWorkspace(tab: "nodes" | "subs" = "nodes", subId?: string | null): void {
+    setState((prev) => ({
+      ...prev,
+      nodesTabHint: { tab, subId: subId ?? null },
+    }));
+    appActions.setNav("nodes");
+  },
+
+  consumeNodesTabHint(): void {
+    setState((prev) => (prev.nodesTabHint === null ? prev : { ...prev, nodesTabHint: null }));
   },
 
   openSettingsTab(tab: "system" | "appearance" | "dns" | "core" | "updates"): void {

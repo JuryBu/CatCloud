@@ -2253,7 +2253,15 @@ function ProcessAttachDrawer({
  * Main Page Export: NodesSubsPage
  * ============================================================================ */
 
-export function NodesSubsPage() {
+export interface NodesSubsPageProps {
+  embeddedSubsOnly?: boolean;
+  onViewSubNodes?: (subId: string | null) => void;
+}
+
+export function NodesSubsPage({
+  embeddedSubsOnly = false,
+  onViewSubNodes,
+}: NodesSubsPageProps = {}) {
   const storeSubs = useAppSelector((s) => s.subscriptions);
   const storeNodes = useAppSelector((s) => s.nodes);
   const storeProbes = useAppSelector((s) => s.probes);
@@ -3244,6 +3252,7 @@ export function NodesSubsPage() {
       {/* ====================================================================
        * 1. Compact Header, Route Mode Guide Bar & Refresh All Bar
        * ==================================================================== */}
+      {!embeddedSubsOnly && (
       <section className="cc-card cc-glass space-y-2.5 rounded-2xl px-4 py-3">
         <div className="flex flex-wrap items-center justify-between gap-2.5">
           <div className="min-w-0">
@@ -3321,6 +3330,7 @@ export function NodesSubsPage() {
           </button>
         </div>
       </section>
+      )}
 
       {/* ====================================================================
        * 2. Beginner-Friendly 3-Card Quick Import Hub
@@ -3549,7 +3559,37 @@ export function NodesSubsPage() {
       {/* ====================================================================
        * 3. Adaptive Subscription Cards Grid
        * ==================================================================== */}
-      <section aria-label="已导入订阅卡片">
+      <section aria-label="已导入订阅卡片" className="space-y-2.5">
+        {embeddedSubsOnly && (
+          <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-xs font-semibold text-[var(--text)]">
+                已导入订阅（{subscriptions.length}）
+              </h2>
+              <span className="inline-flex items-center gap-1 text-[11px] text-[var(--green)]">
+                <ShieldCheck className="h-3.5 w-3.5" />
+                刷新失败时自动保留原有节点
+              </span>
+            </div>
+            <button
+              type="button"
+              disabled={refreshingAll || subscriptions.length === 0}
+              onClick={() => void refreshAllSubscriptions()}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 text-[var(--accent)] ${refreshingAll ? "animate-spin" : ""}`}
+              />
+              全部刷新
+            </button>
+          </div>
+        )}
+
+        {subscriptions.length === 0 ? (
+          <div className="cc-card cc-glass rounded-2xl px-4 py-6 text-center text-xs text-[var(--muted)]">
+            还没有导入订阅来源，请先在上方任选一种方式添加节点
+          </div>
+        ) : (
         <div
           className={
             subscriptions.length >= 3
@@ -3574,7 +3614,7 @@ export function NodesSubsPage() {
                   : "var(--accent)";
             const expire = formatExpireInfo(sub.expires_at);
             const nodeCount = subNodeCountMap.get(sub.id) ?? 0;
-            const isSelectedFilter = filterSubId === sub.id;
+            const isSelectedFilter = !embeddedSubsOnly && filterSubId === sub.id;
             const isRefreshing = Boolean(refreshingIds[sub.id]) || refreshingAll;
             const maskedSource = maskSubscriptionSource(getSubSource(sub));
 
@@ -3590,11 +3630,15 @@ export function NodesSubsPage() {
                   <div className="flex items-start justify-between gap-2">
                     <button
                       type="button"
-                      onClick={() =>
-                        setFilterSubId(isSelectedFilter ? "all" : sub.id)
-                      }
+                      onClick={() => {
+                        if (onViewSubNodes) {
+                          onViewSubNodes(sub.id);
+                        } else {
+                          setFilterSubId(isSelectedFilter ? "all" : sub.id);
+                        }
+                      }}
                       className="min-w-0 text-left"
-                      title="点击只看这个订阅的节点"
+                      title={onViewSubNodes ? "查看这个订阅下的节点" : "点击只看这个订阅的节点"}
                     >
                       <div className="flex items-center gap-1.5">
                         <span className="truncate text-sm font-semibold text-[var(--text)]">
@@ -3717,12 +3761,29 @@ export function NodesSubsPage() {
                       <span>{sub.last_error}</span>
                     </div>
                   )}
+
+                  {onViewSubNodes && (
+                    <div className="flex items-center justify-end pt-1">
+                      <button
+                        type="button"
+                        onClick={() => onViewSubNodes(sub.id)}
+                        className="inline-flex items-center gap-1 rounded-lg border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
+                      >
+                        <span>查看节点（{nodeCount}）</span>
+                        <ChevronRight className="h-3 w-3" />
+                      </button>
+                    </div>
+                  )}
                 </div>
               </article>
             );
           })}
         </div>
+        )}
       </section>
+
+      {!embeddedSubsOnly && (
+      <>
 
       {/* ====================================================================
        * 4. Compact Node Filter Bar (Primary: Search + Source + Region; More Filters Collapsible)
@@ -4522,6 +4583,8 @@ export function NodesSubsPage() {
           />
         )}
       </section>
+      </>
+      )}
 
       {/* ====================================================================
        * 7. Slide-Over Drawers: Legacy Read-Only Migration & Process Attach

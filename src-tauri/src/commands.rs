@@ -74,6 +74,7 @@ pub const EVENT_RUNTIME: &str = "catcloud://runtime";
 pub const EVENT_CORE_LOG: &str = "catcloud://core-log";
 pub const EVENT_PROBE_PROGRESS: &str = "catcloud://probe-progress";
 pub const EVENT_TUN_NEEDS_ADMIN: &str = "catcloud://tun-needs-admin";
+pub const EVENT_STRATEGY_SWITCH: &str = "catcloud://strategy-switch";
 
 /// Shared backend state managed by Tauri across commands, tray callbacks, streams, and shortcuts.
 pub struct AppState {
@@ -539,6 +540,357 @@ fn mask_ip_address(ip: &str) -> String {
     "--.--.--.***".to_string()
 }
 
+/// Return whether `node_id` is an enabled, valid member of `group`.
+/// When `group.member_node_ids` is non-empty, the node MUST appear in `member_node_ids`.
+fn is_valid_group_member(group: &MultiGroup, node_id: &str, nodes: &[ProxyNode]) -> bool {
+    let trimmed = node_id.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if !group.member_node_ids.is_empty()
+        && !group.member_node_ids.iter().any(|id| id == trimmed)
+    {
+        return false;
+    }
+    nodes.iter().any(|n| n.id == trimmed && n.enabled)
+}
+
+/// Count distinct enabled nodes eligible inside `group`.
+pub fn count_enabled_group_members(group: &MultiGroup, nodes: &[ProxyNode]) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    if !group.member_node_ids.is_empty() {
+        for mid in &group.member_node_ids {
+            if let Some(n) = nodes.iter().find(|n| &n.id == mid && n.enabled) {
+                seen.insert(n.id.as_str());
+            }
+        }
+    } else if matches!(group.mode, MultiGroupMode::ConditionalPool) || group.dynamic_filter.is_some()
+    {
+        for n in nodes.iter().filter(|n| n.enabled) {
+            seen.insert(n.id.as_str());
+        }
+    }
+    seen.len()
+}
+
+/// Resolve the consecutive failure threshold for runtime watchdog failover (`>= 2`).
+pub fn group_watchdog_failure_threshold(group: &MultiGroup) -> u32 {
+    group
+        .trigger_rules
+        .iter()
+        .map(|r| r.consecutive_failures)
+        .min()
+        .unwrap_or(2)
+        .max(2)
+}
+
+/// Resolve the displayable active node for `group`, strictly rejecting ghost `active_node_id`
+/// values that have been removed from `group.member_node_ids`.
+pub fn resolve_valid_group_active_node<'a>(
+    group: &MultiGroup,
+    nodes: &'a [ProxyNode],
+) -> Option<&'a ProxyNode> {
+    if !group.member_node_ids.is_empty() {
+        if let Some(active_id) = group
+            .active_node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if group.member_node_ids.iter().any(|m| m == active_id) {
+                if let Some(node) = nodes.iter().find(|n| n.id == active_id && n.enabled) {
+                    return Some(node);
+                }
+            }
+        }
+        return group
+            .member_node_ids
+            .iter()
+            .filter_map(|id| nodes.iter().find(|n| &n.id == id && n.enabled))
+            .next()
+            .or_else(|| {
+                group
+                    .member_node_ids
+                    .iter()
+                    .filter_map(|id| nodes.iter().find(|n| &n.id == id))
+                    .next()
+            });
+    }
+
+    if let Some(active_id) = group
+        .active_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(node) = nodes.iter().find(|n| n.id == active_id && n.enabled) {
+            return Some(node);
+        }
+    }
+    nodes
+        .iter()
+        .find(|n| n.enabled)
+        .or_else(|| nodes.first())
+}
+
+/// Pick the best enabled member node in `group` according to `evaluate_group_candidates`:
+/// 1. Highest-scoring healthy candidate (`healthy_candidates`);
+/// 2. Highest-scoring `ok` gate-passing candidate (`gate_passed`);
+/// 3. Highest-scoring gate-passing candidate when static `hard_gates` are configured;
+/// 4. When all members are rejected by `hard_gates` (`gate_passed` empty), keep honoring
+///    `evaluate_group_candidates`'s descending score ranking (`gate_rejected`) — preferring
+///    `ok` candidates first, then probed/score-distinguished candidates — instead of blindly
+///    picking `member_node_ids[0]`;
+/// 5. Finally fall back to the next enabled member in group order.
+pub fn pick_best_group_candidate(
+    group: &MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    exclude_node_id: Option<&str>,
+) -> Option<String> {
+    let excluded = exclude_node_id.map(str::trim).filter(|s| !s.is_empty());
+    let allowed = |id: &str| excluded != Some(id) && is_valid_group_member(group, id, nodes);
+
+    if let Ok(report) = evaluate_group_candidates(group, nodes, snaps) {
+        if let Some(best) = report
+            .healthy_candidates
+            .iter()
+            .find(|c| allowed(&c.node_id))
+        {
+            return Some(best.node_id.clone());
+        }
+        if let Some(best) = report
+            .gate_passed
+            .iter()
+            .find(|c| c.ok && allowed(&c.node_id))
+        {
+            return Some(best.node_id.clone());
+        }
+        if !group.hard_gates.is_empty() {
+            if let Some(best) = report.gate_passed.iter().find(|c| allowed(&c.node_id)) {
+                return Some(best.node_id.clone());
+            }
+        }
+        // Fallback when all candidates failed hard gates (e.g. unprobed `keepalive_ok == 1`):
+        // keep honoring the descending score list (`gate_rejected`) rather than skipping scoring
+        // and blindly falling back to `member_node_ids[0]`.
+        if let Some(best) = report
+            .gate_rejected
+            .iter()
+            .find(|c| c.ok && allowed(&c.node_id))
+        {
+            return Some(best.node_id.clone());
+        }
+        let allowed_rejected: Vec<_> = report
+            .gate_rejected
+            .iter()
+            .filter(|c| allowed(&c.node_id))
+            .collect();
+        if let Some(best) = allowed_rejected
+            .iter()
+            .find(|c| snaps.contains_key(&c.node_id) && c.score.is_finite())
+        {
+            return Some(best.node_id.clone());
+        }
+        if let (Some(first), Some(last)) = (allowed_rejected.first(), allowed_rejected.last()) {
+            if first.score.is_finite()
+                && (!last.score.is_finite() || (first.score - last.score).abs() > 1e-9)
+            {
+                return Some(first.node_id.clone());
+            }
+        }
+    }
+
+    let mut enabled_members: Vec<&str> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    if !group.member_node_ids.is_empty() {
+        for mid in &group.member_node_ids {
+            if let Some(n) = nodes.iter().find(|n| &n.id == mid && n.enabled) {
+                if seen.insert(n.id.as_str()) {
+                    enabled_members.push(n.id.as_str());
+                }
+            }
+        }
+    } else {
+        for n in nodes.iter().filter(|n| n.enabled) {
+            if seen.insert(n.id.as_str()) {
+                enabled_members.push(n.id.as_str());
+            }
+        }
+    }
+
+    if enabled_members.is_empty() {
+        return None;
+    }
+
+    if let Some(ex) = excluded {
+        if let Some(idx) = enabled_members.iter().position(|&id| id == ex) {
+            if enabled_members.len() <= 1 {
+                return None;
+            }
+            return Some(enabled_members[(idx + 1) % enabled_members.len()].to_string());
+        }
+    }
+
+    enabled_members
+        .into_iter()
+        .find(|&id| excluded != Some(id))
+        .map(str::to_string)
+}
+
+/// Sanitize a group's `active_node_id`: when `!group.member_node_ids.is_empty()` and
+/// `group.active_node_id` is missing, removed from `member_node_ids`, or disabled, replace it
+/// with the highest-scoring gate-passing candidate via `evaluate_group_candidates` (falling back
+/// to the first enabled member, or `None` if no enabled member exists).
+/// Returns `true` if `group.active_node_id` was modified.
+pub fn sanitize_group_active_node(
+    group: &mut MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+) -> bool {
+    if !group.member_node_ids.is_empty() {
+        let current_valid = group
+            .active_node_id
+            .as_deref()
+            .is_some_and(|id| is_valid_group_member(group, id, nodes));
+        if current_valid {
+            return false;
+        }
+        let next = pick_best_group_candidate(group, nodes, snaps, None);
+        if group.active_node_id != next {
+            group.active_node_id = next;
+            return true;
+        }
+        return false;
+    }
+
+    // Even for dynamic/empty-member groups, clear stale references to deleted or disabled nodes.
+    if let Some(active_id) = group.active_node_id.as_deref() {
+        if !is_valid_group_member(group, active_id, nodes) {
+            let next = pick_best_group_candidate(group, nodes, snaps, None);
+            if group.active_node_id != next {
+                group.active_node_id = next;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconcileSwitchDecision {
+    from_node_id: Option<String>,
+    from_node_name: String,
+    to_node_id: String,
+    to_node_name: String,
+    reason: String,
+}
+
+/// Pure strategy reconciler for a multi-group:
+/// 1. Always clears ghost/invalid `active_node_id` via `sanitize_group_active_node`.
+/// 2. For `StickyBest` / `ConditionalPool` groups, if the current active node is unprobed,
+///    failed/disconnected, or violates hard gates while a gate-passing healthy candidate exists,
+///    switches to the top-ranked candidate.
+/// 3. Respects sticky user choice: if the current active node is already in-group, probed,
+///    connected, and passes all hard gates, leaves it untouched to prevent IP drift.
+fn reconcile_group_best_node_in_memory(
+    group: &mut MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+) -> Option<ReconcileSwitchDecision> {
+    let prev_id = group.active_node_id.clone();
+    let prev_name = prev_id
+        .as_deref()
+        .and_then(|id| nodes.iter().find(|n| n.id == id))
+        .map(|n| n.name.clone())
+        .or_else(|| prev_id.clone())
+        .unwrap_or_else(|| "未选定".to_string());
+
+    let current_valid = prev_id
+        .as_deref()
+        .is_some_and(|id| is_valid_group_member(group, id, nodes));
+
+    if !current_valid {
+        sanitize_group_active_node(group, nodes, snaps);
+        if let Some(to_id) = group.active_node_id.clone() {
+            if prev_id.as_deref() != Some(to_id.as_str()) {
+                let to_name = nodes
+                    .iter()
+                    .find(|n| n.id == to_id)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| to_id.clone());
+                return Some(ReconcileSwitchDecision {
+                    from_node_id: prev_id,
+                    from_node_name: prev_name,
+                    to_node_id: to_id,
+                    to_node_name: to_name,
+                    reason: "原节点已不在本组或已停用，已自动切换至最优候选节点".to_string(),
+                });
+            }
+        }
+        return None;
+    }
+
+    if !matches!(
+        group.mode,
+        MultiGroupMode::StickyBest | MultiGroupMode::ConditionalPool
+    ) {
+        return None;
+    }
+
+    let cur_id = prev_id.as_deref()?;
+    let Ok(report) = evaluate_group_candidates(group, nodes, snaps) else {
+        return None;
+    };
+
+    let best = report
+        .healthy_candidates
+        .iter()
+        .find(|c| is_valid_group_member(group, &c.node_id, nodes))
+        .or_else(|| {
+            report
+                .gate_passed
+                .iter()
+                .find(|c| c.ok && is_valid_group_member(group, &c.node_id, nodes))
+        })
+        .or_else(|| {
+            report
+                .gate_rejected
+                .iter()
+                .find(|c| c.ok && is_valid_group_member(group, &c.node_id, nodes))
+        })?;
+
+    if best.node_id == cur_id {
+        return None;
+    }
+
+    let cur_snap = snaps.get(cur_id);
+    let assessment = report.active_assessment.as_ref();
+
+    let reason = if cur_snap.is_none() {
+        "当前节点尚未测速，已自动选用组内最优合格节点"
+    } else if assessment.map_or(cur_snap.is_some_and(|s| !s.ok), |a| a.is_disconnected) {
+        "当前节点测速未通过，已自动切换至组内最优健康节点"
+    } else if best.passed_hard_gates && assessment.is_some_and(|a| !a.passed_hard_gates) {
+        "当前节点未满足本组硬性门禁条件，已自动切换至达标最优节点"
+    } else if best.meets_thresholds && assessment.is_some_and(|a| a.any_rule_triggered) {
+        "当前节点已触发本组自动切换条件，已切换至达标最优节点"
+    } else {
+        // Current active node is in-group, probed, healthy, passes all hard gates, and triggers no rules:
+        // preserve sticky selection to avoid IP drift.
+        return None;
+    };
+
+    group.active_node_id = Some(best.node_id.clone());
+    Some(ReconcileSwitchDecision {
+        from_node_id: prev_id,
+        from_node_name: prev_name,
+        to_node_id: best.node_id.clone(),
+        to_node_name: best.node_name.clone(),
+        reason: reason.to_string(),
+    })
+}
+
 fn select_tray_group_candidates<'a>(
     group: &MultiGroup,
     nodes: &'a [ProxyNode],
@@ -557,8 +909,12 @@ fn select_tray_group_candidates<'a>(
     };
     let mut ordered = Vec::with_capacity(limit.min(raw_members.len().saturating_add(1)));
     if let Some(active_id) = group.active_node_id.as_deref() {
-        if let Some(active_node) = node_by_id.get(active_id).copied().filter(|n| n.enabled) {
-            ordered.push(active_node);
+        let in_group = group.member_node_ids.is_empty()
+            || group.member_node_ids.iter().any(|m| m == active_id);
+        if in_group {
+            if let Some(active_node) = node_by_id.get(active_id).copied().filter(|n| n.enabled) {
+                ordered.push(active_node);
+            }
         }
     }
     for n in raw_members {
@@ -624,13 +980,17 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
     let mut group_summaries: Vec<TrayGroupSummary> = Vec::new();
     for g in ordered_groups {
         let member_nodes = select_tray_group_candidates(g, &nodes, &node_by_id, 8);
-        let active_label = g
-            .active_node_id
-            .as_deref()
+        let valid_active_id = g.active_node_id.as_deref().filter(|id| {
+            (g.member_node_ids.is_empty() || g.member_node_ids.iter().any(|m| m == id))
+                && node_by_id.get(id).is_some_and(|n| n.enabled)
+        });
+        let active_label = valid_active_id
             .and_then(|id| node_by_id.get(id))
             .map(|n| n.name.clone())
             .or_else(|| member_nodes.first().map(|n| n.name.clone()))
             .unwrap_or_else(|| "自动择优".to_string());
+        let effective_selected_id =
+            valid_active_id.or_else(|| member_nodes.first().map(|n| n.id.as_str()));
         let candidates = member_nodes
             .into_iter()
             .map(|n| {
@@ -644,7 +1004,7 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
                     ping_ms: snap
                         .and_then(|s| s.latency_ms)
                         .map(|v| v.max(0.0).round() as u32),
-                    selected: !in_single_mode && g.active_node_id.as_deref() == Some(n.id.as_str()),
+                    selected: !in_single_mode && effective_selected_id == Some(n.id.as_str()),
                 }
             })
             .collect();
@@ -777,16 +1137,14 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
             }
         }
         let groups = db.list_multi_groups().ok()?;
+        let nodes = db.list_nodes().unwrap_or_default();
         let g = cfg
             .active_group_id
             .as_deref()
             .and_then(|gid| groups.iter().find(|g| g.id == gid))
             .or_else(|| groups.first())?;
-        let node_name = g
-            .active_node_id
-            .as_deref()
-            .and_then(|id| db.get_node(id).ok().flatten())
-            .map(|n| n.name)
+        let node_name = resolve_valid_group_active_node(g, &nodes)
+            .map(|n| n.name.clone())
             .unwrap_or_else(|| "自动择优".to_string());
         Some(format!("{} -> {}", g.name, node_name))
     });
@@ -872,15 +1230,10 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         let (mode, active_node, probe_id_hint) = if let Some(sn) = single_node {
             (RouteTargetMode::Single, Some(sn), None)
         } else {
-            let group_node = primary_group
-                .and_then(|g| g.active_node_id.as_deref())
-                .and_then(|id| nodes.iter().find(|n| n.id == id))
-                .or_else(|| {
-                    primary_group
-                        .and_then(|g| g.member_node_ids.first())
-                        .and_then(|id| nodes.iter().find(|n| n.id == *id))
-                })
-                .or_else(|| nodes.first());
+            let group_node = match primary_group {
+                Some(g) => resolve_valid_group_active_node(g, &nodes),
+                None => nodes.iter().find(|n| n.enabled).or_else(|| nodes.first()),
+            };
             (
                 RouteTargetMode::Group,
                 group_node,
@@ -1546,11 +1899,49 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
 
     let (nodes, groups, relays) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        (
-            db.list_nodes().map_err(|e| e.to_string())?,
-            db.list_multi_groups().map_err(|e| e.to_string())?,
-            db.list_preaccel_relays(false).map_err(|e| e.to_string())?,
-        )
+        let nodes = db.list_nodes().map_err(|e| e.to_string())?;
+        let mut groups = db.list_multi_groups().map_err(|e| e.to_string())?;
+        let relays = db.list_preaccel_relays(false).map_err(|e| e.to_string())?;
+
+        // Before compiling runtime YAML, sanitize ghost active_node_id on all groups and
+        // reconcile best healthy candidates for the active group & independent-routing groups.
+        if !nodes.is_empty() && !groups.is_empty() {
+            let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+            let default_snaps = db
+                .get_probe_snapshots_batch(&node_ids, None)
+                .unwrap_or_default();
+            let primary_gid = cfg
+                .active_group_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|aid| groups.iter().find(|g| g.id == aid).map(|g| g.id.clone()))
+                .or_else(|| groups.first().map(|g| g.id.clone()));
+
+            for group in &mut groups {
+                let prev_active = group.active_node_id.clone();
+                let is_target =
+                    primary_gid.as_deref() == Some(group.id.as_str()) || group.independent_routing;
+                if let Some(ref probe_id) = group.primary_probe_id {
+                    let group_snaps = db
+                        .get_probe_snapshots_batch(&node_ids, Some(probe_id.as_str()))
+                        .unwrap_or_else(|_| default_snaps.clone());
+                    if is_target {
+                        let _ = reconcile_group_best_node_in_memory(group, &nodes, &group_snaps);
+                    } else {
+                        let _ = sanitize_group_active_node(group, &nodes, &group_snaps);
+                    }
+                } else if is_target {
+                    let _ = reconcile_group_best_node_in_memory(group, &nodes, &default_snaps);
+                } else {
+                    let _ = sanitize_group_active_node(group, &nodes, &default_snaps);
+                }
+                if group.active_node_id != prev_active {
+                    let _ = db.upsert_multi_group(group);
+                }
+            }
+        }
+        (nodes, groups, relays)
     };
     let (extra_rules, extra_filters) = {
         let tracker = state.campus_tracker.lock().map_err(|e| e.to_string())?;
@@ -1709,6 +2100,7 @@ async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
         .await
         .map_err(|e| format!("停止旧代理核心失败：{e}"))?;
     state.bump_core_session_generation();
+    state.telemetry.clear_traffic();
     let status = state.adapter.status().await;
     state.update_cached_runtime(status);
     if let Ok(mut m) = state.cached_metrics.write() {
@@ -1763,6 +2155,7 @@ async fn stop_core_locked(
         .await
         .map_err(|e| format!("停止代理核心失败：{e}"))?;
     state.bump_core_session_generation();
+    state.telemetry.clear_traffic();
     let status = state.adapter.status().await;
     state.update_cached_runtime(status);
     if let Ok(mut m) = state.cached_metrics.write() {
@@ -2115,7 +2508,8 @@ pub async fn switch_next_best_internal(
         .and_then(|id| nodes.iter().find(|n| n.id == id))
         .map(|n| n.name.clone());
 
-    // Rank candidates using the real strategy formula evaluator; fall back to enabled members if unprobed.
+    // Rank candidates using the real strategy formula evaluator; when all members fail hard gates,
+    // keep honoring probed-ok scores in `gate_rejected` before falling back to enabled member order.
     let ranked_ids: Vec<String> = match evaluate_group_candidates(&group, &nodes, &snaps) {
         Ok(report) => {
             if !report.healthy_candidates.is_empty() {
@@ -2124,10 +2518,17 @@ pub async fn switch_next_best_internal(
                     .iter()
                     .map(|c| c.node_id.clone())
                     .collect()
-            } else {
+            } else if !report.gate_passed.is_empty() {
                 report
                     .gate_passed
                     .iter()
+                    .map(|c| c.node_id.clone())
+                    .collect()
+            } else {
+                report
+                    .gate_rejected
+                    .iter()
+                    .filter(|c| c.ok)
                     .map(|c| c.node_id.clone())
                     .collect()
             }
@@ -2296,13 +2697,14 @@ pub async fn select_single_node_internal(
     Ok(dto)
 }
 
-pub async fn select_group_node_internal(
+async fn select_group_node_core(
     app: &AppHandle,
     state: &AppState,
     group_id: String,
     node_id: String,
     close_old: Option<bool>,
     prev_node_name_hint: Option<String>,
+    activate_group: bool,
 ) -> Result<SwitchResultDto, String> {
     let (mut group, target_node, prev_id, prev_node_name, snap) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
@@ -2328,7 +2730,9 @@ pub async fn select_group_node_internal(
     };
 
     let mut members_changed = false;
-    if !group.member_node_ids.iter().any(|id| id == &target_node.id) {
+    let is_dynamic_unpinned_pool = group.member_node_ids.is_empty()
+        && (group.mode == MultiGroupMode::ConditionalPool || group.dynamic_filter.is_some());
+    if !is_dynamic_unpinned_pool && !group.member_node_ids.iter().any(|id| id == &target_node.id) {
         group.member_node_ids.push(target_node.id.clone());
         members_changed = true;
     }
@@ -2341,7 +2745,7 @@ pub async fn select_group_node_internal(
     let mut cfg = state.snapshot_config();
     let was_single = cfg.route_mode == RouteTargetMode::Single;
     let active_group_changed = cfg.active_group_id.as_deref() != Some(group.id.as_str());
-    let route_cfg_changed = was_single || active_group_changed;
+    let route_cfg_changed = activate_group && (was_single || active_group_changed);
     if route_cfg_changed {
         cfg.route_mode = RouteTargetMode::Group;
         cfg.active_group_id = Some(group.id.clone());
@@ -2355,7 +2759,8 @@ pub async fn select_group_node_internal(
     if state.adapter.has_live_controller().await {
         if members_changed || route_cfg_changed {
             if let Some(outcome) =
-                trigger_reload_if_running(app, state, was_single || members_changed).await
+                trigger_reload_if_running(app, state, (activate_group && was_single) || members_changed)
+                    .await
             {
                 if outcome.rejected {
                     let detail = outcome
@@ -2416,6 +2821,146 @@ pub async fn select_group_node_internal(
         up_mbps: snap.as_ref().and_then(|s| s.up_mbps),
         closed_connections,
     })
+}
+
+pub async fn select_group_node_internal(
+    app: &AppHandle,
+    state: &AppState,
+    group_id: String,
+    node_id: String,
+    close_old: Option<bool>,
+    prev_node_name_hint: Option<String>,
+) -> Result<SwitchResultDto, String> {
+    select_group_node_core(
+        app,
+        state,
+        group_id,
+        node_id,
+        close_old,
+        prev_node_name_hint,
+        true,
+    )
+    .await
+}
+
+/// Switch a group's active node in Mihomo and SQLite WITHOUT changing `config.active_group_id`
+/// (used by background watchdog failover for non-primary `independent_routing` groups).
+pub async fn select_group_node_in_place_internal(
+    app: &AppHandle,
+    state: &AppState,
+    group_id: String,
+    node_id: String,
+    close_old: Option<bool>,
+    prev_node_name_hint: Option<String>,
+) -> Result<SwitchResultDto, String> {
+    select_group_node_core(
+        app,
+        state,
+        group_id,
+        node_id,
+        close_old,
+        prev_node_name_hint,
+        false,
+    )
+    .await
+}
+
+/// Reconcile a single multi-group against current membership, hard gates, and probe snapshots.
+/// Persists any `active_node_id` update to SQLite, optionally hot-switches Mihomo & closes stale
+/// connections when `sync_live_core` is true, and optionally emits `catcloud://strategy-switch`.
+pub async fn reconcile_group_best_node_internal(
+    app: &AppHandle,
+    state: &AppState,
+    group_id: &str,
+    sync_live_core: bool,
+    emit_notification: bool,
+) -> Result<Option<SwitchResultDto>, String> {
+    let (group_name, switch_mode, decision, target_node_region, target_snap) = {
+        let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let Some(mut group) = db
+            .get_multi_group(group_id)
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(None);
+        };
+        let nodes = db.list_nodes().map_err(|e| e.to_string())?;
+        let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let snaps = db
+            .get_probe_snapshots_batch(&node_ids, group.primary_probe_id.as_deref())
+            .map_err(|e| e.to_string())?;
+
+        let prev_active = group.active_node_id.clone();
+        let decision = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps);
+        if group.active_node_id != prev_active {
+            db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
+        }
+
+        let Some(dec) = decision else {
+            return Ok(None);
+        };
+        let target_region = nodes
+            .iter()
+            .find(|n| n.id == dec.to_node_id)
+            .map(|n| n.region_code.clone())
+            .unwrap_or_else(|| "--".to_string());
+        let snap = snaps.get(&dec.to_node_id).cloned();
+        (group.name, group.switch_mode, dec, target_region, snap)
+    };
+
+    let mut closed_connections = 0usize;
+    if sync_live_core && state.adapter.has_live_controller().await {
+        let target_proxy_name =
+            state.resolve_compiled_proxy_name(&decision.to_node_id, &decision.to_node_name);
+        if let Err(err) = state
+            .adapter
+            .select_group_proxy(&group_name, &target_proxy_name)
+            .await
+        {
+            tracing::debug!(
+                group = %group_name,
+                proxy = %target_proxy_name,
+                "reconcile_group_best_node_internal hot-switch skipped: {err}"
+            );
+        } else if matches!(switch_mode, SwitchMode::ForceCloseOld) {
+            let prev_compiled_name = decision.from_node_id.as_deref().map(|pid| {
+                state.resolve_compiled_proxy_name(pid, &decision.from_node_name)
+            });
+            let prev_target = prev_compiled_name
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(Some(decision.from_node_name.as_str()));
+            if let Ok(closed) = state
+                .adapter
+                .close_connections_for_group_or_node(Some(&group_name), prev_target)
+                .await
+            {
+                closed_connections = closed;
+            }
+        }
+    }
+
+    if emit_notification {
+        let _ = app.emit(
+            EVENT_STRATEGY_SWITCH,
+            serde_json::json!({
+                "group_name": group_name,
+                "from_node": decision.from_node_name,
+                "to_node": decision.to_node_name,
+                "reason": decision.reason,
+            }),
+        );
+    }
+
+    Ok(Some(SwitchResultDto {
+        group_id: group_id.to_string(),
+        previous_node_id: decision.from_node_id,
+        active_node_id: decision.to_node_id,
+        active_node_name: decision.to_node_name,
+        active_node_region: target_node_region,
+        latency_ms: target_snap.as_ref().and_then(|s| s.latency_ms),
+        up_mbps: target_snap.as_ref().and_then(|s| s.up_mbps),
+        closed_connections,
+    }))
 }
 
 pub fn open_directory_in_os(path: &std::path::Path) -> Result<String, String> {
@@ -3044,16 +3589,20 @@ pub async fn set_active_group(
     if trimmed.is_empty() {
         return Err("路线分组标识不能为空".to_string());
     }
-    {
+    let group_name = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        let exists = db
+        let Some(group) = db
             .get_multi_group(&trimmed)
             .map_err(|e| e.to_string())?
-            .is_some();
-        if !exists {
+        else {
             return Err(format!("未找到指定路线分组（{trimmed}）"));
-        }
-    }
+        };
+        group.name
+    };
+
+    // Sanitize ghost active_node_id and auto-pick best healthy candidate before activating group.
+    let reconciled = reconcile_group_best_node_internal(&app, &state, &trimmed, false, false).await?;
+
     let prev_cfg = state.snapshot_config();
     let was_single = prev_cfg.route_mode == RouteTargetMode::Single;
     let group_changed = prev_cfg.active_group_id.as_deref() != Some(trimmed.as_str());
@@ -3081,6 +3630,15 @@ pub async fn set_active_group(
                     .unwrap_or_else(|| "未知原因".to_string());
                 return Err(format!("切换活跃路线分组失败，核心配置重载未通过：{detail}"));
             }
+        }
+    } else if let Some(ref sw) = reconciled {
+        if state.adapter.has_live_controller().await {
+            let target_proxy =
+                state.resolve_compiled_proxy_name(&sw.active_node_id, &sw.active_node_name);
+            let _ = state
+                .adapter
+                .select_group_proxy(&group_name, &target_proxy)
+                .await;
         }
     }
     sync_app_side_effects(&app, &state, &cfg);
@@ -3118,7 +3676,23 @@ pub fn enter_windowless_mode(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 pub fn list_multi_groups(state: State<'_, AppState>) -> Result<Vec<MultiGroup>, String> {
     let db = state.storage.lock().map_err(|e| e.to_string())?;
-    db.list_multi_groups().map_err(|e| e.to_string())
+    let mut groups = db.list_multi_groups().map_err(|e| e.to_string())?;
+    if let Ok(nodes) = db.list_nodes() {
+        let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        for g in &mut groups {
+            let needs_sanitize = match g.active_node_id.as_deref() {
+                Some(aid) => !is_valid_group_member(g, aid, &nodes),
+                None => !g.member_node_ids.is_empty(),
+            };
+            if needs_sanitize {
+                let snaps = db
+                    .get_probe_snapshots_batch(&node_ids, g.primary_probe_id.as_deref())
+                    .unwrap_or_default();
+                let _ = sanitize_group_active_node(g, &nodes, &snaps);
+            }
+        }
+    }
+    Ok(groups)
 }
 
 #[tauri::command]
@@ -3132,11 +3706,66 @@ pub async fn upsert_multi_group(
     }
     catcloud_core::strategy::formula::validate_formula(&group.formula_expr)
         .map_err(|e| format!("分组排序公式无效：{e}"))?;
-    {
+    let (prev_active_id, prev_active_name, next_active_name) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let existing_prev = db
+            .get_multi_group(&group.id)
+            .ok()
+            .flatten()
+            .and_then(|g| g.active_node_id)
+            .or_else(|| group.active_node_id.clone());
+        let nodes = db.list_nodes().map_err(|e| e.to_string())?;
+        let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let snaps = db
+            .get_probe_snapshots_batch(&node_ids, group.primary_probe_id.as_deref())
+            .unwrap_or_default();
+        let prev_name = existing_prev
+            .as_deref()
+            .and_then(|id| nodes.iter().find(|n| n.id == id))
+            .map(|n| n.name.clone());
+
+        // Sanitize ghost active_node_id and re-pick best healthy candidate if current violates
+        // updated hard gates/membership while preserving healthy in-group selection.
+        let _ = sanitize_group_active_node(&mut group, &nodes, &snaps);
+        let _ = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps);
+
+        let next_name = group
+            .active_node_id
+            .as_deref()
+            .and_then(|id| nodes.iter().find(|n| n.id == id))
+            .map(|n| n.name.clone());
         db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
-    }
+        (existing_prev, prev_name, next_name)
+    };
     let _ = trigger_reload_if_running(&app, &state, false).await;
+    if group.active_node_id != prev_active_id && state.adapter.has_live_controller().await {
+        if let Some(ref next_id) = group.active_node_id {
+            let fallback = next_active_name.as_deref().unwrap_or(next_id.as_str());
+            let target_proxy = state.resolve_compiled_proxy_name(next_id, fallback);
+            let _ = state
+                .adapter
+                .select_group_proxy(&group.name, &target_proxy)
+                .await;
+        }
+        if matches!(group.switch_mode, SwitchMode::ForceCloseOld)
+            || prev_active_id
+                .as_deref()
+                .is_some_and(|pid| !group.member_node_ids.iter().any(|m| m == pid))
+        {
+            let prev_compiled = prev_active_id.as_deref().map(|pid| {
+                let fb = prev_active_name.as_deref().unwrap_or("");
+                state.resolve_compiled_proxy_name(pid, fb)
+            });
+            let prev_target = prev_compiled
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .or(prev_active_name.as_deref());
+            let _ = state
+                .adapter
+                .close_connections_for_group_or_node(Some(&group.name), prev_target)
+                .await;
+        }
+    }
     let cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &cfg);
     Ok(group)
@@ -3184,17 +3813,58 @@ pub async fn update_multi_group_members(
     group_id: String,
     member_node_ids: Vec<String>,
 ) -> Result<MultiGroup, String> {
-    let updated = {
+    let (updated, prev_active_id, prev_active_name, next_active_name) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let mut group = db
             .get_multi_group(&group_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("未找到指定路线分组（{group_id}）"))?;
+        let prev_active = group.active_node_id.clone();
+        let nodes = db.list_nodes().map_err(|e| e.to_string())?;
+        let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let snaps = db
+            .get_probe_snapshots_batch(&node_ids, group.primary_probe_id.as_deref())
+            .unwrap_or_default();
+        let prev_name = prev_active
+            .as_deref()
+            .and_then(|id| nodes.iter().find(|n| n.id == id))
+            .map(|n| n.name.clone());
+
         group.member_node_ids = member_node_ids;
+        let _ = sanitize_group_active_node(&mut group, &nodes, &snaps);
+        let _ = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps);
+
+        let next_name = group
+            .active_node_id
+            .as_deref()
+            .and_then(|id| nodes.iter().find(|n| n.id == id))
+            .map(|n| n.name.clone());
         db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
-        group
+        (group, prev_active, prev_name, next_name)
     };
     let _ = trigger_reload_if_running(&app, &state, false).await;
+    if updated.active_node_id != prev_active_id && state.adapter.has_live_controller().await {
+        if let Some(ref next_id) = updated.active_node_id {
+            let fallback = next_active_name.as_deref().unwrap_or(next_id.as_str());
+            let target_proxy = state.resolve_compiled_proxy_name(next_id, fallback);
+            let _ = state
+                .adapter
+                .select_group_proxy(&updated.name, &target_proxy)
+                .await;
+        }
+        let prev_compiled = prev_active_id.as_deref().map(|pid| {
+            let fb = prev_active_name.as_deref().unwrap_or("");
+            state.resolve_compiled_proxy_name(pid, fb)
+        });
+        let prev_target = prev_compiled
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(prev_active_name.as_deref());
+        let _ = state
+            .adapter
+            .close_connections_for_group_or_node(Some(&updated.name), prev_target)
+            .await;
+    }
     let cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &cfg);
     Ok(updated)
@@ -3615,6 +4285,46 @@ pub async fn run_isolated_probes(
             "error": null
         }),
     );
+
+    // Engage strategy engine immediately after fresh probe snapshots are persisted:
+    // reconcile the active multi-group and all independent-routing StickyBest/ConditionalPool groups.
+    let latest_cfg = state.snapshot_config();
+    if !snapshots.is_empty() {
+        let target_group_ids: Vec<String> = state
+            .storage
+            .lock()
+            .ok()
+            .and_then(|db| db.list_multi_groups().ok())
+            .map(|groups| {
+                let active_gid = latest_cfg
+                    .active_group_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|aid| groups.iter().find(|g| g.id == aid).map(|g| g.id.clone()))
+                    .or_else(|| groups.first().map(|g| g.id.clone()));
+
+                let mut ids = Vec::new();
+                for g in &groups {
+                    let is_primary = active_gid.as_deref() == Some(g.id.as_str());
+                    let is_strategy_mode = matches!(
+                        g.mode,
+                        MultiGroupMode::StickyBest | MultiGroupMode::ConditionalPool
+                    );
+                    if (is_primary || (g.independent_routing && is_strategy_mode))
+                        && !ids.iter().any(|existing| existing == &g.id)
+                    {
+                        ids.push(g.id.clone());
+                    }
+                }
+                ids
+            })
+            .unwrap_or_default();
+
+        for gid in target_group_ids {
+            let _ = reconcile_group_best_node_internal(&app, &state, &gid, true, true).await;
+        }
+    }
 
     let latest_cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &latest_cfg);
@@ -4424,15 +5134,10 @@ fn resolve_homepage_node<'a>(
         .and_then(|gid| groups.iter().find(|g| g.id == gid))
         .or_else(|| groups.first());
 
-    primary_group
-        .and_then(|g| g.active_node_id.as_deref())
-        .and_then(|id| nodes.iter().find(|n| n.id == id))
-        .or_else(|| {
-            primary_group
-                .and_then(|g| g.member_node_ids.first())
-                .and_then(|id| nodes.iter().find(|n| n.id == *id))
-        })
-        .or_else(|| nodes.first())
+    match primary_group {
+        Some(g) => resolve_valid_group_active_node(g, nodes),
+        None => nodes.iter().find(|n| n.enabled).or_else(|| nodes.first()),
+    }
 }
 
 fn select_comparison_overseas_node(
@@ -4483,9 +5188,13 @@ fn select_comparison_overseas_node(
 
     if let Some(group) = primary_group {
         if let Some(ref aid) = group.active_node_id {
-            if let Some(n) = nodes.iter().find(|n| &n.id == aid) {
-                if seen.insert(n.id.as_str()) {
-                    ordered.push(n);
+            let in_group = group.member_node_ids.is_empty()
+                || group.member_node_ids.iter().any(|m| m == aid);
+            if in_group {
+                if let Some(n) = nodes.iter().find(|n| &n.id == aid) {
+                    if seen.insert(n.id.as_str()) {
+                        ordered.push(n);
+                    }
                 }
             }
         }
@@ -4781,7 +5490,7 @@ pub async fn benchmark_preaccel_comparison(
         &state.job_guard,
         &relay,
         &target_node,
-        &cfg.dns.proxy_server_nameserver,
+        &[],
         DEFAULT_READY_TIMEOUT,
     )
     .await
@@ -5227,13 +5936,28 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
     }
 }
 
+fn normalize_quick_site_probe_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let stripped = trimmed.trim_end_matches('/');
+    if stripped.eq_ignore_ascii_case("https://chatgpt.com")
+        || stripped.eq_ignore_ascii_case("http://chatgpt.com")
+        || stripped.eq_ignore_ascii_case("https://www.chatgpt.com")
+        || stripped.eq_ignore_ascii_case("http://www.chatgpt.com")
+    {
+        return "https://chatgpt.com/cdn-cgi/trace".to_string();
+    }
+    trimmed.to_string()
+}
+
 #[tauri::command]
 pub async fn check_quick_sites(state: State<'_, AppState>) -> Result<Vec<SiteCheckItemDto>, String> {
     let cfg = state.snapshot_config();
     let rt = state.adapter.status().await;
     let mut builder = reqwest::Client::builder()
         .no_proxy()
-        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(7))
+        .pool_max_idle_per_host(8)
         .redirect(reqwest::redirect::Policy::none());
     if rt.running {
         let proxy_url = format!("socks5h://127.0.0.1:{}", rt.mixed_port);
@@ -5249,29 +5973,52 @@ pub async fn check_quick_sites(state: State<'_, AppState>) -> Result<Vec<SiteChe
     for site in cfg.core_runtime.quick_check_sites {
         let cli = client.clone();
         handles.push(tokio::spawn(async move {
-            let started = Instant::now();
-            match cli.get(&site.url).send().await {
+            let probe_url = normalize_quick_site_probe_url(&site.url);
+            let expected_status = site.expected_status;
+            let check_status = |status: u16| {
+                expected_status
+                    .map(|exp| status == exp)
+                    .unwrap_or((200..300).contains(&status))
+            };
+
+            // 1. Warmup connection (establish SOCKS5 + TLS tunnel and drain small body for Keep-Alive reuse).
+            let t0 = Instant::now();
+            let first = match cli.get(&probe_url).send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
-                    let ok = site
-                        .expected_status
-                        .map(|exp| status == exp)
-                        .unwrap_or((200..300).contains(&status));
-                    SiteCheckItemDto {
+                    let _ = read_bounded_response_bytes(resp, 16 * 1024).await;
+                    let ms = t0.elapsed().as_millis() as u64;
+                    (ms, check_status(status))
+                }
+                Err(_) => {
+                    return SiteCheckItemDto {
                         id: site.id,
                         name: site.name,
                         url: site.url,
-                        latency_ms: Some(started.elapsed().as_millis() as u64),
-                        ok: Some(ok),
-                    }
+                        latency_ms: None,
+                        ok: Some(false),
+                    };
                 }
-                Err(_) => SiteCheckItemDto {
-                    id: site.id,
-                    name: site.name,
-                    url: site.url,
-                    latency_ms: None,
-                    ok: Some(false),
-                },
+            };
+
+            // 2. Measure true warm RTT over the reused connection (still strictly checking expected_status).
+            let t1 = Instant::now();
+            let (final_ms, final_ok) = match cli.get(&probe_url).send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let _ = read_bounded_response_bytes(resp, 16 * 1024).await;
+                    let ms = t1.elapsed().as_millis() as u64;
+                    (ms, check_status(status))
+                }
+                Err(_) => first,
+            };
+
+            SiteCheckItemDto {
+                id: site.id,
+                name: site.name,
+                url: site.url,
+                latency_ms: Some(final_ms),
+                ok: Some(final_ok),
             }
         }));
     }
@@ -5358,6 +6105,39 @@ pub fn get_recent_logs(
         }
     }
     Ok(logs)
+}
+
+fn build_traffic_history(state: &AppState) -> Vec<TrafficEventPayload> {
+    let ticks = state.telemetry.traffic_snapshot();
+    if ticks.is_empty() {
+        return Vec::new();
+    }
+    let core_mem_bytes = state
+        .cached_metrics
+        .read()
+        .map(|m| m.core_mem_bytes)
+        .unwrap_or(0);
+    let core_memory_mb = (core_mem_bytes as f64) / (1024.0 * 1024.0);
+    ticks
+        .into_iter()
+        .map(|t| TrafficEventPayload {
+            up_bps: t.up,
+            down_bps: t.down,
+            up_total_bytes: 0,
+            down_total_bytes: 0,
+            active_connections: 0,
+            core_memory_mb,
+            timestamp_ms: t.timestamp_ms,
+        })
+        .collect()
+}
+
+#[tauri::command]
+pub fn get_traffic_history(state: State<'_, AppState>) -> Vec<TrafficEventPayload> {
+    if !state.snapshot_runtime().running {
+        return Vec::new();
+    }
+    build_traffic_history(&state)
 }
 
 #[tauri::command]
@@ -5994,7 +6774,7 @@ pub fn open_app_dir(state: State<'_, AppState>, kind: String) -> Result<String, 
     open_directory_in_os(path)
 }
 
-fn percent_encode_query_value(raw: &str) -> String {
+pub(crate) fn percent_encode_path_segment(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for &b in raw.as_bytes() {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
@@ -6004,6 +6784,10 @@ fn percent_encode_query_value(raw: &str) -> String {
         }
     }
     out
+}
+
+fn percent_encode_query_value(raw: &str) -> String {
+    percent_encode_path_segment(raw)
 }
 
 fn redact_web_ui_secret_in_url(url: &str) -> String {
@@ -6730,5 +7514,426 @@ mod tests {
             map_tray_click(&CoreTrayClickAction::None),
             TrayClickAction::ShowMenu
         );
+    }
+
+    #[test]
+    fn sanitize_group_active_node_clears_ghost_and_picks_best_scored_candidate() {
+        let ghost_ar = ProxyNode {
+            id: "n-ar".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "🇦🇷 阿根廷".to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let tw_slow = ProxyNode {
+            id: "n-tw".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "🇹🇼 台湾 01".to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let jp_best = ProxyNode {
+            id: "n-jp".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "🇯🇵 日本 02".to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let us_disabled = ProxyNode {
+            id: "n-us-off".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "🇺🇸 已禁用".to_string(),
+            enabled: false,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let nodes = vec![ghost_ar, tw_slow, jp_best, us_disabled];
+
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "n-tw".to_string(),
+            ProbeSnapshot {
+                node_id: "n-tw".to_string(),
+                ok: true,
+                latency_ms: Some(120.0),
+                up_mbps: Some(10.0),
+                down_mbps: Some(50.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "n-jp".to_string(),
+            ProbeSnapshot {
+                node_id: "n-jp".to_string(),
+                ok: true,
+                latency_ms: Some(55.0),
+                up_mbps: Some(80.0),
+                down_mbps: Some(200.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut group = MultiGroup {
+            id: "g-ai".to_string(),
+            name: "测试多选组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            hard_gates: vec!["google_clean == 1".to_string()],
+            member_node_ids: vec![
+                "n-us-off".to_string(),
+                "n-tw".to_string(),
+                "n-jp".to_string(),
+            ],
+            active_node_id: Some("n-ar".to_string()),
+            ..Default::default()
+        };
+
+        // 1. Ghost active_node_id outside member_node_ids is replaced by top-scoring candidate.
+        assert!(sanitize_group_active_node(&mut group, &nodes, &snaps));
+        assert_eq!(group.active_node_id.as_deref(), Some("n-jp"));
+
+        // 2. Calling again while active_node_id is valid and enabled makes no change.
+        assert!(!sanitize_group_active_node(&mut group, &nodes, &snaps));
+        assert_eq!(group.active_node_id.as_deref(), Some("n-jp"));
+
+        // 3. When no members are probed yet, ghost active_node_id falls back to first enabled member.
+        let empty_snaps = HashMap::new();
+        group.active_node_id = Some("n-ar".to_string());
+        assert!(sanitize_group_active_node(&mut group, &nodes, &empty_snaps));
+        assert_eq!(group.active_node_id.as_deref(), Some("n-tw"));
+
+        // 4. When only disabled members remain, ghost active_node_id is cleared to None.
+        group.member_node_ids = vec!["n-us-off".to_string()];
+        group.active_node_id = Some("n-ar".to_string());
+        assert!(sanitize_group_active_node(&mut group, &nodes, &snaps));
+        assert_eq!(group.active_node_id, None);
+    }
+
+    #[test]
+    fn build_runtime_info_dto_never_exposes_removed_ghost_active_node() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_ghost_dto_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+
+        let sub = SubscriptionRecord {
+            id: "sub-ghost".to_string(),
+            name: "测试订阅".to_string(),
+            kind: SubscriptionKind::Migrated,
+            url_or_cmd: "local://test".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_subscription(&sub).expect("upsert sub");
+
+        let ghost_ar = ProxyNode {
+            id: "n-ar".to_string(),
+            sub_id: "sub-ghost".to_string(),
+            name: "🇦🇷 阿根廷幽灵".to_string(),
+            region_code: "AR".to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.1".to_string(),
+            port: 443,
+            enabled: true,
+            ..Default::default()
+        };
+        let tw_member = ProxyNode {
+            id: "n-tw".to_string(),
+            sub_id: "sub-ghost".to_string(),
+            name: "🇹🇼 台湾主力".to_string(),
+            region_code: "TW".to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.2".to_string(),
+            port: 443,
+            enabled: true,
+            ..Default::default()
+        };
+        let jp_member = ProxyNode {
+            id: "n-jp".to_string(),
+            sub_id: "sub-ghost".to_string(),
+            name: "🇯🇵 日本备用".to_string(),
+            region_code: "JP".to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.3".to_string(),
+            port: 443,
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_node(&ghost_ar).expect("upsert ghost");
+        storage.upsert_node(&tw_member).expect("upsert tw");
+        storage.upsert_node(&jp_member).expect("upsert jp");
+
+        // Persist a group whose active_node_id still points to the removed ghost node `n-ar`.
+        let group = MultiGroup {
+            id: "g-main".to_string(),
+            name: "测试多选组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-tw".to_string(), "n-jp".to_string()],
+            active_node_id: Some("n-ar".to_string()),
+            ..Default::default()
+        };
+        storage.upsert_multi_group(&group).expect("upsert group");
+
+        let mut cfg = AppConfig::default();
+        cfg.route_mode = RouteTargetMode::Group;
+        cfg.active_group_id = Some("g-main".to_string());
+
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, cfg, storage, job_guard);
+
+        let dto = build_runtime_info_dto(&state).expect("build runtime dto");
+        assert_ne!(dto.active_node_id, "n-ar");
+        assert_ne!(dto.active_node_name, "🇦🇷 阿根廷幽灵");
+        assert_eq!(dto.active_node_id, "n-tw");
+        assert_eq!(dto.active_node_name, "🇹🇼 台湾主力");
+
+        let visual = build_tray_visual_state(&state);
+        assert!(!visual.tooltip.contains("阿根廷幽灵"));
+        assert!(visual.tooltip.contains("台湾主力"));
+
+        let nodes_slice = [ghost_ar, tw_member, jp_member];
+        let node_by_id: HashMap<&str, &ProxyNode> =
+            nodes_slice.iter().map(|n| (n.id.as_str(), n)).collect();
+        let tray_candidates = select_tray_group_candidates(&group, &nodes_slice, &node_by_id, 8);
+        assert!(!tray_candidates.iter().any(|n| n.id == "n-ar"));
+        assert_eq!(tray_candidates[0].id, "n-tw");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn reconcile_group_best_node_preserves_healthy_sticky_choice_and_switches_unprobed_or_failed() {
+        let n1 = ProxyNode {
+            id: "n-1".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "台湾 01".to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let n2 = ProxyNode {
+            id: "n-2".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "日本 02".to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let nodes = vec![n1, n2];
+
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "n-1".to_string(),
+            ProbeSnapshot {
+                node_id: "n-1".to_string(),
+                ok: true,
+                latency_ms: Some(90.0),
+                up_mbps: Some(20.0),
+                down_mbps: Some(100.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "n-2".to_string(),
+            ProbeSnapshot {
+                node_id: "n-2".to_string(),
+                ok: true,
+                latency_ms: Some(45.0),
+                up_mbps: Some(120.0),
+                down_mbps: Some(300.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let mut group = MultiGroup {
+            id: "g-sticky".to_string(),
+            name: "粘性组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            hard_gates: vec!["google_clean == 1".to_string()],
+            member_node_ids: vec!["n-1".to_string(), "n-2".to_string()],
+            active_node_id: Some("n-1".to_string()),
+            ..Default::default()
+        };
+
+        // 1. Healthy & gate-passing user selection must NOT drift even though n-2 scores higher.
+        assert!(reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps).is_none());
+        assert_eq!(group.active_node_id.as_deref(), Some("n-1"));
+
+        // 2. When active node fails a hard gate, auto-switch to gate-passing n-2.
+        snaps.get_mut("n-1").unwrap().google_clean = Some(false);
+        let dec_gate = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps)
+            .expect("should switch when hard gate fails");
+        assert_eq!(dec_gate.to_node_id, "n-2");
+        assert_eq!(group.active_node_id.as_deref(), Some("n-2"));
+
+        // 3. When active node is unprobed while another member is healthy, auto-switch to healthy.
+        group.active_node_id = Some("n-1".to_string());
+        snaps.remove("n-1");
+        let dec_unprobed = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps)
+            .expect("should switch when active node is unprobed");
+        assert_eq!(dec_unprobed.to_node_id, "n-2");
+        assert_eq!(group.active_node_id.as_deref(), Some("n-2"));
+    }
+
+    #[test]
+    fn normalize_quick_site_probe_url_rewrites_legacy_chatgpt_root() {
+        assert_eq!(
+            normalize_quick_site_probe_url("https://chatgpt.com"),
+            "https://chatgpt.com/cdn-cgi/trace"
+        );
+        assert_eq!(
+            normalize_quick_site_probe_url("HTTPS://CHATGPT.COM/"),
+            "https://chatgpt.com/cdn-cgi/trace"
+        );
+        assert_eq!(
+            normalize_quick_site_probe_url("https://chatgpt.com/cdn-cgi/trace"),
+            "https://chatgpt.com/cdn-cgi/trace"
+        );
+        assert_eq!(
+            normalize_quick_site_probe_url("https://www.google.com/generate_204"),
+            "https://www.google.com/generate_204"
+        );
+    }
+
+    #[test]
+    fn pick_best_group_candidate_ranks_gate_rejected_by_score_when_all_fail_gates() {
+        let tw_slow = ProxyNode {
+            id: "n-tw".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "台湾慢节点".to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let jp_fast = ProxyNode {
+            id: "n-jp".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "日本快节点".to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let sg_disabled = ProxyNode {
+            id: "n-sg-off".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "新加坡禁用".to_string(),
+            enabled: false,
+            multiplier: 0.5,
+            ..Default::default()
+        };
+        let nodes = vec![tw_slow, jp_fast, sg_disabled];
+
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "n-tw".to_string(),
+            ProbeSnapshot {
+                node_id: "n-tw".to_string(),
+                ok: true,
+                latency_ms: Some(140.0),
+                up_mbps: Some(8.0),
+                down_mbps: Some(40.0),
+                keepalive_60s_ok: None,
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "n-jp".to_string(),
+            ProbeSnapshot {
+                node_id: "n-jp".to_string(),
+                ok: true,
+                latency_ms: Some(45.0),
+                up_mbps: Some(95.0),
+                down_mbps: Some(200.0),
+                keepalive_60s_ok: None,
+                ..Default::default()
+            },
+        );
+
+        // Hard gate `keepalive_ok == 1` rejects all members when 60s keepalive hasn't been probed;
+        // fallback must still pick the highest-scored enabled member (`n-jp`), not `member_node_ids[0]` (`n-tw`).
+        let mut group = MultiGroup {
+            id: "g-keepalive".to_string(),
+            name: "长连接门禁组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            hard_gates: vec!["keepalive_ok == 1".to_string()],
+            member_node_ids: vec![
+                "n-sg-off".to_string(),
+                "n-tw".to_string(),
+                "n-jp".to_string(),
+            ],
+            active_node_id: Some("n-tw".to_string()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            pick_best_group_candidate(&group, &nodes, &snaps, None).as_deref(),
+            Some("n-jp")
+        );
+        assert_eq!(
+            pick_best_group_candidate(&group, &nodes, &snaps, Some("n-jp")).as_deref(),
+            Some("n-tw")
+        );
+
+        // Sticky preservation: when active `n-tw` is already ok and no node passes hard gates, do not drift.
+        assert!(reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps).is_none());
+        assert_eq!(group.active_node_id.as_deref(), Some("n-tw"));
+
+        // When active `n-tw` is unprobed while `n-jp` is ok (even if gate-rejected), switch to `n-jp`.
+        snaps.remove("n-tw");
+        let switched = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps)
+            .expect("should switch unprobed active node to highest-scored ok fallback");
+        assert_eq!(switched.to_node_id, "n-jp");
+        assert_eq!(group.active_node_id.as_deref(), Some("n-jp"));
+    }
+
+    #[test]
+    fn build_traffic_history_returns_buffered_ticks_with_cached_memory() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_traffic_history_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, AppConfig::default(), storage, job_guard);
+
+        assert!(build_traffic_history(&state).is_empty());
+
+        if let Ok(mut m) = state.cached_metrics.write() {
+            m.core_mem_bytes = 32 * 1024 * 1024;
+        }
+        state.telemetry.push_traffic(catcloud_core::core_adapter::TrafficTick {
+            up: 1024,
+            down: 4096,
+            timestamp_ms: 1_700_000_001_000,
+        });
+        state.telemetry.push_traffic(catcloud_core::core_adapter::TrafficTick {
+            up: 2048,
+            down: 8192,
+            timestamp_ms: 1_700_000_002_000,
+        });
+
+        let history = build_traffic_history(&state);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].up_bps, 1024);
+        assert_eq!(history[0].down_bps, 4096);
+        assert_eq!(history[0].up_total_bytes, 0);
+        assert_eq!(history[0].down_total_bytes, 0);
+        assert_eq!(history[0].active_connections, 0);
+        assert!((history[0].core_memory_mb - 32.0).abs() < 1e-6);
+        assert_eq!(history[0].timestamp_ms, 1_700_000_001_000);
+        assert_eq!(history[1].up_bps, 2048);
+        assert_eq!(history[1].down_bps, 8192);
+        assert_eq!(history[1].timestamp_ms, 1_700_000_002_000);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

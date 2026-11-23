@@ -88,27 +88,43 @@ impl EvalContext {
     }
 
     fn lookup_probe_up(&self, probe_id: &str) -> f64 {
+        let trimmed = probe_id.trim();
         self.per_probe_up_mbps
             .get(probe_id)
+            .or_else(|| self.per_probe_up_mbps.get(trimmed))
             .copied()
+            .filter(|v| v.is_finite())
             .map(sanitize_f64)
-            .unwrap_or(0.0)
+            .unwrap_or_else(|| sanitize_f64(self.up_mbps))
     }
 
     fn lookup_probe_down(&self, probe_id: &str) -> f64 {
+        let trimmed = probe_id.trim();
         self.per_probe_down_mbps
             .get(probe_id)
+            .or_else(|| self.per_probe_down_mbps.get(trimmed))
             .copied()
+            .filter(|v| v.is_finite())
             .map(sanitize_f64)
-            .unwrap_or(0.0)
+            .unwrap_or_else(|| sanitize_f64(self.down_mbps))
     }
 
     fn lookup_probe_ping(&self, probe_id: &str) -> f64 {
-        self.per_probe_ping_ms
+        let trimmed = probe_id.trim();
+        if let Some(v) = self
+            .per_probe_ping_ms
             .get(probe_id)
+            .or_else(|| self.per_probe_ping_ms.get(trimmed))
             .copied()
             .filter(|v| v.is_finite())
-            .unwrap_or(DEFAULT_MISSING_PING_MS)
+        {
+            return sanitize_f64(v);
+        }
+        if self.ping_ms.is_finite() && (self.ping_ms > 0.0 || self.ok) {
+            sanitize_f64(self.ping_ms)
+        } else {
+            DEFAULT_MISSING_PING_MS
+        }
     }
 
     fn lookup_probe_ok(&self, probe_id: &str) -> f64 {
@@ -216,6 +232,11 @@ impl FormulaExpr {
     /// Return `true` if this AST explicitly references the `multiplier` scalar.
     pub fn uses_multiplier(&self) -> bool {
         self.root.uses_multiplier()
+    }
+
+    /// Return `true` if this AST explicitly references the `keepalive_ok` scalar.
+    pub fn uses_keepalive_ok(&self) -> bool {
+        self.root.uses_keepalive_ok()
     }
 }
 
@@ -368,6 +389,29 @@ impl Expr {
                 then_val,
                 else_val,
             } => cond.uses_multiplier() || then_val.uses_multiplier() || else_val.uses_multiplier(),
+        }
+    }
+
+    fn uses_keepalive_ok(&self) -> bool {
+        match self {
+            Self::Scalar(ScalarField::KeepaliveOk) => true,
+            Self::Number(_) | Self::Scalar(_) | Self::ProbeLookup { .. } => false,
+            Self::Unary { operand, .. } | Self::Abs(operand) => operand.uses_keepalive_ok(),
+            Self::Binary { left, right, .. } | Self::Min(left, right) | Self::Max(left, right) => {
+                left.uses_keepalive_ok() || right.uses_keepalive_ok()
+            }
+            Self::Clamp { x, lo, hi } => {
+                x.uses_keepalive_ok() || lo.uses_keepalive_ok() || hi.uses_keepalive_ok()
+            }
+            Self::If {
+                cond,
+                then_val,
+                else_val,
+            } => {
+                cond.uses_keepalive_ok()
+                    || then_val.uses_keepalive_ok()
+                    || else_val.uses_keepalive_ok()
+            }
         }
     }
 }
@@ -1284,5 +1328,53 @@ mod tests {
             .unlocked_sites
             .insert("gemini_aistudio".to_string(), true);
         assert!(!expr_google_ai.eval_bool(&ctx_priority).unwrap());
+    }
+
+    #[test]
+    fn probe_lookups_fall_back_to_generic_metrics_when_probe_name_absent() {
+        let mut ctx = EvalContext {
+            up_mbps: 18.5,
+            down_mbps: 240.0,
+            ping_ms: 48.0,
+            ok: true,
+            ..Default::default()
+        };
+        ctx.per_probe_up_mbps
+            .insert("builtin_upload".to_string(), 18.5);
+        ctx.per_probe_down_mbps
+            .insert("builtin_download".to_string(), 240.0);
+        ctx.per_probe_ping_ms
+            .insert("builtin_latency".to_string(), 48.0);
+
+        // Missing legacy probe name ("antigravity") falls back gracefully to node generic metrics.
+        let trigger = FormulaExpr::parse(r#"probe_up("antigravity") < 2.0"#).unwrap();
+        assert!(!trigger.eval_bool(&ctx).unwrap());
+
+        let up_expr = FormulaExpr::parse(r#"probe_up("antigravity")"#).unwrap();
+        let down_expr = FormulaExpr::parse(r#"probe_down("antigravity")"#).unwrap();
+        let ping_expr = FormulaExpr::parse(r#"probe_ping("antigravity")"#).unwrap();
+        assert!((up_expr.eval_f64(&ctx).unwrap() - 18.5).abs() < 1e-9);
+        assert!((down_expr.eval_f64(&ctx).unwrap() - 240.0).abs() < 1e-9);
+        assert!((ping_expr.eval_f64(&ctx).unwrap() - 48.0).abs() < 1e-9);
+
+        // Explicit per-probe entry always takes precedence over generic fallback (even if low/0).
+        ctx.per_probe_up_mbps.insert("antigravity".to_string(), 0.4);
+        assert!(trigger.eval_bool(&ctx).unwrap());
+        assert!((up_expr.eval_f64(&ctx).unwrap() - 0.4).abs() < 1e-9);
+
+        // When generic metrics are also absent, up/down return 0.0 and ping returns missing sentinel.
+        let empty = EvalContext::default();
+        assert_eq!(up_expr.eval_f64(&empty).unwrap(), 0.0);
+        assert_eq!(down_expr.eval_f64(&empty).unwrap(), 0.0);
+        assert_eq!(ping_expr.eval_f64(&empty).unwrap(), DEFAULT_MISSING_PING_MS);
+
+        // `uses_keepalive_ok` AST inspection accurately distinguishes keepalive gates.
+        assert!(FormulaExpr::parse("keepalive_ok == 1").unwrap().uses_keepalive_ok());
+        assert!(
+            FormulaExpr::parse("google_clean == 1 && keepalive_ok == 1")
+                .unwrap()
+                .uses_keepalive_ok()
+        );
+        assert!(!FormulaExpr::parse("google_clean == 1").unwrap().uses_keepalive_ok());
     }
 }

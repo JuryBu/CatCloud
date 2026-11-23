@@ -184,11 +184,20 @@ mod tests {
         .expect("parse probe gate");
         assert!(gate.eval_bool(&ctx).unwrap());
 
-        let missing = FormulaExpr::parse(
+        // When a named probe ID is absent from per_probe_*, numeric lookups gracefully fall back
+        // to the node's generic metrics; on an unprobed context they return 0 / >5000ms.
+        let missing_fallback = FormulaExpr::parse(
+            "probe_up(\"missing\") == 10 && !probe_ok(\"missing\") && probe_ping(\"missing\") == 50",
+        )
+        .expect("parse missing probe fallback");
+        assert!(missing_fallback.eval_bool(&ctx).unwrap());
+
+        let empty_ctx = EvalContext::default();
+        let missing_empty = FormulaExpr::parse(
             "probe_up(\"missing\") == 0 && !probe_ok(\"missing\") && probe_ping(\"missing\") > 5000",
         )
-        .expect("parse missing probe");
-        assert!(missing.eval_bool(&ctx).unwrap());
+        .expect("parse missing probe on empty ctx");
+        assert!(missing_empty.eval_bool(&empty_ctx).unwrap());
 
         // Built-in templates validate and produce expected deterministic scores.
         validate_formula(DEFAULT_COST_EFFECTIVE_FORMULA).expect("validate cost-effective");

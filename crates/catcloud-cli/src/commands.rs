@@ -21,7 +21,7 @@ use catcloud_core::preaccel::schema::{
 };
 use catcloud_core::probe::registry::{FunnelTier, ProbeRegistry, validate_definition};
 use catcloud_core::probe::{
-    DEFAULT_READY_TIMEOUT, FunnelOptions, FunnelRunReport, IsolatedProbeCore, run_funnel_for_node,
+    FunnelOptions, FunnelRunReport, IsolatedProbeCore, run_funnel_for_node,
 };
 use catcloud_core::process_guard::JobGuard;
 use catcloud_core::storage::Storage;
@@ -43,7 +43,6 @@ use chrono::Utc;
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -699,25 +698,29 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     max_tier,
                     ..FunnelOptions::default()
                 });
-                let direct_dns_ips: Vec<String> = cfg
-                    .dns
-                    .default_nameserver
-                    .iter()
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| s.parse::<IpAddr>().is_ok())
-                    .collect();
+                let active_relay = if cfg.preaccel.enabled {
+                    let enabled_relays = db.list_preaccel_relays(true).unwrap_or_default();
+                    cfg.preaccel
+                        .active_relay_id
+                        .as_deref()
+                        .and_then(|aid| enabled_relays.iter().find(|r| r.id == aid).cloned())
+                        .or_else(|| enabled_relays.into_iter().next())
+                        .filter(|r| !r.server.trim().is_empty() && r.port > 0)
+                } else {
+                    None
+                };
                 let probe_temp_dir = paths.runtime_dir.join("probe-tmp");
                 let mut reports: Vec<FunnelRunReport> = Vec::with_capacity(nodes.len());
                 let mut persisted_records = 0usize;
 
                 for batch in nodes.chunks(32) {
-                    let core = IsolatedProbeCore::spawn_with_options(
+                    let core = IsolatedProbeCore::spawn_with_preaccel(
                         &mihomo_bin,
                         &probe_temp_dir,
                         job_guard.as_ref(),
                         batch,
-                        &direct_dns_ips,
-                        DEFAULT_READY_TIMEOUT,
+                        active_relay.as_ref(),
+                        cfg.preaccel.skip_443_native,
                     )
                     .await?;
 
@@ -810,6 +813,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "executed": true,
                     "tier": &args.tier,
                     "binary_path": &mihomo_bin,
+                    "used_preaccel": active_relay.is_some(),
+                    "preaccel_relay_name": active_relay.as_ref().map(|r| &r.name),
                     "node_count": nodes.len(),
                     "passed_nodes": passed_nodes,
                     "probe_count": selected_probes.len(),

@@ -238,6 +238,44 @@ pub fn prepare_probe_core_binary(mihomo_bin: &Path, temp_root: &Path) -> CatResu
     }
 }
 
+/// Return `true` only for encrypted DNS URLs whose host is a literal IP address
+/// (`https://223.5.5.5/dns-query`, `tls://1.12.12.12:853`, etc.) so isolated probe cores
+/// never issue plain UDP :53 queries that an active TUN `dns-hijack: any:53` could turn into
+/// Fake-IP (`198.18.x.x`) blackholes.
+fn is_ip_host_encrypted_dns(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !(lower.starts_with("https://")
+        || lower.starts_with("tls://")
+        || lower.starts_with("quic://")
+        || lower.starts_with("h3://"))
+    {
+        return false;
+    }
+    url::Url::parse(trimmed)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_string()))
+        .map(|host| host.parse::<std::net::IpAddr>().is_ok())
+        .unwrap_or(false)
+}
+
+fn sanitize_isolated_probe_nameservers(input: &[String]) -> Vec<String> {
+    let filtered: Vec<String> = input
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| is_ip_host_encrypted_dns(s))
+        .map(ToString::to_string)
+        .collect();
+    if filtered.is_empty() {
+        DEFAULT_PROBE_NAMESERVERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    } else {
+        filtered
+    }
+}
+
 /// Generate a strictly isolated, zero-interference Mihomo probe configuration YAML.
 ///
 /// Enforced invariants:
@@ -318,21 +356,7 @@ pub fn build_isolated_probe_yaml_with_preaccel(
         }
     }
 
-    let resolved_ns: Vec<String> = {
-        let filtered: Vec<String> = proxy_nameservers
-            .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if filtered.is_empty() {
-            DEFAULT_PROBE_NAMESERVERS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        } else {
-            filtered
-        }
-    };
+    let resolved_ns = sanitize_isolated_probe_nameservers(proxy_nameservers);
     let ns_yaml: Vec<YamlValue> = resolved_ns.iter().cloned().map(YamlValue::from).collect();
     let bootstrap_ns_yaml: Vec<YamlValue> = DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS
         .iter()
@@ -527,21 +551,7 @@ pub fn generate_preaccel_comparison_yaml(
         ));
     }
 
-    let resolved_ns: Vec<String> = {
-        let filtered: Vec<String> = dns_servers
-            .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if filtered.is_empty() {
-            DEFAULT_PROBE_NAMESERVERS
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect()
-        } else {
-            filtered
-        }
-    };
+    let resolved_ns = sanitize_isolated_probe_nameservers(dns_servers);
     let ns_yaml: Vec<YamlValue> = resolved_ns.iter().cloned().map(YamlValue::from).collect();
     let bootstrap_ns_yaml: Vec<YamlValue> = DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS
         .iter()
@@ -1769,5 +1779,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn isolated_probe_yaml_ignores_plain_udp_and_domain_doh_nameservers() {
+        let node = sample_node("n-dns-guard", "TW-02");
+        let ports = allocate_ephemeral_ports(2).unwrap();
+        let bindings = vec![(ports[1], &node)];
+
+        // Plain UDP :53 IPs and domain-hosted DoH (which require UDP :53 bootstrap) must be
+        // rejected in favor of pure-IP DoH so active TUN `dns-hijack: any:53` never returns Fake-IP.
+        let unsafe_ns = vec![
+            "223.5.5.5".to_string(),
+            "119.29.29.29".to_string(),
+            "udp://223.5.5.5:53".to_string(),
+            "https://dns.alidns.com/dns-query".to_string(),
+        ];
+        let yaml_text =
+            build_isolated_probe_yaml(ports[0], "secret-token-32bytes", &bindings, &unsafe_ns)
+                .expect("build isolated yaml with fallback doh");
+        let parsed: YamlValue = serde_yaml_ng::from_str(&yaml_text).expect("valid yaml");
+        let psn = parsed["dns"]["proxy-server-nameserver"]
+            .as_sequence()
+            .expect("proxy-server-nameserver");
+        assert_eq!(psn[0].as_str(), Some("https://223.5.5.5/dns-query"));
+        assert_eq!(psn[1].as_str(), Some("https://1.12.12.12/dns-query"));
+
+        // Explicit pure-IP encrypted resolvers are preserved.
+        let safe_ns = vec![
+            "223.5.5.5".to_string(),
+            "https://1.12.12.12/dns-query".to_string(),
+            "tls://223.5.5.5:853".to_string(),
+        ];
+        let yaml_custom =
+            build_isolated_probe_yaml(ports[0], "secret-token-32bytes", &bindings, &safe_ns)
+                .expect("build isolated yaml with custom pure-ip doh");
+        let parsed_custom: YamlValue = serde_yaml_ng::from_str(&yaml_custom).expect("valid yaml");
+        let psn_custom = parsed_custom["dns"]["proxy-server-nameserver"]
+            .as_sequence()
+            .expect("custom proxy-server-nameserver");
+        assert_eq!(psn_custom.len(), 2);
+        assert_eq!(psn_custom[0].as_str(), Some("https://1.12.12.12/dns-query"));
+        assert_eq!(psn_custom[1].as_str(), Some("tls://223.5.5.5:853"));
     }
 }

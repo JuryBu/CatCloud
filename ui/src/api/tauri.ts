@@ -288,6 +288,7 @@ export interface MultiGroup {
   id: string;
   name: string;
   mode: MultiGroupMode;
+  independent_routing?: boolean;
   match_rules: string[];
   member_node_ids: string[];
   dynamic_filter: DynamicFilterSpec | Record<string, unknown> | string | null;
@@ -305,6 +306,13 @@ export interface MultiGroup {
   hysteresis_pct: number;
   active_node_id: string | null;
   state?: string;
+}
+
+export interface StrategySwitchEvent {
+  group_name: string;
+  from_node: string;
+  to_node: string;
+  reason: string;
 }
 
 export interface PreAccelRelay {
@@ -1061,6 +1069,7 @@ const MOCK_GROUPS: MultiGroup[] = [
     id: "grp-ai",
     name: "AI 专线粘性组",
     mode: "sticky_best",
+    independent_routing: false,
     match_rules: ["DOMAIN-SUFFIX,googleapis.com", "DOMAIN-SUFFIX,openai.com"],
     member_node_ids: ["node-jp-01", "node-sg-02", "node-us-03"],
     dynamic_filter: { expr: "multiplier <= 1 && google_clean == 1", require_google_clean: true },
@@ -1089,6 +1098,7 @@ const MOCK_GROUPS: MultiGroup[] = [
     id: "grp-media",
     name: "影音下载均衡组",
     mode: "load_balance_consistent_hash",
+    independent_routing: false,
     match_rules: ["DOMAIN-SUFFIX,github.com", "DOMAIN-SUFFIX,youtube.com"],
     member_node_ids: ["node-jp-01", "node-sg-02"],
     dynamic_filter: { expr: "multiplier <= 1.5 && google_clean == 1", require_google_clean: true },
@@ -1110,6 +1120,7 @@ const MOCK_GROUPS: MultiGroup[] = [
     id: "grp-backup-3x",
     name: "备用精选组",
     mode: "sticky_best",
+    independent_routing: false,
     match_rules: [],
     member_node_ids: ["node-tw-04"],
     dynamic_filter: null,
@@ -1178,7 +1189,7 @@ const MOCK_QUICK_SITES: SiteCheckItem[] = [
   { id: "site-google", name: "Google 连通", url: "https://www.google.com/generate_204", latency_ms: 69, ok: true },
   { id: "site-github", name: "GitHub", url: "https://github.com", latency_ms: 112, ok: true },
   { id: "site-youtube", name: "YouTube", url: "https://www.youtube.com", latency_ms: 84, ok: true },
-  { id: "site-chatgpt", name: "OpenAI", url: "https://chatgpt.com", latency_ms: 95, ok: true },
+  { id: "site-chatgpt", name: "OpenAI", url: "https://chatgpt.com/cdn-cgi/trace", latency_ms: 95, ok: true },
 ];
 
 let mockConfig: AppConfig = structuredClone(DEFAULT_APP_CONFIG);
@@ -2376,6 +2387,36 @@ export const catcloudApi = {
     return url ?? `http://127.0.0.1:${mockConfig.controller_port}/ui`;
   },
 
+  async getTrafficHistory(): Promise<TrafficSample[]> {
+    if (!isTauriEnv()) {
+      return [];
+    }
+    type RawTrafficPayload = Partial<TrafficSample> & {
+      active_connections?: number;
+      core_memory_mb?: number;
+    };
+    let rows: RawTrafficPayload[];
+    try {
+      rows = await tauriInvokeOrThrow<RawTrafficPayload[]>("get_traffic_history");
+    } catch {
+      return [];
+    }
+    if (!Array.isArray(rows)) return [];
+    const safeNum = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+    return rows
+      .filter((r) => Boolean(r && typeof r === "object"))
+      .map((r) => ({
+        up_bps: safeNum(r.up_bps),
+        down_bps: safeNum(r.down_bps),
+        up_total_bytes: safeNum(r.up_total_bytes),
+        down_total_bytes: safeNum(r.down_total_bytes),
+        connections: safeNum(r.connections ?? r.active_connections),
+        memory_mb: safeNum(r.memory_mb ?? r.core_memory_mb),
+        timestamp_ms: safeNum(r.timestamp_ms),
+      }))
+      .filter((s) => s.timestamp_ms > 0);
+  },
+
   /**
    * Subscribe to 2-second traffic telemetry.
    * Uses real Tauri event stream in desktop runtime; smooth mock ticker only in browser preview.
@@ -2474,6 +2515,26 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       void tauriListen<ProbeProgressEvent>("catcloud://probe-progress", (payload) => {
         if (!disposed && payload) onProgress(payload);
+      }).then((fn) => {
+        if (disposed) {
+          fn?.();
+        } else {
+          unlisten = fn;
+        }
+      });
+    }
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
+
+  subscribeStrategySwitch(onSwitch: (ev: StrategySwitchEvent) => void): () => void {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    if (isTauriEnv()) {
+      void tauriListen<StrategySwitchEvent>("catcloud://strategy-switch", (payload) => {
+        if (!disposed && payload) onSwitch(payload);
       }).then((fn) => {
         if (disposed) {
           fn?.();

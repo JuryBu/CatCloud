@@ -2,6 +2,7 @@ import {
   Activity,
   AlertTriangle,
   ArrowLeft,
+  ArrowUpDown,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -104,7 +105,10 @@ const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
     switchMode: "force_close_old",
     formula: FORMULA_COST_EFFECTIVE,
     matchRules: [
+      "DOMAIN-SUFFIX,chatgpt.com",
+      "DOMAIN-SUFFIX,ab.chatgpt.com",
       "DOMAIN-SUFFIX,openai.com",
+      "DOMAIN-SUFFIX,anthropic.com",
       "DOMAIN-SUFFIX,claude.ai",
       "DOMAIN-SUFFIX,googleapis.com",
     ],
@@ -236,6 +240,7 @@ interface TriggerMeta {
 }
 
 type NodeViewMode = "all" | "members";
+type NodeSortMode = "default" | "up_desc" | "down_desc" | "latency_asc";
 
 /* ============================================================================
  * Safe Formatting Helpers for dynamic_filter, trigger_rules & match_rules
@@ -547,6 +552,7 @@ function normalizeGroupForBackend(group: MultiGroup, meta: TriggerMeta): MultiGr
 
   return {
     ...group,
+    independent_routing: Boolean(group.independent_routing),
     dynamic_filter: dynamicFilter,
     trigger_rules: triggerRules,
     trigger_expr: expr || null,
@@ -929,11 +935,21 @@ function evaluateFormulaSafely(expr: string, ctx: EvalContext): EvalOutcome {
           if (!close || close.kind !== "op" || close.value !== ")") {
             throw new Error(`${name} 缺少闭合括号`);
           }
-          if (name === "probe_up") return sanitizeNumber(ctx.probeUp[arg.value] ?? 0);
-          if (name === "probe_down") return sanitizeNumber(ctx.probeDown[arg.value] ?? 0);
+          if (name === "probe_up") {
+            const v = ctx.probeUp[arg.value];
+            return sanitizeNumber(typeof v === "number" && Number.isFinite(v) ? v : (ctx.vars.up_mbps ?? 0));
+          }
+          if (name === "probe_down") {
+            const v = ctx.probeDown[arg.value];
+            return sanitizeNumber(typeof v === "number" && Number.isFinite(v) ? v : (ctx.vars.down_mbps ?? 0));
+          }
           if (name === "probe_ping") {
             const p = ctx.probePing[arg.value];
-            return typeof p === "number" && Number.isFinite(p) ? p : DEFAULT_MISSING_PING_MS;
+            if (typeof p === "number" && Number.isFinite(p)) return p;
+            const fallbackPing = ctx.vars.ping_ms;
+            return typeof fallbackPing === "number" && Number.isFinite(fallbackPing)
+              ? fallbackPing
+              : DEFAULT_MISSING_PING_MS;
           }
           if (name === "probe_ok") {
             return ctx.probeOk[arg.value] === true ? 1 : 0;
@@ -1088,11 +1104,16 @@ function assessNodeAgainstGates(
       }
       continue;
     }
-    // Custom gate expression: evaluate only when snapshot exists
+    // Custom / compound gate expression: neutrally allow untested keepalive_ok (matching Rust evaluator)
     if (!lazyCtx) {
       lazyCtx = buildEvalContextForNode(node, snap);
     }
-    if (!checkHardGate(gate, lazyCtx)) {
+    const evalCtx =
+      (snap.keepalive_60s_ok === null || snap.keepalive_60s_ok === undefined) &&
+      gate.includes("keepalive_ok")
+        ? { ...lazyCtx, vars: { ...lazyCtx.vars, keepalive_ok: 1 } }
+        : lazyCtx;
+    if (!checkHardGate(gate, evalCtx)) {
       failedReasons.push(gate);
     }
   }
@@ -1131,6 +1152,17 @@ function extractCardAiDots(snap: ProbeSnapshot | undefined): Array<{
   return list;
 }
 
+function isNodeAiReady(snap: ProbeSnapshot | undefined): boolean {
+  if (!snap) return false;
+  const sites = snap.unlocked_sites ?? {};
+  return (
+    sites.claude === true ||
+    sites.chatgpt === true ||
+    sites.windsurf === true ||
+    (sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai) === true
+  );
+}
+
 function buildMultiGroupAgentMarkdown(group: MultiGroup, meta: TriggerMeta): string {
   const normalized = normalizeGroupForBackend(group, meta);
   const snippet = JSON.stringify(
@@ -1138,6 +1170,7 @@ function buildMultiGroupAgentMarkdown(group: MultiGroup, meta: TriggerMeta): str
       id: normalized.id,
       name: normalized.name,
       mode: normalized.mode,
+      independent_routing: Boolean(normalized.independent_routing),
       match_rules: normalized.match_rules,
       hard_gates: normalized.hard_gates,
       trigger_rules: normalized.trigger_rules,
@@ -1250,6 +1283,9 @@ export function MultiGroupPage() {
   const [filterRegion, setFilterRegion] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
   const [viewMode, setViewMode] = useState<NodeViewMode>("all");
+  const [sortMode, setSortMode] = useState<NodeSortMode>("default");
+  const [filterGoogleClean, setFilterGoogleClean] = useState(false);
+  const [filterAiReady, setFilterAiReady] = useState(false);
   const [nodePage, setNodePage] = useState(1);
   const [nodePageSize, setNodePageSize] = useState(24);
   const [confirmClearMembers, setConfirmClearMembers] = useState(false);
@@ -1347,7 +1383,17 @@ export function MultiGroupPage() {
 
   useEffect(() => {
     setNodePage(1);
-  }, [selectedGroupId, viewMode, searchQuery, selectedSubId, filterContinent, filterRegion]);
+  }, [
+    selectedGroupId,
+    viewMode,
+    searchQuery,
+    selectedSubId,
+    filterContinent,
+    filterRegion,
+    sortMode,
+    filterGoogleClean,
+    filterAiReady,
+  ]);
 
   // Debounced backend authoritative formula validation in Tauri runtime (only when advanced panel is open or dirty)
   const currentFormulaExpr = selectedGroup?.formula_expr ?? "";
@@ -1464,12 +1510,14 @@ export function MultiGroupPage() {
     [selectedGroup?.member_node_ids]
   );
 
-  // Only bind live probe/member/active dependencies when sorting inside "members" view
+  // Only bind live probe/member/active dependencies when needed (members view, metric sort, or health filters)
   // so streaming probe updates never re-filter/re-sort all 430+ nodes in default "all" view.
   const memberFilterSet = viewMode === "members" ? memberIdSet : null;
   const memberActiveId =
     viewMode === "members" ? (selectedGroup?.active_node_id ?? null) : null;
-  const memberSortProbes = viewMode === "members" ? probes : null;
+  const needsLiveProbes =
+    viewMode === "members" || sortMode !== "default" || filterGoogleClean || filterAiReady;
+  const activeFilterProbes = needsLiveProbes ? probes : null;
 
   // Filter & stably sort nodes for the main grid
   const filteredNodes = useMemo(() => {
@@ -1478,6 +1526,12 @@ export function MultiGroupPage() {
       if (memberFilterSet && !memberFilterSet.has(node.id)) return false;
       if (selectedSubId !== "all" && (node.sub_id || "__unknown__") !== selectedSubId) return false;
       if (!nodeMatchesContinentAndRegion(node, filterContinent, filterRegion)) {
+        return false;
+      }
+      if (filterGoogleClean && activeFilterProbes?.[node.id]?.google_clean !== true) {
+        return false;
+      }
+      if (filterAiReady && !isNodeAiReady(activeFilterProbes?.[node.id])) {
         return false;
       }
       if (q) {
@@ -1495,14 +1549,52 @@ export function MultiGroupPage() {
     const pinnedActive = usePinned ? pinnedOrder.activeId : null;
     const pinnedMembers = usePinned ? pinnedOrder.memberIds : null;
 
+    const getMetricRank = (
+      snap: ProbeSnapshot | undefined
+    ): { tier: number; primary: number; secondary: number } => {
+      if (!snap) return { tier: 2, primary: 0, secondary: 99999 };
+      if (!snap.ok) return { tier: 3, primary: 0, secondary: 99999 };
+      const lat =
+        typeof snap.latency_ms === "number" && Number.isFinite(snap.latency_ms)
+          ? snap.latency_ms
+          : 99999;
+      if (sortMode === "up_desc") {
+        if (typeof snap.up_mbps === "number" && Number.isFinite(snap.up_mbps)) {
+          return { tier: 0, primary: -snap.up_mbps, secondary: lat };
+        }
+        return { tier: 1, primary: lat, secondary: 0 };
+      }
+      if (sortMode === "down_desc") {
+        if (typeof snap.down_mbps === "number" && Number.isFinite(snap.down_mbps)) {
+          return { tier: 0, primary: -snap.down_mbps, secondary: lat };
+        }
+        return { tier: 1, primary: lat, secondary: 0 };
+      }
+      // latency_asc
+      if (typeof snap.latency_ms === "number" && Number.isFinite(snap.latency_ms)) {
+        const up =
+          typeof snap.up_mbps === "number" && Number.isFinite(snap.up_mbps) ? snap.up_mbps : -1;
+        return { tier: 0, primary: snap.latency_ms, secondary: -up };
+      }
+      return { tier: 1, primary: 99999, secondary: 0 };
+    };
+
     const sorted = [...list];
     sorted.sort((a, b) => {
+      if (sortMode !== "default") {
+        const ra = getMetricRank(activeFilterProbes?.[a.id]);
+        const rb = getMetricRank(activeFilterProbes?.[b.id]);
+        if (ra.tier !== rb.tier) return ra.tier - rb.tier;
+        if (ra.primary !== rb.primary) return ra.primary - rb.primary;
+        if (ra.secondary !== rb.secondary) return ra.secondary - rb.secondary;
+        return a.name.localeCompare(b.name);
+      }
       if (viewMode === "members") {
         const aAct = memberActiveId === a.id ? 1 : 0;
         const bAct = memberActiveId === b.id ? 1 : 0;
         if (aAct !== bAct) return bAct - aAct;
-        const aSnap = memberSortProbes?.[a.id];
-        const bSnap = memberSortProbes?.[b.id];
+        const aSnap = activeFilterProbes?.[a.id];
+        const bSnap = activeFilterProbes?.[b.id];
         const aLat = aSnap?.ok ? (aSnap.latency_ms ?? 99999) : 99999;
         const bLat = bSnap?.ok ? (bSnap.latency_ms ?? 99999) : 99999;
         if (aLat !== bLat) return aLat - bLat;
@@ -1520,6 +1612,9 @@ export function MultiGroupPage() {
   }, [
     enabledNodes,
     viewMode,
+    sortMode,
+    filterGoogleClean,
+    filterAiReady,
     memberFilterSet,
     selectedSubId,
     filterContinent,
@@ -1529,7 +1624,7 @@ export function MultiGroupPage() {
     pinnedOrder,
     selectedGroupId,
     memberActiveId,
-    memberSortProbes,
+    activeFilterProbes,
   ]);
 
   const totalNodePages = Math.max(1, Math.ceil(filteredNodes.length / nodePageSize));
@@ -1889,6 +1984,7 @@ export function MultiGroupPage() {
       id: `grp-${Date.now().toString(36)}`,
       name,
       mode: tpl.mode,
+      independent_routing: false,
       match_rules: [...tpl.matchRules],
       member_node_ids: [],
       dynamic_filter: null,
@@ -2372,6 +2468,7 @@ export function MultiGroupPage() {
             {groups.map((g) => {
               const isSelected = selectedGroup?.id === g.id;
               const isSystemActive = isGroupMode && runtime.active_group_id === g.id;
+              const isIndependentActive = !isSystemActive && Boolean(g.independent_routing);
               const activeNode = g.active_node_id ? nodeById.get(g.active_node_id) : null;
               const modeMeta = GROUP_MODES.find((m) => m.id === g.mode) ?? GROUP_MODES[0];
               const isDirty = Boolean(dirtyGroupIds[g.id]);
@@ -2456,13 +2553,28 @@ export function MultiGroupPage() {
                     </div>
                   ) : (
                     <>
-                      <div className="mt-1.5 flex items-center justify-between gap-1.5 text-[11px]">
+                      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
                         <span className="cc-mono font-medium text-[var(--text-secondary)]">
                           {g.member_node_ids.length} 个节点
                         </span>
-                        <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                          {modeMeta.shortLabel}
-                        </span>
+                        <div className="flex flex-wrap items-center gap-1">
+                          {isIndependentActive && (
+                            <span
+                              title={
+                                g.match_rules.length > 0
+                                  ? `已开启独立分流：即使首页在用其它组，命中本组 ${g.match_rules.length} 条适用网站规则的流量也会单独走此组`
+                                  : "已开启独立分流开关（在右侧添加适用网站域名后将单独接管对应流量）"
+                              }
+                              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--amber)]"
+                            >
+                              <span className="h-1.5 w-1.5 rounded-full bg-[var(--amber)]" />
+                              <span>分站生效中</span>
+                            </span>
+                          )}
+                          <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                            {modeMeta.shortLabel}
+                          </span>
+                        </div>
                       </div>
                       <div className="mt-1.5 flex items-center justify-between gap-1.5">
                         <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--muted)]">
@@ -2656,11 +2768,11 @@ export function MultiGroupPage() {
             )}
           </div>
 
-          {/* Spacious Two-Row Filter, Legend & Batch Action Bar */}
+          {/* Spacious Two-Row Filter, Sort, Quick Health Pills & Batch Action Bar */}
           <div className="cc-card cc-glass space-y-2.5 rounded-2xl px-4 py-3">
-            {/* Row 1: Wide Search Box + Source & Two-Tier Continent/Region Filter Dropdowns */}
+            {/* Row 1: Wide Search Box + Source + Continent/Region + Sort Dropdown */}
             <div className="flex flex-wrap items-center gap-2">
-              <div className="relative min-w-[200px] flex-1">
+              <div className="relative min-w-[160px] flex-1">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
                 <input
                   type="text"
@@ -2688,7 +2800,7 @@ export function MultiGroupPage() {
                   value={selectedSubId}
                   onChange={(e) => setSelectedSubId(e.target.value)}
                   aria-label="按来源筛选"
-                  className="h-9 max-w-[190px] rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  className="h-9 max-w-[175px] rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                 >
                   <option value="all">全部来源 ({enabledNodes.length})</option>
                   {providerTabs.map((sub) => (
@@ -2714,11 +2826,36 @@ export function MultiGroupPage() {
                   setNodePage(1);
                 }}
               />
+
+              {/* Metric Sort Dropdown */}
+              <div className="relative shrink-0">
+                <ArrowUpDown
+                  className={`pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 ${
+                    sortMode !== "default" ? "text-[var(--accent)]" : "text-[var(--muted)]"
+                  }`}
+                />
+                <select
+                  value={sortMode}
+                  onChange={(e) => setSortMode(e.target.value as NodeSortMode)}
+                  aria-label="节点排序方式"
+                  className={`h-9 max-w-[200px] cursor-pointer appearance-none rounded-xl border bg-[var(--bg-elevated)] pl-8 pr-7 text-xs font-medium text-[var(--text)] outline-none transition-colors hover:border-[var(--line-strong)] focus:border-[var(--accent)] ${
+                    sortMode !== "default"
+                      ? "border-[var(--accent)]/60"
+                      : "border-[var(--line)]"
+                  }`}
+                >
+                  <option value="default">排序：默认（在用优先）</option>
+                  <option value="up_desc">排序：上传最快</option>
+                  <option value="down_desc">排序：下载最快</option>
+                  <option value="latency_asc">排序：延迟最低</option>
+                </select>
+                <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+              </div>
             </div>
 
-            {/* Row 2: View Mode Switch + Solid Color Legend + Batch Actions */}
-            <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-[var(--line)]/60 pt-2.5">
-              <div className="flex flex-wrap items-center gap-3">
+            {/* Row 2: View Mode Switch + Quick Health Filter Pills + Batch Actions */}
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)]/60 pt-2.5">
+              <div className="flex flex-wrap items-center gap-2">
                 {/* View mode segmented switch */}
                 <div className="inline-flex rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-xs">
                   <button
@@ -2745,29 +2882,40 @@ export function MultiGroupPage() {
                   </button>
                 </div>
 
-                {/* Clear solid / thick-bordered swatch legend */}
-                <div className="flex flex-wrap items-center gap-3 text-[11px]">
-                  <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
-                    <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--green)] shadow-xs" />
-                    <span className="font-medium">正在用</span>
-                  </span>
-                  <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
-                    <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--accent)] shadow-xs" />
-                    <span className="font-medium">已在本组</span>
-                  </span>
-                  <span className="inline-flex items-center gap-1.5 text-[var(--muted)]">
-                    <span className="h-3 w-3 shrink-0 rounded-[4px] border-2 border-[var(--line-strong)] bg-[var(--card)]" />
-                    <span>未加入</span>
-                  </span>
-                  <span className="cc-mono text-[11px] text-[var(--muted)]">
-                    · 匹配 {filteredNodes.length} 个
-                    {totalNodePages > 1 ? `（第 ${safeNodePage}/${totalNodePages} 页）` : ""}
-                  </span>
-                </div>
+                {/* Quick Health Filter Pills */}
+                <button
+                  type="button"
+                  aria-pressed={filterGoogleClean}
+                  onClick={() => setFilterGoogleClean((v) => !v)}
+                  title="仅看已测出谷歌地区正常的节点（不送中）"
+                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1 text-xs font-medium transition-colors ${
+                    filterGoogleClean
+                      ? "border-[var(--green)]/60 bg-[var(--green-soft)] text-[var(--green)]"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--green)]/50 hover:text-[var(--text)]"
+                  }`}
+                >
+                  <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                  <span>谷歌正常</span>
+                </button>
+
+                <button
+                  type="button"
+                  aria-pressed={filterAiReady}
+                  onClick={() => setFilterAiReady((v) => !v)}
+                  title="仅看已测出支持 ChatGPT / Gemini / Claude / Windsurf 任一 AI 的节点"
+                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1 text-xs font-medium transition-colors ${
+                    filterAiReady
+                      ? "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)]/50 hover:text-[var(--text)]"
+                  }`}
+                >
+                  <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                  <span>AI 可用</span>
+                </button>
               </div>
 
               {/* Batch quick actions */}
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 {viewMode === "all" && unjoinedInFilterIds.length > 0 && (
                   <button
                     type="button"
@@ -2793,6 +2941,54 @@ export function MultiGroupPage() {
                   </button>
                 )}
               </div>
+            </div>
+
+            {/* Compact Legend & Match Count Row */}
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+              <div className="flex flex-wrap items-center gap-3">
+                <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
+                  <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--green)] shadow-xs" />
+                  <span className="font-medium">正在用</span>
+                </span>
+                <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
+                  <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--accent)] shadow-xs" />
+                  <span className="font-medium">已在本组</span>
+                </span>
+                <span className="inline-flex items-center gap-1.5 text-[var(--muted)]">
+                  <span className="h-3 w-3 shrink-0 rounded-[4px] border-2 border-[var(--line-strong)] bg-[var(--card)]" />
+                  <span>未加入</span>
+                </span>
+                <span className="cc-mono text-[11px] text-[var(--muted)]">
+                  · 匹配 {filteredNodes.length} 个
+                  {totalNodePages > 1 ? `（第 ${safeNodePage}/${totalNodePages} 页）` : ""}
+                </span>
+              </div>
+
+              {(searchQuery ||
+                selectedSubId !== "all" ||
+                filterContinent !== "all" ||
+                filterRegion !== "all" ||
+                filterGoogleClean ||
+                filterAiReady ||
+                sortMode !== "default") && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery("");
+                    setSelectedSubId("all");
+                    setFilterContinent("all");
+                    setFilterRegion("all");
+                    setFilterGoogleClean(false);
+                    setFilterAiReady(false);
+                    setSortMode("default");
+                    setNodePage(1);
+                  }}
+                  className="inline-flex items-center gap-1 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--accent)]"
+                >
+                  <RotateCcw className="h-3 w-3" />
+                  <span>重置筛选</span>
+                </button>
+              )}
             </div>
           </div>
 
@@ -3063,40 +3259,46 @@ export function MultiGroupPage() {
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center px-6 py-12 text-center">
               <p className="text-xs font-medium text-[var(--text-secondary)]">
-                {viewMode === "members"
+                {viewMode === "members" && selectedGroup.member_node_ids.length === 0
                   ? "当前多选组里还没有节点"
                   : enabledNodes.length === 0
                     ? "节点库里还没有节点，请先去「节点与订阅」导入订阅"
                     : "没有找到符合当前筛选条件的节点"}
               </p>
-              {viewMode === "members" && enabledNodes.length > 0 && (
-                <button
-                  type="button"
-                  onClick={() => setViewMode("all")}
-                  className="mt-3 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
-                >
-                  切到「全部节点」挑选加入
-                </button>
-              )}
-              {viewMode === "all" &&
-                (searchQuery ||
-                  selectedSubId !== "all" ||
-                  filterContinent !== "all" ||
-                  filterRegion !== "all") && (
+              {viewMode === "members" &&
+                selectedGroup.member_node_ids.length === 0 &&
+                enabledNodes.length > 0 && (
                   <button
                     type="button"
-                    onClick={() => {
-                      setSearchQuery("");
-                      setSelectedSubId("all");
-                      setFilterContinent("all");
-                      setFilterRegion("all");
-                      setNodePage(1);
-                    }}
-                    className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    onClick={() => setViewMode("all")}
+                    className="mt-3 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
                   >
-                    重置全部筛选
+                    切到「全部节点」挑选加入
                   </button>
                 )}
+              {(searchQuery ||
+                selectedSubId !== "all" ||
+                filterContinent !== "all" ||
+                filterRegion !== "all" ||
+                filterGoogleClean ||
+                filterAiReady) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery("");
+                    setSelectedSubId("all");
+                    setFilterContinent("all");
+                    setFilterRegion("all");
+                    setFilterGoogleClean(false);
+                    setFilterAiReady(false);
+                    setSortMode("default");
+                    setNodePage(1);
+                  }}
+                  className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                >
+                  重置全部筛选
+                </button>
+              )}
             </div>
           )}
 
@@ -3539,10 +3741,51 @@ export function MultiGroupPage() {
               </div>
 
               {/* 5. 适用网站 */}
-              <div className="space-y-2 border-t border-[var(--line)]/70 pt-4">
+              <div className="space-y-2.5 border-t border-[var(--line)]/70 pt-4">
                 <div className="text-xs font-semibold text-[var(--text)]">
                   5. 适用网站（哪些网站走这个组）
                 </div>
+
+                {/* Independent site routing switch (default off so inactive groups never steal traffic) */}
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={Boolean(selectedGroup.independent_routing)}
+                  onClick={() =>
+                    updateSelectedGroup((g) => ({
+                      ...g,
+                      independent_routing: !Boolean(g.independent_routing),
+                    }))
+                  }
+                  className={`w-full rounded-xl border p-2.5 text-left transition-colors ${
+                    selectedGroup.independent_routing
+                      ? "border-[var(--amber)]/55 bg-[var(--amber-soft)]/50"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-semibold text-[var(--text)]">
+                      独立接管专属网站分流
+                    </span>
+                    <span
+                      className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold transition-colors ${
+                        selectedGroup.independent_routing
+                          ? "bg-[var(--amber)] text-[var(--accent-ink)]"
+                          : "bg-[var(--card)] text-[var(--muted)]"
+                      }`}
+                    >
+                      {selectedGroup.independent_routing ? "已开启" : "已关闭"}
+                    </span>
+                  </div>
+                  <p className="mt-1.5 text-[10px] leading-relaxed text-[var(--muted)]">
+                    关闭时，只有首页选中本组才会走这里，绝不抢其它组的流量；打开后，即使首页在用别的组，命中下方域名的网站也会单独走本组
+                  </p>
+                  {selectedGroup.independent_routing && selectedGroup.match_rules.length === 0 && (
+                    <p className="mt-1 text-[10px] font-medium text-[var(--amber)]">
+                      提示：请在下方添加至少一条网站域名，独立分流才会匹配生效
+                    </p>
+                  )}
+                </button>
 
                 <div className="flex flex-wrap gap-1.5">
                   {selectedGroup.match_rules.length > 0 ? (

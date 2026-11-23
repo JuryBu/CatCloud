@@ -1,8 +1,6 @@
 import {
   Check,
   ChevronDown,
-  Cpu,
-  Gauge,
   Globe,
   Image,
   Layers,
@@ -10,7 +8,6 @@ import {
   Loader2,
   Moon,
   Network,
-  Pause,
   PictureInPicture2,
   ScrollText,
   ShieldCheck,
@@ -22,7 +19,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   BUILTIN_WALLPAPER_PRESETS,
@@ -31,13 +28,10 @@ import {
   type ResolvedTheme,
   type ThemeMode,
   appActions,
-  appStore,
   useAppSelector,
-  useLatestTraffic,
-  useTrafficVersion,
 } from "../store/appStore";
 import { MascotSprite } from "./MascotSprite";
-import { formatRate } from "./TrafficSparkline";
+import { TrafficSparkline } from "./TrafficSparkline";
 
 export interface NavItemSpec {
   id: NavRouteId;
@@ -49,9 +43,8 @@ export interface NavItemSpec {
 export const NAV_ITEMS: readonly NavItemSpec[] = [
   { id: "overview", label: "总览", shortDesc: "代理开关与实时状态", icon: LayoutDashboard },
   { id: "groups", label: "智能多选组", shortDesc: "路线分组与自动优选", icon: Layers },
-  { id: "speedtest", label: "节点测速", shortDesc: "批量检测延迟与速度", icon: Gauge },
+  { id: "nodes", label: "节点与测速", shortDesc: "节点管理、订阅导入与测速", icon: Globe },
   { id: "preaccel", label: "国内提速", shortDesc: "国内中转与稳连加速", icon: Zap },
-  { id: "nodes", label: "节点与订阅", shortDesc: "导入与管理全部节点", icon: Globe },
   { id: "rules", label: "分流与连接", shortDesc: "网站分流与当前连接", icon: Network },
   { id: "logs", label: "运行日志", shortDesc: "查看内核运行记录", icon: ScrollText },
   { id: "settings", label: "设置", shortDesc: "外观、启动与偏好", icon: SlidersHorizontal },
@@ -124,216 +117,13 @@ function resolveStatusLabel(status: string, running: boolean): string {
   }
 }
 
-function buildMiniSvgPath(
-  values: Float64Array,
-  count: number,
-  maxValue: number,
-  width: number,
-  height: number,
-  padX: number,
-  padTop: number,
-  padBottom: number
-): { linePath: string; areaPath: string } {
-  if (count === 0) return { linePath: "", areaPath: "" };
-  const innerW = Math.max(1, width - padX * 2);
-  const innerH = Math.max(1, height - padTop - padBottom);
-  const baseY = height - padBottom;
-  const safeMax = Math.max(maxValue, 1024);
-  const xs = new Float64Array(count);
-  const ys = new Float64Array(count);
-
-  for (let i = 0; i < count; i++) {
-    xs[i] = count === 1 ? padX + innerW : padX + (i / (count - 1)) * innerW;
-    const ratio = Math.min(1, Math.max(0, values[i] / safeMax));
-    ys[i] = baseY - ratio * innerH;
-  }
-
-  if (count === 1) {
-    const linePath = `M${padX.toFixed(1)},${ys[0].toFixed(1)} L${xs[0].toFixed(1)},${ys[0].toFixed(1)}`;
-    const areaPath = `${linePath} L${xs[0].toFixed(1)},${baseY.toFixed(1)} L${padX.toFixed(1)},${baseY.toFixed(1)} Z`;
-    return { linePath, areaPath };
-  }
-
-  const parts: string[] = [`M${xs[0].toFixed(1)},${ys[0].toFixed(1)}`];
-  if (count === 2) {
-    parts.push(`L${xs[1].toFixed(1)},${ys[1].toFixed(1)}`);
-  } else {
-    for (let i = 1; i < count - 1; i++) {
-      const mx = (xs[i] + xs[i + 1]) * 0.5;
-      const my = (ys[i] + ys[i + 1]) * 0.5;
-      parts.push(`Q${xs[i].toFixed(1)},${ys[i].toFixed(1)} ${mx.toFixed(1)},${my.toFixed(1)}`);
-    }
-    const last = count - 1;
-    parts.push(`L${xs[last].toFixed(1)},${ys[last].toFixed(1)}`);
-  }
-
-  const linePath = parts.join(" ");
-  const areaPath = `${linePath} L${xs[count - 1].toFixed(1)},${baseY.toFixed(1)} L${xs[0].toFixed(1)},${baseY.toFixed(1)} Z`;
-  return { linePath, areaPath };
-}
-
-function SidebarMiniTrafficCard() {
-  const uid = useId().replace(/:/g, "");
-  const liveVersion = useTrafficVersion();
-  const latest = useLatestTraffic();
-  const sparklineEnabled = useAppSelector(
-    (s) => s.config.personalization.animations_enabled && s.config.personalization.sparkline_enabled
-  );
-
-  const [isVisible, setIsVisible] = useState<boolean>(() =>
-    typeof document === "undefined" ? true : document.visibilityState === "visible"
-  );
-  const lastRenderedVersionRef = useRef<number>(liveVersion);
-
-  useEffect(() => {
-    const onVisibility = () => {
-      setIsVisible(document.visibilityState === "visible");
-    };
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, []);
-
-  const redrawPaused = !isVisible || !sparklineEnabled;
-  if (!redrawPaused) {
-    lastRenderedVersionRef.current = liveVersion;
-  }
-  const effectiveVersion = lastRenderedVersionRef.current;
-
-  const ring = appStore.getTrafficBuffer();
-  const vbWidth = 196;
-  const vbHeight = 42;
-  const computed = useMemo(() => {
-    const total = ring.length;
-    const count = Math.min(total, 60);
-    const startOffset = total - count;
-    const upSlice = new Float64Array(count);
-    const downSlice = new Float64Array(count);
-
-    let peak = 64 * 1024;
-    for (let i = 0; i < count; i++) {
-      const idx = startOffset + i;
-      const u = ring.upAt(idx);
-      const d = ring.downAt(idx);
-      upSlice[i] = u;
-      downSlice[i] = d;
-      if (u > peak) peak = u;
-      if (d > peak) peak = d;
-    }
-
-    const scaleMax = peak * 1.15;
-    return {
-      downGeom: buildMiniSvgPath(downSlice, count, scaleMax, vbWidth, vbHeight, 2, 4, 3),
-      upGeom: buildMiniSvgPath(upSlice, count, scaleMax, vbWidth, vbHeight, 2, 4, 3),
-      version: effectiveVersion,
-    };
-  }, [effectiveVersion, ring]);
-
-  const gradDownId = `cc-sb-down-${uid}`;
-  const gradUpId = `cc-sb-up-${uid}`;
-
-  return (
-    <div
-      className="cc-card cc-glass rounded-xl px-3 py-2.5"
-      title={
-        redrawPaused
-          ? "流量动画已暂停（省电模式）"
-          : `近 2 分钟实时流量 · 内核内存 ${latest.memory_mb.toFixed(1)} MB`
-      }
-    >
-      <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--muted)]">
-        <span className="font-medium">实时流量</span>
-        {!sparklineEnabled ? (
-          <span className="inline-flex items-center gap-1 text-[10px] text-[var(--amber)]">
-            <Pause className="h-2.5 w-2.5" />
-            已暂停
-          </span>
-        ) : (
-          <span className="cc-tabular text-[10px] text-[var(--muted)]">
-            {latest.connections} 个连接
-          </span>
-        )}
-      </div>
-
-      <svg
-        viewBox={`0 0 ${vbWidth} ${vbHeight}`}
-        preserveAspectRatio="none"
-        className="block h-[40px] w-full overflow-visible"
-        aria-hidden="true"
-      >
-        <defs>
-          <linearGradient id={gradDownId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="var(--sky)" stopOpacity="0.34" />
-            <stop offset="100%" stopColor="var(--sky)" stopOpacity="0.02" />
-          </linearGradient>
-          <linearGradient id={gradUpId} x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="var(--coral)" stopOpacity="0.32" />
-            <stop offset="100%" stopColor="var(--coral)" stopOpacity="0.02" />
-          </linearGradient>
-        </defs>
-        {computed.downGeom.areaPath && (
-          <path d={computed.downGeom.areaPath} fill={`url(#${gradDownId})`} />
-        )}
-        {computed.upGeom.areaPath && (
-          <path d={computed.upGeom.areaPath} fill={`url(#${gradUpId})`} />
-        )}
-        {computed.downGeom.linePath && (
-          <path
-            d={computed.downGeom.linePath}
-            fill="none"
-            stroke="var(--sky)"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-        {computed.upGeom.linePath && (
-          <path
-            d={computed.upGeom.linePath}
-            fill="none"
-            stroke="var(--coral)"
-            strokeWidth="1.4"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            vectorEffect="non-scaling-stroke"
-          />
-        )}
-      </svg>
-
-      <div className="mt-2 flex items-center justify-between gap-2 text-[11px]">
-        <span className="inline-flex min-w-0 items-center gap-1 whitespace-nowrap">
-          <span className="text-[var(--coral)]">↑</span>
-          <span className="cc-mono truncate font-medium text-[var(--text)]">
-            {formatRate(latest.up_bps)}
-          </span>
-        </span>
-        <span className="inline-flex min-w-0 items-center gap-1 whitespace-nowrap">
-          <span className="text-[var(--sky)]">↓</span>
-          <span className="cc-mono truncate font-medium text-[var(--text)]">
-            {formatRate(latest.down_bps)}
-          </span>
-        </span>
-      </div>
-
-      <div className="mt-1.5 flex items-center justify-between border-t border-[var(--line)] pt-1.5 text-[11px]">
-        <span className="inline-flex items-center gap-1 text-[var(--muted)]">
-          <Cpu className="h-3 w-3 text-[var(--green)]" />
-          内核内存
-        </span>
-        <span className="cc-mono font-medium text-[var(--green)]">
-          {latest.memory_mb.toFixed(1)} MB
-        </span>
-      </div>
-    </div>
-  );
-}
-
 export function Sidebar() {
   const activeNav = useAppSelector((s) => s.activeNav);
   const themeMode = useAppSelector((s) => s.config.personalization.theme_mode);
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const runtime = useAppSelector((s) => s.runtime);
+  const isProbeRunning = useAppSelector((s) => s.probeProgress.running);
   const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
   const tunAdminPromptBusy = useAppSelector((s) => s.tunAdminPromptBusy);
   const tunAdminPromptReason = useAppSelector((s) => s.tunAdminPromptReason);
@@ -570,11 +360,12 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Unified 8-item primary navigation */}
+      {/* Unified 7-item primary navigation */}
       <nav className="flex-1 space-y-0.5 overflow-y-auto pr-0.5" aria-label="主导航">
         {NAV_ITEMS.map((item) => {
           const Icon = item.icon;
-          const isActive = activeNav === item.id;
+          const isActive =
+            activeNav === item.id || (item.id === "nodes" && activeNav === "speedtest");
           return (
             <button
               key={item.id}
@@ -602,8 +393,13 @@ export function Sidebar() {
               />
               <span className="truncate">{item.label}</span>
 
+              {item.id === "nodes" && isProbeRunning && (
+                <span className="ml-auto shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                  测速中
+                </span>
+              )}
               {item.id === "preaccel" && runtime.preaccel_active && (
-                <span className="ml-auto rounded-full bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]">
+                <span className="ml-auto shrink-0 rounded-full bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]">
                   提速中
                 </span>
               )}
@@ -643,7 +439,7 @@ export function Sidebar() {
         </div>
       ) : (
         <div className="mt-3 space-y-2 border-t border-[var(--line)] pt-2">
-          <SidebarMiniTrafficCard />
+          <TrafficSparkline variant="mini" />
 
           {/* System Proxy / Virtual Network Card Quick Capsules */}
           <div className="grid grid-cols-2 gap-1.5">

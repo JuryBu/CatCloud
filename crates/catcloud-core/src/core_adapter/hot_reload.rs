@@ -1871,4 +1871,107 @@ mod tests {
         server.abort();
         let _ = std::fs::remove_dir_all(&paths.root_data_dir);
     }
+
+    #[tokio::test]
+    async fn independent_routing_toggle_triggers_l2_hot_reload_and_updates_rules() {
+        let paths = temp_paths("independent-routing-l2");
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter = Arc::new(MihomoAdapter::new(guard).unwrap());
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        let mut cfg = AppConfig::default();
+        cfg.active_group_id = Some("grp-main".to_string());
+        save(&paths, &cfg).unwrap();
+
+        let node = ProxyNode {
+            id: "n-jp".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "Node-JP-01".to_string(),
+            protocol: "trojan".to_string(),
+            server: "203.0.113.50".to_string(),
+            port: 443,
+            raw_config: serde_json::json!({
+                "name": "Node-JP-01",
+                "type": "trojan",
+                "server": "203.0.113.50",
+                "port": 443,
+                "password": "demo"
+            }),
+            region_code: "JP".to_string(),
+            multiplier: 1.0,
+            is_443_native: true,
+            ..Default::default()
+        };
+
+        let active_group = MultiGroup {
+            id: "grp-main".to_string(),
+            name: "Main-Group".to_string(),
+            member_node_ids: vec!["n-jp".to_string()],
+            ..Default::default()
+        };
+        let mut ai_group = MultiGroup {
+            id: "grp-ai".to_string(),
+            name: "AI-Dedicated".to_string(),
+            match_rules: vec!["DOMAIN-SUFFIX,openai.com".to_string()],
+            member_node_ids: vec!["n-jp".to_string()],
+            independent_routing: false,
+            ..Default::default()
+        };
+
+        // 1. Initial apply with independent_routing = false -> AI rules excluded.
+        let out1 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                snapshot_override: Some(DiskReloadSnapshot {
+                    nodes: vec![node.clone()],
+                    groups: vec![active_group.clone(), ai_group.clone()],
+                    relays: Vec::new(),
+                }),
+                ..Default::default()
+            })
+            .await;
+        assert!(out1.applied, "initial error: {:?}", out1.error);
+        let yaml1 = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
+        assert!(!yaml1.contains("DOMAIN-SUFFIX,openai.com,AI-Dedicated"));
+
+        // 2. Toggle independent_routing = true without changing config.json -> must trigger L2 reload.
+        ai_group.independent_routing = true;
+        let out2 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                snapshot_override: Some(DiskReloadSnapshot {
+                    nodes: vec![node.clone()],
+                    groups: vec![active_group.clone(), ai_group.clone()],
+                    relays: Vec::new(),
+                }),
+                ..Default::default()
+            })
+            .await;
+        assert!(out2.applied, "toggle-on error: {:?}", out2.error);
+        assert!(!out2.skipped_unchanged);
+        assert_eq!(out2.level, ReloadLevel::L2HotReload);
+        let yaml2 = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
+        assert!(yaml2.contains("DOMAIN-SUFFIX,openai.com,AI-Dedicated"));
+
+        // 3. Toggle independent_routing = false -> must trigger L2 reload again and strip rule.
+        ai_group.independent_routing = false;
+        let out3 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                snapshot_override: Some(DiskReloadSnapshot {
+                    nodes: vec![node],
+                    groups: vec![active_group, ai_group],
+                    relays: Vec::new(),
+                }),
+                ..Default::default()
+            })
+            .await;
+        assert!(out3.applied, "toggle-off error: {:?}", out3.error);
+        assert!(!out3.skipped_unchanged);
+        assert_eq!(out3.level, ReloadLevel::L2HotReload);
+        let yaml3 = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
+        assert!(!yaml3.contains("DOMAIN-SUFFIX,openai.com,AI-Dedicated"));
+
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
 }

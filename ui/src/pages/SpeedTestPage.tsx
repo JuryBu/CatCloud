@@ -538,7 +538,17 @@ interface CtrlDragState {
   visitedIds: Set<string>;
 }
 
-export function SpeedTestPage() {
+export interface SpeedTestPageProps {
+  embedded?: boolean;
+  initialSubId?: string | null;
+  onOpenSubs?: () => void;
+}
+
+export function SpeedTestPage({
+  embedded = false,
+  initialSubId = null,
+  onOpenSubs,
+}: SpeedTestPageProps = {}) {
   const nodes = useAppSelector((s) => s.nodes);
   const subscriptions = useAppSelector((s) => s.subscriptions);
   const groups = useAppSelector((s) => s.groups);
@@ -626,7 +636,8 @@ export function SpeedTestPage() {
 
   // Filters, sorting & pagination
   const [searchQuery, setSearchQuery] = useState("");
-  const [sourceFilter, setSourceFilter] = useState<string>("all");
+  const [sourceFilter, setSourceFilter] = useState<string>(() => initialSubId || "all");
+  const prevInitialSubIdRef = useRef<string | null | undefined>(initialSubId);
   const [groupFilter, setGroupFilter] = useState<string>("all");
   const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
   const [regionFilter, setRegionFilter] = useState<string>("all");
@@ -973,6 +984,21 @@ export function SpeedTestPage() {
     }
     return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
   }, [subscriptions, nodes]);
+
+  useEffect(() => {
+    if (prevInitialSubIdRef.current !== initialSubId) {
+      prevInitialSubIdRef.current = initialSubId;
+      setSourceFilter(initialSubId || "all");
+      setPage(1);
+    }
+  }, [initialSubId]);
+
+  useEffect(() => {
+    if (!initialized || sourceFilter === "all") return;
+    if (!sourceOptions.some((opt) => opt.id === sourceFilter)) {
+      setSourceFilter("all");
+    }
+  }, [initialized, sourceFilter, sourceOptions]);
 
   // Pre-build O(1) lookup structures per group: Map<groupId, Set<nodeId>> & compiled dynamic filters
   const groupMemberSetById = useMemo(() => {
@@ -1661,7 +1687,7 @@ export function SpeedTestPage() {
   const handlePrimaryTestClick = (tier: SpeedTestTier) => {
     if (isRunning) return;
     if (nodes.length === 0) {
-      appActions.showToast("当前还没有节点，请先在「节点与订阅」中导入", "warn");
+      appActions.showToast("当前还没有节点，请先在「订阅与导入」中导入", "warn");
       return;
     }
 
@@ -1962,70 +1988,74 @@ export function SpeedTestPage() {
   );
 
   return (
-    <div className="space-y-3.5">
+    <div className="space-y-3">
       {/* Compact Header & Main Speed Test Controls */}
-      <section className="cc-card cc-glass rounded-2xl p-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-3">
-            <div className="flex min-h-[76px] min-w-[76px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1">
-              <MascotSprite
-                state="searching"
-                scale={2}
-                animationsEnabled={isRunning}
-                title={isRunning ? "猫咪正在逐条测速中" : "独立测速通道已就绪"}
-              />
-            </div>
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h1 className="text-base font-semibold tracking-tight text-[var(--text)]">
-                  节点测速
-                </h1>
-                {isRunning && (
-                  <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
-                    <span className="cc-pulse-dot inline-block h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
-                    正在边测边出结果
-                  </span>
-                )}
+      <section className={`cc-card cc-glass rounded-2xl ${embedded ? "p-3.5" : "p-4"}`}>
+        {!embedded && (
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="flex min-h-[76px] min-w-[76px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1">
+                <MascotSprite
+                  state="searching"
+                  scale={2}
+                  animationsEnabled={isRunning}
+                  title={isRunning ? "猫咪正在逐条测速中" : "独立测速通道已就绪"}
+                />
               </div>
-              <p className="mt-0.5 text-xs text-[var(--muted)]">
-                走独立测速通道，不影响你现在正常上网
-              </p>
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <h1 className="text-base font-semibold tracking-tight text-[var(--text)]">
+                    节点测速
+                  </h1>
+                  {isRunning && (
+                    <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+                      <span className="cc-pulse-dot inline-block h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+                      正在边测边出结果
+                    </span>
+                  )}
+                </div>
+                <p className="mt-0.5 text-xs text-[var(--muted)]">
+                  走独立测速通道，不影响你现在正常上网
+                </p>
+              </div>
             </div>
-          </div>
 
-          <button
-            type="button"
-            onClick={() => setShowProbeSettings((v) => !v)}
-            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
-              showProbeSettings
-                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
-            }`}
-          >
-            <Settings className="h-3.5 w-3.5" />
-            <span>测速项目设置 ({enabledProbeCount} 项)</span>
-            {showProbeSettings ? (
-              <ChevronUp className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronDown className="h-3.5 w-3.5" />
-            )}
-          </button>
-        </div>
+            <button
+              type="button"
+              onClick={() => setShowProbeSettings((v) => !v)}
+              className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
+                showProbeSettings
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+              }`}
+            >
+              <Settings className="h-3.5 w-3.5" />
+              <span>测速项目设置 ({enabledProbeCount} 项)</span>
+              {showProbeSettings ? (
+                <ChevronUp className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </div>
+        )}
 
         {/* Primary & Auxiliary Speed Test Controls + Pre-Accel & Keepalive Toggles */}
-        <div className="mt-3.5 flex flex-wrap items-center gap-2">
+        <div className={`${embedded ? "" : "mt-3.5"} flex flex-wrap items-center gap-2`}>
           <button
             type="button"
             disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
             onClick={() => handlePrimaryTestClick("unlock")}
             title="主推省流方案：一次测出延迟、谷歌是否送中与 AI 解锁，约 0.2 MB/节点"
-            className="inline-flex items-center gap-2 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
             <span>测延迟 + 送中/AI（省流）</span>
-            <span className="rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium">
-              约 0.2 MB/节点
-            </span>
+            {!embedded && (
+              <span className="rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium">
+                约 0.2 MB/节点
+              </span>
+            )}
             <span className="hidden rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium sm:inline">
               {targetCountTag}
             </span>
@@ -2036,13 +2066,15 @@ export function SpeedTestPage() {
             disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
             onClick={() => handlePrimaryTestClick("full")}
             title="测延迟 + 送中/AI + 真实上传/下载速度，约 3 MB/节点"
-            className="inline-flex items-center gap-2 rounded-xl border border-[var(--sky)]/60 bg-[var(--sky-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--sky)]/60 bg-[var(--sky-soft)] px-3 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <Rocket className="h-3.5 w-3.5 shrink-0" />
             <span>含上下行完整测速</span>
-            <span className="rounded-md bg-[var(--card)]/80 px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
-              测真实上传/下载，约 3 MB/节点
-            </span>
+            {!embedded && (
+              <span className="rounded-md bg-[var(--card)]/80 px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
+                测真实上传/下载，约 3 MB/节点
+              </span>
+            )}
           </button>
 
           <button
@@ -2072,14 +2104,14 @@ export function SpeedTestPage() {
                 ? "开启后测速将经由已启用的国内 443 中转测出真实提速表现；关闭可裸连对比"
                 : "需先在「国内提速」中添加并启用国内中转机，方可走国内 443 提速测速"
             }
-            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
+            className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
               usePreaccelForProbe && hasEnabledPreAccelRelay
                 ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
             }`}
           >
             <Zap className="h-3.5 w-3.5 shrink-0" />
-            <span>同步走国内 443 提速测速</span>
+            <span>{embedded ? "走国内 443 提速" : "同步走国内 443 提速测速"}</span>
             <span
               className={`h-2 w-2 rounded-full ${
                 usePreaccelForProbe && hasEnabledPreAccelRelay
@@ -2091,7 +2123,7 @@ export function SpeedTestPage() {
 
           <label
             title="开启后每节点多耗时约 1 分钟，仅排查断流时建议勾选（与测速项目设置中的 60 秒长连接同步）"
-            className={`inline-flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-xs transition-colors ${
+            className={`inline-flex cursor-pointer items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs transition-colors ${
               includeKeepalive
                 ? "border-[var(--amber)]/60 bg-[var(--amber-soft)] text-[var(--amber)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
@@ -2105,8 +2137,29 @@ export function SpeedTestPage() {
               className="h-3.5 w-3.5 accent-[var(--accent)]"
             />
             <Clock className="h-3.5 w-3.5 shrink-0" />
-            <span className="font-medium">附带测 60 秒长连接</span>
+            <span className="font-medium">{embedded ? "60秒长连接" : "附带测 60 秒长连接"}</span>
           </label>
+
+          {embedded && (
+            <button
+              type="button"
+              onClick={() => setShowProbeSettings((v) => !v)}
+              className={`ml-auto inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors ${
+                showProbeSettings
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+              }`}
+              title="自定义测速项目与网站解锁检测"
+            >
+              <Settings className="h-3.5 w-3.5 shrink-0" />
+              <span>测速项 ({enabledProbeCount})</span>
+              {showProbeSettings ? (
+                <ChevronUp className="h-3.5 w-3.5 shrink-0" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+              )}
+            </button>
+          )}
         </div>
 
         {/* Lightweight Confirmation Bar when Unselected List > 50 Nodes */}
@@ -2155,66 +2208,75 @@ export function SpeedTestPage() {
           </div>
         )}
 
-        {/* Fixed-Height Status & Live Progress Strip (Zero Table Jump on Start/Stop) */}
-        <div
-          className={`mt-3 flex h-[60px] items-center justify-between gap-3 overflow-hidden rounded-xl border px-3.5 transition-colors ${
-            isRunning
-              ? "border-[var(--accent)]/50 bg-[var(--bg-elevated)]"
-              : "border-[var(--line)] bg-[var(--bg-elevated)]/70"
-          }`}
-        >
-          {isRunning ? (
-            <>
-              <div className="flex min-w-0 flex-1 flex-col justify-center gap-1.5">
-                <div className="flex min-w-0 items-center gap-2 text-xs">
-                  <span className="cc-mono cc-tabular shrink-0 font-semibold text-[var(--accent)]">
-                    已完成 {probeProgress.completed} / 总计 {probeProgress.total}
-                  </span>
-                  <span className="shrink-0 text-[var(--muted)]">·</span>
-                  <span className="truncate font-medium text-[var(--text)]">
-                    {probeProgress.currentNodeName
-                      ? `正在测：${probeProgress.currentNodeName}`
-                      : "正在准备独立测速通道…"}
-                  </span>
-                  <span className="hidden shrink-0 text-[11px] text-[var(--muted)] xl:inline">
-                    · 测速中已锁定行顺序，结束后自动按结果排序
-                  </span>
+        {/* Live Progress Strip (always shown when running; idle guide banner omitted in embedded mode to stay clean) */}
+        {(!embedded || isRunning || includeKeepalive) && (
+          <div
+            className={`mt-3 flex ${embedded && !isRunning ? "py-2" : "h-[60px]"} items-center justify-between gap-3 overflow-hidden rounded-xl border px-3.5 transition-colors ${
+              isRunning
+                ? "border-[var(--accent)]/50 bg-[var(--bg-elevated)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)]/70"
+            }`}
+          >
+            {isRunning ? (
+              <>
+                <div className="flex min-w-0 flex-1 flex-col justify-center gap-1.5">
+                  <div className="flex min-w-0 items-center gap-2 text-xs">
+                    <span className="cc-mono cc-tabular shrink-0 font-semibold text-[var(--accent)]">
+                      已完成 {probeProgress.completed} / 总计 {probeProgress.total}
+                    </span>
+                    <span className="shrink-0 text-[var(--muted)]">·</span>
+                    <span className="truncate font-medium text-[var(--text)]">
+                      {probeProgress.currentNodeName
+                        ? `正在测：${probeProgress.currentNodeName}`
+                        : "正在准备独立测速通道…"}
+                    </span>
+                    <span className="hidden shrink-0 text-[11px] text-[var(--muted)] xl:inline">
+                      · 测速中已锁定行顺序，结束后自动按结果排序
+                    </span>
+                  </div>
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                    <div
+                      className="h-full rounded-full bg-[var(--accent)] transition-all duration-200"
+                      style={{ width: `${Math.max(progressPct, probeProgress.total > 0 ? 3 : 0)}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                  <div
-                    className="h-full rounded-full bg-[var(--accent)] transition-all duration-200"
-                    style={{ width: `${Math.max(progressPct, probeProgress.total > 0 ? 3 : 0)}%` }}
-                  />
-                </div>
-              </div>
 
-              <button
-                type="button"
-                disabled={isPausing}
-                onClick={() => void handlePauseTest()}
-                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--red)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:cursor-wait disabled:opacity-65"
-              >
-                <Square className="h-3.5 w-3.5 fill-current" />
-                <span>{isPausing ? "正在暂停并保存…" : "暂停（保留已测结果）"}</span>
-              </button>
-            </>
-          ) : (
-            <>
-              <div className="flex min-w-0 flex-1 items-center gap-2 text-xs text-[var(--text-secondary)]">
-                <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                <button
+                  type="button"
+                  disabled={isPausing}
+                  onClick={() => void handlePauseTest()}
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--red)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:cursor-wait disabled:opacity-65"
+                >
+                  <Square className="h-3.5 w-3.5 fill-current" />
+                  <span>{isPausing ? "正在暂停并保存…" : "暂停（保留已测结果）"}</span>
+                </button>
+              </>
+            ) : embedded ? (
+              <div className="flex min-w-0 flex-1 items-center gap-1.5 text-[11px] text-[var(--amber)]">
+                <Clock className="h-3.5 w-3.5 shrink-0" />
                 <span className="truncate">
-                  勾选部分或全部节点后点上方开始测速，结果会逐行实时出现；中途随时可暂停并保留已测结果
+                  已开启 60 秒长连接检测（每节点约多耗时 1 分钟，仅排查断流时建议勾选）
                 </span>
               </div>
-              {includeKeepalive && (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--amber)]">
-                  <Clock className="h-3 w-3 shrink-0" />
-                  <span>含 60 秒长连接（约+1分钟/节点）</span>
-                </span>
-              )}
-            </>
-          )}
-        </div>
+            ) : (
+              <>
+                <div className="flex min-w-0 flex-1 items-center gap-2 text-xs text-[var(--text-secondary)]">
+                  <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                  <span className="truncate">
+                    勾选部分或全部节点后点上方开始测速，结果会逐行实时出现；中途随时可暂停并保留已测结果
+                  </span>
+                </div>
+                {includeKeepalive && (
+                  <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--amber)]">
+                    <Clock className="h-3 w-3 shrink-0" />
+                    <span>含 60 秒长连接（约+1分钟/节点）</span>
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </section>
 
       {/* Collapsible Probe Settings Drawer (Hidden by Default) */}
@@ -2714,22 +2776,24 @@ export function SpeedTestPage() {
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5 text-[11px]">
-            <Sparkles
-              className={`h-3.5 w-3.5 shrink-0 ${
-                ctrlHeld ? "text-[var(--accent)]" : "text-[var(--muted)]"
-              }`}
-            />
-            {ctrlHeld ? (
-              <span className="font-medium text-[var(--accent)]">
-                已按住 Ctrl：单击行精准切换勾选，按住鼠标左键滑过行即可批量选中或取消
-              </span>
-            ) : (
-              <span className="text-[var(--muted)]">
-                点击勾选 · 按住 Shift 连选区间 · 按住 Ctrl 按住左键滑过批量选中
-              </span>
-            )}
-          </div>
+          {(!embedded || ctrlHeld) && (
+            <div className="flex items-center gap-1.5 text-[11px]">
+              <Sparkles
+                className={`h-3.5 w-3.5 shrink-0 ${
+                  ctrlHeld ? "text-[var(--accent)]" : "text-[var(--muted)]"
+                }`}
+              />
+              {ctrlHeld ? (
+                <span className="font-medium text-[var(--accent)]">
+                  已按住 Ctrl：单击行精准切换勾选，按住鼠标左键滑过行即可批量选中或取消
+                </span>
+              ) : (
+                <span className="text-[var(--muted)]">
+                  点击勾选 · 按住 Shift 连选区间 · 按住 Ctrl 按住左键滑过批量选中
+                </span>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Clean Paginated Results Table */}
@@ -2755,12 +2819,12 @@ export function SpeedTestPage() {
                 {(
                   [
                     { key: "name", label: "节点名称", cls: "px-2" },
-                    { key: "source", label: "来源", cls: "w-[82px] px-1.5" },
+                    { key: "source", label: "来源", cls: "w-[78px] px-1.5" },
                     { key: "latency", label: "延迟", cls: "w-[60px] px-1.5" },
-                    { key: "up", label: "上传", cls: "w-[56px] px-1.5" },
-                    { key: "down", label: "下载", cls: "w-[60px] px-1.5" },
-                    { key: "google", label: "谷歌地区", cls: "w-[84px] px-1.5" },
-                    { key: "unlocks", label: "AI 解锁", cls: "w-[136px] px-1.5" },
+                    { key: "up", label: "上传", cls: "w-[54px] px-1.5" },
+                    { key: "down", label: "下载", cls: "w-[58px] px-1.5" },
+                    { key: "google", label: "谷歌地区", cls: "w-[80px] px-1.5" },
+                    { key: "unlocks", label: "AI 解锁", cls: "w-[134px] px-1.5" },
                   ] as ReadonlyArray<{ key: SortKey; label: string; cls: string }>
                 ).map((col) => (
                   <th key={col.key} className={`whitespace-nowrap py-2.5 font-medium ${col.cls}`}>
@@ -2774,7 +2838,7 @@ export function SpeedTestPage() {
                     </button>
                   </th>
                 ))}
-                <th className="w-[228px] whitespace-nowrap px-2 py-2.5 text-right font-medium">
+                <th className="w-[240px] whitespace-nowrap px-2 py-2.5 text-right font-medium">
                   操作
                 </th>
               </tr>
@@ -2872,7 +2936,7 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Source */}
-                      <td className="w-[82px] px-1.5 py-2">
+                      <td className="w-[78px] px-1.5 py-2">
                         <span
                           className="block truncate text-[11px] text-[var(--text-secondary)]"
                           title={sourceName}
@@ -2916,7 +2980,7 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Upload Speed */}
-                      <td className="w-[56px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
+                      <td className="w-[54px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
                         {snap?.up_mbps !== null && snap?.up_mbps !== undefined ? (
                           <span className="font-semibold text-[var(--coral)]">
                             {snap.up_mbps.toFixed(1)}
@@ -2930,7 +2994,7 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Download Speed */}
-                      <td className="w-[60px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
+                      <td className="w-[58px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
                         {snap?.down_mbps !== null && snap?.down_mbps !== undefined ? (
                           <span className="font-semibold text-[var(--sky)]">
                             {snap.down_mbps >= 100
@@ -2946,7 +3010,7 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Google Region Status */}
-                      <td className="w-[84px] whitespace-nowrap px-1.5 py-2">
+                      <td className="w-[80px] whitespace-nowrap px-1.5 py-2">
                         <div className="flex flex-col items-start gap-1">
                           {snap?.google_clean === true ? (
                             <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10.5px] font-medium text-[var(--green)]">
@@ -2975,9 +3039,9 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* AI Unlocks (2x2 compact micro-grid) */}
-                      <td className="w-[136px] px-1.5 py-2">
+                      <td className="w-[134px] px-1.5 py-2">
                         {hasUnlockData ? (
-                          <div className="grid w-[124px] grid-cols-2 gap-1">
+                          <div className="grid w-[122px] grid-cols-2 gap-1">
                             {(
                               [
                                 { id: "gemini", label: "Gemini", ok: unlocks.gemini },
@@ -3004,7 +3068,7 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Row Actions: Primary Single-Node Use + Compact Full Probe + Lightweight Latency / +Group */}
-                      <td className="w-[228px] whitespace-nowrap px-2 py-2 text-right">
+                      <td className="w-[240px] whitespace-nowrap px-2 py-2 text-right">
                         <div className="inline-flex flex-nowrap items-center justify-end gap-1">
                           <button
                             type="button"
@@ -3020,13 +3084,13 @@ export function SpeedTestPage() {
                             }
                             aria-label={
                               isSingleActiveNode
-                                ? `单节点在用：${node.name}`
+                                ? `单节点在用中：${node.name}`
                                 : `用它（单节点）：${node.name}`
                             }
-                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-semibold transition-colors ${
+                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap border px-2 py-1 text-[11px] font-semibold transition-colors ${
                               isSingleActiveNode
-                                ? "border-[var(--green)] bg-[var(--green)] text-[var(--accent-ink)]"
-                                : "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-ink)] disabled:cursor-not-allowed disabled:opacity-65"
+                                ? "rounded-full border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
+                                : "rounded-lg border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-ink)] disabled:cursor-not-allowed disabled:opacity-65"
                             }`}
                           >
                             {isSingleActiveNode ? (
@@ -3036,7 +3100,7 @@ export function SpeedTestPage() {
                             )}
                             <span>
                               {isSingleActiveNode
-                                ? "在用"
+                                ? "在用中"
                                 : isSwitchingThis
                                   ? "切换"
                                   : "用它"}
@@ -3114,9 +3178,27 @@ export function SpeedTestPage() {
               {pagedRows.length === 0 && (
                 <tr>
                   <td colSpan={9} className="px-4 py-10 text-center text-xs text-[var(--muted)]">
-                    {nodes.length === 0
-                      ? "还没有任何节点，请先前往「节点与订阅」导入节点"
-                      : "没有找到符合条件的节点，试试放宽筛选条件吧"}
+                    {nodes.length === 0 ? (
+                      <div className="flex flex-col items-center justify-center gap-2.5">
+                        <span>还没有导入任何节点，先添加一个订阅即可开始测速与选线</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (onOpenSubs) {
+                              onOpenSubs();
+                            } else {
+                              appActions.openNodesWorkspace("subs");
+                            }
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                        >
+                          <Plus className="h-3.5 w-3.5" />
+                          <span>去导入订阅</span>
+                        </button>
+                      </div>
+                    ) : (
+                      "没有找到符合条件的节点，试试放宽筛选条件吧"
+                    )}
                   </td>
                 </tr>
               )}

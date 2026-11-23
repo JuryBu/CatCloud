@@ -56,14 +56,11 @@ const HomePage = lazy(() =>
 const MultiGroupPage = lazy(() =>
   import("./pages/MultiGroupPage").then((m) => ({ default: m.MultiGroupPage }))
 );
-const SpeedTestPage = lazy(() =>
-  import("./pages/SpeedTestPage").then((m) => ({ default: m.SpeedTestPage }))
+const NodesWorkspacePage = lazy(() =>
+  import("./pages/NodesWorkspacePage").then((m) => ({ default: m.NodesWorkspacePage }))
 );
 const PreAccelPage = lazy(() =>
   import("./pages/PreAccelPage").then((m) => ({ default: m.PreAccelPage }))
-);
-const NodesSubsPage = lazy(() =>
-  import("./pages/NodesSubsPage").then((m) => ({ default: m.NodesSubsPage }))
 );
 const RulesConnsPage = lazy(() =>
   import("./pages/RulesConnsPage").then((m) => ({ default: m.RulesConnsPage }))
@@ -93,11 +90,10 @@ function renderActivePage(route: NavRouteId) {
     case "groups":
       return <MultiGroupPage />;
     case "speedtest":
-      return <SpeedTestPage />;
+    case "nodes":
+      return <NodesWorkspacePage />;
     case "preaccel":
       return <PreAccelPage />;
-    case "nodes":
-      return <NodesSubsPage />;
     case "rules":
       return <RulesConnsPage />;
     case "logs":
