@@ -164,16 +164,21 @@ pub fn apply_directory_overrides_always<R: Runtime>(
         Some(AppDirectoriesOverride::Directories(overrides));
 }
 
-/// Helper for single-threaded bootstrap paths (such as `lib::run()` fallback) to set
-/// `WEBVIEW2_USER_DATA_FOLDER` before Tauri initializes.
+/// Helper for single-threaded bootstrap paths to set `WEBVIEW2_USER_DATA_FOLDER` before Tauri
+/// initializes. Elevated processes always receive an isolated `webview2_elevated` directory so
+/// High IL and Medium IL WebView2 instances never contend on `EBWebView` locks or ACLs.
 ///
 /// # Safety
 /// Must only be invoked while the process is single-threaded prior to spawning threads.
 pub unsafe fn set_webview2_user_data_env(paths: &AppPaths) {
-    let _ = std::fs::create_dir_all(&paths.webview_dir);
-    if paths.is_portable || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
+    let is_elevated = catcloud_core::platform::default_platform()
+        .capabilities()
+        .is_elevated;
+    let webview_dir = paths.effective_webview_dir(is_elevated);
+    let _ = std::fs::create_dir_all(&webview_dir);
+    if is_elevated || paths.is_portable || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
         unsafe {
-            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &paths.webview_dir);
+            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_dir);
         }
     }
 }
@@ -537,11 +542,18 @@ pub fn should_prevent_exit(code: Option<i32>) -> bool {
     code.is_none()
 }
 
+/// Decision helper combining exit code with the user's `destroy_on_close` (minimize-to-tray)
+/// preference. Only intercepts implicit `None` exit when tray persistence is enabled.
+#[inline]
+pub fn should_prevent_exit_for_mode(code: Option<i32>, destroy_on_close: bool) -> bool {
+    code.is_none() && destroy_on_close
+}
+
 /// Handle `App::run` events in an `FnMut`-compatible way.
 ///
-/// - `RunEvent::ExitRequested { code, api, .. }`: calls `api.prevent_exit()` **strictly**
-///   when `code.is_none()` so windowless tray mode stays alive while explicit `app.exit(0)`
-///   is never deadlocked.
+/// - `RunEvent::ExitRequested { code, api, .. }`: reads `WindowLifecycleState::destroy_on_close()`
+///   and calls `api.prevent_exit()` **only** when `code.is_none() && destroy_on_close`, so turning
+///   off minimize-to-tray allows closing the last window to exit cleanly and trigger `RunEvent::Exit`.
 /// - `RunEvent::Exit`: consumes `cleanup.take()` exactly once for deterministic teardown.
 pub fn handle_run_event<R: Runtime, F: FnOnce()>(
     app: &AppHandle<R>,
@@ -550,7 +562,11 @@ pub fn handle_run_event<R: Runtime, F: FnOnce()>(
 ) {
     match event {
         RunEvent::ExitRequested { code, api, .. } => {
-            if should_prevent_exit(code) {
+            let destroy_on_close = app
+                .try_state::<WindowLifecycleState>()
+                .map(|s| s.destroy_on_close())
+                .unwrap_or(true);
+            if should_prevent_exit_for_mode(code, destroy_on_close) {
                 api.prevent_exit();
             }
         }
@@ -633,6 +649,11 @@ mod tests {
         assert!(!should_prevent_exit(Some(0)));
         assert!(!should_prevent_exit(Some(1)));
         assert!(!should_prevent_exit(Some(tauri::RESTART_EXIT_CODE)));
+
+        assert!(should_prevent_exit_for_mode(None, true));
+        assert!(!should_prevent_exit_for_mode(None, false));
+        assert!(!should_prevent_exit_for_mode(Some(0), true));
+        assert!(!should_prevent_exit_for_mode(Some(0), false));
     }
 
     #[test]

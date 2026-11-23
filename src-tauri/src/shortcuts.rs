@@ -20,6 +20,7 @@ pub enum ShortcutAction {
     ToggleCapsule,
     ToggleMainWindow,
     ToggleSystemProxy,
+    ToggleTun,
 }
 
 /// Configurable global shortcut accelerators.
@@ -29,6 +30,8 @@ pub struct ShortcutBindings {
     pub toggle_capsule: Option<String>,
     pub toggle_main_window: Option<String>,
     pub toggle_system_proxy: Option<String>,
+    #[serde(default)]
+    pub toggle_tun: Option<String>,
 }
 
 impl Default for ShortcutBindings {
@@ -38,6 +41,7 @@ impl Default for ShortcutBindings {
             toggle_capsule: Some(DEFAULT_TOGGLE_CAPSULE_SHORTCUT.to_string()),
             toggle_main_window: None,
             toggle_system_proxy: None,
+            toggle_tun: None,
         }
     }
 }
@@ -59,6 +63,7 @@ impl ShortcutBindings {
                 ShortcutAction::ToggleSystemProxy,
                 self.toggle_system_proxy.as_deref(),
             ),
+            (ShortcutAction::ToggleTun, self.toggle_tun.as_deref()),
         ];
         raw.into_iter()
             .filter_map(|(action, accel)| {
@@ -292,14 +297,21 @@ mod tests {
             toggle_capsule: Some(" CommandOrControl+Alt+C ".into()),
             toggle_main_window: None,
             toggle_system_proxy: Some(String::new()),
+            toggle_tun: Some("CommandOrControl+Alt+T".into()),
         };
         let pairs = bindings.active_pairs();
         assert_eq!(
             pairs,
-            vec![(
-                ShortcutAction::ToggleCapsule,
-                "CommandOrControl+Alt+C".to_string()
-            )]
+            vec![
+                (
+                    ShortcutAction::ToggleCapsule,
+                    "CommandOrControl+Alt+C".to_string()
+                ),
+                (
+                    ShortcutAction::ToggleTun,
+                    "CommandOrControl+Alt+T".to_string()
+                ),
+            ]
         );
     }
 }

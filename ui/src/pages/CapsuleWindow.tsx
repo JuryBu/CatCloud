@@ -1,8 +1,10 @@
-import { Maximize2, Minimize2, Zap } from "lucide-react";
+import { Check, Loader2, Maximize2, X, Zap } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { catcloudApi, formatErrorMessage } from "../api/tauri";
 import { MascotSprite } from "../components/MascotSprite";
 import {
   appActions,
+  appStore,
   useAppSelector,
   useLatestTraffic,
 } from "../store/appStore";
@@ -34,10 +36,44 @@ function formatCompactRate(bytesPerSec: number): string {
 export function CapsuleWindow() {
   const isTauri = useAppSelector((s) => s.isTauri);
   const runtime = useAppSelector((s) => s.runtime);
+  const groups = useAppSelector((s) => s.groups);
   const trayIconMode = useAppSelector((s) => s.config.personalization.tray_icon_mode);
   const traffic = useLatestTraffic();
 
+  const [switching, setSwitching] = useState<boolean>(false);
+  const [justSwitched, setJustSwitched] = useState<boolean>(false);
+  const switchFeedbackTimerRef = useRef<number | null>(null);
+  const mountedRef = useRef<boolean>(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      if (switchFeedbackTimerRef.current !== null) {
+        window.clearTimeout(switchFeedbackTimerRef.current);
+      }
+    };
+  }, []);
+
+  const triggerSwitchedFeedback = () => {
+    if (!mountedRef.current) return;
+    setJustSwitched(true);
+    if (switchFeedbackTimerRef.current !== null) {
+      window.clearTimeout(switchFeedbackTimerRef.current);
+    }
+    switchFeedbackTimerRef.current = window.setTimeout(() => {
+      switchFeedbackTimerRef.current = null;
+      if (mountedRef.current) {
+        setJustSwitched(false);
+      }
+    }, 1600);
+  };
+
   const statusMeta = resolveStatusAccent(runtime.status);
+  const isSingleMode = runtime.route_mode === "single";
+  const displayNodeName =
+    runtime.active_node_name?.trim() || runtime.active_group_name?.trim() || "待选节点";
+  const displayGroupName = runtime.active_group_name?.trim() || "默认分组";
 
   const useStarryIcon =
     trayIconMode === "always_c" ||
@@ -51,23 +87,88 @@ export function CapsuleWindow() {
     ? "./icons/icon_c_starry_neko.png"
     : "./icons/icon_a_cream_cat.png";
 
-  const handleCloseToWindowless = async () => {
+  const handleSwitchNextBest = async () => {
+    if (switching) return;
+    setSwitching(true);
+    try {
+      if (isSingleMode) {
+        const res = await catcloudApi.switchNextBestNode("single");
+        const latestRt = await catcloudApi.getRuntimeInfo().catch(() => null);
+        if (latestRt) {
+          appActions.syncRuntime(latestRt);
+        } else {
+          const curRt = appStore.getState().runtime;
+          appActions.syncRuntime({
+            ...curRt,
+            route_mode: "single",
+            active_node_id: res.active_node_id,
+            active_node_name: res.active_node_name,
+            active_node_region: res.active_node_region,
+            active_node_latency_ms: res.latency_ms,
+            active_node_up_mbps: res.up_mbps,
+          });
+        }
+        appActions.showToast(`已切至 ${res.active_node_name}`, "ok");
+        triggerSwitchedFeedback();
+        return;
+      }
+
+      const groupId = runtime.active_group_id || groups[0]?.id || "";
+      if (!groupId) {
+        appActions.showToast("暂无可用分组，请先在主窗口创建", "warn");
+        return;
+      }
+      const res = await catcloudApi.switchNextBestNode(groupId);
+      const curState = appStore.getState();
+      appActions.syncRuntime({
+        ...curState.runtime,
+        active_group_id: res.group_id,
+        active_node_id: res.active_node_id,
+        active_node_name: res.active_node_name,
+        active_node_region: res.active_node_region,
+        active_node_latency_ms: res.latency_ms,
+        active_node_up_mbps: res.up_mbps,
+      });
+      appActions.syncGroups(
+        curState.groups.map((g) =>
+          g.id === res.group_id ? { ...g, active_node_id: res.active_node_id } : g
+        )
+      );
+      appActions.showToast(
+        `已切至 ${res.active_node_name}${res.closed_connections > 0 ? `（断 ${res.closed_connections} 旧连）` : ""}`,
+        "ok"
+      );
+      triggerSwitchedFeedback();
+    } catch (err) {
+      appActions.showToast(`切下一优失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      if (mountedRef.current) {
+        setSwitching(false);
+      }
+    }
+  };
+
+  const handleCloseCapsule = async () => {
     if (isTauri) {
       try {
-        await catcloudApi.enterWindowlessMode();
+        await catcloudApi.toggleCapsuleWindow();
       } catch (err) {
-        appActions.showToast(`收进托盘省内存失败：${formatErrorMessage(err)}`, "warn");
+        appActions.showToast(`关闭悬浮小窗失败：${formatErrorMessage(err)}`, "warn");
       }
       return;
     }
-    appActions.showToast("已关闭悬浮小窗并收进托盘省内存（预览已返回主窗）", "info");
+    appActions.showToast("已关闭悬浮小窗（预览已返回主窗）", "info");
     await appActions.showMainFromCapsule();
   };
+
+  const routeSummaryTitle = isSingleMode
+    ? `单节点模式 · ${displayNodeName}${runtime.active_node_latency_ms !== null ? ` (${Math.round(runtime.active_node_latency_ms)} ms)` : ""}`
+    : `分组：${displayGroupName} · ${displayNodeName}${runtime.active_node_latency_ms !== null ? ` (${Math.round(runtime.active_node_latency_ms)} ms)` : ""}`;
 
   const capsulePill = (
     <div
       data-tauri-drag-region
-      className="flex h-[60px] w-[296px] select-none items-center gap-2 rounded-full border border-[var(--line-strong)] bg-[var(--surface)]/95 px-2.5 text-[var(--text)]"
+      className="cc-glass flex h-[60px] w-[296px] select-none items-center gap-1.5 rounded-full border border-[var(--line-strong)] bg-[var(--surface)]/95 px-2 text-[var(--text)]"
       style={{ boxShadow: "var(--shadow-popover)" }}
     >
       {/* A / C / Pixel status badge with semantic status dot */}
@@ -97,20 +198,56 @@ export function CapsuleWindow() {
         />
       </div>
 
-      {/* Active node & live up/down rates */}
+      {/* Route mode badge, active node/group, live up/down rates & proxy/TUN indicators */}
       <div
         className="min-w-0 flex-1"
         data-tauri-drag-region
-        title={`${runtime.active_group_name} · ${runtime.active_node_name}${runtime.active_node_latency_ms !== null ? ` (${runtime.active_node_latency_ms} ms)` : ""}`}
+        title={routeSummaryTitle}
       >
-        <div className="flex items-center gap-1">
+        <div className="flex min-w-0 items-center gap-1" data-tauri-drag-region>
+          <span
+            className={`shrink-0 rounded px-1 py-[1px] text-[9px] font-medium leading-none border ${
+              isSingleMode
+                ? "border-[var(--accent)]/40 bg-[var(--accent-soft)] text-[var(--accent)]"
+                : "border-[var(--sky)]/40 bg-[var(--sky-soft)] text-[var(--sky)]"
+            }`}
+            title={isSingleMode ? "当前为单节点直选模式" : `当前多选组：${displayGroupName}`}
+          >
+            {isSingleMode ? "单节点" : "组"}
+          </span>
           <span className="truncate text-[11px] font-semibold leading-tight text-[var(--text)]">
-            {runtime.active_node_name}
+            {displayNodeName}
           </span>
         </div>
-        <div className="mt-1 flex items-center gap-2 cc-mono text-[10px] leading-none whitespace-nowrap">
-          <span className="text-[var(--coral)]">↑{formatCompactRate(traffic.up_bps)}</span>
-          <span className="text-[var(--sky)]">↓{formatCompactRate(traffic.down_bps)}</span>
+
+        <div className="mt-1 flex items-center justify-between gap-1 leading-none">
+          <div className="cc-mono flex min-w-0 items-center gap-1 truncate text-[9px] whitespace-nowrap">
+            <span className="text-[var(--coral)]">↑{formatCompactRate(traffic.up_bps)}</span>
+            <span className="text-[var(--sky)]">↓{formatCompactRate(traffic.down_bps)}</span>
+          </div>
+
+          <div className="flex shrink-0 items-center gap-0.5">
+            <span
+              className={`whitespace-nowrap rounded border px-1 py-[1px] text-[8.5px] font-medium leading-none transition-colors ${
+                runtime.system_proxy_enabled
+                  ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[var(--muted)]/55"
+              }`}
+              title={runtime.system_proxy_enabled ? "系统代理：已开启" : "系统代理：未开启"}
+            >
+              代理
+            </span>
+            <span
+              className={`whitespace-nowrap rounded border px-1 py-[1px] text-[8.5px] font-medium leading-none transition-colors ${
+                runtime.tun_enabled
+                  ? "border-[var(--accent)]/45 bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[var(--muted)]/55"
+              }`}
+              title={runtime.tun_enabled ? "虚拟网卡：已开启" : "虚拟网卡：未开启"}
+            >
+              虚拟网卡
+            </span>
+          </div>
         </div>
       </div>
 
@@ -118,18 +255,29 @@ export function CapsuleWindow() {
       <div className="flex shrink-0 items-center gap-1">
         <button
           type="button"
-          onClick={() => void appActions.switchNextBestNode()}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
-          title="换下一个更快节点"
-          aria-label="换下一个更快节点"
+          disabled={switching}
+          onClick={() => void handleSwitchNextBest()}
+          className={`inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border transition-colors disabled:opacity-60 ${
+            justSwitched
+              ? "border-[var(--green)] bg-[var(--green-soft)] text-[var(--green)]"
+              : "border-[var(--line)] bg-[var(--card)] text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+          }`}
+          title={switching ? "正在切换下一优节点..." : "切下一优节点"}
+          aria-label="切下一优节点"
         >
-          <Zap className="h-3.5 w-3.5" />
+          {switching ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : justSwitched ? (
+            <Check className="h-3 w-3" />
+          ) : (
+            <Zap className="h-3 w-3" />
+          )}
         </button>
 
         <button
           type="button"
           onClick={() => void appActions.showMainFromCapsule()}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+          className="inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
           title="展开主窗口"
           aria-label="展开主窗口"
         >
@@ -138,12 +286,12 @@ export function CapsuleWindow() {
 
         <button
           type="button"
-          onClick={() => void handleCloseToWindowless()}
-          className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:border-[var(--red)] hover:bg-[var(--red-soft)] hover:text-[var(--red)]"
-          title="关闭悬浮小窗，收进托盘省内存"
-          aria-label="关闭悬浮小窗，收进托盘省内存"
+          onClick={() => void handleCloseCapsule()}
+          className="inline-flex h-[26px] w-[26px] items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:border-[var(--red)] hover:bg-[var(--red-soft)] hover:text-[var(--red)]"
+          title="关闭悬浮小窗"
+          aria-label="关闭悬浮小窗"
         >
-          <Minimize2 className="h-3 w-3" />
+          <X className="h-3 w-3" />
         </button>
       </div>
     </div>
@@ -164,7 +312,8 @@ export function CapsuleWindow() {
           悬浮小窗预览（300 × 64 透明圆角窗）
         </div>
         <div className="mt-1 text-[11px] text-[var(--muted)]">
-          当前状态：{statusMeta.label} · 图标策略：{trayIconMode}
+          状态：{statusMeta.label} · 模式：{isSingleMode ? "单节点" : `多选组（${displayGroupName}）`} · 系统代理：
+          {runtime.system_proxy_enabled ? "开" : "关"} · 虚拟网卡：{runtime.tun_enabled ? "开" : "关"}
         </div>
       </div>
 

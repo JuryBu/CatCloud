@@ -15,6 +15,7 @@ export type TunStackMode = "mixed" | "system" | "gvisor";
 export type CoreHealthStatus = "idle" | "ok" | "preaccel" | "warn" | "error";
 export type MemoryTier = "auto" | "mb48" | "mb64" | "mb96" | "48MiB" | "64MiB" | "96MiB";
 export type PreAccelOverrideMode = "inherit" | "force_on" | "force_off";
+export type RouteTargetMode = "single" | "group";
 
 export type MultiGroupMode =
   | "sticky_best"
@@ -107,6 +108,14 @@ export interface QuickCheckSiteConfig {
   expected_status?: number | null;
 }
 
+export interface RulesOverrideConfig {
+  global_prepend_rules?: string[];
+  global_append_rules?: string[];
+  override_script_path?: string | null;
+  block_quic_udp_443?: boolean;
+  domestic_direct_enabled?: boolean;
+}
+
 export interface FullAppConfig {
   schema_version?: number;
   proxy_mode?: ProxyMode;
@@ -156,11 +165,7 @@ export interface FullAppConfig {
       domain?: string[];
     };
   };
-  rules_override?: {
-    global_prepend_rules?: string[];
-    global_append_rules?: string[];
-    override_script_path?: string | null;
-  };
+  rules_override?: RulesOverrideConfig;
   core_runtime?: {
     custom_binary_path?: string | null;
     memory_tier?: string;
@@ -340,6 +345,7 @@ export interface CoreRuntimeInfo {
   controller_addr: string;
   uptime_sec: number;
   rule_count: number;
+  route_mode?: RouteTargetMode;
   active_group_id: string;
   active_group_name: string;
   active_node_id: string;
@@ -417,6 +423,8 @@ export interface RunIsolatedProbesResult {
   snapshots: Record<string, ProbeSnapshot>;
   errors: string[];
   core_available: boolean;
+  used_preaccel?: boolean;
+  preaccel_relay_name?: string | null;
 }
 
 export interface ProbeProgressEvent {
@@ -474,6 +482,7 @@ export interface PreAccelComparisonResult {
   direct: PreAccelSideSpeed;
   up_boost_ratio: number | null;
   down_boost_ratio: number | null;
+  fallback_reason?: string | null;
   tested_at: string;
 }
 
@@ -649,6 +658,19 @@ export interface RefreshGeoDbResult {
   ok: boolean;
   updated_targets: string[];
   message: string;
+}
+
+export interface GeoDataFileStatus {
+  exists: boolean;
+  size_bytes: number;
+  updated_at: string | null;
+}
+
+export interface GeoDataStatusDto {
+  country_mmdb: GeoDataFileStatus;
+  geoip_dat: GeoDataFileStatus;
+  geosite_dat: GeoDataFileStatus;
+  asn_mmdb: GeoDataFileStatus;
 }
 
 export interface AppUpdateCheckResult {
@@ -1193,6 +1215,13 @@ let mockFullConfig: FullAppConfig = {
   preaccel: {
     ...DEFAULT_APP_CONFIG.preaccel,
   },
+  rules_override: {
+    global_prepend_rules: [],
+    global_append_rules: [],
+    override_script_path: null,
+    block_quic_udp_443: true,
+    domestic_direct_enabled: true,
+  },
 };
 let mockGroups: MultiGroup[] = structuredClone(MOCK_GROUPS);
 let mockNodes: ProxyNode[] = structuredClone(MOCK_NODES);
@@ -1214,6 +1243,7 @@ let mockRuntime: CoreRuntimeInfo = {
   controller_addr: `127.0.0.1:${mockConfig.controller_port}`,
   uptime_sec: 4820,
   rule_count: 1428,
+  route_mode: "group",
   active_group_id: "grp-ai",
   active_group_name: "AI 专线粘性组",
   active_node_id: MOCK_NODES[0].id,
@@ -1317,6 +1347,13 @@ export const catcloudApi = {
         patch.preaccel && typeof patch.preaccel === "object"
           ? { ...mockFullConfig.preaccel, ...(patch.preaccel as FullAppConfig["preaccel"]) }
           : mockFullConfig.preaccel,
+      rules_override:
+        patch.rules_override && typeof patch.rules_override === "object"
+          ? {
+              ...mockFullConfig.rules_override,
+              ...(patch.rules_override as RulesOverrideConfig),
+            }
+          : mockFullConfig.rules_override,
     };
     if (patch.preaccel && typeof patch.preaccel === "object") {
       const prePatch = patch.preaccel as Partial<PreAccelConfig>;
@@ -1463,6 +1500,7 @@ export const catcloudApi = {
     const snap = mockProbes[nodeId];
     mockRuntime = {
       ...mockRuntime,
+      route_mode: "group",
       active_group_id: groupId,
       active_group_name: group?.name ?? mockRuntime.active_group_name,
       active_node_id: node.id,
@@ -1496,11 +1534,32 @@ export const catcloudApi = {
       const snap = node ? mockProbes[node.id] : undefined;
       mockRuntime = {
         ...mockRuntime,
+        route_mode: "group",
         active_group_id: group.id,
         active_group_name: group.name,
         active_node_id: node?.id ?? "",
         active_node_name: node?.name ?? "待选节点",
         active_node_region: node?.region_code ?? "--",
+        active_node_latency_ms: snap?.latency_ms ?? null,
+        active_node_up_mbps: snap?.up_mbps ?? null,
+      };
+    }
+    return { ...mockRuntime };
+  },
+
+  async selectSingleNode(nodeId: string): Promise<CoreRuntimeInfo> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<CoreRuntimeInfo>("select_single_node", { nodeId });
+    }
+    const node = mockNodes.find((n) => n.id === nodeId) ?? mockNodes[0];
+    if (node) {
+      const snap = mockProbes[node.id];
+      mockRuntime = {
+        ...mockRuntime,
+        route_mode: "single",
+        active_node_id: node.id,
+        active_node_name: node.name,
+        active_node_region: node.region_code,
         active_node_latency_ms: snap?.latency_ms ?? null,
         active_node_up_mbps: snap?.up_mbps ?? null,
       };
@@ -1626,19 +1685,26 @@ export const catcloudApi = {
     nodeIds: string[],
     probeIds: string[],
     maxTier: "latency" | "unlock" | "full" = "full",
-    includeKeepalive = false
+    includeKeepalive = false,
+    usePreaccel?: boolean
   ): Promise<RunIsolatedProbesResult> {
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<RunIsolatedProbesResult>("run_isolated_probes", {
+      const args: Record<string, unknown> = {
         nodeIds,
         probeIds,
         maxTier,
         includeKeepalive,
-      });
+      };
+      if (usePreaccel !== undefined) {
+        args.usePreaccel = usePreaccel;
+      }
+      return tauriInvokeOrThrow<RunIsolatedProbesResult>("run_isolated_probes", args);
     }
     const nowIso = new Date().toISOString();
     const targetIds = nodeIds.length > 0 ? nodeIds : mockNodes.map((n) => n.id);
     const out: Record<string, ProbeSnapshot> = {};
+    const activeRelay = mockRelays.find((r) => r.enabled) ?? null;
+    const usedPreaccel = Boolean(usePreaccel && activeRelay);
     for (const id of targetIds) {
       const existing = mockProbes[id];
       out[id] = {
@@ -1673,6 +1739,8 @@ export const catcloudApi = {
       snapshots: out,
       errors: [],
       core_available: true,
+      used_preaccel: usedPreaccel,
+      preaccel_relay_name: usedPreaccel ? activeRelay?.name ?? null : null,
     };
   },
 
@@ -1942,17 +2010,38 @@ export const catcloudApi = {
       (relayId ? mockRelays.find((r) => r.id === relayId) : null) ??
       mockRelays.find((r) => r.enabled) ??
       mockRelays[0];
-    const chosenNode =
-      (nodeId ? mockNodes.find((n) => n.id === nodeId) : null) ??
-      mockNodes.find((n) => n.enabled && !n.is_443_native) ??
-      mockNodes.find((n) => n.enabled) ??
-      mockNodes[0];
+    const isUdpOnlyProto = (proto: string) => {
+      const p = proto.trim().toLowerCase();
+      return p === "hysteria2" || p === "hy2" || p === "hysteria" || p === "tuic" || p === "wireguard";
+    };
+    const activeRuntimeNode = mockRuntime.active_node_id
+      ? mockNodes.find((n) => n.id === mockRuntime.active_node_id) ?? null
+      : null;
+    let fallbackReason: string | null = null;
+    let chosenNode: ProxyNode | undefined;
+    if (nodeId) {
+      chosenNode =
+        mockNodes.find((n) => n.id === nodeId) ??
+        activeRuntimeNode ??
+        mockNodes.find((n) => n.enabled) ??
+        mockNodes[0];
+    } else if (activeRuntimeNode && !isUdpOnlyProto(activeRuntimeNode.protocol)) {
+      chosenNode = activeRuntimeNode;
+    } else {
+      chosenNode =
+        mockNodes.find((n) => n.enabled && !isUdpOnlyProto(n.protocol)) ??
+        mockNodes.find((n) => n.enabled) ??
+        mockNodes[0];
+      if (activeRuntimeNode && isUdpOnlyProto(activeRuntimeNode.protocol) && chosenNode) {
+        fallbackReason = `首页当前节点「${activeRuntimeNode.name}」是纯 UDP 协议无法套 TCP 中转，已自动改测「${chosenNode.name}」`;
+      }
+    }
     return {
       ok: true,
       relay_id: chosenRelay?.id ?? "relay-cn-east",
       relay_name: chosenRelay?.name ?? "CN-East-443 Primary",
-      node_id: chosenNode?.id ?? "node-sg-02",
-      node_name: chosenNode?.name ?? "SG-Edge-02 · 1x",
+      node_id: chosenNode?.id ?? "node-jp-01",
+      node_name: chosenNode?.name ?? "JP-Tokyo-01 · 1x",
       accelerated: {
         ok: true,
         latency_ms: 48,
@@ -1969,6 +2058,7 @@ export const catcloudApi = {
       },
       up_boost_ratio: 9.2,
       down_boost_ratio: 2.3,
+      fallback_reason: fallbackReason,
       tested_at: new Date().toISOString(),
     };
   },
@@ -2168,6 +2258,46 @@ export const catcloudApi = {
       updated_targets: targets ?? ["geoip", "geosite", "mmdb", "asn"],
       message: "浏览器预览模式：已模拟刷新地理库",
     };
+  },
+
+  async getGeodataStatus(): Promise<GeoDataStatusDto> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<GeoDataStatusDto>("get_geodata_status");
+    }
+    return {
+      country_mmdb: {
+        exists: true,
+        size_bytes: 6_420_000,
+        updated_at: "2026-11-20T08:00:00Z",
+      },
+      geoip_dat: {
+        exists: true,
+        size_bytes: 9_850_000,
+        updated_at: "2026-11-22T08:00:00Z",
+      },
+      geosite_dat: {
+        exists: true,
+        size_bytes: 4_120_000,
+        updated_at: "2026-11-22T08:00:00Z",
+      },
+      asn_mmdb: {
+        exists: true,
+        size_bytes: 7_310_000,
+        updated_at: "2026-11-18T08:00:00Z",
+      },
+    };
+  },
+
+  async relaunchAsAdmin(enableTun = true): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("relaunch_as_admin", { enableTun });
+    }
+    mockRuntime.tun_admin_ready = true;
+    if (enableTun) {
+      mockConfig.tun_enabled = true;
+      mockRuntime.tun_enabled = true;
+    }
+    return true;
   },
 
   async checkAppUpdate(): Promise<AppUpdateCheckResult> {

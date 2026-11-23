@@ -526,7 +526,9 @@ impl Storage {
         Ok(())
     }
 
-    /// Seed built-in probe definitions without overwriting user-modified rows.
+    /// Seed built-in probe definitions without overwriting user-modified rows, and migrate
+    /// legacy built-in AI unlock probes (when `builtin = 1` and `body_regex IS NULL`) to
+    /// credential-free semantic probing (`expected_status = NULL` + latest `target_url`/`method`).
     pub fn seed_builtin_probes(&mut self) -> CatResult<usize> {
         let builtins = ProbeDefinition::builtin_defaults();
         self.in_transaction(|tx| {
@@ -552,6 +554,28 @@ impl Storage {
                         bool_to_int(def.builtin),
                     ],
                 )?;
+                if changed == 0
+                    && matches!(
+                        def.id.as_str(),
+                        "builtin_unlock_claude"
+                            | "builtin_unlock_chatgpt"
+                            | "builtin_unlock_gemini"
+                    )
+                {
+                    tx.execute(
+                        "
+                        UPDATE probe_definitions
+                        SET expected_status = NULL,
+                            target_url = ?2,
+                            method = ?3
+                        WHERE id = ?1
+                          AND builtin = 1
+                          AND (body_regex IS NULL OR TRIM(body_regex) = '')
+                          AND (expected_status IS NOT NULL OR target_url != ?2 OR method != ?3)
+                        ",
+                        params![def.id, def.target_url, def.method],
+                    )?;
+                }
                 inserted += changed;
             }
             Ok(inserted)
@@ -1857,5 +1881,199 @@ mod tests {
         }
         let pruned = storage.prune_old_probe_results(2).unwrap();
         assert_eq!(pruned, 4); // 1 original + 5 new = 6 total, keep 2 -> delete 4
+    }
+
+    #[test]
+    fn seed_builtin_probes_idempotently_backfills_missing_builtins_without_clobbering_legacy_data() {
+        let mut storage = Storage::open_in_memory().unwrap();
+
+        // Populate a legacy portable database with subscription, node, custom probe, and history.
+        storage
+            .upsert_subscription(&sample_sub("sub-legacy", "Legacy Provider"))
+            .unwrap();
+        let legacy_node = sample_node("n-legacy", "sub-legacy", "JP", 1.0, "vless", true, &["ai"]);
+        storage.upsert_node(&legacy_node).unwrap();
+
+        // Seed only a legacy subset of built-in probes, plus a user-customized version of one built-in
+        // and a user-created custom probe.
+        let customized_latency = ProbeDefinition {
+            id: "builtin_latency".to_string(),
+            name: "User Tuned Latency".to_string(),
+            kind: ProbeKind::Latency,
+            target_url: "https://cp.cloudflare.com/generate_204".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(204),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 9500,
+            builtin: true,
+        };
+        storage.upsert_probe_definition(&customized_latency).unwrap();
+
+        let custom_probe = ProbeDefinition {
+            id: "user_custom_unlock".to_string(),
+            name: "User Custom Unlock".to_string(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://example.invalid/custom".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(200),
+            body_regex: Some("ok".to_string()),
+            payload_bytes: None,
+            timeout_ms: 5000,
+            builtin: false,
+        };
+        storage.upsert_probe_definition(&custom_probe).unwrap();
+
+        storage
+            .insert_probe_result(&ProbeResultRecord {
+                node_id: "n-legacy".into(),
+                probe_id: "builtin_latency".into(),
+                tested_at: "2026-11-22T12:00:00Z".into(),
+                ok: true,
+                latency_ms: Some(42.0),
+                ..Default::default()
+            })
+            .unwrap();
+
+        // Run seed_builtin_probes on the legacy DB: should backfill all missing builtins without
+        // deleting or overwriting any existing rows.
+        let expected_defaults = ProbeDefinition::builtin_defaults();
+        let inserted = storage.seed_builtin_probes().unwrap();
+        assert_eq!(inserted, expected_defaults.len().saturating_sub(1));
+
+        // Second call must be strictly idempotent.
+        assert_eq!(storage.seed_builtin_probes().unwrap(), 0);
+
+        // Every built-in default must now exist in the database.
+        for def in &expected_defaults {
+            assert!(
+                storage.get_probe_definition(&def.id).unwrap().is_some(),
+                "missing seeded builtin probe {}",
+                def.id
+            );
+        }
+
+        // User customization on existing builtin_latency must remain intact.
+        let preserved_latency = storage.get_probe_definition("builtin_latency").unwrap().unwrap();
+        assert_eq!(preserved_latency.name, "User Tuned Latency");
+        assert_eq!(preserved_latency.timeout_ms, 9500);
+        assert_eq!(preserved_latency, customized_latency);
+
+        // Custom probe, legacy node, and historical probe results must remain untouched.
+        assert_eq!(
+            storage.get_probe_definition("user_custom_unlock").unwrap(),
+            Some(custom_probe)
+        );
+        assert!(storage.get_node("n-legacy").unwrap().is_some());
+        let hist = storage.latest_probe_results_for_node("n-legacy").unwrap();
+        assert_eq!(hist.len(), 1);
+        assert_eq!(hist[0].latency_ms, Some(42.0));
+    }
+
+    #[test]
+    fn seed_builtin_probes_migrates_legacy_ai_unlock_probes_and_preserves_customizations() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        let defaults: HashMap<String, ProbeDefinition> = ProbeDefinition::builtin_defaults()
+            .into_iter()
+            .map(|d| (d.id.clone(), d))
+            .collect();
+
+        // Simulate legacy DB rows where built-in AI unlock probes used fixed expected_status=200
+        // and legacy homepage URLs / methods without custom body_regex.
+        let legacy_rows = [
+            ProbeDefinition {
+                id: "builtin_unlock_claude".to_string(),
+                name: "Claude / Anthropic 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://claude.ai/".to_string(),
+                method: "GET".to_string(),
+                expected_status: Some(200),
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+            ProbeDefinition {
+                id: "builtin_unlock_chatgpt".to_string(),
+                name: "ChatGPT / OpenAI 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://chatgpt.com/".to_string(),
+                method: "HEAD".to_string(),
+                expected_status: Some(200),
+                body_regex: Some(String::new()),
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+            ProbeDefinition {
+                id: "builtin_unlock_gemini".to_string(),
+                name: "Gemini / Google AI 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://gemini.google.com/".to_string(),
+                method: "HEAD".to_string(),
+                expected_status: Some(200),
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+        ];
+        for row in &legacy_rows {
+            storage.upsert_probe_definition(row).unwrap();
+        }
+
+        storage.seed_builtin_probes().unwrap();
+
+        for id in [
+            "builtin_unlock_claude",
+            "builtin_unlock_chatgpt",
+            "builtin_unlock_gemini",
+        ] {
+            let migrated = storage.get_probe_definition(id).unwrap().unwrap();
+            let expected = defaults.get(id).expect("default builtin exists");
+            assert_eq!(migrated.expected_status, None, "{id} expected_status must be NULL");
+            assert_eq!(migrated.target_url, expected.target_url, "{id} target_url must sync");
+            assert_eq!(migrated.method, expected.method, "{id} method must sync");
+        }
+
+        // User customizations (non-empty body_regex OR builtin=false) must NOT be overwritten.
+        let custom_regex_claude = ProbeDefinition {
+            id: "builtin_unlock_claude".to_string(),
+            name: "Custom Claude Regex".to_string(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://example.invalid/custom-claude".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(200),
+            body_regex: Some("ok_marker".to_string()),
+            payload_bytes: None,
+            timeout_ms: 7000,
+            builtin: true,
+        };
+        let custom_non_builtin_chatgpt = ProbeDefinition {
+            id: "builtin_unlock_chatgpt".to_string(),
+            name: "User Override ChatGPT".to_string(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://example.invalid/custom-chatgpt".to_string(),
+            method: "POST".to_string(),
+            expected_status: Some(204),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 6000,
+            builtin: false,
+        };
+        storage.upsert_probe_definition(&custom_regex_claude).unwrap();
+        storage
+            .upsert_probe_definition(&custom_non_builtin_chatgpt)
+            .unwrap();
+
+        assert_eq!(storage.seed_builtin_probes().unwrap(), 0);
+        assert_eq!(
+            storage.get_probe_definition("builtin_unlock_claude").unwrap(),
+            Some(custom_regex_claude)
+        );
+        assert_eq!(
+            storage.get_probe_definition("builtin_unlock_chatgpt").unwrap(),
+            Some(custom_non_builtin_chatgpt)
+        );
     }
 }

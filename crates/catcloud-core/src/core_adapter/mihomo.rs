@@ -612,6 +612,56 @@ impl MihomoAdapter {
         )))
     }
 
+    /// Close all active connections via `DELETE /connections`.
+    pub async fn close_all_connections(&self) -> CatResult<()> {
+        let (base_url, secret) = self.controller_endpoint().await;
+        let url = format!("{base_url}/connections");
+        let resp = self.http.delete(&url).bearer_auth(&secret).send().await?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = resp.text().await.unwrap_or_default();
+        Err(CatError::Core(format!(
+            "DELETE /connections failed with HTTP {}: {}",
+            status.as_u16(),
+            body.trim()
+        )))
+    }
+
+    /// Gracefully disable TUN mode via `PATCH /configs` (`{"tun":{"enable":false}}`) when the
+    /// controller is live, then pause 250ms so Mihomo can cleanly tear down Wintun and system routes.
+    pub async fn disable_tun_gracefully(&self) -> CatResult<()> {
+        if !self.has_live_controller().await {
+            return Ok(());
+        }
+
+        let (base_url, secret) = self.controller_endpoint().await;
+        let url = format!("{base_url}/configs");
+        let resp = self
+            .http
+            .patch(&url)
+            .bearer_auth(&secret)
+            .timeout(Duration::from_millis(1200))
+            .json(&serde_json::json!({ "tun": { "enable": false } }))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(CatError::Core(format!(
+                "PATCH /configs(tun.enable=false) failed with HTTP {}: {}",
+                status.as_u16(),
+                body.trim()
+            )));
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        Ok(())
+    }
+
     /// Close only active connections matching the specified group and/or node chain
     /// without disrupting unrelated groups.
     pub async fn close_connections_for_group_or_node(
@@ -1171,6 +1221,94 @@ mod tests {
                 .unwrap();
         assert!(truncated);
         assert_eq!(captured.len(), MAX_VERIFY_OUTPUT_BYTES);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn close_all_connections_and_disable_tun_gracefully_hit_expected_endpoints() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let secret = generate_controller_secret();
+        let expected_auth = format!("Bearer {secret}");
+        let recorded: Arc<StdMutex<Vec<(String, String)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let recorded_bg = Arc::clone(&recorded);
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut raw_bytes = Vec::with_capacity(1024);
+                let mut chunk = [0u8; 1024];
+                loop {
+                    let n = socket.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    raw_bytes.extend_from_slice(&chunk[..n]);
+                    if let Some(pos) = raw_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&raw_bytes[..pos]);
+                        let content_len = header
+                            .lines()
+                            .find_map(|line| {
+                                let (k, v) = line.split_once(':')?;
+                                if k.trim().eq_ignore_ascii_case("content-length") {
+                                    v.trim().parse::<usize>().ok()
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or(0);
+                        if raw_bytes.len() >= pos + 4 + content_len {
+                            break;
+                        }
+                    }
+                    if raw_bytes.len() >= 8192 {
+                        break;
+                    }
+                }
+                let raw = String::from_utf8_lossy(&raw_bytes).to_string();
+                let first_line = raw.lines().next().unwrap_or_default().to_string();
+                let body_part = raw
+                    .split_once("\r\n\r\n")
+                    .map(|(_, b)| b.to_string())
+                    .unwrap_or_default();
+                assert!(raw.contains(&expected_auth), "missing bearer auth: {raw}");
+                recorded_bg.lock().unwrap().push((first_line, body_part));
+
+                let response = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+
+        // Non-live adapter must short-circuit disable_tun_gracefully without error.
+        let idle_guard = Arc::new(JobGuard::new().unwrap());
+        let idle_adapter = MihomoAdapter::new(idle_guard).unwrap();
+        idle_adapter
+            .disable_tun_gracefully()
+            .await
+            .expect("idle disable_tun_gracefully should be a no-op");
+
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter =
+            MihomoAdapter::with_controller_endpoint(guard, "127.0.0.1", port, secret).unwrap();
+
+        adapter
+            .close_all_connections()
+            .await
+            .expect("DELETE /connections must succeed");
+        adapter
+            .disable_tun_gracefully()
+            .await
+            .expect("PATCH /configs(tun.enable=false) must succeed");
+
+        let reqs = recorded.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].0.starts_with("DELETE /connections HTTP/1.1"));
+        assert!(reqs[1].0.starts_with("PATCH /configs HTTP/1.1"));
+        let parsed: serde_json::Value = serde_json::from_str(&reqs[1].1).unwrap();
+        assert_eq!(parsed["tun"]["enable"], serde_json::Value::Bool(false));
 
         server.abort();
     }

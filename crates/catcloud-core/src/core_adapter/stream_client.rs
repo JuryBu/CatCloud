@@ -24,6 +24,15 @@ pub const DEFAULT_MAX_MEMORY_SAMPLES: usize = 600;
 /// Hard upper bound on a single NDJSON line before it is truncated to guard against malformed streams.
 const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
 
+/// Hard upper bound (4 KiB) when reading non-2xx HTTP error bodies on NDJSON stream endpoints.
+const MAX_STREAM_ERROR_BODY_BYTES: usize = 4 * 1024;
+
+/// Initial reconnect backoff for background `/traffic`, `/memory`, and `/logs` streams.
+const STREAM_RECONNECT_INITIAL: Duration = Duration::from_millis(250);
+
+/// Maximum reconnect backoff cap for background streams.
+const STREAM_RECONNECT_MAX: Duration = Duration::from_millis(3000);
+
 /// Fixed-capacity ring buffer that evicts the oldest item when full.
 #[derive(Debug, Clone)]
 pub struct BoundedRingBuffer<T> {
@@ -453,6 +462,8 @@ impl MihomoStreamClient {
     }
 
     /// Spawn background `/traffic`, `/memory`, and `/logs` stream tasks feeding a bounded `CoreTelemetryStore`.
+    /// Each task runs an exponential-backoff reconnect loop (250ms -> 3000ms, reset to 250ms after
+    /// receiving any valid payload) and exits immediately on `cancel`.
     pub fn spawn_background_streams(
         &self,
         log_level: CoreLogLevel,
@@ -466,9 +477,30 @@ impl MihomoStreamClient {
             let token = cancel.clone();
             let sink = Arc::clone(&store);
             tasks.push(tokio::spawn(async move {
-                let _ = client
-                    .stream_traffic(token, move |tick| sink.push_traffic(tick))
-                    .await;
+                let mut backoff = STREAM_RECONNECT_INITIAL;
+                while !token.is_cancelled() {
+                    let mut received_any = false;
+                    let _ = client
+                        .stream_traffic(token.clone(), |tick| {
+                            received_any = true;
+                            sink.push_traffic(tick);
+                        })
+                        .await;
+                    if token.is_cancelled() {
+                        break;
+                    }
+                    if received_any {
+                        backoff = STREAM_RECONNECT_INITIAL;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => break,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    if !received_any {
+                        backoff = backoff.saturating_mul(2).min(STREAM_RECONNECT_MAX);
+                    }
+                }
             }));
         }
 
@@ -477,9 +509,30 @@ impl MihomoStreamClient {
             let token = cancel.clone();
             let sink = Arc::clone(&store);
             tasks.push(tokio::spawn(async move {
-                let _ = client
-                    .stream_memory(token, move |tick| sink.push_memory(tick))
-                    .await;
+                let mut backoff = STREAM_RECONNECT_INITIAL;
+                while !token.is_cancelled() {
+                    let mut received_any = false;
+                    let _ = client
+                        .stream_memory(token.clone(), |tick| {
+                            received_any = true;
+                            sink.push_memory(tick);
+                        })
+                        .await;
+                    if token.is_cancelled() {
+                        break;
+                    }
+                    if received_any {
+                        backoff = STREAM_RECONNECT_INITIAL;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => break,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    if !received_any {
+                        backoff = backoff.saturating_mul(2).min(STREAM_RECONNECT_MAX);
+                    }
+                }
             }));
         }
 
@@ -488,9 +541,30 @@ impl MihomoStreamClient {
             let token = cancel.clone();
             let sink = Arc::clone(&store);
             tasks.push(tokio::spawn(async move {
-                let _ = client
-                    .stream_logs(&log_level, token, move |line| sink.push_log(line))
-                    .await;
+                let mut backoff = STREAM_RECONNECT_INITIAL;
+                while !token.is_cancelled() {
+                    let mut received_any = false;
+                    let _ = client
+                        .stream_logs(&log_level, token.clone(), |line| {
+                            received_any = true;
+                            sink.push_log(line);
+                        })
+                        .await;
+                    if token.is_cancelled() {
+                        break;
+                    }
+                    if received_any {
+                        backoff = STREAM_RECONNECT_INITIAL;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = token.cancelled() => break,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    if !received_any {
+                        backoff = backoff.saturating_mul(2).min(STREAM_RECONNECT_MAX);
+                    }
+                }
             }));
         }
 
@@ -519,7 +593,27 @@ impl MihomoStreamClient {
 
         let status = resp.status();
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
+            let mut err_buf: Vec<u8> = Vec::new();
+            while err_buf.len() < MAX_STREAM_ERROR_BODY_BYTES {
+                if cancel.is_cancelled() {
+                    return Ok(());
+                }
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Ok(()),
+                    next_chunk = resp.chunk() => {
+                        match next_chunk {
+                            Ok(Some(chunk)) => {
+                                let remaining = MAX_STREAM_ERROR_BODY_BYTES - err_buf.len();
+                                let take = chunk.len().min(remaining);
+                                err_buf.extend_from_slice(&chunk[..take]);
+                            }
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
+                }
+            }
+            let body = String::from_utf8_lossy(&err_buf);
             return Err(CatError::Core(format!(
                 "NDJSON stream `{url}` failed with HTTP {}: {}",
                 status.as_u16(),
@@ -764,6 +858,146 @@ mod tests {
         assert_eq!(received[0].down, 2048);
         assert_eq!(received[1].up, 4096);
         assert_eq!(received[1].down, 8192);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn background_streams_reconnect_after_eof_and_shutdown_promptly() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let traffic_hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = Arc::clone(&traffic_hits);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let hits = Arc::clone(&hits_bg);
+                tokio::spawn(async move {
+                    let mut req_buf = vec![0u8; 2048];
+                    let n = socket.read(&mut req_buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&req_buf[..n]).to_string();
+                    if req.starts_with("GET /traffic") {
+                        let idx = hits.fetch_add(1, Ordering::SeqCst);
+                        let body = format!("{{\"up\":{},\"down\":{}}}\n", (idx + 1) * 100, (idx + 1) * 200);
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    } else {
+                        let resp = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = socket.write_all(resp.as_bytes()).await;
+                    }
+                });
+            }
+        });
+
+        let client = MihomoStreamClient::new("127.0.0.1", port, "reconnect-secret").unwrap();
+        let store = Arc::new(CoreTelemetryStore::default());
+        let handle = client.spawn_background_streams(CoreLogLevel::Info, Arc::clone(&store));
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while store.traffic_snapshot().len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let ticks = store.traffic_snapshot();
+        assert!(
+            ticks.len() >= 2,
+            "expected reconnect to deliver >= 2 traffic ticks, got {}",
+            ticks.len()
+        );
+        assert_eq!(ticks[0].up, 100);
+        assert_eq!(ticks[1].up, 200);
+
+        let shutdown_start = tokio::time::Instant::now();
+        handle.shutdown().await;
+        assert!(
+            shutdown_start.elapsed() < Duration::from_millis(500),
+            "background streams must stop promptly on cancel"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn non_2xx_stalled_error_body_exits_promptly_on_cancel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = vec![0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+            let header = "HTTP/1.1 500 Internal Server Error\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.flush().await;
+            // Intentionally stall without sending error body or closing the connection.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let client = MihomoStreamClient::new("127.0.0.1", port, "stall-secret").unwrap();
+        let cancel = StreamCancelToken::new();
+        let cancel_trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            cancel_trigger.cancel();
+        });
+
+        let started = tokio::time::Instant::now();
+        let res = client.stream_traffic(cancel, |_| {}).await;
+        assert!(res.is_ok(), "cancelled stalled error body must exit cleanly");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "cancelled non-2xx read must not hang"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn non_2xx_oversized_error_body_is_capped_at_4kib() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut req_buf = vec![0u8; 1024];
+            let _ = socket.read(&mut req_buf).await;
+            let payload = "E".repeat(16 * 1024);
+            let header = format!(
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: {}\r\n\r\n",
+                payload.len()
+            );
+            let _ = socket.write_all(header.as_bytes()).await;
+            let _ = socket.write_all(&payload.as_bytes()[..8192]).await;
+            let _ = socket.flush().await;
+            // Hold open without sending remaining bytes to verify the 4 KiB cap returns early.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+
+        let client = MihomoStreamClient::new("127.0.0.1", port, "cap-secret").unwrap();
+        let cancel = StreamCancelToken::new();
+        let started = tokio::time::Instant::now();
+        let err = client
+            .stream_traffic(cancel, |_| {})
+            .await
+            .expect_err("non-2xx response must return an error");
+        let msg = err.to_string();
+        assert!(msg.contains("HTTP 502"));
+        assert!(
+            msg.len() <= MAX_STREAM_ERROR_BODY_BYTES + 256,
+            "error body must be bounded to 4 KiB, got len={}",
+            msg.len()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(800),
+            "oversized non-2xx body must stop after 4 KiB without waiting for EOF"
+        );
 
         server.abort();
     }

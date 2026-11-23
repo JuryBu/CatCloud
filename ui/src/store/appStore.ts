@@ -26,6 +26,7 @@ export type {
   CoreRuntimeInfo,
   ProxyMode,
   ResolvedTheme,
+  RouteTargetMode,
   ThemeMode,
   TrafficSample,
 } from "../api/tauri";
@@ -446,6 +447,9 @@ export interface AppState {
   latestTraffic: TrafficSample;
   trafficVersion: number;
   toast: ToastNotice | null;
+  tunAdminPromptOpen: boolean;
+  tunAdminPromptBusy: boolean;
+  tunAdminPromptReason: string | null;
 }
 
 const runningInTauri = isTauriEnv();
@@ -513,6 +517,7 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       controller_addr: `127.0.0.1:${initialConfig.controller_port}`,
       uptime_sec: 0,
       rule_count: 0,
+      route_mode: "group",
       active_group_id: "",
       active_group_name: "等待连接",
       active_node_id: "",
@@ -542,6 +547,7 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       controller_addr: `127.0.0.1:${initialConfig.controller_port}`,
       uptime_sec: 4820,
       rule_count: 1428,
+      route_mode: "group",
       active_group_id: "grp-ai",
       active_group_name: "AI 专线粘性组",
       active_node_id: "node-jp-01",
@@ -582,6 +588,61 @@ const initialExitIp: ExitIpInfo = runningInTauri
       core_running: true,
     };
 
+function buildPendingExitIp(coreRunning: boolean): ExitIpInfo {
+  return {
+    ip_masked: "--.--.--.***",
+    ip_raw: null,
+    isp: coreRunning ? "已切换线路，点击「测一下」刷新" : "待核心启动探测",
+    location: "待检测",
+    timezone: "--",
+    google_clean: null,
+    core_running: coreRunning,
+  };
+}
+
+function mergeProbeSnapshotSafe(
+  prev: ProbeSnapshot | undefined,
+  incoming: ProbeSnapshot
+): ProbeSnapshot {
+  if (!prev) return incoming;
+  const incomingUnlocked = incoming.unlocked_sites ?? {};
+  const hasIncomingUnlocked = Object.keys(incomingUnlocked).length > 0;
+  return {
+    ...prev,
+    ...incoming,
+    up_mbps: incoming.up_mbps ?? prev.up_mbps,
+    down_mbps: incoming.down_mbps ?? prev.down_mbps,
+    cf_loc: incoming.cf_loc ?? prev.cf_loc,
+    yt_gl: incoming.yt_gl ?? prev.yt_gl,
+    google_clean: incoming.google_clean ?? prev.google_clean,
+    google_risk_mismatch:
+      incoming.google_clean !== null && incoming.google_clean !== undefined
+        ? incoming.google_risk_mismatch
+        : prev.google_risk_mismatch,
+    keepalive_60s_ok: incoming.keepalive_60s_ok ?? prev.keepalive_60s_ok,
+    unlocked_sites: hasIncomingUnlocked
+      ? { ...(prev.unlocked_sites ?? {}), ...incomingUnlocked }
+      : (prev.unlocked_sites ?? {}),
+    per_probe_ok: { ...(prev.per_probe_ok ?? {}), ...(incoming.per_probe_ok ?? {}) },
+    per_probe_up_mbps: {
+      ...(prev.per_probe_up_mbps ?? {}),
+      ...(incoming.per_probe_up_mbps ?? {}),
+    },
+    per_probe_down_mbps: {
+      ...(prev.per_probe_down_mbps ?? {}),
+      ...(incoming.per_probe_down_mbps ?? {}),
+    },
+    per_probe_ping_ms: {
+      ...(prev.per_probe_ping_ms ?? {}),
+      ...(incoming.per_probe_ping_ms ?? {}),
+    },
+    per_probe_detail: {
+      ...(prev.per_probe_detail ?? {}),
+      ...(incoming.per_probe_detail ?? {}),
+    },
+  };
+}
+
 let state: AppState = {
   initialized: false,
   isTauri: runningInTauri,
@@ -611,6 +672,9 @@ let state: AppState = {
   latestTraffic: initialTraffic,
   trafficVersion: initialTrafficVersion,
   toast: null,
+  tunAdminPromptOpen: false,
+  tunAdminPromptBusy: false,
+  tunAdminPromptReason: null,
 };
 
 const listeners = new Set<() => void>();
@@ -655,6 +719,7 @@ let personalizationReqSeq = 0;
 let disposeTraffic: (() => void) | null = null;
 let disposeRuntime: (() => void) | null = null;
 let disposeProbeProgress: (() => void) | null = null;
+let disposeTunNeedsAdmin: (() => void) | null = null;
 let themeClockTimer: number | null = null;
 
 function syncResolvedThemeFromClock(): void {
@@ -866,7 +931,10 @@ export const appStore = {
       setState((prev) => {
         const nextProbes =
           ev.node_id && ev.snapshot
-            ? { ...prev.probes, [ev.node_id]: ev.snapshot }
+            ? {
+                ...prev.probes,
+                [ev.node_id]: mergeProbeSnapshotSafe(prev.probes[ev.node_id], ev.snapshot),
+              }
             : prev.probes;
         return {
           ...prev,
@@ -883,6 +951,53 @@ export const appStore = {
       });
     });
 
+    if (isTauriEnv()) {
+      let tunAdminDisposed = false;
+      let tunAdminUnlisten: (() => void) | null = null;
+      void import("@tauri-apps/api/event")
+        .then(({ listen }) =>
+          listen<unknown>("catcloud://tun-needs-admin", (ev) => {
+            if (tunAdminDisposed || state.windowMode === "capsule") return;
+            const payload = ev.payload;
+            let rawReason: string | null = null;
+            if (typeof payload === "string") {
+              rawReason = payload;
+            } else if (payload && typeof payload === "object") {
+              const rec = payload as { reason?: unknown; message?: unknown };
+              if (typeof rec.reason === "string") rawReason = rec.reason;
+              else if (typeof rec.message === "string") rawReason = rec.message;
+            }
+            if (rawReason) {
+              const prefix = "NEEDS_ADMIN:";
+              const idx = rawReason.indexOf(prefix);
+              if (idx >= 0) {
+                rawReason = rawReason.slice(idx + prefix.length).trim() || null;
+              }
+            }
+            setState((prev) => ({
+              ...prev,
+              runtime: { ...prev.runtime, tun_admin_ready: false },
+            }));
+            appActions.openTunAdminPrompt(rawReason);
+          })
+        )
+        .then((unlisten) => {
+          if (tunAdminDisposed) {
+            unlisten();
+          } else {
+            tunAdminUnlisten = unlisten;
+          }
+        })
+        .catch(() => {
+          /* ignore event listener setup errors outside desktop runtime */
+        });
+      disposeTunNeedsAdmin = () => {
+        tunAdminDisposed = true;
+        tunAdminUnlisten?.();
+        tunAdminUnlisten = null;
+      };
+    }
+
     void hydrateFromBackend().catch((err) => {
       setState((prev) => ({ ...prev, initialized: true }));
       if (isTauriEnv()) {
@@ -898,6 +1013,8 @@ export const appStore = {
     disposeRuntime = null;
     disposeProbeProgress?.();
     disposeProbeProgress = null;
+    disposeTunNeedsAdmin?.();
+    disposeTunNeedsAdmin = null;
     if (typeof window !== "undefined") {
       window.removeEventListener("hashchange", handleHashChange);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
@@ -1156,11 +1273,40 @@ export const appActions = {
     }
   },
 
+  async selectSingleNode(nodeId: string): Promise<void> {
+    try {
+      const rt = await catcloudApi.selectSingleNode(nodeId);
+      const matchedNode = state.nodes.find((n) => n.id === nodeId);
+      const nextRuntime: CoreRuntimeInfo = {
+        ...rt,
+        route_mode: "single",
+        active_node_id: rt.active_node_id || nodeId,
+        active_node_name: rt.active_node_name || matchedNode?.name || nodeId,
+      };
+      setState((prev) => ({
+        ...prev,
+        runtime: nextRuntime,
+        exitIp: buildPendingExitIp(nextRuntime.running),
+      }));
+      pushToast(`已切换为单节点模式：${nextRuntime.active_node_name}`, "ok");
+    } catch (err) {
+      pushToast(`切换单节点失败：${formatErrorMessage(err)}`, "warn");
+    }
+  },
+
   async setActiveGroup(groupId: string): Promise<void> {
     try {
       const rt = await catcloudApi.setActiveGroup(groupId);
-      setState((prev) => ({ ...prev, runtime: rt }));
-      pushToast(`已切换当前分组：${rt.active_group_name}`, "ok");
+      const nextRuntime: CoreRuntimeInfo = {
+        ...rt,
+        route_mode: "group",
+      };
+      setState((prev) => ({
+        ...prev,
+        runtime: nextRuntime,
+        exitIp: buildPendingExitIp(nextRuntime.running),
+      }));
+      pushToast(`已切换当前分组：${nextRuntime.active_group_name}`, "ok");
     } catch (err) {
       pushToast(`切换分组失败：${formatErrorMessage(err)}`, "warn");
     }
@@ -1170,9 +1316,17 @@ export const appActions = {
     try {
       const res = await catcloudApi.selectGroupNode(groupId, nodeId, closeOld);
       const rt = await catcloudApi.getRuntimeInfo();
+      const nextRuntime: CoreRuntimeInfo = {
+        ...rt,
+        route_mode: "group",
+        active_group_id: rt.active_group_id || res.group_id,
+        active_node_id: rt.active_node_id || res.active_node_id,
+        active_node_name: rt.active_node_name || res.active_node_name,
+      };
       setState((prev) => ({
         ...prev,
-        runtime: rt,
+        runtime: nextRuntime,
+        exitIp: buildPendingExitIp(nextRuntime.running),
         groups: prev.groups.map((g) =>
           g.id === res.group_id ? { ...g, active_node_id: res.active_node_id } : g
         ),
@@ -1202,6 +1356,7 @@ export const appActions = {
         ...prev,
         config: { ...prev.config, proxy_mode: applied },
         runtime: { ...prev.runtime, proxy_mode: applied },
+        exitIp: buildPendingExitIp(prev.runtime.running),
       }));
       pushToast(`已切换至${labelMap[applied]}`, "ok");
     } catch (err) {
@@ -1228,8 +1383,80 @@ export const appActions = {
     }
   },
 
+  openTunAdminPrompt(reason: string | null = null): void {
+    setState((prev) => ({
+      ...prev,
+      tunAdminPromptOpen: true,
+      tunAdminPromptBusy: false,
+      tunAdminPromptReason: reason?.trim() || null,
+    }));
+  },
+
+  closeTunAdminPrompt(): void {
+    setState((prev) =>
+      prev.tunAdminPromptOpen || prev.tunAdminPromptBusy
+        ? {
+            ...prev,
+            tunAdminPromptOpen: false,
+            tunAdminPromptBusy: false,
+            tunAdminPromptReason: null,
+          }
+        : prev
+    );
+  },
+
+  async relaunchAsAdminForTun(): Promise<boolean> {
+    if (state.tunAdminPromptBusy) return false;
+    setState((prev) => ({ ...prev, tunAdminPromptBusy: true }));
+    try {
+      const launched = await catcloudApi.relaunchAsAdmin(true);
+      if (launched) {
+        if (!isTauriEnv()) {
+          const [cfg, rt] = await Promise.all([
+            catcloudApi.getConfig(),
+            catcloudApi.getRuntimeInfo(),
+          ]);
+          setState((prev) => ({
+            ...prev,
+            config: cfg,
+            runtime: rt,
+            tunAdminPromptOpen: false,
+            tunAdminPromptBusy: false,
+            tunAdminPromptReason: null,
+          }));
+          pushToast("演示模式：已模拟管理员提权并开启虚拟网卡", "ok");
+        } else {
+          setState((prev) => ({
+            ...prev,
+            tunAdminPromptOpen: false,
+            tunAdminPromptBusy: false,
+            tunAdminPromptReason: null,
+          }));
+          pushToast("已拉起管理员实例，正在接管并开启虚拟网卡…", "ok");
+        }
+        return true;
+      }
+      setState((prev) => ({
+        ...prev,
+        tunAdminPromptOpen: false,
+        tunAdminPromptBusy: false,
+        tunAdminPromptReason: null,
+      }));
+      pushToast("已取消管理员授权，虚拟网卡未开启", "info");
+      return false;
+    } catch (err) {
+      setState((prev) => ({ ...prev, tunAdminPromptBusy: false }));
+      pushToast(`管理员重启失败：${formatErrorMessage(err)}`, "warn");
+      return false;
+    }
+  },
+
   async toggleTun(next?: boolean, silent = false): Promise<boolean> {
     const target = next ?? !state.runtime.tun_enabled;
+    if (target && state.runtime.tun_admin_ready === false) {
+      appActions.openTunAdminPrompt(null);
+      return false;
+    }
     try {
       const applied = await catcloudApi.toggleTun(target);
       setState((prev) => ({
@@ -1242,35 +1469,57 @@ export const appActions = {
       }
       return true;
     } catch (err) {
-      pushToast(`切换虚拟网卡失败：${formatErrorMessage(err)}`, "warn");
+      const msg = formatErrorMessage(err);
+      const adminPrefix = "NEEDS_ADMIN:";
+      const adminIdx = msg.indexOf(adminPrefix);
+      if (target && adminIdx >= 0) {
+        const detail = msg.slice(adminIdx + adminPrefix.length).trim() || null;
+        setState((prev) => ({
+          ...prev,
+          runtime: { ...prev.runtime, tun_admin_ready: false },
+          tunAdminPromptOpen: true,
+          tunAdminPromptBusy: false,
+          tunAdminPromptReason: detail,
+        }));
+        return false;
+      }
+      pushToast(`切换虚拟网卡失败：${msg}`, "warn");
       return false;
     }
   },
 
   async switchNextBestNode(): Promise<void> {
-    const groupId = state.runtime.active_group_id || state.groups[0]?.id || "";
-    if (!groupId) {
+    const isSingleMode = state.runtime.route_mode === "single";
+    const targetId = isSingleMode
+      ? "single"
+      : state.runtime.active_group_id || state.groups[0]?.id || "";
+    if (!isSingleMode && !targetId) {
       pushToast("当前暂无可用多选组，请先在「智能多选组」中创建", "warn");
       return;
     }
     setState((prev) => ({ ...prev, mascotState: "thinking" }));
     try {
-      const res = await catcloudApi.switchNextBestNode(groupId);
+      const res = await catcloudApi.switchNextBestNode(targetId);
       setState((prev) => ({
         ...prev,
         mascotState: "complete",
+        exitIp: buildPendingExitIp(prev.runtime.running),
         runtime: {
           ...prev.runtime,
-          active_group_id: res.group_id,
+          ...(isSingleMode
+            ? { route_mode: "single" as const }
+            : { active_group_id: res.group_id || prev.runtime.active_group_id }),
           active_node_id: res.active_node_id,
           active_node_name: res.active_node_name,
           active_node_region: res.active_node_region,
           active_node_latency_ms: res.latency_ms,
           active_node_up_mbps: res.up_mbps,
         },
-        groups: prev.groups.map((g) =>
-          g.id === res.group_id ? { ...g, active_node_id: res.active_node_id } : g
-        ),
+        groups: isSingleMode
+          ? prev.groups
+          : prev.groups.map((g) =>
+              g.id === res.group_id ? { ...g, active_node_id: res.active_node_id } : g
+            ),
       }));
       pushToast(`已秒切至 ${res.active_node_name}（清理 ${res.closed_connections} 条旧连接）`, "ok");
       if (mascotResetTimer !== null) {

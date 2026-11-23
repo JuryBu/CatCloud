@@ -35,6 +35,8 @@ import {
 import {
   type AppConfig,
   type FullAppConfig,
+  type GeoDataFileStatus,
+  type GeoDataStatusDto,
   type MemoryTier,
   type ResolvedTheme,
   type ThemeMode,
@@ -58,10 +60,9 @@ type DnsEnhancedMode = "fake-ip" | "redir-host";
 type GeoKey = "geoip" | "geosite" | "mmdb" | "asn";
 
 interface ExtendedSettings {
-  pacEnabled: boolean;
-  pacPort: number;
-  pacUrl: string;
   bypassDomains: string;
+  domesticDirectEnabled: boolean;
+  blockQuicUdp443: boolean;
   allowLan: boolean;
   controllerSecret: string;
   webuiUrls: WebUiEntry[];
@@ -108,10 +109,9 @@ const DEFAULT_WEBUI_ENTRIES: WebUiEntry[] = [
 ];
 
 const DEFAULT_EXTENDED: ExtendedSettings = {
-  pacEnabled: false,
-  pacPort: 17891,
-  pacUrl: "",
   bypassDomains: "localhost, 127.*, 10.*, 172.16.*, 192.168.*, *.local, <local>",
+  domesticDirectEnabled: true,
+  blockQuicUdp443: true,
   allowLan: false,
   controllerSecret: "",
   webuiUrls: DEFAULT_WEBUI_ENTRIES,
@@ -253,12 +253,46 @@ const DIR_ITEMS: ReadonlyArray<readonly ["config" | "data" | "logs" | "core", st
   ["core", "内核目录"],
 ];
 
-const GEO_ITEMS: ReadonlyArray<readonly [GeoKey, string, string]> = [
-  ["geoip", "IP 归属地库", "识别国内外 IP 归属"],
-  ["geosite", "网站域名分流库", "识别常见网站所属分类"],
-  ["mmdb", "国家地区库", "用于识别节点与出口地区"],
-  ["asn", "网络运营商库", "识别宽带与机房运营商"],
+const GEO_ITEMS: ReadonlyArray<
+  readonly [GeoKey, keyof GeoDataStatusDto, string, string]
+> = [
+  ["mmdb", "country_mmdb", "Country.mmdb", "国家地区库"],
+  ["geoip", "geoip_dat", "geoip.dat", "IP 归属地库"],
+  ["geosite", "geosite_dat", "geosite.dat", "网站域名分流库"],
+  ["asn", "asn_mmdb", "asn.mmdb", "网络运营商库"],
 ];
+
+function formatGeoFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${Math.round(bytes)} B`;
+}
+
+function formatGeoUpdatedAt(iso: string | null): string {
+  if (!iso) return "时间未知";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso.slice(0, 10);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function renderGeoStatusSummary(
+  fileStatus: GeoDataFileStatus | undefined,
+  loading: boolean
+): { state: "loading" | "ready" | "missing"; text: string } {
+  if (loading && !fileStatus) {
+    return { state: "loading", text: "检测中…" };
+  }
+  if (!fileStatus || !fileStatus.exists) {
+    return { state: "missing", text: "尚未下载" };
+  }
+  const sizeLabel = formatGeoFileSize(fileStatus.size_bytes);
+  const timeLabel = formatGeoUpdatedAt(fileStatus.updated_at);
+  return { state: "ready", text: `${sizeLabel} · ${timeLabel}` };
+}
 
 const AGENT_DOCS = [
   {
@@ -400,12 +434,12 @@ function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
   const dnsPort = full.dns_listen_port ?? 11053;
 
   return {
-    pacEnabled: sp?.pac?.enabled ?? DEFAULT_EXTENDED.pacEnabled,
-    pacPort: sp?.pac?.port ?? DEFAULT_EXTENDED.pacPort,
-    pacUrl: sp?.pac?.script_override ?? "",
     bypassDomains: Array.isArray(sp?.bypass)
       ? sp.bypass.join(", ")
       : DEFAULT_EXTENDED.bypassDomains,
+    domesticDirectEnabled:
+      rules?.domestic_direct_enabled ?? DEFAULT_EXTENDED.domesticDirectEnabled,
+    blockQuicUdp443: rules?.block_quic_udp_443 ?? DEFAULT_EXTENDED.blockQuicUdp443,
     allowLan: full.allow_lan ?? DEFAULT_EXTENDED.allowLan,
     controllerSecret: full.controller_secret ?? "",
     webuiUrls:
@@ -479,9 +513,7 @@ function buildExtendedPatch(ext: ExtendedSettings): Record<string, unknown> {
     system_proxy: {
       bypass: splitCsvOrLines(ext.bypassDomains),
       pac: {
-        enabled: ext.pacEnabled,
-        port: ext.pacPort,
-        script_override: ext.pacUrl.trim() ? ext.pacUrl.trim() : null,
+        enabled: false,
       },
     },
     dns: {
@@ -509,6 +541,8 @@ function buildExtendedPatch(ext: ExtendedSettings): Record<string, unknown> {
     rules_override: {
       global_append_rules: splitLines(ext.appendRules),
       override_script_path: ext.overrideScriptPath.trim() ? ext.overrideScriptPath.trim() : null,
+      domestic_direct_enabled: ext.domesticDirectEnabled,
+      block_quic_udp_443: ext.blockQuicUdp443,
     },
     core_runtime: {
       startup_script_path: ext.startupScriptPath.trim() ? ext.startupScriptPath.trim() : null,
@@ -591,13 +625,6 @@ function buildMergedSettingsPatch(
       include_prerelease: draft.update.include_prerelease,
     },
   };
-}
-
-function resolveWebUiTemplate(entry: WebUiEntry, controllerPort: number, secret: string): string {
-  return entry.url_template
-    .replace(/\{host\}/g, "127.0.0.1")
-    .replace(/\{port\}/g, String(controllerPort))
-    .replace(/\{secret\}/g, encodeURIComponent(secret));
 }
 
 async function copyText(text: string, label: string): Promise<void> {
@@ -818,12 +845,9 @@ export function SettingsPage() {
   const [yamlSha, setYamlSha] = useState<string | null>(null);
   const [yamlLoading, setYamlLoading] = useState(false);
   const [geoBusy, setGeoBusy] = useState<GeoKey | "all" | null>(null);
-  const [geoStamp, setGeoStamp] = useState<Record<GeoKey, string>>({
-    geoip: inTauri ? "未更新" : "2026-11-22",
-    geosite: inTauri ? "未更新" : "2026-11-22",
-    mmdb: inTauri ? "未更新" : "2026-11-20",
-    asn: inTauri ? "未更新" : "2026-11-18",
-  });
+  const [geoStatus, setGeoStatus] = useState<GeoDataStatusDto | null>(null);
+  const [geoStatusLoading, setGeoStatusLoading] = useState(true);
+  const [confirmImportBackupOpen, setConfirmImportBackupOpen] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [activeDocId, setActiveDocId] = useState<string>(AGENT_DOCS[0].id);
@@ -887,10 +911,35 @@ export function SettingsPage() {
       .catch(() => {
         /* keep default extended fields if backend config read fails */
       });
+
+    setGeoStatusLoading(true);
+    void catcloudApi
+      .getGeodataStatus()
+      .then((status) => {
+        if (active) setGeoStatus(status);
+      })
+      .catch(() => {
+        /* ignore geodata status query errors */
+      })
+      .finally(() => {
+        if (active) setGeoStatusLoading(false);
+      });
+
     return () => {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!confirmImportBackupOpen) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        setConfirmImportBackupOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [confirmImportBackupOpen]);
 
   const patchDraft = (patch: Partial<AppConfig>) => {
     setDraft((prev) => ({ ...prev, ...patch }));
@@ -1089,23 +1138,11 @@ export function SettingsPage() {
     setGeoBusy(target);
     try {
       const res = await catcloudApi.refreshGeoDb(target === "all" ? null : [target]);
-      const today = new Date().toISOString().slice(0, 10);
-      if (res.ok) {
-        const updatedKeys =
-          res.updated_targets.length > 0
-            ? res.updated_targets
-            : target === "all"
-              ? (["geoip", "geosite", "mmdb", "asn"] as GeoKey[])
-              : [target];
-        setGeoStamp((prev) => {
-          const next = { ...prev };
-          for (const k of updatedKeys) {
-            if (k === "geoip" || k === "geosite" || k === "mmdb" || k === "asn") {
-              next[k] = today;
-            }
-          }
-          return next;
-        });
+      try {
+        const latest = await catcloudApi.getGeodataStatus();
+        setGeoStatus(latest);
+      } catch {
+        /* ignore secondary status refresh error */
       }
       appActions.showToast(res.message || "地理数据库已更新", res.ok ? "ok" : "warn");
     } catch (err) {
@@ -1169,7 +1206,7 @@ export function SettingsPage() {
     appActions.showToast("已下载配置备份文件", "ok");
   };
 
-  const handleImportBackup = async () => {
+  const openImportBackupPicker = () => {
     const input = Object.assign(document.createElement("input"), {
       type: "file",
       accept: "application/json,.json",
@@ -1230,12 +1267,10 @@ export function SettingsPage() {
 
   const handleOpenWebUi = async () => {
     const entry = ext.webuiUrls[selectedWebUiIdx] ?? ext.webuiUrls[0];
-    const resolvedUrl = entry
-      ? resolveWebUiTemplate(entry, draft.controller_port, ext.controllerSecret.trim())
-      : `http://127.0.0.1:${draft.controller_port}/ui`;
+    const rawTemplate = entry?.url_template?.trim() || null;
     try {
-      const opened = await catcloudApi.openWebUi(resolvedUrl);
-      appActions.showToast(`已打开外部面板：${opened}`, "info");
+      await catcloudApi.openWebUi(rawTemplate);
+      appActions.showToast("已在浏览器打开面板", "info");
     } catch (err) {
       appActions.showToast(`打开外部面板失败：${formatErrorMessage(err)}`, "warn");
     }
@@ -1428,35 +1463,30 @@ export function SettingsPage() {
                 </label>
               </div>
               <SwitchRow
-                title="智能分流模式"
-                desc={`通过本地 :${ext.pacPort} 端口按规则分配浏览器流量`}
-                checked={ext.pacEnabled}
-                onChange={(v) => patchExt("pacEnabled", v)}
+                title="国内网站与局域网自动直连"
+                desc="微信、QQ、国内网站、高校内网和局域网直连不绕代理"
+                checked={ext.domesticDirectEnabled}
+                onChange={(v) => patchExt("domesticDirectEnabled", v)}
               />
-              {ext.pacEnabled && (
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-[120px_1fr]">
-                  <label className="block text-[11px] text-[var(--muted)]">
-                    分流规则端口
-                    <input
-                      type="number"
-                      min={1024}
-                      max={65535}
-                      value={ext.pacPort}
-                      onChange={(e) => patchExt("pacPort", Number(e.target.value) || 17891)}
-                      className={`${INPUT_CLS} mt-1 cc-mono`}
-                    />
-                  </label>
-                  <label className="block text-[11px] text-[var(--muted)]">
-                    自定义分流规则地址或脚本（可选）
-                    <input
-                      value={ext.pacUrl}
-                      placeholder="留空则自动生成规则"
-                      onChange={(e) => patchExt("pacUrl", e.target.value)}
-                      className={`${INPUT_CLS} mt-1 cc-mono`}
-                    />
-                  </label>
+              <SwitchRow
+                title="自动拦截 QUIC (UDP 443)"
+                desc="防止 Chrome / Google / AI 走 UDP 443 经中转黑洞卡顿"
+                checked={ext.blockQuicUdp443}
+                onChange={(v) => patchExt("blockQuicUdp443", v)}
+              />
+              <div className="flex items-center justify-between gap-3 rounded-xl border border-dashed border-[var(--line)] bg-[var(--bg-elevated)]/55 px-3 py-2 opacity-75">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2 text-xs font-medium text-[var(--muted)]">
+                    <span>本地 PAC 分流</span>
+                    <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                      规划中
+                    </span>
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                    本地 PAC 服务正在规划中，推荐使用规则模式或虚拟网卡
+                  </p>
                 </div>
-              )}
+              </div>
               <label className="block text-[11px] text-[var(--muted)]">
                 不走代理的地址（逗号分隔）
                 <textarea
@@ -1563,13 +1593,13 @@ export function SettingsPage() {
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <SwitchRow
                   title="允许局域网连接"
-                  desc="让同一 Wi-Fi 下的设备共享代理"
+                  desc="供局域网设备共用代理"
                   checked={ext.allowLan}
                   onChange={(v) => patchExt("allowLan", v)}
                 />
                 <SwitchRow
                   title="统一测速延迟"
-                  desc="去除握手耗时，延迟读数更真实"
+                  desc="延迟测速更贴近真实"
                   checked={draft.unified_delay}
                   onChange={(v) => patchDraft({ unified_delay: v })}
                 />
@@ -1618,25 +1648,27 @@ export function SettingsPage() {
                 </button>
               }
             >
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <SwitchRow
                   title="开机自启"
-                  desc="随系统自动启动"
+                  desc="开机自动启动猫猫云梯"
                   checked={draft.autostart_enabled}
                   onChange={(v) => patchDraft({ autostart_enabled: v })}
                 />
                 <SwitchRow
                   title="静默启动"
-                  desc="启动后藏在托盘"
+                  desc="启动后静默藏于托盘"
                   checked={draft.silent_start}
                   onChange={(v) => patchDraft({ silent_start: v })}
                 />
-                <SwitchRow
-                  title="关闭进无窗"
-                  desc="关窗不退出且省内存"
-                  checked={ext.closeToWindowless}
-                  onChange={(v) => patchExt("closeToWindowless", v)}
-                />
+                <div className="sm:col-span-2">
+                  <SwitchRow
+                    title="关闭进无窗"
+                    desc="关闭主窗口时不退出，仅留托盘图标以省内存"
+                    checked={ext.closeToWindowless}
+                    onChange={(v) => patchExt("closeToWindowless", v)}
+                  />
+                </div>
               </div>
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <label className="text-[11px] text-[var(--muted)]">
@@ -1671,15 +1703,15 @@ export function SettingsPage() {
             </Card>
 
             <Card title="全局快捷键" sub="随时一键切换代理、节点或窗口，留空表示禁用">
-              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <div className="space-y-2">
                 {Object.entries(ext.hotkeys).map(([k, val]) => (
                   <label
                     key={k}
-                    className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-1.5 text-xs text-[var(--text-secondary)]"
+                    className="flex items-center justify-between gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-1.5 text-xs text-[var(--text-secondary)]"
                   >
-                    <span className="inline-flex min-w-0 items-center gap-1.5 truncate">
+                    <span className="inline-flex min-w-0 flex-1 items-center gap-2 whitespace-nowrap">
                       <Keyboard className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-                      <span className="truncate">{HOTKEY_LABELS[k] ?? k}</span>
+                      <span className="font-medium text-[var(--text)]">{HOTKEY_LABELS[k] ?? k}</span>
                     </span>
                     <input
                       value={val}
@@ -1687,7 +1719,7 @@ export function SettingsPage() {
                       onChange={(e) =>
                         patchExt("hotkeys", { ...ext.hotkeys, [k]: e.target.value })
                       }
-                      className="w-28 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-right text-[11px] cc-mono text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                      className="w-[152px] shrink-0 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-right text-[11px] cc-mono text-[var(--text)] outline-none focus:border-[var(--accent)]"
                     />
                   </label>
                 ))}
@@ -2458,30 +2490,53 @@ export function SettingsPage() {
               </div>
 
               <div className="grid grid-cols-2 gap-2">
-                {GEO_ITEMS.map(([key, fileName, desc]) => (
-                  <div
-                    key={key}
-                    className="flex items-center justify-between rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2"
-                  >
-                    <div className="min-w-0">
-                      <div className="truncate text-xs font-medium text-[var(--text)]">
-                        {fileName}
-                      </div>
-                      <div className="text-[10px] text-[var(--muted)]">
-                        {desc} · <span className="cc-mono">{geoStamp[key]}</span>
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void handleRefreshGeo(key)}
-                      disabled={geoBusy !== null}
-                      title={`更新 ${fileName}`}
-                      className="shrink-0 rounded-lg border border-[var(--line)] p-1.5 text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                {GEO_ITEMS.map(([key, dtoKey, fileName, desc]) => {
+                  const statusSummary = renderGeoStatusSummary(
+                    geoStatus?.[dtoKey],
+                    geoStatusLoading
+                  );
+                  return (
+                    <div
+                      key={key}
+                      className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2"
                     >
-                      <Database className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                ))}
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="truncate cc-mono text-xs font-medium text-[var(--text)]">
+                            {fileName}
+                          </span>
+                          <span
+                            className={`shrink-0 rounded px-1 py-0.5 text-[9px] font-medium ${
+                              statusSummary.state === "ready"
+                                ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                : statusSummary.state === "loading"
+                                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                  : "bg-[var(--bg-elevated)] text-[var(--muted)]"
+                            }`}
+                          >
+                            {statusSummary.state === "ready"
+                              ? "已就绪"
+                              : statusSummary.state === "loading"
+                                ? "检测中"
+                                : "未下载"}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 truncate text-[10px] text-[var(--muted)]">
+                          {desc} · <span className="cc-mono">{statusSummary.text}</span>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => void handleRefreshGeo(key)}
+                        disabled={geoBusy !== null}
+                        title={`更新 ${fileName}`}
+                        className="shrink-0 rounded-lg border border-[var(--line)] p-1.5 text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                      >
+                        <Database className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  );
+                })}
               </div>
 
               <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2.5">
@@ -2540,7 +2595,11 @@ export function SettingsPage() {
                 <Download className="h-3.5 w-3.5" />
                 <span>导出备份</span>
               </button>
-              <button type="button" onClick={() => void handleImportBackup()} className={BTN_CLS}>
+              <button
+                type="button"
+                onClick={() => setConfirmImportBackupOpen(true)}
+                className={BTN_CLS}
+              >
                 <Upload className="h-3.5 w-3.5" />
                 <span>导入备份</span>
               </button>
@@ -2832,6 +2891,67 @@ export function SettingsPage() {
               </div>
             )}
           </section>
+        </div>
+      )}
+
+      {/* Backup Import Two-Step Confirmation Modal */}
+      {confirmImportBackupOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+          onClick={() => setConfirmImportBackupOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="确认导入备份配置"
+            onClick={(e) => e.stopPropagation()}
+            className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--amber-soft)] text-[var(--amber)]">
+                  <AlertTriangle className="h-4 w-4" />
+                </span>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-[var(--text)]">
+                    确认导入配置备份？
+                  </h3>
+                  <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                    导入备份将会覆盖当前的代理参数、智能多选组和国内中转配置。建议先点「导出备份」保留一份当前配置，再继续导入。
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setConfirmImportBackupOpen(false)}
+                className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
+                aria-label="关闭弹窗"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setConfirmImportBackupOpen(false)}
+                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)]"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setConfirmImportBackupOpen(false);
+                  openImportBackupPicker();
+                }}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+              >
+                <Upload className="h-3.5 w-3.5" />
+                <span>确认覆盖并选择文件</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

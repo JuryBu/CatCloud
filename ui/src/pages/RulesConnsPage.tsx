@@ -1,6 +1,10 @@
 import {
   Activity,
+  AlertTriangle,
   Check,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Code2,
   Copy,
   Eye,
@@ -21,12 +25,14 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type ActiveConnectionDto,
+  type CompiledYamlPreview,
   type MultiGroup,
+  type PreAccelRelay,
   catcloudApi,
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
-import { formatBytes } from "../components/TrafficSparkline";
+import { formatBytes, formatRate } from "../components/TrafficSparkline";
 import { appActions, useAppSelector } from "../store/appStore";
 
 type ActiveTab = "rules" | "connections";
@@ -67,14 +73,40 @@ interface LiveConnection {
   port: number;
   network: "tcp" | "udp";
   rule: string;
+  chains: string[];
   groupId: string;
   groupName: string;
   nodeName: string;
   viaPreAccel: boolean;
   uploadBytes: number;
   downloadBytes: number;
+  upBps: number;
+  downBps: number;
   startedAtMs: number;
 }
+
+interface ConnTrafficSnap {
+  uploadBytes: number;
+  downloadBytes: number;
+  atMs: number;
+}
+
+interface ParsedValidationIssue {
+  code: string;
+  severity: "error" | "warning";
+  message: string;
+}
+
+interface ParsedCompiledMeta {
+  totalRules: number | null;
+  totalProxies: number | null;
+  proxyGroups: number | null;
+  validationOk: boolean;
+  errors: ParsedValidationIssue[];
+  warnings: ParsedValidationIssue[];
+}
+
+const CONNECTIONS_PAGE_SIZE = 30;
 
 const RULE_TYPE_LABELS: Record<RuleMatchType, string> = {
   "DOMAIN-SUFFIX": "域名后缀",
@@ -96,17 +128,21 @@ const AI_PRESETS_TEMPLATE: ReadonlyArray<Omit<AiPresetBundle, "targetGroup" | "e
   {
     id: "ai-anthropic",
     name: "Anthropic / Claude",
-    desc: "Claude 对话网页与接口",
-    domains: ["anthropic.com", "claude.ai"],
+    desc: "Claude 对话网页、静态资源与接口",
+    domains: ["anthropic.com", "claude.ai", "claude.com", "claudeusercontent.com"],
   },
   {
     id: "ai-gemini",
     name: "Google Gemini / AI Studio",
-    desc: "Gemini、AI Studio 与相关接口",
+    desc: "Gemini、AI Studio、DeepMind 与 Google AI 相关接口",
     domains: [
       "gemini.google.com",
       "aistudio.google.com",
       "generativelanguage.googleapis.com",
+      "googleapis.com",
+      "cloudcode-pa.googleapis.com",
+      "ai.google.dev",
+      "deepmind.com",
     ],
   },
   {
@@ -318,6 +354,23 @@ function formatConnectionRuleLabel(rawRule: string): string {
   return payload ? `${rawType}：${payload}` : rawType;
 }
 
+function matchesPreAccelChain(chains: string[], relays: PreAccelRelay[]): boolean {
+  const relayNames = new Set(
+    relays.map((r) => r.name.trim().toLowerCase()).filter((name) => name.length > 0)
+  );
+  return chains.some((c) => {
+    const trimmed = c.trim();
+    if (!trimmed) return false;
+    const lower = trimmed.toLowerCase();
+    return (
+      lower.includes("preaccel") ||
+      trimmed.includes("预加速") ||
+      trimmed.includes("国内预加速入口") ||
+      relayNames.has(lower)
+    );
+  });
+}
+
 function buildPreviewConnections(): LiveConnection[] {
   const now = Date.now();
   return [
@@ -329,12 +382,15 @@ function buildPreviewConnections(): LiveConnection[] {
       port: 443,
       network: "tcp",
       rule: "DOMAIN-SUFFIX,googleapis.com",
+      chains: ["JP-Tokyo-01 · 1x", "AI 专线粘性组"],
       groupId: "grp-ai",
       groupName: "AI 专线粘性组",
       nodeName: "JP-Tokyo-01 · 1x",
       viaPreAccel: false,
       uploadBytes: 18_420_000,
       downloadBytes: 94_180_000,
+      upBps: 5_800,
+      downBps: 46_400,
       startedAtMs: now - 420_000,
     },
     {
@@ -345,12 +401,15 @@ function buildPreviewConnections(): LiveConnection[] {
       port: 443,
       network: "tcp",
       rule: "DOMAIN-SUFFIX,codeium.com",
+      chains: ["JP-Tokyo-01 · 1x", "AI 专线粘性组"],
       groupId: "grp-ai",
       groupName: "AI 专线粘性组",
       nodeName: "JP-Tokyo-01 · 1x",
       viaPreAccel: false,
       uploadBytes: 6_240_000,
       downloadBytes: 24_860_000,
+      upBps: 11_600,
+      downBps: 69_600,
       startedAtMs: now - 310_000,
     },
     {
@@ -361,24 +420,31 @@ function buildPreviewConnections(): LiveConnection[] {
       port: 443,
       network: "udp",
       rule: "DOMAIN-SUFFIX,youtube.com",
+      chains: ["SG-Edge-02 · 1x", "⚡ 国内预加速入口", "流媒体与下载受控均衡"],
       groupId: "grp-media",
       groupName: "流媒体与下载受控均衡",
       nodeName: "SG-Edge-02 · 1x",
       viaPreAccel: true,
       uploadBytes: 2_890_000,
       downloadBytes: 286_400_000,
+      upBps: 17_400,
+      downBps: 92_800,
       startedAtMs: now - 690_000,
     },
   ];
 }
 
-function mapDtoConnection(dto: ActiveConnectionDto, groups: MultiGroup[]): LiveConnection {
+function mapDtoConnection(
+  dto: ActiveConnectionDto,
+  groups: MultiGroup[],
+  relays: PreAccelRelay[]
+): LiveConnection {
   const chains = Array.isArray(dto.chains) ? dto.chains : [];
   const matchedGroup = groups.find((g) => chains.includes(g.name) || chains.includes(g.id));
   const groupName = matchedGroup?.name ?? chains[chains.length - 1] ?? "DIRECT";
   const groupId = matchedGroup?.id ?? groupName;
   const nodeName = chains[0] ?? groupName;
-  const viaPreAccel = chains.some((c) => c.toLowerCase().includes("preaccel") || c.includes("预加速"));
+  const viaPreAccel = matchesPreAccelChain(chains, relays);
   const parsedStart = Date.parse(dto.start);
 
   return {
@@ -389,13 +455,59 @@ function mapDtoConnection(dto: ActiveConnectionDto, groups: MultiGroup[]): LiveC
     port: Number(dto.destination_port) || 0,
     network: dto.network.toLowerCase() === "udp" ? "udp" : "tcp",
     rule: dto.rule_payload ? `${dto.rule},${dto.rule_payload}` : dto.rule || "MATCH",
+    chains,
     groupId,
     groupName,
     nodeName,
     viaPreAccel,
     uploadBytes: dto.upload ?? 0,
     downloadBytes: dto.download ?? 0,
+    upBps: 0,
+    downBps: 0,
     startedAtMs: Number.isFinite(parsedStart) ? parsedStart : Date.now(),
+  };
+}
+
+function parseCompiledPreviewMeta(preview: CompiledYamlPreview): ParsedCompiledMeta {
+  const stats = preview.stats ?? {};
+  const toOptNum = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) ? v : null;
+
+  const totalRules = toOptNum(stats.total_rules);
+  const totalProxies = toOptNum(stats.total_proxies);
+  const proxyGroups = toOptNum(stats.proxy_groups);
+
+  const validation = preview.validation ?? {};
+  const rawIssues = Array.isArray(validation.issues) ? validation.issues : [];
+  const errors: ParsedValidationIssue[] = [];
+  const warnings: ParsedValidationIssue[] = [];
+
+  for (const item of rawIssues) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const severity = rec.severity === "error" ? "error" : "warning";
+    const parsed: ParsedValidationIssue = {
+      code: typeof rec.code === "string" ? rec.code : "",
+      severity,
+      message: typeof rec.message === "string" ? rec.message : JSON.stringify(item),
+    };
+    if (severity === "error") {
+      errors.push(parsed);
+    } else {
+      warnings.push(parsed);
+    }
+  }
+
+  const validationOk =
+    typeof validation.ok === "boolean" ? validation.ok : errors.length === 0;
+
+  return {
+    totalRules,
+    totalProxies,
+    proxyGroups,
+    validationOk,
+    errors,
+    warnings,
   };
 }
 
@@ -411,6 +523,7 @@ function formatDuration(startedAtMs: number, nowMs: number): string {
 
 export function RulesConnsPage() {
   const groups = useAppSelector((s) => s.groups);
+  const preAccelRelays = useAppSelector((s) => s.preAccelRelays);
   const runtime = useAppSelector((s) => s.runtime);
   const inTauri = isTauriEnv();
 
@@ -432,6 +545,9 @@ export function RulesConnsPage() {
   const [ruleSearch, setRuleSearch] = useState<string>("");
   const [ruleLayerFilter, setRuleLayerFilter] = useState<"all" | RuleLayer>("all");
   const [showYamlPreview, setShowYamlPreview] = useState<boolean>(false);
+  const [compiledPreview, setCompiledPreview] = useState<CompiledYamlPreview | null>(null);
+  const [loadingPreview, setLoadingPreview] = useState<boolean>(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
   const [copiedYaml, setCopiedYaml] = useState<boolean>(false);
 
   // New rule composer state
@@ -447,7 +563,9 @@ export function RulesConnsPage() {
   );
   const [connSearch, setConnSearch] = useState<string>("");
   const [connGroupFilter, setConnGroupFilter] = useState<string>("all");
-  const [connSort, setConnSort] = useState<"down" | "up" | "age" | "process">("down");
+  const [connSort, setConnSort] = useState<"down" | "up" | "rate" | "age" | "process">("down");
+  const [connPage, setConnPage] = useState<number>(1);
+  const [pageJumpInput, setPageJumpInput] = useState<string>("");
   const [connPaused, setConnPaused] = useState<boolean>(false);
   const [confirmCloseAll, setConfirmCloseAll] = useState<boolean>(false);
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
@@ -457,11 +575,20 @@ export function RulesConnsPage() {
   const confirmCloseAllTimerRef = useRef<number | null>(null);
   const groupsRef = useRef<MultiGroup[]>(groups);
   groupsRef.current = groups;
+  const relaysRef = useRef<PreAccelRelay[]>(preAccelRelays);
+  relaysRef.current = preAccelRelays;
+  const runtimeRunningRef = useRef<boolean>(runtime.running);
+  runtimeRunningRef.current = runtime.running;
   const aiPresetsRef = useRef<AiPresetBundle[]>(aiPresets);
   aiPresetsRef.current = aiPresets;
   const userRulesRef = useRef<ManagedRuleItem[]>(userRules);
   userRulesRef.current = userRules;
+  const showYamlPreviewRef = useRef<boolean>(showYamlPreview);
+  showYamlPreviewRef.current = showYamlPreview;
   const userPickedNewTargetRef = useRef<boolean>(false);
+  const inFlightRef = useRef<boolean>(false);
+  const prevSnapRef = useRef<Map<string, ConnTrafficSnap>>(new Map());
+  const previewReqSeqRef = useRef<number>(0);
 
   useEffect(() => {
     return () => {
@@ -472,6 +599,26 @@ export function RulesConnsPage() {
         window.clearTimeout(confirmCloseAllTimerRef.current);
       }
     };
+  }, []);
+
+  const loadCompiledPreview = useCallback(async () => {
+    const seq = ++previewReqSeqRef.current;
+    setLoadingPreview(true);
+    setPreviewError(null);
+    try {
+      const res = await catcloudApi.compilePreviewYaml();
+      if (seq !== previewReqSeqRef.current) return;
+      setCompiledPreview(res);
+    } catch (err) {
+      if (seq !== previewReqSeqRef.current) return;
+      const msg = formatErrorMessage(err);
+      setPreviewError(msg);
+      appActions.showToast(`编译配置预览失败：${msg}`, "warn");
+    } finally {
+      if (seq === previewReqSeqRef.current) {
+        setLoadingPreview(false);
+      }
+    }
   }, []);
 
   // Load persisted rules_override from backend config on mount
@@ -569,6 +716,9 @@ export function RulesConnsPage() {
         const payload = buildRulesOverridePayload(nextPresets, nextUserRules);
         await catcloudApi.saveExtendedSettings({ rules_override: payload });
         appActions.showToast(successToast, "ok");
+        if (showYamlPreviewRef.current) {
+          void loadCompiledPreview();
+        }
         return true;
       } catch (err) {
         setAiPresets(prevPresets);
@@ -579,56 +729,144 @@ export function RulesConnsPage() {
         setSavingRules(false);
       }
     },
-    []
+    [loadCompiledPreview]
   );
 
   const fetchLiveConnections = useCallback(
-    async (notifyOnError = false) => {
+    async (manual = false, notifyOnError = false): Promise<boolean> => {
+      if (inFlightRef.current) return false;
       if (!inTauri) {
         setConnections(buildPreviewConnections());
-        return;
+        setNowTick(Date.now());
+        return true;
       }
-      setRefreshingConns(true);
+      if (!runtimeRunningRef.current) {
+        prevSnapRef.current = new Map();
+        setConnections([]);
+        if (notifyOnError) {
+          appActions.showToast("代理核心尚未启动，开启代理后这里会实时显示连接", "info");
+        }
+        return false;
+      }
+
+      inFlightRef.current = true;
+      if (manual) {
+        setRefreshingConns(true);
+      }
       try {
         const snap = await catcloudApi.getActiveConnections();
-        setConnections(snap.connections.map((c) => mapDtoConnection(c, groupsRef.current)));
-        setNowTick(Date.now());
+        const nowMs = Date.now();
+        const prevMap = prevSnapRef.current;
+        const nextMap = new Map<string, ConnTrafficSnap>();
+
+        const mapped = snap.connections.map((dto) => {
+          const item = mapDtoConnection(dto, groupsRef.current, relaysRef.current);
+          const prev = prevMap.get(item.id);
+          if (prev && nowMs > prev.atMs) {
+            const dtSec = Math.max(0.2, (nowMs - prev.atMs) / 1000);
+            item.upBps = Math.max(0, (item.uploadBytes - prev.uploadBytes) / dtSec);
+            item.downBps = Math.max(0, (item.downloadBytes - prev.downloadBytes) / dtSec);
+          }
+          nextMap.set(item.id, {
+            uploadBytes: item.uploadBytes,
+            downloadBytes: item.downloadBytes,
+            atMs: nowMs,
+          });
+          return item;
+        });
+
+        prevSnapRef.current = nextMap;
+        setConnections(mapped);
+        setNowTick(nowMs);
+        return true;
       } catch (err) {
         if (notifyOnError) {
           appActions.showToast(`获取当前连接失败：${formatErrorMessage(err)}`, "warn");
         }
+        return false;
       } finally {
-        setRefreshingConns(false);
+        inFlightRef.current = false;
+        if (manual) {
+          setRefreshingConns(false);
+        }
       }
     },
     [inTauri]
   );
 
-  // Poll real connections in Tauri runtime when Connections tab is active; tick preview demo in browser
+  // Fetch active connection count once on mount (even on Rules tab) when core is running,
+  // and clear stale connections when core stops.
+  useEffect(() => {
+    if (!inTauri) return;
+    if (!runtime.running) {
+      prevSnapRef.current = new Map();
+      setConnections([]);
+      return;
+    }
+    void fetchLiveConnections(false, false);
+  }, [fetchLiveConnections, inTauri, runtime.running]);
+
+  // Re-evaluate custom relay names whenever preAccelRelays updates
+  useEffect(() => {
+    if (preAccelRelays.length === 0) return;
+    setConnections((prev) => {
+      let changed = false;
+      const next = prev.map((c) => {
+        const via = matchesPreAccelChain(c.chains, preAccelRelays);
+        if (via !== c.viaPreAccel) {
+          changed = true;
+          return { ...c, viaPreAccel: via };
+        }
+        return c;
+      });
+      return changed ? next : prev;
+    });
+  }, [preAccelRelays]);
+
+  // Silently poll real connections in Tauri runtime when Connections tab is active; tick preview demo in browser
   useEffect(() => {
     if (connPaused) return;
+    if (inTauri && !runtime.running) return;
     if (inTauri && activeTab === "connections") {
-      void fetchLiveConnections(false);
+      void fetchLiveConnections(false, false);
     }
     const timer = window.setInterval(() => {
       if (document.visibilityState !== "visible") return;
-      setNowTick(Date.now());
+      const nowMs = Date.now();
+      setNowTick(nowMs);
       if (inTauri) {
-        if (activeTab === "connections") {
-          void fetchLiveConnections(false);
+        if (activeTab === "connections" && runtimeRunningRef.current) {
+          void fetchLiveConnections(false, false);
         }
       } else {
-        setConnections((prev) =>
-          prev.map((c, idx) => ({
-            ...c,
-            uploadBytes: c.uploadBytes + (idx + 1) * 14_500,
-            downloadBytes: c.downloadBytes + (idx + 2) * 58_000,
-          }))
-        );
+        setConnections((prev) => {
+          const prevMap = prevSnapRef.current;
+          const nextMap = new Map<string, ConnTrafficSnap>();
+          const updated = prev.map((c, idx) => {
+            const deltaUp = (idx + 1) * 14_500;
+            const deltaDown = (idx + 2) * 58_000;
+            const nextUp = c.uploadBytes + deltaUp;
+            const nextDown = c.downloadBytes + deltaDown;
+            const last = prevMap.get(c.id);
+            const dtSec = last && nowMs > last.atMs ? Math.max(0.2, (nowMs - last.atMs) / 1000) : 2.5;
+            const upBps = last ? Math.max(0, (nextUp - last.uploadBytes) / dtSec) : deltaUp / 2.5;
+            const downBps = last ? Math.max(0, (nextDown - last.downloadBytes) / dtSec) : deltaDown / 2.5;
+            nextMap.set(c.id, { uploadBytes: nextUp, downloadBytes: nextDown, atMs: nowMs });
+            return {
+              ...c,
+              uploadBytes: nextUp,
+              downloadBytes: nextDown,
+              upBps,
+              downBps,
+            };
+          });
+          prevSnapRef.current = nextMap;
+          return updated;
+        });
       }
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [activeTab, connPaused, fetchLiveConnections, inTauri]);
+  }, [activeTab, connPaused, fetchLiveConnections, inTauri, runtime.running]);
 
   // Combine group match_rules from store with editable local rules
   const groupBoundRules = useMemo<ManagedRuleItem[]>(() => {
@@ -665,33 +903,18 @@ export function RulesConnsPage() {
     });
   }, [groupBoundRules, ruleLayerFilter, ruleSearch, userRules]);
 
-  const compiledOverrideYaml = useMemo(() => {
-    const payload = buildRulesOverridePayload(aiPresets, userRules);
-    const defaultMatch = runtime.active_group_name || groups[0]?.name || "DIRECT";
-    const lines: string[] = [
-      "# 当前生效分流规则顺序预览（从上到下依次匹配）",
-      "rules:",
-      "  # 1. 优先匹配与常用网站分流",
-    ];
-    for (const line of payload.global_prepend_rules) {
-      lines.push(`  - ${line}`);
+  const compiledMeta = useMemo<ParsedCompiledMeta | null>(
+    () => (compiledPreview ? parseCompiledPreviewMeta(compiledPreview) : null),
+    [compiledPreview]
+  );
+
+  const handleToggleYamlPreview = () => {
+    const next = !showYamlPreview;
+    setShowYamlPreview(next);
+    if (next) {
+      void loadCompiledPreview();
     }
-    if (groupBoundRules.length > 0) {
-      lines.push("  # 2. 分组自带规则");
-      for (const r of groupBoundRules) {
-        lines.push(`  - ${serializeRuleItem(r)}`);
-      }
-    }
-    if (payload.global_append_rules.length > 0) {
-      lines.push("  # 3. 兜底匹配规则");
-      for (const line of payload.global_append_rules) {
-        lines.push(`  - ${line}`);
-      }
-    }
-    lines.push("  # 4. 其他未命中流量");
-    lines.push(`  - MATCH,${defaultMatch}`);
-    return lines.join("\n");
-  }, [aiPresets, groupBoundRules, groups, runtime.active_group_name, userRules]);
+  };
 
   const handleAddRule = async () => {
     if (savingRules) return;
@@ -769,10 +992,14 @@ export function RulesConnsPage() {
   };
 
   const handleCopyYaml = async () => {
+    if (!compiledPreview?.yaml) {
+      appActions.showToast("暂无可复制的编译配置", "warn");
+      return;
+    }
     try {
-      await navigator.clipboard.writeText(compiledOverrideYaml);
+      await navigator.clipboard.writeText(compiledPreview.yaml);
       setCopiedYaml(true);
-      appActions.showToast("已复制当前分流规则预览", "ok");
+      appActions.showToast("已复制后端编译生成的脱敏配置", "ok");
       if (copiedYamlTimerRef.current !== null) {
         window.clearTimeout(copiedYamlTimerRef.current);
       }
@@ -785,11 +1012,21 @@ export function RulesConnsPage() {
     }
   };
 
-  // --- Connections filtering & teardown ---
+  // --- Connections filtering, pagination & teardown ---
   const filteredConnections = useMemo(() => {
     const kw = connSearch.trim().toLowerCase();
     const list = connections.filter((c) => {
-      if (connGroupFilter !== "all" && c.groupId !== connGroupFilter) return false;
+      if (connGroupFilter !== "all") {
+        if (connGroupFilter === "DIRECT") {
+          const isDirect =
+            c.groupId.toUpperCase() === "DIRECT" ||
+            c.groupName.toUpperCase() === "DIRECT" ||
+            c.nodeName.toUpperCase() === "DIRECT";
+          if (!isDirect) return false;
+        } else if (c.groupId !== connGroupFilter && c.groupName !== connGroupFilter) {
+          return false;
+        }
+      }
       if (!kw) return true;
       const friendlyRule = formatConnectionRuleLabel(c.rule).toLowerCase();
       return (
@@ -804,6 +1041,7 @@ export function RulesConnsPage() {
     });
 
     list.sort((a, b) => {
+      if (connSort === "rate") return b.upBps + b.downBps - (a.upBps + a.downBps);
       if (connSort === "down") return b.downloadBytes - a.downloadBytes;
       if (connSort === "up") return b.uploadBytes - a.uploadBytes;
       if (connSort === "age") return a.startedAtMs - b.startedAtMs;
@@ -811,6 +1049,38 @@ export function RulesConnsPage() {
     });
     return list;
   }, [connGroupFilter, connSearch, connSort, connections]);
+
+  const totalConnPages = Math.max(
+    1,
+    Math.ceil(filteredConnections.length / CONNECTIONS_PAGE_SIZE)
+  );
+  const safeConnPage = Math.min(connPage, totalConnPages);
+
+  useEffect(() => {
+    setConnPage(1);
+  }, [connGroupFilter, connSearch, connSort]);
+
+  useEffect(() => {
+    if (connPage > totalConnPages) {
+      setConnPage(totalConnPages);
+    }
+  }, [connPage, totalConnPages]);
+
+  const pagedConnections = useMemo(() => {
+    const start = (safeConnPage - 1) * CONNECTIONS_PAGE_SIZE;
+    return filteredConnections.slice(start, start + CONNECTIONS_PAGE_SIZE);
+  }, [filteredConnections, safeConnPage]);
+
+  const handleJumpConnPage = () => {
+    const parsed = Number.parseInt(pageJumpInput.trim(), 10);
+    if (!Number.isFinite(parsed)) {
+      appActions.showToast("请输入有效的页码数字", "warn");
+      return;
+    }
+    const target = Math.max(1, Math.min(totalConnPages, parsed));
+    setConnPage(target);
+    setPageJumpInput("");
+  };
 
   const totalConnUpload = useMemo(
     () => filteredConnections.reduce((acc, c) => acc + c.uploadBytes, 0),
@@ -820,10 +1090,19 @@ export function RulesConnsPage() {
     () => filteredConnections.reduce((acc, c) => acc + c.downloadBytes, 0),
     [filteredConnections]
   );
+  const totalConnUpBps = useMemo(
+    () => filteredConnections.reduce((acc, c) => acc + c.upBps, 0),
+    [filteredConnections]
+  );
+  const totalConnDownBps = useMemo(
+    () => filteredConnections.reduce((acc, c) => acc + c.downBps, 0),
+    [filteredConnections]
+  );
 
   const handleCloseSingleConn = async (conn: LiveConnection) => {
     try {
       await catcloudApi.closeConnection(conn.id);
+      prevSnapRef.current.delete(conn.id);
       setConnections((prev) => prev.filter((c) => c.id !== conn.id));
       appActions.showToast(`已断开连接：${conn.process} -> ${conn.host}`, "ok");
     } catch (err) {
@@ -877,6 +1156,7 @@ export function RulesConnsPage() {
     try {
       const closed = await catcloudApi.closeAllConnections();
       const shownCount = inTauri ? closed : connections.length;
+      prevSnapRef.current = new Map();
       setConnections([]);
       setConfirmCloseAll(false);
       appActions.showToast(`已断开全部 ${shownCount} 条连接`, "ok");
@@ -887,8 +1167,10 @@ export function RulesConnsPage() {
   };
 
   const handleRefreshConns = async () => {
-    await fetchLiveConnections(true);
-    appActions.showToast("已刷新当前连接列表", "info");
+    const ok = await fetchLiveConnections(true, true);
+    if (ok) {
+      appActions.showToast("已刷新当前连接列表", "info");
+    }
   };
 
   const enabledAiDomainCount = aiPresets
@@ -965,11 +1247,11 @@ export function RulesConnsPage() {
                 )}
                 <button
                   type="button"
-                  onClick={() => setShowYamlPreview((v) => !v)}
+                  onClick={handleToggleYamlPreview}
                   className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
                 >
                   <Code2 className="h-3.5 w-3.5 text-[var(--accent)]" />
-                  {showYamlPreview ? "收起规则预览" : "查看规则预览"}
+                  {showYamlPreview ? "收起实际规则" : "预览实际规则"}
                 </button>
               </div>
             </div>
@@ -1048,30 +1330,104 @@ export function RulesConnsPage() {
             </div>
           </section>
 
-          {/* 完整规则预览 */}
+          {/* 后端真实编译配置预览（已脱敏） */}
           {showYamlPreview && (
             <section className="cc-card cc-glass overflow-hidden rounded-2xl">
-              <div className="flex items-center justify-between border-b border-[var(--line)] bg-[var(--bg-elevated)] px-4 py-2.5">
-                <div className="flex items-center gap-2 text-xs font-semibold text-[var(--text)]">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] bg-[var(--bg-elevated)] px-4 py-2.5">
+                <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-[var(--text)]">
                   <Eye className="h-3.5 w-3.5 text-[var(--accent)]" />
-                  当前生效规则顺序预览
-                </div>
-                <button
-                  type="button"
-                  onClick={() => void handleCopyYaml()}
-                  className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
-                >
-                  {copiedYaml ? (
-                    <Check className="h-3 w-3 text-[var(--green)]" />
-                  ) : (
-                    <Copy className="h-3 w-3 text-[var(--accent)]" />
+                  <span>后端编译配置预览（已脱敏）</span>
+                  {compiledMeta && (
+                    <>
+                      <span className="cc-mono rounded-full border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--text-secondary)]">
+                        规则 {compiledMeta.totalRules ?? "--"} 条
+                        {compiledMeta.proxyGroups !== null ? ` · 分组 ${compiledMeta.proxyGroups}` : ""}
+                        {compiledMeta.totalProxies !== null ? ` · 节点 ${compiledMeta.totalProxies}` : ""}
+                      </span>
+                      {compiledMeta.validationOk ? (
+                        compiledMeta.warnings.length > 0 ? (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--amber)]">
+                            <AlertTriangle className="h-3 w-3" />
+                            校验通过（{compiledMeta.warnings.length} 条提醒）
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--green)]">
+                            <CheckCircle2 className="h-3 w-3" />
+                            编译校验通过
+                          </span>
+                        )
+                      ) : (
+                        <span className="inline-flex items-center gap-1 rounded-full bg-[var(--red-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--red)]">
+                          <AlertTriangle className="h-3 w-3" />
+                          校验未通过（{compiledMeta.errors.length} 项错误）
+                        </span>
+                      )}
+                    </>
                   )}
-                  {copiedYaml ? "已复制" : "复制规则"}
-                </button>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={loadingPreview}
+                    onClick={() => void loadCompiledPreview()}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
+                  >
+                    <RefreshCw className={`h-3 w-3 ${loadingPreview ? "animate-spin" : ""}`} />
+                    重新编译
+                  </button>
+                  <button
+                    type="button"
+                    disabled={loadingPreview || !compiledPreview?.yaml}
+                    onClick={() => void handleCopyYaml()}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
+                  >
+                    {copiedYaml ? (
+                      <Check className="h-3 w-3 text-[var(--green)]" />
+                    ) : (
+                      <Copy className="h-3 w-3 text-[var(--accent)]" />
+                    )}
+                    {copiedYaml ? "已复制" : "复制配置"}
+                  </button>
+                </div>
               </div>
-              <pre className="cc-selectable cc-mono max-h-[260px] overflow-auto p-4 text-[11px] leading-relaxed text-[var(--text-secondary)]">
-                {compiledOverrideYaml}
-              </pre>
+
+              {compiledMeta && (compiledMeta.errors.length > 0 || compiledMeta.warnings.length > 0) && (
+                <div className="space-y-1 border-b border-[var(--line)] bg-[var(--bg-elevated)]/50 px-4 py-2 text-[11px]">
+                  {compiledMeta.errors.map((issue, idx) => (
+                    <div key={`err-${idx}`} className="flex items-start gap-1.5 text-[var(--red)]">
+                      <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                      <span>
+                        {issue.code ? `[${issue.code}] ` : ""}
+                        {issue.message}
+                      </span>
+                    </div>
+                  ))}
+                  {compiledMeta.warnings.map((issue, idx) => (
+                    <div key={`warn-${idx}`} className="flex items-start gap-1.5 text-[var(--amber)]">
+                      <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                      <span>
+                        {issue.code ? `[${issue.code}] ` : ""}
+                        {issue.message}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {loadingPreview && !compiledPreview ? (
+                <div className="py-8 text-center text-xs text-[var(--muted)]">
+                  正在调用后端编译并校验配置...
+                </div>
+              ) : previewError && !compiledPreview ? (
+                <div className="px-4 py-6 text-center text-xs text-[var(--red)]">
+                  编译预览失败：{previewError}
+                </div>
+              ) : (
+                <pre className="cc-selectable cc-mono max-h-[300px] overflow-auto p-4 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                  {compiledPreview?.yaml ?? ""}
+                </pre>
+              )}
             </section>
           )}
 
@@ -1081,7 +1437,7 @@ export function RulesConnsPage() {
               <h2 className="text-xs font-semibold text-[var(--text)]">自定义分流规则</h2>
               <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] text-[var(--green)]">
                 <Shield className="h-3 w-3" />
-                系统已自动保护本机直连与防回环，添加规则后立即保存生效
+                系统已自动保护本机直连与防绕路死循环，添加规则后立即保存生效
               </span>
             </div>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-12">
@@ -1307,15 +1663,21 @@ export function RulesConnsPage() {
               </div>
               <div className="h-7 w-px bg-[var(--line)]" />
               <div>
-                <span className="text-[var(--muted)]">累计上传</span>
+                <span className="text-[var(--muted)]">实时上传 / 累计</span>
                 <div className="cc-mono mt-0.5 text-sm font-semibold text-[var(--coral)]">
-                  ↑ {formatBytes(totalConnUpload)}
+                  ↑ {formatRate(totalConnUpBps)}
+                  <span className="ml-1.5 text-[11px] font-normal text-[var(--muted)]">
+                    ({formatBytes(totalConnUpload)})
+                  </span>
                 </div>
               </div>
               <div>
-                <span className="text-[var(--muted)]">累计下载</span>
+                <span className="text-[var(--muted)]">实时下载 / 累计</span>
                 <div className="cc-mono mt-0.5 text-sm font-semibold text-[var(--sky)]">
-                  ↓ {formatBytes(totalConnDownload)}
+                  ↓ {formatRate(totalConnDownBps)}
+                  <span className="ml-1.5 text-[11px] font-normal text-[var(--muted)]">
+                    ({formatBytes(totalConnDownload)})
+                  </span>
                 </div>
               </div>
             </div>
@@ -1389,6 +1751,7 @@ export function RulesConnsPage() {
                 className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
               >
                 <option value="all">全部分组</option>
+                <option value="DIRECT">直接连接</option>
                 {groups.map((g) => (
                   <option key={g.id} value={g.id}>
                     {g.name}
@@ -1399,12 +1762,13 @@ export function RulesConnsPage() {
               <select
                 value={connSort}
                 onChange={(e) =>
-                  setConnSort(e.target.value as "down" | "up" | "age" | "process")
+                  setConnSort(e.target.value as "down" | "up" | "rate" | "age" | "process")
                 }
                 className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
               >
                 <option value="down">按下载量排序</option>
                 <option value="up">按上传量排序</option>
+                <option value="rate">按实时速率排序</option>
                 <option value="age">按连接时长排序</option>
                 <option value="process">按软件名排序</option>
               </select>
@@ -1424,14 +1788,14 @@ export function RulesConnsPage() {
           {/* 当前连接表格 */}
           <section className="cc-card cc-glass overflow-hidden rounded-2xl">
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[820px] border-collapse text-left text-xs">
+              <table className="w-full min-w-[860px] border-collapse text-left text-xs">
                 <thead>
                   <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[11px] text-[var(--muted)]">
                     <th className="px-4 py-2.5 font-medium">软件 / 协议</th>
                     <th className="px-3 py-2.5 font-medium">访问地址与端口</th>
                     <th className="px-3 py-2.5 font-medium">命中规则</th>
                     <th className="px-3 py-2.5 font-medium">分组与当前节点</th>
-                    <th className="px-3 py-2.5 text-right font-medium">上传 / 下载</th>
+                    <th className="px-3 py-2.5 text-right font-medium">实时速率 / 累计流量</th>
                     <th className="px-3 py-2.5 text-right font-medium">时长</th>
                     <th className="px-4 py-2.5 text-right font-medium">操作</th>
                   </tr>
@@ -1443,11 +1807,15 @@ export function RulesConnsPage() {
                         colSpan={7}
                         className="py-10 text-center text-xs text-[var(--muted)]"
                       >
-                        当前没有进行中的连接
+                        {!runtime.running
+                          ? "代理核心尚未启动，开启代理后这里会实时显示每个软件的连接去向"
+                          : connections.length === 0
+                            ? "当前没有进行中的连接"
+                            : "没有符合当前筛选条件的连接"}
                       </td>
                     </tr>
                   ) : (
-                    filteredConnections.map((conn) => (
+                    pagedConnections.map((conn) => (
                       <tr key={conn.id} className="hover:bg-[var(--card-hover)]">
                         <td className="px-4 py-2.5">
                           <div className="cc-mono font-semibold text-[var(--text)]">
@@ -1483,7 +1851,7 @@ export function RulesConnsPage() {
                             </span>
                             {conn.viaPreAccel && (
                               <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] text-[var(--green)]">
-                                国内提速
+                                走国内提速
                               </span>
                             )}
                           </div>
@@ -1492,12 +1860,14 @@ export function RulesConnsPage() {
                           </div>
                         </td>
 
-                        <td className="cc-mono px-3 py-2.5 text-right">
-                          <div className="text-[11px] text-[var(--coral)]">
-                            ↑ {formatBytes(conn.uploadBytes)}
+                        <td className="cc-mono px-3 py-2.5 text-right whitespace-nowrap">
+                          <div className="text-[11px] font-medium">
+                            <span className="text-[var(--coral)]">↑ {formatRate(conn.upBps)}</span>
+                            <span className="mx-1 text-[var(--muted)]">·</span>
+                            <span className="text-[var(--sky)]">↓ {formatRate(conn.downBps)}</span>
                           </div>
-                          <div className="text-[11px] text-[var(--sky)]">
-                            ↓ {formatBytes(conn.downloadBytes)}
+                          <div className="mt-0.5 text-[10px] text-[var(--muted)]">
+                            累计 ↑ {formatBytes(conn.uploadBytes)} · ↓ {formatBytes(conn.downloadBytes)}
                           </div>
                         </td>
 
@@ -1521,6 +1891,64 @@ export function RulesConnsPage() {
                 </tbody>
               </table>
             </div>
+
+            {filteredConnections.length > CONNECTIONS_PAGE_SIZE && (
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] bg-[var(--bg-elevated)]/60 px-4 py-2.5 text-xs">
+                <div className="text-[11px] text-[var(--muted)]">
+                  显示第 {(safeConnPage - 1) * CONNECTIONS_PAGE_SIZE + 1}–
+                  {Math.min(safeConnPage * CONNECTIONS_PAGE_SIZE, filteredConnections.length)} 条，共{" "}
+                  {filteredConnections.length} 条（每页 {CONNECTIONS_PAGE_SIZE} 条）
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={safeConnPage <= 1}
+                    onClick={() => setConnPage((p) => Math.max(1, p - 1))}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" />
+                    上一页
+                  </button>
+
+                  <span className="cc-mono text-[11px] text-[var(--text-secondary)]">
+                    第 {safeConnPage} / {totalConnPages} 页
+                  </span>
+
+                  <button
+                    type="button"
+                    disabled={safeConnPage >= totalConnPages}
+                    onClick={() => setConnPage((p) => Math.min(totalConnPages, p + 1))}
+                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-45"
+                  >
+                    下一页
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
+
+                  <div className="ml-1 flex items-center gap-1">
+                    <input
+                      type="number"
+                      min={1}
+                      max={totalConnPages}
+                      value={pageJumpInput}
+                      onChange={(e) => setPageJumpInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleJumpConnPage();
+                      }}
+                      placeholder="页码"
+                      className="cc-mono w-14 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-center text-[11px] text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleJumpConnPage}
+                      className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
+                    >
+                      跳转
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </section>
         </div>
       )}

@@ -14,6 +14,7 @@ pub mod subscription;
 pub mod updater;
 
 pub use error::{CatError, CatResult};
+pub use models::RouteTargetMode;
 pub use paths::AppPaths;
 
 /// Install the process-wide Rustls ring CryptoProvider (idempotent).

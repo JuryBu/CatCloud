@@ -1413,17 +1413,20 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     cfg.port_guard_auto_shift,
                 )?;
                 let empty_filter = HashMap::new();
-                let compiled = compile_mihomo_config(&CompileInput {
-                    config: &cfg,
-                    nodes: &nodes,
-                    groups: &groups,
-                    relays: &relays,
-                    controller_secret: "compile-placeholder-secret",
-                    allocated_ports: &ports,
-                    extra_prepend_rules: &[],
-                    extra_fake_ip_filters: &[],
-                    group_filtered_members: &empty_filter,
-                })?;
+                let compiled = catcloud_core::core_adapter::compile_mihomo_config_with_runtime_dir(
+                    &CompileInput {
+                        config: &cfg,
+                        nodes: &nodes,
+                        groups: &groups,
+                        relays: &relays,
+                        controller_secret: "compile-placeholder-secret",
+                        allocated_ports: &ports,
+                        extra_prepend_rules: &[],
+                        extra_fake_ip_filters: &[],
+                        group_filtered_members: &empty_filter,
+                    },
+                    Some(&paths.runtime_dir),
+                )?;
                 if let Some(path) = output {
                     AppPaths::atomic_write(&path, compiled.yaml.as_bytes())?;
                     let out = json!({ "ok": true, "output": path, "sha256": compiled.sha256 });

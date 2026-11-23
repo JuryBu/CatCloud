@@ -1,6 +1,7 @@
 import {
   Activity,
   AlertTriangle,
+  ArrowLeft,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -159,11 +160,14 @@ interface GatePreset {
   failText: string;
 }
 
+const GEMINI_GATE_EXPR = 'site_unlocked("gemini") == 1';
+const LEGACY_GEMINI_GATE_EXPR = 'site_unlocked("google_ai") == 1';
+
 const HARD_GATE_PRESETS: readonly GatePreset[] = [
   { expr: "google_clean == 1", label: "谷歌地区正常", failText: "谷歌地区异常" },
   { expr: "keepalive_ok == 1", label: "长连接稳定(60秒)", failText: "60秒长连接未通过" },
   { expr: 'site_unlocked("chatgpt") == 1', label: "ChatGPT 可用", failText: "ChatGPT 未解锁" },
-  { expr: 'site_unlocked("google_ai") == 1', label: "Gemini 可用", failText: "Gemini 未解锁" },
+  { expr: GEMINI_GATE_EXPR, label: "Gemini 可用", failText: "Gemini 未解锁" },
   { expr: 'site_unlocked("claude") == 1', label: "Claude 可用", failText: "Claude 未解锁" },
   { expr: 'site_unlocked("windsurf") == 1', label: "Windsurf 可用", failText: "Windsurf 未解锁" },
 ];
@@ -172,6 +176,7 @@ const SITE_FRIENDLY_NAMES: Record<string, string> = {
   chatgpt: "ChatGPT",
   google_ai: "Gemini",
   gemini: "Gemini",
+  gemini_aistudio: "Gemini",
   claude: "Claude",
   windsurf: "Windsurf",
 };
@@ -222,7 +227,7 @@ const PROBE_ADDRESS_SNIPPETS: ReadonlyArray<{ token: string; desc: string }> = [
   { token: 'probe_ping("chatgpt")', desc: "指定探针延迟 ms" },
   { token: 'probe_ok("builtin_unlock_windsurf")', desc: "指定探针通过 (1/0)" },
   { token: 'site_unlocked("chatgpt")', desc: "ChatGPT 解锁 (1/0)" },
-  { token: 'site_unlocked("google_ai")', desc: "Gemini 解锁 (1/0)" },
+  { token: 'site_unlocked("gemini")', desc: "Gemini 解锁 (1/0)" },
 ];
 
 interface TriggerMeta {
@@ -715,13 +720,28 @@ function lookupSiteUnlockedRaw(
   unlockedSites: Record<string, boolean>,
   siteName: string
 ): boolean | null {
-  if (siteName in unlockedSites) {
-    return unlockedSites[siteName];
-  }
+  const findKey = (target: string): boolean | null => {
+    if (target in unlockedSites) {
+      return unlockedSites[target];
+    }
+    const targetLower = target.toLowerCase();
+    for (const [k, v] of Object.entries(unlockedSites)) {
+      if (k.toLowerCase() === targetLower) {
+        return v;
+      }
+    }
+    return null;
+  };
+
+  const direct = findKey(siteName);
+  if (direct !== null) return direct;
+
   const lower = siteName.toLowerCase();
-  for (const [k, v] of Object.entries(unlockedSites)) {
-    if (k.toLowerCase() === lower) {
-      return v;
+  if (lower === "google_ai" || lower === "gemini" || lower === "gemini_aistudio") {
+    for (const alias of ["gemini", "gemini_aistudio", "google_ai"]) {
+      if (alias === lower) continue;
+      const hit = findKey(alias);
+      if (hit !== null) return hit;
     }
   }
   return null;
@@ -1095,6 +1115,22 @@ function formatMultiplierLabel(multiplier: number): string {
   return Number.isInteger(multiplier) ? `${multiplier}x` : `${Number(multiplier.toFixed(2))}x`;
 }
 
+function extractCardAiDots(snap: ProbeSnapshot | undefined): Array<{
+  id: string;
+  label: string;
+  short: string;
+}> {
+  if (!snap) return [];
+  const sites = snap.unlocked_sites ?? {};
+  const list: Array<{ id: string; label: string; short: string }> = [];
+  if (sites.claude === true) list.push({ id: "claude", label: "Claude 可用", short: "C" });
+  if ((sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai) === true) {
+    list.push({ id: "gemini", label: "Gemini 可用", short: "G" });
+  }
+  if (sites.chatgpt === true) list.push({ id: "chatgpt", label: "ChatGPT 可用", short: "GPT" });
+  return list;
+}
+
 function buildMultiGroupAgentMarkdown(group: MultiGroup, meta: TriggerMeta): string {
   const normalized = normalizeGroupForBackend(group, meta);
   const snippet = JSON.stringify(
@@ -1186,6 +1222,7 @@ export function MultiGroupPage() {
   const probeProgress = useAppSelector((s) => s.probeProgress);
   const subscriptions = useAppSelector((s) => s.subscriptions);
   const runtime = useAppSelector((s) => s.runtime);
+  const isGroupMode = runtime.route_mode !== "single";
   const initialized = useAppSelector((s) => s.initialized);
   const inTauri = isTauriEnv();
 
@@ -1734,9 +1771,6 @@ export function MultiGroupPage() {
         const joined = await persistGroupMembers(selectedGroup.id, [...currentIds, node.id]);
         if (!joined) return;
       }
-      if (appStore.getState().runtime.active_group_id !== selectedGroup.id) {
-        await appActions.setActiveGroup(selectedGroup.id);
-      }
       const closeOld = selectedGroup.switch_mode === "force_close_old";
       await appActions.selectGroupNode(selectedGroup.id, node.id, closeOld);
       setGroups((prev) =>
@@ -1818,7 +1852,12 @@ export function MultiGroupPage() {
     try {
       const res = await catcloudApi.switchNextBestNode(selectedGroup.id);
       const rt = await catcloudApi.getRuntimeInfo();
-      appActions.syncRuntime(rt);
+      appActions.syncRuntime({
+        ...rt,
+        route_mode: "group",
+        active_group_id: rt.active_group_id || selectedGroup.id,
+        active_group_name: rt.active_group_name || selectedGroup.name,
+      });
       setGroups((prev) => {
         const next = prev.map((g) =>
           g.id === selectedGroup.id ? { ...g, active_node_id: res.active_node_id } : g
@@ -1972,6 +2011,18 @@ export function MultiGroupPage() {
 
   const handleToggleGate = (expr: string) => {
     updateSelectedGroup((g) => {
+      if (expr === GEMINI_GATE_EXPR) {
+        const hasAnyGemini =
+          g.hard_gates.includes(GEMINI_GATE_EXPR) ||
+          g.hard_gates.includes(LEGACY_GEMINI_GATE_EXPR);
+        const cleaned = g.hard_gates.filter(
+          (item) => item !== GEMINI_GATE_EXPR && item !== LEGACY_GEMINI_GATE_EXPR
+        );
+        return {
+          ...g,
+          hard_gates: hasAnyGemini ? cleaned : [...cleaned, GEMINI_GATE_EXPR],
+        };
+      }
       const exists = g.hard_gates.includes(expr);
       return {
         ...g,
@@ -2164,11 +2215,16 @@ export function MultiGroupPage() {
     : null;
 
   const isRuntimeActiveGroup =
-    Boolean(selectedGroup) && runtime.active_group_id === selectedGroup?.id;
+    isGroupMode &&
+    Boolean(selectedGroup) &&
+    runtime.active_group_id === selectedGroup?.id;
 
   const customHardGates = useMemo(() => {
     if (!selectedGroup) return [];
-    const presetSet = new Set(HARD_GATE_PRESETS.map((p) => p.expr));
+    const presetSet = new Set([
+      ...HARD_GATE_PRESETS.map((p) => p.expr),
+      LEGACY_GEMINI_GATE_EXPR,
+    ]);
     return selectedGroup.hard_gates.filter((expr) => !presetSet.has(expr));
   }, [selectedGroup]);
 
@@ -2287,11 +2343,35 @@ export function MultiGroupPage() {
             <span className="cc-mono text-[10px] text-[var(--muted)]">{groups.length} 组</span>
           </div>
 
+          {/* Gentle Guide Banner when Home is Currently in Single-Node Mode */}
+          {!isGroupMode && (
+            <div className="mb-2.5 rounded-xl border border-[var(--green)]/35 bg-[var(--green-soft)]/55 px-2.5 py-2 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+              <div className="flex items-start gap-1.5">
+                <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--green)]" />
+                <span>
+                  当前首页正在使用单节点（
+                  <span className="font-semibold text-[var(--text)]">
+                    {runtime.active_node_name || "单节点"}
+                  </span>
+                  ），点下方组的「使用此组」可切回智能多选组
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => appActions.setNav("overview")}
+                className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-medium text-[var(--green)] hover:underline"
+              >
+                <ArrowLeft className="h-3 w-3 shrink-0" />
+                <span>返回总览</span>
+              </button>
+            </div>
+          )}
+
           {/* Existing multi-groups list */}
           <div className="space-y-1.5">
             {groups.map((g) => {
               const isSelected = selectedGroup?.id === g.id;
-              const isSystemActive = runtime.active_group_id === g.id;
+              const isSystemActive = isGroupMode && runtime.active_group_id === g.id;
               const activeNode = g.active_node_id ? nodeById.get(g.active_node_id) : null;
               const modeMeta = GROUP_MODES.find((m) => m.id === g.mode) ?? GROUP_MODES[0];
               const isDirty = Boolean(dirtyGroupIds[g.id]);
@@ -2306,9 +2386,13 @@ export function MultiGroupPage() {
                   onClick={() => setSelectedId(g.id)}
                   onKeyDown={(ev) => handleCardKeyDown(ev, () => setSelectedId(g.id))}
                   className={`group relative cursor-pointer rounded-xl border p-2.5 transition-colors ${
-                    isSelected
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] shadow-xs"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
+                    isSystemActive && isSelected
+                      ? "border-[var(--green)] bg-[var(--green-soft)]/55 shadow-xs"
+                      : isSystemActive
+                        ? "border-[var(--green)]/65 bg-[var(--green-soft)]/30 hover:border-[var(--green)]"
+                        : isSelected
+                          ? "border-[var(--accent)] bg-[var(--accent-soft)] shadow-xs"
+                          : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
                   }`}
                 >
                   <div className="flex items-start justify-between gap-1.5">
@@ -2380,8 +2464,29 @@ export function MultiGroupPage() {
                           {modeMeta.shortLabel}
                         </span>
                       </div>
-                      <div className="mt-1 truncate text-[11px] text-[var(--muted)]">
-                        {activeNode ? `正在用：${activeNode.name}` : "尚未选定节点"}
+                      <div className="mt-1.5 flex items-center justify-between gap-1.5">
+                        <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--muted)]">
+                          {activeNode
+                            ? `${isSystemActive ? "正在用" : "组内选定"}：${activeNode.name}`
+                            : "尚未选定节点"}
+                        </span>
+                        {isSystemActive ? (
+                          <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                            当前使用中
+                          </span>
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              setSelectedId(g.id);
+                              void appActions.setActiveGroup(g.id);
+                            }}
+                            className="shrink-0 whitespace-nowrap rounded-md border border-[var(--accent)]/50 bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
+                          >
+                            使用此组
+                          </button>
+                        )}
                       </div>
                     </>
                   )}
@@ -2451,19 +2556,29 @@ export function MultiGroupPage() {
                   )}
 
                   {isRuntimeActiveGroup ? (
-                    <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--green)]">
+                    <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[var(--green)]/40 bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] font-semibold text-[var(--green)]">
                       <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
-                      当前生效组
+                      当前使用中
                     </span>
                   ) : (
                     <button
                       type="button"
                       onClick={() => void appActions.setActiveGroup(selectedGroup.id)}
-                      className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--accent)] px-3 py-1 text-[11px] font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90"
                     >
-                      设为当前组
+                      <Play className="h-2.5 w-2.5 fill-current" />
+                      <span>使用此组</span>
                     </button>
                   )}
+
+                  <button
+                    type="button"
+                    onClick={() => appActions.setNav("overview")}
+                    className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                  >
+                    <ArrowLeft className="h-3 w-3 shrink-0" />
+                    <span>返回总览</span>
+                  </button>
                 </div>
 
                 {/* Plain-language status summary */}
@@ -2476,8 +2591,12 @@ export function MultiGroupPage() {
                       </span>{" "}
                       个节点
                       <span className="mx-1.5 opacity-50">·</span>
-                      正在用：
-                      <span className="font-medium text-[var(--green)]">
+                      {isRuntimeActiveGroup ? "正在用：" : "组内选定："}
+                      <span
+                        className={`font-medium ${
+                          isRuntimeActiveGroup ? "text-[var(--green)]" : "text-[var(--text-secondary)]"
+                        }`}
+                      >
                         {activeNodeInSelectedGroup ? activeNodeInSelectedGroup.name : "尚未选定"}
                       </span>
                     </>
@@ -2715,12 +2834,14 @@ export function MultiGroupPage() {
                 const isHighMult = node.multiplier > 1.05;
                 const isLowMult = node.multiplier < 0.95;
 
-                // Distinct visual framing: Active (emerald thick border) > Member (warm-gold thick border) > Non-member (subtle gray)
-                const cardClass = isActive
+                // Distinct visual framing: Live active (emerald thick border) > Group-selected (soft emerald) > Member (warm-gold thick border) > Non-member (subtle gray)
+                const cardClass = isLiveActive
                   ? "border-2 border-[var(--green)] bg-[var(--green-soft)] shadow-sm"
-                  : isMember
-                    ? "border-2 border-[var(--accent)] bg-[var(--accent-soft)]"
-                    : "border border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)] hover:bg-[var(--card-hover)]";
+                  : isActive
+                    ? "border-2 border-[var(--green)]/60 bg-[var(--green-soft)]/45"
+                    : isMember
+                      ? "border-2 border-[var(--accent)] bg-[var(--accent-soft)]"
+                      : "border border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)] hover:bg-[var(--card-hover)]";
 
                 return (
                   <div
@@ -2734,8 +2855,8 @@ export function MultiGroupPage() {
                     className={`group relative flex cursor-pointer flex-col justify-between gap-2.5 rounded-xl p-3 transition-all ${cardClass}`}
                   >
                     {/* Top row: region badge + node name + membership badge */}
-                    <div className="flex items-start justify-between gap-2">
-                      <div className="flex min-w-0 items-center gap-1.5">
+                    <div className="flex items-center justify-between gap-1.5">
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
                         <span
                           title={getRegionLabel(regionCode)}
                           className="cc-mono shrink-0 rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-secondary)]"
@@ -2744,34 +2865,39 @@ export function MultiGroupPage() {
                         </span>
                         <span
                           title={node.name}
-                          className="truncate text-xs font-semibold text-[var(--text)]"
+                          className="min-w-0 flex-1 truncate text-xs font-semibold text-[var(--text)]"
                         >
                           {node.name}
                         </span>
                       </div>
 
-                      {isActive ? (
-                        <span className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-[var(--green)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
+                      {isLiveActive ? (
+                        <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--green)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
                           <Star className="h-2.5 w-2.5 fill-current" />
                           <span>正在用</span>
                         </span>
+                      ) : isActive ? (
+                        <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-full border border-[var(--green)]/50 bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                          <Star className="h-2.5 w-2.5" />
+                          <span>组内选定</span>
+                        </span>
                       ) : isMember ? (
-                        <span className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-[var(--accent)]/50 bg-[var(--card)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
+                        <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-full border border-[var(--accent)]/50 bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
                           <Check className="h-2.5 w-2.5" />
                           <span>在组内</span>
                         </span>
                       ) : (
-                        <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)] opacity-0 transition-opacity group-hover:opacity-100 group-hover:text-[var(--accent)]">
+                        <span className="pointer-events-none absolute right-2.5 top-2.5 rounded-full border border-[var(--accent)]/40 bg-[var(--card)]/95 px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)] opacity-0 shadow-xs transition-opacity group-hover:opacity-100">
                           + 加入本组
                         </span>
                       )}
                     </div>
 
-                    {/* Middle row: provider + multiplier */}
+                    {/* Middle row: provider + multiplier + Google clean/CN & AI unlock dots */}
                     <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
                       <span
                         title={subName}
-                        className="max-w-[140px] truncate rounded-md bg-[var(--bg-elevated)]/90 px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                        className="max-w-[128px] truncate rounded-md bg-[var(--bg-elevated)]/90 px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
                       >
                         {subName}
                       </span>
@@ -2787,6 +2913,48 @@ export function MultiGroupPage() {
                       ) : (
                         <span className="cc-mono text-[10px] text-[var(--muted)]/80">1x</span>
                       )}
+
+                      {snap?.google_clean === true && (
+                        <span className="rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                          谷歌正常
+                        </span>
+                      )}
+                      {snap?.google_clean === false && (
+                        <span className="rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
+                          送中
+                        </span>
+                      )}
+                      {snap?.google_risk_mismatch && (
+                        <span
+                          className="rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                          title="不同网站识别出的地区存在差异，仅供参考"
+                        >
+                          地区有偏差
+                        </span>
+                      )}
+
+                      {(() => {
+                        const aiDots = extractCardAiDots(snap);
+                        if (aiDots.length === 0) return null;
+                        return (
+                          <span
+                            className="inline-flex items-center gap-1"
+                            title={`AI 解锁：${aiDots.map((d) => d.label).join(" · ")}`}
+                          >
+                            {aiDots.map((dot) => (
+                              <span
+                                key={dot.id}
+                                title={dot.label}
+                                aria-label={dot.label}
+                                className="inline-flex items-center gap-0.5 rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--accent)]"
+                              >
+                                <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                                {dot.short}
+                              </span>
+                            ))}
+                          </span>
+                        );
+                      })()}
                     </div>
 
                     {/* Bottom row: gentle probe status + 2 quick actions ("测" & "用它") */}
@@ -2814,8 +2982,13 @@ export function MultiGroupPage() {
                               </span>
                             )}
                             {snap.up_mbps !== null && (
-                              <span className="cc-mono cc-tabular text-[10px] text-[var(--text-secondary)]">
+                              <span className="cc-mono cc-tabular text-[10px] text-[var(--coral)]">
                                 ↑{snap.up_mbps.toFixed(1)}M
+                              </span>
+                            )}
+                            {snap.down_mbps !== null && (
+                              <span className="cc-mono cc-tabular text-[10px] text-[var(--sky)]">
+                                ↓{snap.down_mbps >= 100 ? Math.round(snap.down_mbps) : snap.down_mbps.toFixed(1)}M
                               </span>
                             )}
                             {gateEval.hasMeasuredFailure && (
@@ -3082,7 +3255,10 @@ export function MultiGroupPage() {
 
                 <div className="flex flex-wrap gap-1.5">
                   {HARD_GATE_PRESETS.map((preset) => {
-                    const enabled = selectedGroup.hard_gates.includes(preset.expr);
+                    const enabled =
+                      selectedGroup.hard_gates.includes(preset.expr) ||
+                      (preset.expr === GEMINI_GATE_EXPR &&
+                        selectedGroup.hard_gates.includes(LEGACY_GEMINI_GATE_EXPR));
                     return (
                       <button
                         key={preset.expr}
@@ -3450,7 +3626,7 @@ export function MultiGroupPage() {
                     <div className="space-y-1.5">
                       <div className="flex flex-wrap items-center justify-between gap-1.5">
                         <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
-                          节点评分公式（安全 AST 解析）
+                          节点评分公式（安全公式校验）
                         </span>
                         <button
                           type="button"
@@ -3596,7 +3772,7 @@ export function MultiGroupPage() {
 
                       <label className="block">
                         <span className="text-[10px] text-[var(--muted)]">
-                          防抖动滞回幅度 (%)
+                          防频繁切换缓冲幅度 (%)
                         </span>
                         <input
                           type="number"
@@ -3642,7 +3818,7 @@ export function MultiGroupPage() {
                         className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
                       >
                         <RefreshCw className={`h-3 w-3 ${evaluating ? "animate-spin" : ""}`} />
-                        <span>{evaluating ? "后端评估中..." : "运行后端权威评估"}</span>
+                        <span>{evaluating ? "模拟打分中..." : "立即模拟打分排序"}</span>
                       </button>
 
                       {evalReport && (

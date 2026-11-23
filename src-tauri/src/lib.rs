@@ -3,11 +3,13 @@ pub mod lifecycle;
 pub mod shortcuts;
 pub mod tray;
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use catcloud_core::config;
 use catcloud_core::models::ProxyMode;
+use catcloud_core::platform::default_platform;
 use catcloud_core::process_guard::{
     AcquireOutcome, JobGuard, SingleInstanceGuard, spawn_detached_self,
 };
@@ -83,6 +85,7 @@ pub fn run_with_paths(paths: AppPaths) {
     let restarting = has_cli_flag("--restarting");
     let silent_flag = has_cli_flag("--silent");
     let post_update_cleanup = has_cli_flag("--post-update-cleanup");
+    let enable_tun_flag = has_cli_flag("--enable-tun");
 
     if post_update_cleanup {
         let _ = catcloud_core::updater::run_post_update_cleanup(&paths.backup_dir);
@@ -173,9 +176,11 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::set_proxy_mode,
             commands::set_system_proxy,
             commands::set_tun_enabled,
+            commands::relaunch_as_admin,
             commands::switch_next_best_node,
             commands::select_group_node,
             commands::set_active_group,
+            commands::select_single_node,
             commands::toggle_capsule_window,
             commands::show_main_window,
             commands::enter_windowless_mode,
@@ -227,6 +232,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::inspect_process_source,
             commands::export_shell_env,
             commands::export_sanitized_diagnostics,
+            commands::get_geodata_status,
             commands::refresh_geo_db,
             commands::check_app_update,
             commands::export_backup_bundle,
@@ -257,6 +263,8 @@ pub fn run_with_paths(paths: AppPaths) {
 
             // Spawn background telemetry event forwarders feeding frontend sparklines, logs, and tray tooltip.
             spawn_telemetry_forwarders(&handle, &state);
+            // Spawn background Windows ProxyGuard watchdog preventing third-party proxy hijacking.
+            spawn_proxy_guard(&handle);
 
             let initial_menu = commands::build_tray_menu_state(&handle, &state);
             let initial_visual = commands::build_tray_visual_state(&state);
@@ -307,12 +315,15 @@ pub fn run_with_paths(paths: AppPaths) {
                         tauri::async_runtime::spawn(async move {
                             if let Some(st) = app_async.try_state::<AppState>() {
                                 let next_enabled = !st.snapshot_config().tun.enabled;
-                                let _ = commands::set_tun_enabled(
-                                    app_async.clone(),
-                                    st,
+                                if let Err(err) = commands::set_tun_enabled_internal(
+                                    &app_async,
+                                    &st,
                                     next_enabled,
                                 )
-                                .await;
+                                .await
+                                {
+                                    commands::handle_tun_toggle_error(&app_async, &err);
+                                }
                             }
                         });
                     }
@@ -428,13 +439,43 @@ pub fn run_with_paths(paths: AppPaths) {
                 lifecycle::enter_pure_windowless_mode(&handle);
             }
 
-            // Asynchronously start the managed proxy core ONLY when system proxy or TUN is
-            // explicitly enabled in config AND at least one node exists, guaranteeing 0 background
-            // traffic on idle startup.
+            // Asynchronously start the managed proxy core when `--enable-tun` elevation handoff
+            // is requested OR when system proxy / TUN is enabled in config and nodes exist,
+            // guaranteeing 0 background traffic on idle startup.
             {
                 let auto_handle = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(st) = auto_handle.try_state::<AppState>() {
+                        if enable_tun_flag && default_platform().capabilities().is_elevated {
+                            let has_enabled = commands::has_enabled_nodes(&st).unwrap_or(false);
+                            if !has_enabled {
+                                tracing::warn!(
+                                    "--enable-tun 启动跳过：暂无可用节点，请先导入订阅"
+                                );
+                                return;
+                            }
+                            let old_cfg = st.snapshot_config();
+                            let mut next_cfg = old_cfg.clone();
+                            next_cfg.tun.enabled = true;
+                            if let Err(err) = config::save(&st.paths, &next_cfg) {
+                                tracing::warn!("--enable-tun 保存配置失败：{err}");
+                                return;
+                            }
+                            if let Ok(mut guard) = st.config.write() {
+                                *guard = next_cfg.clone();
+                            }
+                            commands::sync_app_side_effects(&auto_handle, &st, &next_cfg);
+                            if let Err(err) = commands::start_core_internal(&auto_handle, &st).await {
+                                tracing::warn!("--enable-tun 启动核心失败，已回滚 TUN 开关：{err}");
+                                let _ = config::save(&st.paths, &old_cfg);
+                                if let Ok(mut guard) = st.config.write() {
+                                    *guard = old_cfg.clone();
+                                }
+                                commands::sync_app_side_effects(&auto_handle, &st, &old_cfg);
+                            }
+                            return;
+                        }
+
                         let cfg = st.snapshot_config();
                         if !(cfg.system_proxy.enabled || cfg.tun.enabled) {
                             tracing::info!(
@@ -442,12 +483,7 @@ pub fn run_with_paths(paths: AppPaths) {
                             );
                             return;
                         }
-                        let has_nodes = st
-                            .storage
-                            .lock()
-                            .ok()
-                            .and_then(|db| db.list_nodes().ok())
-                            .is_some_and(|n| !n.is_empty());
+                        let has_nodes = commands::has_enabled_nodes(&st).unwrap_or(false);
                         if has_nodes {
                             if let Err(err) = commands::start_core_internal(&auto_handle, &st).await {
                                 tracing::info!("auto-start core skipped: {err}");
@@ -462,7 +498,11 @@ pub fn run_with_paths(paths: AppPaths) {
         .build(context)
         .expect("failed to build CatCloud desktop application");
 
+    let exit_app_handle = app.handle().clone();
     let mut cleanup = Some(move || {
+        if let Some(st) = exit_app_handle.try_state::<AppState>() {
+            commands::emergency_cleanup_on_exit(&st);
+        }
         let _ = exit_job_ref.terminate_all();
         if let Ok(mut guard_lock) = exit_guard_ref.lock() {
             if let Some(mut si) = guard_lock.take() {
@@ -473,6 +513,78 @@ pub fn run_with_paths(paths: AppPaths) {
 
     app.run(move |app_handle, event| {
         lifecycle::handle_run_event(app_handle, event, &mut cleanup);
+    });
+}
+
+fn spawn_proxy_guard(app: &tauri::AppHandle) {
+    let app_h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let interval_sec = {
+                let Some(st) = app_h.try_state::<AppState>() else {
+                    break;
+                };
+                if st.shutting_down.load(Ordering::SeqCst) {
+                    break;
+                }
+                st.snapshot_config()
+                    .system_proxy
+                    .proxy_guard
+                    .interval_sec
+                    .clamp(5, 120)
+            };
+
+            tokio::time::sleep(Duration::from_secs(interval_sec)).await;
+
+            let Some(st) = app_h.try_state::<AppState>() else {
+                break;
+            };
+            if st.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+            let cfg = st.snapshot_config();
+            if !(cfg.system_proxy.enabled && cfg.system_proxy.proxy_guard.enabled) {
+                continue;
+            }
+            if !st.adapter.has_live_controller().await {
+                continue;
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                let app_blocking = app_h.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let Some(st) = app_blocking.try_state::<AppState>() else {
+                        return;
+                    };
+                    let _proxy_guard = st
+                        .system_proxy_lock
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if st.shutting_down.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let latest_cfg = st.snapshot_config();
+                    if !(latest_cfg.system_proxy.enabled
+                        && latest_cfg.system_proxy.proxy_guard.enabled)
+                    {
+                        return;
+                    }
+                    let rt = st.snapshot_runtime();
+                    let port = if rt.running {
+                        rt.mixed_port
+                    } else {
+                        latest_cfg.mixed_port
+                    };
+                    let expected = latest_cfg.system_proxy.to_platform_spec("127.0.0.1", port);
+                    let plat = catcloud_core::platform::windows::WindowsPlatform::new();
+                    if let Err(err) = plat.proxy_guard_tick(&expected) {
+                        tracing::debug!("proxy_guard_tick failed: {err}");
+                    }
+                })
+                .await;
+            }
+        }
     });
 }
 

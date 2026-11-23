@@ -16,8 +16,23 @@ use uuid::Uuid;
 /// Hardcoded loopback bind host for isolated probe cores (never expose `0.0.0.0` or `::`).
 pub const ISOLATED_BIND_HOST: &str = "127.0.0.1";
 
-/// Default physical-NIC DNS resolvers used to prevent active TUN Fake-IP (`198.18.x.x`) pollution.
-pub const DEFAULT_PROBE_NAMESERVERS: &[&str] = &["223.5.5.5", "119.29.29.29"];
+/// Dedicated process filename used by isolated probe cores so the primary Mihomo core can
+/// unconditionally bypass probe traffic via `PROCESS-NAME` without TUN hijacking/nesting.
+pub const PROBE_CORE_PROCESS_NAME: &str = if cfg!(windows) {
+    "catcloud-probe-core.exe"
+} else {
+    "catcloud-probe-core"
+};
+
+/// Plain-IP bootstrap resolvers for `dns.default-nameserver` inside isolated probe configs.
+pub const DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS: &[&str] = &["223.5.5.5", "119.29.29.29"];
+
+/// Default pure-IP DoH resolvers used for `proxy-server-nameserver` / `nameserver` so isolated
+/// probe DNS completely avoids primary-core TUN `dns-hijack: any:53` interception.
+pub const DEFAULT_PROBE_NAMESERVERS: &[&str] = &[
+    "https://223.5.5.5/dns-query",
+    "https://1.12.12.12/dns-query",
+];
 
 /// Memory limit injected into temporary isolated Mihomo probe instances.
 pub const ISOLATED_CORE_GOMEMLIMIT: &str = "32MiB";
@@ -112,9 +127,22 @@ pub fn allocate_ephemeral_ports(count: usize) -> CatResult<Vec<u16>> {
     Ok(ports)
 }
 
+/// Canonical proxy name for the optional domestic pre-acceleration relay inside isolated probe cores.
+pub const PROBE_RELAY_PROXY_NAME: &str = "catcloud-probe-relay";
+
 /// Resolve deterministic, collision-free proxy names for a slice of bound nodes.
 pub fn resolve_unique_proxy_names(bindings: &[(u16, &ProxyNode)]) -> Vec<String> {
-    let mut used: HashSet<String> = HashSet::with_capacity(bindings.len());
+    resolve_unique_proxy_names_with_reserved(bindings, None)
+}
+
+fn resolve_unique_proxy_names_with_reserved(
+    bindings: &[(u16, &ProxyNode)],
+    reserved_name: Option<&str>,
+) -> Vec<String> {
+    let mut used: HashSet<String> = HashSet::with_capacity(bindings.len() + 1);
+    if let Some(reserved) = reserved_name {
+        used.insert(reserved.to_string());
+    }
     let mut out = Vec::with_capacity(bindings.len());
 
     for (idx, (_, node)) in bindings.iter().enumerate() {
@@ -142,6 +170,74 @@ pub fn resolve_unique_proxy_names(bindings: &[(u16, &ProxyNode)]) -> Vec<String>
     out
 }
 
+/// Prepare a dedicated probe-core executable under `temp_root` named [`PROBE_CORE_PROCESS_NAME`]
+/// so the primary Mihomo core can unconditionally bypass isolated probe traffic via `PROCESS-NAME`
+/// without TUN hijacking or nesting.
+///
+/// Reuses an existing file when its size matches `mihomo_bin`; otherwise prefers a zero-copy
+/// `hard_link` and falls back to an atomic copy.
+pub fn prepare_probe_core_binary(mihomo_bin: &Path, temp_root: &Path) -> CatResult<PathBuf> {
+    if !mihomo_bin.is_file() {
+        return Err(CatError::NotFound(format!(
+            "isolated probe mihomo binary not found: {}",
+            mihomo_bin.display()
+        )));
+    }
+
+    std::fs::create_dir_all(temp_root)?;
+    let src_len = std::fs::metadata(mihomo_bin)?.len();
+    let target = temp_root.join(PROBE_CORE_PROCESS_NAME);
+
+    if let Ok(dst_meta) = std::fs::metadata(&target) {
+        if dst_meta.is_file() && dst_meta.len() == src_len {
+            return Ok(target);
+        }
+        let _ = std::fs::remove_file(&target);
+    }
+
+    if std::fs::hard_link(mihomo_bin, &target).is_ok() {
+        return Ok(target);
+    }
+
+    // Check whether a concurrent probe spawn already created a matching binary.
+    if let Ok(dst_meta) = std::fs::metadata(&target) {
+        if dst_meta.is_file() && dst_meta.len() == src_len {
+            return Ok(target);
+        }
+    }
+
+    let tmp_path = temp_root.join(format!(".catcloud-probe-bin-{}.tmp", Uuid::new_v4()));
+    if let Err(copy_err) = std::fs::copy(mihomo_bin, &tmp_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(CatError::Process(format!(
+            "failed to copy isolated probe core binary `{}` to `{}`: {copy_err}",
+            mihomo_bin.display(),
+            tmp_path.display()
+        )));
+    }
+
+    let _ = std::fs::remove_file(&target);
+    match std::fs::rename(&tmp_path, &target) {
+        Ok(()) => Ok(target),
+        Err(rename_err) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            if let Ok(dst_meta) = std::fs::metadata(&target) {
+                if dst_meta.is_file() && dst_meta.len() == src_len {
+                    return Ok(target);
+                }
+            }
+            std::fs::copy(mihomo_bin, &target).map_err(|copy_err| {
+                CatError::Process(format!(
+                    "failed to prepare isolated probe core binary `{}` from `{}` (rename={rename_err}, copy={copy_err})",
+                    target.display(),
+                    mihomo_bin.display()
+                ))
+            })?;
+            Ok(target)
+        }
+    }
+}
+
 /// Generate a strictly isolated, zero-interference Mihomo probe configuration YAML.
 ///
 /// Enforced invariants:
@@ -155,6 +251,33 @@ pub fn build_isolated_probe_yaml(
     secret: &str,
     bindings: &[(u16, &ProxyNode)],
     proxy_nameservers: &[String],
+) -> CatResult<String> {
+    build_isolated_probe_yaml_with_preaccel(
+        controller_port,
+        secret,
+        bindings,
+        proxy_nameservers,
+        None,
+        true,
+    )
+}
+
+/// Generate a strictly isolated, zero-interference Mihomo probe configuration YAML with optional
+/// domestic `:443` pre-acceleration relay chaining (`dialer-proxy: catcloud-probe-relay`).
+///
+/// When `preaccel_relay` is `Some(relay)`:
+/// - Compiles the relay into `proxies` as `catcloud-probe-relay`.
+/// - Injects `dialer-proxy: catcloud-probe-relay` ONLY on nodes where
+///   `node.should_apply_preaccel(skip_443_native)` is `true`; pure UDP transports and skipped
+///   native-443 nodes keep `dialer-proxy` stripped.
+/// - Prepends `host_to_direct_rule(&relay.server)` at the top of `rules` to prevent routing loops.
+pub fn build_isolated_probe_yaml_with_preaccel(
+    controller_port: u16,
+    secret: &str,
+    bindings: &[(u16, &ProxyNode)],
+    proxy_nameservers: &[String],
+    preaccel_relay: Option<&PreAccelRelay>,
+    skip_443_native: bool,
 ) -> CatResult<String> {
     if controller_port == 0 {
         return Err(CatError::Validation(
@@ -170,6 +293,13 @@ pub fn build_isolated_probe_yaml(
         return Err(CatError::Validation(
             "isolated probe configuration requires at least one node binding".into(),
         ));
+    }
+    if let Some(relay) = preaccel_relay {
+        if relay.server.trim().is_empty() || relay.port == 0 {
+            return Err(CatError::Validation(
+                "domestic pre-acceleration relay must specify a valid server and port".into(),
+            ));
+        }
     }
 
     let mut used_ports: HashSet<u16> = HashSet::with_capacity(bindings.len() + 1);
@@ -204,8 +334,15 @@ pub fn build_isolated_probe_yaml(
         }
     };
     let ns_yaml: Vec<YamlValue> = resolved_ns.iter().cloned().map(YamlValue::from).collect();
+    let bootstrap_ns_yaml: Vec<YamlValue> = DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS
+        .iter()
+        .map(|s| YamlValue::from(*s))
+        .collect();
 
-    let proxy_names = resolve_unique_proxy_names(bindings);
+    let proxy_names = resolve_unique_proxy_names_with_reserved(
+        bindings,
+        preaccel_relay.map(|_| PROBE_RELAY_PROXY_NAME),
+    );
 
     let mut root = Mapping::new();
     root.insert(YamlValue::from("mixed-port"), YamlValue::from(0u16));
@@ -235,7 +372,7 @@ pub fn build_isolated_probe_yaml(
     tun.insert(YamlValue::from("enable"), YamlValue::from(false));
     root.insert(YamlValue::from("tun"), YamlValue::Mapping(tun));
 
-    // Explicit redir-host DNS to defeat active TUN Fake-IP pollution
+    // Explicit redir-host DNS with pure-IP DoH to defeat active TUN Fake-IP & dns-hijack: any:53
     let mut dns = Mapping::new();
     dns.insert(YamlValue::from("enable"), YamlValue::from(true));
     dns.insert(YamlValue::from("ipv6"), YamlValue::from(false));
@@ -245,7 +382,7 @@ pub fn build_isolated_probe_yaml(
     );
     dns.insert(
         YamlValue::from("default-nameserver"),
-        YamlValue::Sequence(ns_yaml.clone()),
+        YamlValue::Sequence(bootstrap_ns_yaml),
     );
     dns.insert(
         YamlValue::from("proxy-server-nameserver"),
@@ -258,8 +395,14 @@ pub fn build_isolated_probe_yaml(
     root.insert(YamlValue::from("dns"), YamlValue::Mapping(dns));
 
     // proxies & listeners
-    let mut proxies_seq: Vec<YamlValue> = Vec::with_capacity(bindings.len());
+    let mut proxies_seq: Vec<YamlValue> =
+        Vec::with_capacity(bindings.len() + usize::from(preaccel_relay.is_some()));
     let mut listeners_seq: Vec<YamlValue> = Vec::with_capacity(bindings.len());
+
+    if let Some(relay) = preaccel_relay {
+        let relay_yaml = compile_relay_to_mihomo_yaml(relay, PROBE_RELAY_PROXY_NAME)?;
+        proxies_seq.push(relay_yaml);
+    }
 
     for (idx, ((listen_port, node), proxy_name)) in
         bindings.iter().zip(proxy_names.iter()).enumerate()
@@ -269,9 +412,16 @@ pub fn build_isolated_probe_yaml(
             _ => Mapping::new(),
         };
 
-        // Strip `dialer-proxy` so isolated probe instances never fail referencing groups absent
-        // from the minimal ephemeral probe configuration.
+        // Always strip stale `dialer-proxy` first so isolated probe instances never reference
+        // groups absent from the minimal ephemeral probe configuration.
         proxy_map.remove("dialer-proxy");
+
+        if preaccel_relay.is_some() && node.should_apply_preaccel(skip_443_native) {
+            proxy_map.insert(
+                YamlValue::from("dialer-proxy"),
+                YamlValue::from(PROBE_RELAY_PROXY_NAME),
+            );
+        }
 
         proxy_map.insert(
             YamlValue::from("name"),
@@ -318,10 +468,15 @@ pub fn build_isolated_probe_yaml(
         YamlValue::from("listeners"),
         YamlValue::Sequence(listeners_seq),
     );
-    root.insert(
-        YamlValue::from("rules"),
-        YamlValue::Sequence(vec![YamlValue::from("MATCH,DIRECT")]),
-    );
+
+    let mut rules_seq: Vec<YamlValue> = Vec::new();
+    if let Some(relay) = preaccel_relay {
+        if let Some(anti_loop) = host_to_direct_rule(&relay.server) {
+            rules_seq.push(YamlValue::from(anti_loop));
+        }
+    }
+    rules_seq.push(YamlValue::from("MATCH,DIRECT"));
+    root.insert(YamlValue::from("rules"), YamlValue::Sequence(rules_seq));
 
     let yaml = serde_yaml_ng::to_string(&YamlValue::Mapping(root))?;
     Ok(yaml)
@@ -388,6 +543,10 @@ pub fn generate_preaccel_comparison_yaml(
         }
     };
     let ns_yaml: Vec<YamlValue> = resolved_ns.iter().cloned().map(YamlValue::from).collect();
+    let bootstrap_ns_yaml: Vec<YamlValue> = DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS
+        .iter()
+        .map(|s| YamlValue::from(*s))
+        .collect();
 
     let mut root = Mapping::new();
     root.insert(YamlValue::from("mixed-port"), YamlValue::from(0u16));
@@ -424,7 +583,7 @@ pub fn generate_preaccel_comparison_yaml(
     );
     dns.insert(
         YamlValue::from("default-nameserver"),
-        YamlValue::Sequence(ns_yaml.clone()),
+        YamlValue::Sequence(bootstrap_ns_yaml),
     );
     dns.insert(
         YamlValue::from("proxy-server-nameserver"),
@@ -681,13 +840,28 @@ impl IsolatedProbeCore {
         job_guard: &JobGuard,
         nodes: &[ProxyNode],
     ) -> CatResult<Self> {
-        Self::spawn_with_options(
+        Self::spawn_with_preaccel(mihomo_bin, temp_dir, job_guard, nodes, None, true).await
+    }
+
+    /// Spawn an isolated temporary Mihomo probe core optionally chained through a domestic `:443`
+    /// pre-acceleration relay for eligible TCP nodes.
+    pub async fn spawn_with_preaccel(
+        mihomo_bin: &Path,
+        temp_root: &Path,
+        job_guard: &JobGuard,
+        nodes: &[ProxyNode],
+        preaccel_relay: Option<&PreAccelRelay>,
+        skip_443_native: bool,
+    ) -> CatResult<Self> {
+        Self::spawn_with_options_and_preaccel(
             mihomo_bin,
-            temp_dir,
+            temp_root,
             job_guard,
             nodes,
             &[],
             DEFAULT_READY_TIMEOUT,
+            preaccel_relay,
+            skip_443_native,
         )
         .await
     }
@@ -701,6 +875,32 @@ impl IsolatedProbeCore {
         nodes: &[ProxyNode],
         proxy_nameservers: &[String],
         ready_timeout: Duration,
+    ) -> CatResult<Self> {
+        Self::spawn_with_options_and_preaccel(
+            mihomo_bin,
+            temp_dir,
+            job_guard,
+            nodes,
+            proxy_nameservers,
+            ready_timeout,
+            None,
+            true,
+        )
+        .await
+    }
+
+    /// Full-control isolated probe core spawn supporting custom DNS, readiness timeout, and
+    /// optional domestic `:443` pre-acceleration relay chaining.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_options_and_preaccel(
+        mihomo_bin: &Path,
+        temp_dir: &Path,
+        job_guard: &JobGuard,
+        nodes: &[ProxyNode],
+        proxy_nameservers: &[String],
+        ready_timeout: Duration,
+        preaccel_relay: Option<&PreAccelRelay>,
+        skip_443_native: bool,
     ) -> CatResult<Self> {
         if !mihomo_bin.is_file() {
             return Err(CatError::NotFound(format!(
@@ -724,12 +924,17 @@ impl IsolatedProbeCore {
             .copied()
             .zip(nodes.iter())
             .collect();
-        let proxy_names = resolve_unique_proxy_names(&pair_refs);
-        let yaml = build_isolated_probe_yaml(
+        let proxy_names = resolve_unique_proxy_names_with_reserved(
+            &pair_refs,
+            preaccel_relay.map(|_| PROBE_RELAY_PROXY_NAME),
+        );
+        let yaml = build_isolated_probe_yaml_with_preaccel(
             controller_port,
             &secret,
             &pair_refs,
             proxy_nameservers,
+            preaccel_relay,
+            skip_443_native,
         )?;
 
         let work_dir = temp_dir.join(format!("catcloud-probe-{}", Uuid::new_v4()));
@@ -751,7 +956,8 @@ impl IsolatedProbeCore {
             Err(_) => Stdio::null(),
         };
 
-        let norm_bin = crate::paths::normalize_os_path(mihomo_bin);
+        let probe_bin = prepare_probe_core_binary(mihomo_bin, temp_dir)?;
+        let norm_bin = crate::paths::normalize_os_path(&probe_bin);
         let norm_work = crate::paths::normalize_os_path(&work_dir);
         let norm_cfg = crate::paths::normalize_os_path(&config_path);
 
@@ -771,7 +977,7 @@ impl IsolatedProbeCore {
         let child = cmd.spawn().map_err(|err| {
             CatError::Process(format!(
                 "failed to spawn isolated probe core `{}`: {err}",
-                mihomo_bin.display()
+                probe_bin.display()
             ))
         })?;
         cleanup_guard.child = Some(child);
@@ -896,7 +1102,8 @@ impl IsolatedProbeCore {
             Err(_) => Stdio::null(),
         };
 
-        let norm_bin = crate::paths::normalize_os_path(mihomo_bin);
+        let probe_bin = prepare_probe_core_binary(mihomo_bin, temp_dir)?;
+        let norm_bin = crate::paths::normalize_os_path(&probe_bin);
         let norm_work = crate::paths::normalize_os_path(&work_dir);
         let norm_cfg = crate::paths::normalize_os_path(&config_path);
 
@@ -916,7 +1123,7 @@ impl IsolatedProbeCore {
         let child = cmd.spawn().map_err(|err| {
             CatError::Process(format!(
                 "failed to spawn isolated comparison core `{}`: {err}",
-                mihomo_bin.display()
+                probe_bin.display()
             ))
         })?;
         cleanup_guard.child = Some(child);
@@ -1227,19 +1434,25 @@ mod tests {
             Some(format!("127.0.0.1:{}", ports[0]).as_str())
         );
 
-        // DNS must explicitly use redir-host and physical-NIC nameservers to defeat Fake-IP
+        // DNS must explicitly use redir-host with pure-IP bootstrap & pure-IP DoH to defeat
+        // active TUN Fake-IP and `dns-hijack: any:53` interception
         assert_eq!(parsed["dns"]["enable"].as_bool(), Some(true));
         assert_eq!(parsed["dns"]["enhanced-mode"].as_str(), Some("redir-host"));
+        let dns_bootstrap = parsed["dns"]["default-nameserver"]
+            .as_sequence()
+            .expect("default-nameserver sequence");
+        assert_eq!(dns_bootstrap[0].as_str(), Some("223.5.5.5"));
+        assert_eq!(dns_bootstrap[1].as_str(), Some("119.29.29.29"));
         let psn = parsed["dns"]["proxy-server-nameserver"]
             .as_sequence()
             .expect("proxy-server-nameserver sequence");
-        assert_eq!(psn[0].as_str(), Some("223.5.5.5"));
-        assert_eq!(psn[1].as_str(), Some("119.29.29.29"));
+        assert_eq!(psn[0].as_str(), Some("https://223.5.5.5/dns-query"));
+        assert_eq!(psn[1].as_str(), Some("https://1.12.12.12/dns-query"));
         let ns = parsed["dns"]["nameserver"]
             .as_sequence()
             .expect("nameserver sequence");
-        assert_eq!(ns[0].as_str(), Some("223.5.5.5"));
-        assert_eq!(ns[1].as_str(), Some("119.29.29.29"));
+        assert_eq!(ns[0].as_str(), Some("https://223.5.5.5/dns-query"));
+        assert_eq!(ns[1].as_str(), Some("https://1.12.12.12/dns-query"));
 
         // Every listener must bind 127.0.0.1 with type: mixed and match unique proxy names
         let listeners = parsed["listeners"].as_sequence().expect("listeners");
@@ -1350,6 +1563,21 @@ mod tests {
         assert_eq!(parsed["geodata-mode"].as_bool(), Some(false));
         assert_eq!(parsed["tun"]["enable"].as_bool(), Some(false));
         assert_eq!(parsed["dns"]["enhanced-mode"].as_str(), Some("redir-host"));
+        let cmp_bootstrap = parsed["dns"]["default-nameserver"]
+            .as_sequence()
+            .expect("comparison default-nameserver");
+        assert_eq!(cmp_bootstrap[0].as_str(), Some("223.5.5.5"));
+        assert_eq!(cmp_bootstrap[1].as_str(), Some("119.29.29.29"));
+        let cmp_psn = parsed["dns"]["proxy-server-nameserver"]
+            .as_sequence()
+            .expect("comparison proxy-server-nameserver");
+        assert_eq!(cmp_psn[0].as_str(), Some("https://223.5.5.5/dns-query"));
+        assert_eq!(cmp_psn[1].as_str(), Some("https://1.12.12.12/dns-query"));
+        let cmp_ns = parsed["dns"]["nameserver"]
+            .as_sequence()
+            .expect("comparison nameserver");
+        assert_eq!(cmp_ns[0].as_str(), Some("https://223.5.5.5/dns-query"));
+        assert_eq!(cmp_ns[1].as_str(), Some("https://1.12.12.12/dns-query"));
 
         let proxies = parsed["proxies"].as_sequence().expect("proxies");
         assert_eq!(proxies.len(), 3);
@@ -1376,5 +1604,170 @@ mod tests {
             rules[0].as_str(),
             Some("IP-CIDR,203.0.113.10/32,DIRECT,no-resolve")
         );
+    }
+
+    #[test]
+    fn isolated_probe_yaml_with_preaccel_wires_tcp_nodes_skips_udp_and_adds_antiloop() {
+        let relay = PreAccelRelay {
+            id: "relay-probe-1".to_string(),
+            name: "CN-Probe-Relay".to_string(),
+            provider: "tencent".to_string(),
+            region: "CN-GZ".to_string(),
+            server: "198.51.100.42".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "relay-probe-password".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+        };
+
+        // 1. Eligible non-443 TCP node -> MUST receive dialer-proxy: catcloud-probe-relay
+        let mut tcp_non443 = sample_node("n-tcp-8443", "JP-TCP-8443");
+        tcp_non443.port = 8443;
+        tcp_non443.is_443_native = false;
+        tcp_non443.preaccel_eligible = true;
+        tcp_non443.raw_config["port"] = serde_json::json!(8443);
+        tcp_non443.raw_config["dialer-proxy"] = serde_json::json!("stale-old-group");
+
+        // 2. Pure UDP node (hysteria2) -> MUST skip preaccel and keep dialer-proxy stripped
+        let mut udp_hy2 = sample_node("n-udp-hy2", "JP-HY2-8443");
+        udp_hy2.protocol = "hysteria2".to_string();
+        udp_hy2.port = 8443;
+        udp_hy2.is_443_native = false;
+        udp_hy2.preaccel_eligible = true;
+        udp_hy2.raw_config = serde_json::json!({
+            "name": "JP-HY2-8443",
+            "type": "hysteria2",
+            "server": "n-udp-hy2.example.invalid",
+            "port": 8443,
+            "password": "hy2-password",
+            "dialer-proxy": "stale-udp-group"
+        });
+
+        // 3. Native 443 TCP node -> skipped when skip_443_native=true, accelerated when false
+        let mut tcp_443 = sample_node("n-tcp-443", "SG-TCP-443");
+        tcp_443.port = 443;
+        tcp_443.is_443_native = true;
+        tcp_443.preaccel_eligible = true;
+
+        let ports = allocate_ephemeral_ports(4).unwrap();
+        let bindings = vec![
+            (ports[1], &tcp_non443),
+            (ports[2], &udp_hy2),
+            (ports[3], &tcp_443),
+        ];
+
+        // Case A: skip_443_native = true
+        let yaml_skip443 = build_isolated_probe_yaml_with_preaccel(
+            ports[0],
+            "probe-secret-0123456789",
+            &bindings,
+            &[],
+            Some(&relay),
+            true,
+        )
+        .expect("build isolated preaccel yaml (skip_443_native=true)");
+
+        let parsed: YamlValue = serde_yaml_ng::from_str(&yaml_skip443).expect("valid yaml");
+        let proxies = parsed["proxies"].as_sequence().expect("proxies");
+        assert_eq!(proxies.len(), 4); // relay + 3 nodes
+        assert_eq!(proxies[0]["name"].as_str(), Some(PROBE_RELAY_PROXY_NAME));
+
+        // tcp_non443 -> wired to catcloud-probe-relay
+        assert_eq!(proxies[1]["name"].as_str(), Some("JP-TCP-8443"));
+        assert_eq!(
+            proxies[1]["dialer-proxy"].as_str(),
+            Some(PROBE_RELAY_PROXY_NAME)
+        );
+        // udp_hy2 -> pure UDP skipped, stale dialer-proxy stripped
+        assert_eq!(proxies[2]["name"].as_str(), Some("JP-HY2-8443"));
+        assert!(proxies[2].get("dialer-proxy").is_none());
+        // tcp_443 -> skipped because skip_443_native=true
+        assert_eq!(proxies[3]["name"].as_str(), Some("SG-TCP-443"));
+        assert!(proxies[3].get("dialer-proxy").is_none());
+
+        // Listeners still map strictly to the 3 node proxies (never the relay itself)
+        let listeners = parsed["listeners"].as_sequence().expect("listeners");
+        assert_eq!(listeners.len(), 3);
+        assert_eq!(listeners[0]["proxy"].as_str(), Some("JP-TCP-8443"));
+        assert_eq!(listeners[1]["proxy"].as_str(), Some("JP-HY2-8443"));
+        assert_eq!(listeners[2]["proxy"].as_str(), Some("SG-TCP-443"));
+
+        // Rules must prepend anti-loop DIRECT rule for relay server, followed by MATCH,DIRECT
+        let rules = parsed["rules"].as_sequence().expect("rules");
+        assert_eq!(rules.len(), 2);
+        assert_eq!(
+            rules[0].as_str(),
+            Some("IP-CIDR,198.51.100.42/32,DIRECT,no-resolve")
+        );
+        assert_eq!(rules[1].as_str(), Some("MATCH,DIRECT"));
+
+        // Case B: skip_443_native = false -> native 443 TCP gets dialer-proxy, UDP still skipped
+        let yaml_all_tcp = build_isolated_probe_yaml_with_preaccel(
+            ports[0],
+            "probe-secret-0123456789",
+            &bindings,
+            &[],
+            Some(&relay),
+            false,
+        )
+        .expect("build isolated preaccel yaml (skip_443_native=false)");
+
+        let parsed_b: YamlValue = serde_yaml_ng::from_str(&yaml_all_tcp).expect("valid yaml");
+        let proxies_b = parsed_b["proxies"].as_sequence().expect("proxies");
+        assert_eq!(
+            proxies_b[1]["dialer-proxy"].as_str(),
+            Some(PROBE_RELAY_PROXY_NAME)
+        );
+        assert!(
+            proxies_b[2].get("dialer-proxy").is_none(),
+            "pure UDP node must still skip preaccel when skip_443_native=false"
+        );
+        assert_eq!(
+            proxies_b[3]["dialer-proxy"].as_str(),
+            Some(PROBE_RELAY_PROXY_NAME)
+        );
+    }
+
+    #[test]
+    fn prepare_probe_core_binary_links_reuses_and_refreshes_on_size_change() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-probe-bin-test-{}",
+            Uuid::new_v4()
+        ));
+        let src_dir = root.join("src");
+        let tmp_dir = root.join("tmp");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let missing = src_dir.join("missing-mihomo.exe");
+        assert!(prepare_probe_core_binary(&missing, &tmp_dir).is_err());
+
+        let src_bin = src_dir.join("mihomo.exe");
+        std::fs::write(&src_bin, b"mihomo-v1-bytes").unwrap();
+
+        let prepared = prepare_probe_core_binary(&src_bin, &tmp_dir).expect("prepare probe bin");
+        assert_eq!(prepared, tmp_dir.join(PROBE_CORE_PROCESS_NAME));
+        assert_eq!(std::fs::read(&prepared).unwrap(), b"mihomo-v1-bytes");
+
+        // Second call with identical size reuses existing binary without error.
+        let reused = prepare_probe_core_binary(&src_bin, &tmp_dir).expect("reuse probe bin");
+        assert_eq!(reused, prepared);
+
+        // When source binary is atomically replaced with a different-sized upgrade, probe binary refreshes.
+        std::fs::remove_file(&src_bin).unwrap();
+        std::fs::write(&src_bin, b"mihomo-v2-upgraded-payload-bytes").unwrap();
+        let refreshed = prepare_probe_core_binary(&src_bin, &tmp_dir).expect("refresh probe bin");
+        assert_eq!(refreshed, prepared);
+        assert_eq!(
+            std::fs::read(&refreshed).unwrap(),
+            b"mihomo-v2-upgraded-payload-bytes"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

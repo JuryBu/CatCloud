@@ -139,6 +139,8 @@ pub enum TrayClickAction {
     #[default]
     ToggleMain,
     ToggleCapsule,
+    ToggleSystemProxy,
+    SwitchNextBest,
     ShowMenu,
 }
 
@@ -239,6 +241,8 @@ pub struct TrayMenuState {
     pub windowless_mode: bool,
     pub capsule_open: bool,
     pub autostart_enabled: bool,
+    #[serde(default)]
+    pub active_single_node_label: Option<String>,
     pub primary_group: Option<TrayGroupSummary>,
     pub extra_groups: Vec<TrayGroupSummary>,
     pub preaccel: TrayPreAccelSummary,
@@ -254,6 +258,7 @@ impl Default for TrayMenuState {
             windowless_mode: false,
             capsule_open: false,
             autostart_enabled: false,
+            active_single_node_label: None,
             primary_group: None,
             extra_groups: Vec::new(),
             preaccel: TrayPreAccelSummary::default(),
@@ -668,8 +673,48 @@ pub fn build_tray_menu<R: Runtime>(
         None::<&str>,
     )?;
 
-    // Multi-group quick-switch submenu (with ⚡ next-best + ↑ Mbps telemetry)
-    let group_submenu = if let Some(ref primary) = state.primary_group {
+    // Multi-group / single-node quick-switch submenu (with ⚡ next-best + ↑ Mbps telemetry)
+    let active_single = state
+        .active_single_node_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let group_submenu = if let Some(single_label) = active_single {
+        let title = format!("路线快切 (单节点 · {single_label})");
+        let sub = Submenu::new(app, &title, true)?;
+        let current_item =
+            MenuItem::new(app, format!("当前: 单节点 · {single_label}"), false, None::<&str>)?;
+        let next_single = MenuItem::with_id(
+            app,
+            format!("{}default", menu_id::QUICK_SWITCH_NEXT_BEST_PREFIX),
+            "⚡ 单节点秒切下一优",
+            true,
+            None::<&str>,
+        )?;
+        sub.append(&current_item)?;
+        sub.append(&next_single)?;
+        if let Some(ref primary) = state.primary_group {
+            sub.append(&PredefinedMenuItem::separator(app)?)?;
+            let primary_title = if primary.active_node_label.trim().is_empty() {
+                format!("切回分组: {}", primary.group_name)
+            } else {
+                format!("切回分组: {} ({})", primary.group_name, primary.active_node_label)
+            };
+            let nested_primary = build_group_submenu(app, &primary_title, primary)?;
+            sub.append(&nested_primary)?;
+            for extra in &state.extra_groups {
+                let extra_title = if extra.active_node_label.trim().is_empty() {
+                    extra.group_name.clone()
+                } else {
+                    format!("{}: {}", extra.group_name, extra.active_node_label)
+                };
+                let nested = build_group_submenu(app, &extra_title, extra)?;
+                sub.append(&nested)?;
+            }
+        }
+        sub
+    } else if let Some(ref primary) = state.primary_group {
         let title = if primary.active_node_label.trim().is_empty() {
             format!("路线分组快切 ({})", primary.group_name)
         } else {
@@ -955,6 +1000,7 @@ where
 
     let show_menu_on_left = matches!(click_action, TrayClickAction::ShowMenu);
     let action_handler = Arc::new(on_action);
+    let action_handler_click = Arc::clone(&action_handler);
 
     let _tray = TrayIconBuilder::<R>::with_id(MAIN_TRAY_ID)
         .icon(initial_icon)
@@ -966,7 +1012,7 @@ where
                 action_handler(app_handle, action);
             }
         })
-        .on_tray_icon_event(|tray, event| {
+        .on_tray_icon_event(move |tray, event| {
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
@@ -989,6 +1035,17 @@ where
                     }
                     TrayClickAction::ToggleCapsule => {
                         crate::lifecycle::toggle_capsule_window(app_handle);
+                    }
+                    TrayClickAction::ToggleSystemProxy => {
+                        action_handler_click(app_handle, TrayAction::ToggleSystemProxy);
+                    }
+                    TrayClickAction::SwitchNextBest => {
+                        action_handler_click(
+                            app_handle,
+                            TrayAction::QuickSwitchNextBest {
+                                group_id: String::new(),
+                            },
+                        );
                     }
                     TrayClickAction::ShowMenu => {}
                 }
@@ -1242,5 +1299,27 @@ mod tests {
             selected: true,
         };
         assert_eq!(format_candidate_label(&cand), "节点 01  (↑2.68 Mbps)");
+    }
+
+    #[test]
+    fn single_node_mode_reflected_in_tooltip_and_menu_diff() {
+        let info = TrayTooltipInfo {
+            primary_group_summary: Some("单节点 · 🇯🇵 Tokyo 01".into()),
+            ..Default::default()
+        };
+        let formatted = info.format_tooltip();
+        assert!(formatted.contains("主力: 单节点 · 🇯🇵 Tokyo 01"));
+        assert!(formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
+
+        let initial = TrayMenuState::default();
+        let runtime = TrayRuntimeState::new(
+            initial.clone(),
+            (TrayIconPack::A, TrayHealthState::Ok),
+            formatted,
+            TrayClickAction::ToggleMain,
+        );
+        let mut single_menu = initial;
+        single_menu.active_single_node_label = Some("🇯🇵 Tokyo 01".into());
+        assert!(runtime.should_rebuild_menu(&single_menu));
     }
 }

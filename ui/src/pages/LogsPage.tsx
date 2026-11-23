@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { catcloudApi, isTauriEnv } from "../api/tauri";
-import { appActions } from "../store/appStore";
+import { appActions, useAppSelector } from "../store/appStore";
 
 export type LogLevel = "debug" | "info" | "warning" | "error";
 
@@ -76,6 +76,90 @@ function normalizeLogLevel(raw?: string): LogLevel {
   }
   if (lower === "warn") return "warning";
   return "info";
+}
+
+interface RawLogPayload {
+  time: string;
+  level: LogLevel;
+  module: string;
+  message: string;
+}
+
+const RAW_CORE_MODULE_RE = /^(mihomo|clash|meta|core|kernel|engine|unknown)$/i;
+
+function classifyLogModule(message: string, rawModule?: string): string {
+  const cleanedModule = rawModule?.trim() ?? "";
+  if (cleanedModule && !RAW_CORE_MODULE_RE.test(cleanedModule)) {
+    return cleanedModule;
+  }
+  const text = message.trim();
+  if (/(\btun\b|wintun|gvisor|utun|sing-tun|虚拟网卡|网卡)/i.test(text)) {
+    return "虚拟网卡";
+  }
+  if (/(\bdns\b|fake-?ip|nameserver|resolver|\bdoh\b|\bdot\b|lookup|hosts|域名解析|域名)/i.test(text)) {
+    return "域名解析";
+  }
+  if (/(url-?test|health\s*check|delay|latency|probe|connectivity|keepalive|\bping\b|timeout|测速|连通|检测|心跳|延迟)/i.test(text)) {
+    return "网络检测";
+  }
+  if (/(\[tcp\]|\[udp\]|\bmatch\b|\brule\b|geosite|geoip|using\s|-->|\bdirect\b|\breject\b|dialer|proxy-?group|分流|路由|命中)/i.test(text)) {
+    return "分流";
+  }
+  return "代理核心";
+}
+
+function logEntryKey(item: Pick<RawLogPayload, "time" | "level" | "message">): string {
+  return `${item.time}\u0000${item.level}\u0000${item.message}`;
+}
+
+/**
+ * Deduplicate real-time logs buffered while `getRecentLogs` was in flight against
+ * the tail of the returned history snapshot using `(time, level, message)`.
+ */
+function dedupeEarlyQueueAgainstHistory(
+  history: RawLogPayload[],
+  earlyQueue: RawLogPayload[]
+): RawLogPayload[] {
+  if (history.length === 0 || earlyQueue.length === 0) {
+    return earlyQueue;
+  }
+
+  const historyKeys = history.map(logEntryKey);
+  const earlyKeys = earlyQueue.map(logEntryKey);
+
+  // Case 1: entire earlyQueue is already contained inside the tail window of history
+  const searchStart = Math.max(0, historyKeys.length - earlyKeys.length - 64);
+  const maxStart = historyKeys.length - earlyKeys.length;
+  for (let start = maxStart; start >= searchStart; start--) {
+    let allMatch = true;
+    for (let i = 0; i < earlyKeys.length; i++) {
+      if (historyKeys[start + i] !== earlyKeys[i]) {
+        allMatch = false;
+        break;
+      }
+    }
+    if (allMatch) {
+      return [];
+    }
+  }
+
+  // Case 2: longest suffix of history matching prefix of earlyQueue
+  const maxOverlap = Math.min(historyKeys.length, earlyKeys.length);
+  for (let k = maxOverlap; k >= 1; k--) {
+    let matched = true;
+    const offset = historyKeys.length - k;
+    for (let i = 0; i < k; i++) {
+      if (historyKeys[offset + i] !== earlyKeys[i]) {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) {
+      return earlyQueue.slice(k);
+    }
+  }
+
+  return earlyQueue;
 }
 
 function formatLogTimestamp(ts?: string): string {
@@ -201,6 +285,7 @@ const STREAM_SAMPLES: Array<{ level: LogLevel; module: string; message: string }
 
 export function LogsPage() {
   const inTauri = isTauriEnv();
+  const runtime = useAppSelector((s) => s.runtime);
   const [logState, setLogState] = useState<LogBufferState>(() => ({
     entries: inTauri ? [] : buildSeedLogs(),
     truncatedCount: 0,
@@ -261,18 +346,21 @@ export function LogsPage() {
     let unlisten: (() => void) | null = null;
     let mockTimer: number | null = null;
 
-    const pushIncoming = (level: LogLevel, module: string, message: string, time?: string) => {
-      nextIdRef.current += 1;
-      const item: CoreLogEntry = {
-        id: nextIdRef.current,
-        time: time ?? formatNowClock(),
-        level,
-        module,
-        message,
-      };
+    const enqueueEntries = (rawItems: RawLogPayload[]) => {
+      if (rawItems.length === 0) return;
+      const items: CoreLogEntry[] = rawItems.map((raw) => {
+        nextIdRef.current += 1;
+        return {
+          id: nextIdRef.current,
+          time: raw.time,
+          level: raw.level,
+          module: raw.module,
+          message: raw.message,
+        };
+      });
 
       if (pausedRef.current) {
-        pendingBufferRef.current.push(item);
+        pendingBufferRef.current.push(...items);
         if (pendingBufferRef.current.length > MAX_LOG_LINES) {
           pendingBufferRef.current = pendingBufferRef.current.slice(-MAX_LOG_LINES);
         }
@@ -280,7 +368,18 @@ export function LogsPage() {
         return;
       }
 
-      appendBatch([item]);
+      appendBatch(items);
+    };
+
+    const pushIncoming = (level: LogLevel, module: string, message: string, time?: string) => {
+      enqueueEntries([
+        {
+          time: time ?? formatNowClock(),
+          level,
+          module,
+          message,
+        },
+      ]);
     };
 
     const startMockStream = () => {
@@ -294,52 +393,74 @@ export function LogsPage() {
     };
 
     if (inTauri) {
-      // Load recent buffered backend logs first
-      void catcloudApi
-        .getRecentLogs(500)
-        .then((lines) => {
-          if (disposed || lines.length === 0) return;
-          const batch: CoreLogEntry[] = lines.map((line) => {
-            nextIdRef.current += 1;
-            return {
-              id: nextIdRef.current,
-              time: formatLogTimestamp(line.timestamp),
-              level: normalizeLogLevel(line.level),
-              module: "mihomo",
-              message: line.payload ?? "",
-            };
-          });
-          appendBatch(batch);
-        })
-        .catch(() => {
-          /* core may not have emitted logs yet */
-        });
+      let historyLoaded = false;
+      let earlyQueue: RawLogPayload[] = [];
 
-      void import("@tauri-apps/api/event")
-        .then(({ listen }) =>
-          listen<{ level?: string; module?: string; payload?: string; message?: string; time?: string; timestamp?: string }>(
-            "catcloud://core-log",
-            (ev) => {
-              if (disposed) return;
-              pushIncoming(
-                normalizeLogLevel(ev.payload.level),
-                ev.payload.module ?? "mihomo",
-                ev.payload.message ?? ev.payload.payload ?? "",
-                ev.payload.time ?? formatLogTimestamp(ev.payload.timestamp)
-              );
+      const bootRealLogStream = async () => {
+        // 1. Register real-time listener FIRST so no lines are missed while fetching history.
+        try {
+          const { listen } = await import("@tauri-apps/api/event");
+          const fn = await listen<{
+            level?: string;
+            module?: string;
+            payload?: string;
+            message?: string;
+            time?: string;
+            timestamp?: string;
+          }>("catcloud://core-log", (ev) => {
+            if (disposed) return;
+            const message = ev.payload.message ?? ev.payload.payload ?? "";
+            const item: RawLogPayload = {
+              time: ev.payload.time ?? formatLogTimestamp(ev.payload.timestamp),
+              level: normalizeLogLevel(ev.payload.level),
+              module: classifyLogModule(message, ev.payload.module),
+              message,
+            };
+            if (!historyLoaded) {
+              earlyQueue.push(item);
+              if (earlyQueue.length > MAX_LOG_LINES) {
+                earlyQueue = earlyQueue.slice(-MAX_LOG_LINES);
+              }
+              return;
             }
-          )
-        )
-        .then((fn) => {
+            enqueueEntries([item]);
+          });
+
           if (disposed) {
             fn();
-          } else {
-            unlisten = fn;
+            return;
           }
-        })
-        .catch(() => {
+          unlisten = fn;
+        } catch {
           /* never inject mock stream in Tauri runtime */
-        });
+        }
+
+        // 2. Fetch recent history snapshot and merge with deduplicated earlyQueue.
+        let historyBatch: RawLogPayload[] = [];
+        try {
+          const lines = await catcloudApi.getRecentLogs(500);
+          if (disposed) return;
+          historyBatch = lines.map((line) => {
+            const message = line.payload ?? "";
+            return {
+              time: formatLogTimestamp(line.timestamp),
+              level: normalizeLogLevel(line.level),
+              module: classifyLogModule(message),
+              message,
+            };
+          });
+        } catch {
+          /* core may not have emitted logs yet */
+        }
+
+        if (disposed) return;
+        const dedupedEarly = dedupeEarlyQueueAgainstHistory(historyBatch, earlyQueue);
+        earlyQueue = [];
+        historyLoaded = true;
+        enqueueEntries(historyBatch.concat(dedupedEarly));
+      };
+
+      void bootRealLogStream();
     } else {
       startMockStream();
     }
@@ -507,6 +628,11 @@ export function LogsPage() {
                 <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber)]">
                   已暂停{bufferedWhilePaused > 0 ? `（新增 +${bufferedWhilePaused} 条）` : ""}
                 </span>
+              ) : !runtime.running ? (
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--muted)]">
+                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--muted)] opacity-60" />
+                  代理核心未启动（开启代理后自动接收日志）
+                </span>
               ) : (
                 <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--green)]">
                   <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
@@ -648,7 +774,11 @@ export function LogsPage() {
               </button>
             )}
             <span className="text-[10px]">
-              {autoScroll && !paused ? "自动跟随最新" : "手动浏览中"}
+              {!runtime.running
+                ? "等待核心启动"
+                : autoScroll && !paused
+                  ? "自动跟随最新"
+                  : "手动浏览中"}
             </span>
           </div>
         </div>
@@ -661,7 +791,11 @@ export function LogsPage() {
           {filteredEntries.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-[var(--muted)]">
               <ScrollText className="h-6 w-6 opacity-50" />
-              <span>暂无符合条件的运行日志</span>
+              <span>
+                {entries.length === 0 && !runtime.running
+                  ? "代理核心未启动，开启代理后将自动接收实时运行日志"
+                  : "暂无符合条件的运行日志"}
+              </span>
             </div>
           ) : (
             <div className="space-y-0.5">

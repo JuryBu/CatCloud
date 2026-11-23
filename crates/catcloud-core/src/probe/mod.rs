@@ -4,15 +4,16 @@ pub mod isolated_runner;
 pub mod registry;
 
 pub use builtins::{
-    DEFAULT_AI_STUDIO_URL, DEFAULT_CF_TRACE_URL, DEFAULT_GOOGLE_204_URL,
+    DEFAULT_AI_STUDIO_URL, DEFAULT_CF_TRACE_URL, DEFAULT_GOOGLE_204_URL, DEFAULT_GOOGLE_HOME_URL,
     DEFAULT_KEEPALIVE_INTERVALS_MS, DEFAULT_LATENCY_SAMPLES, DEFAULT_YOUTUBE_REGION_URL,
     FAST_FUSE_MIN_MBPS, FAST_FUSE_PROBE_BYTES, GoogleCleanAssessment, GoogleCleanSignals,
     GoogleCnEndpoints, LatencyStats, MAX_INSPECT_BODY_BYTES, MAX_THROUGHPUT_PAYLOAD_BYTES,
     ThroughputProbeConfig, build_download_stage_url, compute_latency_stats, compute_mbps,
     default_keepalive_intervals, evaluate_google_cleanliness, infer_unlock_site_key,
-    is_google_cn_location, parse_cloudflare_trace_loc, parse_youtube_gl, run_download_probe,
-    run_download_probe_with_config, run_google_cn_probe, run_keepalive_probe, run_latency_probe,
-    run_unlock_regex_probe, run_upload_probe, run_upload_probe_with_config,
+    is_ai_studio_restricted_location, is_google_cn_location, is_google_sorry_or_cn_location,
+    parse_cloudflare_trace_loc, parse_youtube_gl, probe_live_google_cleanliness,
+    run_download_probe, run_download_probe_with_config, run_google_cn_probe, run_keepalive_probe,
+    run_latency_probe, run_unlock_regex_probe, run_upload_probe, run_upload_probe_with_config,
 };
 pub use external::{
     ExternalProbeInput, ExternalProbeOutput, MAX_EXTERNAL_STDERR_BYTES, MAX_EXTERNAL_STDOUT_BYTES,
@@ -21,11 +22,11 @@ pub use external::{
 pub use isolated_runner::{
     CMP_ACCEL_PROXY_NAME, CMP_DIRECT_PROXY_NAME, CMP_RELAY_PROXY_NAME, DEFAULT_PROBE_NAMESERVERS,
     DEFAULT_READY_TIMEOUT, ISOLATED_BIND_HOST, ISOLATED_CORE_GOGC, ISOLATED_CORE_GOMEMLIMIT,
-    IsolatedProbeCore, IsolatedProxyScheme, NodeProbeBinding, allocate_ephemeral_ports,
-    build_direct_no_proxy_client, build_isolated_http_client,
+    IsolatedProbeCore, IsolatedProxyScheme, NodeProbeBinding, PROBE_RELAY_PROXY_NAME,
+    allocate_ephemeral_ports, build_direct_no_proxy_client, build_isolated_http_client,
     build_isolated_http_client_with_options, build_isolated_probe_yaml,
-    generate_controller_secret, generate_preaccel_comparison_yaml, isolated_proxy_url,
-    resolve_unique_proxy_names,
+    build_isolated_probe_yaml_with_preaccel, generate_controller_secret,
+    generate_preaccel_comparison_yaml, isolated_proxy_url, resolve_unique_proxy_names,
 };
 pub use registry::{
     DEFAULT_DOWNLOAD_PAYLOAD_BYTES, DEFAULT_UPLOAD_PAYLOAD_BYTES, FunnelTier, MAX_PAYLOAD_BYTES,
@@ -111,6 +112,9 @@ pub async fn run_single_probe(
         if def.kind == ProbeKind::GoogleCn {
             if let Some(ref ep) = options.google_endpoints {
                 ensure_loopback_target(&ep.google_url)?;
+                if let Some(ref u) = ep.google_home_url {
+                    ensure_loopback_target(u)?;
+                }
                 if let Some(ref u) = ep.youtube_url {
                     ensure_loopback_target(u)?;
                 }
@@ -351,6 +355,7 @@ mod tests {
         method: String,
         target: String,
         body_len: usize,
+        cookie: Option<String>,
     }
 
     async fn read_http_request(stream: &mut TcpStream) -> Option<ParsedHttpRequest> {
@@ -378,10 +383,14 @@ mod tests {
         let target = parts.next()?.to_string();
 
         let mut content_length: usize = 0;
+        let mut cookie: Option<String> = None;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("content-length") {
+                let key = k.trim();
+                if key.eq_ignore_ascii_case("content-length") {
                     content_length = v.trim().parse::<usize>().unwrap_or(0);
+                } else if key.eq_ignore_ascii_case("cookie") {
+                    cookie = Some(v.trim().to_string());
                 }
             }
         }
@@ -402,6 +411,7 @@ mod tests {
             method,
             target,
             body_len: body_received,
+            cookie,
         })
     }
 
@@ -491,6 +501,14 @@ mod tests {
                                 b"HTTP/1.1 302 Found\r\nLocation: https://www.google.cn/generate_204\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
                                     .to_vec()
                             }
+                            ("GET", "/google_home_ok") => {
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+                                    .to_vec()
+                            }
+                            ("GET", "/google_home_sorry_302") => {
+                                b"HTTP/1.1 302 Found\r\nLocation: https://www.google.com/sorry/index?continue=https://www.google.com/\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                    .to_vec()
+                            }
                             ("GET", "/yt_us") => {
                                 let body = br#"{"countryCode":"US","ok":true}"#;
                                 format!(
@@ -509,6 +527,32 @@ mod tests {
                                 )
                                 .into_bytes()
                             }
+                            ("GET", "/yt_redir_gl") => {
+                                let has_socs = req
+                                    .cookie
+                                    .as_deref()
+                                    .is_some_and(|ck| ck.contains("SOCS=CAI"));
+                                if has_socs {
+                                    b"HTTP/1.1 302 Found\r\nLocation: https://www.youtube.com/premium?gl=JP\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                        .to_vec()
+                                } else {
+                                    b"HTTP/1.1 302 Found\r\nLocation: https://consent.youtube.com/\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                        .to_vec()
+                                }
+                            }
+                            ("GET", "/yt_redir_hop1") => {
+                                let has_socs = req
+                                    .cookie
+                                    .as_deref()
+                                    .is_some_and(|ck| ck.contains("SOCS=CAI"));
+                                if has_socs {
+                                    b"HTTP/1.1 302 Found\r\nLocation: /yt_us\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                        .to_vec()
+                                } else {
+                                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                        .to_vec()
+                                }
+                            }
                             ("GET", "/ai_ok") => {
                                 let body = "AI Studio Available";
                                 format!(
@@ -526,6 +570,10 @@ mod tests {
                                     body
                                 )
                                 .into_bytes()
+                            }
+                            ("GET", "/ai_302_regions") => {
+                                b"HTTP/1.1 302 Found\r\nLocation: https://ai.google.dev/available_regions\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"
+                                    .to_vec()
                             }
                             ("GET", "/cf_tw") => {
                                 let body = "fl=1f\nh=cp.cloudflare.com\nloc=TW\n";
@@ -685,9 +733,10 @@ mod tests {
             ..Default::default()
         };
 
-        // Case 1: CF=TW while YT=US, Google 204, AI Studio 200 -> CLEAN + advisory risk tag only
+        // Case 1: CF=TW while YT=US, Google 204 + home 200, AI Studio 200 -> CLEAN + advisory risk tag only
         let ep_clean_mismatch = GoogleCnEndpoints {
             google_url: format!("http://127.0.0.1:{port}/google_ok"),
+            google_home_url: Some(format!("http://127.0.0.1:{port}/google_home_ok")),
             youtube_url: Some(format!("http://127.0.0.1:{port}/yt_us")),
             ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_ok")),
             cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
@@ -697,13 +746,17 @@ mod tests {
         assert_eq!(rec.google_clean, Some(true));
         assert_eq!(rec.cf_loc.as_deref(), Some("TW"));
         assert_eq!(rec.yt_gl.as_deref(), Some("US"));
+        assert_eq!(rec.unlocked_map.get("gemini"), Some(&true));
+        assert_eq!(rec.unlocked_map.get("gemini_aistudio"), Some(&true));
         let snap = ProbeSnapshot::from_results("n-tw", &[rec], None);
         assert_eq!(snap.google_clean, Some(true));
         assert!(snap.google_risk_mismatch);
+        assert_eq!(snap.unlocked_sites.get("gemini"), Some(&true));
 
         // Case 2: Google 302 -> google.cn must fail hard gate
         let ep_cn_302 = GoogleCnEndpoints {
             google_url: format!("http://127.0.0.1:{port}/google_cn_302"),
+            google_home_url: None,
             youtube_url: Some(format!("http://127.0.0.1:{port}/yt_us")),
             ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_ok")),
             cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
@@ -715,6 +768,7 @@ mod tests {
         // Case 3: YouTube GL=HK must fail hard gate
         let ep_yt_hk = GoogleCnEndpoints {
             google_url: format!("http://127.0.0.1:{port}/google_ok"),
+            google_home_url: None,
             youtube_url: Some(format!("http://127.0.0.1:{port}/yt_hk")),
             ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_ok")),
             cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
@@ -723,9 +777,10 @@ mod tests {
         assert!(!rec_hk.ok);
         assert_eq!(rec_hk.google_clean, Some(false));
 
-        // Case 4: AI Studio body region block must fail hard gate
+        // Case 4: AI Studio body region block must fail hard gate and mark both gemini keys false
         let ep_ai_blocked = GoogleCnEndpoints {
             google_url: format!("http://127.0.0.1:{port}/google_ok"),
+            google_home_url: None,
             youtube_url: Some(format!("http://127.0.0.1:{port}/yt_us")),
             ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_blocked")),
             cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
@@ -734,6 +789,60 @@ mod tests {
         assert!(!rec_ai.ok);
         assert_eq!(rec_ai.google_clean, Some(false));
         assert_eq!(rec_ai.unlocked_map.get("gemini_aistudio"), Some(&false));
+        assert_eq!(rec_ai.unlocked_map.get("gemini"), Some(&false));
+
+        // Case 5: Google home 302 -> /sorry/ captcha wall must fail hard gate
+        let ep_home_sorry = GoogleCnEndpoints {
+            google_url: format!("http://127.0.0.1:{port}/google_ok"),
+            google_home_url: Some(format!("http://127.0.0.1:{port}/google_home_sorry_302")),
+            youtube_url: Some(format!("http://127.0.0.1:{port}/yt_us")),
+            ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_ok")),
+            cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
+        };
+        let rec_sorry =
+            run_google_cn_probe(&client_no_redir, "n-sorry", &def, Some(&ep_home_sorry)).await;
+        assert!(!rec_sorry.ok);
+        assert_eq!(rec_sorry.google_clean, Some(false));
+
+        // Case 6: AI Studio 302 -> available_regions must fail hard gate and mark gemini false
+        let ep_ai_302 = GoogleCnEndpoints {
+            google_url: format!("http://127.0.0.1:{port}/google_ok"),
+            google_home_url: Some(format!("http://127.0.0.1:{port}/google_home_ok")),
+            youtube_url: Some(format!("http://127.0.0.1:{port}/yt_us")),
+            ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_302_regions")),
+            cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
+        };
+        let rec_ai_302 =
+            run_google_cn_probe(&client_no_redir, "n-ai-302", &def, Some(&ep_ai_302)).await;
+        assert!(!rec_ai_302.ok);
+        assert_eq!(rec_ai_302.google_clean, Some(false));
+        assert_eq!(rec_ai_302.unlocked_map.get("gemini_aistudio"), Some(&false));
+        assert_eq!(rec_ai_302.unlocked_map.get("gemini"), Some(&false));
+
+        // Case 7: YouTube Cookie: SOCS=CAI + 302 Location gl= extraction and manual 1-hop follow
+        let ep_yt_redir_gl = GoogleCnEndpoints {
+            google_url: format!("http://127.0.0.1:{port}/google_ok"),
+            google_home_url: None,
+            youtube_url: Some(format!("http://127.0.0.1:{port}/yt_redir_gl")),
+            ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_ok")),
+            cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
+        };
+        let rec_yt_gl =
+            run_google_cn_probe(&client_no_redir, "n-yt-gl", &def, Some(&ep_yt_redir_gl)).await;
+        assert!(rec_yt_gl.ok);
+        assert_eq!(rec_yt_gl.yt_gl.as_deref(), Some("JP"));
+
+        let ep_yt_hop = GoogleCnEndpoints {
+            google_url: format!("http://127.0.0.1:{port}/google_ok"),
+            google_home_url: None,
+            youtube_url: Some(format!("http://127.0.0.1:{port}/yt_redir_hop1")),
+            ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_ok")),
+            cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),
+        };
+        let rec_yt_hop =
+            run_google_cn_probe(&client_no_redir, "n-yt-hop", &def, Some(&ep_yt_hop)).await;
+        assert!(rec_yt_hop.ok);
+        assert_eq!(rec_yt_hop.yt_gl.as_deref(), Some("US"));
     }
 
     #[tokio::test]
@@ -1010,6 +1119,7 @@ mod tests {
             latency_samples: 2,
             google_endpoints: Some(GoogleCnEndpoints {
                 google_url: format!("http://127.0.0.1:{port}/google_ok"),
+                google_home_url: Some(format!("http://127.0.0.1:{port}/google_home_ok")),
                 youtube_url: Some(format!("http://127.0.0.1:{port}/yt_us")),
                 ai_studio_url: Some(format!("http://127.0.0.1:{port}/ai_ok")),
                 cf_trace_url: Some(format!("http://127.0.0.1:{port}/cf_tw")),

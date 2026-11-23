@@ -1,5 +1,7 @@
 import {
   AlertTriangle,
+  ArrowLeft,
+  ArrowUpDown,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -15,6 +17,7 @@ import {
   Layers,
   Link2,
   Minus,
+  Play,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -61,6 +64,7 @@ import {
 
 type MultiplierRange = "all" | "le1" | "1to2" | "ge3";
 type Native443Filter = "all" | "only_443" | "non_443";
+type NodeSortBy = "default" | "latency" | "up" | "down";
 type MigrationSourceKind =
   | "clash_verge"
   | "flclash"
@@ -1017,24 +1021,53 @@ function parsePastedConfigPreview(rawInput: string): MigrationPreviewItem {
   };
 }
 
-function isAiUnlocked(probe: ProbeSnapshot | undefined): boolean {
-  if (!probe) return false;
-  return Object.values(probe.unlocked_sites).some(Boolean);
-}
-
-function countAiUnlocked(probe: ProbeSnapshot | undefined): {
+function getNodeAiInfo(probe: ProbeSnapshot | undefined): {
   passed: number;
   total: number;
+  unlockedLabels: string[];
   detail: string;
 } {
-  if (!probe) return { passed: 0, total: 0, detail: "暂无解锁快照" };
-  const entries = Object.entries(probe.unlocked_sites);
-  const passed = entries.filter(([, ok]) => ok).length;
-  const detail =
-    entries.length > 0
-      ? entries.map(([k, ok]) => `${k}: ${ok ? "解锁" : "受限"}`).join(" · ")
-      : "暂无解锁快照";
-  return { passed, total: entries.length, detail };
+  if (!probe) {
+    return { passed: 0, total: 0, unlockedLabels: [], detail: "暂无解锁快照" };
+  }
+  const sites = probe.unlocked_sites ?? {};
+  const geminiVal = sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai;
+  const claudeVal = sites.claude;
+  const chatgptVal = sites.chatgpt;
+  const windsurfVal = sites.windsurf ?? probe.per_probe_ok?.builtin_unlock_windsurf;
+
+  const normalized: Array<{ label: string; short: string; val: boolean | undefined }> = [
+    { label: "Claude", short: "Claude", val: claudeVal },
+    { label: "Gemini", short: "Gemini", val: geminiVal },
+    { label: "ChatGPT", short: "GPT", val: chatgptVal },
+    { label: "Windsurf", short: "WS", val: windsurfVal },
+  ];
+
+  const measured = normalized.filter((item) => item.val !== undefined);
+  const unlocked = measured.filter((item) => item.val === true);
+  if (measured.length === 0) {
+    const fallbackEntries = Object.entries(sites);
+    const passed = fallbackEntries.filter(([, ok]) => ok).length;
+    return {
+      passed,
+      total: fallbackEntries.length,
+      unlockedLabels: fallbackEntries.filter(([, ok]) => ok).map(([k]) => k),
+      detail:
+        fallbackEntries.length > 0
+          ? fallbackEntries.map(([k, ok]) => `${k}: ${ok ? "解锁" : "受限"}`).join(" · ")
+          : "暂无解锁快照",
+    };
+  }
+  return {
+    passed: unlocked.length,
+    total: measured.length,
+    unlockedLabels: unlocked.map((item) => item.short),
+    detail: measured.map((item) => `${item.label}: ${item.val ? "可用" : "受限"}`).join(" · "),
+  };
+}
+
+function isAiUnlocked(probe: ProbeSnapshot | undefined): boolean {
+  return getNodeAiInfo(probe).passed > 0;
 }
 
 /* ============================================================================
@@ -2225,7 +2258,9 @@ export function NodesSubsPage() {
   const storeNodes = useAppSelector((s) => s.nodes);
   const storeProbes = useAppSelector((s) => s.probes);
   const storeGroups = useAppSelector((s) => s.groups);
+  const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.config.preaccel);
+  const isSingleMode = runtime.route_mode === "single";
 
   // Directly subscribe to appStore so edits on other pages always stay in sync
   const subscriptions = storeSubs;
@@ -2236,6 +2271,7 @@ export function NodesSubsPage() {
   const [refreshingIds, setRefreshingIds] = useState<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [importingSub, setImportingSub] = useState(false);
+  const [selectingSingleNodeId, setSelectingSingleNodeId] = useState<string | null>(null);
   const [showLocalFileForm, setShowLocalFileForm] = useState(false);
   const [newSubName, setNewSubName] = useState("");
   const [newSubSource, setNewSubSource] = useState("");
@@ -2243,13 +2279,26 @@ export function NodesSubsPage() {
   const [localFilePath, setLocalFilePath] = useState("");
   const [newSubIntervalSec, setNewSubIntervalSec] = useState(21600);
 
-  // Drawers
+  // Drawers & Delete Confirmation
   const [migrationOpen, setMigrationOpen] = useState(false);
   const [processAttachOpen, setProcessAttachOpen] = useState(false);
+  const [pendingDeleteSub, setPendingDeleteSub] = useState<SubscriptionRecord | null>(null);
+  const [deletingSub, setDeletingSub] = useState(false);
   const closeMigration = useCallback(() => setMigrationOpen(false), []);
   const closeProcessAttach = useCallback(() => setProcessAttachOpen(false), []);
 
-  // Multi-dimensional node filters & pagination
+  useEffect(() => {
+    if (!pendingDeleteSub) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape" && !deletingSub) {
+        setPendingDeleteSub(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pendingDeleteSub, deletingSub]);
+
+  // Multi-dimensional node filters, sorting & pagination
   const [keyword, setKeyword] = useState("");
   const [filterSubId, setFilterSubId] = useState<string>("all");
   const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
@@ -2263,6 +2312,7 @@ export function NodesSubsPage() {
     keepalive60s: false,
     aiUnlocked: false,
   });
+  const [sortBy, setSortBy] = useState<NodeSortBy>("default");
   const [showMoreFilters, setShowMoreFilters] = useState(false);
   const [pageSize, setPageSize] = useState<number>(30);
   const [currentPage, setCurrentPage] = useState<number>(1);
@@ -2311,6 +2361,7 @@ export function NodesSubsPage() {
     filterProtocol,
     filter443,
     healthFilters,
+    sortBy,
     pageSize,
   ]);
 
@@ -2394,7 +2445,7 @@ export function NodesSubsPage() {
 
   const filteredNodes = useMemo(() => {
     const kw = keyword.trim().toLowerCase();
-    return nodes.filter((node) => {
+    const matched = nodes.filter((node) => {
       if (filterSubId !== "all" && node.sub_id !== filterSubId) return false;
       if (!nodeMatchesContinentAndRegion(node, filterContinent, filterRegion)) {
         return false;
@@ -2418,10 +2469,7 @@ export function NodesSubsPage() {
       if (filter443 === "non_443" && node.is_443_native) return false;
 
       const probe = storeProbes[node.id];
-      if (
-        healthFilters.googleClean &&
-        !(probe?.google_clean === true && !probe.google_risk_mismatch)
-      ) {
+      if (healthFilters.googleClean && probe?.google_clean !== true) {
         return false;
       }
       if (healthFilters.keepalive60s && probe?.keepalive_60s_ok !== true) {
@@ -2448,6 +2496,32 @@ export function NodesSubsPage() {
 
       return true;
     });
+
+    if (sortBy === "default") return matched;
+
+    return [...matched].sort((a, b) => {
+      const pa = storeProbes[a.id];
+      const pb = storeProbes[b.id];
+      if (sortBy === "latency") {
+        const aOk = pa?.ok !== false && pa?.latency_ms != null;
+        const bOk = pb?.ok !== false && pb?.latency_ms != null;
+        if (aOk !== bOk) return aOk ? -1 : 1;
+        if (aOk && bOk) return (pa!.latency_ms ?? 99999) - (pb!.latency_ms ?? 99999);
+        return a.name.localeCompare(b.name);
+      }
+      if (sortBy === "up") {
+        const aHas = pa?.up_mbps != null;
+        const bHas = pb?.up_mbps != null;
+        if (aHas !== bHas) return aHas ? -1 : 1;
+        if (aHas && bHas) return (pb!.up_mbps ?? -1) - (pa!.up_mbps ?? -1);
+        return a.name.localeCompare(b.name);
+      }
+      const aHas = pa?.down_mbps != null;
+      const bHas = pb?.down_mbps != null;
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      if (aHas && bHas) return (pb!.down_mbps ?? -1) - (pa!.down_mbps ?? -1);
+      return a.name.localeCompare(b.name);
+    });
   }, [
     nodes,
     keyword,
@@ -2458,6 +2532,7 @@ export function NodesSubsPage() {
     filterMultiplier,
     filter443,
     healthFilters,
+    sortBy,
     storeProbes,
     subNameMap,
   ]);
@@ -2484,15 +2559,16 @@ export function NodesSubsPage() {
     (filterMultiplier !== "all" ? 1 : 0) +
     (filterProtocol !== "all" ? 1 : 0) +
     (filter443 !== "all" ? 1 : 0) +
-    (healthFilters.googleClean ? 1 : 0) +
-    (healthFilters.keepalive60s ? 1 : 0) +
-    (healthFilters.aiUnlocked ? 1 : 0);
+    (healthFilters.keepalive60s ? 1 : 0);
 
   const hasActiveFilters =
     keyword.trim().length > 0 ||
     filterSubId !== "all" ||
     filterContinent !== "all" ||
     filterRegion !== "all" ||
+    healthFilters.googleClean ||
+    healthFilters.aiUnlocked ||
+    sortBy !== "default" ||
     advancedFilterCount > 0;
 
   const totalPages = Math.max(1, Math.ceil(filteredNodes.length / pageSize));
@@ -2763,7 +2839,10 @@ export function NodesSubsPage() {
     }
   };
 
-  const handleRemoveSubscription = async (sub: SubscriptionRecord) => {
+  const handleConfirmRemoveSubscription = async () => {
+    if (!pendingDeleteSub || deletingSub) return;
+    const sub = pendingDeleteSub;
+    setDeletingSub(true);
     const removedIds = new Set(
       nodes.filter((n) => n.sub_id === sub.id).map((n) => n.id)
     );
@@ -2785,9 +2864,12 @@ export function NodesSubsPage() {
         });
       }
       if (filterSubId === sub.id) setFilterSubId("all");
-      appActions.showToast(`已移除订阅：${sub.name}`, "info");
+      setPendingDeleteSub(null);
+      appActions.showToast(`已移除订阅：${sub.name}（同时移除 ${removedIds.size} 个节点）`, "info");
     } catch (err) {
       appActions.showToast(`移除订阅失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setDeletingSub(false);
     }
   };
 
@@ -3131,6 +3213,16 @@ export function NodesSubsPage() {
     }
   };
 
+  const handleSelectSingleNode = async (nodeId: string) => {
+    if (selectingSingleNodeId) return;
+    setSelectingSingleNodeId(nodeId);
+    try {
+      await appActions.selectSingleNode(nodeId);
+    } finally {
+      setSelectingSingleNodeId(null);
+    }
+  };
+
   const resetAllFilters = () => {
     setKeyword("");
     setFilterSubId("all");
@@ -3144,42 +3236,90 @@ export function NodesSubsPage() {
       keepalive60s: false,
       aiUnlocked: false,
     });
+    setSortBy("default");
   };
 
   return (
     <div className="space-y-3">
       {/* ====================================================================
-       * 1. Compact Header & Refresh All Bar
+       * 1. Compact Header, Route Mode Guide Bar & Refresh All Bar
        * ==================================================================== */}
-      <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-2.5 rounded-2xl px-4 py-2.5">
-        <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <h1 className="text-base font-semibold tracking-tight text-[var(--text)]">
-              节点与订阅
-            </h1>
-            <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-0.5 cc-mono text-[11px] font-medium text-[var(--accent)]">
-              {subscriptions.length} 个订阅 · {nodes.length} 个节点 · {native443Count} 个直连 443
-            </span>
+      <section className="cc-card cc-glass space-y-2.5 rounded-2xl px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2.5">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h1 className="text-base font-semibold tracking-tight text-[var(--text)]">
+                节点与订阅
+              </h1>
+              <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-0.5 cc-mono text-[11px] font-medium text-[var(--accent)]">
+                {subscriptions.length} 个订阅 · {nodes.length} 个节点 · {native443Count} 个直连 443
+              </span>
+            </div>
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
+              <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[var(--green)]">
+                <ShieldCheck className="h-3.5 w-3.5" />
+                刷新失败时自动保留原有节点，不会清空
+              </span>
+            </div>
           </div>
-          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
-            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[var(--green)]">
-              <ShieldCheck className="h-3.5 w-3.5" />
-              刷新失败时自动保留原有节点，不会清空
-            </span>
-          </div>
+
+          <button
+            type="button"
+            disabled={refreshingAll || subscriptions.length === 0}
+            onClick={() => void refreshAllSubscriptions()}
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
+          >
+            <RefreshCw
+              className={`h-3.5 w-3.5 text-[var(--accent)] ${refreshingAll ? "animate-spin" : ""}`}
+            />
+            全部刷新
+          </button>
         </div>
 
-        <button
-          type="button"
-          disabled={refreshingAll || subscriptions.length === 0}
-          onClick={() => void refreshAllSubscriptions()}
-          className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
+        {/* Active Route Mode Status Guide Bar */}
+        <div
+          className={`flex flex-wrap items-center justify-between gap-2.5 rounded-xl border px-3 py-2 text-xs ${
+            isSingleMode
+              ? "border-[var(--green)]/40 bg-[var(--bg-elevated)]/85"
+              : "border-[var(--accent)]/40 bg-[var(--bg-elevated)]/85"
+          }`}
         >
-          <RefreshCw
-            className={`h-3.5 w-3.5 text-[var(--accent)] ${refreshingAll ? "animate-spin" : ""}`}
-          />
-          全部刷新
-        </button>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            {isSingleMode ? (
+              <>
+                <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[var(--green)]/35 bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] font-semibold text-[var(--green)]">
+                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                  当前：单节点模式
+                </span>
+                <span className="truncate text-[11px] text-[var(--text-secondary)]">
+                  正在使用：
+                  <strong className="font-semibold text-[var(--text)]">
+                    {runtime.active_node_name || "未选择"}
+                  </strong>
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[var(--accent)]/35 bg-[var(--accent-soft)] px-2.5 py-0.5 text-[11px] font-semibold text-[var(--accent)]">
+                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+                  当前：智能多选组（{runtime.active_group_name || "未启用"}）
+                </span>
+                <span className="text-[11px] text-[var(--text-secondary)]">
+                  点下方任意节点的「用它」，可立刻切为单节点固定使用
+                </span>
+              </>
+            )}
+          </div>
+
+          <button
+            type="button"
+            onClick={() => appActions.setNav("overview")}
+            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+          >
+            <ArrowLeft className="h-3 w-3 shrink-0" />
+            <span>返回总览</span>
+          </button>
+        </div>
       </section>
 
       {/* ====================================================================
@@ -3496,7 +3636,7 @@ export function NodesSubsPage() {
                       {(inTauri || subscriptions.length > 1) && (
                         <button
                           type="button"
-                          onClick={() => void handleRemoveSubscription(sub)}
+                          onClick={() => setPendingDeleteSub(sub)}
                           className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:border-[var(--red)] hover:text-[var(--red)]"
                           title="删除此订阅"
                         >
@@ -3600,7 +3740,7 @@ export function NodesSubsPage() {
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <div className="relative w-60">
+            <div className="relative w-56">
               <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
               <input
                 type="text"
@@ -3609,6 +3749,51 @@ export function NodesSubsPage() {
                 placeholder="搜节点名称、地区、协议或地址..."
                 className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
+            </div>
+
+            <button
+              type="button"
+              onClick={() =>
+                setHealthFilters((prev) => ({ ...prev, googleClean: !prev.googleClean }))
+              }
+              className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                healthFilters.googleClean
+                  ? "border-[var(--green)] bg-[var(--green-soft)] text-[var(--green)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+              }`}
+            >
+              {healthFilters.googleClean && <Check className="h-3 w-3" />}
+              <span>仅看谷歌正常</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                setHealthFilters((prev) => ({ ...prev, aiUnlocked: !prev.aiUnlocked }))
+              }
+              className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                healthFilters.aiUnlocked
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+              }`}
+            >
+              {healthFilters.aiUnlocked && <Check className="h-3 w-3" />}
+              <span>仅看 AI 可用</span>
+            </button>
+
+            <div className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
+              <ArrowUpDown className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+              <select
+                aria-label="节点排序方式"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as NodeSortBy)}
+                className="bg-transparent text-xs text-[var(--text)] outline-none"
+              >
+                <option value="default">排序：默认</option>
+                <option value="latency">排序：延迟最低</option>
+                <option value="up">排序：上传最快</option>
+                <option value="down">排序：下载最快</option>
+              </select>
             </div>
 
             <button
@@ -3776,36 +3961,24 @@ export function NodesSubsPage() {
               </div>
 
               <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[var(--muted)]">可用性</span>
-                {(
-                  [
-                    { key: "googleClean", label: "Google 正常" },
-                    { key: "keepalive60s", label: "长连接稳定" },
-                    { key: "aiUnlocked", label: "AI 解锁" },
-                  ] as const
-                ).map((item) => {
-                  const active = healthFilters[item.key];
-                  return (
-                    <button
-                      key={item.key}
-                      type="button"
-                      onClick={() =>
-                        setHealthFilters((prev) => ({
-                          ...prev,
-                          [item.key]: !prev[item.key],
-                        }))
-                      }
-                      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 transition-colors ${
-                        active
-                          ? "border-[var(--green)] bg-[var(--green-soft)] font-medium text-[var(--green)]"
-                          : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                      }`}
-                    >
-                      {active && <Check className="h-3 w-3" />}
-                      {item.label}
-                    </button>
-                  );
-                })}
+                <span className="text-[var(--muted)]">长连接</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setHealthFilters((prev) => ({
+                      ...prev,
+                      keepalive60s: !prev.keepalive60s,
+                    }))
+                  }
+                  className={`inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 transition-colors ${
+                    healthFilters.keepalive60s
+                      ? "border-[var(--green)] bg-[var(--green-soft)] font-medium text-[var(--green)]"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                  }`}
+                >
+                  {healthFilters.keepalive60s && <Check className="h-3 w-3" />}
+                  60 秒长连接稳定
+                </button>
               </div>
             </div>
           )}
@@ -3953,10 +4126,10 @@ export function NodesSubsPage() {
           />
         )}
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[980px] border-collapse text-left text-xs">
+          <table className="w-full table-fixed border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--muted)]">
-                <th className="w-10 px-3.5 py-2.5">
+                <th className="w-8 px-2 py-2.5 text-center">
                   <input
                     type="checkbox"
                     checked={allFilteredSelected}
@@ -3965,23 +4138,23 @@ export function NodesSubsPage() {
                     className="accent-[var(--accent)]"
                   />
                 </th>
-                <th className="max-w-[260px] whitespace-nowrap px-3 py-2.5">
+                <th className="whitespace-nowrap px-2 py-2.5">
                   节点名称 / 来源 / 分组
                 </th>
-                <th className="min-w-[168px] whitespace-nowrap px-3 py-2.5">
+                <th className="w-[132px] whitespace-nowrap px-2 py-2.5">
                   地区 · 倍率 · 协议
                 </th>
-                <th className="min-w-[180px] whitespace-nowrap px-3 py-2.5">
-                  延迟与可用性
+                <th className="w-[236px] whitespace-nowrap px-2 py-2.5">
+                  延迟 · 上下行 · 解锁
                 </th>
-                <th className="min-w-[196px] whitespace-nowrap px-3 py-2.5">
+                <th className="w-[148px] whitespace-nowrap px-2 py-2.5">
                   <div className="inline-flex items-center gap-1 whitespace-nowrap">
                     <Zap className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                     国内提速
                   </div>
                 </th>
-                <th className="w-[108px] min-w-[108px] whitespace-nowrap px-3.5 py-2.5 text-right">
-                  分组
+                <th className="w-[148px] whitespace-nowrap px-2 py-2.5 text-right">
+                  使用 / 分组
                 </th>
               </tr>
             </thead>
@@ -4000,12 +4173,15 @@ export function NodesSubsPage() {
                 pagedNodes.map((node) => {
                   const selected = selectedNodeIds.has(node.id);
                   const probe = storeProbes[node.id];
-                  const aiInfo = countAiUnlocked(probe);
+                  const aiInfo = getNodeAiInfo(probe);
                   const subName = subNameMap.get(node.sub_id) ?? node.sub_id;
                   const memberGroups = nodeGroupMembership.get(node.id) ?? [];
                   const inTargetGroup = targetGroupMemberSet.has(node.id);
                   const regionCode = resolveNodeRegionCode(node);
                   const regionLabel = getRegionLabel(regionCode);
+                  const isSingleActive =
+                    isSingleMode && runtime.active_node_id === node.id;
+                  const isSwitchingSingle = selectingSingleNodeId === node.id;
 
                   const effectiveGlobalPreAccel =
                     globalPreAccel.enabled &&
@@ -4015,13 +4191,15 @@ export function NodesSubsPage() {
                     <tr
                       key={node.id}
                       className={`transition-colors ${
-                        selected
-                          ? "bg-[var(--accent-soft)]/60"
-                          : "hover:bg-[var(--card-hover)]"
+                        isSingleActive
+                          ? "bg-[var(--green-soft)]/35"
+                          : selected
+                            ? "bg-[var(--accent-soft)]/60"
+                            : "hover:bg-[var(--card-hover)]"
                       }`}
                     >
                       {/* Checkbox */}
-                      <td className="w-10 px-3.5 py-3 align-middle">
+                      <td className="w-8 px-2 py-2.5 text-center align-middle">
                         <input
                           type="checkbox"
                           checked={selected}
@@ -4032,27 +4210,34 @@ export function NodesSubsPage() {
                       </td>
 
                       {/* Node Name, Source Sub & Group Membership */}
-                      <td className="max-w-[260px] px-3 py-3 align-middle">
-                        <div className="flex min-w-0 items-center gap-2">
+                      <td className="px-2 py-2.5 align-middle">
+                        <div className="flex min-w-0 items-center gap-1.5">
                           <Server className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
                           <span
                             title={node.name}
-                            className="block max-w-[228px] truncate font-semibold text-[var(--text)]"
+                            className="block min-w-0 flex-1 truncate font-semibold text-[var(--text)]"
                           >
                             {node.name}
                           </span>
                         </div>
-                        <div className="mt-1 flex max-w-[252px] flex-wrap items-center gap-1.5 text-[10px]">
-                          <span className="max-w-[112px] truncate rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--text-secondary)]">
+                        <div className="mt-1 flex flex-wrap items-center gap-1 text-[10px]">
+                          <span
+                            title={subName}
+                            className="max-w-[110px] truncate rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--text-secondary)]"
+                          >
                             {subName}
                           </span>
-                          <span className="max-w-[130px] truncate cc-mono text-[var(--muted)]">
+                          <span
+                            title={`${node.server}:${node.port}`}
+                            className="max-w-[100px] truncate cc-mono text-[var(--muted)]"
+                          >
                             {node.server}:{node.port}
                           </span>
                           {memberGroups.map((g) => (
                             <span
                               key={g.id}
-                              className="max-w-[116px] truncate rounded-full bg-[var(--sky-soft)] px-1.5 py-0.5 font-medium text-[var(--sky)]"
+                              title={g.name}
+                              className="max-w-[96px] truncate rounded-full bg-[var(--sky-soft)] px-1.5 py-0.5 font-medium text-[var(--sky)]"
                             >
                               {g.name}
                             </span>
@@ -4061,106 +4246,154 @@ export function NodesSubsPage() {
                       </td>
 
                       {/* Region, Multiplier, Protocol & Direct 443 */}
-                      <td className="min-w-[168px] px-3 py-3 align-middle">
-                        <div className="flex flex-wrap items-center gap-1.5 cc-mono text-[11px]">
-                          <span
-                            title={regionLabel}
-                            className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-medium text-[var(--text)]"
-                          >
-                            {regionCode}
-                          </span>
-                          <span
-                            className={`rounded-md px-1.5 py-0.5 font-medium ${
-                              node.multiplier >= 3
-                                ? "bg-[var(--coral-soft)] text-[var(--coral)]"
-                                : node.multiplier <= 1
-                                  ? "bg-[var(--green-soft)] text-[var(--green)]"
-                                  : "bg-[var(--amber-soft)] text-[var(--amber)]"
-                            }`}
-                          >
-                            {node.multiplier}x
-                          </span>
-                          <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 uppercase text-[var(--text-secondary)]">
-                            {node.protocol}
-                          </span>
-                          {node.is_443_native ? (
-                            <span className="whitespace-nowrap rounded-md bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                              直连 443
+                      <td className="w-[132px] px-2 py-2.5 align-middle">
+                        <div className="flex flex-col gap-1 cc-mono text-[10px]">
+                          <div className="flex items-center gap-1">
+                            <span
+                              title={regionLabel}
+                              className="shrink-0 rounded border border-[var(--line)] bg-[var(--bg-elevated)] px-1 py-0.5 font-semibold text-[var(--text)]"
+                            >
+                              {regionCode}
                             </span>
-                          ) : (
-                            <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                              :{node.port}
+                            <span
+                              className={`shrink-0 rounded px-1 py-0.5 font-medium ${
+                                node.multiplier >= 3
+                                  ? "bg-[var(--coral-soft)] text-[var(--coral)]"
+                                  : node.multiplier <= 1
+                                    ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                    : "bg-[var(--amber-soft)] text-[var(--amber)]"
+                              }`}
+                            >
+                              {node.multiplier}x
                             </span>
-                          )}
+                            <span className="truncate rounded bg-[var(--bg-elevated)] px-1 py-0.5 uppercase text-[var(--text-secondary)]">
+                              {node.protocol}
+                            </span>
+                          </div>
+                          <div>
+                            {node.is_443_native ? (
+                              <span className="inline-block whitespace-nowrap rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                                直连 443
+                              </span>
+                            ) : (
+                              <span className="inline-block rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                                :{node.port}
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </td>
 
-                      {/* Health Snapshot Badges */}
-                      <td className="min-w-[180px] px-3 py-3 align-middle">
-                        <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
-                          <span className="cc-mono whitespace-nowrap rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--text)]">
-                            {probe?.latency_ms != null
-                              ? `${probe.latency_ms} ms`
-                              : "未测速"}
-                            {probe?.up_mbps != null
-                              ? ` · ↑${probe.up_mbps.toFixed(1)}M`
-                              : ""}
-                          </span>
-
-                          <span
-                            className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
-                              probe?.google_clean === true &&
-                              !probe.google_risk_mismatch
-                                ? "bg-[var(--green-soft)] text-[var(--green)]"
-                                : probe?.google_clean === false ||
-                                    probe?.google_risk_mismatch
+                      {/* Health Snapshot Badges: Latency, Up/Down Speed, Google Clean/CN & AI Unlocks */}
+                      <td className="w-[236px] px-2 py-2.5 align-middle">
+                        <div className="flex flex-col gap-1 text-[10px]">
+                          <div className="flex items-center gap-2 cc-mono">
+                            <span
+                              className={`shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 font-semibold ${
+                                probe?.ok === false
                                   ? "bg-[var(--red-soft)] text-[var(--red)]"
-                                  : "bg-[var(--bg-elevated)] text-[var(--muted)]"
-                            }`}
-                          >
-                            {probe?.google_clean === true &&
-                            !probe.google_risk_mismatch
-                              ? "Google 正常"
-                              : probe?.google_risk_mismatch
-                                ? "存在风控"
+                                  : probe?.latency_ms != null
+                                    ? probe.latency_ms <= 140
+                                      ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                      : probe.latency_ms <= 300
+                                        ? "bg-[var(--amber-soft)] text-[var(--amber)]"
+                                        : "bg-[var(--red-soft)] text-[var(--red)]"
+                                    : "bg-[var(--bg-elevated)] text-[var(--muted)]"
+                              }`}
+                            >
+                              {probe?.ok === false
+                                ? "超时"
+                                : probe?.latency_ms != null
+                                  ? `${Math.round(probe.latency_ms)} ms`
+                                  : "未测速"}
+                            </span>
+                            {(probe?.up_mbps != null || probe?.down_mbps != null) && (
+                              <div className="flex flex-col leading-tight text-[11px]">
+                                {probe?.up_mbps != null && (
+                                  <span className="whitespace-nowrap font-medium text-[var(--coral)]">
+                                    ↑{probe.up_mbps.toFixed(1)}M
+                                  </span>
+                                )}
+                                {probe?.down_mbps != null && (
+                                  <span className="whitespace-nowrap font-medium text-[var(--sky)]">
+                                    ↓
+                                    {probe.down_mbps >= 100
+                                      ? Math.round(probe.down_mbps)
+                                      : probe.down_mbps.toFixed(1)}
+                                    M
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span
+                              className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
+                                probe?.google_clean === true
+                                  ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                  : probe?.google_clean === false
+                                    ? "bg-[var(--red-soft)] text-[var(--red)]"
+                                    : "bg-[var(--bg-elevated)] text-[var(--muted)]"
+                              }`}
+                            >
+                              {probe?.google_clean === true
+                                ? "谷歌正常"
                                 : probe?.google_clean === false
-                                  ? "地区异常"
-                                  : "未检测"}
-                          </span>
+                                  ? "谷歌送中"
+                                  : "未测地区"}
+                            </span>
 
-                          <span
-                            className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
-                              probe?.keepalive_60s_ok === true
-                                ? "bg-[var(--green-soft)] text-[var(--green)]"
-                                : probe?.keepalive_60s_ok === false
-                                  ? "bg-[var(--red-soft)] text-[var(--red)]"
-                                  : "bg-[var(--bg-elevated)] text-[var(--muted)]"
-                            }`}
-                          >
-                            {probe?.keepalive_60s_ok === true
-                              ? "长连接稳"
-                              : probe?.keepalive_60s_ok === false
-                                ? "易断连"
-                                : "未测稳定"}
-                          </span>
+                            {probe?.google_risk_mismatch && (
+                              <span
+                                className="whitespace-nowrap rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 font-medium text-[var(--amber)]"
+                                title="不同网站识别出的地区存在差异，仅供参考"
+                              >
+                                地区有偏差
+                              </span>
+                            )}
 
-                          <span
-                            title={aiInfo.detail}
-                            className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
-                              aiInfo.passed > 0
-                                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
-                                : "bg-[var(--bg-elevated)] text-[var(--muted)]"
-                            }`}
-                          >
-                            {aiInfo.total > 0
-                              ? `AI ${aiInfo.passed}/${aiInfo.total}`
-                              : "AI 未测"}
-                          </span>
+                            {aiInfo.unlockedLabels.length > 0 ? (
+                              <span
+                                title={aiInfo.detail}
+                                className="inline-flex flex-wrap items-center gap-1"
+                              >
+                                {aiInfo.unlockedLabels.map((lbl) => (
+                                  <span
+                                    key={lbl}
+                                    className="whitespace-nowrap rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 font-medium text-[var(--accent)]"
+                                  >
+                                    {lbl}
+                                  </span>
+                                ))}
+                              </span>
+                            ) : (
+                              <span
+                                title={aiInfo.detail}
+                                className="whitespace-nowrap rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--muted)]"
+                              >
+                                {aiInfo.total > 0 ? "AI 受限" : "AI 未测"}
+                              </span>
+                            )}
+
+                            {probe?.keepalive_60s_ok !== null &&
+                              probe?.keepalive_60s_ok !== undefined && (
+                                <span
+                                  className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
+                                    probe.keepalive_60s_ok
+                                      ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                      : "bg-[var(--red-soft)] text-[var(--red)]"
+                                  }`}
+                                >
+                                  {probe.keepalive_60s_ok ? "长连接稳" : "易断连"}
+                                </span>
+                              )}
+                          </div>
                         </div>
                       </td>
 
                       {/* Single-Node Relay 3-State Override */}
-                      <td className="min-w-[196px] whitespace-nowrap px-3 py-3 align-middle">
+                      <td className="w-[148px] whitespace-nowrap px-2 py-2.5 align-middle">
                         <div className="flex flex-col gap-1">
                           <div className="inline-flex w-fit shrink-0 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[10px]">
                             {(
@@ -4184,7 +4417,7 @@ export function NodesSubsPage() {
                                   onClick={() =>
                                     void handleSetPreAccelOverride([node.id], opt.value)
                                   }
-                                  className={`shrink-0 whitespace-nowrap rounded-md px-2 py-0.5 transition-colors ${
+                                  className={`shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 transition-colors ${
                                     active
                                       ? activeClass
                                       : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -4199,40 +4432,70 @@ export function NodesSubsPage() {
                             <span className="whitespace-nowrap text-[10px] text-[var(--muted)]">
                               当前：
                               {effectiveGlobalPreAccel
-                                ? "自动走中转加速"
+                                ? "自动走中转"
                                 : node.is_443_native &&
                                     globalPreAccel.skip_443_native
-                                  ? "高速直连免中转"
+                                  ? "直连免中转"
                                   : "全局中转已关"}
                             </span>
                           )}
                         </div>
                       </td>
 
-                      {/* Single-Node Quick Group Action */}
-                      <td className="w-[108px] min-w-[108px] whitespace-nowrap px-3.5 py-3 text-right align-middle">
-                        <button
-                          type="button"
-                          disabled={!targetGroup}
-                          onClick={() => void handleToggleSingleGroupMember(node.id)}
-                          className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                            inTargetGroup
-                              ? "border-[var(--green)] bg-[var(--green-soft)] text-[var(--green)] hover:opacity-85"
-                              : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)]"
-                          }`}
-                        >
-                          {inTargetGroup ? (
-                            <>
-                              <Check className="h-3 w-3 shrink-0" />
-                              已在组
-                            </>
-                          ) : (
-                            <>
-                              <Plus className="h-3 w-3 shrink-0" />
-                              加组
-                            </>
-                          )}
-                        </button>
+                      {/* Single-Node Use & Quick Group Actions */}
+                      <td className="w-[148px] whitespace-nowrap px-2 py-2.5 text-right align-middle">
+                        <div className="inline-flex flex-nowrap items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            disabled={isSingleActive || isSwitchingSingle}
+                            onClick={() => void handleSelectSingleNode(node.id)}
+                            title={
+                              isSingleActive
+                                ? "当前正处于单节点模式并使用此节点"
+                                : "切换为单节点模式，固定使用此节点"
+                            }
+                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-semibold transition-colors disabled:cursor-default ${
+                              isSingleActive
+                                ? "border-[var(--green)] bg-[var(--green)] text-[var(--accent-ink)]"
+                                : "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-ink)] disabled:opacity-60"
+                            }`}
+                          >
+                            {isSingleActive ? (
+                              <>
+                                <Check className="h-3 w-3 shrink-0" />
+                                <span>在用</span>
+                              </>
+                            ) : (
+                              <>
+                                <Play className="h-2.5 w-2.5 shrink-0 fill-current" />
+                                <span>{isSwitchingSingle ? "切换中" : "用它"}</span>
+                              </>
+                            )}
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={!targetGroup}
+                            onClick={() => void handleToggleSingleGroupMember(node.id)}
+                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
+                              inTargetGroup
+                                ? "border-[var(--green)] bg-[var(--green-soft)] text-[var(--green)] hover:opacity-85"
+                                : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)]"
+                            }`}
+                          >
+                            {inTargetGroup ? (
+                              <>
+                                <Check className="h-3 w-3 shrink-0" />
+                                <span>已在组</span>
+                              </>
+                            ) : (
+                              <>
+                                <Plus className="h-3 w-3 shrink-0" />
+                                <span>加组</span>
+                              </>
+                            )}
+                          </button>
+                        </div>
                       </td>
                     </tr>
                   );
@@ -4274,6 +4537,77 @@ export function NodesSubsPage() {
         onClose={closeProcessAttach}
         onAttachSource={handleProcessAttach}
       />
+
+      {/* Delete Subscription Two-Step Confirmation Modal */}
+      {pendingDeleteSub && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+          onClick={() => {
+            if (!deletingSub) setPendingDeleteSub(null);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="确认删除订阅"
+            onClick={(e) => e.stopPropagation()}
+            className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--red-soft)] text-[var(--red)]">
+                  <AlertTriangle className="h-4 w-4" />
+                </span>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-[var(--text)]">
+                    确认删除整条订阅？
+                  </h3>
+                  <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                    即将删除订阅「
+                    <span className="font-semibold text-[var(--text)]">
+                      {pendingDeleteSub.name}
+                    </span>
+                    」，并同时移除该订阅下的{" "}
+                    <strong className="cc-mono text-[var(--red)]">
+                      {subNodeCountMap.get(pendingDeleteSub.id) ?? 0} 个节点
+                    </strong>
+                    。此操作无法撤销，请确认后再继续。
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={deletingSub}
+                onClick={() => setPendingDeleteSub(null)}
+                className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+                aria-label="关闭弹窗"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={deletingSub}
+                onClick={() => setPendingDeleteSub(null)}
+                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={deletingSub}
+                onClick={() => void handleConfirmRemoveSubscription()}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--red)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>{deletingSub ? "删除中…" : "确认删除"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

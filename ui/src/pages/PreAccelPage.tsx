@@ -408,6 +408,17 @@ function formatClockStamp(isoOrNow?: string): string {
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
+function isUdpOnlyProto(proto: string): boolean {
+  const p = proto.trim().toLowerCase();
+  return (
+    p === "hysteria2" ||
+    p === "hy2" ||
+    p === "hysteria" ||
+    p === "tuic" ||
+    p === "wireguard"
+  );
+}
+
 const INPUT_CLS =
   "w-full rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-xs text-[var(--text)] outline-none transition-colors focus:border-[var(--accent)]";
 
@@ -415,6 +426,7 @@ export function PreAccelPage() {
   const config = useAppSelector((s) => s.config);
   const runtime = useAppSelector((s) => s.runtime);
   const storeRelays = useAppSelector((s) => s.preAccelRelays);
+  const groups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const initialized = useAppSelector((s) => s.initialized);
   const inTauri = isTauriEnv();
@@ -458,6 +470,8 @@ export function PreAccelPage() {
   const [showProbeModal, setShowProbeModal] = useState(false);
   const [showGuideModal, setShowGuideModal] = useState(false);
   const [copiedGuide, setCopiedGuide] = useState(false);
+  const [pendingDeleteRelay, setPendingDeleteRelay] = useState<PreAccelRelay | null>(null);
+  const [deletingRelay, setDeletingRelay] = useState(false);
 
   // Real Pre-Accel vs Direct Speed Comparison Card
   const [benchmarking, setBenchmarking] = useState(false);
@@ -526,11 +540,14 @@ export function PreAccelPage() {
   }, []);
 
   useEffect(() => {
-    if (!showAddModal && !showProbeModal && !showGuideModal) return;
+    if (!showAddModal && !showProbeModal && !showGuideModal && !pendingDeleteRelay) return;
     const handleKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") {
         if (!savingManual && !importing) {
           setShowAddModal(false);
+        }
+        if (!deletingRelay) {
+          setPendingDeleteRelay(null);
         }
         setShowProbeModal(false);
         setShowGuideModal(false);
@@ -538,7 +555,15 @@ export function PreAccelPage() {
     };
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [showAddModal, showProbeModal, showGuideModal, savingManual, importing]);
+  }, [
+    showAddModal,
+    showProbeModal,
+    showGuideModal,
+    pendingDeleteRelay,
+    savingManual,
+    importing,
+    deletingRelay,
+  ]);
 
   const scheduleTimer = (fn: () => void, ms: number) => {
     const id = window.setTimeout(() => {
@@ -602,11 +627,32 @@ export function PreAccelPage() {
     return sortedRelays.find((r) => r.enabled)?.id ?? null;
   }, [sortedRelays, runtime.preaccel_relay_name]);
 
+  const homeCurrentNode = useMemo(() => {
+    if (nodes.length === 0) return null;
+    if (runtime.active_node_id) {
+      const byRuntime = nodes.find((n) => n.id === runtime.active_node_id);
+      if (byRuntime) return byRuntime;
+    }
+    if (runtime.route_mode !== "single") {
+      const activeGroup =
+        groups.find((g) => g.id === runtime.active_group_id) ?? groups[0] ?? null;
+      if (activeGroup?.active_node_id) {
+        const byGroupActive = nodes.find((n) => n.id === activeGroup.active_node_id);
+        if (byGroupActive) return byGroupActive;
+      }
+      if (activeGroup && activeGroup.member_node_ids.length > 0) {
+        const firstMember = nodes.find((n) => activeGroup.member_node_ids.includes(n.id));
+        if (firstMember) return firstMember;
+      }
+    }
+    return null;
+  }, [nodes, groups, runtime.active_node_id, runtime.active_group_id, runtime.route_mode]);
+
+  const isHomeCurrentNodeUdpOnly = homeCurrentNode
+    ? isUdpOnlyProto(homeCurrentNode.protocol)
+    : false;
+
   const benchmarkableNodes = useMemo(() => {
-    const isUdpOnlyProto = (proto: string) => {
-      const p = proto.trim().toLowerCase();
-      return p === "hysteria2" || p === "hy2" || p === "hysteria" || p === "tuic" || p === "wireguard";
-    };
     const isInfoPlaceholder = (name: string) =>
       /剩余流量|过期时间|到期时间|重置|套餐|官网|发布页|续费地址|使用前|更新订阅/i.test(name);
     const enabledList = nodes.filter(
@@ -627,15 +673,23 @@ export function PreAccelPage() {
     });
   }, [nodes, runtime.active_node_id]);
 
+  const otherBenchmarkableNodes = useMemo(
+    () =>
+      homeCurrentNode
+        ? benchmarkableNodes.filter((n) => n.id !== homeCurrentNode.id)
+        : benchmarkableNodes,
+    [benchmarkableNodes, homeCurrentNode]
+  );
+
   const resolvedCompareNodeId = useMemo(() => {
     if (
       selectedCompareNodeId &&
-      benchmarkableNodes.some((n) => n.id === selectedCompareNodeId)
+      otherBenchmarkableNodes.some((n) => n.id === selectedCompareNodeId)
     ) {
       return selectedCompareNodeId;
     }
     return "";
-  }, [benchmarkableNodes, selectedCompareNodeId]);
+  }, [otherBenchmarkableNodes, selectedCompareNodeId]);
 
   const openAddModal = (tab: AddModalTab = "manual") => {
     setAddModalTab(tab);
@@ -1085,15 +1139,21 @@ export function PreAccelPage() {
     }
   };
 
-  const handleRemoveRelay = async (id: string) => {
+  const handleConfirmRemoveRelay = async () => {
+    if (!pendingDeleteRelay || deletingRelay) return;
+    const target = pendingDeleteRelay;
+    setDeletingRelay(true);
     try {
-      await catcloudApi.deletePreAccelRelay(id);
-      const next = relays.filter((r) => r.id !== id);
+      await catcloudApi.deletePreAccelRelay(target.id);
+      const next = relays.filter((r) => r.id !== target.id);
       setRelays(next);
       appActions.syncPreAccelRelays(next);
-      appActions.showToast("已删除该中转线路", "info");
+      setPendingDeleteRelay(null);
+      appActions.showToast(`已删除中转线路「${target.name}」`, "info");
     } catch (err) {
       appActions.showToast(`删除线路失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setDeletingRelay(false);
     }
   };
 
@@ -1662,7 +1722,7 @@ export function PreAccelPage() {
 
                     <button
                       type="button"
-                      onClick={() => void handleRemoveRelay(relay.id)}
+                      onClick={() => setPendingDeleteRelay(relay)}
                       className="inline-flex items-center gap-1 text-[var(--muted)] transition-colors hover:text-[var(--red)]"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
@@ -1709,7 +1769,7 @@ export function PreAccelPage() {
                 </h2>
               </div>
               <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted)]">
-                选一个海外节点，现场对比「走国内中转」和「普通直连」的真实上传、下载速度
+                默认直接拿首页当前节点对比「走国内中转」和「普通直连」的真实上传、下载速度（也可下拉换测其它节点）
               </p>
             </div>
             <button
@@ -1750,16 +1810,20 @@ export function PreAccelPage() {
               >
                 对照节点
               </label>
-              {benchmarkableNodes.length > 0 ? (
+              {benchmarkableNodes.length > 0 || homeCurrentNode ? (
                 <select
                   id="preaccel-compare-node"
                   value={resolvedCompareNodeId}
                   disabled={benchmarking}
                   onChange={(e) => setSelectedCompareNodeId(e.target.value)}
-                  className="max-w-[190px] truncate rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none transition-colors focus:border-[var(--accent)] disabled:opacity-60"
+                  className="max-w-[240px] truncate rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none transition-colors focus:border-[var(--accent)] disabled:opacity-60"
                 >
-                  <option value="">自动推荐海外节点</option>
-                  {benchmarkableNodes.map((node) => (
+                  <option value="">
+                    {homeCurrentNode
+                      ? `跟随首页当前节点（${homeCurrentNode.name}）`
+                      : "跟随首页当前节点"}
+                  </option>
+                  {otherBenchmarkableNodes.map((node) => (
                     <option key={node.id} value={node.id}>
                       {node.name}
                     </option>
@@ -1770,6 +1834,15 @@ export function PreAccelPage() {
               )}
             </div>
           </div>
+
+          {resolvedCompareNodeId === "" && isHomeCurrentNodeUdpOnly && (
+            <div className="mb-3 flex items-start gap-2 rounded-xl border border-[var(--amber)]/35 bg-[var(--amber-soft)]/55 px-3.5 py-2 text-[11px] leading-relaxed text-[var(--amber)]">
+              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+              <span>
+                首页当前节点为纯 UDP 协议，无法套 TCP 中转；点击对比时将自动改测其它可用节点，或请直接从右侧下拉指定
+              </span>
+            </div>
+          )}
 
           {!comparison ? (
             <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-[var(--line-strong)] bg-[var(--bg-elevated)]/65 px-5 py-9 text-center">
@@ -1807,46 +1880,55 @@ export function PreAccelPage() {
           ) : (
             <>
               {/* 本次实测对照组合 + 提速倍数徽章 */}
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--accent)]/35 bg-[var(--accent-soft)]/35 px-3.5 py-2 text-[11px]">
-                <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[var(--text-secondary)]">
-                  <span className="shrink-0 text-[var(--muted)]">本次对照：</span>
-                  <span className="truncate font-semibold text-[var(--text)]">
-                    {comparison.relay_name}
-                  </span>
-                  <span className="text-[var(--muted)]">+</span>
-                  <span className="truncate font-semibold text-[var(--text)]">
-                    {comparison.node_name}
-                  </span>
-                  {comparisonIsDemo && (
-                    <span className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                      演示数据
+              <div className="mb-3 rounded-xl border border-[var(--accent)]/35 bg-[var(--accent-soft)]/35 px-3.5 py-2 text-[11px]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[var(--text-secondary)]">
+                    <span className="shrink-0 text-[var(--muted)]">本次对照：</span>
+                    <span className="truncate font-semibold text-[var(--text)]">
+                      {comparison.relay_name}
                     </span>
-                  )}
+                    <span className="text-[var(--muted)]">+</span>
+                    <span className="truncate font-semibold text-[var(--text)]">
+                      {comparison.node_name}
+                    </span>
+                    {comparisonIsDemo && (
+                      <span className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                        演示数据
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    {effectiveUpRatio !== null && (
+                      <span
+                        className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
+                          effectiveUpRatio >= 1.1
+                            ? "bg-[var(--green)] text-[var(--accent-ink)]"
+                            : "border border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)]"
+                        }`}
+                      >
+                        <Zap className="h-3 w-3" />
+                        <span>
+                          {effectiveUpRatio >= 1.1
+                            ? `上传提速 ${effectiveUpRatio.toFixed(1)} 倍`
+                            : `上传约 ${effectiveUpRatio.toFixed(1)} 倍`}
+                        </span>
+                      </span>
+                    )}
+                    {effectiveDownRatio !== null && effectiveDownRatio >= 1.1 && (
+                      <span className="rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--accent)]">
+                        下载 {effectiveDownRatio.toFixed(1)} 倍
+                      </span>
+                    )}
+                  </div>
                 </div>
 
-                <div className="flex shrink-0 items-center gap-1.5">
-                  {effectiveUpRatio !== null && (
-                    <span
-                      className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
-                        effectiveUpRatio >= 1.1
-                          ? "bg-[var(--green)] text-[var(--accent-ink)]"
-                          : "border border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)]"
-                      }`}
-                    >
-                      <Zap className="h-3 w-3" />
-                      <span>
-                        {effectiveUpRatio >= 1.1
-                          ? `上传提速 ${effectiveUpRatio.toFixed(1)} 倍`
-                          : `上传约 ${effectiveUpRatio.toFixed(1)} 倍`}
-                      </span>
-                    </span>
-                  )}
-                  {effectiveDownRatio !== null && effectiveDownRatio >= 1.1 && (
-                    <span className="rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--accent)]">
-                      下载 {effectiveDownRatio.toFixed(1)} 倍
-                    </span>
-                  )}
-                </div>
+                {comparison.fallback_reason?.trim() && (
+                  <div className="mt-2 flex items-start gap-1.5 border-t border-[var(--accent)]/20 pt-2 leading-relaxed text-[var(--amber)]">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{comparison.fallback_reason.trim()}</span>
+                  </div>
+                )}
               </div>
 
               <div className="space-y-3">
@@ -2692,6 +2774,76 @@ export function PreAccelPage() {
               >
                 {copiedGuide ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                 <span>{copiedGuide ? "已复制到剪贴板" : "一键复制说明"}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ====================================================================
+       * 弹窗 4：删除中转线路二次确认
+       * ==================================================================== */}
+      {pendingDeleteRelay && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+          onClick={() => {
+            if (!deletingRelay) setPendingDeleteRelay(null);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="确认删除国内中转机"
+            onClick={(e) => e.stopPropagation()}
+            className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-start gap-3">
+                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--red-soft)] text-[var(--red)]">
+                  <AlertTriangle className="h-4 w-4" />
+                </span>
+                <div className="min-w-0">
+                  <h3 className="text-sm font-semibold text-[var(--text)]">
+                    确认删除国内中转机？
+                  </h3>
+                  <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                    即将移除中转线路「
+                    <span className="font-semibold text-[var(--text)]">
+                      {pendingDeleteRelay.name}
+                    </span>
+                    」（<span className="cc-mono">{pendingDeleteRelay.server}:{pendingDeleteRelay.port}</span>
+                    ）。删除后无法撤销，如仍在使用将自动回落至其它中转或直连。
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                disabled={deletingRelay}
+                onClick={() => setPendingDeleteRelay(null)}
+                className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+                aria-label="关闭弹窗"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                disabled={deletingRelay}
+                onClick={() => setPendingDeleteRelay(null)}
+                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                disabled={deletingRelay}
+                onClick={() => void handleConfirmRemoveRelay()}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--red)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>{deletingRelay ? "删除中…" : "确认删除"}</span>
               </button>
             </div>
           </div>

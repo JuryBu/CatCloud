@@ -457,4 +457,55 @@ mod tests {
         bad_ext.target_url = "echo ok\nrm -rf /".to_string();
         assert!(validate_definition(&bad_ext).is_err());
     }
+
+    #[test]
+    fn semantic_ai_unlock_probe_definitions_validate_and_map_to_l1() {
+        let mut reg = ProbeRegistry::new();
+        let defs = [
+            ProbeDefinition {
+                id: "builtin_unlock_claude".to_string(),
+                name: "Claude / Anthropic 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://api.anthropic.com/v1/messages".to_string(),
+                method: "POST".to_string(),
+                expected_status: None,
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+            ProbeDefinition {
+                id: "builtin_unlock_chatgpt".to_string(),
+                name: "ChatGPT / OpenAI 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://api.openai.com/v1/models".to_string(),
+                method: "GET".to_string(),
+                expected_status: None,
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+            ProbeDefinition {
+                id: "builtin_unlock_gemini".to_string(),
+                name: "Gemini / Google AI 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
+                method: "GET".to_string(),
+                expected_status: None,
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+        ];
+
+        for def in defs {
+            validate_definition(&def).expect("semantic AI unlock probe must validate");
+            reg.register(def).expect("register semantic AI unlock probe");
+        }
+
+        let l1 = reg.select_funnel_tier(FunnelTier::L1CleanAndUnlock);
+        assert_eq!(l1.len(), 3);
+    }
 }

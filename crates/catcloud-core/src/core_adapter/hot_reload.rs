@@ -1,12 +1,16 @@
 use crate::config::{load_or_default, validate_config};
 use crate::core_adapter::binary_resolver::resolve_mihomo_binary;
-use crate::core_adapter::config_compiler::{CompileInput, compile_mihomo_config};
+use crate::core_adapter::config_compiler::{
+    CompileInput, compile_mihomo_config_with_runtime_dir,
+};
 use crate::core_adapter::mihomo::{
     MihomoAdapter, generate_controller_secret, verify_config_with_binary,
 };
-use crate::core_adapter::port_guard::{AllocatedPorts, allocate_safe_ports};
+use crate::core_adapter::port_guard::{
+    AllocatedPorts, PortShiftNotice, allocate_safe_ports_for_hosts, is_port_available_tcp_udp,
+};
 use crate::core_adapter::stream_client::StreamCancelToken;
-use crate::core_adapter::{CoreStartRequest, ReloadLevel, ReloadOutcome};
+use crate::core_adapter::{CoreRuntimeStatus, CoreStartRequest, ReloadLevel, ReloadOutcome};
 use crate::error::{CatError, CatResult};
 use crate::models::{AppConfig, MultiGroup, PreAccelRelay, ProxyNode};
 use crate::paths::AppPaths;
@@ -16,7 +20,7 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -157,7 +161,9 @@ pub fn classify_config_diff(old: &AppConfig, new: &AppConfig) -> ReloadLevel {
         return ReloadLevel::L3CoreRestart;
     }
 
-    let requires_l2 = old.active_group_id != new.active_group_id
+    let requires_l2 = old.route_mode != new.route_mode
+        || old.active_single_node_id != new.active_single_node_id
+        || old.active_group_id != new.active_group_id
         || old.controller_secret != new.controller_secret
         || old.unified_delay != new.unified_delay
         || old.tcp_concurrent != new.tcp_concurrent
@@ -165,7 +171,10 @@ pub fn classify_config_diff(old: &AppConfig, new: &AppConfig) -> ReloadLevel {
         || old.log_level != new.log_level
         || old.core_ipv6 != new.core_ipv6
         || old.dns != new.dns
+        || old.dns.direct_nameserver != new.dns.direct_nameserver
         || old.rules_override != new.rules_override
+        || old.rules_override.block_quic_udp_443 != new.rules_override.block_quic_udp_443
+        || old.rules_override.domestic_direct_enabled != new.rules_override.domestic_direct_enabled
         || old.geodata != new.geodata
         || old.preaccel != new.preaccel
         || old.core_runtime.store_selected != new.core_runtime.store_selected
@@ -249,6 +258,7 @@ pub struct HotReloadCoordinator {
     adapter: Arc<MihomoAdapter>,
     state: Arc<Mutex<CoordinatorState>>,
     op_lock: Arc<Mutex<()>>,
+    extra_binary_candidates: Arc<RwLock<Vec<PathBuf>>>,
 }
 
 impl HotReloadCoordinator {
@@ -258,7 +268,23 @@ impl HotReloadCoordinator {
             adapter,
             state: Arc::new(Mutex::new(CoordinatorState::default())),
             op_lock: Arc::new(Mutex::new(())),
+            extra_binary_candidates: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    pub fn set_extra_binary_candidates(&self, candidates: Vec<PathBuf>) {
+        let mut guard = self
+            .extra_binary_candidates
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = candidates;
+    }
+
+    fn extra_binary_candidates_snapshot(&self) -> Vec<PathBuf> {
+        self.extra_binary_candidates
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub fn paths(&self) -> &AppPaths {
@@ -437,19 +463,9 @@ impl HotReloadCoordinator {
             },
         };
 
+        let current_status = self.adapter.runtime_status().await;
         let mut allocated_ports = if level == ReloadLevel::L3CoreRestart {
-            let bind_host = if new_cfg.allow_lan {
-                new_cfg.bind_address.as_str()
-            } else {
-                "127.0.0.1"
-            };
-            match allocate_safe_ports(
-                bind_host,
-                new_cfg.mixed_port,
-                new_cfg.controller_port,
-                new_cfg.dns_listen_port,
-                new_cfg.port_guard_auto_shift,
-            ) {
+            match allocate_l3_ports_respecting_running_core(&new_cfg, &current_status) {
                 Ok(p) => p,
                 Err(err) => {
                     return rejected_outcome(
@@ -485,7 +501,10 @@ impl HotReloadCoordinator {
             group_filtered_members: &options.group_filtered_members,
         };
 
-        let compiled = match compile_mihomo_config(&compile_input) {
+        let compiled = match compile_mihomo_config_with_runtime_dir(
+            &compile_input,
+            Some(&self.paths.runtime_dir),
+        ) {
             Ok(c) => c,
             Err(err) => {
                 return rejected_outcome(level, format!("YAML compilation failed: {err}"));
@@ -544,8 +563,10 @@ impl HotReloadCoordinator {
             );
         }
 
-        let resolved_binary =
-            resolve_mihomo_binary(&new_cfg, &self.paths, &[], false).ok().and_then(|r| r.path);
+        let extra_candidates = self.extra_binary_candidates_snapshot();
+        let resolved_binary = resolve_mihomo_binary(&new_cfg, &self.paths, &extra_candidates, false)
+            .ok()
+            .and_then(|r| r.path);
 
         if options.verify_with_binary {
             if let Some(ref bin_path) = resolved_binary {
@@ -591,7 +612,7 @@ impl HotReloadCoordinator {
         let mut applied_binary_path: Option<PathBuf> = None;
         let replayed_groups = if level == ReloadLevel::L3CoreRestart && options.allow_l3_restart {
             let bin_path = resolved_binary.expect("validated binary path above");
-            // Capture previous running core snapshot BEFORE `start_with_request` stops/overwrites state.
+            // Capture previous running core snapshot BEFORE stopping/overwriting state.
             let prev_status = self.adapter.runtime_status().await;
             let prev_adapter_selections = self.adapter.active_selections_snapshot().await;
             let prev_adapter_secret = self.adapter.controller_secret().await;
@@ -607,7 +628,7 @@ impl HotReloadCoordinator {
                         .clone()
                         .or_else(|| prev_bin.clone())
                         .or_else(|| {
-                            resolve_mihomo_binary(old_cfg, &self.paths, &[], false)
+                            resolve_mihomo_binary(old_cfg, &self.paths, &extra_candidates, false)
                                 .ok()
                                 .and_then(|r| r.path)
                         })
@@ -660,11 +681,58 @@ impl HotReloadCoordinator {
                 None
             };
 
+            let prev_tun_enabled = prev_cfg
+                .as_ref()
+                .map(|c| c.tun.enabled)
+                .unwrap_or_else(|| {
+                    previous_runtime_yaml
+                        .as_deref()
+                        .and_then(|bytes| {
+                            serde_yaml_ng::from_slice::<serde_yaml_ng::Value>(bytes).ok()
+                        })
+                        .and_then(|doc| {
+                            doc.get("tun")
+                                .and_then(|t| t.get("enable"))
+                                .and_then(|v| v.as_bool())
+                        })
+                        .unwrap_or(false)
+                });
+
+            let proxy_host = if new_cfg.allow_lan {
+                new_cfg.bind_address.as_str()
+            } else {
+                "127.0.0.1"
+            };
             let controller_host = if new_cfg.allow_lan {
                 new_cfg.controller_host.clone()
             } else {
                 "127.0.0.1".to_string()
             };
+            let dns_host = if new_cfg.allow_lan {
+                new_cfg.dns_listen_host.as_str()
+            } else {
+                "127.0.0.1"
+            };
+
+            // Before restarting the core: gracefully tear down TUN if active, then explicitly stop
+            // the running core and allow any retained ports to finish releasing before spawning.
+            if prev_status.running {
+                if prev_tun_enabled {
+                    let _ = self.adapter.disable_tun_gracefully().await;
+                }
+                let _ = self.adapter.stop_process().await;
+                if prev_status.pid.is_some() {
+                    wait_for_reused_ports_release(
+                        proxy_host,
+                        &controller_host,
+                        dns_host,
+                        &allocated_ports,
+                        &prev_status,
+                    )
+                    .await;
+                }
+            }
+
             let req = CoreStartRequest {
                 binary_path: bin_path.clone(),
                 working_dir: self.paths.runtime_dir.clone(),
@@ -957,6 +1025,206 @@ impl Drop for ConfigWatcherHandle {
     }
 }
 
+const L3_PORT_MAX_SHIFT_PROBES: u16 = 512;
+const L3_PORT_WRAP_MIN: u16 = 10240;
+
+fn normalize_l3_bind_host(host: &str) -> &str {
+    let trimmed = host.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        "0.0.0.0"
+    } else {
+        trimmed
+    }
+}
+
+fn next_l3_probe_port(current: u16) -> u16 {
+    if current == u16::MAX {
+        L3_PORT_WRAP_MIN
+    } else {
+        current + 1
+    }
+}
+
+/// Allocate L3 restart ports while preserving any port currently bound by our own running core,
+/// preventing `port_guard` false conflicts or upward port drift when restarting Mihomo.
+fn allocate_l3_ports_respecting_running_core(
+    new_cfg: &AppConfig,
+    prev_status: &CoreRuntimeStatus,
+) -> CatResult<AllocatedPorts> {
+    let proxy_host = if new_cfg.allow_lan {
+        new_cfg.bind_address.as_str()
+    } else {
+        "127.0.0.1"
+    };
+    let controller_host = if new_cfg.allow_lan {
+        new_cfg.controller_host.as_str()
+    } else {
+        "127.0.0.1"
+    };
+    let dns_host = if new_cfg.allow_lan {
+        new_cfg.dns_listen_host.as_str()
+    } else {
+        "127.0.0.1"
+    };
+
+    if !prev_status.running {
+        return allocate_safe_ports_for_hosts(
+            proxy_host,
+            controller_host,
+            dns_host,
+            new_cfg.mixed_port,
+            new_cfg.controller_port,
+            new_cfg.dns_listen_port,
+            new_cfg.port_guard_auto_shift,
+        );
+    }
+
+    let mut owned_by_prev_core: HashSet<u16> = HashSet::with_capacity(3);
+    if prev_status.mixed_port > 0 {
+        owned_by_prev_core.insert(prev_status.mixed_port);
+    }
+    if prev_status.controller_port > 0 {
+        owned_by_prev_core.insert(prev_status.controller_port);
+    }
+    if prev_status.dns_listen_port > 0 {
+        owned_by_prev_core.insert(prev_status.dns_listen_port);
+    }
+
+    let mut reserved = HashSet::with_capacity(3);
+    let mut shifted = Vec::new();
+
+    let mixed_port = allocate_single_l3_role(
+        "mixed",
+        proxy_host,
+        new_cfg.mixed_port,
+        new_cfg.port_guard_auto_shift,
+        &owned_by_prev_core,
+        &mut reserved,
+        &mut shifted,
+    )?;
+    let controller_port = allocate_single_l3_role(
+        "controller",
+        controller_host,
+        new_cfg.controller_port,
+        new_cfg.port_guard_auto_shift,
+        &owned_by_prev_core,
+        &mut reserved,
+        &mut shifted,
+    )?;
+    let dns_port = allocate_single_l3_role(
+        "dns",
+        dns_host,
+        new_cfg.dns_listen_port,
+        new_cfg.port_guard_auto_shift,
+        &owned_by_prev_core,
+        &mut reserved,
+        &mut shifted,
+    )?;
+
+    Ok(AllocatedPorts {
+        bind_host: normalize_l3_bind_host(proxy_host).to_string(),
+        mixed_port,
+        controller_port,
+        dns_port,
+        shifted,
+    })
+}
+
+fn allocate_single_l3_role(
+    role: &str,
+    host: &str,
+    desired: u16,
+    auto_shift: bool,
+    owned_by_prev_core: &HashSet<u16>,
+    reserved: &mut HashSet<u16>,
+    shifted: &mut Vec<PortShiftNotice>,
+) -> CatResult<u16> {
+    if desired == 0 {
+        return Err(CatError::Core(format!(
+            "port_guard: desired {role} port cannot be 0"
+        )));
+    }
+
+    if !reserved.contains(&desired)
+        && (owned_by_prev_core.contains(&desired) || is_port_available_tcp_udp(host, desired))
+    {
+        reserved.insert(desired);
+        return Ok(desired);
+    }
+
+    let reason = if reserved.contains(&desired) {
+        format!("port {desired} collides with another CatCloud listener role")
+    } else {
+        format!("port {desired} on `{host}` is already occupied on TCP or UDP")
+    };
+
+    if !auto_shift {
+        return Err(CatError::Core(format!(
+            "port_guard: cannot bind {role} listener ({reason}); auto_shift is disabled"
+        )));
+    }
+
+    let mut candidate = next_l3_probe_port(desired);
+    for _ in 0..L3_PORT_MAX_SHIFT_PROBES {
+        if !reserved.contains(&candidate)
+            && (owned_by_prev_core.contains(&candidate)
+                || is_port_available_tcp_udp(host, candidate))
+        {
+            reserved.insert(candidate);
+            shifted.push(PortShiftNotice {
+                role: role.to_string(),
+                desired_port: desired,
+                actual_port: candidate,
+                reason,
+            });
+            return Ok(candidate);
+        }
+        candidate = next_l3_probe_port(candidate);
+    }
+
+    Err(CatError::Core(format!(
+        "port_guard: exhausted {L3_PORT_MAX_SHIFT_PROBES} upward probes for {role} port starting from {desired} on `{host}`"
+    )))
+}
+
+async fn wait_for_reused_ports_release(
+    proxy_host: &str,
+    controller_host: &str,
+    dns_host: &str,
+    ports: &AllocatedPorts,
+    prev_status: &CoreRuntimeStatus,
+) {
+    let prev_ports = [
+        prev_status.mixed_port,
+        prev_status.controller_port,
+        prev_status.dns_listen_port,
+    ];
+    let mut watched: Vec<(&str, u16)> = Vec::new();
+    if prev_ports.contains(&ports.mixed_port) {
+        watched.push((proxy_host, ports.mixed_port));
+    }
+    if prev_ports.contains(&ports.controller_port) {
+        watched.push((controller_host, ports.controller_port));
+    }
+    if prev_ports.contains(&ports.dns_port) {
+        watched.push((dns_host, ports.dns_port));
+    }
+    if watched.is_empty() {
+        return;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if watched
+            .iter()
+            .all(|(host, port)| is_port_available_tcp_udp(host, *port))
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn rejected_outcome(level: ReloadLevel, error: String) -> ReloadOutcome {
     ReloadOutcome {
         applied: false,
@@ -1051,7 +1319,7 @@ fn append_file_bytes(dst: &mut Vec<u8>, path: &Path) {
 mod tests {
     use super::*;
     use crate::config::save;
-    use crate::models::{MemoryLimitTier, OverrideMode, ProxyMode, TunStackMode};
+    use crate::models::{MemoryLimitTier, OverrideMode, ProxyMode, RouteTargetMode, TunStackMode};
     use crate::process_guard::JobGuard;
     use uuid::Uuid;
 
@@ -1128,6 +1396,13 @@ mod tests {
         l2_dns.dns.prefer_h3 = true;
         assert_eq!(classify_config_diff(&base, &l2_dns), ReloadLevel::L2HotReload);
 
+        let mut l2_direct_ns = base.clone();
+        l2_direct_ns.dns.direct_nameserver = vec!["114.114.114.114".to_string()];
+        assert_eq!(
+            classify_config_diff(&base, &l2_direct_ns),
+            ReloadLevel::L2HotReload
+        );
+
         let mut l2_rules = base.clone();
         l2_rules
             .rules_override
@@ -1135,6 +1410,21 @@ mod tests {
             .push("DOMAIN,example.com,DIRECT".to_string());
         assert_eq!(
             classify_config_diff(&base, &l2_rules),
+            ReloadLevel::L2HotReload
+        );
+
+        let mut l2_quic = base.clone();
+        l2_quic.rules_override.block_quic_udp_443 = !base.rules_override.block_quic_udp_443;
+        assert_eq!(
+            classify_config_diff(&base, &l2_quic),
+            ReloadLevel::L2HotReload
+        );
+
+        let mut l2_domestic = base.clone();
+        l2_domestic.rules_override.domestic_direct_enabled =
+            !base.rules_override.domestic_direct_enabled;
+        assert_eq!(
+            classify_config_diff(&base, &l2_domestic),
             ReloadLevel::L2HotReload
         );
 
@@ -1152,6 +1442,22 @@ mod tests {
             ReloadLevel::L2HotReload
         );
         assert!(has_core_config_changes(&base, &l2_active_group));
+
+        let mut l2_route_mode = base.clone();
+        l2_route_mode.route_mode = RouteTargetMode::Single;
+        assert_eq!(
+            classify_config_diff(&base, &l2_route_mode),
+            ReloadLevel::L2HotReload
+        );
+        assert!(has_core_config_changes(&base, &l2_route_mode));
+
+        let mut l2_single_node = base.clone();
+        l2_single_node.active_single_node_id = Some("node-jp-1".to_string());
+        assert_eq!(
+            classify_config_diff(&base, &l2_single_node),
+            ReloadLevel::L2HotReload
+        );
+        assert!(has_core_config_changes(&base, &l2_single_node));
 
         // L3: ports / TUN stack / binary path / memory tier
         let mut l3_port = base.clone();
@@ -1345,6 +1651,222 @@ mod tests {
         assert_eq!(outcome.level, ReloadLevel::L2HotReload);
         assert_eq!(adapter.controller_secret().await, new_secret);
         assert_eq!(adapter.fetch_version().await.unwrap(), "v1.19.0");
+
+        server.abort();
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[tokio::test]
+    async fn disk_reload_passes_runtime_dir_for_geodata_file_detection() {
+        let paths = temp_paths("runtime-geodata");
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter = Arc::new(MihomoAdapter::new(guard).unwrap());
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        let cfg = AppConfig::default();
+        save(&paths, &cfg).unwrap();
+
+        // Without geosite.dat / Country.mmdb in runtime_dir -> safe fallback rules, no GEOSITE/GEOIP
+        let outcome_no_geo = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                ..Default::default()
+            })
+            .await;
+        assert!(outcome_no_geo.applied, "err: {:?}", outcome_no_geo.error);
+        let yaml_no_geo = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
+        assert!(!yaml_no_geo.contains("GEOSITE,cn,DIRECT"));
+        assert!(!yaml_no_geo.contains("GEOIP,CN,DIRECT,no-resolve"));
+
+        // Place geosite.dat and Country.mmdb in runtime_dir and force reload -> GEOSITE/GEOIP enabled
+        std::fs::write(paths.runtime_dir.join("geosite.dat"), b"stub").unwrap();
+        std::fs::write(paths.runtime_dir.join("Country.mmdb"), b"stub").unwrap();
+        let outcome_with_geo = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                force: true,
+                verify_with_binary: false,
+                ..Default::default()
+            })
+            .await;
+        assert!(outcome_with_geo.applied, "err: {:?}", outcome_with_geo.error);
+        let yaml_with_geo = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
+        assert!(yaml_with_geo.contains("GEOSITE,private,DIRECT"));
+        assert!(yaml_with_geo.contains("GEOSITE,cn,DIRECT"));
+        assert!(yaml_with_geo.contains("GEOIP,CN,DIRECT,no-resolve"));
+
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[test]
+    fn l3_port_allocation_retains_running_core_ports_without_self_conflict_or_drift() {
+        use std::net::{TcpListener, UdpSocket};
+
+        fn hold_tcp_udp_port() -> (u16, TcpListener, UdpSocket) {
+            for _ in 0..64 {
+                let tcp = TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+                let port = tcp.local_addr().unwrap().port();
+                if let Ok(udp) = UdpSocket::bind(format!("127.0.0.1:{port}")) {
+                    return (port, tcp, udp);
+                }
+            }
+            panic!("failed to reserve ephemeral test port pair");
+        }
+
+        let (p_mixed, _t1, _u1) = hold_tcp_udp_port();
+        let (p_ctrl, _t2, _u2) = hold_tcp_udp_port();
+        let (p_dns, _t3, _u3) = hold_tcp_udp_port();
+        let (p_external, _t4, _u4) = hold_tcp_udp_port();
+
+        let prev_status = CoreRuntimeStatus {
+            running: true,
+            mixed_port: p_mixed,
+            controller_port: p_ctrl,
+            dns_listen_port: p_dns,
+            ..Default::default()
+        };
+
+        // Even with auto_shift=false, ports owned by the running core must be retained verbatim.
+        let mut cfg_no_shift = AppConfig::default();
+        cfg_no_shift.mixed_port = p_mixed;
+        cfg_no_shift.controller_port = p_ctrl;
+        cfg_no_shift.dns_listen_port = p_dns;
+        cfg_no_shift.port_guard_auto_shift = false;
+
+        let kept = allocate_l3_ports_respecting_running_core(&cfg_no_shift, &prev_status)
+            .expect("running core's own ports must not self-conflict");
+        assert_eq!(kept.mixed_port, p_mixed);
+        assert_eq!(kept.controller_port, p_ctrl);
+        assert_eq!(kept.dns_port, p_dns);
+        assert!(kept.shifted.is_empty());
+
+        // With auto_shift=true, ports owned by the running core must also stay pinned without drift.
+        let mut cfg_auto_shift = cfg_no_shift.clone();
+        cfg_auto_shift.port_guard_auto_shift = true;
+        let pinned = allocate_l3_ports_respecting_running_core(&cfg_auto_shift, &prev_status)
+            .expect("running core's own ports must not drift");
+        assert_eq!(pinned.mixed_port, p_mixed);
+        assert_eq!(pinned.controller_port, p_ctrl);
+        assert_eq!(pinned.dns_port, p_dns);
+        assert!(pinned.shifted.is_empty());
+
+        // Switching mixed_port to an externally occupied port still triggers conflict / shift,
+        // while keeping unchanged controller & DNS ports pinned.
+        let mut cfg_ext_conflict = cfg_no_shift.clone();
+        cfg_ext_conflict.mixed_port = p_external;
+        assert!(
+            allocate_l3_ports_respecting_running_core(&cfg_ext_conflict, &prev_status).is_err(),
+            "external occupancy must still fail when auto_shift is disabled"
+        );
+        cfg_ext_conflict.port_guard_auto_shift = true;
+        let shifted = allocate_l3_ports_respecting_running_core(&cfg_ext_conflict, &prev_status)
+            .expect("auto_shift must shift only the externally conflicted port");
+        assert_ne!(shifted.mixed_port, p_external);
+        assert_eq!(shifted.controller_port, p_ctrl);
+        assert_eq!(shifted.dns_port, p_dns);
+        assert_eq!(shifted.shifted.len(), 1);
+        assert_eq!(shifted.shifted[0].role, "mixed");
+
+        // When previous core is NOT running, occupied ports must never be bypassed.
+        let stopped_status = CoreRuntimeStatus {
+            running: false,
+            ..prev_status
+        };
+        assert!(
+            allocate_l3_ports_respecting_running_core(&cfg_no_shift, &stopped_status).is_err(),
+            "stopped core must not suppress port occupancy checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn extra_binary_candidates_are_stored_and_tun_disabled_gracefully_before_l3_restart() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = listener.local_addr().unwrap().port();
+        let secret = "tun_graceful_secret_0123456789abcdef".to_string();
+        let tun_patch_received = Arc::new(AtomicBool::new(false));
+        let tun_flag = Arc::clone(&tun_patch_received);
+
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                if raw.starts_with("PATCH /configs")
+                    && raw.contains("\"tun\"")
+                    && raw.contains("\"enable\":false")
+                {
+                    tun_flag.store(true, Ordering::SeqCst);
+                }
+                let resp = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let paths = temp_paths("l3-extra-candidates-tun");
+        let extra_bin_dir = paths.root_data_dir.join("bundled-extra");
+        std::fs::create_dir_all(&extra_bin_dir).unwrap();
+        let fake_bin = extra_bin_dir.join(crate::core_adapter::mihomo_binary_name());
+        std::fs::write(&fake_bin, b"not-a-real-binary").unwrap();
+
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter = Arc::new(
+            MihomoAdapter::with_controller_endpoint(guard, "127.0.0.1", ctrl_port, secret.clone())
+                .unwrap(),
+        );
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+        coordinator.set_extra_binary_candidates(vec![fake_bin.clone()]);
+        assert_eq!(coordinator.extra_binary_candidates_snapshot(), vec![fake_bin]);
+
+        let mut old_cfg = AppConfig::default();
+        old_cfg.controller_port = ctrl_port;
+        old_cfg.controller_secret = Some(secret.clone());
+        old_cfg.tun.enabled = true;
+        old_cfg.port_guard_auto_shift = false;
+
+        let ports = AllocatedPorts {
+            bind_host: "127.0.0.1".to_string(),
+            mixed_port: old_cfg.mixed_port,
+            controller_port: ctrl_port,
+            dns_port: old_cfg.dns_listen_port,
+            shifted: Vec::new(),
+        };
+        coordinator
+            .seed_active_state(old_cfg.clone(), "prev-hash".into(), ports, secret)
+            .await;
+
+        let mut next_cfg = old_cfg;
+        next_cfg.tun.stack_mode = TunStackMode::Gvisor;
+        save(&paths, &next_cfg).unwrap();
+
+        // Trigger L3 restart: controller_port is held by our mock server (matching prev_status),
+        // candidate binary comes from `extra_binary_candidates`, and TUN must be patched off first.
+        let outcome = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                ..Default::default()
+            })
+            .await;
+        assert!(outcome.rejected, "fake binary spawn should reject & rollback");
+        assert_eq!(outcome.level, ReloadLevel::L3CoreRestart);
+        assert!(
+            !outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no Mihomo binary could be resolved"),
+            "extra_binary_candidates must resolve the fake binary: {:?}",
+            outcome.error
+        );
+        assert!(
+            tun_patch_received.load(Ordering::SeqCst),
+            "disable_tun_gracefully must be invoked before L3 restart when old core had TUN enabled"
+        );
 
         server.abort();
         let _ = std::fs::remove_dir_all(&paths.root_data_dir);

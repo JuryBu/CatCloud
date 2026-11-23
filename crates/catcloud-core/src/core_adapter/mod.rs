@@ -23,9 +23,10 @@ pub use binary_resolver::{
 pub use config_compiler::{
     CompileInput, CompileStats, CompiledCoreConfig, CompiledGroupMapping,
     DEFAULT_FALLBACK_GROUP_NAME, MAX_YAML_BYTES, PREACCEL_FALLBACK_GROUP_NAME,
-    PREACCEL_SELECT_GROUP_NAME, StaticCheckIssue, StaticCheckSeverity, StaticValidationReport,
-    apply_yaml_merge_patch, build_default_ai_routing_rules, compile_mihomo_config,
-    expand_group_match_rule, redact_compiled_yaml_for_preview, validate_compiled_yaml,
+    PREACCEL_SELECT_GROUP_NAME, SINGLE_NODE_GROUP_NAME, StaticCheckIssue, StaticCheckSeverity,
+    StaticValidationReport, apply_yaml_merge_patch, build_default_ai_routing_rules,
+    compile_mihomo_config, compile_mihomo_config_with_runtime_dir, expand_group_match_rule,
+    redact_compiled_yaml_for_preview, validate_compiled_yaml,
 };
 pub use hot_reload::{
     ConfigWatcherHandle, DEFAULT_DEBOUNCE_WINDOW, DebounceDecision, DiskReloadOptions,

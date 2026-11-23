@@ -226,22 +226,71 @@ impl Default for ProbeDefinition {
 }
 
 /// Default public AI service domains included in CatCloud built-in AI routing presets
-/// (covers OpenAI, Anthropic, Google AI, and Windsurf/Devin/Codeium endpoints).
+/// (covers OpenAI, Anthropic, Google AI / Antigravity / Cloud Code / OAuth, Windsurf/Devin/Codeium,
+/// Cursor, Perplexity, xAI, and GitHub Copilot endpoints; intentionally excludes `play.googleapis.com`).
 pub const DEFAULT_AI_ROUTING_DOMAINS: &[&str] = &[
     "openai.com",
     "chatgpt.com",
     "oaistatic.com",
     "oaiusercontent.com",
+    "auth.openai.com",
+    "auth0.openai.com",
+    "auth0.com",
+    "sora.com",
+    "chat.com",
     "anthropic.com",
     "claude.ai",
+    "claude.com",
+    "claudeusercontent.com",
+    "clau.de",
+    "statsig.anthropic.com",
+    "sentry.io",
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "gvt1.com",
+    "gvt2.com",
+    "ggpht.com",
+    "accounts.google.com",
+    "oauth2.googleapis.com",
+    "apis.google.com",
     "gemini.google.com",
     "aistudio.google.com",
     "generativelanguage.googleapis.com",
+    "antigravity.google",
+    "antigravity.google.com",
+    "antigravity-unleash.goog",
+    "cloudcode-pa.googleapis.com",
+    "daily-cloudcode-pa.sandbox.googleapis.com",
+    "daily-cloudcode-pa.googleapis.com",
+    "autopush-cloudcode-pa.sandbox.googleapis.com",
+    "aicode.googleapis.com",
+    "businessaicode.googleapis.com",
+    "aiplatform.googleapis.com",
+    "alkalimakersuite-pa.clients6.google.com",
+    "proactivebackend-pa.googleapis.com",
+    "ai.google.dev",
+    "makersuite.google.com",
+    "deepmind.com",
+    "deepmind.google",
+    "labs.google",
+    "notebooklm.google.com",
+    "jules.google.com",
     "codeium.com",
     "windsurf.com",
     "devin.ai",
     "cognition.ai",
     "exafunction.com",
+    "statsigapi.net",
+    "featuregates.org",
+    "cursor.sh",
+    "cursor.com",
+    "cursor-cdn.com",
+    "perplexity.ai",
+    "x.ai",
+    "grok.com",
+    "githubcopilot.com",
 ];
 
 impl ProbeDefinition {
@@ -315,6 +364,42 @@ impl ProbeDefinition {
                 target_url: "https://windsurf.com".to_string(),
                 method: "GET".to_string(),
                 expected_status: Some(200),
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+            Self {
+                id: "builtin_unlock_claude".to_string(),
+                name: "Claude / Anthropic 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://api.anthropic.com/v1/messages".to_string(),
+                method: "POST".to_string(),
+                expected_status: None,
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+            Self {
+                id: "builtin_unlock_chatgpt".to_string(),
+                name: "ChatGPT / OpenAI 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://api.openai.com/v1/models".to_string(),
+                method: "GET".to_string(),
+                expected_status: None,
+                body_regex: None,
+                payload_bytes: None,
+                timeout_ms: 8000,
+                builtin: true,
+            },
+            Self {
+                id: "builtin_unlock_gemini".to_string(),
+                name: "Gemini / Google AI 解锁".to_string(),
+                kind: ProbeKind::UnlockRegex,
+                target_url: "https://generativelanguage.googleapis.com/v1beta/models".to_string(),
+                method: "GET".to_string(),
+                expected_status: None,
                 body_regex: None,
                 payload_bytes: None,
                 timeout_ms: 8000,
@@ -525,4 +610,62 @@ pub struct NodeFilter {
     pub keyword: Option<String>,
     /// Require node tags to contain all specified tags (case-insensitive).
     pub tags: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_routing_domains_and_builtin_probes_cover_required_entries() {
+        assert!(!DEFAULT_AI_ROUTING_DOMAINS.contains(&"play.googleapis.com"));
+        for required in [
+            "openai.com",
+            "chatgpt.com",
+            "anthropic.com",
+            "claude.ai",
+            "claude.com",
+            "antigravity.google",
+            "antigravity.google.com",
+            "cloudcode-pa.googleapis.com",
+            "generativelanguage.googleapis.com",
+            "windsurf.com",
+            "codeium.com",
+            "cursor.com",
+            "githubcopilot.com",
+        ] {
+            assert!(
+                DEFAULT_AI_ROUTING_DOMAINS.contains(&required),
+                "missing required AI routing domain `{required}`"
+            );
+        }
+
+        let builtins = ProbeDefinition::builtin_defaults();
+        assert_eq!(builtins.len(), 9);
+        let claude = builtins
+            .iter()
+            .find(|p| p.id == "builtin_unlock_claude")
+            .expect("missing builtin_unlock_claude");
+        assert_eq!(claude.kind, ProbeKind::UnlockRegex);
+        assert_eq!(claude.method, "POST");
+        assert_eq!(claude.expected_status, None);
+        assert_eq!(claude.timeout_ms, 8000);
+        assert!(claude.builtin);
+
+        let chatgpt = builtins
+            .iter()
+            .find(|p| p.id == "builtin_unlock_chatgpt")
+            .expect("missing builtin_unlock_chatgpt");
+        assert_eq!(chatgpt.kind, ProbeKind::UnlockRegex);
+        assert_eq!(chatgpt.method, "GET");
+        assert_eq!(chatgpt.expected_status, None);
+
+        let gemini = builtins
+            .iter()
+            .find(|p| p.id == "builtin_unlock_gemini")
+            .expect("missing builtin_unlock_gemini");
+        assert_eq!(gemini.kind, ProbeKind::UnlockRegex);
+        assert_eq!(gemini.method, "GET");
+        assert_eq!(gemini.expected_status, None);
+    }
 }

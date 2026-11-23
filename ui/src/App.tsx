@@ -1,7 +1,53 @@
 import { X } from "lucide-react";
-import { Suspense, lazy, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
+import { type AppConfig, catcloudApi, isTauriEnv } from "./api/tauri";
 import { Sidebar } from "./components/Sidebar";
-import { type NavRouteId, useAppSelector } from "./store/appStore";
+import {
+  BUILTIN_WALLPAPER_PRESETS,
+  type NavRouteId,
+  appActions,
+  appStore,
+  useAppSelector,
+} from "./store/appStore";
+
+const SAFE_BITMAP_DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif|bmp);base64,/i;
+
+function isImmediateWallpaperPath(rawPath: string): boolean {
+  if (!rawPath) return true;
+  if (BUILTIN_WALLPAPER_PRESETS.some((p) => p.id === rawPath)) return true;
+  if (/^https?:\/\//i.test(rawPath)) return true;
+  if (SAFE_BITMAP_DATA_URL_RE.test(rawPath)) return true;
+  return false;
+}
+
+async function syncLocalWallpaperVarsIfNeeded(cfg: AppConfig): Promise<void> {
+  if (typeof document === "undefined") return;
+  const p = cfg.personalization;
+  const rawPath = p.wallpaper_path?.trim() ?? "";
+  if (!rawPath || isImmediateWallpaperPath(rawPath)) return;
+  if (/^data:/i.test(rawPath)) return;
+
+  try {
+    const dataUrl = await catcloudApi.resolveWallpaperDataUrl(rawPath);
+    if ((appStore.getState().config.personalization.wallpaper_path?.trim() ?? "") !== rawPath) {
+      return;
+    }
+    if (!dataUrl || !SAFE_BITMAP_DATA_URL_RE.test(dataUrl)) return;
+    const safeUrl = dataUrl.replace(/["\\\n\r]/g, "");
+    const opacity = Math.max(0.05, Math.min(0.65, p.wallpaper_opacity));
+    const blurPx = Math.max(0, Math.min(24, Math.round(p.glass_blur_px)));
+    const root = document.documentElement;
+    root.setAttribute("data-wallpaper", "on");
+    root.setAttribute("data-glass", blurPx > 0 ? "on" : "off");
+    root.style.setProperty("--wallpaper-image", `url("${safeUrl}")`);
+    root.style.setProperty("--wallpaper-opacity", String(opacity));
+    root.style.setProperty("--surface-alpha", blurPx > 0 ? "0.82" : "0.90");
+    root.style.setProperty("--card-alpha", blurPx > 0 ? "0.78" : "0.88");
+    root.style.setProperty("--glass-blur", `${blurPx}px`);
+  } catch {
+    /* keep base theme tokens intact if local wallpaper file is unreadable */
+  }
+}
 
 // Code-split every page + floating capsule so initial load and per-window memory stay minimal.
 const HomePage = lazy(() =>
@@ -69,11 +115,137 @@ export function App() {
 
   const visibleToast = toast && toast.id !== dismissedToastId ? toast : null;
 
+  // Keep the floating capsule window synced with the latest theme, wallpaper & personalization
+  // changes saved from the main window across WebView instances.
+  useEffect(() => {
+    if (windowMode !== "capsule") return;
+    let disposed = false;
+    let inFlight = false;
+    let pendingAgain = false;
+    let lastPersonalizationSig = "";
+    let debounceTimer: number | null = null;
+
+    const syncCapsuleAppearance = async (force = false) => {
+      if (disposed) return;
+      if (inFlight) {
+        pendingAgain = true;
+        return;
+      }
+      inFlight = true;
+      try {
+        const latestCfg = await catcloudApi.getConfig();
+        if (disposed) return;
+        const sig = JSON.stringify(latestCfg.personalization);
+        if (force || sig !== lastPersonalizationSig) {
+          lastPersonalizationSig = sig;
+          appActions.syncConfig(latestCfg);
+          await syncLocalWallpaperVarsIfNeeded(latestCfg);
+        }
+      } catch {
+        /* ignore transient IPC sync failures */
+      } finally {
+        inFlight = false;
+        if (!disposed && pendingAgain) {
+          pendingAgain = false;
+          void syncCapsuleAppearance(false);
+        }
+      }
+    };
+
+    const scheduleSync = () => {
+      if (disposed) return;
+      if (debounceTimer !== null) {
+        window.clearTimeout(debounceTimer);
+      }
+      debounceTimer = window.setTimeout(() => {
+        debounceTimer = null;
+        void syncCapsuleAppearance(false);
+      }, 80);
+    };
+
+    const onStorage = (ev: StorageEvent) => {
+      if (!ev.key || ev.key === "catcloud.ui.prefs.v1") {
+        if (ev.newValue) {
+          try {
+            const parsed = JSON.parse(ev.newValue) as Partial<AppConfig["personalization"]>;
+            if (parsed && typeof parsed === "object") {
+              appActions.previewPersonalization(parsed);
+            }
+          } catch {
+            /* fallback to backend sync below */
+          }
+        }
+        scheduleSync();
+      }
+    };
+
+    const onFocus = () => {
+      scheduleSync();
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        scheduleSync();
+      }
+    };
+
+    void syncCapsuleAppearance(true);
+    window.addEventListener("storage", onStorage);
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibility);
+
+    // Backend broadcasts `catcloud://runtime` whenever config or wallpaper is saved.
+    const unsubRuntime = isTauriEnv()
+      ? catcloudApi.subscribeRuntimeUpdate(() => {
+          scheduleSync();
+        })
+      : null;
+
+    return () => {
+      disposed = true;
+      if (debounceTimer !== null) {
+        window.clearTimeout(debounceTimer);
+        debounceTimer = null;
+      }
+      window.removeEventListener("storage", onStorage);
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibility);
+      unsubRuntime?.();
+    };
+  }, [windowMode]);
+
   if (windowMode === "capsule") {
     return (
-      <Suspense fallback={null}>
-        <CapsuleWindow />
-      </Suspense>
+      <div className="relative h-full w-full">
+        <Suspense fallback={null}>
+          <CapsuleWindow />
+        </Suspense>
+
+        {visibleToast && (
+          <div className="pointer-events-none fixed inset-x-1.5 bottom-1 z-50 flex justify-center">
+            <div
+              role="status"
+              title={visibleToast.text}
+              onClick={() => setDismissedToastId(visibleToast.id)}
+              className="pointer-events-auto flex max-w-[288px] cursor-pointer items-center gap-1.5 rounded-full border border-[var(--line-strong)] bg-[var(--surface)]/95 px-2.5 py-0.5 text-[10px] leading-tight text-[var(--text)] shadow-md"
+            >
+              <span
+                className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{
+                  backgroundColor:
+                    visibleToast.tone === "warn"
+                      ? "var(--amber)"
+                      : visibleToast.tone === "ok"
+                        ? "var(--green)"
+                        : "var(--accent)",
+                }}
+              />
+              <span className="min-w-0 truncate">{visibleToast.text}</span>
+              <X className="h-2.5 w-2.5 shrink-0 text-[var(--muted)]" />
+            </div>
+          </div>
+        )}
+      </div>
     );
   }
 

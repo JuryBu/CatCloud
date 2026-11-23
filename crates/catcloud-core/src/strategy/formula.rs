@@ -116,12 +116,31 @@ impl EvalContext {
         bool_to_f64(passed)
     }
 
-    fn lookup_site_unlocked(&self, site_name: &str) -> f64 {
-        if let Some(&v) = self.unlocked_sites.get(site_name) {
-            return bool_to_f64(v);
+    fn lookup_site_exact_or_ci(&self, name: &str) -> Option<bool> {
+        if let Some(&v) = self.unlocked_sites.get(name) {
+            return Some(v);
         }
         for (k, &v) in &self.unlocked_sites {
-            if k.eq_ignore_ascii_case(site_name) {
+            if k.eq_ignore_ascii_case(name) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn lookup_site_unlocked(&self, site_name: &str) -> f64 {
+        let trimmed = site_name.trim();
+        if let Some(v) = self.lookup_site_exact_or_ci(trimmed) {
+            return bool_to_f64(v);
+        }
+        let aliases: &[&str] = match trimmed.to_ascii_lowercase().as_str() {
+            "google_ai" => &["gemini", "gemini_aistudio"],
+            "gemini" => &["gemini_aistudio", "google_ai"],
+            "gemini_aistudio" => &["gemini", "google_ai"],
+            _ => &[],
+        };
+        for alias in aliases {
+            if let Some(v) = self.lookup_site_exact_or_ci(alias) {
                 return bool_to_f64(v);
             }
         }
@@ -1201,5 +1220,69 @@ fn safe_div(lhs: f64, rhs: f64) -> f64 {
         0.0
     } else {
         sanitize_f64(lhs / rhs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn site_unlocked_aliases_google_ai_gemini_and_gemini_aistudio() {
+        let expr_google_ai = FormulaExpr::parse(r#"site_unlocked("google_ai")"#).unwrap();
+        let expr_google_ai_ci = FormulaExpr::parse(r#"site_unlocked("Google_AI")"#).unwrap();
+        let expr_gemini = FormulaExpr::parse(r#"site_unlocked("gemini")"#).unwrap();
+        let expr_aistudio = FormulaExpr::parse(r#"site_unlocked("gemini_aistudio")"#).unwrap();
+        let expr_claude = FormulaExpr::parse(r#"site_unlocked("claude")"#).unwrap();
+
+        // 1. Only "gemini" present -> google_ai and gemini_aistudio fall back to "gemini".
+        let mut ctx_gemini_only = EvalContext::default();
+        ctx_gemini_only
+            .unlocked_sites
+            .insert("gemini".to_string(), true);
+        assert!(expr_google_ai.eval_bool(&ctx_gemini_only).unwrap());
+        assert!(expr_google_ai_ci.eval_bool(&ctx_gemini_only).unwrap());
+        assert!(expr_gemini.eval_bool(&ctx_gemini_only).unwrap());
+        assert!(expr_aistudio.eval_bool(&ctx_gemini_only).unwrap());
+        assert!(!expr_claude.eval_bool(&ctx_gemini_only).unwrap());
+
+        // 2. Only "gemini_aistudio" present -> google_ai and gemini both fall back to it.
+        let mut ctx_aistudio_only = EvalContext::default();
+        ctx_aistudio_only
+            .unlocked_sites
+            .insert("gemini_aistudio".to_string(), true);
+        assert!(expr_google_ai.eval_bool(&ctx_aistudio_only).unwrap());
+        assert!(expr_gemini.eval_bool(&ctx_aistudio_only).unwrap());
+        assert!(expr_aistudio.eval_bool(&ctx_aistudio_only).unwrap());
+
+        // 3. Only "google_ai" present -> gemini and gemini_aistudio both fall back to it.
+        let mut ctx_google_ai_only = EvalContext::default();
+        ctx_google_ai_only
+            .unlocked_sites
+            .insert("google_ai".to_string(), true);
+        assert!(expr_google_ai.eval_bool(&ctx_google_ai_only).unwrap());
+        assert!(expr_gemini.eval_bool(&ctx_google_ai_only).unwrap());
+        assert!(expr_aistudio.eval_bool(&ctx_google_ai_only).unwrap());
+
+        // 4. Direct match always takes precedence over fallback aliases.
+        let mut ctx_direct_override = EvalContext::default();
+        ctx_direct_override
+            .unlocked_sites
+            .insert("google_ai".to_string(), false);
+        ctx_direct_override
+            .unlocked_sites
+            .insert("gemini".to_string(), true);
+        assert!(!expr_google_ai.eval_bool(&ctx_direct_override).unwrap());
+        assert!(expr_gemini.eval_bool(&ctx_direct_override).unwrap());
+
+        // 5. Fallback priority for "google_ai": "gemini" before "gemini_aistudio".
+        let mut ctx_priority = EvalContext::default();
+        ctx_priority
+            .unlocked_sites
+            .insert("gemini".to_string(), false);
+        ctx_priority
+            .unlocked_sites
+            .insert("gemini_aistudio".to_string(), true);
+        assert!(!expr_google_ai.eval_bool(&ctx_priority).unwrap());
     }
 }

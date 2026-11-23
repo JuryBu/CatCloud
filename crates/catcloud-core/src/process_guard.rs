@@ -65,7 +65,9 @@ pub enum AcquireOutcome {
 /// matching `AppPaths::from_data_dir` byte-for-byte.
 pub fn compute_instance_hash(data_dir: &Path) -> CatResult<String> {
     std::fs::create_dir_all(data_dir)?;
-    let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+    let canonical = crate::paths::normalize_os_path(
+        &std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf()),
+    );
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().to_lowercase().as_bytes());
     let digest = hex::encode(hasher.finalize());
@@ -758,6 +760,150 @@ pub fn spawn_restarted_self(extra_args: &[String]) -> CatResult<DetachedSpawnRes
 }
 
 #[cfg(target_os = "windows")]
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteW(
+        hwnd: *mut std::ffi::c_void,
+        lp_operation: *const u16,
+        lp_file: *const u16,
+        lp_parameters: *const u16,
+        lp_directory: *const u16,
+        n_show_cmd: i32,
+    ) -> isize;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(pv_reserved: *mut std::ffi::c_void, dw_co_init: u32) -> i32;
+    fn CoUninitialize();
+}
+
+/// Lightweight RAII guard initializing a Win32 STA COM apartment on the current thread
+/// before calling `ShellExecuteW`, and uninitializing it on drop only when `hr >= 0`.
+#[cfg(target_os = "windows")]
+struct ComApartmentGuard {
+    should_uninit: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl ComApartmentGuard {
+    fn init_sta() -> Self {
+        // COINIT_APARTMENTTHREADED (0x2) | COINIT_DISABLE_OLE1DDE (0x4)
+        const COINIT_APARTMENTTHREADED: u32 = 0x2;
+        const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+        // SAFETY: Initializes COM apartment for the current thread with valid flags and null reserved pointer.
+        let hr = unsafe {
+            CoInitializeEx(
+                std::ptr::null_mut(),
+                COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+            )
+        };
+        Self {
+            should_uninit: hr >= 0,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for ComApartmentGuard {
+    fn drop(&mut self) {
+        if self.should_uninit {
+            // SAFETY: Paired with a successful (`hr >= 0`) `CoInitializeEx` on this thread.
+            unsafe {
+                CoUninitialize();
+            }
+            self.should_uninit = false;
+        }
+    }
+}
+
+/// Relaunch `exe` with Windows UAC elevation (`ShellExecuteW` verb `"runas"`).
+///
+/// - Returns `Ok(true)` when the elevated process was successfully started.
+/// - Returns `Ok(false)` when the user cancelled the UAC prompt (`ERROR_CANCELLED = 1223` or
+///   `SE_ERR_ACCESSDENIED = 5`).
+/// - Returns `Err(_)` on non-Windows platforms, missing executable, or unexpected OS errors.
+pub fn relaunch_self_as_admin(exe: &Path, args: &[String], workdir: &Path) -> CatResult<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::GetLastError;
+
+        const SW_SHOWNORMAL: i32 = 1;
+        const SE_ERR_ACCESSDENIED: isize = 5;
+        const ERROR_CANCELLED_CODE: u32 = 1223;
+
+        if !exe.exists() {
+            return Err(CatError::Validation(format!(
+                "elevated executable does not exist: {}",
+                exe.display()
+            )));
+        }
+
+        let clean_exe = strip_verbatim_prefix(exe);
+        let clean_workdir = strip_verbatim_prefix(workdir);
+        let wide_verb = to_wide_null("runas");
+        let wide_file = to_wide_null(&clean_exe.to_string_lossy());
+
+        let joined_args = args
+            .iter()
+            .map(|a| quote_win32_arg(a))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let wide_params = if joined_args.is_empty() {
+            None
+        } else {
+            Some(to_wide_null(&joined_args))
+        };
+        let workdir_str = clean_workdir.to_string_lossy();
+        let wide_dir = if workdir_str.is_empty() {
+            None
+        } else {
+            Some(to_wide_null(&workdir_str))
+        };
+
+        let params_ptr = wide_params.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        let dir_ptr = wide_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+
+        let _com_guard = ComApartmentGuard::init_sta();
+
+        // SAFETY: All non-null pointers reference NUL-terminated UTF-16 buffers that outlive this call.
+        let rc = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                wide_verb.as_ptr(),
+                wide_file.as_ptr(),
+                params_ptr,
+                dir_ptr,
+                SW_SHOWNORMAL,
+            )
+        };
+
+        if rc > 32 {
+            return Ok(true);
+        }
+
+        let last_err = unsafe { GetLastError() };
+        if last_err == ERROR_CANCELLED_CODE || rc == SE_ERR_ACCESSDENIED {
+            return Ok(false);
+        }
+
+        Err(CatError::Process(format!(
+            "ShellExecuteW(runas, `{}`) failed with rc={rc}, win32_err={last_err}",
+            clean_exe.display()
+        )))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (exe, args, workdir);
+        Err(CatError::Process(
+            "relaunch_self_as_admin is only supported on Windows".into(),
+        ))
+    }
+}
+
+#[cfg(target_os = "windows")]
 const MAX_WMI_OUTPUT_BYTES: usize = 32 * 1024;
 
 #[cfg(target_os = "windows")]
@@ -988,6 +1134,156 @@ fn to_wide_null(s: &str) -> Vec<u16> {
         .collect()
 }
 
+#[cfg(target_os = "windows")]
+#[link(name = "advapi32")]
+unsafe extern "system" {
+    fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        string_security_descriptor: *const u16,
+        string_sd_revision: u32,
+        security_descriptor: *mut *mut std::ffi::c_void,
+        security_descriptor_size: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn LocalFree(hmem: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+}
+
+#[cfg(target_os = "windows")]
+struct OwnedSecurityDescriptor(*mut std::ffi::c_void);
+
+#[cfg(target_os = "windows")]
+impl OwnedSecurityDescriptor {
+    fn from_sddl(sddl: &str) -> Option<Self> {
+        const SDDL_REVISION_1: u32 = 1;
+        let wide = to_wide_null(sddl);
+        let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: Valid NUL-terminated UTF-16 SDDL string and valid output pointer.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 && !sd.is_null() {
+            Some(Self(sd))
+        } else {
+            None
+        }
+    }
+
+    fn as_security_attributes(&self) -> windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+        windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>()
+                as u32,
+            lpSecurityDescriptor: self.0,
+            bInheritHandle: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for OwnedSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: Allocated by `ConvertStringSecurityDescriptorToSecurityDescriptorW`.
+            unsafe {
+                let _ = LocalFree(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+const CROSS_IL_SDDL_WITH_ML: &str =
+    "D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x001F0003;;;AU)S:(ML;;NW;;;ME)";
+
+#[cfg(target_os = "windows")]
+const CROSS_IL_SDDL_DACL_ONLY: &str = "D:(A;;GA;;;BA)(A;;GA;;;SY)(A;;0x001F0003;;;AU)";
+
+#[cfg(target_os = "windows")]
+fn create_named_mutex_with_cross_il_sd(
+    wide_mutex: &[u16],
+) -> (windows_sys::Win32::Foundation::HANDLE, u32) {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    const ERROR_ACCESS_DENIED_CODE: u32 = 5;
+
+    if let Some(sd) = OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_WITH_ML) {
+        let sa = sd.as_security_attributes();
+        // SAFETY: Valid SECURITY_ATTRIBUTES and NUL-terminated UTF-16 mutex name.
+        let handle = unsafe { CreateMutexW(&sa, 0, wide_mutex.as_ptr()) };
+        let last_err = unsafe { GetLastError() };
+        if !handle.is_null() {
+            return (handle, last_err);
+        }
+    }
+
+    if let Some(sd) = OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_DACL_ONLY) {
+        let sa = sd.as_security_attributes();
+        // SAFETY: Valid SECURITY_ATTRIBUTES and NUL-terminated UTF-16 mutex name.
+        let handle = unsafe { CreateMutexW(&sa, 0, wide_mutex.as_ptr()) };
+        let last_err = unsafe { GetLastError() };
+        if !handle.is_null() || last_err == ERROR_ACCESS_DENIED_CODE {
+            return (handle, last_err);
+        }
+    }
+
+    // SAFETY: Fallback to default security descriptor.
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide_mutex.as_ptr()) };
+    let last_err = unsafe { GetLastError() };
+    (handle, last_err)
+}
+
+#[cfg(target_os = "windows")]
+fn create_named_event_with_cross_il_sd(
+    wide_event: &[u16],
+) -> windows_sys::Win32::Foundation::HANDLE {
+    use windows_sys::Win32::System::Threading::CreateEventW;
+
+    if let Some(sd) = OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_WITH_ML) {
+        let sa = sd.as_security_attributes();
+        // SAFETY: Valid SECURITY_ATTRIBUTES and NUL-terminated UTF-16 event name.
+        let ev = unsafe { CreateEventW(&sa, 0, 0, wide_event.as_ptr()) };
+        if !ev.is_null() {
+            return ev;
+        }
+    }
+
+    if let Some(sd) = OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_DACL_ONLY) {
+        let sa = sd.as_security_attributes();
+        // SAFETY: Valid SECURITY_ATTRIBUTES and NUL-terminated UTF-16 event name.
+        let ev = unsafe { CreateEventW(&sa, 0, 0, wide_event.as_ptr()) };
+        if !ev.is_null() {
+            return ev;
+        }
+    }
+
+    // SAFETY: Fallback to default security descriptor.
+    unsafe { CreateEventW(std::ptr::null(), 0, 0, wide_event.as_ptr()) }
+}
+
+#[cfg(target_os = "windows")]
+fn signal_existing_wakeup_event(wide_event: &[u16]) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+    // SAFETY: Opening existing named wakeup event with EVENT_MODIFY_STATE only.
+    unsafe {
+        let ev = OpenEventW(EVENT_MODIFY_STATE, 0, wide_event.as_ptr());
+        if !ev.is_null() {
+            let _ = SetEvent(ev);
+            let _ = CloseHandle(ev);
+        }
+    }
+}
+
 // ============================================================================
 // SingleInstanceGuard: canonical_data_dir-scoped single instance with wakeup
 // ============================================================================
@@ -1063,10 +1359,9 @@ impl SingleInstanceGuard {
         instance_hash: String,
         wait_timeout: Duration,
     ) -> CatResult<AcquireOutcome> {
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
-        use windows_sys::Win32::System::Threading::{
-            CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, OpenEventW, SetEvent,
-        };
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
+
+        const ERROR_ACCESS_DENIED_CODE: u32 = 5;
 
         let mutex_name = format!("Local\\CatCloud_SI_{instance_hash}");
         let event_name = format!("Local\\CatCloud_Wake_{instance_hash}");
@@ -1075,19 +1370,28 @@ impl SingleInstanceGuard {
         let deadline = Instant::now() + wait_timeout;
 
         loop {
-            // SAFETY: Creating a named per-session mutex; `GetLastError` immediately inspects creation status.
-            let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide_mutex.as_ptr()) };
-            let last_err = unsafe { GetLastError() };
+            let (handle, last_err) = create_named_mutex_with_cross_il_sd(&wide_mutex);
             if handle.is_null() {
+                if last_err == ERROR_ACCESS_DENIED_CODE {
+                    // An elevated (High IL) primary instance already owns this mutex; never return
+                    // Err (which would trigger a dual-instance fallback). Respect `--restarting`
+                    // wait timeout, otherwise wake the running primary and exit cleanly.
+                    if !wait_timeout.is_zero() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(100));
+                        continue;
+                    }
+                    signal_existing_wakeup_event(&wide_event);
+                    return Ok(AcquireOutcome::SecondaryWokePrimary);
+                }
                 return Err(CatError::Process(format!(
                     "CreateMutexW({mutex_name}) failed with Win32 error {last_err}"
                 )));
             }
 
             if last_err != ERROR_ALREADY_EXISTS {
-                // We are the primary instance; create auto-reset wakeup event.
-                // SAFETY: Valid null-terminated UTF-16 name; auto-reset (manual=FALSE), initial=FALSE.
-                let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide_event.as_ptr()) };
+                // We are the primary instance; create auto-reset wakeup event with cross-IL SD
+                // so a Medium IL secondary launch can still signal a High IL primary window.
+                let ev = create_named_event_with_cross_il_sd(&wide_event);
                 let ev_opt = if ev.is_null() {
                     None
                 } else {
@@ -1113,15 +1417,7 @@ impl SingleInstanceGuard {
                 continue;
             }
 
-            // Signal the existing primary instance to wake its window and exit.
-            // SAFETY: Opening existing named event with EVENT_MODIFY_STATE only.
-            unsafe {
-                let ev = OpenEventW(EVENT_MODIFY_STATE, 0, wide_event.as_ptr());
-                if !ev.is_null() {
-                    let _ = SetEvent(ev);
-                    let _ = CloseHandle(ev);
-                }
-            }
+            signal_existing_wakeup_event(&wide_event);
             return Ok(AcquireOutcome::SecondaryWokePrimary);
         }
     }
@@ -1521,5 +1817,57 @@ mod tests {
         let guard = JobGuard::new().expect("create JobGuard");
         // Calling unregister_pid with a nonexistent PID must never panic or error.
         guard.unregister_pid(u32::MAX / 2);
+    }
+
+    #[test]
+    fn relaunch_self_as_admin_rejects_missing_exe_without_prompt() {
+        let missing = std::env::temp_dir().join(format!(
+            "catcloud-nonexistent-elevated-{}.exe",
+            uuid::Uuid::new_v4()
+        ));
+        let res = relaunch_self_as_admin(&missing, &[], &std::env::temp_dir());
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn compute_instance_hash_matches_app_paths_instance_hash() {
+        let dir = make_temp_dir("hash-align");
+        let paths = AppPaths::from_data_dir(dir.clone(), true).expect("init AppPaths");
+        let hash = compute_instance_hash(&dir).expect("compute instance hash");
+        assert_eq!(hash, paths.instance_hash);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn com_apartment_guard_initializes_and_uninitializes_on_worker_thread() {
+        let handle = std::thread::spawn(|| {
+            let outer = ComApartmentGuard::init_sta();
+            assert!(
+                outer.should_uninit,
+                "fresh worker thread should initialize STA COM with S_OK"
+            );
+            let inner = ComApartmentGuard::init_sta();
+            assert!(
+                inner.should_uninit,
+                "re-entrant STA COM init on same thread returns S_FALSE (>= 0) and must pair CoUninitialize"
+            );
+            drop(inner);
+            drop(outer);
+        });
+        handle.join().expect("worker thread must exit cleanly without COM panic");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn cross_il_sddl_parses_cleanly_for_single_instance_sync_objects() {
+        assert!(
+            OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_WITH_ML).is_some(),
+            "SDDL with Medium mandatory label must parse on Windows"
+        );
+        assert!(
+            OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_DACL_ONLY).is_some(),
+            "DACL-only cross-IL SDDL must parse on Windows"
+        );
     }
 }

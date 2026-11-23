@@ -6,7 +6,7 @@ use crate::probe::registry::{
 use chrono::Utc;
 use regex::Regex;
 use reqwest::Method;
-use reqwest::header::LOCATION;
+use reqwest::header::{ACCEPT_LANGUAGE, CONTENT_TYPE, COOKIE, LOCATION};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -34,9 +34,22 @@ pub const DEFAULT_KEEPALIVE_INTERVALS_MS: &[u64] = &[20_000, 40_000, 60_000];
 
 /// Default Google-side and advisory endpoints for L1 Google cleanliness probing.
 pub const DEFAULT_GOOGLE_204_URL: &str = "https://www.google.com/generate_204";
+pub const DEFAULT_GOOGLE_HOME_URL: &str = "https://www.google.com/";
 pub const DEFAULT_YOUTUBE_REGION_URL: &str = "https://www.youtube.com/premium";
 pub const DEFAULT_AI_STUDIO_URL: &str = "https://aistudio.google.com/";
 pub const DEFAULT_CF_TRACE_URL: &str = "https://cp.cloudflare.com/cdn-cgi/trace";
+
+/// Credential-free endpoints for built-in AI semantic unlock probes.
+const CLAUDE_TRACE_URL: &str = "https://claude.ai/cdn-cgi/trace";
+const CLAUDE_API_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
+const CHATGPT_TRACE_URL: &str = "https://chatgpt.com/cdn-cgi/trace";
+const CHATGPT_API_MODELS_URL: &str = "https://api.openai.com/v1/models";
+const GEMINI_API_MODELS_CHECK_URL: &str =
+    "https://generativelanguage.googleapis.com/v1beta/models?key=catcloud_probe_check";
+
+/// Unsupported jurisdictions for Claude / ChatGPT Cloudflare trace pre-filtering.
+const AI_TRACE_BLOCKED_COUNTRIES: &[&str] =
+    &["CN", "HK", "MO", "RU", "BY", "KP", "IR", "SY", "CU"];
 
 /// Computed summary statistics for multi-sample L0 latency probes.
 #[derive(Debug, Clone, PartialEq)]
@@ -188,6 +201,8 @@ pub async fn run_latency_probe(
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GoogleCnEndpoints {
     pub google_url: String,
+    #[serde(default)]
+    pub google_home_url: Option<String>,
     pub youtube_url: Option<String>,
     pub ai_studio_url: Option<String>,
     pub cf_trace_url: Option<String>,
@@ -197,6 +212,7 @@ impl Default for GoogleCnEndpoints {
     fn default() -> Self {
         Self {
             google_url: DEFAULT_GOOGLE_204_URL.to_string(),
+            google_home_url: Some(DEFAULT_GOOGLE_HOME_URL.to_string()),
             youtube_url: Some(DEFAULT_YOUTUBE_REGION_URL.to_string()),
             ai_studio_url: Some(DEFAULT_AI_STUDIO_URL.to_string()),
             cf_trace_url: Some(DEFAULT_CF_TRACE_URL.to_string()),
@@ -207,8 +223,12 @@ impl Default for GoogleCnEndpoints {
 impl GoogleCnEndpoints {
     pub fn from_probe_definition(def: &ProbeDefinition) -> Self {
         let mut ep = Self::default();
-        if !def.target_url.trim().is_empty() {
-            ep.google_url = def.target_url.trim().to_string();
+        let trimmed = def.target_url.trim();
+        if !trimmed.is_empty() {
+            ep.google_url = trimmed.to_string();
+            if is_loopback_url(trimmed) {
+                ep.google_home_url = None;
+            }
         }
         ep
     }
@@ -219,12 +239,15 @@ impl GoogleCnEndpoints {
 pub struct GoogleCleanSignals {
     /// HTTP status from the Google 204/landing endpoint.
     pub google_status: Option<u16>,
-    /// `Location` header or final URL host when Google redirected.
+    /// `Location` header or final URL host when Google redirected (including `/sorry/` or `google.cn`).
     pub google_redirect_location: Option<String>,
     /// YouTube resolved country/region code (`GL`, e.g., `"US"`, `"JP"`, `"TW"`, `"HK"`, `"CN"`).
     pub yt_gl: Option<String>,
     /// Optional AI Studio / Gemini HTTP status code.
     pub ai_studio_status: Option<u16>,
+    /// Optional AI Studio / Gemini `Location` redirect header or restricted final URL.
+    #[serde(default)]
+    pub ai_studio_redirect_location: Option<String>,
     /// Optional AI Studio / Gemini response body snippet for region-block detection.
     pub ai_studio_body_snippet: Option<String>,
     /// Optional Cloudflare trace `loc` country code (advisory risk mismatch signal ONLY).
@@ -247,17 +270,16 @@ pub struct GoogleCleanAssessment {
 const AI_STUDIO_GEO_BLOCK_MARKERS: &[&str] = &[
     "not available in your country",
     "not available in your region",
+    "gemini is not currently supported",
     "region is not supported",
     "location is not supported",
     "unsupported_country",
     "unsupported_region",
-    "gemini is not currently supported in your country",
-    "available regions",
 ];
 
 /// Evaluate Google cleanliness strictly from Google-side ground truth:
-/// - Hard gate fails if Google redirects to `google.cn`, Google returns HTTP 403/451,
-///   YouTube `yt_gl` falls into `{CN, HK}`, or AI Studio/Gemini reports regional unavailability.
+/// - Hard gate fails if Google redirects to `google.cn` or `/sorry/`, Google returns HTTP 403/429/451,
+///   YouTube `yt_gl` falls into `{CN, HK}`, or AI Studio/Gemini redirects to/reports regional unavailability.
 /// - `cf_loc != yt_gl` ONLY sets `google_risk_mismatch = true` as an advisory warning badge
 ///   and NEVER false-kills valid TW/JP/SG/US nodes.
 pub fn evaluate_google_cleanliness(signals: &GoogleCleanSignals) -> GoogleCleanAssessment {
@@ -278,6 +300,7 @@ pub fn evaluate_google_cleanliness(signals: &GoogleCleanSignals) -> GoogleCleanA
         || signals.google_redirect_location.is_some()
         || yt_gl.is_some()
         || signals.ai_studio_status.is_some()
+        || signals.ai_studio_redirect_location.is_some()
         || signals.ai_studio_body_snippet.is_some();
 
     if !has_google_ground_truth {
@@ -289,11 +312,14 @@ pub fn evaluate_google_cleanliness(signals: &GoogleCleanSignals) -> GoogleCleanA
         if is_google_cn_location(loc) {
             clean = false;
             reasons.push(format!("google_redirect_to_cn:{loc}"));
+        } else if is_google_sorry_or_cn_location(loc) {
+            clean = false;
+            reasons.push(format!("google_redirect_to_sorry:{loc}"));
         }
     }
 
     if let Some(status) = signals.google_status {
-        if matches!(status, 403 | 451) {
+        if matches!(status, 403 | 429 | 451) {
             clean = false;
             reasons.push(format!("google_http_restricted:{status}"));
         } else if status >= 500 {
@@ -314,6 +340,14 @@ pub fn evaluate_google_cleanliness(signals: &GoogleCleanSignals) -> GoogleCleanA
             clean = false;
             ai_studio_restricted = true;
             reasons.push(format!("ai_studio_http_restricted:{status}"));
+        }
+    }
+
+    if let Some(ref loc) = signals.ai_studio_redirect_location {
+        if is_ai_studio_restricted_location(loc) {
+            clean = false;
+            ai_studio_restricted = true;
+            reasons.push(format!("ai_studio_redirect_restricted:{loc}"));
         }
     }
 
@@ -379,6 +413,33 @@ pub fn is_google_cn_location(raw: &str) -> bool {
         || lower == "google.cn"
 }
 
+/// Check whether a redirect `Location` or URL points to `google.cn` or Google's `/sorry/` captcha gate.
+pub fn is_google_sorry_or_cn_location(raw: &str) -> bool {
+    if is_google_cn_location(raw) {
+        return true;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    lower.contains("/sorry/") || lower.ends_with("/sorry") || lower.contains("/sorry?")
+}
+
+/// Check whether an AI Studio redirect `Location` or final URL indicates regional restriction or `/sorry/`.
+pub fn is_ai_studio_restricted_location(raw: &str) -> bool {
+    let lower = raw.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return false;
+    }
+    lower.contains("available_regions")
+        || lower.contains("available-regions")
+        || lower.contains("unsupported")
+        || lower.contains("/sorry/")
+        || lower.ends_with("/sorry")
+        || lower.contains("/sorry?")
+}
+
 /// Extract the two-letter `loc` country code from a Cloudflare `/cdn-cgi/trace` text response.
 pub fn parse_cloudflare_trace_loc(body: &str) -> Option<String> {
     for line in body.lines() {
@@ -435,25 +496,104 @@ fn normalize_country_code(raw: &str) -> Option<String> {
     }
 }
 
-/// Execute an L1 Google region cleanliness probe across injectable Google, YouTube, AI Studio,
-/// and Cloudflare trace endpoints. The supplied `client` should disable auto-redirects
-/// (`Policy::none()`) so 302 redirects to `google.cn` are captured directly; final URL host
-/// is also inspected as a fallback.
-pub async fn run_google_cn_probe(
-    client: &reqwest::Client,
-    node_id: &str,
-    def: &ProbeDefinition,
-    endpoints: Option<&GoogleCnEndpoints>,
-) -> ProbeResultRecord {
-    let owned_ep = match endpoints {
-        Some(ep) => ep.clone(),
-        None => GoogleCnEndpoints::from_probe_definition(def),
+fn is_loopback_url(raw: &str) -> bool {
+    let Ok(parsed) = Url::parse(raw.trim()) else {
+        return false;
     };
-    let timeout = Duration::from_millis(def.timeout_ms.max(500));
+    matches!(
+        parsed.host_str().map(|h| h.to_ascii_lowercase()).as_deref(),
+        Some("127.0.0.1" | "localhost" | "[::1]" | "::1")
+    )
+}
 
+async fn fetch_youtube_gl(
+    client: &reqwest::Client,
+    initial_url: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let initial_is_loopback = is_loopback_url(initial_url);
+    let mut current_url = initial_url.to_string();
+
+    // Initial request + up to 2 manual redirect hops via the SAME proxied client (never leak unproxied).
+    for hop in 0..=2 {
+        let Ok(resp) = client
+            .get(&current_url)
+            .header(COOKIE, "SOCS=CAI")
+            .header(ACCEPT_LANGUAGE, "en-US,en;q=0.9")
+            .timeout(timeout)
+            .send()
+            .await
+        else {
+            return None;
+        };
+
+        let status = resp.status().as_u16();
+        let header_gl = resp
+            .headers()
+            .get("x-youtube-gl")
+            .or_else(|| resp.headers().get("x-goog-country"))
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        if let Some(ref raw_gl) = header_gl {
+            if let Some(code) = normalize_country_code(raw_gl) {
+                let _ = drain_capped_body(resp, 4 * 1024).await;
+                return Some(code);
+            }
+        }
+
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let loc = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string);
+            let _ = drain_capped_body(resp, 4 * 1024).await;
+
+            if let Some(loc_str) = loc {
+                if let Some(code) = parse_youtube_gl(None, &loc_str) {
+                    return Some(code);
+                }
+                if hop < 2 {
+                    let joined = Url::parse(&current_url)
+                        .ok()
+                        .and_then(|base| base.join(loc_str.trim()).ok())
+                        .map(|u| u.to_string());
+                    let next_url = joined.unwrap_or(loc_str);
+                    if (next_url.starts_with("http://") || next_url.starts_with("https://"))
+                        && (!initial_is_loopback || is_loopback_url(&next_url))
+                    {
+                        current_url = next_url;
+                        continue;
+                    }
+                }
+            }
+            return None;
+        }
+
+        let final_url = resp.url().to_string();
+        if let Some(code) = parse_youtube_gl(None, &final_url) {
+            let _ = drain_capped_body(resp, 4 * 1024).await;
+            return Some(code);
+        }
+
+        let bytes = drain_capped_body(resp, MAX_INSPECT_BODY_BYTES)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&bytes);
+        return parse_youtube_gl(header_gl.as_deref(), &body);
+    }
+
+    None
+}
+
+async fn collect_google_clean_signals(
+    client: &reqwest::Client,
+    endpoints: &GoogleCnEndpoints,
+    timeout: Duration,
+) -> (GoogleCleanSignals, Option<f64>) {
     let google_fut = async {
         let started = Instant::now();
-        match client.get(&owned_ep.google_url).timeout(timeout).send().await {
+        match client.get(&endpoints.google_url).timeout(timeout).send().await {
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -464,7 +604,7 @@ pub async fn run_google_cn_probe(
                     .map(ToString::to_string);
                 let final_url = resp.url().to_string();
                 let redirect_loc = loc_header.or_else(|| {
-                    if is_google_cn_location(&final_url) {
+                    if is_google_sorry_or_cn_location(&final_url) {
                         Some(final_url)
                     } else {
                         None
@@ -477,43 +617,70 @@ pub async fn run_google_cn_probe(
         }
     };
 
-    let yt_fut = async {
-        let Some(ref url) = owned_ep.youtube_url else {
-            return None;
-        };
-        let Ok(resp) = client.get(url).timeout(timeout).send().await else {
-            return None;
-        };
-        let header_gl = resp
-            .headers()
-            .get("x-youtube-gl")
-            .or_else(|| resp.headers().get("x-goog-country"))
-            .and_then(|v| v.to_str().ok())
-            .map(ToString::to_string);
-        let bytes = drain_capped_body(resp, MAX_INSPECT_BODY_BYTES)
-            .await
-            .unwrap_or_default();
-        let body = String::from_utf8_lossy(&bytes);
-        parse_youtube_gl(header_gl.as_deref(), &body)
-    };
-
-    let ai_fut = async {
-        let Some(ref url) = owned_ep.ai_studio_url else {
+    let google_home_fut = async {
+        let Some(ref url) = endpoints.google_home_url else {
             return (None, None);
         };
         let Ok(resp) = client.get(url).timeout(timeout).send().await else {
             return (None, None);
         };
         let status = resp.status().as_u16();
+        let loc_header = resp
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let final_url = resp.url().to_string();
+        let redirect_loc = loc_header
+            .filter(|loc| is_google_sorry_or_cn_location(loc))
+            .or_else(|| {
+                if is_google_sorry_or_cn_location(&final_url) {
+                    Some(final_url)
+                } else {
+                    None
+                }
+            });
+        let _ = drain_capped_body(resp, 16 * 1024).await;
+        (Some(status), redirect_loc)
+    };
+
+    let yt_fut = async {
+        let Some(ref url) = endpoints.youtube_url else {
+            return None;
+        };
+        fetch_youtube_gl(client, url, timeout).await
+    };
+
+    let ai_fut = async {
+        let Some(ref url) = endpoints.ai_studio_url else {
+            return (None, None, None);
+        };
+        let Ok(resp) = client.get(url).timeout(timeout).send().await else {
+            return (None, None, None);
+        };
+        let status = resp.status().as_u16();
+        let loc_header = resp
+            .headers()
+            .get(LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(ToString::to_string);
+        let final_url = resp.url().to_string();
+        let redirect_loc = loc_header.or_else(|| {
+            if is_ai_studio_restricted_location(&final_url) {
+                Some(final_url)
+            } else {
+                None
+            }
+        });
         let bytes = drain_capped_body(resp, 64 * 1024)
             .await
             .unwrap_or_default();
         let body = String::from_utf8_lossy(&bytes).into_owned();
-        (Some(status), Some(body))
+        (Some(status), redirect_loc, Some(body))
     };
 
     let cf_fut = async {
-        let Some(ref url) = owned_ep.cf_trace_url else {
+        let Some(ref url) = endpoints.cf_trace_url else {
             return None;
         };
         let Ok(resp) = client.get(url).timeout(timeout).send().await else {
@@ -526,26 +693,86 @@ pub async fn run_google_cn_probe(
         parse_cloudflare_trace_loc(&body)
     };
 
-    let ((google_status, google_redirect_location, google_ms), yt_gl, (ai_status, ai_body), cf_loc) =
-        tokio::join!(google_fut, yt_fut, ai_fut, cf_fut);
+    let (
+        (google_204_status, google_204_redirect, google_ms),
+        (google_home_status, google_home_redirect),
+        yt_gl,
+        (ai_status, ai_redirect, ai_body),
+        cf_loc,
+    ) = tokio::join!(google_fut, google_home_fut, yt_fut, ai_fut, cf_fut);
+
+    let google_redirect_location = if google_204_redirect
+        .as_deref()
+        .is_some_and(is_google_sorry_or_cn_location)
+    {
+        google_204_redirect
+    } else if google_home_redirect
+        .as_deref()
+        .is_some_and(is_google_sorry_or_cn_location)
+    {
+        google_home_redirect
+    } else {
+        google_204_redirect.or(google_home_redirect)
+    };
+
+    let google_status = match (google_204_status, google_home_status) {
+        (_, Some(s)) if matches!(s, 403 | 429 | 451) => Some(s),
+        (Some(s), _) => Some(s),
+        (None, home) => home,
+    };
 
     let signals = GoogleCleanSignals {
         google_status,
         google_redirect_location,
         yt_gl,
         ai_studio_status: ai_status,
+        ai_studio_redirect_location: ai_redirect,
         ai_studio_body_snippet: ai_body,
         cf_loc,
     };
 
+    (signals, google_ms)
+}
+
+/// Lightweight live Google cleanliness probe for exit-IP diagnostics.
+/// Uses ONLY the caller-supplied proxied `client` and never creates an unproxied client.
+pub async fn probe_live_google_cleanliness(
+    client: &reqwest::Client,
+    timeout: Duration,
+) -> GoogleCleanAssessment {
+    let effective_timeout = timeout.max(Duration::from_millis(500));
+    let endpoints = GoogleCnEndpoints::default();
+    let (signals, _) = collect_google_clean_signals(client, &endpoints, effective_timeout).await;
+    evaluate_google_cleanliness(&signals)
+}
+
+/// Execute an L1 Google region cleanliness probe across injectable Google, Google Home,
+/// YouTube, AI Studio, and Cloudflare trace endpoints. The supplied `client` should disable
+/// auto-redirects (`Policy::none()`) so 302 redirects to `google.cn`, `/sorry/`, or AI Studio
+/// `available_regions` are captured directly; final URL host/path is also inspected as a fallback.
+pub async fn run_google_cn_probe(
+    client: &reqwest::Client,
+    node_id: &str,
+    def: &ProbeDefinition,
+    endpoints: Option<&GoogleCnEndpoints>,
+) -> ProbeResultRecord {
+    let owned_ep = match endpoints {
+        Some(ep) => ep.clone(),
+        None => GoogleCnEndpoints::from_probe_definition(def),
+    };
+    let timeout = Duration::from_millis(def.timeout_ms.max(500));
+
+    let (signals, google_ms) = collect_google_clean_signals(client, &owned_ep, timeout).await;
     let assessment = evaluate_google_cleanliness(&signals);
+
     let mut unlocked_map = HashMap::new();
     unlocked_map.insert("google_clean".to_string(), assessment.google_clean);
-    if owned_ep.ai_studio_url.is_some() && signals.ai_studio_status.is_some() {
-        unlocked_map.insert(
-            "gemini_aistudio".to_string(),
-            !assessment.ai_studio_restricted,
-        );
+    if owned_ep.ai_studio_url.is_some()
+        && (signals.ai_studio_status.is_some() || signals.ai_studio_redirect_location.is_some())
+    {
+        let gemini_ok = !assessment.ai_studio_restricted;
+        unlocked_map.insert("gemini_aistudio".to_string(), gemini_ok);
+        unlocked_map.insert("gemini".to_string(), gemini_ok);
     }
 
     let detail = if assessment.reasons.is_empty() {
@@ -616,7 +843,10 @@ pub fn infer_unlock_site_key(def: &ProbeDefinition) -> String {
             if h.contains("devin.ai") || h.contains("cognition.ai") {
                 return "devin".to_string();
             }
-            if h.contains("gemini.google.com") || h.contains("aistudio.google.com") {
+            if h.contains("gemini.google.com")
+                || h.contains("aistudio.google.com")
+                || h.contains("generativelanguage.googleapis.com")
+            {
                 return "gemini".to_string();
             }
         }
@@ -629,14 +859,331 @@ pub fn infer_unlock_site_key(def: &ProbeDefinition) -> String {
     }
 }
 
+fn is_ai_trace_country_blocked(loc: &str) -> bool {
+    AI_TRACE_BLOCKED_COUNTRIES
+        .iter()
+        .any(|code| loc.eq_ignore_ascii_case(code))
+}
+
+const CLAUDE_GEO_BLOCK_MARKERS: &[&str] = &[
+    "not available in your country",
+    "not available in your region",
+    "country is not supported",
+    "region is not supported",
+    "unsupported_country",
+    "unsupported_region",
+    "unavailable in your country",
+];
+
+fn evaluate_claude_semantic_unlock(
+    trace_loc: Option<&str>,
+    api_status: Option<u16>,
+    api_body: Option<&str>,
+) -> (bool, String) {
+    let normalized_loc = trace_loc.and_then(normalize_country_code);
+    let trace_blocked = normalized_loc
+        .as_deref()
+        .is_some_and(is_ai_trace_country_blocked);
+
+    let (api_ok, api_reason) = match api_status {
+        Some(status) => {
+            let body_lower = api_body.unwrap_or("").to_ascii_lowercase();
+            let geo_blocked = CLAUDE_GEO_BLOCK_MARKERS
+                .iter()
+                .any(|marker| body_lower.contains(marker));
+            if matches!(status, 403 | 451) || geo_blocked {
+                (
+                    false,
+                    format!("blocked(status={status},geo={geo_blocked})"),
+                )
+            } else if matches!(status, 401 | 400) {
+                (true, format!("ok(status={status})"))
+            } else {
+                (false, format!("unexpected_status({status})"))
+            }
+        }
+        None => (false, "request_failed".to_string()),
+    };
+
+    let unlocked = !trace_blocked && api_ok;
+    let detail = format!(
+        "semantic_claude: unlocked={unlocked}, trace_loc={}, trace_blocked={trace_blocked}, api={api_reason}",
+        normalized_loc.as_deref().unwrap_or("NONE"),
+    );
+    (unlocked, detail)
+}
+
+fn evaluate_chatgpt_semantic_unlock(
+    trace_loc: Option<&str>,
+    api_status: Option<u16>,
+    api_body: Option<&str>,
+) -> (bool, String) {
+    let normalized_loc = trace_loc.and_then(normalize_country_code);
+    let trace_blocked = normalized_loc
+        .as_deref()
+        .is_some_and(is_ai_trace_country_blocked);
+
+    let (api_ok, api_reason) = match api_status {
+        Some(status) => {
+            let body_lower = api_body.unwrap_or("").to_ascii_lowercase();
+            let geo_blocked = body_lower.contains("unsupported_country_region_territory")
+                || body_lower.contains("unsupported_country");
+            if matches!(status, 403 | 451) || geo_blocked {
+                (
+                    false,
+                    format!("blocked(status={status},geo={geo_blocked})"),
+                )
+            } else if status == 401 {
+                (true, "ok(status=401)".to_string())
+            } else {
+                (false, format!("unexpected_status({status})"))
+            }
+        }
+        None => (false, "request_failed".to_string()),
+    };
+
+    let unlocked = !trace_blocked && api_ok;
+    let detail = format!(
+        "semantic_chatgpt: unlocked={unlocked}, trace_loc={}, trace_blocked={trace_blocked}, api={api_reason}",
+        normalized_loc.as_deref().unwrap_or("NONE"),
+    );
+    (unlocked, detail)
+}
+
+fn evaluate_gemini_semantic_unlock(
+    api_status: Option<u16>,
+    api_body: Option<&str>,
+    aistudio_status: Option<u16>,
+    aistudio_location: Option<&str>,
+    aistudio_body: Option<&str>,
+) -> (bool, String) {
+    let aistudio_blocked = aistudio_status.is_some_and(|s| matches!(s, 403 | 451))
+        || aistudio_location.is_some_and(is_ai_studio_restricted_location)
+        || aistudio_body.is_some_and(|body| {
+            let lower = body.to_ascii_lowercase();
+            AI_STUDIO_GEO_BLOCK_MARKERS
+                .iter()
+                .any(|marker| lower.contains(marker))
+        });
+
+    let (api_ok, api_reason) = match api_status {
+        Some(status) => {
+            let body = api_body.unwrap_or("");
+            let body_lower = body.to_ascii_lowercase();
+            let geo_blocked = status == 451
+                || body_lower.contains("user location is not supported")
+                || body_lower.contains("failed_precondition")
+                || body_lower.contains("location is not supported");
+            let key_invalid = body.contains("API_KEY_INVALID")
+                || body_lower.contains("api key not valid");
+
+            if geo_blocked {
+                (false, format!("geo_blocked(status={status})"))
+            } else if key_invalid {
+                (true, format!("ok_api_key_invalid(status={status})"))
+            } else {
+                (false, format!("unexpected(status={status})"))
+            }
+        }
+        None => (false, "request_failed".to_string()),
+    };
+
+    let unlocked = api_ok && !aistudio_blocked;
+    let detail = format!(
+        "semantic_gemini: unlocked={unlocked}, api={api_reason}, aistudio_blocked={aistudio_blocked}"
+    );
+    (unlocked, detail)
+}
+
+async fn run_builtin_ai_semantic_unlock_probe(
+    client: &reqwest::Client,
+    node_id: &str,
+    def: &ProbeDefinition,
+    site_key: &str,
+) -> ProbeResultRecord {
+    let timeout = Duration::from_millis(def.timeout_ms.max(500));
+
+    let (unlocked, latency_ms, detail) = match def.id.trim() {
+        "builtin_unlock_claude" => {
+            let trace_fut = async {
+                let Ok(resp) = client.get(CLAUDE_TRACE_URL).timeout(timeout).send().await else {
+                    return None;
+                };
+                let bytes = drain_capped_body(resp, 16 * 1024).await.unwrap_or_default();
+                let body = String::from_utf8_lossy(&bytes);
+                parse_cloudflare_trace_loc(&body)
+            };
+            let api_fut = async {
+                let started = Instant::now();
+                match client
+                    .post(CLAUDE_API_MESSAGES_URL)
+                    .header("anthropic-version", "2023-06-01")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body("{}")
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let elapsed_ms = round2(started.elapsed().as_secs_f64() * 1000.0);
+                        let bytes = drain_capped_body(resp, 32 * 1024).await.unwrap_or_default();
+                        let body = String::from_utf8_lossy(&bytes).into_owned();
+                        (Some(status), Some(body), Some(elapsed_ms))
+                    }
+                    Err(_) => (None, None, None),
+                }
+            };
+
+            let (trace_loc, (api_status, api_body, api_ms)) = tokio::join!(trace_fut, api_fut);
+            let (ok, detail) = evaluate_claude_semantic_unlock(
+                trace_loc.as_deref(),
+                api_status,
+                api_body.as_deref(),
+            );
+            (ok, api_ms, detail)
+        }
+        "builtin_unlock_chatgpt" => {
+            let trace_fut = async {
+                let Ok(resp) = client.get(CHATGPT_TRACE_URL).timeout(timeout).send().await else {
+                    return None;
+                };
+                let bytes = drain_capped_body(resp, 16 * 1024).await.unwrap_or_default();
+                let body = String::from_utf8_lossy(&bytes);
+                parse_cloudflare_trace_loc(&body)
+            };
+            let api_fut = async {
+                let started = Instant::now();
+                match client
+                    .get(CHATGPT_API_MODELS_URL)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let elapsed_ms = round2(started.elapsed().as_secs_f64() * 1000.0);
+                        let bytes = drain_capped_body(resp, 32 * 1024).await.unwrap_or_default();
+                        let body = String::from_utf8_lossy(&bytes).into_owned();
+                        (Some(status), Some(body), Some(elapsed_ms))
+                    }
+                    Err(_) => (None, None, None),
+                }
+            };
+
+            let (trace_loc, (api_status, api_body, api_ms)) = tokio::join!(trace_fut, api_fut);
+            let (ok, detail) = evaluate_chatgpt_semantic_unlock(
+                trace_loc.as_deref(),
+                api_status,
+                api_body.as_deref(),
+            );
+            (ok, api_ms, detail)
+        }
+        "builtin_unlock_gemini" => {
+            let api_fut = async {
+                let started = Instant::now();
+                match client
+                    .get(GEMINI_API_MODELS_CHECK_URL)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let elapsed_ms = round2(started.elapsed().as_secs_f64() * 1000.0);
+                        let bytes = drain_capped_body(resp, 32 * 1024).await.unwrap_or_default();
+                        let body = String::from_utf8_lossy(&bytes).into_owned();
+                        (Some(status), Some(body), Some(elapsed_ms))
+                    }
+                    Err(_) => (None, None, None),
+                }
+            };
+            let aistudio_fut = async {
+                let Ok(resp) = client
+                    .get(DEFAULT_AI_STUDIO_URL)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                else {
+                    return (None, None, None);
+                };
+                let status = resp.status().as_u16();
+                let loc_header = resp
+                    .headers()
+                    .get(LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string);
+                let final_url = resp.url().to_string();
+                let redirect_loc = loc_header.or_else(|| {
+                    if is_ai_studio_restricted_location(&final_url) {
+                        Some(final_url)
+                    } else {
+                        None
+                    }
+                });
+                let bytes = drain_capped_body(resp, 32 * 1024).await.unwrap_or_default();
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                (Some(status), redirect_loc, Some(body))
+            };
+
+            let ((api_status, api_body, api_ms), (ai_status, ai_redirect, ai_body)) =
+                tokio::join!(api_fut, aistudio_fut);
+            let (ok, detail) = evaluate_gemini_semantic_unlock(
+                api_status,
+                api_body.as_deref(),
+                ai_status,
+                ai_redirect.as_deref(),
+                ai_body.as_deref(),
+            );
+            (ok, api_ms, detail)
+        }
+        _ => (false, None, format!("unsupported semantic probe {}", def.id)),
+    };
+
+    let mut unlocked_map = HashMap::new();
+    unlocked_map.insert(site_key.to_string(), unlocked);
+    if def.id != site_key && !def.id.is_empty() {
+        unlocked_map.insert(def.id.clone(), unlocked);
+    }
+
+    ProbeResultRecord {
+        node_id: node_id.to_string(),
+        probe_id: def.id.clone(),
+        tested_at: now_rfc3339(),
+        ok: unlocked,
+        latency_ms,
+        unlocked_map,
+        detail: Some(detail),
+        ..Default::default()
+    }
+}
+
 /// Execute an L1 arbitrary site unlock probe with configurable URL, HTTP method,
 /// expected status code, and optional response-body regular expression.
+/// For built-in AI unlock probes (`builtin_unlock_claude`, `builtin_unlock_chatgpt`,
+/// `builtin_unlock_gemini`) without custom regex/status targeting non-loopback endpoints,
+/// dispatches to credential-free semantic unlock detection to avoid Cloudflare 403 false negatives.
 pub async fn run_unlock_regex_probe(
     client: &reqwest::Client,
     node_id: &str,
     def: &ProbeDefinition,
 ) -> ProbeResultRecord {
     let site_key = infer_unlock_site_key(def);
+
+    let has_body_regex = def
+        .body_regex
+        .as_deref()
+        .is_some_and(|pat| !pat.trim().is_empty());
+    if !has_body_regex
+        && def.expected_status.is_none()
+        && matches!(
+            def.id.trim(),
+            "builtin_unlock_claude" | "builtin_unlock_chatgpt" | "builtin_unlock_gemini"
+        )
+        && !is_loopback_url(&def.target_url)
+    {
+        return run_builtin_ai_semantic_unlock_probe(client, node_id, def, &site_key).await;
+    }
     let method = match parse_http_method(&def.method) {
         Ok(m) => m,
         Err(err) => {
@@ -1373,6 +1920,7 @@ mod tests {
             google_redirect_location: None,
             yt_gl: Some("US".to_string()),
             ai_studio_status: Some(200),
+            ai_studio_redirect_location: None,
             ai_studio_body_snippet: Some("<html>AI Studio Ready</html>".to_string()),
             cf_loc: Some("TW".to_string()),
         });
@@ -1391,6 +1939,22 @@ mod tests {
         });
         assert!(!cn_redirect.google_clean);
         assert!(!cn_redirect.google_risk_mismatch);
+
+        // Google 302 redirect to /sorry/ captcha wall -> hard fail
+        let sorry_redirect = evaluate_google_cleanliness(&GoogleCleanSignals {
+            google_status: Some(204),
+            google_redirect_location: Some(
+                "https://www.google.com/sorry/index?continue=https://www.google.com/".to_string(),
+            ),
+            yt_gl: Some("US".to_string()),
+            cf_loc: Some("US".to_string()),
+            ..Default::default()
+        });
+        assert!(!sorry_redirect.google_clean);
+        assert!(is_google_sorry_or_cn_location(
+            "https://www.google.com/sorry/index?continue=https://www.google.com/"
+        ));
+        assert!(!is_google_sorry_or_cn_location("https://www.google.co.jp/"));
 
         // YouTube GL in {CN, HK} -> hard fail
         for restricted in ["CN", "HK"] {
@@ -1417,6 +1981,179 @@ mod tests {
         });
         assert!(!dirty_ai.google_clean);
         assert!(dirty_ai.ai_studio_restricted);
+
+        // AI Studio body mentioning "available regions" in a normal doc link must NOT false-fail
+        let clean_ai_doc_link = evaluate_google_cleanliness(&GoogleCleanSignals {
+            google_status: Some(204),
+            yt_gl: Some("US".to_string()),
+            ai_studio_status: Some(200),
+            ai_studio_body_snippet: Some(
+                r#"<html><a href="/docs/available-regions">View available regions</a></html>"#
+                    .to_string(),
+            ),
+            cf_loc: Some("US".to_string()),
+            ..Default::default()
+        });
+        assert!(clean_ai_doc_link.google_clean);
+        assert!(!clean_ai_doc_link.ai_studio_restricted);
+
+        // AI Studio exact phrase "Gemini is not currently supported" -> hard fail
+        let dirty_ai_gemini_phrase = evaluate_google_cleanliness(&GoogleCleanSignals {
+            google_status: Some(204),
+            yt_gl: Some("SG".to_string()),
+            ai_studio_status: Some(200),
+            ai_studio_body_snippet: Some(
+                "Gemini is not currently supported in your location.".to_string(),
+            ),
+            cf_loc: Some("SG".to_string()),
+            ..Default::default()
+        });
+        assert!(!dirty_ai_gemini_phrase.google_clean);
+        assert!(dirty_ai_gemini_phrase.ai_studio_restricted);
+
+        // AI Studio 302 redirect to available_regions / available-regions / unsupported -> hard fail
+        for loc in [
+            "https://ai.google.dev/available_regions",
+            "https://ai.google.dev/gemini-api/docs/available-regions",
+            "https://aistudio.google.com/unsupported",
+            "https://www.google.com/sorry/index",
+        ] {
+            let dirty_ai_redir = evaluate_google_cleanliness(&GoogleCleanSignals {
+                google_status: Some(204),
+                yt_gl: Some("US".to_string()),
+                ai_studio_status: Some(302),
+                ai_studio_redirect_location: Some(loc.to_string()),
+                cf_loc: Some("US".to_string()),
+                ..Default::default()
+            });
+            assert!(!dirty_ai_redir.google_clean, "loc={loc} must fail");
+            assert!(dirty_ai_redir.ai_studio_restricted, "loc={loc} must restrict AI Studio");
+        }
+    }
+
+    #[test]
+    fn google_endpoints_disables_home_probe_for_loopback_definitions() {
+        let prod_def = ProbeDefinition {
+            id: "builtin_google_cn".to_string(),
+            target_url: DEFAULT_GOOGLE_204_URL.to_string(),
+            ..Default::default()
+        };
+        let prod_ep = GoogleCnEndpoints::from_probe_definition(&prod_def);
+        assert_eq!(
+            prod_ep.google_home_url.as_deref(),
+            Some(DEFAULT_GOOGLE_HOME_URL)
+        );
+
+        let local_def = ProbeDefinition {
+            id: "test_google".to_string(),
+            target_url: "http://127.0.0.1:18080/google_ok".to_string(),
+            ..Default::default()
+        };
+        let local_ep = GoogleCnEndpoints::from_probe_definition(&local_def);
+        assert!(local_ep.google_home_url.is_none());
+    }
+
+    #[test]
+    fn semantic_ai_unlock_evaluators_handle_clean_blocked_and_fallback_cases() {
+        // Claude: JP + 401 auth error -> unlocked
+        let (ok, _) = evaluate_claude_semantic_unlock(
+            Some("JP"),
+            Some(401),
+            Some(r#"{"type":"error","error":{"type":"authentication_error","message":"x-api-key header is required"}}"#),
+        );
+        assert!(ok);
+        // Claude: trace failed + 400 clean invalid_request -> fallback to api_ok=true
+        let (ok, _) = evaluate_claude_semantic_unlock(
+            None,
+            Some(400),
+            Some(r#"{"type":"error","error":{"type":"invalid_request_error","message":"model: Field required"}}"#),
+        );
+        assert!(ok);
+        // Claude: 400 API schema error mentioning broad words ("unsupported", "country", "region")
+        // must NOT be misclassified as a geo-block.
+        let (ok, _) = evaluate_claude_semantic_unlock(
+            Some("US"),
+            Some(400),
+            Some(r#"{"type":"error","error":{"type":"invalid_request_error","message":"unsupported parameter: country / region is not available in beta"}}"#),
+        );
+        assert!(ok);
+        // Claude: HK in trace -> blocked even if API 401
+        let (ok, _) = evaluate_claude_semantic_unlock(Some("HK"), Some(401), Some("authentication_error"));
+        assert!(!ok);
+        // Claude: 403 or exact geo-block phrase -> blocked
+        let (ok, _) = evaluate_claude_semantic_unlock(
+            Some("US"),
+            Some(403),
+            Some("Request not allowed"),
+        );
+        assert!(!ok);
+        for phrase in [
+            "Claude is not available in your country",
+            "Claude is not available in your region",
+            "Your country is not supported",
+            "This region is not supported",
+            r#"{"error":{"code":"unsupported_country"}}"#,
+            r#"{"error":{"code":"unsupported_region"}}"#,
+            "Service is unavailable in your country",
+        ] {
+            let (ok, _) = evaluate_claude_semantic_unlock(Some("US"), Some(400), Some(phrase));
+            assert!(!ok, "exact Claude geo-block phrase `{phrase}` must fail");
+        }
+
+        // ChatGPT: US + 401 missing api key -> unlocked
+        let (ok, _) = evaluate_chatgpt_semantic_unlock(
+            Some("US"),
+            Some(401),
+            Some(r#"{"error":{"message":"You didn't provide an API key."}}"#),
+        );
+        assert!(ok);
+        // ChatGPT: CN in trace -> blocked
+        let (ok, _) = evaluate_chatgpt_semantic_unlock(Some("CN"), Some(401), Some("missing key"));
+        assert!(!ok);
+        // ChatGPT: unsupported_country_region_territory -> blocked
+        let (ok, _) = evaluate_chatgpt_semantic_unlock(
+            Some("SG"),
+            Some(403),
+            Some(r#"{"error":{"code":"unsupported_country_region_territory"}}"#),
+        );
+        assert!(!ok);
+
+        // Gemini: API_KEY_INVALID + clean AI Studio (even with doc link mentioning "available regions") -> unlocked
+        let (ok, _) = evaluate_gemini_semantic_unlock(
+            Some(400),
+            Some(r#"{"error":{"status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#),
+            Some(200),
+            None,
+            Some(r#"<html><a href="/docs">See available regions</a></html>"#),
+        );
+        assert!(ok);
+        // Gemini: API_KEY_INVALID + AI Studio body exact geo-block phrase -> blocked
+        let (ok, _) = evaluate_gemini_semantic_unlock(
+            Some(400),
+            Some(r#"{"error":{"status":"INVALID_ARGUMENT","details":[{"reason":"API_KEY_INVALID"}]}}"#),
+            Some(200),
+            None,
+            Some("Gemini is not currently supported in this area"),
+        );
+        assert!(!ok);
+        // Gemini: User location is not supported -> blocked
+        let (ok, _) = evaluate_gemini_semantic_unlock(
+            Some(400),
+            Some(r#"{"error":{"message":"User location is not supported for the API use.","status":"FAILED_PRECONDITION"}}"#),
+            Some(200),
+            None,
+            Some("ok"),
+        );
+        assert!(!ok);
+        // Gemini: API key invalid BUT AI Studio redirects to available_regions -> blocked
+        let (ok, _) = evaluate_gemini_semantic_unlock(
+            Some(400),
+            Some("API key not valid. Please pass a valid API key."),
+            Some(302),
+            Some("https://ai.google.dev/available_regions"),
+            Some(""),
+        );
+        assert!(!ok);
     }
 
     #[test]

@@ -1,13 +1,16 @@
 import {
   Check,
   ChevronDown,
+  Cpu,
   Gauge,
   Globe,
   Image,
   Layers,
   LayoutDashboard,
+  Loader2,
   Moon,
   Network,
+  Pause,
   PictureInPicture2,
   ScrollText,
   ShieldCheck,
@@ -15,10 +18,12 @@ import {
   Sparkles,
   Sun,
   Wifi,
+  X,
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   BUILTIN_WALLPAPER_PRESETS,
   type NavRouteId,
@@ -26,10 +31,13 @@ import {
   type ResolvedTheme,
   type ThemeMode,
   appActions,
+  appStore,
   useAppSelector,
+  useLatestTraffic,
+  useTrafficVersion,
 } from "../store/appStore";
 import { MascotSprite } from "./MascotSprite";
-import { TrafficSparkline } from "./TrafficSparkline";
+import { formatRate } from "./TrafficSparkline";
 
 export interface NavItemSpec {
   id: NavRouteId;
@@ -116,15 +124,233 @@ function resolveStatusLabel(status: string, running: boolean): string {
   }
 }
 
+function buildMiniSvgPath(
+  values: Float64Array,
+  count: number,
+  maxValue: number,
+  width: number,
+  height: number,
+  padX: number,
+  padTop: number,
+  padBottom: number
+): { linePath: string; areaPath: string } {
+  if (count === 0) return { linePath: "", areaPath: "" };
+  const innerW = Math.max(1, width - padX * 2);
+  const innerH = Math.max(1, height - padTop - padBottom);
+  const baseY = height - padBottom;
+  const safeMax = Math.max(maxValue, 1024);
+  const xs = new Float64Array(count);
+  const ys = new Float64Array(count);
+
+  for (let i = 0; i < count; i++) {
+    xs[i] = count === 1 ? padX + innerW : padX + (i / (count - 1)) * innerW;
+    const ratio = Math.min(1, Math.max(0, values[i] / safeMax));
+    ys[i] = baseY - ratio * innerH;
+  }
+
+  if (count === 1) {
+    const linePath = `M${padX.toFixed(1)},${ys[0].toFixed(1)} L${xs[0].toFixed(1)},${ys[0].toFixed(1)}`;
+    const areaPath = `${linePath} L${xs[0].toFixed(1)},${baseY.toFixed(1)} L${padX.toFixed(1)},${baseY.toFixed(1)} Z`;
+    return { linePath, areaPath };
+  }
+
+  const parts: string[] = [`M${xs[0].toFixed(1)},${ys[0].toFixed(1)}`];
+  if (count === 2) {
+    parts.push(`L${xs[1].toFixed(1)},${ys[1].toFixed(1)}`);
+  } else {
+    for (let i = 1; i < count - 1; i++) {
+      const mx = (xs[i] + xs[i + 1]) * 0.5;
+      const my = (ys[i] + ys[i + 1]) * 0.5;
+      parts.push(`Q${xs[i].toFixed(1)},${ys[i].toFixed(1)} ${mx.toFixed(1)},${my.toFixed(1)}`);
+    }
+    const last = count - 1;
+    parts.push(`L${xs[last].toFixed(1)},${ys[last].toFixed(1)}`);
+  }
+
+  const linePath = parts.join(" ");
+  const areaPath = `${linePath} L${xs[count - 1].toFixed(1)},${baseY.toFixed(1)} L${xs[0].toFixed(1)},${baseY.toFixed(1)} Z`;
+  return { linePath, areaPath };
+}
+
+function SidebarMiniTrafficCard() {
+  const uid = useId().replace(/:/g, "");
+  const liveVersion = useTrafficVersion();
+  const latest = useLatestTraffic();
+  const sparklineEnabled = useAppSelector(
+    (s) => s.config.personalization.animations_enabled && s.config.personalization.sparkline_enabled
+  );
+
+  const [isVisible, setIsVisible] = useState<boolean>(() =>
+    typeof document === "undefined" ? true : document.visibilityState === "visible"
+  );
+  const lastRenderedVersionRef = useRef<number>(liveVersion);
+
+  useEffect(() => {
+    const onVisibility = () => {
+      setIsVisible(document.visibilityState === "visible");
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  const redrawPaused = !isVisible || !sparklineEnabled;
+  if (!redrawPaused) {
+    lastRenderedVersionRef.current = liveVersion;
+  }
+  const effectiveVersion = lastRenderedVersionRef.current;
+
+  const ring = appStore.getTrafficBuffer();
+  const vbWidth = 196;
+  const vbHeight = 42;
+  const computed = useMemo(() => {
+    const total = ring.length;
+    const count = Math.min(total, 60);
+    const startOffset = total - count;
+    const upSlice = new Float64Array(count);
+    const downSlice = new Float64Array(count);
+
+    let peak = 64 * 1024;
+    for (let i = 0; i < count; i++) {
+      const idx = startOffset + i;
+      const u = ring.upAt(idx);
+      const d = ring.downAt(idx);
+      upSlice[i] = u;
+      downSlice[i] = d;
+      if (u > peak) peak = u;
+      if (d > peak) peak = d;
+    }
+
+    const scaleMax = peak * 1.15;
+    return {
+      downGeom: buildMiniSvgPath(downSlice, count, scaleMax, vbWidth, vbHeight, 2, 4, 3),
+      upGeom: buildMiniSvgPath(upSlice, count, scaleMax, vbWidth, vbHeight, 2, 4, 3),
+      version: effectiveVersion,
+    };
+  }, [effectiveVersion, ring]);
+
+  const gradDownId = `cc-sb-down-${uid}`;
+  const gradUpId = `cc-sb-up-${uid}`;
+
+  return (
+    <div
+      className="cc-card cc-glass rounded-xl px-3 py-2.5"
+      title={
+        redrawPaused
+          ? "流量动画已暂停（省电模式）"
+          : `近 2 分钟实时流量 · 内核内存 ${latest.memory_mb.toFixed(1)} MB`
+      }
+    >
+      <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--muted)]">
+        <span className="font-medium">实时流量</span>
+        {!sparklineEnabled ? (
+          <span className="inline-flex items-center gap-1 text-[10px] text-[var(--amber)]">
+            <Pause className="h-2.5 w-2.5" />
+            已暂停
+          </span>
+        ) : (
+          <span className="cc-tabular text-[10px] text-[var(--muted)]">
+            {latest.connections} 个连接
+          </span>
+        )}
+      </div>
+
+      <svg
+        viewBox={`0 0 ${vbWidth} ${vbHeight}`}
+        preserveAspectRatio="none"
+        className="block h-[40px] w-full overflow-visible"
+        aria-hidden="true"
+      >
+        <defs>
+          <linearGradient id={gradDownId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--sky)" stopOpacity="0.34" />
+            <stop offset="100%" stopColor="var(--sky)" stopOpacity="0.02" />
+          </linearGradient>
+          <linearGradient id={gradUpId} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stopColor="var(--coral)" stopOpacity="0.32" />
+            <stop offset="100%" stopColor="var(--coral)" stopOpacity="0.02" />
+          </linearGradient>
+        </defs>
+        {computed.downGeom.areaPath && (
+          <path d={computed.downGeom.areaPath} fill={`url(#${gradDownId})`} />
+        )}
+        {computed.upGeom.areaPath && (
+          <path d={computed.upGeom.areaPath} fill={`url(#${gradUpId})`} />
+        )}
+        {computed.downGeom.linePath && (
+          <path
+            d={computed.downGeom.linePath}
+            fill="none"
+            stroke="var(--sky)"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+        {computed.upGeom.linePath && (
+          <path
+            d={computed.upGeom.linePath}
+            fill="none"
+            stroke="var(--coral)"
+            strokeWidth="1.4"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
+      </svg>
+
+      <div className="mt-2 flex items-center justify-between gap-2 text-[11px]">
+        <span className="inline-flex min-w-0 items-center gap-1 whitespace-nowrap">
+          <span className="text-[var(--coral)]">↑</span>
+          <span className="cc-mono truncate font-medium text-[var(--text)]">
+            {formatRate(latest.up_bps)}
+          </span>
+        </span>
+        <span className="inline-flex min-w-0 items-center gap-1 whitespace-nowrap">
+          <span className="text-[var(--sky)]">↓</span>
+          <span className="cc-mono truncate font-medium text-[var(--text)]">
+            {formatRate(latest.down_bps)}
+          </span>
+        </span>
+      </div>
+
+      <div className="mt-1.5 flex items-center justify-between border-t border-[var(--line)] pt-1.5 text-[11px]">
+        <span className="inline-flex items-center gap-1 text-[var(--muted)]">
+          <Cpu className="h-3 w-3 text-[var(--green)]" />
+          内核内存
+        </span>
+        <span className="cc-mono font-medium text-[var(--green)]">
+          {latest.memory_mb.toFixed(1)} MB
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function Sidebar() {
   const activeNav = useAppSelector((s) => s.activeNav);
   const themeMode = useAppSelector((s) => s.config.personalization.theme_mode);
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const runtime = useAppSelector((s) => s.runtime);
+  const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
+  const tunAdminPromptBusy = useAppSelector((s) => s.tunAdminPromptBusy);
+  const tunAdminPromptReason = useAppSelector((s) => s.tunAdminPromptReason);
 
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!tunAdminPromptOpen) return;
+    const handleKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape" && !tunAdminPromptBusy) {
+        appActions.closeTunAdminPrompt();
+      }
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [tunAdminPromptOpen, tunAdminPromptBusy]);
 
   useEffect(() => {
     if (!themeMenuOpen) return;
@@ -417,7 +643,7 @@ export function Sidebar() {
         </div>
       ) : (
         <div className="mt-3 space-y-2 border-t border-[var(--line)] pt-2">
-          <TrafficSparkline variant="mini" />
+          <SidebarMiniTrafficCard />
 
           {/* System Proxy / Virtual Network Card Quick Capsules */}
           <div className="grid grid-cols-2 gap-1.5">
@@ -453,7 +679,7 @@ export function Sidebar() {
               title={
                 runtime.tun_admin_ready
                   ? "点击开关虚拟网卡（接管电脑全部软件）"
-                  : "开启虚拟网卡需要管理员权限"
+                  : "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启"
               }
             >
               <span className="inline-flex items-center gap-1 truncate">
@@ -507,6 +733,83 @@ export function Sidebar() {
           </div>
         </div>
       )}
+
+      {tunAdminPromptOpen &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => {
+              if (!tunAdminPromptBusy) appActions.closeTunAdminPrompt();
+            }}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="需要管理员权限开启虚拟网卡"
+              onClick={(e) => e.stopPropagation()}
+              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                    <ShieldCheck className="h-5 w-5" />
+                  </span>
+                  <div>
+                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                      以管理员身份重启并开启虚拟网卡
+                    </h3>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                      虚拟网卡可接管终端、游戏与桌面软件的全部流量，需要 Windows 管理员权限。确认后将弹出系统授权框（UAC），自动以管理员身份重启猫猫云梯并开启虚拟网卡。
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={tunAdminPromptBusy}
+                  onClick={() => appActions.closeTunAdminPrompt()}
+                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+                  aria-label="关闭弹窗"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              {tunAdminPromptReason && (
+                <div className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
+                  {tunAdminPromptReason}
+                </div>
+              )}
+
+              <div className="mt-5 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={tunAdminPromptBusy}
+                  onClick={() => appActions.closeTunAdminPrompt()}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)] disabled:opacity-50"
+                >
+                  暂不开启
+                </button>
+                <button
+                  type="button"
+                  disabled={tunAdminPromptBusy}
+                  onClick={() => void appActions.relaunchAsAdminForTun()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
+                >
+                  {tunAdminPromptBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                  )}
+                  <span>
+                    {tunAdminPromptBusy ? "正在请求授权…" : "以管理员身份重启并开启"}
+                  </span>
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </aside>
   );
 }

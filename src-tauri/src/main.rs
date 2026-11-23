@@ -106,15 +106,13 @@ fn main() {
 
     // 2. Resolve portable/sandbox/standard data layout while strictly single-threaded.
     let paths = resolve_startup_paths();
-    let _ = std::fs::create_dir_all(&paths.webview_dir);
 
     // 3. Redirect WebView2 user data folder before Tauri Builder or WebView2 initializes.
-    //    Portable / sandbox instances always force isolation to prevent cross-instance locks.
-    if paths.is_portable || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
-        // SAFETY: Called at the very start of `main()` before any threads or Tokio runtimes spawn.
-        unsafe {
-            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &paths.webview_dir);
-        }
+    //    Elevated instances always use a separate `webview2_elevated` directory to prevent
+    //    cross-IL lock/ACL blank screens on Windows 11.
+    // SAFETY: Called at the very start of `main()` before any threads or Tokio runtimes spawn.
+    unsafe {
+        catcloud_desktop_lib::lifecycle::set_webview2_user_data_env(&paths);
     }
 
     // 4. Hand off resolved paths to the Tauri desktop shell.

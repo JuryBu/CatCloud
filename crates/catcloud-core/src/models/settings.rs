@@ -36,6 +36,24 @@ impl ProxyMode {
     }
 }
 
+/// Active routing target mode: smart multi-group (`group`) or direct single-node (`single`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteTargetMode {
+    #[default]
+    Group,
+    Single,
+}
+
+impl RouteTargetMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Group => "group",
+            Self::Single => "single",
+        }
+    }
+}
+
 /// Process matching mode in Mihomo.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -240,12 +258,20 @@ impl Default for TunConfig {
             service_mode: false,
             auto_route: true,
             auto_detect_interface: true,
-            strict_route: false,
+            strict_route: true,
             dns_hijack: vec!["any:53".to_string(), "tcp://any:53".to_string()],
-            mtu: 9000,
+            mtu: 1500,
             device_name: "CatCloud".to_string(),
         }
     }
+}
+
+fn default_direct_nameserver() -> Vec<String> {
+    vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()]
+}
+
+fn default_true_bool() -> bool {
+    true
 }
 
 /// Mihomo DNS enhanced resolution mode.
@@ -287,8 +313,19 @@ impl Default for DnsFallbackFilter {
             ipcidr: vec!["240.0.0.0/4".to_string(), "0.0.0.0/32".to_string()],
             domain: vec![
                 "+.google.com".to_string(),
-                "+.facebook.com".to_string(),
+                "+.googleapis.com".to_string(),
+                "+.gstatic.com".to_string(),
+                "+.googleusercontent.com".to_string(),
                 "+.youtube.com".to_string(),
+                "+.facebook.com".to_string(),
+                "+.anthropic.com".to_string(),
+                "+.claude.ai".to_string(),
+                "+.claude.com".to_string(),
+                "+.openai.com".to_string(),
+                "+.chatgpt.com".to_string(),
+                "+.github.com".to_string(),
+                "+.windsurf.com".to_string(),
+                "+.codeium.com".to_string(),
             ],
         }
     }
@@ -311,6 +348,8 @@ pub struct DnsConfig {
     pub fake_ip_range: String,
     pub fake_ip_filter: Vec<String>,
     pub default_nameserver: Vec<String>,
+    #[serde(default = "default_direct_nameserver")]
+    pub direct_nameserver: Vec<String>,
     pub nameserver_policy: BTreeMap<String, Vec<String>>,
     pub nameserver: Vec<String>,
     pub fallback: Vec<String>,
@@ -327,27 +366,36 @@ impl Default for DnsConfig {
             use_hosts: true,
             hosts: BTreeMap::new(),
             use_system_hosts: true,
-            respect_rules: false,
+            respect_rules: true,
             prefer_h3: false,
             mode: DnsMode::FakeIp,
             fake_ip_range: "198.18.0.1/16".to_string(),
             fake_ip_filter: vec![
                 "*.lan".to_string(),
+                "+.lan".to_string(),
                 "*.local".to_string(),
+                "+.local".to_string(),
+                "+.localdomain".to_string(),
+                "*.home.arpa".to_string(),
                 "localhost.ptlogin2.qq.com".to_string(),
                 "time.*.com".to_string(),
+                "time.*.gov".to_string(),
+                "time.*.edu.cn".to_string(),
                 "ntp.*.com".to_string(),
+                "+.pool.ntp.org".to_string(),
                 "+.stun.*.*".to_string(),
                 "+.msftconnecttest.com".to_string(),
                 "+.msftncsi.com".to_string(),
+                "dns.msftncsi.com".to_string(),
                 "connectivitycheck.platform.hicloud.com".to_string(),
                 "connect.rom.miui.com".to_string(),
             ],
             default_nameserver: vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()],
+            direct_nameserver: default_direct_nameserver(),
             nameserver_policy: BTreeMap::new(),
             nameserver: vec![
-                "https://dns.alidns.com/dns-query".to_string(),
-                "https://doh.pub/dns-query".to_string(),
+                "https://223.5.5.5/dns-query".to_string(),
+                "https://1.12.12.12/dns-query".to_string(),
             ],
             fallback: vec![
                 "https://1.1.1.1/dns-query".to_string(),
@@ -380,7 +428,14 @@ pub struct RulesAndOverrideConfig {
     pub override_merge_path: Option<String>,
     pub override_script_path: Option<String>,
     pub override_script_timeout_ms: u64,
+    #[serde(default = "default_true_bool")]
+    pub block_quic_udp_443: bool,
+    #[serde(default = "default_true_bool")]
+    pub domestic_direct_enabled: bool,
 }
+
+/// Compatibility alias for `RulesAndOverrideConfig`.
+pub type RulesOverrideConfig = RulesAndOverrideConfig;
 
 impl Default for RulesAndOverrideConfig {
     fn default() -> Self {
@@ -391,6 +446,8 @@ impl Default for RulesAndOverrideConfig {
             override_merge_path: None,
             override_script_path: None,
             override_script_timeout_ms: 5000,
+            block_quic_udp_443: true,
+            domestic_direct_enabled: true,
         }
     }
 }
@@ -788,6 +845,10 @@ pub struct AppConfig {
     pub schema_version: u32,
     pub proxy_mode: ProxyMode,
     #[serde(default)]
+    pub route_mode: RouteTargetMode,
+    #[serde(default)]
+    pub active_single_node_id: Option<String>,
+    #[serde(default)]
     pub active_group_id: Option<String>,
     pub mixed_port: u16,
     pub socks_port: Option<u16>,
@@ -827,6 +888,8 @@ impl Default for AppConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             proxy_mode: ProxyMode::Rule,
+            route_mode: RouteTargetMode::Group,
+            active_single_node_id: None,
             active_group_id: None,
             mixed_port: 7890,
             socks_port: None,
@@ -884,5 +947,47 @@ impl AppConfig {
         self.core_runtime
             .memory_tier
             .resolve_env_value(node_count, rule_count)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hardened_network_defaults_and_legacy_json_backcompat() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.tun.mtu, 1500);
+        assert!(cfg.tun.strict_route);
+        assert_eq!(cfg.tun.stack_mode, TunStackMode::Mixed);
+        assert!(cfg.tun.auto_route);
+        assert!(cfg.tun.auto_detect_interface);
+
+        assert!(cfg.dns.respect_rules);
+        assert_eq!(cfg.dns.direct_nameserver, vec!["223.5.5.5", "119.29.29.29"]);
+        assert_eq!(
+            cfg.dns.nameserver,
+            vec!["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"]
+        );
+        assert_eq!(
+            cfg.dns.fallback,
+            vec!["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
+        );
+        assert!(cfg.dns.fallback_filter.domain.iter().any(|d| d == "+.anthropic.com"));
+        assert!(cfg.dns.fallback_filter.domain.iter().any(|d| d == "+.windsurf.com"));
+        assert!(cfg.dns.fake_ip_filter.iter().any(|d| d == "+.localdomain"));
+        assert!(cfg.dns.fake_ip_filter.iter().any(|d| d == "time.*.edu.cn"));
+
+        assert!(cfg.rules_override.block_quic_udp_443);
+        assert!(cfg.rules_override.domestic_direct_enabled);
+
+        // Legacy JSON missing newly added fields must populate defaults via serde attributes.
+        let legacy: AppConfig = serde_json::from_str(r#"{"dns":{},"rules_override":{}}"#).unwrap();
+        assert_eq!(
+            legacy.dns.direct_nameserver,
+            vec!["223.5.5.5", "119.29.29.29"]
+        );
+        assert!(legacy.rules_override.block_quic_udp_443);
+        assert!(legacy.rules_override.domestic_direct_enabled);
     }
 }

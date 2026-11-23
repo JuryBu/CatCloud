@@ -146,6 +146,18 @@ const FRIENDLY_BUILTIN_PROBES: Record<string, { title: string; desc: string }> =
     title: "Windsurf 解锁",
     desc: "检测是否支持正常访问 Windsurf",
   },
+  builtin_unlock_claude: {
+    title: "Claude 解锁",
+    desc: "检测是否支持正常访问 Claude 与 Anthropic 接口",
+  },
+  builtin_unlock_chatgpt: {
+    title: "ChatGPT 解锁",
+    desc: "检测是否支持正常访问 ChatGPT 与 OpenAI 接口",
+  },
+  builtin_unlock_gemini: {
+    title: "Gemini 解锁",
+    desc: "检测是否支持正常访问 Gemini 与 AI Studio",
+  },
 };
 
 const INITIAL_PROBES: ProbeItem[] = [
@@ -218,6 +230,39 @@ const INITIAL_PROBES: ProbeItem[] = [
     builtin: true,
     enabled: true,
   },
+  {
+    id: "builtin_unlock_claude",
+    name: "Claude 解锁",
+    kind: "unlock_regex",
+    target: "https://api.anthropic.com/v1/messages",
+    method: "POST",
+    expectedStatus: null,
+    timeoutMs: 8000,
+    builtin: true,
+    enabled: true,
+  },
+  {
+    id: "builtin_unlock_chatgpt",
+    name: "ChatGPT 解锁",
+    kind: "unlock_regex",
+    target: "https://api.openai.com/v1/models",
+    method: "GET",
+    expectedStatus: null,
+    timeoutMs: 8000,
+    builtin: true,
+    enabled: true,
+  },
+  {
+    id: "builtin_unlock_gemini",
+    name: "Gemini 解锁",
+    kind: "unlock_regex",
+    target: "https://generativelanguage.googleapis.com/v1beta/models",
+    method: "GET",
+    expectedStatus: null,
+    timeoutMs: 8000,
+    builtin: true,
+    enabled: true,
+  },
 ];
 
 const UNLOCK_PRESETS: ReadonlyArray<{
@@ -251,10 +296,61 @@ const UNLOCK_PRESETS: ReadonlyArray<{
 ];
 
 const TIER_LABELS: Record<SpeedTestTier, string> = {
-  latency: "快速测延迟",
-  unlock: "测地区与 AI 解锁",
-  full: "测上下行网速",
+  latency: "仅快测延迟",
+  unlock: "测延迟 + 送中/AI",
+  full: "含上下行完整测速",
 };
+
+function mergeProbeSnapshotsPreserveOld(
+  prevMap: Record<string, ProbeSnapshot>,
+  incomingMap: Record<string, ProbeSnapshot>
+): Record<string, ProbeSnapshot> {
+  const next = { ...prevMap };
+  for (const [nodeId, incoming] of Object.entries(incomingMap)) {
+    const prev = prevMap[nodeId];
+    if (!prev) {
+      next[nodeId] = incoming;
+      continue;
+    }
+    const incomingUnlocked = incoming.unlocked_sites ?? {};
+    const hasIncomingUnlocked = Object.keys(incomingUnlocked).length > 0;
+    next[nodeId] = {
+      ...prev,
+      ...incoming,
+      up_mbps: incoming.up_mbps ?? prev.up_mbps,
+      down_mbps: incoming.down_mbps ?? prev.down_mbps,
+      cf_loc: incoming.cf_loc ?? prev.cf_loc,
+      yt_gl: incoming.yt_gl ?? prev.yt_gl,
+      google_clean: incoming.google_clean ?? prev.google_clean,
+      google_risk_mismatch:
+        incoming.google_clean !== null && incoming.google_clean !== undefined
+          ? incoming.google_risk_mismatch
+          : prev.google_risk_mismatch,
+      keepalive_60s_ok: incoming.keepalive_60s_ok ?? prev.keepalive_60s_ok,
+      unlocked_sites: hasIncomingUnlocked
+        ? { ...(prev.unlocked_sites ?? {}), ...incomingUnlocked }
+        : (prev.unlocked_sites ?? {}),
+      per_probe_ok: { ...(prev.per_probe_ok ?? {}), ...(incoming.per_probe_ok ?? {}) },
+      per_probe_up_mbps: {
+        ...(prev.per_probe_up_mbps ?? {}),
+        ...(incoming.per_probe_up_mbps ?? {}),
+      },
+      per_probe_down_mbps: {
+        ...(prev.per_probe_down_mbps ?? {}),
+        ...(incoming.per_probe_down_mbps ?? {}),
+      },
+      per_probe_ping_ms: {
+        ...(prev.per_probe_ping_ms ?? {}),
+        ...(incoming.per_probe_ping_ms ?? {}),
+      },
+      per_probe_detail: {
+        ...(prev.per_probe_detail ?? {}),
+        ...(incoming.per_probe_detail ?? {}),
+      },
+    };
+  }
+  return next;
+}
 
 const PAGE_SIZE_OPTIONS = [30, 50, 100] as const;
 
@@ -446,11 +542,34 @@ export function SpeedTestPage() {
   const nodes = useAppSelector((s) => s.nodes);
   const subscriptions = useAppSelector((s) => s.subscriptions);
   const groups = useAppSelector((s) => s.groups);
+  const config = useAppSelector((s) => s.config);
+  const preAccelRelays = useAppSelector((s) => s.preAccelRelays);
   const runtime = useAppSelector((s) => s.runtime);
+  const isSingleMode = runtime.route_mode === "single";
   const probes = useAppSelector((s) => s.probes);
   const probeProgress = useAppSelector((s) => s.probeProgress);
   const initialized = useAppSelector((s) => s.initialized);
   const inTauri = isTauriEnv();
+
+  const hasEnabledPreAccelRelay = useMemo(
+    () => preAccelRelays.some((r) => r.enabled),
+    [preAccelRelays]
+  );
+  const defaultUsePreaccel = config.preaccel.enabled && hasEnabledPreAccelRelay;
+  const [usePreaccelForProbe, setUsePreaccelForProbe] = useState<boolean>(
+    () => defaultUsePreaccel
+  );
+  const userToggledPreaccelRef = useRef(false);
+
+  useEffect(() => {
+    if (!hasEnabledPreAccelRelay) {
+      setUsePreaccelForProbe(false);
+      return;
+    }
+    if (initialized && !userToggledPreaccelRef.current) {
+      setUsePreaccelForProbe(defaultUsePreaccel);
+    }
+  }, [initialized, defaultUsePreaccel, hasEnabledPreAccelRelay]);
 
   // Persisted keepalive (single source of truth) & probe enabled states
   const [includeKeepalive, setIncludeKeepalive] = useState<boolean>(() => {
@@ -501,6 +620,7 @@ export function SpeedTestPage() {
   const [isPausing, setIsPausing] = useState(false);
   const [pendingLargeRunTier, setPendingLargeRunTier] = useState<SpeedTestTier | null>(null);
   const [switchingNodeId, setSwitchingNodeId] = useState<string | null>(null);
+  const [addingToGroupNodeId, setAddingToGroupNodeId] = useState<string | null>(null);
   // Locked row order during streaming speed test so rows never jump mid-test
   const [lockedOrderMap, setLockedOrderMap] = useState<Map<string, number> | null>(null);
 
@@ -510,8 +630,10 @@ export function SpeedTestPage() {
   const [groupFilter, setGroupFilter] = useState<string>("all");
   const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
   const [regionFilter, setRegionFilter] = useState<string>("all");
+  const [onlyGolden, setOnlyGolden] = useState(false);
   const [onlyTested, setOnlyTested] = useState(false);
   const [onlyGoogleClean, setOnlyGoogleClean] = useState(false);
+  const [onlyAiUnlocked, setOnlyAiUnlocked] = useState(false);
   const [sortKey, setSortKey] = useState<SortKey>("latency");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [page, setPage] = useState(1);
@@ -663,7 +785,24 @@ export function SpeedTestPage() {
         if (defs.length > 0 || inTauri) {
           const persisted = loadPersistedProbeEnabledMap();
           const keepaliveOn = includeKeepaliveRef.current;
-          setProbeList(defs.map((d) => fromProbeDefinition(d, persisted, keepaliveOn)));
+          const mapped = defs.map((d) => fromProbeDefinition(d, persisted, keepaliveOn));
+          if (!inTauri) {
+            const existingIds = new Set(mapped.map((item) => item.id));
+            for (const fallback of INITIAL_PROBES) {
+              if (!existingIds.has(fallback.id)) {
+                mapped.push({
+                  ...fallback,
+                  enabled:
+                    fallback.kind === "keepalive"
+                      ? keepaliveOn
+                      : typeof persisted[fallback.id] === "boolean"
+                        ? persisted[fallback.id]
+                        : fallback.enabled,
+                });
+              }
+            }
+          }
+          setProbeList(mapped);
         }
       })
       .catch((err) => {
@@ -920,19 +1059,31 @@ export function SpeedTestPage() {
         const regionCode = resolveNodeRegionCode(node);
         const regionLabel = getRegionLabel(regionCode);
         const unlocks = {
-          gemini: snap?.unlocked_sites.gemini ?? snap?.unlocked_sites.google_ai ?? false,
-          chatgpt: snap?.unlocked_sites.chatgpt ?? false,
-          claude: snap?.unlocked_sites.claude ?? false,
+          gemini:
+            snap?.unlocked_sites?.gemini ??
+            snap?.unlocked_sites?.gemini_aistudio ??
+            snap?.unlocked_sites?.google_ai ??
+            false,
+          chatgpt: snap?.unlocked_sites?.chatgpt ?? false,
+          claude: snap?.unlocked_sites?.claude ?? false,
           windsurf:
-            snap?.unlocked_sites.windsurf ?? snap?.per_probe_ok?.builtin_unlock_windsurf ?? false,
+            snap?.unlocked_sites?.windsurf ?? snap?.per_probe_ok?.builtin_unlock_windsurf ?? false,
         };
         const hasUnlockData = Boolean(
           snap &&
-            (Object.keys(snap.unlocked_sites).length > 0 ||
+            (Object.keys(snap.unlocked_sites ?? {}).length > 0 ||
               snap.per_probe_ok?.builtin_unlock_windsurf !== undefined ||
               snap.google_clean !== null)
         );
         const unlockScore = Object.values(unlocks).filter(Boolean).length;
+        const isGoogleClean = snap?.google_clean === true;
+        const hasMeasuredSpeed = Boolean(
+          (snap?.up_mbps !== null && snap?.up_mbps !== undefined && snap.up_mbps > 0) ||
+            (snap?.down_mbps !== null && snap?.down_mbps !== undefined && snap.down_mbps > 0)
+        );
+        const isGolden = Boolean(
+          snap && snap.ok !== false && isGoogleClean && unlockScore > 0 && hasMeasuredSpeed
+        );
         const regionMismatch =
           Boolean(snap?.google_risk_mismatch) ||
           Boolean(
@@ -949,6 +1100,8 @@ export function SpeedTestPage() {
           unlocks,
           hasUnlockData,
           unlockScore,
+          isGoogleClean,
+          isGolden,
           regionMismatch,
         };
       })
@@ -970,8 +1123,10 @@ export function SpeedTestPage() {
           return false;
         }
         if (!nodeMatchesContinentAndRegion(row.node, filterContinent, regionFilter)) return false;
+        if (onlyGolden && !row.isGolden) return false;
         if (onlyTested && !row.snap) return false;
-        if (onlyGoogleClean && row.snap?.google_clean !== true) return false;
+        if (onlyGoogleClean && !row.isGoogleClean) return false;
+        if (onlyAiUnlocked && row.unlockScore === 0) return false;
         return true;
       });
 
@@ -1055,8 +1210,10 @@ export function SpeedTestPage() {
     selectedGroupDynamicFilter,
     filterContinent,
     regionFilter,
+    onlyGolden,
     onlyTested,
     onlyGoogleClean,
+    onlyAiUnlocked,
     sortKey,
     sortDir,
     isRunning,
@@ -1091,8 +1248,10 @@ export function SpeedTestPage() {
     groupFilter !== "all" ||
     filterContinent !== "all" ||
     regionFilter !== "all" ||
+    onlyGolden ||
     onlyTested ||
-    onlyGoogleClean;
+    onlyGoogleClean ||
+    onlyAiUnlocked;
 
   const enabledProbeCount = useMemo(
     () => probeList.filter((p) => p.enabled).length,
@@ -1264,8 +1423,10 @@ export function SpeedTestPage() {
     setGroupFilter("all");
     setFilterContinent("all");
     setRegionFilter("all");
+    setOnlyGolden(false);
     setOnlyTested(false);
     setOnlyGoogleClean(false);
+    setOnlyAiUnlocked(false);
     setPage(1);
   };
 
@@ -1339,19 +1500,21 @@ export function SpeedTestPage() {
       cancelled: false,
     });
 
+    const effectiveUsePreaccel = usePreaccelForProbe && hasEnabledPreAccelRelay;
+
     if (inTauri) {
       try {
         const result = await catcloudApi.runIsolatedProbes(
           targetNodeIds,
           probeIds,
           tier,
-          effectiveKeepalive
+          effectiveKeepalive,
+          effectiveUsePreaccel
         );
         if (result.snapshots && Object.keys(result.snapshots).length > 0) {
-          appActions.syncProbes({
-            ...appStore.getState().probes,
-            ...result.snapshots,
-          });
+          appActions.syncProbes(
+            mergeProbeSnapshotsPreserveOld(appStore.getState().probes, result.snapshots)
+          );
         }
 
         const finalCompleted = Math.max(
@@ -1359,6 +1522,9 @@ export function SpeedTestPage() {
           appStore.getState().probeProgress.completed
         );
         const wasCancelled = Boolean(result.cancelled) || pausingRef.current;
+        const preaccelTag = result.used_preaccel
+          ? `（已走 443 提速${result.preaccel_relay_name ? `：${result.preaccel_relay_name}` : ""}）`
+          : "";
 
         appActions.setProbeProgress({
           running: false,
@@ -1385,12 +1551,12 @@ export function SpeedTestPage() {
           appActions.showToast(`测速未能完成：${result.errors[0]}`, "warn");
         } else if (result.errors.length > 0) {
           appActions.showToast(
-            `${TIER_LABELS[tier]}完成：已更新 ${result.probed_count} 个节点（${result.errors.length} 个超时或跳过）`,
+            `${TIER_LABELS[tier]}完成${preaccelTag}：已更新 ${result.probed_count} 个节点（${result.errors.length} 个超时或跳过）`,
             "info"
           );
         } else {
           appActions.showToast(
-            `${TIER_LABELS[tier]}完成，已更新 ${result.probed_count} 个节点结果`,
+            `${TIER_LABELS[tier]}完成${preaccelTag}，已更新 ${result.probed_count} 个节点结果`,
             "ok"
           );
         }
@@ -1450,7 +1616,7 @@ export function SpeedTestPage() {
         if (previewCancelRef.current) return;
 
         void catcloudApi
-          .runIsolatedProbes([nodeId], probeIds, tier, effectiveKeepalive)
+          .runIsolatedProbes([nodeId], probeIds, tier, effectiveKeepalive, effectiveUsePreaccel)
           .then((res) => {
             if (previewCancelRef.current) return;
             const rawSnap = res.snapshots[nodeId];
@@ -1465,10 +1631,11 @@ export function SpeedTestPage() {
                 tested_at: new Date().toISOString(),
                 latency_ms: nextLatency,
               };
-              appActions.syncProbes({
-                ...appStore.getState().probes,
-                [nodeId]: streamedSnap,
-              });
+              appActions.syncProbes(
+                mergeProbeSnapshotsPreserveOld(appStore.getState().probes, {
+                  [nodeId]: streamedSnap,
+                })
+              );
             }
             appActions.setProbeProgress({
               running: true,
@@ -1589,27 +1756,61 @@ export function SpeedTestPage() {
     }
   };
 
+  const activeGroupForQuickAdd = useMemo(() => {
+    if (groups.length === 0) return null;
+    if (runtime.active_group_id) {
+      const found = groups.find((g) => g.id === runtime.active_group_id);
+      if (found) return found;
+    }
+    if (groupFilter !== "all") {
+      const filtered = groups.find((g) => g.id === groupFilter);
+      if (filtered) return filtered;
+    }
+    return groups[0] ?? null;
+  }, [groups, runtime.active_group_id, groupFilter]);
+
+  const activeGroupMemberSet = useMemo(
+    () => new Set(activeGroupForQuickAdd?.member_node_ids ?? []),
+    [activeGroupForQuickAdd]
+  );
+
+  // Always switch directly in single-node mode without mutating multi-group membership
   const handleSwitchToNode = async (node: ProxyNode) => {
     if (switchingNodeId) return;
-    const validGroupIds = new Set(groups.map((g) => g.id));
-    const targetGroupId =
-      (runtime.active_group_id && validGroupIds.has(runtime.active_group_id)
-        ? runtime.active_group_id
-        : null) ??
-      (groupFilter !== "all" && validGroupIds.has(groupFilter) ? groupFilter : null) ??
-      groups[0]?.id ??
-      "";
-
-    if (!targetGroupId) {
-      appActions.showToast("请先在「智能多选组」中创建一个分组后再切换节点", "warn");
-      return;
-    }
-
     setSwitchingNodeId(node.id);
     try {
-      await appActions.selectGroupNode(targetGroupId, node.id);
+      await appActions.selectSingleNode(node.id);
     } finally {
       setSwitchingNodeId(null);
+    }
+  };
+
+  const handleAddNodeToActiveGroup = async (node: ProxyNode) => {
+    if (!activeGroupForQuickAdd || addingToGroupNodeId) return;
+    if (activeGroupMemberSet.has(node.id)) {
+      appActions.showToast(
+        `「${node.name}」已在「${formatGroupDisplayName(activeGroupForQuickAdd.name)}」中`,
+        "info"
+      );
+      return;
+    }
+    setAddingToGroupNodeId(node.id);
+    try {
+      const updated = await catcloudApi.updateMultiGroupMembers(activeGroupForQuickAdd.id, [
+        ...activeGroupForQuickAdd.member_node_ids,
+        node.id,
+      ]);
+      appActions.syncGroups(
+        appStore.getState().groups.map((g) => (g.id === updated.id ? updated : g))
+      );
+      appActions.showToast(
+        `已将「${node.name}」加入「${formatGroupDisplayName(updated.name)}」`,
+        "ok"
+      );
+    } catch (err) {
+      appActions.showToast(`加入多选组失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setAddingToGroupNodeId(null);
     }
   };
 
@@ -1811,32 +2012,21 @@ export function SpeedTestPage() {
           </button>
         </div>
 
-        {/* 3 Clear Chinese Action Buttons + Adjacent 60s Keepalive Switch */}
+        {/* Primary & Auxiliary Speed Test Controls + Pre-Accel & Keepalive Toggles */}
         <div className="mt-3.5 flex flex-wrap items-center gap-2">
           <button
             type="button"
             disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
-            onClick={() => handlePrimaryTestClick("latency")}
-            title="只测节点通不通和延迟快慢，速度最快、最省流量"
+            onClick={() => handlePrimaryTestClick("unlock")}
+            title="主推省流方案：一次测出延迟、谷歌是否送中与 AI 解锁，约 0.2 MB/节点"
             className="inline-flex items-center gap-2 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
-            <Zap className="h-3.5 w-3.5 shrink-0" />
-            <span>快速测延迟</span>
+            <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+            <span>测延迟 + 送中/AI（省流）</span>
             <span className="rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium">
-              {targetCountTag}
+              约 0.2 MB/节点
             </span>
-          </button>
-
-          <button
-            type="button"
-            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
-            onClick={() => handlePrimaryTestClick("unlock")}
-            title="测延迟 + 谷歌地区检测 + 常用 AI 平台解锁"
-            className="inline-flex items-center gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--card-hover)] disabled:cursor-not-allowed disabled:opacity-55"
-          >
-            <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
-            <span>测地区与 AI 解锁</span>
-            <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-normal text-[var(--muted)]">
+            <span className="hidden rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium sm:inline">
               {targetCountTag}
             </span>
           </button>
@@ -1845,17 +2035,59 @@ export function SpeedTestPage() {
             type="button"
             disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
             onClick={() => handlePrimaryTestClick("full")}
-            title="测延迟 + 地区与 AI 解锁 + 实际上传与下载网速"
-            className="inline-flex items-center gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--card-hover)] disabled:cursor-not-allowed disabled:opacity-55"
+            title="测延迟 + 送中/AI + 真实上传/下载速度，约 3 MB/节点"
+            className="inline-flex items-center gap-2 rounded-xl border border-[var(--sky)]/60 bg-[var(--sky-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
-            <Rocket className="h-3.5 w-3.5 shrink-0 text-[var(--sky)]" />
-            <span>测上下行网速</span>
-            <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-normal text-[var(--muted)]">
-              {targetCountTag}
+            <Rocket className="h-3.5 w-3.5 shrink-0" />
+            <span>含上下行完整测速</span>
+            <span className="rounded-md bg-[var(--card)]/80 px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
+              测真实上传/下载，约 3 MB/节点
             </span>
           </button>
 
+          <button
+            type="button"
+            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
+            onClick={() => handlePrimaryTestClick("latency")}
+            title="只测节点连通与基础延迟，速度最快、保留旧的上下行和解锁记录"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-55"
+          >
+            <Zap className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+            <span>仅快测延迟</span>
+          </button>
+
           <span className="mx-0.5 hidden h-5 w-px bg-[var(--line)] sm:inline-block" aria-hidden="true" />
+
+          <button
+            type="button"
+            role="switch"
+            aria-checked={usePreaccelForProbe && hasEnabledPreAccelRelay}
+            disabled={isRunning || !hasEnabledPreAccelRelay}
+            onClick={() => {
+              userToggledPreaccelRef.current = true;
+              setUsePreaccelForProbe((v) => !v);
+            }}
+            title={
+              hasEnabledPreAccelRelay
+                ? "开启后测速将经由已启用的国内 443 中转测出真实提速表现；关闭可裸连对比"
+                : "需先在「国内提速」中添加并启用国内中转机，方可走国内 443 提速测速"
+            }
+            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
+              usePreaccelForProbe && hasEnabledPreAccelRelay
+                ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+            }`}
+          >
+            <Zap className="h-3.5 w-3.5 shrink-0" />
+            <span>同步走国内 443 提速测速</span>
+            <span
+              className={`h-2 w-2 rounded-full ${
+                usePreaccelForProbe && hasEnabledPreAccelRelay
+                  ? "bg-[var(--green)]"
+                  : "bg-[var(--muted)]/50"
+              }`}
+            />
+          </button>
 
           <label
             title="开启后每节点多耗时约 1 分钟，仅排查断流时建议勾选（与测速项目设置中的 60 秒长连接同步）"
@@ -2310,16 +2542,22 @@ export function SpeedTestPage() {
           <button
             type="button"
             onClick={() => {
-              setOnlyTested((v) => !v);
+              const next = !onlyGolden;
+              setOnlyGolden(next);
+              if (next) {
+                setSortKey("up");
+                setSortDir("desc");
+              }
               setPage(1);
             }}
-            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-              onlyTested
-                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+            title="筛选谷歌未送中、AI 有解锁且已测出速度的优质节点，开启后自动按上传最快排序"
+            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold transition-colors ${
+              onlyGolden
+                ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]"
+                : "border-[var(--accent)]/45 bg-[var(--accent-soft)] text-[var(--accent)] hover:border-[var(--accent)]"
             }`}
           >
-            仅看已测
+            ⭐ 黄金节点（未送中 + AI + 高速）
           </button>
 
           <button
@@ -2334,8 +2572,73 @@ export function SpeedTestPage() {
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
             }`}
           >
-            仅看谷歌正常
+            谷歌正常
           </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setOnlyAiUnlocked((v) => !v);
+              setPage(1);
+            }}
+            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+              onlyAiUnlocked
+                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+            }`}
+          >
+            AI 可用
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setOnlyTested((v) => !v);
+              setPage(1);
+            }}
+            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+              onlyTested
+                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+            }`}
+          >
+            仅看已测
+          </button>
+
+          {/* Quick Sort Pills: Upload Fastest / Download Fastest / Lowest Latency */}
+          <div
+            className="inline-flex items-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]"
+            role="group"
+            aria-label="快捷排序"
+          >
+            {(
+              [
+                { key: "up", dir: "desc", label: "上传最快" },
+                { key: "down", dir: "desc", label: "下载最快" },
+                { key: "latency", dir: "asc", label: "延迟最低" },
+              ] as const
+            ).map((opt) => {
+              const active = sortKey === opt.key && sortDir === opt.dir;
+              return (
+                <button
+                  key={opt.key}
+                  type="button"
+                  onClick={() => {
+                    setSortKey(opt.key);
+                    setSortDir(opt.dir);
+                    setPage(1);
+                  }}
+                  className={`rounded-md px-2 py-1 font-medium transition-colors ${
+                    active
+                      ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
+                      : "text-[var(--muted)] hover:text-[var(--text)]"
+                  }`}
+                >
+                  {opt.label}
+                </button>
+              );
+            })}
+          </div>
 
           {hasActiveFilters && (
             <button
@@ -2435,10 +2738,10 @@ export function SpeedTestPage() {
             modifierHeld ? "select-none" : ""
           }`}
         >
-          <table className="w-full min-w-[920px] border-collapse text-left text-xs">
+          <table className="w-full table-fixed border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] text-[var(--muted)]">
-                <th className="w-10 px-3 py-2.5 text-center">
+                <th className="w-8 px-2 py-2.5 text-center">
                   <input
                     type="checkbox"
                     checked={allPageSelected}
@@ -2451,27 +2754,29 @@ export function SpeedTestPage() {
                 </th>
                 {(
                   [
-                    { key: "name", label: "节点名称" },
-                    { key: "source", label: "来源" },
-                    { key: "latency", label: "延迟" },
-                    { key: "up", label: "上传速度" },
-                    { key: "down", label: "下载速度" },
-                    { key: "google", label: "谷歌地区" },
-                    { key: "unlocks", label: "AI 解锁" },
-                  ] as ReadonlyArray<{ key: SortKey; label: string }>
+                    { key: "name", label: "节点名称", cls: "px-2" },
+                    { key: "source", label: "来源", cls: "w-[82px] px-1.5" },
+                    { key: "latency", label: "延迟", cls: "w-[60px] px-1.5" },
+                    { key: "up", label: "上传", cls: "w-[56px] px-1.5" },
+                    { key: "down", label: "下载", cls: "w-[60px] px-1.5" },
+                    { key: "google", label: "谷歌地区", cls: "w-[84px] px-1.5" },
+                    { key: "unlocks", label: "AI 解锁", cls: "w-[136px] px-1.5" },
+                  ] as ReadonlyArray<{ key: SortKey; label: string; cls: string }>
                 ).map((col) => (
-                  <th key={col.key} className="whitespace-nowrap px-3 py-2.5 font-medium">
+                  <th key={col.key} className={`whitespace-nowrap py-2.5 font-medium ${col.cls}`}>
                     <button
                       type="button"
                       onClick={() => handleSort(col.key)}
-                      className="inline-flex items-center gap-1 whitespace-nowrap text-left transition-colors hover:text-[var(--text)]"
+                      className="inline-flex items-center gap-0.5 whitespace-nowrap text-left transition-colors hover:text-[var(--text)]"
                     >
                       <span>{col.label}</span>
                       {renderSortIcon(col.key)}
                     </button>
                   </th>
                 ))}
-                <th className="w-40 whitespace-nowrap px-3 py-2.5 text-right font-medium">操作</th>
+                <th className="w-[228px] whitespace-nowrap px-2 py-2.5 text-right font-medium">
+                  操作
+                </th>
               </tr>
             </thead>
 
@@ -2488,8 +2793,11 @@ export function SpeedTestPage() {
                 }) => {
                   const isSelected = validSelectedIds.has(node.id);
                   const isActiveNode = runtime.active_node_id === node.id;
+                  const isSingleActiveNode = isSingleMode && isActiveNode;
+                  const isInActiveGroup = activeGroupMemberSet.has(node.id);
                   const isFlashing = recentFlashIds.has(node.id);
                   const isSwitchingThis = switchingNodeId === node.id;
+                  const isAddingThis = addingToGroupNodeId === node.id;
 
                   return (
                     <tr
@@ -2507,7 +2815,7 @@ export function SpeedTestPage() {
                     >
                       {/* Checkbox with clear accent left indicator when selected */}
                       <td
-                        className={`px-3 py-2.5 text-center ${
+                        className={`w-8 px-2 py-2 text-center ${
                           isSelected
                             ? "shadow-[inset_3px_0_0_var(--accent)]"
                             : isFlashing
@@ -2533,29 +2841,29 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Node Name */}
-                      <td className="min-w-[230px] max-w-[300px] px-3 py-2.5">
-                        <div className="flex items-center gap-1.5">
+                      <td className="px-2 py-2">
+                        <div className="flex min-w-0 items-center gap-1">
                           <span
-                            className="truncate font-semibold text-[var(--text)]"
+                            className="min-w-0 flex-1 truncate font-semibold text-[var(--text)]"
                             title={node.name}
                           >
                             {node.name}
                           </span>
                           {isActiveNode && (
-                            <span className="shrink-0 rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                              当前使用
+                            <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                              {isSingleMode ? "单节点" : "当前"}
                             </span>
                           )}
                           {isFlashing && (
                             <span className="cc-pulse-dot shrink-0 rounded-full bg-[var(--green)] px-1.5 py-0.5 text-[9px] font-semibold text-[var(--accent-ink)]">
-                              已更新
+                              新
                             </span>
                           )}
                         </div>
-                        <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
-                          <span>{regionLabel}</span>
+                        <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-[var(--muted)]">
+                          <span className="truncate">{regionLabel}</span>
                           <span>·</span>
-                          <span className="cc-tabular">
+                          <span className="cc-tabular shrink-0">
                             {node.multiplier % 1 === 0
                               ? `${node.multiplier}x`
                               : `${node.multiplier.toFixed(1)}x`}
@@ -2564,9 +2872,9 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Source */}
-                      <td className="min-w-[115px] max-w-[160px] px-3 py-2.5">
+                      <td className="w-[82px] px-1.5 py-2">
                         <span
-                          className="block truncate text-[var(--text-secondary)]"
+                          className="block truncate text-[11px] text-[var(--text-secondary)]"
                           title={sourceName}
                         >
                           {sourceName}
@@ -2574,7 +2882,7 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Latency */}
-                      <td className="whitespace-nowrap px-3 py-2.5 cc-mono cc-tabular">
+                      <td className="w-[60px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
                         {snap ? (
                           <div>
                             <span
@@ -2592,7 +2900,7 @@ export function SpeedTestPage() {
                             {snap.keepalive_60s_ok !== null &&
                               snap.keepalive_60s_ok !== undefined && (
                                 <div
-                                  className={`mt-1 whitespace-nowrap text-xs font-medium ${
+                                  className={`mt-0.5 whitespace-nowrap text-[10px] font-medium ${
                                     snap.keepalive_60s_ok
                                       ? "text-[var(--green)]"
                                       : "text-[var(--red)]"
@@ -2608,12 +2916,12 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Upload Speed */}
-                      <td className="whitespace-nowrap px-3 py-2.5 cc-mono cc-tabular">
+                      <td className="w-[56px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
                         {snap?.up_mbps !== null && snap?.up_mbps !== undefined ? (
                           <span className="font-semibold text-[var(--coral)]">
-                            {snap.up_mbps.toFixed(1)}{" "}
-                            <span className="text-[10px] font-normal text-[var(--muted)]">
-                              Mbps
+                            {snap.up_mbps.toFixed(1)}
+                            <span className="ml-0.5 text-[10px] font-normal text-[var(--muted)]">
+                              M
                             </span>
                           </span>
                         ) : (
@@ -2622,12 +2930,14 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Download Speed */}
-                      <td className="whitespace-nowrap px-3 py-2.5 cc-mono cc-tabular">
+                      <td className="w-[60px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
                         {snap?.down_mbps !== null && snap?.down_mbps !== undefined ? (
                           <span className="font-semibold text-[var(--sky)]">
-                            {snap.down_mbps.toFixed(1)}{" "}
-                            <span className="text-[10px] font-normal text-[var(--muted)]">
-                              Mbps
+                            {snap.down_mbps >= 100
+                              ? Math.round(snap.down_mbps)
+                              : snap.down_mbps.toFixed(1)}
+                            <span className="ml-0.5 text-[10px] font-normal text-[var(--muted)]">
+                              M
                             </span>
                           </span>
                         ) : (
@@ -2636,17 +2946,17 @@ export function SpeedTestPage() {
                       </td>
 
                       {/* Google Region Status */}
-                      <td className="px-3 py-2.5">
+                      <td className="w-[84px] whitespace-nowrap px-1.5 py-2">
                         <div className="flex flex-col items-start gap-1">
                           {snap?.google_clean === true ? (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--green)]">
-                              <CheckCircle2 className="h-3 w-3" />
+                            <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10.5px] font-medium text-[var(--green)]">
+                              <CheckCircle2 className="h-3 w-3 shrink-0" />
                               正常
                             </span>
                           ) : snap?.google_clean === false ? (
-                            <span className="inline-flex items-center gap-1 rounded-full bg-[var(--red-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--red)]">
-                              <XCircle className="h-3 w-3" />
-                              异常
+                            <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10.5px] font-medium text-[var(--red)]">
+                              <XCircle className="h-3 w-3 shrink-0" />
+                              送中
                             </span>
                           ) : (
                             <span className="text-[11px] text-[var(--muted)]">待测</span>
@@ -2654,20 +2964,20 @@ export function SpeedTestPage() {
 
                           {regionMismatch && (
                             <span
-                              className="inline-flex items-center gap-0.5 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] text-[var(--amber)]"
+                              className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[9.5px] text-[var(--amber)]"
                               title="不同网站识别出的地区存在差异，仅供参考"
                             >
-                              <AlertTriangle className="h-2.5 w-2.5" />
+                              <AlertTriangle className="h-2.5 w-2.5 shrink-0" />
                               地区有偏差
                             </span>
                           )}
                         </div>
                       </td>
 
-                      {/* AI Unlocks */}
-                      <td className="px-3 py-2.5">
+                      {/* AI Unlocks (2x2 compact micro-grid) */}
+                      <td className="w-[136px] px-1.5 py-2">
                         {hasUnlockData ? (
-                          <div className="flex flex-wrap gap-1">
+                          <div className="grid w-[124px] grid-cols-2 gap-1">
                             {(
                               [
                                 { id: "gemini", label: "Gemini", ok: unlocks.gemini },
@@ -2678,7 +2988,7 @@ export function SpeedTestPage() {
                             ).map((badge) => (
                               <span
                                 key={badge.id}
-                                className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
+                                className={`whitespace-nowrap rounded-md px-1 py-0.5 text-center text-[10px] font-medium leading-tight ${
                                   badge.ok
                                     ? "bg-[var(--green-soft)] text-[var(--green)]"
                                     : "bg-[var(--bg-elevated)] text-[var(--muted)] opacity-55"
@@ -2693,9 +3003,61 @@ export function SpeedTestPage() {
                         )}
                       </td>
 
-                      {/* Row Actions: Quick Latency Test & Use Node */}
-                      <td className="px-3 py-2.5 text-right">
-                        <div className="inline-flex items-center justify-end gap-1.5">
+                      {/* Row Actions: Primary Single-Node Use + Compact Full Probe + Lightweight Latency / +Group */}
+                      <td className="w-[228px] whitespace-nowrap px-2 py-2 text-right">
+                        <div className="inline-flex flex-nowrap items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            disabled={isSingleActiveNode || isSwitchingThis}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleSwitchToNode(node);
+                            }}
+                            title={
+                              isSingleActiveNode
+                                ? "当前正以单节点模式使用此节点"
+                                : "直接单节点使用此节点（不会修改多选组成员）"
+                            }
+                            aria-label={
+                              isSingleActiveNode
+                                ? `单节点在用：${node.name}`
+                                : `用它（单节点）：${node.name}`
+                            }
+                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-semibold transition-colors ${
+                              isSingleActiveNode
+                                ? "border-[var(--green)] bg-[var(--green)] text-[var(--accent-ink)]"
+                                : "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-ink)] disabled:cursor-not-allowed disabled:opacity-65"
+                            }`}
+                          >
+                            {isSingleActiveNode ? (
+                              <Check className="h-3 w-3 shrink-0" />
+                            ) : (
+                              <ArrowRightLeft className="h-3 w-3 shrink-0" />
+                            )}
+                            <span>
+                              {isSingleActiveNode
+                                ? "在用"
+                                : isSwitchingThis
+                                  ? "切换"
+                                  : "用它"}
+                            </span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={isRunning}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void executeProbes([node.id], "full", true);
+                            }}
+                            title="单测此节点的延迟、谷歌送中/AI 解锁与真实上下行速度，保留其它旧结果"
+                            aria-label={`测全套：${node.name}`}
+                            className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--sky)]/45 bg-[var(--sky-soft)] px-1.5 py-1 text-[11px] font-medium text-[var(--sky)] transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-55"
+                          >
+                            <Rocket className="h-3 w-3 shrink-0" />
+                            <span>测全套</span>
+                          </button>
+
                           <button
                             type="button"
                             disabled={isRunning}
@@ -2703,36 +3065,45 @@ export function SpeedTestPage() {
                               e.stopPropagation();
                               void executeProbes([node.id], "latency", true);
                             }}
-                            title="只快速测这一个节点的延迟，不消耗上下行测速流量"
+                            title="只快速复测此节点延迟，不洗掉之前测好的上下行和解锁结果"
                             aria-label={`测延迟：${node.name}`}
-                            className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line-strong)]/70 bg-[var(--bg-elevated)] px-2 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-65"
+                            className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:opacity-65"
                           >
-                            <Play className="h-3 w-3 shrink-0" />
+                            <Play className="h-2.5 w-2.5 shrink-0" />
                             <span>测延迟</span>
                           </button>
 
-                          <button
-                            type="button"
-                            disabled={isActiveNode || isSwitchingThis}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void handleSwitchToNode(node);
-                            }}
-                            title={isActiveNode ? "当前正在使用此节点" : "立即切换使用此节点"}
-                            aria-label={isActiveNode ? `正在用：${node.name}` : `用它：${node.name}`}
-                            className={`inline-flex items-center gap-1 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors ${
-                              isActiveNode
-                                ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
-                                : "border-[var(--line-strong)]/70 bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--green)] hover:text-[var(--green)] disabled:cursor-not-allowed disabled:opacity-65"
-                            }`}
-                          >
-                            {isActiveNode ? (
-                              <Check className="h-3 w-3 shrink-0" />
-                            ) : (
-                              <ArrowRightLeft className="h-3 w-3 shrink-0" />
-                            )}
-                            <span>{isActiveNode ? "正在用" : isSwitchingThis ? "切换中" : "用它"}</span>
-                          </button>
+                          {!isSingleMode && activeGroupForQuickAdd && (
+                            <button
+                              type="button"
+                              disabled={isAddingThis}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void handleAddNodeToActiveGroup(node);
+                              }}
+                              title={
+                                isInActiveGroup
+                                  ? `已在当前多选组「${formatGroupDisplayName(activeGroupForQuickAdd.name)}」中`
+                                  : `加入当前多选组「${formatGroupDisplayName(activeGroupForQuickAdd.name)}」`
+                              }
+                              aria-label={
+                                isInActiveGroup
+                                  ? `已在当前多选组：${node.name}`
+                                  : `加入当前多选组：${node.name}`
+                              }
+                              className={`inline-flex shrink-0 items-center justify-center rounded-lg border p-1 transition-colors disabled:opacity-50 ${
+                                isInActiveGroup
+                                  ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
+                                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                              }`}
+                            >
+                              {isInActiveGroup ? (
+                                <Check className="h-3 w-3 shrink-0" />
+                              ) : (
+                                <Plus className="h-3 w-3 shrink-0" />
+                              )}
+                            </button>
+                          )}
                         </div>
                       </td>
                     </tr>
