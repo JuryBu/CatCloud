@@ -439,9 +439,11 @@ name = "catcloud-desktop"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "catcloud-core",
  "chrono",
  "hex",
+ "image",
  "libc",
  "reqwest 0.12.28",
  "rustls",

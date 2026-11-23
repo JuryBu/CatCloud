@@ -1,8 +1,12 @@
+use crate::error::{CatError, CatResult};
+use crate::models::ProxyNode;
 use crate::subscription::adapter::{ADAPTER_SCHEMA_V1, render_adapter_template_script};
 use crate::subscription::parser::{
-    MAX_SUBSCRIPTION_BYTES, parse_clash_yaml_value, parse_subscription_payload,
+    MAX_SUBSCRIPTION_BYTES, json_to_u16, node_from_clash_json, parse_clash_yaml_value,
+    parse_subscription_payload,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
@@ -413,6 +417,97 @@ pub fn normalize_loopback_controller_base_url(raw: &str) -> Option<String> {
     }
 
     Some(format!("http://127.0.0.1:{port}"))
+}
+
+/// Parse a Mihomo/Clash REST controller `GET /proxies` JSON payload into normalized `ProxyNode`s.
+///
+/// Returns `(connectable_nodes, metadata_only_count, total_entries, warnings)`.
+/// Standard Mihomo `/proxies` endpoints often omit `server`/`port` credentials for security;
+/// callers can inspect `metadata_only_count` to surface a clear explanation when no directly
+/// connectable node fields are exposed.
+pub fn parse_controller_proxies_json(
+    sub_id: &str,
+    raw_json: &[u8],
+) -> CatResult<(Vec<ProxyNode>, usize, usize, Vec<String>)> {
+    if raw_json.len() > MAX_SUBSCRIPTION_BYTES {
+        return Err(CatError::Validation(format!(
+            "控制接口返回数据超过 16 MiB 上限（{} 字节）",
+            raw_json.len()
+        )));
+    }
+    let val: serde_json::Value = serde_json::from_slice(raw_json)
+        .map_err(|e| CatError::Validation(format!("控制接口返回内容不是有效 JSON：{e}")))?;
+    let Some(proxies_map) = val.get("proxies").and_then(serde_json::Value::as_object) else {
+        return Err(CatError::Validation(
+            "控制接口返回数据缺少 `proxies` 字段".to_string(),
+        ));
+    };
+
+    let mut nodes = Vec::new();
+    let mut meta_only_count = 0usize;
+    let mut warnings = Vec::new();
+    let mut used_ids = HashSet::new();
+
+    for (key_name, entry) in proxies_map {
+        let upper = key_name.to_ascii_uppercase();
+        if matches!(
+            upper.as_str(),
+            "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE" | "GLOBAL"
+        ) {
+            continue;
+        }
+        let Some(obj) = entry.as_object() else {
+            continue;
+        };
+        let kind = obj
+            .get("type")
+            .or_else(|| obj.get("protocol"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if kind.is_empty()
+            || matches!(
+                kind.as_str(),
+                "selector"
+                    | "urltest"
+                    | "fallback"
+                    | "loadbalance"
+                    | "relay"
+                    | "direct"
+                    | "reject"
+                    | "compatible"
+                    | "pass"
+            )
+        {
+            continue;
+        }
+
+        let has_server = obj
+            .get("server")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty());
+        let has_port = obj
+            .get("port")
+            .and_then(json_to_u16)
+            .is_some_and(|p| p > 0);
+
+        if !has_server || !has_port {
+            meta_only_count += 1;
+            continue;
+        }
+
+        let mut normalized = obj.clone();
+        if !normalized.contains_key("name") {
+            normalized.insert("name".to_string(), serde_json::Value::String(key_name.clone()));
+        }
+        match node_from_clash_json(sub_id, &normalized, &mut used_ids) {
+            Ok(node) => nodes.push(node),
+            Err(reason) => warnings.push(format!("跳过节点「{key_name}」：{reason}")),
+        }
+    }
+
+    Ok((nodes, meta_only_count, proxies_map.len(), warnings))
 }
 
 enum ControllerProbeOutcome {

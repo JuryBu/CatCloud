@@ -1,34 +1,58 @@
 import {
   AlertTriangle,
   ArrowDown,
+  ArrowRightLeft,
   ArrowUp,
   ArrowUpDown,
+  Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  ChevronUp,
   Clock,
   Filter,
-  Gauge,
-  Pause,
+  Globe,
+  Layers,
   Play,
   Plus,
+  Rocket,
+  RotateCcw,
   Search,
-  ShieldAlert,
+  Settings,
   ShieldCheck,
+  Sparkles,
+  Square,
   Terminal,
   Trash2,
   X,
   XCircle,
+  Zap,
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  type DynamicFilterSpec,
+  type MultiGroup,
   type ProbeDefinition,
   type ProbeKind,
   type ProbeSnapshot,
+  type ProxyNode,
   catcloudApi,
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
 import { MascotSprite } from "../components/MascotSprite";
-import { appActions, useAppSelector } from "../store/appStore";
+import { appActions, appStore, useAppSelector } from "../store/appStore";
+
+type SpeedTestTier = "latency" | "unlock" | "full";
 
 interface ProbeItem {
   id: string;
@@ -44,20 +68,85 @@ interface ProbeItem {
   enabled: boolean;
 }
 
+const PROBE_ENABLED_STORAGE_KEY = "catcloud.speedtest.probeEnabled.v1";
+const KEEPALIVE_STORAGE_KEY = "__keepalive__";
+
+const FRIENDLY_GROUP_NAME_MAP: Record<string, string> = {
+  流媒体与下载受控均衡: "影音下载均衡组",
+  高优家宽备援池: "备用精选组",
+};
+
+function formatGroupDisplayName(name: string): string {
+  return FRIENDLY_GROUP_NAME_MAP[name] ?? name;
+}
+
+function loadPersistedProbeEnabledMap(): Record<string, boolean> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.localStorage.getItem(PROBE_ENABLED_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as unknown;
+    if (!parsed || typeof parsed !== "object") return {};
+    const out: Record<string, boolean> = {};
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === "boolean") out[k] = v;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function savePersistedProbeEnabledMap(map: Record<string, boolean>): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(PROBE_ENABLED_STORAGE_KEY, JSON.stringify(map));
+  } catch {
+    /* ignore storage quota or privacy-mode errors */
+  }
+}
+
 const PROBE_KIND_LABELS: Record<ProbeKind, string> = {
-  latency: "测活延迟 URL",
-  upload: "上行测速 URL",
-  download: "下行测速 URL",
-  keepalive: "60s 保活",
-  google_cn: "Google 真值",
-  unlock_regex: "正则解锁",
-  external_cmd: "外部脚本探针",
+  latency: "基础延迟",
+  upload: "上传测速",
+  download: "下载测速",
+  keepalive: "60 秒长连接",
+  google_cn: "谷歌地区检测",
+  unlock_regex: "网站解锁",
+  external_cmd: "自定义脚本",
+};
+
+const FRIENDLY_BUILTIN_PROBES: Record<string, { title: string; desc: string }> = {
+  builtin_latency: {
+    title: "基础延迟",
+    desc: "检查节点是否连通及响应速度",
+  },
+  builtin_google_cn: {
+    title: "谷歌地区检测",
+    desc: "检测谷歌识别的地区是否正常",
+  },
+  builtin_upload: {
+    title: "上传测速",
+    desc: "测试节点的上传网速",
+  },
+  builtin_download: {
+    title: "下载测速",
+    desc: "测试节点的下载网速",
+  },
+  builtin_keepalive_60s: {
+    title: "60 秒长连接",
+    desc: "测试连接静置 60 秒后是否稳定不断流",
+  },
+  builtin_unlock_windsurf: {
+    title: "Windsurf 解锁",
+    desc: "检测是否支持正常访问 Windsurf",
+  },
 };
 
 const INITIAL_PROBES: ProbeItem[] = [
   {
     id: "builtin_latency",
-    name: "标准连通延迟 204",
+    name: "基础延迟",
     kind: "latency",
     target: "https://cp.cloudflare.com/generate_204",
     method: "GET",
@@ -68,7 +157,7 @@ const INITIAL_PROBES: ProbeItem[] = [
   },
   {
     id: "builtin_google_cn",
-    name: "Google 侧真值防送中",
+    name: "谷歌地区检测",
     kind: "google_cn",
     target: "https://www.google.com/generate_204",
     method: "GET",
@@ -79,7 +168,7 @@ const INITIAL_PROBES: ProbeItem[] = [
   },
   {
     id: "builtin_upload",
-    name: "上行吞吐 (512KB 快熔断)",
+    name: "上传测速",
     kind: "upload",
     target: "https://speed.cloudflare.com/__up",
     method: "POST",
@@ -91,7 +180,7 @@ const INITIAL_PROBES: ProbeItem[] = [
   },
   {
     id: "builtin_download",
-    name: "下行吞吐测速",
+    name: "下载测速",
     kind: "download",
     target: "https://speed.cloudflare.com/__down?bytes=2097152",
     method: "GET",
@@ -103,18 +192,18 @@ const INITIAL_PROBES: ProbeItem[] = [
   },
   {
     id: "builtin_keepalive_60s",
-    name: "60s 静默长连接黑洞检测",
+    name: "60 秒长连接",
     kind: "keepalive",
     target: "https://cp.cloudflare.com/generate_204",
     method: "GET",
     expectedStatus: 204,
     timeoutMs: 65000,
     builtin: true,
-    enabled: true,
+    enabled: false,
   },
   {
     id: "builtin_unlock_windsurf",
-    name: "Windsurf / Codeium 解锁",
+    name: "Windsurf 解锁",
     kind: "unlock_regex",
     target: "https://windsurf.com",
     method: "GET",
@@ -134,29 +223,122 @@ const UNLOCK_PRESETS: ReadonlyArray<{
   bodyRegex: string;
 }> = [
   {
-    label: "ChatGPT 预设",
+    label: "ChatGPT 模板",
     id: "unlock_chatgpt_api",
-    name: "ChatGPT API 可达性",
+    name: "ChatGPT 解锁",
     target: "https://api.openai.com/v1/models",
     bodyRegex: "invalid_api_key|unauthorized|data",
   },
   {
-    label: "Claude 预设",
+    label: "Claude 模板",
     id: "unlock_claude_web",
-    name: "Claude 地区解锁校验",
+    name: "Claude 解锁",
     target: "https://claude.ai/login",
     bodyRegex: "claude",
   },
   {
-    label: "Windsurf 预设",
+    label: "Windsurf 模板",
     id: "unlock_windsurf_ide",
-    name: "Windsurf IDE 通道校验",
+    name: "Windsurf 解锁",
     target: "https://windsurf.com",
     bodyRegex: "windsurf|codeium",
   },
 ];
 
-function fromProbeDefinition(def: ProbeDefinition): ProbeItem {
+const REGION_LABELS: Record<string, string> = {
+  JP: "日本",
+  SG: "新加坡",
+  US: "美国",
+  TW: "台湾",
+  HK: "香港",
+  UK: "英国",
+  GB: "英国",
+  DE: "德国",
+  KR: "韩国",
+  NL: "荷兰",
+  CA: "加拿大",
+  AU: "澳大利亚",
+  FR: "法国",
+  IN: "印度",
+  TR: "土耳其",
+  AR: "阿根廷",
+  MY: "马来西亚",
+  TH: "泰国",
+  VN: "越南",
+  PH: "菲律宾",
+  ID: "印尼",
+  RU: "俄罗斯",
+  BR: "巴西",
+  CH: "瑞士",
+  SE: "瑞典",
+  FI: "芬兰",
+  PL: "波兰",
+  IE: "爱尔兰",
+  IT: "意大利",
+  ES: "西班牙",
+  AE: "阿联酋",
+  MO: "澳门",
+  UNK: "其他",
+};
+
+const TIER_LABELS: Record<SpeedTestTier, string> = {
+  latency: "快速测延迟",
+  unlock: "测地区与 AI 解锁",
+  full: "测上下行网速",
+};
+
+const PAGE_SIZE_OPTIONS = [30, 50, 100] as const;
+
+type SortKey =
+  | "name"
+  | "source"
+  | "latency"
+  | "up"
+  | "down"
+  | "google"
+  | "unlocks";
+
+type SortDir = "asc" | "desc";
+
+function formatRegionShort(code: string): string {
+  const upper = code.trim().toUpperCase();
+  if (!upper) return "其他";
+  return REGION_LABELS[upper] ?? upper;
+}
+
+function formatRegionOption(code: string): string {
+  const upper = code.trim().toUpperCase();
+  if (!upper) return "其他";
+  const zh = REGION_LABELS[upper];
+  return zh ? `${zh} (${upper})` : upper;
+}
+
+function getProbeDisplayInfo(probe: ProbeItem): { title: string; desc: string } {
+  const mapped = FRIENDLY_BUILTIN_PROBES[probe.id];
+  if (mapped) return mapped;
+  if (probe.builtin) {
+    return {
+      title: PROBE_KIND_LABELS[probe.kind],
+      desc: "内置测速项目",
+    };
+  }
+  return {
+    title: probe.name,
+    desc: PROBE_KIND_LABELS[probe.kind],
+  };
+}
+
+function fromProbeDefinition(
+  def: ProbeDefinition,
+  persistedEnabled: Record<string, boolean>,
+  keepaliveEnabled: boolean
+): ProbeItem {
+  const enabled =
+    def.kind === "keepalive"
+      ? keepaliveEnabled
+      : typeof persistedEnabled[def.id] === "boolean"
+        ? persistedEnabled[def.id]
+        : true;
   return {
     id: def.id,
     name: def.name,
@@ -171,7 +353,7 @@ function fromProbeDefinition(def: ProbeDefinition): ProbeItem {
         : undefined,
     timeoutMs: def.timeout_ms,
     builtin: def.builtin,
-    enabled: true,
+    enabled,
   };
 }
 
@@ -197,53 +379,158 @@ function toProbeDefinition(item: ProbeItem): ProbeDefinition {
   };
 }
 
-type FunnelStageKey = "l0" | "l1" | "l2";
-type FunnelStageState = "idle" | "running" | "done" | "skipped";
-
-interface FunnelProgress {
-  l0: { status: FunnelStageState; pct: number; passed: number; total: number };
-  l1: { status: FunnelStageState; pct: number; passed: number; total: number };
-  l2: { status: FunnelStageState; pct: number; passed: number; total: number };
+interface CompiledDynamicFilter {
+  subIdSet: Set<string> | null;
+  regionUpperSet: Set<string> | null;
+  protocolLowerSet: Set<string> | null;
+  maxMultiplier: number | null;
+  requireGoogleClean: boolean;
+  require443Native: boolean;
 }
 
-type SortKey =
-  | "name"
-  | "source"
-  | "region"
-  | "multiplier"
-  | "latency"
-  | "up"
-  | "down"
-  | "google"
-  | "keepalive"
-  | "unlocks";
-
-type SortDir = "asc" | "desc";
-
-function formatFormulaHint(probe: ProbeItem): string {
-  switch (probe.kind) {
-    case "upload":
-      return `probe_up("${probe.id}")`;
-    case "download":
-      return `probe_down("${probe.id}")`;
-    case "latency":
-      return `probe_ping("${probe.id}")`;
-    default:
-      return `probe_ok("${probe.id}")`;
+function parseDynamicFilterSpec(raw: MultiGroup["dynamic_filter"]): DynamicFilterSpec | null {
+  if (!raw) return null;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (parsed && typeof parsed === "object") {
+        return parsed as DynamicFilterSpec;
+      }
+      return null;
+    } catch {
+      return null;
+    }
   }
+  if (typeof raw === "object") {
+    return raw as DynamicFilterSpec;
+  }
+  return null;
+}
+
+function compileDynamicFilter(raw: MultiGroup["dynamic_filter"]): CompiledDynamicFilter | null {
+  const spec = parseDynamicFilterSpec(raw);
+  if (!spec) return null;
+  return {
+    subIdSet:
+      Array.isArray(spec.sub_ids) && spec.sub_ids.length > 0 ? new Set(spec.sub_ids) : null,
+    regionUpperSet:
+      Array.isArray(spec.region_codes) && spec.region_codes.length > 0
+        ? new Set(spec.region_codes.map((r) => r.toUpperCase()))
+        : null,
+    protocolLowerSet:
+      Array.isArray(spec.protocols) && spec.protocols.length > 0
+        ? new Set(spec.protocols.map((p) => p.toLowerCase()))
+        : null,
+    maxMultiplier:
+      typeof spec.max_multiplier === "number" && Number.isFinite(spec.max_multiplier)
+        ? spec.max_multiplier
+        : null,
+    requireGoogleClean: spec.require_google_clean === true,
+    require443Native: spec.require_443_native === true,
+  };
+}
+
+function nodeBelongsToGroup(
+  node: ProxyNode,
+  memberSet: Set<string> | undefined,
+  compiledFilter: CompiledDynamicFilter | null,
+  probes: Record<string, ProbeSnapshot>
+): boolean {
+  if (memberSet && memberSet.size > 0) {
+    return memberSet.has(node.id);
+  }
+  if (!compiledFilter) {
+    return node.enabled;
+  }
+  if (compiledFilter.subIdSet && !compiledFilter.subIdSet.has(node.sub_id)) {
+    return false;
+  }
+  if (
+    compiledFilter.regionUpperSet &&
+    !compiledFilter.regionUpperSet.has(node.region_code.toUpperCase())
+  ) {
+    return false;
+  }
+  if (
+    compiledFilter.maxMultiplier !== null &&
+    node.multiplier > compiledFilter.maxMultiplier
+  ) {
+    return false;
+  }
+  if (
+    compiledFilter.protocolLowerSet &&
+    !compiledFilter.protocolLowerSet.has(node.protocol.toLowerCase())
+  ) {
+    return false;
+  }
+  if (compiledFilter.requireGoogleClean && probes[node.id]?.google_clean !== true) {
+    return false;
+  }
+  if (compiledFilter.require443Native && !node.is_443_native) {
+    return false;
+  }
+  return node.enabled;
+}
+
+function getLatencyColor(latencyMs: number | null | undefined, ok: boolean | undefined): string {
+  if (ok === false) return "var(--red)";
+  if (latencyMs === null || latencyMs === undefined) return "var(--muted)";
+  if (latencyMs <= 140) return "var(--green)";
+  if (latencyMs <= 300) return "var(--amber)";
+  return "var(--red)";
+}
+
+interface CtrlDragState {
+  dragging: boolean;
+  action: "add" | "remove";
+  visitedIds: Set<string>;
 }
 
 export function SpeedTestPage() {
   const nodes = useAppSelector((s) => s.nodes);
   const subscriptions = useAppSelector((s) => s.subscriptions);
-  const storeProbes = useAppSelector((s) => s.probes);
+  const groups = useAppSelector((s) => s.groups);
+  const runtime = useAppSelector((s) => s.runtime);
+  const probes = useAppSelector((s) => s.probes);
+  const probeProgress = useAppSelector((s) => s.probeProgress);
   const initialized = useAppSelector((s) => s.initialized);
   const inTauri = isTauriEnv();
 
-  const [snapshots, setSnapshots] = useState<Record<string, ProbeSnapshot>>(storeProbes);
-  const [probeList, setProbeList] = useState<ProbeItem[]>(() => (inTauri ? [] : INITIAL_PROBES));
+  // Persisted keepalive (single source of truth) & probe enabled states
+  const [includeKeepalive, setIncludeKeepalive] = useState<boolean>(() => {
+    const persisted = loadPersistedProbeEnabledMap();
+    if (typeof persisted[KEEPALIVE_STORAGE_KEY] === "boolean") {
+      return persisted[KEEPALIVE_STORAGE_KEY];
+    }
+    if (typeof persisted.builtin_keepalive_60s === "boolean") {
+      return persisted.builtin_keepalive_60s;
+    }
+    return false;
+  });
+  const includeKeepaliveRef = useRef(includeKeepalive);
+  includeKeepaliveRef.current = includeKeepalive;
 
-  // Add Probe Form State
+  // Probe definitions & collapsible settings drawer (collapsed by default)
+  const [probeList, setProbeList] = useState<ProbeItem[]>(() => {
+    if (inTauri) return [];
+    const persisted = loadPersistedProbeEnabledMap();
+    const keepaliveOn =
+      typeof persisted[KEEPALIVE_STORAGE_KEY] === "boolean"
+        ? persisted[KEEPALIVE_STORAGE_KEY]
+        : typeof persisted.builtin_keepalive_60s === "boolean"
+          ? persisted.builtin_keepalive_60s
+          : false;
+    return INITIAL_PROBES.map((p) => ({
+      ...p,
+      enabled:
+        p.kind === "keepalive"
+          ? keepaliveOn
+          : typeof persisted[p.id] === "boolean"
+            ? persisted[p.id]
+            : p.enabled,
+    }));
+  });
+  const [showProbeSettings, setShowProbeSettings] = useState(false);
   const [showAddProbe, setShowAddProbe] = useState(false);
   const [newProbeId, setNewProbeId] = useState("");
   const [newProbeName, setNewProbeName] = useState("");
@@ -253,41 +540,163 @@ export function SpeedTestPage() {
   const [newProbePayloadKb, setNewProbePayloadKb] = useState(512);
   const [newProbeTimeoutMs, setNewProbeTimeoutMs] = useState(10000);
 
-  // Funnel Execution State
-  const [running, setRunning] = useState(false);
-  const [runMode, setRunMode] = useState<"full" | "lite">("full");
-  const [funnel, setFunnel] = useState<FunnelProgress>({
-    l0: { status: "idle", pct: 0, passed: 0, total: nodes.length },
-    l1: { status: "idle", pct: 0, passed: 0, total: nodes.length },
-    l2: { status: "idle", pct: 0, passed: 0, total: nodes.length },
-  });
+  // Speed test execution options & state
+  const [localStarting, setLocalStarting] = useState(false);
+  const [isPausing, setIsPausing] = useState(false);
+  const [pendingLargeRunTier, setPendingLargeRunTier] = useState<SpeedTestTier | null>(null);
+  const [switchingNodeId, setSwitchingNodeId] = useState<string | null>(null);
+  // Locked row order during streaming speed test so rows never jump mid-test
+  const [lockedOrderMap, setLockedOrderMap] = useState<Map<string, number> | null>(null);
 
-  // Matrix Filters & Sorting
+  // Filters, sorting & pagination
   const [searchQuery, setSearchQuery] = useState("");
   const [sourceFilter, setSourceFilter] = useState<string>("all");
+  const [groupFilter, setGroupFilter] = useState<string>("all");
+  const [regionFilter, setRegionFilter] = useState<string>("all");
+  const [onlyTested, setOnlyTested] = useState(false);
   const [onlyGoogleClean, setOnlyGoogleClean] = useState(false);
-  const [onlyKeepAliveOk, setOnlyKeepAliveOk] = useState(false);
-  const [sortKey, setSortKey] = useState<SortKey>("up");
-  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [sortKey, setSortKey] = useState<SortKey>("latency");
+  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState<number>(50);
 
-  const syncedRef = useRef(false);
-  const timersRef = useRef<number[]>([]);
-  const cancelledRunRef = useRef(false);
+  // Multi-selection & Ctrl+left-button drag selection
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [lastAnchorId, setLastAnchorId] = useState<string | null>(null);
+  const [ctrlHeld, setCtrlHeld] = useState(false);
+  const [modifierHeld, setModifierHeld] = useState(false);
 
-  const clearAllTimers = () => {
-    for (const id of timersRef.current) {
-      window.clearTimeout(id);
-    }
-    timersRef.current = [];
-  };
+  // Streaming row pulse highlights when new probe snapshots arrive
+  const [recentFlashIds, setRecentFlashIds] = useState<Set<string>>(() => new Set());
+  const prevTestedAtRef = useRef<Record<string, string>>({});
+  const hydratedFlashRef = useRef(false);
+  const flashTimersRef = useRef<Map<string, number>>(new Map());
 
-  useEffect(() => {
-    return () => {
-      cancelledRunRef.current = true;
-      clearAllTimers();
+  // Run control refs
+  const mountedRef = useRef(true);
+  const previewTimersRef = useRef<number[]>([]);
+  const previewCancelRef = useRef(false);
+  const runOwnedBySelfRef = useRef(false);
+  const pausingRef = useRef(false);
+  const externalPauseWaitingRef = useRef(false);
+  const suppressClickRef = useRef(false);
+  const suppressClickTimerRef = useRef<number | null>(null);
+  const latestOrderedIdsRef = useRef<string[]>([]);
+  const ctrlDragRef = useRef<CtrlDragState>({
+    dragging: false,
+    action: "add",
+    visitedIds: new Set<string>(),
+  });
+
+  const isRunning = probeProgress.running || localStarting;
+
+  const persistProbeStates = useCallback((list: ProbeItem[], keepaliveOn: boolean) => {
+    const nextMap: Record<string, boolean> = {
+      ...loadPersistedProbeEnabledMap(),
+      [KEEPALIVE_STORAGE_KEY]: keepaliveOn,
     };
+    for (const item of list) {
+      nextMap[item.id] = item.kind === "keepalive" ? keepaliveOn : item.enabled;
+    }
+    savePersistedProbeEnabledMap(nextMap);
   }, []);
 
+  /** Single source of truth for Keep-Alive: syncs header checkbox, settings drawer & localStorage */
+  const setKeepaliveSynced = useCallback(
+    (next: boolean) => {
+      includeKeepaliveRef.current = next;
+      setIncludeKeepalive(next);
+      setProbeList((prev) => {
+        const updated = prev.map((p) => (p.kind === "keepalive" ? { ...p, enabled: next } : p));
+        persistProbeStates(updated, next);
+        return updated;
+      });
+    },
+    [persistProbeStates]
+  );
+
+  const captureCurrentRowOrder = useCallback(() => {
+    const order = new Map<string, number>();
+    let idx = 0;
+    for (const id of latestOrderedIdsRef.current) {
+      if (!order.has(id)) {
+        order.set(id, idx);
+        idx += 1;
+      }
+    }
+    for (const node of nodes) {
+      if (!order.has(node.id)) {
+        order.set(node.id, idx);
+        idx += 1;
+      }
+    }
+    setLockedOrderMap(order);
+  }, [nodes]);
+
+  // Lock row order for externally-started runs and release automatically once finished
+  useEffect(() => {
+    if (isRunning) {
+      setLockedOrderMap((prev) => {
+        if (prev !== null) return prev;
+        const order = new Map<string, number>();
+        let idx = 0;
+        for (const id of latestOrderedIdsRef.current) {
+          if (!order.has(id)) {
+            order.set(id, idx);
+            idx += 1;
+          }
+        }
+        for (const node of nodes) {
+          if (!order.has(node.id)) {
+            order.set(node.id, idx);
+            idx += 1;
+          }
+        }
+        return order;
+      });
+    } else {
+      setLockedOrderMap((prev) => (prev === null ? prev : null));
+    }
+  }, [isRunning, nodes]);
+
+  const clearPreviewTimers = useCallback(() => {
+    for (const id of previewTimersRef.current) {
+      window.clearTimeout(id);
+    }
+    previewTimersRef.current = [];
+  }, []);
+
+  // Cleanup all timers on unmount
+  useEffect(() => {
+    mountedRef.current = true;
+    const flashTimers = flashTimersRef.current;
+    return () => {
+      mountedRef.current = false;
+      previewCancelRef.current = true;
+      clearPreviewTimers();
+      if (!inTauri && runOwnedBySelfRef.current) {
+        const st = appStore.getState();
+        if (st.probeProgress.running) {
+          appActions.setProbeProgress({
+            running: false,
+            currentNodeName: null,
+            cancelled: true,
+          });
+          appActions.setMascotState("idle");
+        }
+      }
+      if (suppressClickTimerRef.current !== null) {
+        window.clearTimeout(suppressClickTimerRef.current);
+        suppressClickTimerRef.current = null;
+      }
+      for (const timerId of flashTimers.values()) {
+        window.clearTimeout(timerId);
+      }
+      flashTimers.clear();
+    };
+  }, [clearPreviewTimers, inTauri]);
+
+  // Load probe definitions from backend while restoring persisted enabled & keepalive states
   useEffect(() => {
     let active = true;
     void catcloudApi
@@ -295,12 +704,14 @@ export function SpeedTestPage() {
       .then((defs) => {
         if (!active) return;
         if (defs.length > 0 || inTauri) {
-          setProbeList(defs.map(fromProbeDefinition));
+          const persisted = loadPersistedProbeEnabledMap();
+          const keepaliveOn = includeKeepaliveRef.current;
+          setProbeList(defs.map((d) => fromProbeDefinition(d, persisted, keepaliveOn)));
         }
       })
       .catch((err) => {
         if (active && inTauri) {
-          appActions.showToast(`加载探针定义失败：${formatErrorMessage(err)}`, "warn");
+          appActions.showToast(`加载测速项目失败：${formatErrorMessage(err)}`, "warn");
         }
       });
     return () => {
@@ -308,24 +719,143 @@ export function SpeedTestPage() {
     };
   }, [inTauri]);
 
+  // Detect newly arrived streaming probe snapshots to trigger soft row pulse
   useEffect(() => {
-    if (initialized && !syncedRef.current) {
-      syncedRef.current = true;
-      setSnapshots(storeProbes);
-      const count = nodes.length;
-      const hasAny = Object.keys(storeProbes).length > 0;
-      if (hasAny && count > 0) {
-        const l0Passed = nodes.filter((n) => storeProbes[n.id]?.ok).length;
-        const l1Passed = nodes.filter((n) => storeProbes[n.id]?.google_clean === true).length;
-        const l2Passed = nodes.filter((n) => storeProbes[n.id]?.up_mbps != null).length;
-        setFunnel({
-          l0: { status: "done", pct: 100, passed: l0Passed, total: count },
-          l1: { status: "done", pct: 100, passed: l1Passed, total: count },
-          l2: { status: "done", pct: 100, passed: l2Passed, total: count },
-        });
+    const currentMap: Record<string, string> = {};
+    for (const [nodeId, snap] of Object.entries(probes)) {
+      if (snap?.tested_at) {
+        currentMap[nodeId] = snap.tested_at;
       }
     }
-  }, [storeProbes, nodes, initialized]);
+
+    if (!hydratedFlashRef.current) {
+      if (initialized || Object.keys(currentMap).length > 0) {
+        hydratedFlashRef.current = true;
+        prevTestedAtRef.current = currentMap;
+      }
+      return;
+    }
+
+    const updatedIds: string[] = [];
+    for (const [nodeId, ts] of Object.entries(currentMap)) {
+      if (prevTestedAtRef.current[nodeId] !== ts) {
+        updatedIds.push(nodeId);
+      }
+    }
+    prevTestedAtRef.current = currentMap;
+
+    if (updatedIds.length === 0) return;
+
+    setRecentFlashIds((prev) => {
+      const next = new Set(prev);
+      for (const id of updatedIds) {
+        next.add(id);
+      }
+      return next;
+    });
+
+    for (const id of updatedIds) {
+      const existingTimer = flashTimersRef.current.get(id);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+      }
+      const timerId = window.setTimeout(() => {
+        flashTimersRef.current.delete(id);
+        setRecentFlashIds((prev) => {
+          if (!prev.has(id)) return prev;
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }, 1500);
+      flashTimersRef.current.set(id, timerId);
+    }
+  }, [probes, initialized]);
+
+  // Reset pausing indicator & emit toast when an externally-started run finishes pausing
+  useEffect(() => {
+    if (!probeProgress.running) {
+      if (isPausing && !runOwnedBySelfRef.current) {
+        setIsPausing(false);
+        pausingRef.current = false;
+      }
+      if (externalPauseWaitingRef.current) {
+        externalPauseWaitingRef.current = false;
+        appActions.showToast(
+          `已暂停测速，已测完的 ${probeProgress.completed} 个节点结果已全部保留`,
+          "info"
+        );
+      }
+    }
+  }, [probeProgress.running, probeProgress.completed, isPausing]);
+
+  // Global keyboard & mouse listeners for Ctrl+left-drag and Shift range multi-select
+  useEffect(() => {
+    const endCtrlDrag = () => {
+      ctrlDragRef.current.dragging = false;
+      ctrlDragRef.current.visitedIds.clear();
+    };
+
+    const resetAllModifierState = () => {
+      setCtrlHeld(false);
+      setModifierHeld(false);
+      endCtrlDrag();
+      suppressClickRef.current = false;
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") {
+        setCtrlHeld(true);
+        setModifierHeld(true);
+      } else if (e.key === "Shift") {
+        setModifierHeld(true);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "Control" || e.key === "Meta") {
+        setCtrlHeld(false);
+        if (!e.shiftKey) setModifierHeld(false);
+        endCtrlDrag();
+      } else if (e.key === "Shift") {
+        if (!e.ctrlKey && !e.metaKey) setModifierHeld(false);
+      }
+    };
+
+    const handleMouseUp = () => {
+      endCtrlDrag();
+      if (suppressClickRef.current) {
+        if (suppressClickTimerRef.current !== null) {
+          window.clearTimeout(suppressClickTimerRef.current);
+        }
+        // Clear after the synchronous click event that immediately follows mouseup
+        suppressClickTimerRef.current = window.setTimeout(() => {
+          suppressClickRef.current = false;
+          suppressClickTimerRef.current = null;
+        }, 0);
+      }
+    };
+
+    const handleVisibility = () => {
+      if (document.visibilityState !== "visible") {
+        resetAllModifierState();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("mouseup", handleMouseUp);
+    window.addEventListener("blur", resetAllModifierState);
+    document.addEventListener("visibilitychange", handleVisibility);
+
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("mouseup", handleMouseUp);
+      window.removeEventListener("blur", resetAllModifierState);
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
+  }, []);
 
   const subNameById = useMemo(() => {
     const map = new Map<string, string>();
@@ -335,156 +865,764 @@ export function SpeedTestPage() {
     return map;
   }, [subscriptions]);
 
-  const scheduleStep = (fn: () => void, delayMs: number) => {
-    const id = window.setTimeout(() => {
-      timersRef.current = timersRef.current.filter((item) => item !== id);
-      fn();
-    }, delayMs);
-    timersRef.current.push(id);
-  };
-
-  const handleStopTest = () => {
-    cancelledRunRef.current = true;
-    clearAllTimers();
-    setRunning(false);
-    appActions.setMascotState("idle");
-    appActions.showToast("已中止当前测速状态监听", "info");
-  };
-
-  const handleStartTest = async (mode: "full" | "lite") => {
-    if (running) return;
-    if (nodes.length === 0) {
-      appActions.showToast("当前节点库为空，请先导入订阅节点", "warn");
-      return;
+  const sourceOptions = useMemo(() => {
+    const seen = new Map<string, string>();
+    for (const sub of subscriptions) {
+      seen.set(sub.id, sub.name);
     }
+    for (const node of nodes) {
+      if (!seen.has(node.sub_id)) {
+        seen.set(node.sub_id, node.sub_id);
+      }
+    }
+    return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
+  }, [subscriptions, nodes]);
 
-    const enabledProbes = probeList.filter((p) => p.enabled);
-    const selectedProbes =
-      mode === "lite"
-        ? enabledProbes.filter(
-            (p) => p.kind === "latency" || p.kind === "google_cn" || p.kind === "unlock_regex"
+  const regionOptions = useMemo(() => {
+    const codes = new Set<string>();
+    for (const node of nodes) {
+      const code = (node.region_code || "UNK").trim().toUpperCase();
+      codes.add(code);
+    }
+    return Array.from(codes).sort((a, b) => a.localeCompare(b));
+  }, [nodes]);
+
+  // Pre-build O(1) lookup structures per group: Map<groupId, Set<nodeId>> & compiled dynamic filters
+  const groupMemberSetById = useMemo(() => {
+    const map = new Map<string, Set<string>>();
+    for (const g of groups) {
+      map.set(g.id, new Set(g.member_node_ids));
+    }
+    return map;
+  }, [groups]);
+
+  const groupDynamicFilterById = useMemo(() => {
+    const map = new Map<string, CompiledDynamicFilter | null>();
+    for (const g of groups) {
+      map.set(g.id, compileDynamicFilter(g.dynamic_filter));
+    }
+    return map;
+  }, [groups]);
+
+  const selectedGroupObj = useMemo(
+    () => (groupFilter === "all" ? null : groups.find((g) => g.id === groupFilter) ?? null),
+    [groups, groupFilter]
+  );
+
+  const selectedGroupMemberSet = selectedGroupObj
+    ? groupMemberSetById.get(selectedGroupObj.id)
+    : undefined;
+  const selectedGroupDynamicFilter = selectedGroupObj
+    ? (groupDynamicFilterById.get(selectedGroupObj.id) ?? null)
+    : null;
+
+  const nodeIdSet = useMemo(() => new Set(nodes.map((n) => n.id)), [nodes]);
+
+  const validSelectedIds = useMemo(() => {
+    const out = new Set<string>();
+    for (const id of selectedIds) {
+      if (nodeIdSet.has(id)) out.add(id);
+    }
+    return out;
+  }, [selectedIds, nodeIdSet]);
+
+  const filteredRows = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const list = nodes
+      .map((node) => {
+        const snap = probes[node.id];
+        const sourceName = subNameById.get(node.sub_id) ?? node.sub_id;
+        const regionCode = (node.region_code || "UNK").trim().toUpperCase();
+        const regionLabel = formatRegionShort(regionCode);
+        const unlocks = {
+          gemini: snap?.unlocked_sites.gemini ?? snap?.unlocked_sites.google_ai ?? false,
+          chatgpt: snap?.unlocked_sites.chatgpt ?? false,
+          claude: snap?.unlocked_sites.claude ?? false,
+          windsurf:
+            snap?.unlocked_sites.windsurf ?? snap?.per_probe_ok?.builtin_unlock_windsurf ?? false,
+        };
+        const hasUnlockData = Boolean(
+          snap &&
+            (Object.keys(snap.unlocked_sites).length > 0 ||
+              snap.per_probe_ok?.builtin_unlock_windsurf !== undefined ||
+              snap.google_clean !== null)
+        );
+        const unlockScore = Object.values(unlocks).filter(Boolean).length;
+        const regionMismatch =
+          Boolean(snap?.google_risk_mismatch) ||
+          Boolean(
+            snap?.cf_loc &&
+              snap?.yt_gl &&
+              snap.yt_gl.toUpperCase() !== regionCode
+          );
+        return {
+          node,
+          snap,
+          sourceName,
+          regionCode,
+          regionLabel,
+          unlocks,
+          hasUnlockData,
+          unlockScore,
+          regionMismatch,
+        };
+      })
+      .filter((row) => {
+        if (q) {
+          const hay = `${row.node.name} ${row.sourceName} ${row.regionCode} ${row.regionLabel}`.toLowerCase();
+          if (!hay.includes(q)) return false;
+        }
+        if (sourceFilter !== "all" && row.node.sub_id !== sourceFilter) return false;
+        if (
+          selectedGroupObj &&
+          !nodeBelongsToGroup(
+            row.node,
+            selectedGroupMemberSet,
+            selectedGroupDynamicFilter,
+            probes
           )
-        : enabledProbes;
+        ) {
+          return false;
+        }
+        if (regionFilter !== "all" && row.regionCode !== regionFilter) return false;
+        if (onlyTested && !row.snap) return false;
+        if (onlyGoogleClean && row.snap?.google_clean !== true) return false;
+        return true;
+      });
 
-    if (selectedProbes.length === 0) {
-      appActions.showToast("请至少启用一个匹配的探针后再开始测速", "warn");
+    if (isRunning && lockedOrderMap) {
+      list.sort((a, b) => {
+        const aIdx = lockedOrderMap.get(a.node.id) ?? Number.MAX_SAFE_INTEGER;
+        const bIdx = lockedOrderMap.get(b.node.id) ?? Number.MAX_SAFE_INTEGER;
+        if (aIdx !== bIdx) return aIdx - bIdx;
+        return a.node.name.localeCompare(b.node.name);
+      });
+      return list;
+    }
+
+    list.sort((a, b) => {
+      let diff = 0;
+      switch (sortKey) {
+        case "name":
+          diff = a.node.name.localeCompare(b.node.name);
+          break;
+        case "source":
+          diff = a.sourceName.localeCompare(b.sourceName);
+          break;
+        case "latency": {
+          const aVal = a.snap?.latency_ms;
+          const bVal = b.snap?.latency_ms;
+          const aHas = aVal !== null && aVal !== undefined && a.snap?.ok !== false;
+          const bHas = bVal !== null && bVal !== undefined && b.snap?.ok !== false;
+          if (aHas !== bHas) return aHas ? -1 : 1;
+          if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
+          diff = (aVal ?? 99999) - (bVal ?? 99999);
+          break;
+        }
+        case "up": {
+          const aVal = a.snap?.up_mbps;
+          const bVal = b.snap?.up_mbps;
+          const aHas = aVal !== null && aVal !== undefined;
+          const bHas = bVal !== null && bVal !== undefined;
+          if (aHas !== bHas) return aHas ? -1 : 1;
+          if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
+          diff = (aVal ?? -1) - (bVal ?? -1);
+          break;
+        }
+        case "down": {
+          const aVal = a.snap?.down_mbps;
+          const bVal = b.snap?.down_mbps;
+          const aHas = aVal !== null && aVal !== undefined;
+          const bHas = bVal !== null && bVal !== undefined;
+          if (aHas !== bHas) return aHas ? -1 : 1;
+          if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
+          diff = (aVal ?? -1) - (bVal ?? -1);
+          break;
+        }
+        case "google": {
+          const aHas = a.snap?.google_clean !== null && a.snap?.google_clean !== undefined;
+          const bHas = b.snap?.google_clean !== null && b.snap?.google_clean !== undefined;
+          if (aHas !== bHas) return aHas ? -1 : 1;
+          if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
+          diff = (a.snap?.google_clean ? 1 : 0) - (b.snap?.google_clean ? 1 : 0);
+          break;
+        }
+        case "unlocks": {
+          if (a.hasUnlockData !== b.hasUnlockData) return a.hasUnlockData ? -1 : 1;
+          if (!a.hasUnlockData && !b.hasUnlockData) return a.node.name.localeCompare(b.node.name);
+          diff = a.unlockScore - b.unlockScore;
+          break;
+        }
+      }
+      if (diff === 0) return a.node.name.localeCompare(b.node.name);
+      return sortDir === "asc" ? diff : -diff;
+    });
+
+    return list;
+  }, [
+    nodes,
+    probes,
+    subNameById,
+    searchQuery,
+    sourceFilter,
+    selectedGroupObj,
+    selectedGroupMemberSet,
+    selectedGroupDynamicFilter,
+    regionFilter,
+    onlyTested,
+    onlyGoogleClean,
+    sortKey,
+    sortDir,
+    isRunning,
+    lockedOrderMap,
+  ]);
+
+  latestOrderedIdsRef.current = filteredRows.map((r) => r.node.id);
+
+  const totalFiltered = filteredRows.length;
+  const totalPages = Math.max(1, Math.ceil(totalFiltered / pageSize));
+  const safePage = Math.min(page, totalPages);
+  const pageStartIdx = (safePage - 1) * pageSize;
+  const pagedRows = useMemo(
+    () => filteredRows.slice(pageStartIdx, pageStartIdx + pageSize),
+    [filteredRows, pageStartIdx, pageSize]
+  );
+
+  const selectedCount = validSelectedIds.size;
+  const selectedInFilteredCount = useMemo(
+    () => filteredRows.filter((r) => validSelectedIds.has(r.node.id)).length,
+    [filteredRows, validSelectedIds]
+  );
+  const selectedOutsideFiltered = selectedCount - selectedInFilteredCount;
+  const allFilteredSelected =
+    totalFiltered > 0 && selectedInFilteredCount === totalFiltered;
+  const allPageSelected =
+    pagedRows.length > 0 && pagedRows.every((r) => validSelectedIds.has(r.node.id));
+
+  const hasActiveFilters =
+    searchQuery.trim().length > 0 ||
+    sourceFilter !== "all" ||
+    groupFilter !== "all" ||
+    regionFilter !== "all" ||
+    onlyTested ||
+    onlyGoogleClean;
+
+  const enabledProbeCount = useMemo(
+    () => probeList.filter((p) => p.enabled).length,
+    [probeList]
+  );
+
+  // Auto-dismiss large-run confirmation bar when selection changes or list shrinks
+  useEffect(() => {
+    if (pendingLargeRunTier && (selectedCount > 0 || totalFiltered <= 50 || isRunning)) {
+      setPendingLargeRunTier(null);
+    }
+  }, [pendingLargeRunTier, selectedCount, totalFiltered, isRunning]);
+
+  // Selection mutation helpers
+  const applySelectionAction = useCallback((nodeId: string, action: "add" | "remove") => {
+    setSelectedIds((prev) => {
+      const has = prev.has(nodeId);
+      if (action === "add" && has) return prev;
+      if (action === "remove" && !has) return prev;
+      const next = new Set(prev);
+      if (action === "add") next.add(nodeId);
+      else next.delete(nodeId);
+      return next;
+    });
+  }, []);
+
+  const toggleNodeSelection = useCallback((nodeId: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(nodeId)) next.delete(nodeId);
+      else next.add(nodeId);
+      return next;
+    });
+    setLastAnchorId(nodeId);
+  }, []);
+
+  const selectRangeTo = useCallback(
+    (targetId: string) => {
+      if (!lastAnchorId) {
+        applySelectionAction(targetId, "add");
+        setLastAnchorId(targetId);
+        return;
+      }
+      const anchorIdx = filteredRows.findIndex((r) => r.node.id === lastAnchorId);
+      const targetIdx = filteredRows.findIndex((r) => r.node.id === targetId);
+      if (anchorIdx === -1 || targetIdx === -1) {
+        applySelectionAction(targetId, "add");
+        setLastAnchorId(targetId);
+        return;
+      }
+      const start = Math.min(anchorIdx, targetIdx);
+      const end = Math.max(anchorIdx, targetIdx);
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (let i = start; i <= end; i++) {
+          next.add(filteredRows[i].node.id);
+        }
+        return next;
+      });
+    },
+    [filteredRows, lastAnchorId, applySelectionAction]
+  );
+
+  const handleRowMouseDown = (e: ReactMouseEvent<HTMLTableRowElement>, nodeId: string) => {
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl?.closest("button") || targetEl?.closest("input")) return;
+
+    if (e.shiftKey) {
+      e.preventDefault();
+      suppressClickRef.current = false;
       return;
     }
 
-    clearAllTimers();
-    cancelledRunRef.current = false;
-    setRunMode(mode);
-    setRunning(true);
-    appActions.setMascotState("searching");
-    const total = nodes.length;
+    if ((e.ctrlKey || e.metaKey) && e.button === 0) {
+      e.preventDefault();
+      const nextAction: "add" | "remove" = validSelectedIds.has(nodeId) ? "remove" : "add";
+      ctrlDragRef.current = {
+        dragging: true,
+        action: nextAction,
+        visitedIds: new Set<string>([nodeId]),
+      };
+      applySelectionAction(nodeId, nextAction);
+      setLastAnchorId(nodeId);
+      suppressClickRef.current = true;
+      return;
+    }
 
-    setFunnel({
-      l0: { status: "running", pct: 35, passed: 0, total },
-      l1: { status: "running", pct: 20, passed: 0, total },
-      l2: { status: mode === "lite" ? "skipped" : "running", pct: mode === "lite" ? 0 : 15, passed: 0, total },
+    suppressClickRef.current = false;
+  };
+
+  const handleRowMouseEnter = (e: ReactMouseEvent<HTMLTableRowElement>, nodeId: string) => {
+    const drag = ctrlDragRef.current;
+    if (!drag.dragging) return;
+    // Strictly require Ctrl/Meta AND primary mouse button still pressed
+    if ((e.buttons & 1) === 0 || !(e.ctrlKey || e.metaKey)) {
+      drag.dragging = false;
+      drag.visitedIds.clear();
+      return;
+    }
+    if (drag.visitedIds.has(nodeId)) return;
+
+    drag.visitedIds.add(nodeId);
+    applySelectionAction(nodeId, drag.action);
+    setLastAnchorId(nodeId);
+  };
+
+  const handleRowClick = (e: ReactMouseEvent<HTMLTableRowElement>, nodeId: string) => {
+    const targetEl = e.target as HTMLElement | null;
+    if (targetEl?.closest("button") || targetEl?.closest("input")) return;
+
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
+
+    if (e.shiftKey) {
+      selectRangeTo(nodeId);
+      return;
+    }
+
+    toggleNodeSelection(nodeId);
+  };
+
+  const handleSelectAllFiltered = () => {
+    if (totalFiltered === 0) return;
+    if (allFilteredSelected) {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const r of filteredRows) next.delete(r.node.id);
+        return next;
+      });
+    } else {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        for (const r of filteredRows) next.add(r.node.id);
+        return next;
+      });
+    }
+  };
+
+  const handleSelectTop20 = () => {
+    if (totalFiltered === 0) return;
+    const topIds = filteredRows.slice(0, 20).map((r) => r.node.id);
+    setSelectedIds(new Set(topIds));
+    setLastAnchorId(topIds[topIds.length - 1] ?? null);
+  };
+
+  const handleClearSelection = () => {
+    setSelectedIds(new Set());
+    setLastAnchorId(null);
+  };
+
+  const handleTogglePageSelection = () => {
+    if (pagedRows.length === 0) return;
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allPageSelected) {
+        for (const r of pagedRows) next.delete(r.node.id);
+      } else {
+        for (const r of pagedRows) next.add(r.node.id);
+      }
+      return next;
+    });
+  };
+
+  const handleResetFilters = () => {
+    setSearchQuery("");
+    setSourceFilter("all");
+    setGroupFilter("all");
+    setRegionFilter("all");
+    setOnlyTested(false);
+    setOnlyGoogleClean(false);
+    setPage(1);
+  };
+
+  const resolveProbeIdsForRun = (
+    tier: SpeedTestTier,
+    effectiveKeepalive: boolean
+  ): string[] | null => {
+    if (probeList.length === 0) {
+      return [];
+    }
+    const enabledNonKeepalive = probeList.filter((p) => p.kind !== "keepalive" && p.enabled);
+    const keepaliveProbes = effectiveKeepalive
+      ? probeList.filter((p) => p.kind === "keepalive")
+      : [];
+
+    if (enabledNonKeepalive.length === 0 && keepaliveProbes.length === 0) {
+      appActions.showToast("请先在「测速项目设置」中开启至少一项测速项目", "warn");
+      return null;
+    }
+
+    const ids = new Set<string>(enabledNonKeepalive.map((p) => p.id));
+    for (const kp of keepaliveProbes) {
+      ids.add(kp.id);
+    }
+
+    const activeKinds = new Set(
+      probeList.filter((p) => ids.has(p.id)).map((p) => p.kind)
+    );
+    if (tier === "latency" && !activeKinds.has("latency")) {
+      appActions.showToast("请先在「测速项目设置」中开启「基础延迟」", "warn");
+      return null;
+    }
+
+    return Array.from(ids);
+  };
+
+  const executeProbes = async (
+    targetNodeIds: string[],
+    tier: SpeedTestTier,
+    forceSkipKeepalive = false
+  ) => {
+    if (isRunning) return;
+    if (targetNodeIds.length === 0) {
+      appActions.showToast("请先筛选或勾选至少一个节点后再开始测速", "warn");
+      return;
+    }
+
+    const effectiveKeepalive = forceSkipKeepalive ? false : includeKeepalive;
+    const probeIds = resolveProbeIdsForRun(tier, effectiveKeepalive);
+    if (probeIds === null) return;
+
+    const nodeNameById = new Map(nodes.map((n) => [n.id, n.name]));
+    const firstNodeName = nodeNameById.get(targetNodeIds[0]) ?? null;
+
+    // Lock current visible row order immediately before starting streaming test
+    captureCurrentRowOrder();
+    setPendingLargeRunTier(null);
+    setLocalStarting(true);
+    setIsPausing(false);
+    pausingRef.current = false;
+    runOwnedBySelfRef.current = true;
+    previewCancelRef.current = false;
+    clearPreviewTimers();
+
+    appActions.setMascotState("searching");
+    appActions.setProbeProgress({
+      running: true,
+      completed: 0,
+      total: targetNodeIds.length,
+      currentNodeName: firstNodeName,
+      cancelled: false,
     });
 
     if (inTauri) {
       try {
-        const nodeIds = nodes.map((n) => n.id);
-        const probeIds = selectedProbes.map((p) => p.id);
-        const result = await catcloudApi.runIsolatedProbes(nodeIds, probeIds);
-        if (cancelledRunRef.current) return;
+        const result = await catcloudApi.runIsolatedProbes(
+          targetNodeIds,
+          probeIds,
+          tier,
+          effectiveKeepalive
+        );
+        if (result.snapshots && Object.keys(result.snapshots).length > 0) {
+          appActions.syncProbes({
+            ...appStore.getState().probes,
+            ...result.snapshots,
+          });
+        }
 
-        const mergedSnapshots: Record<string, ProbeSnapshot> = {
-          ...snapshots,
-          ...result.snapshots,
-        };
-        setSnapshots(mergedSnapshots);
-        appActions.syncProbes(mergedSnapshots);
+        const finalCompleted = Math.max(
+          result.probed_count,
+          appStore.getState().probeProgress.completed
+        );
+        const wasCancelled = Boolean(result.cancelled) || pausingRef.current;
 
-        const l0Passed = nodes.filter((n) => mergedSnapshots[n.id]?.ok).length;
-        const l1Passed = nodes.filter((n) => mergedSnapshots[n.id]?.google_clean === true).length;
-        const l2Passed = nodes.filter(
-          (n) =>
-            mergedSnapshots[n.id]?.up_mbps != null ||
-            mergedSnapshots[n.id]?.down_mbps != null ||
-            mergedSnapshots[n.id]?.keepalive_60s_ok === true
-        ).length;
-
-        setFunnel({
-          l0: { status: "done", pct: 100, passed: l0Passed, total },
-          l1: { status: "done", pct: 100, passed: l1Passed, total },
-          l2:
-            mode === "lite"
-              ? { status: "skipped", pct: 0, passed: 0, total }
-              : { status: "done", pct: 100, passed: l2Passed, total },
+        appActions.setProbeProgress({
+          running: false,
+          completed: finalCompleted,
+          total: result.total_count ?? targetNodeIds.length,
+          currentNodeName: null,
+          cancelled: wasCancelled,
         });
+        appActions.setMascotState("idle");
 
-        if (!result.core_available) {
+        if (wasCancelled) {
+          if (mountedRef.current) {
+            appActions.showToast(
+              `已暂停测速，已测完的 ${finalCompleted} 个节点结果已全部保留`,
+              "info"
+            );
+          }
+        } else if (!result.core_available) {
           appActions.showToast(
-            result.errors[0] ?? "测速核心未就绪，请先确认 Mihomo 二进制存在并配置正确",
+            result.errors[0] ?? "测速引擎尚未就绪，请先检查内核配置",
             "warn"
           );
+        } else if (result.errors.length > 0 && result.probed_count === 0) {
+          appActions.showToast(`测速未能完成：${result.errors[0]}`, "warn");
         } else if (result.errors.length > 0) {
           appActions.showToast(
-            `测速完成 ${result.probed_count}/${total} 节点（${result.errors.length} 项警告：${result.errors[0]}）`,
-            "warn"
+            `${TIER_LABELS[tier]}完成：已更新 ${result.probed_count} 个节点（${result.errors.length} 个超时或跳过）`,
+            "info"
           );
         } else {
           appActions.showToast(
-            mode === "full"
-              ? `三级零干扰漏斗测速完成（${result.probed_count} 节点，临时核心已释放）`
-              : `L0+L1 极速省流测活完成（${result.probed_count} 节点）`,
+            `${TIER_LABELS[tier]}完成，已更新 ${result.probed_count} 个节点结果`,
             "ok"
           );
         }
       } catch (err) {
-        if (!cancelledRunRef.current) {
-          setFunnel({
-            l0: { status: "idle", pct: 0, passed: 0, total },
-            l1: { status: "idle", pct: 0, passed: 0, total },
-            l2: { status: "idle", pct: 0, passed: 0, total },
-          });
-          appActions.showToast(`隔离测速执行失败：${formatErrorMessage(err)}`, "warn");
-        }
+        appActions.setProbeProgress({
+          running: false,
+          currentNodeName: null,
+          cancelled: pausingRef.current,
+        });
+        appActions.setMascotState("idle");
+        appActions.showToast(`测速执行失败：${formatErrorMessage(err)}`, "warn");
       } finally {
-        if (!cancelledRunRef.current) {
-          setRunning(false);
-          appActions.setMascotState("idle");
-        }
+        runOwnedBySelfRef.current = false;
+        pausingRef.current = false;
+        setLocalStarting(false);
+        setIsPausing(false);
       }
       return;
     }
 
-    // Browser preview demonstration only (marked explicitly as preview simulation)
-    scheduleStep(() => {
-      setFunnel((prev) => ({
-        ...prev,
-        l0: { status: "done", pct: 100, passed: total, total },
-        l1: { status: "running", pct: 60, passed: 0, total },
-      }));
-    }, 360);
-
-    scheduleStep(() => {
-      void catcloudApi
-        .runIsolatedProbes(
-          nodes.map((n) => n.id),
-          selectedProbes.map((p) => p.id)
-        )
-        .then((res) => {
-          if (cancelledRunRef.current) return;
-          const merged = { ...snapshots, ...res.snapshots };
-          setSnapshots(merged);
-          appActions.syncProbes(merged);
-          setFunnel({
-            l0: { status: "done", pct: 100, passed: total, total },
-            l1: { status: "done", pct: 100, passed: total, total },
-            l2:
-              mode === "lite"
-                ? { status: "skipped", pct: 0, passed: 0, total }
-                : { status: "done", pct: 100, passed: total, total },
-          });
-          setRunning(false);
-          appActions.setMascotState("idle");
-          appActions.showToast(`预览模拟：已完成 ${total} 节点测速演示`, "info");
+    // Browser preview streaming simulation (120ms per node, supports pause & full retention)
+    const total = targetNodeIds.length;
+    const stepNext = (index: number) => {
+      if (previewCancelRef.current) return;
+      if (index >= total) {
+        appActions.setProbeProgress({
+          running: false,
+          completed: total,
+          total,
+          currentNodeName: null,
+          cancelled: false,
         });
-    }, 780);
+        appActions.setMascotState("idle");
+        runOwnedBySelfRef.current = false;
+        pausingRef.current = false;
+        setLocalStarting(false);
+        setIsPausing(false);
+        appActions.showToast(
+          `预览模式：${TIER_LABELS[tier]}完成，已逐条更新 ${total} 个节点`,
+          "ok"
+        );
+        return;
+      }
+
+      const nodeId = targetNodeIds[index];
+      const nodeName = nodeNameById.get(nodeId) ?? nodeId;
+      appActions.setProbeProgress({
+        running: true,
+        completed: index,
+        total,
+        currentNodeName: nodeName,
+        cancelled: false,
+      });
+
+      const timerId = window.setTimeout(() => {
+        previewTimersRef.current = previewTimersRef.current.filter((id) => id !== timerId);
+        if (previewCancelRef.current) return;
+
+        void catcloudApi
+          .runIsolatedProbes([nodeId], probeIds, tier, effectiveKeepalive)
+          .then((res) => {
+            if (previewCancelRef.current) return;
+            const rawSnap = res.snapshots[nodeId];
+            if (rawSnap) {
+              const jitterDelta = Math.round((Math.random() - 0.5) * 14);
+              const nextLatency =
+                rawSnap.latency_ms !== null
+                  ? Math.max(18, Math.round(rawSnap.latency_ms + jitterDelta))
+                  : 78;
+              const streamedSnap: ProbeSnapshot = {
+                ...rawSnap,
+                tested_at: new Date().toISOString(),
+                latency_ms: nextLatency,
+              };
+              appActions.syncProbes({
+                ...appStore.getState().probes,
+                [nodeId]: streamedSnap,
+              });
+            }
+            appActions.setProbeProgress({
+              running: true,
+              completed: index + 1,
+              total,
+              currentNodeName: nodeName,
+              cancelled: false,
+            });
+            stepNext(index + 1);
+          })
+          .catch(() => {
+            if (previewCancelRef.current) return;
+            stepNext(index + 1);
+          });
+      }, 120);
+
+      previewTimersRef.current.push(timerId);
+    };
+
+    stepNext(0);
+  };
+
+  const handlePrimaryTestClick = (tier: SpeedTestTier) => {
+    if (isRunning) return;
+    if (nodes.length === 0) {
+      appActions.showToast("当前还没有节点，请先在「节点与订阅」中导入", "warn");
+      return;
+    }
+
+    if (selectedCount > 0) {
+      // Preserve current visible order first, then any selected nodes outside filter
+      const filteredOrder = filteredRows
+        .filter((r) => validSelectedIds.has(r.node.id))
+        .map((r) => r.node.id);
+      const inFilteredSet = new Set(filteredOrder);
+      const restIds = nodes
+        .filter((n) => validSelectedIds.has(n.id) && !inFilteredSet.has(n.id))
+        .map((n) => n.id);
+      void executeProbes([...filteredOrder, ...restIds], tier);
+      return;
+    }
+
+    if (totalFiltered === 0) {
+      appActions.showToast("当前筛选条件下没有可测速的节点", "warn");
+      return;
+    }
+
+    if (totalFiltered > 50) {
+      setPendingLargeRunTier(tier);
+      return;
+    }
+
+    void executeProbes(
+      filteredRows.map((r) => r.node.id),
+      tier
+    );
+  };
+
+  const handlePauseTest = async () => {
+    if (!isRunning || isPausing) return;
+    setIsPausing(true);
+    pausingRef.current = true;
+
+    if (!inTauri) {
+      previewCancelRef.current = true;
+      clearPreviewTimers();
+      try {
+        await catcloudApi.cancelIsolatedProbes();
+      } catch {
+        /* ignore mock cancel errors */
+      }
+      const doneCount = appStore.getState().probeProgress.completed;
+      const total = appStore.getState().probeProgress.total;
+      appActions.setProbeProgress({
+        running: false,
+        completed: doneCount,
+        total,
+        currentNodeName: null,
+        cancelled: true,
+      });
+      appActions.setMascotState("idle");
+      runOwnedBySelfRef.current = false;
+      pausingRef.current = false;
+      setLocalStarting(false);
+      setIsPausing(false);
+      appActions.showToast(
+        `已暂停测速，已测完的 ${doneCount} 个节点结果已全部保留`,
+        "info"
+      );
+      return;
+    }
+
+    try {
+      const wasRunning = await catcloudApi.cancelIsolatedProbes();
+      if (!runOwnedBySelfRef.current) {
+        if (wasRunning) {
+          externalPauseWaitingRef.current = true;
+        } else {
+          const doneCount = appStore.getState().probeProgress.completed;
+          appActions.setProbeProgress({
+            running: false,
+            currentNodeName: null,
+            cancelled: true,
+          });
+          appActions.setMascotState("idle");
+          setIsPausing(false);
+          pausingRef.current = false;
+          appActions.showToast(
+            `已暂停测速，已测完的 ${doneCount} 个节点结果已全部保留`,
+            "info"
+          );
+        }
+      }
+    } catch (err) {
+      setIsPausing(false);
+      pausingRef.current = false;
+      appActions.showToast(`暂停测速失败：${formatErrorMessage(err)}`, "warn");
+    }
+  };
+
+  const handleSwitchToNode = async (node: ProxyNode) => {
+    if (switchingNodeId) return;
+    const validGroupIds = new Set(groups.map((g) => g.id));
+    const targetGroupId =
+      (runtime.active_group_id && validGroupIds.has(runtime.active_group_id)
+        ? runtime.active_group_id
+        : null) ??
+      (groupFilter !== "all" && validGroupIds.has(groupFilter) ? groupFilter : null) ??
+      groups[0]?.id ??
+      "";
+
+    if (!targetGroupId) {
+      appActions.showToast("请先在「智能多选组」中创建一个分组后再切换节点", "warn");
+      return;
+    }
+
+    setSwitchingNodeId(node.id);
+    try {
+      await appActions.selectGroupNode(targetGroupId, node.id);
+    } finally {
+      setSwitchingNodeId(null);
+    }
   };
 
   const handleAddProbe = async (ev: FormEvent) => {
@@ -492,7 +1630,7 @@ export function SpeedTestPage() {
     const trimmedName = newProbeName.trim();
     const trimmedTarget = newProbeTarget.trim();
     if (!trimmedName || !trimmedTarget) {
-      appActions.showToast("请填写探针名称与目标 URL 或命令", "warn");
+      appActions.showToast("请填写测速项名称和目标地址", "warn");
       return;
     }
 
@@ -500,11 +1638,11 @@ export function SpeedTestPage() {
       try {
         const parsed = new URL(trimmedTarget);
         if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-          appActions.showToast("探针 URL 仅支持 HTTP / HTTPS 协议", "warn");
+          appActions.showToast("测试地址仅支持 http:// 或 https:// 开头", "warn");
           return;
         }
       } catch {
-        appActions.showToast("请输入有效的探针目标 URL", "warn");
+        appActions.showToast("请输入有效的网址", "warn");
         return;
       }
     }
@@ -514,7 +1652,7 @@ export function SpeedTestPage() {
     ).replace(/[^a-zA-Z0-9_-]/g, "_");
 
     if (probeList.some((p) => p.id === safeId)) {
-      appActions.showToast(`探针 ID「${safeId}」已存在，请更换`, "warn");
+      appActions.showToast(`标识「${safeId}」已存在，请换一个`, "warn");
       return;
     }
 
@@ -523,8 +1661,12 @@ export function SpeedTestPage() {
       name: trimmedName,
       kind: newProbeKind,
       target: trimmedTarget,
-      method: newProbeKind === "upload" ? "POST" : newProbeKind === "external_cmd" ? "EXEC" : "GET",
-      bodyRegex: newProbeKind === "unlock_regex" && newProbeRegex.trim() ? newProbeRegex.trim() : undefined,
+      method:
+        newProbeKind === "upload" ? "POST" : newProbeKind === "external_cmd" ? "EXEC" : "GET",
+      bodyRegex:
+        newProbeKind === "unlock_regex" && newProbeRegex.trim()
+          ? newProbeRegex.trim()
+          : undefined,
       payloadKb:
         newProbeKind === "upload" || newProbeKind === "download"
           ? Math.max(64, newProbePayloadKb)
@@ -536,31 +1678,59 @@ export function SpeedTestPage() {
 
     try {
       const saved = await catcloudApi.upsertProbeDefinition(toProbeDefinition(created));
-      setProbeList((prev) => [...prev, fromProbeDefinition(saved)]);
+      const persisted = loadPersistedProbeEnabledMap();
+      const nextKeepalive =
+        saved.kind === "keepalive" ? true : includeKeepaliveRef.current;
+      if (saved.kind === "keepalive" && !includeKeepaliveRef.current) {
+        includeKeepaliveRef.current = true;
+        setIncludeKeepalive(true);
+      }
+      const nextItem = fromProbeDefinition(saved, { ...persisted, [saved.id]: true }, nextKeepalive);
+      setProbeList((prev) => {
+        const syncedPrev =
+          saved.kind === "keepalive"
+            ? prev.map((p) => (p.kind === "keepalive" ? { ...p, enabled: true } : p))
+            : prev;
+        const nextList = [...syncedPrev, nextItem];
+        persistProbeStates(nextList, nextKeepalive);
+        return nextList;
+      });
       setNewProbeId("");
       setNewProbeName("");
       setNewProbeTarget("");
       setNewProbeRegex("");
       setShowAddProbe(false);
-      appActions.showToast(`已注册自定义探针：${saved.name} (${saved.id})`, "ok");
+      appActions.showToast(`已新增测速项目：${saved.name}`, "ok");
     } catch (err) {
-      appActions.showToast(`保存探针失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`保存测速项目失败：${formatErrorMessage(err)}`, "warn");
     }
   };
 
   const handleToggleProbe = (id: string) => {
-    setProbeList((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, enabled: !p.enabled } : p))
-    );
+    const target = probeList.find((p) => p.id === id);
+    if (!target) return;
+    if (target.kind === "keepalive") {
+      setKeepaliveSynced(!includeKeepaliveRef.current);
+      return;
+    }
+    setProbeList((prev) => {
+      const nextList = prev.map((p) => (p.id === id ? { ...p, enabled: !p.enabled } : p));
+      persistProbeStates(nextList, includeKeepaliveRef.current);
+      return nextList;
+    });
   };
 
   const handleDeleteProbe = async (id: string) => {
     try {
       await catcloudApi.deleteProbeDefinition(id);
-      setProbeList((prev) => prev.filter((p) => p.id !== id));
-      appActions.showToast("已移除自定义探针", "info");
+      setProbeList((prev) => {
+        const nextList = prev.filter((p) => p.id !== id);
+        persistProbeStates(nextList, includeKeepaliveRef.current);
+        return nextList;
+      });
+      appActions.showToast("已删除自定义测速项目", "info");
     } catch (err) {
-      appActions.showToast(`删除探针失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`删除测速项目失败：${formatErrorMessage(err)}`, "warn");
     }
   };
 
@@ -569,112 +1739,10 @@ export function SpeedTestPage() {
       setSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
     } else {
       setSortKey(key);
-      setSortDir(key === "latency" || key === "multiplier" || key === "name" ? "asc" : "desc");
+      setSortDir(key === "latency" || key === "name" || key === "source" ? "asc" : "desc");
     }
+    setPage(1);
   };
-
-  const matrixRows = useMemo(() => {
-    const q = searchQuery.trim().toLowerCase();
-    const list = nodes
-      .map((node) => {
-        const snap = snapshots[node.id];
-        const sourceName = subNameById.get(node.sub_id) ?? node.sub_id;
-        const unlocks = {
-          gemini: snap?.unlocked_sites.gemini ?? snap?.unlocked_sites.google_ai ?? false,
-          chatgpt: snap?.unlocked_sites.chatgpt ?? false,
-          claude: snap?.unlocked_sites.claude ?? false,
-          windsurf: snap?.unlocked_sites.windsurf ?? snap?.per_probe_ok?.builtin_unlock_windsurf ?? false,
-        };
-        const unlockScore = Object.values(unlocks).filter(Boolean).length;
-        const cfYtMismatch =
-          Boolean(snap?.google_risk_mismatch) ||
-          Boolean(
-            snap?.cf_loc &&
-              snap?.yt_gl &&
-              snap.yt_gl.toUpperCase() !== node.region_code.toUpperCase()
-          );
-        return { node, snap, sourceName, unlocks, unlockScore, cfYtMismatch };
-      })
-      .filter((row) => {
-        if (q) {
-          const hay = `${row.node.name} ${row.sourceName} ${row.node.region_code} ${row.node.protocol}`.toLowerCase();
-          if (!hay.includes(q)) return false;
-        }
-        if (sourceFilter !== "all" && row.node.sub_id !== sourceFilter) return false;
-        if (onlyGoogleClean && row.snap?.google_clean !== true) return false;
-        if (onlyKeepAliveOk && row.snap?.keepalive_60s_ok !== true) return false;
-        return true;
-      });
-
-    list.sort((a, b) => {
-      let diff = 0;
-      switch (sortKey) {
-        case "name":
-          diff = a.node.name.localeCompare(b.node.name);
-          break;
-        case "source":
-          diff = a.sourceName.localeCompare(b.sourceName);
-          break;
-        case "region":
-          diff = a.node.region_code.localeCompare(b.node.region_code);
-          break;
-        case "multiplier":
-          diff = a.node.multiplier - b.node.multiplier;
-          break;
-        case "latency":
-          diff = (a.snap?.latency_ms ?? 99999) - (b.snap?.latency_ms ?? 99999);
-          break;
-        case "up":
-          diff = (a.snap?.up_mbps ?? -1) - (b.snap?.up_mbps ?? -1);
-          break;
-        case "down":
-          diff = (a.snap?.down_mbps ?? -1) - (b.snap?.down_mbps ?? -1);
-          break;
-        case "google":
-          diff = (a.snap?.google_clean ? 1 : 0) - (b.snap?.google_clean ? 1 : 0);
-          break;
-        case "keepalive":
-          diff = (a.snap?.keepalive_60s_ok ? 1 : 0) - (b.snap?.keepalive_60s_ok ? 1 : 0);
-          break;
-        case "unlocks":
-          diff = a.unlockScore - b.unlockScore;
-          break;
-      }
-      return sortDir === "asc" ? diff : -diff;
-    });
-
-    return list;
-  }, [nodes, snapshots, subNameById, searchQuery, sourceFilter, onlyGoogleClean, onlyKeepAliveOk, sortKey, sortDir]);
-
-  const funnelStages: ReadonlyArray<{
-    key: FunnelStageKey;
-    step: string;
-    title: string;
-    detail: string;
-    budget: string;
-  }> = [
-    {
-      key: "l0",
-      step: "L0",
-      title: "连通延迟与抖动",
-      detail: "并发 204 握手 · 快速淘汰超时与高丢包节点",
-      budget: "~4 KB/节点",
-    },
-    {
-      key: "l1",
-      step: "L1",
-      title: "Google 真值防送中 & AI 解锁",
-      detail: "Google 侧硬门禁校验 + ChatGPT / Claude / Windsurf 解锁",
-      budget: "~32 KB/节点",
-    },
-    {
-      key: "l2",
-      step: "L2",
-      title: "自定义上下行 + 512KB 快熔断 & 60s 保活",
-      detail: "低速 512KB 立即止损省流 · 检测 60s 静默长连接黑洞",
-      budget: "仅测 L1 达标项",
-    },
-  ];
 
   const renderSortIcon = (key: SortKey) => {
     if (sortKey !== key) {
@@ -687,622 +1755,1075 @@ export function SpeedTestPage() {
     );
   };
 
+  const progressPct =
+    probeProgress.total > 0
+      ? Math.min(100, Math.round((probeProgress.completed / probeProgress.total) * 100))
+      : 0;
+
+  const targetCountTag =
+    selectedCount > 0
+      ? `已选 ${selectedCount} 个`
+      : totalFiltered > 0
+        ? `当前筛选 ${totalFiltered} 个`
+        : "暂无节点";
+
+  const testedCountInFiltered = useMemo(
+    () => filteredRows.filter((r) => Boolean(r.snap)).length,
+    [filteredRows]
+  );
+
   return (
-    <div className="space-y-4">
-      {/* Top Zero-Interference Isolated SpeedTest Console */}
+    <div className="space-y-3.5">
+      {/* Compact Header & Main Speed Test Controls */}
       <section className="cc-card cc-glass rounded-2xl p-4">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-          <div className="flex items-start gap-3.5">
-            <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl border border-[var(--line)] bg-[var(--bg-elevated)]">
-              <MascotSprite state="searching" scale={2} title="零干扰隔离测速 · 放大镜猫咪" />
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]">
+              <MascotSprite
+                state="searching"
+                scale={1}
+                animationsEnabled={isRunning}
+                title={isRunning ? "猫咪正在逐条测速中" : "独立测速通道已就绪"}
+              />
             </div>
             <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
                 <h1 className="text-base font-semibold tracking-tight text-[var(--text)]">
-                  零干扰隔离测速控制台
+                  节点测速
                 </h1>
-                <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2.5 py-0.5 cc-mono text-[11px] font-medium text-[var(--green)]">
-                  <ShieldCheck className="h-3.5 w-3.5" />
-                  独立临时核心 127.0.0.1 · 现役业务 0 断流
-                </span>
+                {isRunning && (
+                  <span className="inline-flex items-center gap-1.5 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+                    <span className="cc-pulse-dot inline-block h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />
+                    正在边测边出结果
+                  </span>
+                )}
               </div>
-              <p className="mt-1 text-xs leading-relaxed text-[var(--muted)]">
-                测速期间按需拉起隔离临时 Mihomo（强制{" "}
-                <span className="cc-mono text-[var(--text-secondary)]">redir-host</span> +{" "}
-                <span className="cc-mono text-[var(--text-secondary)]">GOMEMLIMIT=32MiB</span> +{" "}
-                <span className="cc-mono text-[var(--text-secondary)]">socks5h://</span>），规避现役 TUN Fake-IP 污染，测完由 JobGuard 自动彻底回收。
+              <p className="mt-0.5 text-xs text-[var(--muted)]">
+                走独立测速通道，不影响你现在正常上网
               </p>
             </div>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            {running ? (
+          <button
+            type="button"
+            onClick={() => setShowProbeSettings((v) => !v)}
+            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
+              showProbeSettings
+                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+            }`}
+          >
+            <Settings className="h-3.5 w-3.5" />
+            <span>测速项目设置 ({enabledProbeCount} 项)</span>
+            {showProbeSettings ? (
+              <ChevronUp className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronDown className="h-3.5 w-3.5" />
+            )}
+          </button>
+        </div>
+
+        {/* 3 Clear Chinese Action Buttons + Adjacent 60s Keepalive Switch */}
+        <div className="mt-3.5 flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
+            onClick={() => handlePrimaryTestClick("latency")}
+            title="只测节点通不通和延迟快慢，速度最快、最省流量"
+            className="inline-flex items-center gap-2 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+          >
+            <Zap className="h-3.5 w-3.5 shrink-0" />
+            <span>快速测延迟</span>
+            <span className="rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium">
+              {targetCountTag}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
+            onClick={() => handlePrimaryTestClick("unlock")}
+            title="测延迟 + 谷歌地区检测 + 常用 AI 平台解锁"
+            className="inline-flex items-center gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--card-hover)] disabled:cursor-not-allowed disabled:opacity-55"
+          >
+            <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
+            <span>测地区与 AI 解锁</span>
+            <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-normal text-[var(--muted)]">
+              {targetCountTag}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
+            onClick={() => handlePrimaryTestClick("full")}
+            title="测延迟 + 地区与 AI 解锁 + 实际上传与下载网速"
+            className="inline-flex items-center gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--card-hover)] disabled:cursor-not-allowed disabled:opacity-55"
+          >
+            <Rocket className="h-3.5 w-3.5 shrink-0 text-[var(--sky)]" />
+            <span>测上下行网速</span>
+            <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-normal text-[var(--muted)]">
+              {targetCountTag}
+            </span>
+          </button>
+
+          <span className="mx-0.5 hidden h-5 w-px bg-[var(--line)] sm:inline-block" aria-hidden="true" />
+
+          <label
+            title="开启后每节点多耗时约 1 分钟，仅排查断流时建议勾选（与测速项目设置中的 60 秒长连接同步）"
+            className={`inline-flex cursor-pointer items-center gap-2 rounded-xl border px-3 py-2 text-xs transition-colors ${
+              includeKeepalive
+                ? "border-[var(--amber)]/60 bg-[var(--amber-soft)] text-[var(--amber)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+            } ${isRunning ? "pointer-events-none opacity-65" : ""}`}
+          >
+            <input
+              type="checkbox"
+              checked={includeKeepalive}
+              disabled={isRunning}
+              onChange={(e) => setKeepaliveSynced(e.target.checked)}
+              className="h-3.5 w-3.5 accent-[var(--accent)]"
+            />
+            <Clock className="h-3.5 w-3.5 shrink-0" />
+            <span className="font-medium">附带测 60 秒长连接</span>
+          </label>
+        </div>
+
+        {/* Lightweight Confirmation Bar when Unselected List > 50 Nodes */}
+        {pendingLargeRunTier && !isRunning && (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2.5 text-xs">
+            <div className="flex items-center gap-2 text-[var(--text)]">
+              <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--amber)]" />
+              <span>
+                当前列表共 <strong className="cc-tabular">{totalFiltered}</strong> 个节点，建议先筛选或勾选部分节点；或者直接开始「
+                {TIER_LABELS[pendingLargeRunTier]}」：
+              </span>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={handleStopTest}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--red)]/50 bg-[var(--red-soft)] px-4 py-2 text-xs font-semibold text-[var(--red)] transition-opacity hover:opacity-90"
+                onClick={() =>
+                  void executeProbes(
+                    filteredRows.slice(0, 30).map((r) => r.node.id),
+                    pendingLargeRunTier
+                  )
+                }
+                className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
               >
-                <Pause className="h-3.5 w-3.5" />
-                <span>终止测速</span>
+                直接测前 30 个
               </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void executeProbes(
+                    filteredRows.map((r) => r.node.id),
+                    pendingLargeRunTier
+                  )
+                }
+                className="rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)]"
+              >
+                全部测完 ({totalFiltered} 个)
+              </button>
+              <button
+                type="button"
+                onClick={() => setPendingLargeRunTier(null)}
+                className="rounded-lg px-2 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)]"
+              >
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Fixed-Height Status & Live Progress Strip (Zero Table Jump on Start/Stop) */}
+        <div
+          className={`mt-3 flex h-[60px] items-center justify-between gap-3 overflow-hidden rounded-xl border px-3.5 transition-colors ${
+            isRunning
+              ? "border-[var(--accent)]/50 bg-[var(--bg-elevated)]"
+              : "border-[var(--line)] bg-[var(--bg-elevated)]/70"
+          }`}
+        >
+          {isRunning ? (
+            <>
+              <div className="flex min-w-0 flex-1 flex-col justify-center gap-1.5">
+                <div className="flex min-w-0 items-center gap-2 text-xs">
+                  <span className="cc-mono cc-tabular shrink-0 font-semibold text-[var(--accent)]">
+                    已完成 {probeProgress.completed} / 总计 {probeProgress.total}
+                  </span>
+                  <span className="shrink-0 text-[var(--muted)]">·</span>
+                  <span className="truncate font-medium text-[var(--text)]">
+                    {probeProgress.currentNodeName
+                      ? `正在测：${probeProgress.currentNodeName}`
+                      : "正在准备独立测速通道…"}
+                  </span>
+                  <span className="hidden shrink-0 text-[11px] text-[var(--muted)] xl:inline">
+                    · 测速中已锁定行顺序，结束后自动按结果排序
+                  </span>
+                </div>
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                  <div
+                    className="h-full rounded-full bg-[var(--accent)] transition-all duration-200"
+                    style={{ width: `${Math.max(progressPct, probeProgress.total > 0 ? 3 : 0)}%` }}
+                  />
+                </div>
+              </div>
+
+              <button
+                type="button"
+                disabled={isPausing}
+                onClick={() => void handlePauseTest()}
+                className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--red)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:cursor-wait disabled:opacity-65"
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+                <span>{isPausing ? "正在暂停并保存…" : "暂停（保留已测结果）"}</span>
+              </button>
+            </>
+          ) : (
+            <>
+              <div className="flex min-w-0 flex-1 items-center gap-2 text-xs text-[var(--text-secondary)]">
+                <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                <span className="truncate">
+                  勾选部分或全部节点后点上方开始测速，结果会逐行实时出现；中途随时可暂停并保留已测结果
+                </span>
+              </div>
+              {includeKeepalive && (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--amber)]">
+                  <Clock className="h-3 w-3 shrink-0" />
+                  <span>含 60 秒长连接（约+1分钟/节点）</span>
+                </span>
+              )}
+            </>
+          )}
+        </div>
+      </section>
+
+      {/* Collapsible Probe Settings Drawer (Hidden by Default) */}
+      {showProbeSettings && (
+        <section className="cc-card cc-glass rounded-2xl p-4">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <h2 className="text-sm font-semibold text-[var(--text)]">测速项目设置</h2>
+              <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                可自由开关各项测速内容，或添加自定义的测速网址与网站解锁检查
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setShowAddProbe((v) => !v)}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85"
+            >
+              {showAddProbe ? <X className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+              <span>{showAddProbe ? "收起表单" : "新增测速项"}</span>
+            </button>
+          </div>
+
+          {showAddProbe && (
+            <form
+              onSubmit={(ev) => void handleAddProbe(ev)}
+              className="mb-3.5 space-y-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3.5 text-xs"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-semibold text-[var(--text)]">新增自定义测速项目</span>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <span className="text-[11px] text-[var(--muted)]">常用解锁模板：</span>
+                  {UNLOCK_PRESETS.map((preset) => (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => {
+                        setNewProbeKind("unlock_regex");
+                        setNewProbeId(preset.id);
+                        setNewProbeName(preset.name);
+                        setNewProbeTarget(preset.target);
+                        setNewProbeRegex(preset.bodyRegex);
+                      }}
+                      className="rounded-md border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    >
+                      {preset.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
+                <label>
+                  <span className="text-[11px] text-[var(--muted)]">测速类型</span>
+                  <select
+                    value={newProbeKind}
+                    onChange={(e) => setNewProbeKind(e.target.value as ProbeKind)}
+                    className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  >
+                    <option value="latency">基础延迟网址</option>
+                    <option value="upload">上传测速网址</option>
+                    <option value="download">下载测速网址</option>
+                    <option value="unlock_regex">网站解锁检测</option>
+                    <option value="keepalive">60 秒长连接</option>
+                    <option value="google_cn">谷歌地区检测</option>
+                    <option value="external_cmd">自定义外部脚本</option>
+                  </select>
+                </label>
+
+                <label>
+                  <span className="text-[11px] text-[var(--muted)]">显示名称</span>
+                  <input
+                    type="text"
+                    value={newProbeName}
+                    onChange={(e) => setNewProbeName(e.target.value)}
+                    placeholder="例如：常用服务上传测速"
+                    className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  />
+                </label>
+
+                <label>
+                  <span className="text-[11px] text-[var(--muted)]">项目标识（可选，用于策略引用）</span>
+                  <input
+                    type="text"
+                    value={newProbeId}
+                    onChange={(e) => setNewProbeId(e.target.value)}
+                    placeholder="留空将自动生成"
+                    className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  />
+                </label>
+
+                <label>
+                  <span className="text-[11px] text-[var(--muted)]">超时时间（毫秒）</span>
+                  <input
+                    type="number"
+                    min={1000}
+                    max={65000}
+                    value={newProbeTimeoutMs}
+                    onChange={(e) => setNewProbeTimeoutMs(Number(e.target.value) || 8000)}
+                    className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  />
+                </label>
+              </div>
+
+              <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-12">
+                <label className="lg:col-span-6">
+                  <span className="text-[11px] text-[var(--muted)]">
+                    {newProbeKind === "external_cmd" ? "外部脚本命令" : "测试网址"}
+                  </span>
+                  <input
+                    type="text"
+                    value={newProbeTarget}
+                    onChange={(e) => setNewProbeTarget(e.target.value)}
+                    placeholder={
+                      newProbeKind === "external_cmd"
+                        ? "python scripts/custom_probe.py --timeout 8"
+                        : "https://example.com/generate_204"
+                    }
+                    className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  />
+                </label>
+
+                {newProbeKind === "unlock_regex" ? (
+                  <label className="lg:col-span-4">
+                    <span className="text-[11px] text-[var(--muted)]">页面关键词匹配规则</span>
+                    <input
+                      type="text"
+                      value={newProbeRegex}
+                      onChange={(e) => setNewProbeRegex(e.target.value)}
+                      placeholder="例如：windsurf|codeium"
+                      className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                    />
+                  </label>
+                ) : newProbeKind === "upload" || newProbeKind === "download" ? (
+                  <label className="lg:col-span-4">
+                    <span className="text-[11px] text-[var(--muted)]">单次测速流量上限（KB）</span>
+                    <input
+                      type="number"
+                      min={64}
+                      max={16384}
+                      value={newProbePayloadKb}
+                      onChange={(e) => setNewProbePayloadKb(Number(e.target.value) || 512)}
+                      className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                    />
+                  </label>
+                ) : (
+                  <div className="flex items-end text-[11px] text-[var(--muted)] lg:col-span-4">
+                    所有项目均通过独立测速通道执行
+                  </div>
+                )}
+
+                <div className="flex items-end lg:col-span-2">
+                  <button
+                    type="submit"
+                    className="w-full rounded-lg bg-[var(--accent)] py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                  >
+                    保存项目
+                  </button>
+                </div>
+              </div>
+            </form>
+          )}
+
+          <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 xl:grid-cols-3">
+            {probeList.map((probe) => {
+              const display = getProbeDisplayInfo(probe);
+              return (
+                <div
+                  key={probe.id}
+                  className={`rounded-xl border p-3 transition-colors ${
+                    probe.enabled
+                      ? "border-[var(--line)] bg-[var(--bg-elevated)]"
+                      : "border-[var(--line)]/60 bg-[var(--bg-elevated)]/50 opacity-65"
+                  }`}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        {probe.kind === "external_cmd" && (
+                          <Terminal className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                        )}
+                        <span className="truncate text-xs font-semibold text-[var(--text)]">
+                          {display.title}
+                        </span>
+                        <span className="shrink-0 rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                          {probe.builtin ? "内置" : "自定义"}
+                        </span>
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-[var(--muted)]">{display.desc}</p>
+                    </div>
+
+                    <div className="flex shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => handleToggleProbe(probe.id)}
+                        className={`rounded-md px-2 py-0.5 text-[10px] font-medium transition-colors ${
+                          probe.enabled
+                            ? "bg-[var(--green-soft)] text-[var(--green)]"
+                            : "bg-[var(--card)] text-[var(--muted)]"
+                        }`}
+                      >
+                        {probe.enabled ? "已开启" : "已停用"}
+                      </button>
+                      {!probe.builtin && (
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteProbe(probe.id)}
+                          className="rounded-md p-1 text-[var(--muted)] hover:bg-[var(--card)] hover:text-[var(--red)]"
+                          aria-label={`删除测速项 ${display.title}`}
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Human-friendly summary tucked at bottom (no raw formula snippets) */}
+                  <div className="mt-2 space-y-0.5 border-t border-[var(--line)]/60 pt-1.5 text-[10px] text-[var(--muted)]">
+                    <div className="truncate cc-mono" title={probe.target}>
+                      {probe.target}
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="truncate opacity-85">
+                        {probe.kind === "keepalive"
+                          ? "与顶部「附带测 60 秒长连接」同步"
+                          : PROBE_KIND_LABELS[probe.kind]}
+                      </span>
+                      <span className="cc-mono shrink-0 opacity-85">
+                        超时 {Math.round(probe.timeoutMs / 1000)} 秒
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      {/* Filter Bar + Multi-Select Status Bar + Streaming Results Table */}
+      <section className="cc-card cc-glass rounded-2xl p-4">
+        {/* Clean Intuitive Filter Row */}
+        <div className="flex flex-wrap items-center gap-2 text-xs">
+          <div className="relative min-w-[180px] flex-1 sm:max-w-[240px]">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => {
+                setSearchQuery(e.target.value);
+                setPage(1);
+              }}
+              placeholder="搜索节点名称、地区或来源"
+              className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+            />
+            {searchQuery && (
+              <button
+                type="button"
+                onClick={() => {
+                  setSearchQuery("");
+                  setPage(1);
+                }}
+                aria-label="清空搜索"
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted)] hover:text-[var(--text)]"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+
+          <div className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
+            <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+            <select
+              aria-label="按来源筛选"
+              value={sourceFilter}
+              onChange={(e) => {
+                setSourceFilter(e.target.value);
+                setPage(1);
+              }}
+              className="bg-transparent text-xs text-[var(--text)] outline-none"
+            >
+              <option value="all">全部来源</option>
+              {sourceOptions.map((sub) => (
+                <option key={sub.id} value={sub.id}>
+                  {sub.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
+            <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+            <select
+              aria-label="按多选组筛选"
+              value={groupFilter}
+              onChange={(e) => {
+                setGroupFilter(e.target.value);
+                setPage(1);
+              }}
+              className="bg-transparent text-xs text-[var(--text)] outline-none"
+            >
+              <option value="all">全部多选组</option>
+              {groups.map((grp) => (
+                <option key={grp.id} value={grp.id}>
+                  {formatGroupDisplayName(grp.name)}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
+            <Globe className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+            <select
+              aria-label="按地区筛选"
+              value={regionFilter}
+              onChange={(e) => {
+                setRegionFilter(e.target.value);
+                setPage(1);
+              }}
+              className="bg-transparent text-xs text-[var(--text)] outline-none"
+            >
+              <option value="all">全部地区</option>
+              {regionOptions.map((code) => (
+                <option key={code} value={code}>
+                  {formatRegionOption(code)}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => {
+              setOnlyTested((v) => !v);
+              setPage(1);
+            }}
+            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+              onlyTested
+                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+            }`}
+          >
+            仅看已测
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setOnlyGoogleClean((v) => !v);
+              setPage(1);
+            }}
+            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+              onlyGoogleClean
+                ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
+                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+            }`}
+          >
+            仅看谷歌正常
+          </button>
+
+          {hasActiveFilters && (
+            <button
+              type="button"
+              onClick={handleResetFilters}
+              className="inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--text)]"
+            >
+              <RotateCcw className="h-3 w-3" />
+              <span>重置</span>
+            </button>
+          )}
+        </div>
+
+        {/* Multi-Selection Status Bar + Selection Guide */}
+        <div
+          className={`mt-3 flex flex-col gap-2 rounded-xl border px-3 py-2.5 transition-colors ${
+            ctrlHeld
+              ? "border-[var(--accent)] bg-[var(--accent-soft)]/70"
+              : "border-[var(--line)] bg-[var(--bg-elevated)]"
+          }`}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <span
+                className={`inline-flex items-center gap-1.5 rounded-lg px-2 py-0.5 font-semibold cc-tabular ${
+                  selectedCount > 0
+                    ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+                    : "bg-[var(--card)] text-[var(--text-secondary)]"
+                }`}
+              >
+                已选 {selectedCount} 个节点
+              </span>
+              {selectedOutsideFiltered > 0 && (
+                <span className="text-[11px] text-[var(--muted)]">
+                  （含当前筛选外 {selectedOutsideFiltered} 个）
+                </span>
+              )}
+              <span className="text-[11px] text-[var(--muted)] cc-tabular">
+                当前列表 {totalFiltered} 个 · 已测 {testedCountInFiltered} 个
+              </span>
+              {isRunning && (
+                <span className="inline-flex items-center gap-1 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+                  测速中已锁定行顺序，结束后自动按结果排序
+                </span>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                disabled={totalFiltered === 0}
+                onClick={handleSelectAllFiltered}
+                className="rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+              >
+                {allFilteredSelected ? "取消全选当前筛选" : "全选当前筛选"}
+              </button>
+              <button
+                type="button"
+                disabled={totalFiltered === 0}
+                onClick={handleSelectTop20}
+                className="rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+              >
+                选前 20 个
+              </button>
+              <button
+                type="button"
+                disabled={selectedCount === 0}
+                onClick={handleClearSelection}
+                className="rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--red)]/60 hover:text-[var(--red)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+              >
+                清空选择
+              </button>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5 text-[11px]">
+            <Sparkles
+              className={`h-3.5 w-3.5 shrink-0 ${
+                ctrlHeld ? "text-[var(--accent)]" : "text-[var(--muted)]"
+              }`}
+            />
+            {ctrlHeld ? (
+              <span className="font-medium text-[var(--accent)]">
+                已按住 Ctrl：单击行精准切换勾选，按住鼠标左键滑过行即可批量选中或取消
+              </span>
             ) : (
-              <>
-                <button
-                  type="button"
-                  onClick={() => void handleStartTest("full")}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-                >
-                  <Play className="h-3.5 w-3.5" />
-                  <span>一键零干扰测速 (L0→L2)</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleStartTest("lite")}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-                >
-                  <Gauge className="h-3.5 w-3.5 text-[var(--accent)]" />
-                  <span>仅测 L0+L1 省流</span>
-                </button>
-              </>
+              <span className="text-[var(--muted)]">
+                点击勾选 · 按住 Shift 连选区间 · 按住 Ctrl 按住左键滑过批量选中
+              </span>
             )}
           </div>
         </div>
 
-        {/* 3-Stage Data-Saving Funnel Progress Bar */}
-        <div className="mt-4 grid grid-cols-1 gap-2.5 md:grid-cols-3">
-          {funnelStages.map((stage) => {
-            const st = funnel[stage.key];
-            const barColor =
-              st.status === "done"
-                ? "var(--green)"
-                : st.status === "running"
-                  ? "var(--accent)"
-                  : "var(--line-strong)";
-            const badgeText =
-              st.status === "done"
-                ? `通过 ${st.passed}/${st.total}`
-                : st.status === "running"
-                  ? "探测中..."
-                  : st.status === "skipped"
-                    ? "本次跳过"
-                    : "待命";
-            return (
-              <div
-                key={stage.key}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3"
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-1.5">
-                    <span className="rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 cc-mono text-[10px] font-semibold text-[var(--accent)]">
-                      {stage.step}
-                    </span>
-                    <span className="text-xs font-semibold text-[var(--text)]">{stage.title}</span>
-                  </div>
-                  <span
-                    className="cc-mono text-[10px] font-medium"
-                    style={{
-                      color:
-                        st.status === "done"
-                          ? "var(--green)"
-                          : st.status === "running"
-                            ? "var(--accent)"
-                            : "var(--muted)",
-                    }}
-                  >
-                    {badgeText}
-                  </span>
-                </div>
-                <p className="mt-1 text-[11px] text-[var(--muted)]">{stage.detail}</p>
-                <div className="mt-2.5 flex items-center gap-2">
-                  <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-[var(--card)]">
-                    <div
-                      className="h-full rounded-full transition-all duration-300"
-                      style={{ width: `${st.pct}%`, backgroundColor: barColor }}
-                    />
-                  </div>
-                  <span className="shrink-0 cc-mono text-[10px] text-[var(--muted)]">
-                    {stage.budget}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        {running && (
-          <div className="mt-2.5 flex items-center gap-2 text-[11px] text-[var(--accent)]">
-            <Clock className="h-3.5 w-3.5" />
-            <span>
-              正在独立临时核心中运行「{runMode === "full" ? "L0→L1→L2 完整漏斗" : "L0→L1 省流模式"}」
-              ，当前现役代理连接零中断…
-            </span>
-          </div>
-        )}
-      </section>
-
-      {/* Extensible Probe Registry Panel */}
-      <section className="cc-card cc-glass rounded-2xl p-4">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-          <div>
-            <h2 className="text-sm font-semibold text-[var(--text)]">
-              可扩展探针管理面板（Probe Registry）
-            </h2>
-            <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-              管理内置与自定义探针，支持在「智能多选组」公式中通过探针 ID 精确引用实测指标
-            </p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setShowAddProbe((v) => !v)}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85"
-          >
-            {showAddProbe ? <X className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
-            <span>{showAddProbe ? "收起表单" : "新增探针"}</span>
-          </button>
-        </div>
-
-        {/* Add Custom Probe Form */}
-        {showAddProbe && (
-          <form
-            onSubmit={(ev) => void handleAddProbe(ev)}
-            className="mb-3.5 space-y-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3.5 text-xs"
-          >
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <span className="font-semibold text-[var(--text)]">注册自定义探针</span>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] text-[var(--muted)]">正则解锁快捷模板：</span>
-                {UNLOCK_PRESETS.map((preset) => (
-                  <button
-                    key={preset.id}
-                    type="button"
-                    onClick={() => {
-                      setNewProbeKind("unlock_regex");
-                      setNewProbeId(preset.id);
-                      setNewProbeName(preset.name);
-                      setNewProbeTarget(preset.target);
-                      setNewProbeRegex(preset.bodyRegex);
-                    }}
-                    className="rounded-md border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
-              <label>
-                <span className="text-[11px] text-[var(--muted)]">探针类型</span>
-                <select
-                  value={newProbeKind}
-                  onChange={(e) => setNewProbeKind(e.target.value as ProbeKind)}
-                  className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                >
-                  <option value="latency">自定义测活 URL (latency)</option>
-                  <option value="upload">上行测速 URL (upload)</option>
-                  <option value="download">下行测速 URL (download)</option>
-                  <option value="unlock_regex">正则解锁 (unlock_regex)</option>
-                  <option value="keepalive">60s 保活 (keepalive)</option>
-                  <option value="google_cn">Google 真值 (google_cn)</option>
-                  <option value="external_cmd">外部脚本探针 (external_cmd)</option>
-                </select>
-              </label>
-
-              <label>
-                <span className="text-[11px] text-[var(--muted)]">显示名称</span>
-                <input
-                  type="text"
-                  value={newProbeName}
-                  onChange={(e) => setNewProbeName(e.target.value)}
-                  placeholder="如 AI API 上行专项"
-                  className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-              </label>
-
-              <label>
-                <span className="text-[11px] text-[var(--muted)]">公式寻址 ID（可选）</span>
-                <input
-                  type="text"
-                  value={newProbeId}
-                  onChange={(e) => setNewProbeId(e.target.value)}
-                  placeholder="如 antigravity_up"
-                  className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-              </label>
-
-              <label>
-                <span className="text-[11px] text-[var(--muted)]">超时 (ms)</span>
-                <input
-                  type="number"
-                  min={1000}
-                  max={65000}
-                  value={newProbeTimeoutMs}
-                  onChange={(e) => setNewProbeTimeoutMs(Number(e.target.value) || 8000)}
-                  className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-              </label>
-            </div>
-
-            <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-12">
-              <label className="lg:col-span-6">
-                <span className="text-[11px] text-[var(--muted)]">
-                  {newProbeKind === "external_cmd" ? "外部脚本命令（接收 JSON stdin）" : "目标探测 URL"}
-                </span>
-                <input
-                  type="text"
-                  value={newProbeTarget}
-                  onChange={(e) => setNewProbeTarget(e.target.value)}
-                  placeholder={
-                    newProbeKind === "external_cmd"
-                      ? "python scripts/custom_probe.py --timeout 8"
-                      : "https://example.com/generate_204"
-                  }
-                  className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-              </label>
-
-              {newProbeKind === "unlock_regex" ? (
-                <label className="lg:col-span-4">
-                  <span className="text-[11px] text-[var(--muted)]">响应正文匹配正则</span>
-                  <input
-                    type="text"
-                    value={newProbeRegex}
-                    onChange={(e) => setNewProbeRegex(e.target.value)}
-                    placeholder="loc=(?!CN|HK)"
-                    className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  />
-                </label>
-              ) : newProbeKind === "upload" || newProbeKind === "download" ? (
-                <label className="lg:col-span-4">
-                  <span className="text-[11px] text-[var(--muted)]">
-                    测试负载大小 (KB · 建议 512KB 快熔断)
-                  </span>
-                  <input
-                    type="number"
-                    min={64}
-                    max={16384}
-                    value={newProbePayloadKb}
-                    onChange={(e) => setNewProbePayloadKb(Number(e.target.value) || 512)}
-                    className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  />
-                </label>
-              ) : (
-                <div className="flex items-end text-[11px] text-[var(--muted)] lg:col-span-4">
-                  支持经由隔离 socks5h 隧道独立执行
-                </div>
-              )}
-
-              <div className="flex items-end lg:col-span-2">
-                <button
-                  type="submit"
-                  className="w-full rounded-lg bg-[var(--accent)] py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-                >
-                  保存探针
-                </button>
-              </div>
-            </div>
-          </form>
-        )}
-
-        <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-4">
-          {probeList.map((probe) => (
-            <div
-              key={probe.id}
-              className={`rounded-xl border p-3 transition-colors ${
-                probe.enabled
-                  ? "border-[var(--line)] bg-[var(--bg-elevated)]"
-                  : "border-[var(--line)]/60 bg-[var(--bg-elevated)]/50 opacity-70"
-              }`}
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-1.5">
-                    {probe.kind === "external_cmd" && (
-                      <Terminal className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-                    )}
-                    <span className="truncate text-xs font-semibold text-[var(--text)]">
-                      {probe.name}
-                    </span>
-                  </div>
-                  <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                    <span className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]">
-                      {PROBE_KIND_LABELS[probe.kind]}
-                    </span>
-                    <span className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                      {probe.builtin ? "内置" : "自定义"}
-                    </span>
-                  </div>
-                </div>
-
-                <div className="flex shrink-0 items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => handleToggleProbe(probe.id)}
-                    className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
-                      probe.enabled
-                        ? "bg-[var(--green-soft)] text-[var(--green)]"
-                        : "bg-[var(--card)] text-[var(--muted)]"
-                    }`}
-                  >
-                    {probe.enabled ? "启用" : "停用"}
-                  </button>
-                  {!probe.builtin && (
-                    <button
-                      type="button"
-                      onClick={() => void handleDeleteProbe(probe.id)}
-                      className="rounded-md p-1 text-[var(--muted)] hover:bg-[var(--card)] hover:text-[var(--red)]"
-                      aria-label={`删除探针 ${probe.name}`}
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              <div className="mt-2 truncate cc-mono text-[10px] text-[var(--muted)]" title={probe.target}>
-                {probe.target}
-              </div>
-              <div className="mt-1.5 flex items-center justify-between gap-2 border-t border-[var(--line)]/60 pt-1.5 cc-mono text-[10px]">
-                <span className="truncate text-[var(--text-secondary)]">
-                  {formatFormulaHint(probe)}
-                </span>
-                <span className="shrink-0 text-[var(--muted)]">{probe.timeoutMs}ms</span>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-
-      {/* Multi-Dimensional Results Matrix Table */}
-      <section className="cc-card cc-glass rounded-2xl p-4">
-        <div className="mb-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <h2 className="text-sm font-semibold text-[var(--text)]">多维测速结果矩阵</h2>
-            <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-              点击任意列头升降序排序；Google 洁净度仅以 Google 侧真值作硬门禁，CF/YT 地区差异仅标风险提示
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 text-xs">
-            <div className="relative">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-              <input
-                type="text"
-                value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="筛选节点 / 地区 / 协议"
-                className="w-44 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-2.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-              />
-            </div>
-
-            <div className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1">
-              <Filter className="h-3.5 w-3.5 text-[var(--muted)]" />
-              <select
-                value={sourceFilter}
-                onChange={(e) => setSourceFilter(e.target.value)}
-                className="bg-transparent text-xs text-[var(--text)] outline-none"
-              >
-                <option value="all">全部来源订阅</option>
-                {subscriptions.map((sub) => (
-                  <option key={sub.id} value={sub.id}>
-                    {sub.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => setOnlyGoogleClean((v) => !v)}
-              className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-                onlyGoogleClean
-                  ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
-                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
-              }`}
-            >
-              仅 Google 洁净
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setOnlyKeepAliveOk((v) => !v)}
-              className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-                onlyKeepAliveOk
-                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
-              }`}
-            >
-              仅 60s 保活通过
-            </button>
-          </div>
-        </div>
-
-        <div className="overflow-x-auto rounded-xl border border-[var(--line)]">
-          <table className="w-full min-w-[960px] border-collapse text-left text-xs">
+        {/* Clean Paginated Results Table */}
+        <div
+          className={`mt-3 overflow-x-auto rounded-xl border border-[var(--line)] ${
+            modifierHeld ? "select-none" : ""
+          }`}
+        >
+          <table className="w-full min-w-[920px] border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] text-[var(--muted)]">
+                <th className="w-10 px-3 py-2.5 text-center">
+                  <input
+                    type="checkbox"
+                    checked={allPageSelected}
+                    disabled={pagedRows.length === 0}
+                    onChange={handleTogglePageSelection}
+                    aria-label="全选当前页节点"
+                    title="全选 / 取消当前页"
+                    className="h-3.5 w-3.5 cursor-pointer accent-[var(--accent)]"
+                  />
+                </th>
                 {(
                   [
-                    { key: "name", label: "节点名" },
+                    { key: "name", label: "节点名称" },
                     { key: "source", label: "来源" },
-                    { key: "region", label: "地区" },
-                    { key: "multiplier", label: "倍率" },
-                    { key: "latency", label: "延迟 / 抖动" },
-                    { key: "up", label: "上行 Mbps" },
-                    { key: "down", label: "下行 Mbps" },
-                    { key: "google", label: "Google 洁净度" },
-                    { key: "keepalive", label: "60s 保活" },
-                    { key: "unlocks", label: "站点解锁" },
+                    { key: "latency", label: "延迟" },
+                    { key: "up", label: "上传速度" },
+                    { key: "down", label: "下载速度" },
+                    { key: "google", label: "谷歌地区" },
+                    { key: "unlocks", label: "AI 解锁" },
                   ] as ReadonlyArray<{ key: SortKey; label: string }>
                 ).map((col) => (
-                  <th key={col.key} className="px-3 py-2.5 font-medium">
+                  <th key={col.key} className="whitespace-nowrap px-3 py-2.5 font-medium">
                     <button
                       type="button"
                       onClick={() => handleSort(col.key)}
-                      className="inline-flex items-center gap-1 text-left transition-colors hover:text-[var(--text)]"
+                      className="inline-flex items-center gap-1 whitespace-nowrap text-left transition-colors hover:text-[var(--text)]"
                     >
                       <span>{col.label}</span>
                       {renderSortIcon(col.key)}
                     </button>
                   </th>
                 ))}
+                <th className="w-40 whitespace-nowrap px-3 py-2.5 text-right font-medium">操作</th>
               </tr>
             </thead>
 
             <tbody className="divide-y divide-[var(--line)]/70">
-              {matrixRows.map(({ node, snap, sourceName, unlocks, cfYtMismatch }) => (
-                <tr
-                  key={node.id}
-                  className="bg-[var(--card)]/40 transition-colors hover:bg-[var(--card-hover)]"
-                >
-                  {/* Node Name */}
-                  <td className="px-3 py-2.5">
-                    <div className="font-semibold text-[var(--text)]">{node.name}</div>
-                    <div className="mt-0.5 flex items-center gap-1.5 cc-mono text-[10px] text-[var(--muted)]">
-                      <span className="uppercase">{node.protocol}</span>
-                      <span>:{node.port}</span>
-                      {node.is_443_native && (
-                        <span className="rounded bg-[var(--accent-soft)] px-1 text-[var(--accent)]">
-                          原生 443
-                        </span>
-                      )}
-                    </div>
-                  </td>
+              {pagedRows.map(
+                ({
+                  node,
+                  snap,
+                  sourceName,
+                  regionLabel,
+                  unlocks,
+                  hasUnlockData,
+                  regionMismatch,
+                }) => {
+                  const isSelected = validSelectedIds.has(node.id);
+                  const isActiveNode = runtime.active_node_id === node.id;
+                  const isFlashing = recentFlashIds.has(node.id);
+                  const isSwitchingThis = switchingNodeId === node.id;
 
-                  {/* Source Subscription */}
-                  <td className="px-3 py-2.5 text-[var(--text-secondary)]">{sourceName}</td>
-
-                  {/* Region */}
-                  <td className="px-3 py-2.5 cc-mono">
-                    <div className="font-semibold text-[var(--text)]">{node.region_code}</div>
-                    {(snap?.cf_loc || snap?.yt_gl) && (
-                      <div className="text-[10px] text-[var(--muted)]">
-                        CF:{snap?.cf_loc ?? "-"} / YT:{snap?.yt_gl ?? "-"}
-                      </div>
-                    )}
-                  </td>
-
-                  {/* Multiplier */}
-                  <td className="px-3 py-2.5 cc-mono cc-tabular">
-                    <span
-                      className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${
-                        node.multiplier <= 1.0
-                          ? "bg-[var(--green-soft)] text-[var(--green)]"
-                          : "bg-[var(--amber-soft)] text-[var(--amber)]"
+                  return (
+                    <tr
+                      key={node.id}
+                      onMouseDown={(e) => handleRowMouseDown(e, node.id)}
+                      onMouseEnter={(e) => handleRowMouseEnter(e, node.id)}
+                      onClick={(e) => handleRowClick(e, node.id)}
+                      className={`cursor-pointer transition-colors duration-500 ${
+                        isFlashing
+                          ? "bg-[var(--green-soft)]"
+                          : isSelected
+                            ? "bg-[var(--accent-soft)] hover:bg-[var(--accent-soft)]"
+                            : "bg-[var(--card)]/40 hover:bg-[var(--card-hover)]"
                       }`}
                     >
-                      {node.multiplier.toFixed(1)}x
-                    </span>
-                  </td>
+                      {/* Checkbox with clear accent left indicator when selected */}
+                      <td
+                        className={`px-3 py-2.5 text-center ${
+                          isSelected
+                            ? "shadow-[inset_3px_0_0_var(--accent)]"
+                            : isFlashing
+                              ? "shadow-[inset_3px_0_0_var(--green)]"
+                              : ""
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={isSelected}
+                          onChange={() => {}}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            if (e.shiftKey) {
+                              selectRangeTo(node.id);
+                            } else {
+                              toggleNodeSelection(node.id);
+                            }
+                          }}
+                          aria-label={`选择节点 ${node.name}`}
+                          className="h-3.5 w-3.5 cursor-pointer accent-[var(--accent)]"
+                        />
+                      </td>
 
-                  {/* Latency / Jitter */}
-                  <td className="px-3 py-2.5 cc-mono cc-tabular">
-                    <div className="font-semibold text-[var(--text)]">
-                      {snap?.latency_ms !== null && snap?.latency_ms !== undefined
-                        ? `${Math.round(snap.latency_ms)} ms`
-                        : "--"}
-                    </div>
-                    <div className="text-[10px] text-[var(--muted)]">
-                      ±{snap?.jitter_ms !== null && snap?.jitter_ms !== undefined ? snap.jitter_ms.toFixed(1) : "--"} ms
-                    </div>
-                  </td>
+                      {/* Node Name */}
+                      <td className="min-w-[230px] max-w-[300px] px-3 py-2.5">
+                        <div className="flex items-center gap-1.5">
+                          <span
+                            className="truncate font-semibold text-[var(--text)]"
+                            title={node.name}
+                          >
+                            {node.name}
+                          </span>
+                          {isActiveNode && (
+                            <span className="shrink-0 rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                              当前使用
+                            </span>
+                          )}
+                          {isFlashing && (
+                            <span className="cc-pulse-dot shrink-0 rounded-full bg-[var(--green)] px-1.5 py-0.5 text-[9px] font-semibold text-[var(--accent-ink)]">
+                              已更新
+                            </span>
+                          )}
+                        </div>
+                        <div className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[var(--muted)]">
+                          <span>{regionLabel}</span>
+                          <span>·</span>
+                          <span className="cc-tabular">
+                            {node.multiplier % 1 === 0
+                              ? `${node.multiplier}x`
+                              : `${node.multiplier.toFixed(1)}x`}
+                          </span>
+                        </div>
+                      </td>
 
-                  {/* Upload Mbps */}
-                  <td className="px-3 py-2.5 cc-mono cc-tabular font-semibold text-[var(--coral)]">
-                    {snap?.up_mbps !== null && snap?.up_mbps !== undefined
-                      ? `${snap.up_mbps.toFixed(1)}`
-                      : "--"}
-                  </td>
-
-                  {/* Download Mbps */}
-                  <td className="px-3 py-2.5 cc-mono cc-tabular font-semibold text-[var(--sky)]">
-                    {snap?.down_mbps !== null && snap?.down_mbps !== undefined
-                      ? `${snap.down_mbps.toFixed(1)}`
-                      : "--"}
-                  </td>
-
-                  {/* Google Cleanliness (Hard Gate vs CF/YT Advisory Tag) */}
-                  <td className="px-3 py-2.5">
-                    <div className="flex flex-col items-start gap-1">
-                      {snap?.google_clean === true ? (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                          <CheckCircle2 className="h-3 w-3" />
-                          Google 硬门禁洁净
-                        </span>
-                      ) : snap?.google_clean === false ? (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-[var(--red-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--red)]">
-                          <XCircle className="h-3 w-3" />
-                          送中拦截
-                        </span>
-                      ) : (
-                        <span className="text-[11px] text-[var(--muted)]">待测</span>
-                      )}
-
-                      {cfYtMismatch && (
+                      {/* Source */}
+                      <td className="min-w-[115px] max-w-[160px] px-3 py-2.5">
                         <span
-                          className="inline-flex items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                          title="CF 与 YouTube 归属不一致，仅作参考提示，不触发硬门禁误杀"
+                          className="block truncate text-[var(--text-secondary)]"
+                          title={sourceName}
                         >
-                          <AlertTriangle className="h-2.5 w-2.5" />
-                          CF/YT 提示
+                          {sourceName}
                         </span>
-                      )}
-                    </div>
-                  </td>
+                      </td>
 
-                  {/* 60s Keep-Alive */}
-                  <td className="px-3 py-2.5">
-                    {snap?.keepalive_60s_ok === true ? (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[var(--green)]">
-                        <ShieldCheck className="h-3.5 w-3.5" />
-                        通过
-                      </span>
-                    ) : snap?.keepalive_60s_ok === false ? (
-                      <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[var(--red)]">
-                        <ShieldAlert className="h-3.5 w-3.5" />
-                        黑洞断开
-                      </span>
-                    ) : (
-                      <span className="text-[11px] text-[var(--muted)]">未检</span>
-                    )}
-                  </td>
+                      {/* Latency */}
+                      <td className="whitespace-nowrap px-3 py-2.5 cc-mono cc-tabular">
+                        {snap ? (
+                          <div>
+                            <span
+                              className="font-semibold"
+                              style={{
+                                color: getLatencyColor(snap.latency_ms, snap.ok),
+                              }}
+                            >
+                              {snap.ok === false
+                                ? "超时"
+                                : snap.latency_ms !== null && snap.latency_ms !== undefined
+                                  ? `${Math.round(snap.latency_ms)} ms`
+                                  : "--"}
+                            </span>
+                            {snap.keepalive_60s_ok !== null &&
+                              snap.keepalive_60s_ok !== undefined && (
+                                <div
+                                  className={`mt-1 whitespace-nowrap text-xs font-medium ${
+                                    snap.keepalive_60s_ok
+                                      ? "text-[var(--green)]"
+                                      : "text-[var(--red)]"
+                                  }`}
+                                >
+                                  {snap.keepalive_60s_ok ? "长连接稳" : "长连接断"}
+                                </div>
+                              )}
+                          </div>
+                        ) : (
+                          <span className="text-[var(--muted)]">--</span>
+                        )}
+                      </td>
 
-                  {/* Site Unlock Badges */}
-                  <td className="px-3 py-2.5">
-                    <div className="flex flex-wrap gap-1">
-                      {(
-                        [
-                          { id: "gemini", label: "Gemini", ok: unlocks.gemini },
-                          { id: "chatgpt", label: "ChatGPT", ok: unlocks.chatgpt },
-                          { id: "claude", label: "Claude", ok: unlocks.claude },
-                          { id: "windsurf", label: "Windsurf", ok: unlocks.windsurf },
-                        ] as const
-                      ).map((badge) => (
-                        <span
-                          key={badge.id}
-                          className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
-                            badge.ok
-                              ? "bg-[var(--green-soft)] text-[var(--green)]"
-                              : "bg-[var(--bg-elevated)] text-[var(--muted)] line-through"
-                          }`}
-                        >
-                          {badge.label}
-                        </span>
-                      ))}
-                    </div>
-                  </td>
-                </tr>
-              ))}
+                      {/* Upload Speed */}
+                      <td className="whitespace-nowrap px-3 py-2.5 cc-mono cc-tabular">
+                        {snap?.up_mbps !== null && snap?.up_mbps !== undefined ? (
+                          <span className="font-semibold text-[var(--coral)]">
+                            {snap.up_mbps.toFixed(1)}{" "}
+                            <span className="text-[10px] font-normal text-[var(--muted)]">
+                              Mbps
+                            </span>
+                          </span>
+                        ) : (
+                          <span className="text-[var(--muted)]">--</span>
+                        )}
+                      </td>
 
-              {matrixRows.length === 0 && (
+                      {/* Download Speed */}
+                      <td className="whitespace-nowrap px-3 py-2.5 cc-mono cc-tabular">
+                        {snap?.down_mbps !== null && snap?.down_mbps !== undefined ? (
+                          <span className="font-semibold text-[var(--sky)]">
+                            {snap.down_mbps.toFixed(1)}{" "}
+                            <span className="text-[10px] font-normal text-[var(--muted)]">
+                              Mbps
+                            </span>
+                          </span>
+                        ) : (
+                          <span className="text-[var(--muted)]">--</span>
+                        )}
+                      </td>
+
+                      {/* Google Region Status */}
+                      <td className="px-3 py-2.5">
+                        <div className="flex flex-col items-start gap-1">
+                          {snap?.google_clean === true ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--green)]">
+                              <CheckCircle2 className="h-3 w-3" />
+                              正常
+                            </span>
+                          ) : snap?.google_clean === false ? (
+                            <span className="inline-flex items-center gap-1 rounded-full bg-[var(--red-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--red)]">
+                              <XCircle className="h-3 w-3" />
+                              异常
+                            </span>
+                          ) : (
+                            <span className="text-[11px] text-[var(--muted)]">待测</span>
+                          )}
+
+                          {regionMismatch && (
+                            <span
+                              className="inline-flex items-center gap-0.5 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] text-[var(--amber)]"
+                              title="不同网站识别出的地区存在差异，仅供参考"
+                            >
+                              <AlertTriangle className="h-2.5 w-2.5" />
+                              地区有偏差
+                            </span>
+                          )}
+                        </div>
+                      </td>
+
+                      {/* AI Unlocks */}
+                      <td className="px-3 py-2.5">
+                        {hasUnlockData ? (
+                          <div className="flex flex-wrap gap-1">
+                            {(
+                              [
+                                { id: "gemini", label: "Gemini", ok: unlocks.gemini },
+                                { id: "chatgpt", label: "ChatGPT", ok: unlocks.chatgpt },
+                                { id: "claude", label: "Claude", ok: unlocks.claude },
+                                { id: "windsurf", label: "Windsurf", ok: unlocks.windsurf },
+                              ] as const
+                            ).map((badge) => (
+                              <span
+                                key={badge.id}
+                                className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
+                                  badge.ok
+                                    ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                    : "bg-[var(--bg-elevated)] text-[var(--muted)] opacity-55"
+                                }`}
+                              >
+                                {badge.label}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-[11px] text-[var(--muted)]">--</span>
+                        )}
+                      </td>
+
+                      {/* Row Actions: Quick Latency Test & Use Node */}
+                      <td className="px-3 py-2.5 text-right">
+                        <div className="inline-flex items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            disabled={isRunning}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void executeProbes([node.id], "latency", true);
+                            }}
+                            title="只快速测这一个节点的延迟，不消耗上下行测速流量"
+                            aria-label={`测延迟：${node.name}`}
+                            className="inline-flex items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line-strong)]/70 bg-[var(--bg-elevated)] px-2 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-65"
+                          >
+                            <Play className="h-3 w-3 shrink-0" />
+                            <span>测延迟</span>
+                          </button>
+
+                          <button
+                            type="button"
+                            disabled={isActiveNode || isSwitchingThis}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void handleSwitchToNode(node);
+                            }}
+                            title={isActiveNode ? "当前正在使用此节点" : "立即切换使用此节点"}
+                            aria-label={isActiveNode ? `正在用：${node.name}` : `用它：${node.name}`}
+                            className={`inline-flex items-center gap-1 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors ${
+                              isActiveNode
+                                ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
+                                : "border-[var(--line-strong)]/70 bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--green)] hover:text-[var(--green)] disabled:cursor-not-allowed disabled:opacity-65"
+                            }`}
+                          >
+                            {isActiveNode ? (
+                              <Check className="h-3 w-3 shrink-0" />
+                            ) : (
+                              <ArrowRightLeft className="h-3 w-3 shrink-0" />
+                            )}
+                            <span>{isActiveNode ? "正在用" : isSwitchingThis ? "切换中" : "用它"}</span>
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                }
+              )}
+
+              {pagedRows.length === 0 && (
                 <tr>
-                  <td colSpan={10} className="px-4 py-8 text-center text-xs text-[var(--muted)]">
-                    无符合筛选条件的节点测速记录。
+                  <td colSpan={9} className="px-4 py-10 text-center text-xs text-[var(--muted)]">
+                    {nodes.length === 0
+                      ? "还没有任何节点，请先前往「节点与订阅」导入节点"
+                      : "没有找到符合条件的节点，试试放宽筛选条件吧"}
                   </td>
                 </tr>
               )}
             </tbody>
           </table>
         </div>
+
+        {/* Clean Pagination Footer */}
+        {totalFiltered > 0 && (
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--muted)]">
+            <div className="flex flex-wrap items-center gap-2 cc-tabular">
+              <span>
+                显示第 {pageStartIdx + 1}–{Math.min(pageStartIdx + pageSize, totalFiltered)} 条，共{" "}
+                {totalFiltered} 条
+              </span>
+              <span className="opacity-40">|</span>
+              <label className="inline-flex items-center gap-1.5">
+                <span>每页</span>
+                <select
+                  aria-label="每页显示条数"
+                  value={pageSize}
+                  onChange={(e) => {
+                    setPageSize(Number(e.target.value) || 50);
+                    setPage(1);
+                  }}
+                  className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                >
+                  {PAGE_SIZE_OPTIONS.map((sz) => (
+                    <option key={sz} value={sz}>
+                      {sz} 条
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <div className="flex items-center gap-1.5 cc-tabular">
+              <button
+                type="button"
+                disabled={safePage <= 1}
+                onClick={() => setPage(Math.max(1, safePage - 1))}
+                className="inline-flex items-center gap-0.5 rounded-lg border border-[var(--line-strong)]/80 bg-[var(--bg-elevated)] px-2.5 py-1 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+                <span>上一页</span>
+              </button>
+              <span className="px-2 text-xs font-medium text-[var(--text)]">
+                {safePage} / {totalPages}
+              </span>
+              <button
+                type="button"
+                disabled={safePage >= totalPages}
+                onClick={() => setPage(Math.min(totalPages, safePage + 1))}
+                className="inline-flex items-center gap-0.5 rounded-lg border border-[var(--line-strong)]/80 bg-[var(--bg-elevated)] px-2.5 py-1 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+              >
+                <span>下一页</span>
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        )}
       </section>
     </div>
   );

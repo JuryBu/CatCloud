@@ -12,9 +12,9 @@ function resolveStatusAccent(status: string): { color: string; label: string } {
     case "error":
       return { color: "var(--red)", label: "核心异常" };
     case "warn":
-      return { color: "var(--amber)", label: "节点降级预警" };
+      return { color: "var(--amber)", label: "路线存在波动" };
     case "preaccel":
-      return { color: "var(--accent)", label: "国内预加速双活运行" };
+      return { color: "var(--accent)", label: "国内提速运行中" };
     case "ok":
       return { color: "var(--green)", label: "代理运行正常" };
     default:
@@ -56,11 +56,11 @@ export function CapsuleWindow() {
       try {
         await catcloudApi.enterWindowlessMode();
       } catch (err) {
-        appActions.showToast(`进入无窗模式失败：${formatErrorMessage(err)}`, "warn");
+        appActions.showToast(`收进托盘省内存失败：${formatErrorMessage(err)}`, "warn");
       }
       return;
     }
-    appActions.showToast("已关闭悬浮胶囊并切换至纯无窗省内存模式（预览已返回主窗）", "info");
+    appActions.showToast("已关闭悬浮小窗并收进托盘省内存（预览已返回主窗）", "info");
     await appActions.showMainFromCapsule();
   };
 
@@ -120,8 +120,8 @@ export function CapsuleWindow() {
           type="button"
           onClick={() => void appActions.switchNextBestNode()}
           className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
-          title="一键秒切下一优节点"
-          aria-label="一键秒切下一优节点"
+          title="换下一个更快节点"
+          aria-label="换下一个更快节点"
         >
           <Zap className="h-3.5 w-3.5" />
         </button>
@@ -140,8 +140,8 @@ export function CapsuleWindow() {
           type="button"
           onClick={() => void handleCloseToWindowless()}
           className="inline-flex h-7 w-7 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:border-[var(--red)] hover:bg-[var(--red-soft)] hover:text-[var(--red)]"
-          title="关闭胶囊进入纯无窗省内存模式"
-          aria-label="关闭胶囊进入纯无窗省内存模式"
+          title="关闭悬浮小窗，收进托盘省内存"
+          aria-label="关闭悬浮小窗，收进托盘省内存"
         >
           <Minimize2 className="h-3 w-3" />
         </button>
@@ -161,7 +161,7 @@ export function CapsuleWindow() {
     <div className="flex h-full w-full flex-col items-center justify-center gap-4 bg-[var(--bg)] p-6">
       <div className="text-center">
         <div className="text-xs font-semibold text-[var(--text)]">
-          悬浮胶囊微窗预览（300 × 64 透明圆角窗）
+          悬浮小窗预览（300 × 64 透明圆角窗）
         </div>
         <div className="mt-1 text-[11px] text-[var(--muted)]">
           当前状态：{statusMeta.label} · 图标策略：{trayIconMode}

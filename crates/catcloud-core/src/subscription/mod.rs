@@ -25,7 +25,8 @@ pub use parser::{
 pub use process_attach::{
     AttachRecommendation, DEFAULT_CONTROLLER_PROBE_TIMEOUT, ProcessCandidate,
     ProcessInspectionResult, inspect_process_source, inspect_process_source_with_timeout,
-    list_process_candidates, normalize_loopback_controller_base_url, parse_process_cmdline,
+    list_process_candidates, normalize_loopback_controller_base_url,
+    parse_controller_proxies_json, parse_process_cmdline,
 };
 
 #[cfg(test)]

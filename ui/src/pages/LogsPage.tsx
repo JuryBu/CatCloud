@@ -39,22 +39,22 @@ const LEVEL_META: Record<
   { label: string; color: string; softBg: string }
 > = {
   debug: {
-    label: "Debug",
+    label: "调试",
     color: "var(--muted)",
     softBg: "var(--bg-elevated)",
   },
   info: {
-    label: "Info",
+    label: "普通",
     color: "var(--sky)",
     softBg: "var(--sky-soft)",
   },
   warning: {
-    label: "Warning",
+    label: "提醒",
     color: "var(--amber)",
     softBg: "var(--amber-soft)",
   },
   error: {
-    label: "Error",
+    label: "错误",
     color: "var(--red)",
     softBg: "var(--red-soft)",
   },
@@ -141,33 +141,34 @@ function buildSeedLogs(): CoreLogEntry[] {
   const templates: Array<{ level: LogLevel; module: string; message: string }> = [
     {
       level: "info",
-      module: "core.boot",
-      message: "Mihomo Meta v1.19.12-alpha started (GOMEMLIMIT=48MiB, GOGC=35, mixed-port=17890)",
+      module: "代理核心",
+      message: "代理内核已启动，本地代理端口 17890 就绪（省内存模式）",
     },
     {
       level: "info",
-      module: "dns.server",
-      message: "DNS listener active on 127.0.0.1:11053 (mode=fake-ip, range=198.18.0.1/16, ipv6=false)",
+      module: "域名解析",
+      message: "本地域名解析服务已就绪（127.0.0.1:11053，智能分流已开启）",
     },
     {
       level: "info",
-      module: "preaccel.probe",
-      message: "Domestic probe http://connectivitycheck.platform.hicloud.com/generate_204 -> 204 OK (18ms)",
+      module: "国内提速",
+      message: "国内连通检测正常，中转通道延迟 18 ms",
     },
     {
       level: "debug",
-      module: "router.match",
-      message: "[TCP] 127.0.0.1:53120 --> generativelanguage.googleapis.com:443 match DomainSuffix(googleapis.com) using AI 专线粘性组[JP-Tokyo-01 · 1x]",
+      module: "分流路由",
+      message:
+        "访问 generativelanguage.googleapis.com:443，按域名匹配走「AI 专线粘性组 → JP-Tokyo-01 · 1x」",
     },
     {
       level: "warning",
-      module: "strategy.arbiter",
-      message: "Group '流媒体与下载受控均衡' observed jitter spike on SG-Edge-02 (19.4ms), cooldown 60s active",
+      module: "智能选路",
+      message: "「影音下载均衡组」检测到 SG-Edge-02 延迟波动（19.4 ms），进入 60 秒观察冷却",
     },
     {
       level: "info",
-      module: "hotreload.l2",
-      message: "Config preflight (syntax + anti-loop + mihomo -t) passed in 42ms; zero active connections dropped",
+      module: "配置更新",
+      message: "配置检查通过（42 ms），已平滑应用最新设置且未中断现有连接",
     },
   ];
 
@@ -183,18 +184,18 @@ function buildSeedLogs(): CoreLogEntry[] {
 const STREAM_SAMPLES: Array<{ level: LogLevel; module: string; message: string }> = [
   {
     level: "debug",
-    module: "router.match",
-    message: "[TCP] 127.0.0.1:54012 --> chatgpt.com:443 match DomainSuffix(chatgpt.com) using AI 专线粘性组[JP-Tokyo-01 · 1x]",
+    module: "分流路由",
+    message: "访问 chatgpt.com:443，按域名匹配走「AI 专线粘性组 → JP-Tokyo-01 · 1x」",
   },
   {
     level: "info",
-    module: "preaccel.probe",
-    message: "Domestic 204 heartbeat OK on CN-East-443 Primary (198.51.100.10:443, 19ms)",
+    module: "国内提速",
+    message: "主力中转线路心跳正常（华东 443 主力线路，延迟 19 ms）",
   },
   {
     level: "info",
-    module: "memory.gc",
-    message: "Mihomo RSS 35.4 MiB / budget 48 MiB (within low-memory envelope)",
+    module: "资源占用",
+    message: "当前内核内存占用 35.4 MB，处于省内存运行区间",
   },
 ];
 
@@ -375,7 +376,8 @@ export function LogsPage() {
         item.message.toLowerCase().includes(kw) ||
         item.module.toLowerCase().includes(kw) ||
         item.time.includes(kw) ||
-        item.level.includes(kw)
+        item.level.includes(kw) ||
+        LEVEL_META[item.level].label.includes(kw)
       );
     });
   }, [enabledLevels, entries, keyword]);
@@ -414,7 +416,7 @@ export function LogsPage() {
     setBufferedWhilePaused(0);
     setLogState({ entries: [], truncatedCount: 0 });
     setRenderLimit(DEFAULT_RENDER_LIMIT);
-    appActions.showToast("已清空实时日志环形缓冲", "info");
+    appActions.showToast("已清空运行日志", "info");
   };
 
   const toggleLevel = (lvl: LogLevel) => {
@@ -423,14 +425,14 @@ export function LogsPage() {
 
   const formatSanitizedLogText = (): string => {
     const header = [
-      `# CatCloud Sanitized Core Log Export`,
-      `# Exported Lines: ${filteredEntries.length} (Ring Capacity: ${MAX_LOG_LINES}, Truncated: ${truncatedCount})`,
-      `# Sanitization: Sensitive tokens, user paths, and non-RFC5737 public IPs masked automatically`,
+      `# 猫猫云梯运行日志导出`,
+      `# 导出条数：${filteredEntries.length}（最多保留 ${MAX_LOG_LINES} 条，已清理早期记录 ${truncatedCount} 条）`,
+      `# 隐私保护：已自动隐藏密钥、本机用户名及公网 IP`,
       "",
     ];
     const body = filteredEntries.map((item) =>
       sanitizeLogLine(
-        `[${item.time}] [${item.level.toUpperCase().padEnd(7, " ")}] [${item.module}] ${item.message}`
+        `[${item.time}] [${LEVEL_META[item.level].label}] [${item.module}] ${item.message}`
       )
     );
     return header.concat(body).join("\n");
@@ -441,7 +443,7 @@ export function LogsPage() {
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
-      appActions.showToast(`已复制 ${filteredEntries.length} 行脱敏日志到剪贴板`, "ok");
+      appActions.showToast(`已复制 ${filteredEntries.length} 条日志（隐私已自动打码）`, "ok");
       if (copiedTimerRef.current !== null) {
         window.clearTimeout(copiedTimerRef.current);
       }
@@ -450,7 +452,7 @@ export function LogsPage() {
         setCopied(false);
       }, 1800);
     } catch {
-      appActions.showToast("剪贴板写入受限，请改用导出 .log 文件", "warn");
+      appActions.showToast("无法写入剪贴板，请改用「导出」保存为日志文件", "warn");
     }
   };
 
@@ -461,12 +463,12 @@ export function LogsPage() {
     const a = document.createElement("a");
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     a.href = url;
-    a.download = `catcloud-core-sanitized-${stamp}.log`;
+    a.download = `catcloud-logs-${stamp}.log`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    appActions.showToast(`已导出脱敏日志文件（${filteredEntries.length} 行）`, "ok");
+    appActions.showToast(`已导出日志文件（${filteredEntries.length} 条，隐私已自动打码）`, "ok");
   };
 
   const handleScroll = () => {
@@ -489,7 +491,7 @@ export function LogsPage() {
 
   return (
     <div className="space-y-4">
-      {/* Header & Ring Buffer Capacity Banner */}
+      {/* 顶部标题与操作栏 */}
       <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
         <div className="flex items-center gap-3">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--accent)]">
@@ -497,23 +499,23 @@ export function LogsPage() {
           </div>
           <div>
             <div className="flex flex-wrap items-center gap-2">
-              <h1 className="text-sm font-semibold text-[var(--text)]">独立实时内核日志</h1>
+              <h1 className="text-sm font-semibold text-[var(--text)]">运行日志</h1>
               <span className="cc-mono rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
-                {entries.length} / {MAX_LOG_LINES} 行
+                {entries.length} / {MAX_LOG_LINES} 条
               </span>
               {paused ? (
                 <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber)]">
-                  已暂停{bufferedWhilePaused > 0 ? `（待追齐 +${bufferedWhilePaused}）` : ""}
+                  已暂停{bufferedWhilePaused > 0 ? `（新增 +${bufferedWhilePaused} 条）` : ""}
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--green)]">
                   <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
-                  实时流订阅中
+                  实时更新中
                 </span>
               )}
             </div>
             <p className="mt-0.5 text-xs text-[var(--muted)]">
-              固定 2000 行环形缓冲，默认渲染最新 300 条以保持低内存与丝滑滚动；复制与导出自动执行脱敏掩码。
+              最多保留最近 {MAX_LOG_LINES} 条记录，默认先展示最新 {DEFAULT_RENDER_LIMIT} 条保持流畅；复制和导出时会自动隐藏隐私信息。
             </p>
           </div>
         </div>
@@ -529,7 +531,7 @@ export function LogsPage() {
             }`}
           >
             {paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
-            {paused ? "恢复流与滚动" : "暂停滚动"}
+            {paused ? "继续滚动" : "暂停滚动"}
           </button>
 
           <button
@@ -542,7 +544,7 @@ export function LogsPage() {
             ) : (
               <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
             )}
-            复制脱敏日志
+            {copied ? "已复制" : "复制（已自动打码隐私）"}
           </button>
 
           <button
@@ -551,7 +553,7 @@ export function LogsPage() {
             className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
           >
             <Download className="h-3.5 w-3.5 text-[var(--sky)]" />
-            导出 .log
+            导出
           </button>
 
           <button
@@ -565,17 +567,16 @@ export function LogsPage() {
         </div>
       </section>
 
-      {/* Ring Buffer Truncation Notice */}
+      {/* 超出上限自动清理提示 */}
       {truncatedCount > 0 && (
         <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)] px-3.5 py-2 text-xs text-[var(--amber)]">
           <span>
-            已触发 {MAX_LOG_LINES} 行环形缓冲上限截断，已自动回收 {truncatedCount} 条早期日志以保障常驻低内存。
+            日志已超过 {MAX_LOG_LINES} 条上限，已自动清理较早的 {truncatedCount} 条记录以保持省内存。
           </span>
-          <span className="cc-mono text-[11px]">Ring FIFO</span>
         </div>
       )}
 
-      {/* Filter Toolbar */}
+      {/* 筛选工具栏 */}
       <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-3.5">
         <div className="flex flex-wrap items-center gap-1.5">
           {ALL_LEVELS.map((lvl) => {
@@ -607,7 +608,7 @@ export function LogsPage() {
             type="text"
             value={keyword}
             onChange={(e) => setKeyword(e.target.value)}
-            placeholder="检索域名、策略组、模块名或错误关键词..."
+            placeholder="搜索网址、分组、模块或关键词..."
             className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-8 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
           />
           {keyword && (
@@ -623,17 +624,17 @@ export function LogsPage() {
         </div>
       </section>
 
-      {/* Streaming Log Console */}
+      {/* 日志内容区 */}
       <section className="cc-card cc-glass relative overflow-hidden rounded-2xl">
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 px-4 py-2 text-[11px] text-[var(--muted)]">
           <div className="flex flex-wrap items-center gap-2">
             <span>
-              当前渲染 {visibleEntries.length} / {filteredEntries.length} 条记录
+              当前显示 {visibleEntries.length} / {filteredEntries.length} 条记录
             </span>
             <span>·</span>
             <span className="inline-flex items-center gap-1 text-[var(--green)]">
               <ShieldCheck className="h-3 w-3" />
-              导出自动脱敏（密钥 / 用户名 / 非白名单公网 IP 掩码）
+              复制与导出会自动隐藏密钥、用户名和公网 IP
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -646,8 +647,8 @@ export function LogsPage() {
                 收起至最新 {DEFAULT_RENDER_LIMIT} 条
               </button>
             )}
-            <span className="cc-mono text-[10px]">
-              {autoScroll && !paused ? "自动贴底" : "手动浏览模式"}
+            <span className="text-[10px]">
+              {autoScroll && !paused ? "自动跟随最新" : "手动浏览中"}
             </span>
           </div>
         </div>
@@ -660,13 +661,13 @@ export function LogsPage() {
           {filteredEntries.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-[var(--muted)]">
               <ScrollText className="h-6 w-6 opacity-50" />
-              <span>暂无符合当前级别与关键词条件的内核日志</span>
+              <span>暂无符合条件的运行日志</span>
             </div>
           ) : (
             <div className="space-y-0.5">
               {hiddenOlderCount > 0 && (
                 <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
-                  <span>已折叠较早的 {hiddenOlderCount} 条日志（仅渲染最新 {visibleEntries.length} 条）</span>
+                  <span>已折叠较早的 {hiddenOlderCount} 条日志（当前仅展示最新 {visibleEntries.length} 条）</span>
                   <div className="flex items-center gap-2">
                     <button
                       type="button"
@@ -694,13 +695,13 @@ export function LogsPage() {
                   >
                     <span className="shrink-0 text-[var(--muted)]">{item.time}</span>
                     <span
-                      className="inline-block w-[58px] shrink-0 rounded px-1.5 py-0.5 text-center text-[10px] font-semibold uppercase leading-none"
+                      className="inline-block w-[46px] shrink-0 rounded px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none"
                       style={{
                         color: meta.color,
                         backgroundColor: meta.softBg,
                       }}
                     >
-                      {item.level}
+                      {meta.label}
                     </span>
                     <span className="w-[118px] shrink-0 truncate text-[var(--accent)]">
                       {item.module}

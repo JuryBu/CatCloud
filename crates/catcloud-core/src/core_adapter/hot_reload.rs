@@ -157,7 +157,8 @@ pub fn classify_config_diff(old: &AppConfig, new: &AppConfig) -> ReloadLevel {
         return ReloadLevel::L3CoreRestart;
     }
 
-    let requires_l2 = old.controller_secret != new.controller_secret
+    let requires_l2 = old.active_group_id != new.active_group_id
+        || old.controller_secret != new.controller_secret
         || old.unified_delay != new.unified_delay
         || old.tcp_concurrent != new.tcp_concurrent
         || old.find_process_mode != new.find_process_mode
@@ -1143,6 +1144,14 @@ mod tests {
             classify_config_diff(&base, &l2_preaccel),
             ReloadLevel::L2HotReload
         );
+
+        let mut l2_active_group = base.clone();
+        l2_active_group.active_group_id = Some("grp-ai".to_string());
+        assert_eq!(
+            classify_config_diff(&base, &l2_active_group),
+            ReloadLevel::L2HotReload
+        );
+        assert!(has_core_config_changes(&base, &l2_active_group));
 
         // L3: ports / TUN stack / binary path / memory tier
         let mut l3_port = base.clone();

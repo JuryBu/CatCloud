@@ -155,8 +155,8 @@ export function TrafficSparkline({
   const vbWidth = isFull ? 600 : 196;
   const vbHeight = isFull ? 168 : 42;
   const padX = isFull ? 6 : 2;
-  const padTop = isFull ? 14 : 4;
-  const padBottom = isFull ? 10 : 3;
+  const padTop = isFull ? 18 : 4;
+  const padBottom = isFull ? 12 : 3;
   const windowPoints = isFull ? 300 : 60;
 
   // Snapshot slice from the Float64Array ring buffer only when effectiveVersion advances
@@ -236,20 +236,20 @@ export function TrafficSparkline({
         className={`cc-card cc-glass rounded-xl px-3 py-2.5 ${className}`}
         title={
           redrawPaused
-            ? "曲线动效已暂停（低功耗模式）"
-            : `近 2 分钟实时波形 · 内核内存 ${latest.memory_mb.toFixed(1)} MB`
+            ? "流量动画已暂停（省电模式）"
+            : `近 2 分钟实时流量 · 内核内存 ${latest.memory_mb.toFixed(1)} MB`
         }
       >
         <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--muted)]">
-          <span className="font-medium tracking-wide">实时流量</span>
+          <span className="font-medium">实时流量</span>
           {!sparklineEnabled ? (
             <span className="inline-flex items-center gap-1 text-[10px] text-[var(--amber)]">
               <Pause className="h-2.5 w-2.5" />
-              静止
+              已暂停
             </span>
           ) : (
-            <span className="cc-mono text-[10px] text-[var(--muted)]">
-              {latest.connections} 连接
+            <span className="cc-tabular text-[10px] text-[var(--muted)]">
+              {latest.connections} 个连接
             </span>
           )}
         </div>
@@ -342,15 +342,15 @@ export function TrafficSparkline({
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2.5">
           <h2 className="text-sm font-semibold tracking-tight text-[var(--text)]">
-            10 分钟实时流量曲线
+            近 10 分钟流量走势
           </h2>
-          <span className="rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--muted)] cc-mono">
-            {computed.count}/300 pts
+          <span className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10.5px] cc-mono text-[var(--text-secondary)]">
+            量程峰值 {formatRate(computed.scaleMax)}
           </span>
           {!sparklineEnabled && (
             <span className="inline-flex items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber)]">
               <Pause className="h-3 w-3" />
-              曲线重绘已暂停
+              曲线已暂停
             </span>
           )}
         </div>
@@ -370,164 +370,178 @@ export function TrafficSparkline({
               {formatRate(latest.down_bps)}
             </span>
           </div>
-          <div className="hidden items-center gap-1 text-[11px] text-[var(--muted)] sm:flex">
-            <span>量程</span>
-            <span className="cc-mono">{formatRate(computed.scaleMax)}</span>
-          </div>
         </div>
       </div>
 
-      <div className="relative h-[168px] w-full">
-        {/* Subtle horizontal reference labels */}
-        <div className="pointer-events-none absolute inset-y-2 left-1 z-10 flex flex-col justify-between text-[10px] cc-mono text-[var(--muted)]/80">
-          <span>{formatRate(computed.scaleMax)}</span>
-          <span>{formatRate(computed.scaleMax * 0.5)}</span>
-          <span>0</span>
+      <div className="flex h-[168px] w-full items-stretch gap-2">
+        {/* Dedicated left Y-axis scale column positioned slightly above each gridline to avoid overlapping curves */}
+        <div
+          className="relative w-[68px] shrink-0 select-none text-right text-[10.5px] font-medium leading-none cc-mono text-[var(--text-secondary)]"
+          aria-hidden="true"
+        >
+          <span className="absolute right-0 top-[3px] whitespace-nowrap">
+            {formatRate(computed.scaleMax)}
+          </span>
+          <span className="absolute right-0 top-[72px] whitespace-nowrap">
+            {formatRate(computed.scaleMax * 0.5)}
+          </span>
+          <span className="absolute right-0 top-[141px] whitespace-nowrap">0</span>
         </div>
 
-        <svg
-          ref={svgRef}
-          viewBox={`0 0 ${vbWidth} ${vbHeight}`}
-          preserveAspectRatio="none"
-          onMouseMove={handleMouseMove}
-          onMouseLeave={handleMouseLeave}
-          className="block h-full w-full cursor-crosshair select-none"
-          role="img"
-          aria-label="10 分钟实时上传与下载流量曲线"
-        >
-          <defs>
-            <linearGradient id={gradDownId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="var(--sky)" stopOpacity="0.28" />
-              <stop offset="100%" stopColor="var(--sky)" stopOpacity="0.01" />
-            </linearGradient>
-            <linearGradient id={gradUpId} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="var(--coral)" stopOpacity="0.26" />
-              <stop offset="100%" stopColor="var(--coral)" stopOpacity="0.01" />
-            </linearGradient>
-          </defs>
+        <div className="relative min-w-0 flex-1">
+          <svg
+            ref={svgRef}
+            viewBox={`0 0 ${vbWidth} ${vbHeight}`}
+            preserveAspectRatio="none"
+            onMouseMove={handleMouseMove}
+            onMouseLeave={handleMouseLeave}
+            className="block h-full w-full cursor-crosshair select-none"
+            role="img"
+            aria-label="近 10 分钟上传与下载流量走势"
+          >
+            <defs>
+              <linearGradient id={gradDownId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="var(--sky)" stopOpacity="0.28" />
+                <stop offset="100%" stopColor="var(--sky)" stopOpacity="0.01" />
+              </linearGradient>
+              <linearGradient id={gradUpId} x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="var(--coral)" stopOpacity="0.26" />
+                <stop offset="100%" stopColor="var(--coral)" stopOpacity="0.01" />
+              </linearGradient>
+            </defs>
 
-          {/* 3 lightweight horizontal gridlines */}
-          <line
-            x1={padX}
-            y1={padTop}
-            x2={vbWidth - padX}
-            y2={padTop}
-            stroke="var(--line)"
-            strokeOpacity="0.45"
-            strokeDasharray="3 4"
-            vectorEffect="non-scaling-stroke"
-          />
-          <line
-            x1={padX}
-            y1={(padTop + (vbHeight - padBottom)) * 0.5}
-            x2={vbWidth - padX}
-            y2={(padTop + (vbHeight - padBottom)) * 0.5}
-            stroke="var(--line)"
-            strokeOpacity="0.45"
-            strokeDasharray="3 4"
-            vectorEffect="non-scaling-stroke"
-          />
-          <line
-            x1={padX}
-            y1={vbHeight - padBottom}
-            x2={vbWidth - padX}
-            y2={vbHeight - padBottom}
-            stroke="var(--line)"
-            strokeOpacity="0.7"
-            vectorEffect="non-scaling-stroke"
-          />
-
-          {/* Area fills (1 path each) */}
-          {computed.downGeom.areaPath && (
-            <path d={computed.downGeom.areaPath} fill={`url(#${gradDownId})`} />
-          )}
-          {computed.upGeom.areaPath && (
-            <path d={computed.upGeom.areaPath} fill={`url(#${gradUpId})`} />
-          )}
-
-          {/* Smooth single-path strokes */}
-          {computed.downGeom.linePath && (
-            <path
-              d={computed.downGeom.linePath}
-              fill="none"
-              stroke="var(--sky)"
-              strokeWidth="1.9"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
-          {computed.upGeom.linePath && (
-            <path
-              d={computed.upGeom.linePath}
-              fill="none"
-              stroke="var(--coral)"
-              strokeWidth="1.8"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              vectorEffect="non-scaling-stroke"
-            />
-          )}
-
-          {/* Hover vertical guide line */}
-          {validHover !== null && (
+            {/* 3 lightweight horizontal gridlines */}
             <line
-              x1={hoverX}
+              x1={padX}
               y1={padTop}
-              x2={hoverX}
-              y2={vbHeight - padBottom}
-              stroke="var(--accent)"
-              strokeOpacity="0.65"
-              strokeWidth="1"
-              strokeDasharray="3 3"
+              x2={vbWidth - padX}
+              y2={padTop}
+              stroke="var(--line)"
+              strokeOpacity="0.45"
+              strokeDasharray="3 4"
               vectorEffect="non-scaling-stroke"
             />
-          )}
-        </svg>
+            <line
+              x1={padX}
+              y1={(padTop + (vbHeight - padBottom)) * 0.5}
+              x2={vbWidth - padX}
+              y2={(padTop + (vbHeight - padBottom)) * 0.5}
+              stroke="var(--line)"
+              strokeOpacity="0.45"
+              strokeDasharray="3 4"
+              vectorEffect="non-scaling-stroke"
+            />
+            <line
+              x1={padX}
+              y1={vbHeight - padBottom}
+              x2={vbWidth - padX}
+              y2={vbHeight - padBottom}
+              stroke="var(--line)"
+              strokeOpacity="0.7"
+              vectorEffect="non-scaling-stroke"
+            />
 
-        {/* Crisp non-distorted hover dots & floating tooltip */}
-        {validHover !== null && (
-          <>
-            <span
-              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[var(--card)] bg-[var(--sky)]"
-              style={{
-                left: `${hoverLeftPct}%`,
-                top: `${(hoverDownY / vbHeight) * 100}%`,
-              }}
-            />
-            <span
-              className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[var(--card)] bg-[var(--coral)]"
-              style={{
-                left: `${hoverLeftPct}%`,
-                top: `${(hoverUpY / vbHeight) * 100}%`,
-              }}
-            />
-            <div
-              className="pointer-events-none absolute top-2 z-20 min-w-[144px] rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3 py-2 text-xs"
-              style={{
-                boxShadow: "var(--shadow-popover)",
-                left: alignRight ? undefined : `calc(${Math.min(hoverLeftPct, 82)}% + 10px)`,
-                right: alignRight ? `calc(${100 - hoverLeftPct}% + 10px)` : undefined,
-              }}
-            >
-              <div className="mb-1 border-b border-[var(--line)] pb-1 cc-mono text-[11px] font-semibold text-[var(--accent)]">
-                {formatClock(computed.tsSlice[validHover])}
+            {/* Area fills (1 path each) */}
+            {computed.downGeom.areaPath && (
+              <path d={computed.downGeom.areaPath} fill={`url(#${gradDownId})`} />
+            )}
+            {computed.upGeom.areaPath && (
+              <path d={computed.upGeom.areaPath} fill={`url(#${gradUpId})`} />
+            )}
+
+            {/* Smooth single-path strokes */}
+            {computed.downGeom.linePath && (
+              <path
+                d={computed.downGeom.linePath}
+                fill="none"
+                stroke="var(--sky)"
+                strokeWidth="1.9"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+            {computed.upGeom.linePath && (
+              <path
+                d={computed.upGeom.linePath}
+                fill="none"
+                stroke="var(--coral)"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+
+            {/* Hover vertical guide line */}
+            {validHover !== null && (
+              <line
+                x1={hoverX}
+                y1={padTop}
+                x2={hoverX}
+                y2={vbHeight - padBottom}
+                stroke="var(--accent)"
+                strokeOpacity="0.65"
+                strokeWidth="1"
+                strokeDasharray="3 3"
+                vectorEffect="non-scaling-stroke"
+              />
+            )}
+          </svg>
+
+          {/* Crisp non-distorted hover dots & floating tooltip */}
+          {validHover !== null && (
+            <>
+              <span
+                className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[var(--card)] bg-[var(--sky)]"
+                style={{
+                  left: `${hoverLeftPct}%`,
+                  top: `${(hoverDownY / vbHeight) * 100}%`,
+                }}
+              />
+              <span
+                className="pointer-events-none absolute h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-[var(--card)] bg-[var(--coral)]"
+                style={{
+                  left: `${hoverLeftPct}%`,
+                  top: `${(hoverUpY / vbHeight) * 100}%`,
+                }}
+              />
+              <div
+                className="pointer-events-none absolute top-2 z-20 min-w-[152px] rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3 py-2 text-xs"
+                style={{
+                  boxShadow: "var(--shadow-popover)",
+                  left: alignRight ? undefined : `calc(${Math.min(hoverLeftPct, 82)}% + 10px)`,
+                  right: alignRight ? `calc(${100 - hoverLeftPct}% + 10px)` : undefined,
+                }}
+              >
+                <div className="mb-1.5 flex items-center justify-between border-b border-[var(--line)] pb-1 text-[11px]">
+                  <span className="text-[var(--muted)]">时间</span>
+                  <span className="cc-mono font-semibold text-[var(--accent)]">
+                    {formatClock(computed.tsSlice[validHover])}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="inline-flex items-center gap-1 text-[var(--coral)]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--coral)]" />
+                    上传
+                  </span>
+                  <span className="cc-mono font-medium text-[var(--text)]">
+                    {formatRate(computed.upSlice[validHover])}
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between gap-3">
+                  <span className="inline-flex items-center gap-1 text-[var(--sky)]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--sky)]" />
+                    下载
+                  </span>
+                  <span className="cc-mono font-medium text-[var(--text)]">
+                    {formatRate(computed.downSlice[validHover])}
+                  </span>
+                </div>
               </div>
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-[var(--coral)]">↑ 上传</span>
-                <span className="cc-mono font-medium text-[var(--text)]">
-                  {formatRate(computed.upSlice[validHover])}
-                </span>
-              </div>
-              <div className="mt-0.5 flex items-center justify-between gap-3">
-                <span className="text-[var(--sky)]">↓ 下载</span>
-                <span className="cc-mono font-medium text-[var(--text)]">
-                  {formatRate(computed.downSlice[validHover])}
-                </span>
-              </div>
-            </div>
-          </>
-        )}
+            </>
+          )}
+        </div>
       </div>
     </div>
   );

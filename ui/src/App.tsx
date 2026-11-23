@@ -91,7 +91,7 @@ export function App() {
       {toast && (
         <div
           role="status"
-          className="fixed bottom-4 right-5 z-50 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2 text-xs text-[var(--text)] shadow-lg"
+          className="fixed left-1/2 top-4 z-50 -translate-x-1/2 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2 text-xs text-[var(--text)] shadow-lg"
         >
           <span
             className="mr-2 inline-block h-2 w-2 rounded-full"

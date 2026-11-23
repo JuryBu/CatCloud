@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use catcloud_core::config;
-use catcloud_core::models::{AppConfig, ProxyMode, TrayClickAction as CoreTrayClickAction};
+use catcloud_core::models::ProxyMode;
 use catcloud_core::process_guard::{
     AcquireOutcome, JobGuard, SingleInstanceGuard, spawn_detached_self,
 };
@@ -17,8 +17,7 @@ use tauri::{Emitter, Manager};
 
 use crate::commands::{AppState, TrafficEventPayload};
 use crate::lifecycle::WindowLifecycleState;
-use crate::shortcuts::{ShortcutAction, ShortcutBindings};
-use crate::tray::{TrayAction, TrayClickAction, TrayOpenDirKind, TrayProxyMode};
+use crate::tray::{TrayAction, TrayOpenDirKind, TrayProxyMode};
 
 /// Default entry point used when launched without pre-resolved `AppPaths`.
 pub fn run() {
@@ -35,31 +34,6 @@ pub fn run() {
 
 fn has_cli_flag(flag: &str) -> bool {
     std::env::args().skip(1).any(|a| a == flag)
-}
-
-fn map_tray_click(action: &CoreTrayClickAction) -> TrayClickAction {
-    match action {
-        CoreTrayClickAction::ToggleCapsule => TrayClickAction::ToggleCapsule,
-        CoreTrayClickAction::None => TrayClickAction::ShowMenu,
-        _ => TrayClickAction::ToggleMain,
-    }
-}
-
-fn shortcut_bindings_from_config(cfg: &AppConfig) -> ShortcutBindings {
-    if !cfg.behavior.hotkeys.enabled {
-        return ShortcutBindings {
-            switch_next_best: None,
-            toggle_capsule: None,
-            toggle_main_window: None,
-            toggle_system_proxy: None,
-        };
-    }
-    ShortcutBindings {
-        switch_next_best: cfg.behavior.hotkeys.switch_next_best.clone(),
-        toggle_capsule: cfg.behavior.hotkeys.toggle_capsule.clone(),
-        toggle_main_window: cfg.behavior.hotkeys.show_main_window.clone(),
-        toggle_system_proxy: cfg.behavior.hotkeys.toggle_system_proxy.clone(),
-    }
 }
 
 fn try_apply_staged_portable_update(paths: &AppPaths) -> bool {
@@ -144,8 +118,7 @@ pub fn run_with_paths(paths: AppPaths) {
 
     let destroy_on_close = cfg.behavior.minimize_to_tray_on_close;
     let silent_start = silent_flag || cfg.behavior.silent_start;
-    let tray_click = map_tray_click(&cfg.behavior.tray_click_action);
-    let hotkey_bindings = shortcut_bindings_from_config(&cfg);
+    let tray_click = commands::map_tray_click(&cfg.behavior.tray_click_action);
 
     let app_state = AppState::new(paths.clone(), cfg, storage, Arc::clone(&job_guard));
 
@@ -196,6 +169,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::set_tun_enabled,
             commands::switch_next_best_node,
             commands::select_group_node,
+            commands::set_active_group,
             commands::toggle_capsule_window,
             commands::show_main_window,
             commands::enter_windowless_mode,
@@ -210,6 +184,9 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::delete_probe_definition,
             commands::list_probe_snapshots,
             commands::run_isolated_probes,
+            commands::cancel_isolated_probes,
+            commands::pick_wallpaper_image,
+            commands::resolve_wallpaper_data_url,
             commands::list_subscriptions,
             commands::upsert_subscription,
             commands::delete_subscription,
@@ -437,53 +414,27 @@ pub fn run_with_paths(paths: AppPaths) {
                 }
             })?;
 
-            let _ = shortcuts::register_shortcuts(&handle, &hotkey_bindings, |app_h, action| {
-                let app_async = app_h.clone();
-                match action {
-                    ShortcutAction::ToggleCapsule => lifecycle::toggle_capsule_window(app_h),
-                    ShortcutAction::ToggleMainWindow => {
-                        if lifecycle::window_mode_snapshot(app_h).main_open {
-                            lifecycle::enter_windowless_mode(app_h);
-                        } else {
-                            lifecycle::show_or_rebuild_main_window(app_h);
-                        }
-                    }
-                    ShortcutAction::ToggleSystemProxy => {
-                        tauri::async_runtime::spawn(async move {
-                            if let Some(st) = app_async.try_state::<AppState>() {
-                                let next = !st.snapshot_config().system_proxy.enabled;
-                                let _ = commands::apply_system_proxy_internal(
-                                    &app_async, &st, next,
-                                )
-                                .await;
-                            }
-                        });
-                    }
-                    ShortcutAction::SwitchNextBestNode => {
-                        tauri::async_runtime::spawn(async move {
-                            if let Some(st) = app_async.try_state::<AppState>() {
-                                let _ = commands::switch_next_best_internal(
-                                    &app_async,
-                                    &st,
-                                    "default".to_string(),
-                                )
-                                .await;
-                            }
-                        });
-                    }
-                }
-            });
+            let initial_cfg = state.snapshot_config();
+            commands::apply_configured_shortcuts(&handle, &state, &initial_cfg, true);
 
             if silent_start {
                 lifecycle::enter_pure_windowless_mode(&handle);
             }
 
-            // Asynchronously start the managed proxy core when nodes & core binary are present.
-            // Does not alter OS system proxy or TUN unless explicitly enabled in config.
+            // Asynchronously start the managed proxy core ONLY when system proxy or TUN is
+            // explicitly enabled in config AND at least one node exists, guaranteeing 0 background
+            // traffic on idle startup.
             {
                 let auto_handle = handle.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Some(st) = auto_handle.try_state::<AppState>() {
+                        let cfg = st.snapshot_config();
+                        if !(cfg.system_proxy.enabled || cfg.tun.enabled) {
+                            tracing::info!(
+                                "auto-start core skipped: system_proxy and tun are both disabled"
+                            );
+                            return;
+                        }
                         let has_nodes = st
                             .storage
                             .lock()
@@ -524,13 +475,13 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
         let app_h = app.clone();
         let mut rx_traffic = state.telemetry.subscribe_traffic();
         let mut rx_memory = state.telemetry.subscribe_memory();
+        let mut observed_gen: u64 = state.core_session_generation();
         tauri::async_runtime::spawn(async move {
             let mut up_total: u64 = 0;
             let mut down_total: u64 = 0;
             let mut core_mem_bytes: u64 = 0;
             let mut active_connections: usize = 0;
-            let mut last_up_bps: u64 = 0;
-            let mut last_down_bps: u64 = 0;
+            let mut last_traffic_at: Option<Instant> = None;
             let mut last_tray_sync = Instant::now();
             let mut conn_poll = tokio::time::interval(Duration::from_secs(2));
             conn_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -539,13 +490,47 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                 tokio::select! {
                     _ = conn_poll.tick() => {
                         let win = lifecycle::window_mode_snapshot(&app_h);
-                        if !win.main_open && !win.capsule_open {
-                            continue;
-                        }
                         if let Some(st) = app_h.try_state::<AppState>() {
+                            let cur_gen = st.core_session_generation();
+                            if cur_gen != observed_gen {
+                                observed_gen = cur_gen;
+                                up_total = 0;
+                                down_total = 0;
+                                core_mem_bytes = 0;
+                                active_connections = 0;
+                                last_traffic_at = None;
+                            }
+                            let traffic_quiet = last_traffic_at
+                                .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
+                            if !win.main_open && !win.capsule_open {
+                                if traffic_quiet {
+                                    let mut cleared_rate = false;
+                                    if let Ok(mut m) = st.cached_metrics.write() {
+                                        if m.up_bps != 0 || m.down_bps != 0 {
+                                            m.up_bps = 0;
+                                            m.down_bps = 0;
+                                            cleared_rate = true;
+                                        }
+                                    }
+                                    if cleared_rate {
+                                        let _ = tray::sync_tray_visual(
+                                            &app_h,
+                                            &commands::build_tray_visual_state(&st),
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             if st.adapter.has_live_controller().await {
-                                use catcloud_core::core_adapter::CoreAdapter;
                                 if let Ok(snap) = st.adapter.list_connections().await {
+                                    let cur_gen_after = st.core_session_generation();
+                                    if cur_gen_after != observed_gen {
+                                        observed_gen = cur_gen_after;
+                                        up_total = 0;
+                                        down_total = 0;
+                                        core_mem_bytes = 0;
+                                        last_traffic_at = None;
+                                    }
                                     active_connections = snap.connections.len();
                                     if snap.memory > 0 {
                                         core_mem_bytes = snap.memory;
@@ -556,32 +541,60 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                     if snap.download_total > down_total {
                                         down_total = snap.download_total;
                                     }
+                                    let quiet_now = last_traffic_at
+                                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
                                     if let Ok(mut m) = st.cached_metrics.write() {
                                         m.core_mem_bytes = core_mem_bytes;
+                                        if quiet_now {
+                                            m.up_bps = 0;
+                                            m.down_bps = 0;
+                                        }
                                     }
-                                    let payload = TrafficEventPayload {
-                                        up_bps: last_up_bps,
-                                        down_bps: last_down_bps,
-                                        up_total_bytes: up_total,
-                                        down_total_bytes: down_total,
-                                        active_connections,
-                                        core_memory_mb: (core_mem_bytes as f64) / (1024.0 * 1024.0),
-                                        timestamp_ms: chrono::Utc::now().timestamp_millis(),
-                                    };
-                                    let _ = app_h.emit(commands::EVENT_TRAFFIC, payload);
+                                    // Only emit a zero-rate heartbeat if `/traffic` WS has been quiet,
+                                    // avoiding duplicate points or replaying stale spike rates.
+                                    if quiet_now {
+                                        let payload = TrafficEventPayload {
+                                            up_bps: 0,
+                                            down_bps: 0,
+                                            up_total_bytes: up_total,
+                                            down_total_bytes: down_total,
+                                            active_connections,
+                                            core_memory_mb: (core_mem_bytes as f64) / (1024.0 * 1024.0),
+                                            timestamp_ms: chrono::Utc::now().timestamp_millis(),
+                                        };
+                                        let _ = app_h.emit(commands::EVENT_TRAFFIC, payload);
+                                        if last_tray_sync.elapsed() >= Duration::from_secs(3) {
+                                            last_tray_sync = Instant::now();
+                                            let _ = tray::sync_tray_visual(
+                                                &app_h,
+                                                &commands::build_tray_visual_state(&st),
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
                     res = rx_memory.recv() => match res {
                         Ok(mem) => {
-                            if mem.inuse > 0 {
-                                core_mem_bytes = mem.inuse;
-                            }
                             if let Some(st) = app_h.try_state::<AppState>() {
+                                let cur_gen = st.core_session_generation();
+                                if cur_gen != observed_gen {
+                                    observed_gen = cur_gen;
+                                    up_total = 0;
+                                    down_total = 0;
+                                    core_mem_bytes = 0;
+                                    active_connections = 0;
+                                    last_traffic_at = None;
+                                }
+                                if mem.inuse > 0 {
+                                    core_mem_bytes = mem.inuse;
+                                }
                                 if let Ok(mut m) = st.cached_metrics.write() {
                                     m.core_mem_bytes = core_mem_bytes;
                                 }
+                            } else if mem.inuse > 0 {
+                                core_mem_bytes = mem.inuse;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -589,11 +602,18 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                     },
                     res = rx_traffic.recv() => match res {
                         Ok(tick) => {
-                            last_up_bps = tick.up;
-                            last_down_bps = tick.down;
-                            up_total = up_total.saturating_add(tick.up);
-                            down_total = down_total.saturating_add(tick.down);
                             if let Some(st) = app_h.try_state::<AppState>() {
+                                let cur_gen = st.core_session_generation();
+                                if cur_gen != observed_gen {
+                                    observed_gen = cur_gen;
+                                    up_total = 0;
+                                    down_total = 0;
+                                    core_mem_bytes = 0;
+                                    active_connections = 0;
+                                }
+                                last_traffic_at = Some(Instant::now());
+                                up_total = up_total.saturating_add(tick.up);
+                                down_total = down_total.saturating_add(tick.down);
                                 if let Ok(mut m) = st.cached_metrics.write() {
                                     m.up_bps = tick.up;
                                     m.down_bps = tick.down;

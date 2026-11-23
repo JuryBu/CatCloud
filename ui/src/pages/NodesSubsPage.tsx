@@ -2,6 +2,8 @@ import {
   AlertTriangle,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Copy,
   Cpu,
   Download,
@@ -12,6 +14,7 @@ import {
   Globe,
   Layers,
   Link2,
+  Minus,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -25,7 +28,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type MigrationPreviewDto,
   type MultiGroup,
@@ -39,11 +42,10 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
-import { formatBytes } from "../components/TrafficSparkline";
 import { appActions, useAppSelector } from "../store/appStore";
 
 /* ============================================================================
- * Domain Types & Sanitized Constants (RFC 5737 IPs & Placeholder Labels Only)
+ * Domain Types & Demo Presets
  * ============================================================================ */
 
 type MultiplierRange = "all" | "le1" | "1to2" | "ge3";
@@ -122,10 +124,10 @@ interface ProcessInspectionItem {
 const ADAPTER_SCHEMA_V1 = "catcloud-adapter/v1";
 
 const SUB_KIND_LABELS: Record<SubscriptionRecord["kind"], string> = {
-  url: "URL 订阅",
-  file: "本地只读",
-  migrated: "老配置迁移",
-  process_adapter: "进程 / 外挂源",
+  url: "订阅链接",
+  file: "本地文件",
+  migrated: "已有软件导入",
+  process_adapter: "软件抓取",
 };
 
 const REGION_LABELS: Record<string, string> = {
@@ -154,19 +156,19 @@ const KNOWN_CLIENT_SPECS: Array<{
     label: "Clash Verge / Rev",
     readonlyPathHint:
       "%APPDATA%\\io.github.clash-verge-rev.clash-verge-rev\\profiles",
-    desc: "只读解析 YAML 节点清单与自定义 prepend/append 分流规则",
+    desc: "只读复制里面的节点列表和自定义分流规则，不改原软件",
   },
   {
     kind: "flclash",
-    label: "FlClash",
+    label: "落云 / FlClash",
     readonlyPathHint: "%APPDATA%\\com.follow.clash\\profiles",
-    desc: "只读提取多配置文件节点及地区/倍率元信息",
+    desc: "只读提取多份配置里的节点、地区和倍率信息",
   },
   {
     kind: "v2rayn",
     label: "v2rayN",
     readonlyPathHint: "%APPDATA%\\v2rayN\\guiConfigs\\config.json",
-    desc: "只读解析 outbounds 节点与 routing 直连/代理规则",
+    desc: "只读读取已保存的节点以及直连/代理规则",
   },
 ];
 
@@ -237,12 +239,12 @@ const DEMO_MIGRATION_SCANS: Record<
       "PROCESS-NAME,sample-sync.exe,DIRECT",
     ],
     append_rules: ["DOMAIN-SUFFIX,openai.com,PROXY"],
-    warnings: ["已自动忽略原配置中的 MATCH 兜底规则，避免覆盖猫猫云梯路由策略"],
+    warnings: ["已自动忽略原配置中的默认兜底规则，避免覆盖猫猫云梯路由策略"],
   },
   flclash: {
     id: "mig-flclash",
     source_kind: "flclash",
-    client_label: "FlClash",
+    client_label: "落云 / FlClash",
     source_path:
       "C:\\Users\\<USER>\\AppData\\Roaming\\com.follow.clash\\profiles\\demo_pool.yaml",
     nodes: [
@@ -377,18 +379,85 @@ function getSubSource(sub: SubscriptionRecord): string {
   return sub.url_or_cmd || sub.source || "";
 }
 
+function maskSubscriptionSource(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+
+  const secretSepIdx = trimmed.indexOf("|secret=");
+  const hasInlineSecret = secretSepIdx >= 0;
+  const basePart = hasInlineSecret ? trimmed.slice(0, secretSepIdx).trim() : trimmed;
+
+  if (/^https?:\/\//i.test(basePart)) {
+    try {
+      const parsed = new URL(basePart);
+      const isLocalLoopback =
+        parsed.hostname === "127.0.0.1" ||
+        parsed.hostname === "localhost" ||
+        parsed.hostname === "::1";
+      const segs = parsed.pathname.split("/").filter(Boolean);
+      const hasQuery = parsed.search.length > 0;
+
+      if (isLocalLoopback) {
+        const cleanPath = segs.length > 0 ? `/${segs.join("/")}` : "";
+        const secretHint = hasInlineSecret || hasQuery ? "（已设口令）" : "";
+        return `${parsed.protocol}//${parsed.host}${cleanPath}${secretHint}`;
+      }
+
+      if (segs.length === 0) {
+        return hasQuery
+          ? `${parsed.protocol}//${parsed.host}/••••••`
+          : `${parsed.protocol}//${parsed.host}`;
+      }
+      const firstSeg = segs[0];
+      const firstLooksSecret = firstSeg.length >= 12 || /[0-9a-f]{10,}/i.test(firstSeg);
+      const maskedPath = firstLooksSecret ? "/••••••" : `/${firstSeg}/••••••`;
+      return `${parsed.protocol}//${parsed.host}${maskedPath}`;
+    } catch {
+      return basePart.replace(/([?&][^=&\s]+=)[^&\s]+/g, "$1••••••");
+    }
+  }
+
+  return basePart
+    .replace(/[A-Za-z]:[\\/]Users[\\/][^\\/]+/gi, "C:\\Users\\<USER>")
+    .replace(/\/(?:Users|home)\/[^/]+/g, "/home/<USER>");
+}
+
+function formatQuotaBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0.0 GB";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let value = bytes;
+  let idx = 0;
+  while (value >= 1024 && idx < units.length - 1) {
+    value /= 1024;
+    idx += 1;
+  }
+  if (idx === 0) return `${Math.round(value)} B`;
+  return `${value.toFixed(1)} ${units[idx]}`;
+}
+
+function inferSubNameFromUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    const host = parsed.hostname.replace(/^www\./i, "");
+    if (host) return host;
+  } catch {
+    /* use fallback */
+  }
+  return "我的订阅";
+}
+
 function migrationClientLabel(kind: string): string {
   switch (kind) {
     case "clash_verge":
       return "Clash Verge / Rev";
     case "flclash":
-      return "FlClash";
+      return "落云 / FlClash";
     case "v2rayn":
       return "v2rayN";
     case "local_file":
       return "本地配置文件";
     case "clipboard_text":
-      return "粘贴文本 / 剪贴板";
+      return "粘贴的配置文本";
     default:
       return kind;
   }
@@ -484,7 +553,7 @@ function mapProcessInspectToUi(
       path: configPath,
       node_count: yamlNodeCount,
       reason:
-        "检测到可读明文 YAML 配置文件，优先推荐只读文件关联（零进程侵入、不改写原目录）。",
+        "找到了该软件正在使用的配置文件，可以直接安全读取节点，不会修改原文件。",
     };
   } else if (normalizedCtrl) {
     recommendation = {
@@ -492,7 +561,9 @@ function mapProcessInspectToUi(
       endpoint_url: `${normalizedCtrl.replace(/\/+$/, "")}/proxies`,
       proxy_count: controllerProxyCount,
       requires_secret: controllerRequiresSecret,
-      reason: "检测到本地公开控制口，可按只读方式关联拉取节点列表。",
+      reason: controllerRequiresSecret
+        ? "检测到本地软件接口，填入访问口令后即可安全读取节点列表。"
+        : "检测到该软件的本地公开接口，可以直接安全抓取可用节点。",
     };
   } else {
     recommendation = {
@@ -501,7 +572,7 @@ function mapProcessInspectToUi(
       suggested_command: `python3 adapters/${processName.replace(/\.exe$/i, "")}_adapter.py`,
       template_script: template,
       reason:
-        "未发现明文 YAML 或公开环回控制口，推荐通过开放 catcloud-adapter/v1 外挂脚本槽位对接。",
+        "这个软件没有公开配置文件或本地接口，暂时无法直接自动抓节点。建议优先尝试「粘贴订阅链接」或「从电脑已有梯子导入」，也可在下方展开高级自定义刷新脚本。",
     };
   }
 
@@ -518,7 +589,7 @@ function mapProcessInspectToUi(
     notes:
       rawNotes.length > 0
         ? rawNotes
-        : ["只读解析命令行与公开接口元数据，零进程内存侵入。"],
+        : ["安全只读模式：仅读取配置或本地公开接口，不会修改对方软件。"],
     preview_nodes: [],
   };
 }
@@ -650,11 +721,11 @@ function buildMockInspection(proc: ProcessCandidateItem): ProcessInspectionItem 
         path: proc.detected_config_file,
         node_count: 2,
         reason:
-          "在命令行参数 -d/-f 中定位到可读明文 YAML 配置，优先推荐只读文件关联（零进程侵入）。",
+          "找到了该软件正在使用的配置文件，可以直接安全读取节点，不会修改原文件。",
       },
       notes: [
-        "只读打开配置文件验证 YAML 语法与 proxies 字段，未写入目标目录。",
-        "关联后支持按周期只读同步节点变更，异常时自动保护现有节点。",
+        "仅只读打开配置文件提取节点，不会修改原软件目录。",
+        "关联后支持定期安全同步节点，读取异常会自动保留旧节点。",
       ],
       preview_nodes: [
         {
@@ -707,12 +778,12 @@ function buildMockInspection(proc: ProcessCandidateItem): ProcessInspectionItem 
         proxy_count: requiresSecret ? 0 : 2,
         requires_secret: requiresSecret,
         reason: requiresSecret
-          ? "探测到本地环回控制口返回 HTTP 401，请填入只读 Bearer Secret 后关联公开 REST 接口。"
-          : "探测到本地公开 Mihomo REST 控制口 /proxies 响应 200 OK，可直接只读拉取节点列表。",
+          ? "检测到该软件的本地接口设有访问口令，填入后即可安全抓取节点。"
+          : "检测到该软件的本地公开接口，可以直接安全抓取可用节点。",
       },
       notes: [
-        `仅访问环回地址 ${normalized}/proxies（GET 只读，超时 2s，上限 8 MiB）。`,
-        "未读取任何进程内存或修改目标客户端状态。",
+        `仅在本机安全读取接口 ${normalized}/proxies。`,
+        "不会修改原软件配置，也不会影响它正常运行。",
       ],
       preview_nodes: [
         {
@@ -762,11 +833,11 @@ function buildMockInspection(proc: ProcessCandidateItem): ProcessInspectionItem 
       suggested_command: `python3 adapters/${proc.name.replace(/\.exe$/i, "")}_adapter.py`,
       template_script: template,
       reason:
-        "未发现明文 YAML 或公开环回控制口，推荐通过开放 catcloud-adapter/v1 外挂脚本槽位对接。",
+        "这个软件没有公开配置文件或本地接口，暂时无法直接自动抓节点。建议优先尝试「粘贴订阅链接」或「从电脑已有梯子导入」，也可在下方展开高级自定义刷新脚本。",
     },
     notes: [
-      "严格遵守零内存注入原则：不尝试读取受保护进程内存或私有数据库。",
-      "外挂适配器强制防风暴冷却 >= 60s，单次 stdout 上限 16 MiB。",
+      "安全只读原则：不会读取受保护的程序内存或私密数据。",
+      "如果你熟悉写脚本，可以在下方「高级：自定义刷新脚本」中接入自定义来源。",
     ],
     preview_nodes: [],
   };
@@ -870,7 +941,7 @@ function parsePastedConfigPreview(rawInput: string): MigrationPreviewItem {
           .trim()
           .replace(/^["']|["']$/g, "");
         if (/^MATCH\s*,/i.test(rule)) {
-          warnings.push("已跳过 MATCH 兜底规则，保留猫猫云梯主分流结构");
+          warnings.push("已跳过默认兜底规则，保留猫猫云梯主分流结构");
         } else if (/,DIRECT$/i.test(rule)) {
           prependRules.push(rule);
         } else if (rule.includes(",")) {
@@ -935,7 +1006,7 @@ function parsePastedConfigPreview(rawInput: string): MigrationPreviewItem {
   }
 
   if (nodes.length === 0) {
-    warnings.push("未提取到有效节点，请确认粘贴内容为 Clash YAML 或标准代理 URI 列表");
+    warnings.push("未提取到有效节点，请确认粘贴的是完整的节点配置或节点分享链接");
   }
 
   return {
@@ -995,15 +1066,78 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
   );
   const [customSubName, setCustomSubName] = useState("");
   const [includeRules, setIncludeRules] = useState(true);
+  const openSessionRef = useRef(false);
+
+  const runScanClient = useCallback(
+    async (
+      kind: "clash_verge" | "flclash" | "v2rayn" | "all",
+      autoTriggered = false
+    ) => {
+      setScanningKind(kind);
+      try {
+        let items: MigrationPreviewItem[];
+        if (isTauriEnv()) {
+          const rawList = await catcloudApi.scanLocalMigrations();
+          const mapped = rawList.map((dto, idx) => mapMigrationDtoToPreview(dto, idx));
+          items =
+            kind === "all"
+              ? mapped
+              : mapped.filter((item) => item.source_kind === kind);
+        } else {
+          items =
+            kind === "all"
+              ? [
+                  DEMO_MIGRATION_SCANS.clash_verge,
+                  DEMO_MIGRATION_SCANS.flclash,
+                  DEMO_MIGRATION_SCANS.v2rayn,
+                ]
+              : [DEMO_MIGRATION_SCANS[kind]];
+        }
+
+        setScannedItems((prev) => {
+          const merged = new Map<string, MigrationPreviewItem>();
+          for (const p of prev) merged.set(p.id, p);
+          for (const next of items) merged.set(next.id, next);
+          return Array.from(merged.values());
+        });
+        if (items.length > 0) {
+          setSelectedPreviewId(items[0].id);
+          setCustomSubName(`导入 · ${items[0].client_label}`);
+          appActions.showToast(
+            `已找到 ${items.reduce((acc, i) => acc + i.nodes.length, 0)} 个可导入节点（不会改动原软件）`,
+            "ok"
+          );
+        } else if (!autoTriggered) {
+          appActions.showToast(
+            "未在常见位置找到已有软件配置，也可以切换到「粘贴配置文本」导入",
+            "info"
+          );
+        }
+      } catch (err) {
+        appActions.showToast(`扫描已有配置失败：${formatErrorMessage(err)}`, "warn");
+      } finally {
+        setScanningKind(null);
+      }
+    },
+    []
+  );
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      openSessionRef.current = false;
+      return;
+    }
+    if (!openSessionRef.current) {
+      openSessionRef.current = true;
+      setTab("scan");
+      void runScanClient("all", true);
+    }
     const onKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
+  }, [open, onClose, runScanClient]);
 
   if (!open) return null;
 
@@ -1014,69 +1148,22 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         null
       : pastePreview;
 
-  const runScanClient = async (
-    kind: "clash_verge" | "flclash" | "v2rayn" | "all"
-  ) => {
-    setScanningKind(kind);
-    try {
-      let items: MigrationPreviewItem[];
-      if (isTauriEnv()) {
-        const rawList = await catcloudApi.scanLocalMigrations();
-        const mapped = rawList.map((dto, idx) => mapMigrationDtoToPreview(dto, idx));
-        items =
-          kind === "all"
-            ? mapped
-            : mapped.filter((item) => item.source_kind === kind);
-      } else {
-        items =
-          kind === "all"
-            ? [
-                DEMO_MIGRATION_SCANS.clash_verge,
-                DEMO_MIGRATION_SCANS.flclash,
-                DEMO_MIGRATION_SCANS.v2rayn,
-              ]
-            : [DEMO_MIGRATION_SCANS[kind]];
-      }
-
-      setScannedItems((prev) => {
-        const merged = new Map<string, MigrationPreviewItem>();
-        for (const p of prev) merged.set(p.id, p);
-        for (const next of items) merged.set(next.id, next);
-        return Array.from(merged.values());
-      });
-      if (items.length > 0) {
-        setSelectedPreviewId(items[0].id);
-        setCustomSubName(`迁移 · ${items[0].client_label}`);
-        appActions.showToast(
-          `只读扫描完成：发现 ${items.reduce((acc, i) => acc + i.nodes.length, 0)} 个可迁移节点（原目录零改动）`,
-          "ok"
-        );
-      } else {
-        appActions.showToast("未在本机标准目录检测到可迁移配置", "info");
-      }
-    } catch (err) {
-      appActions.showToast(`只读扫描失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setScanningKind(null);
-    }
-  };
-
   const handleParsePaste = async () => {
     if (!pasteText.trim()) {
-      appActions.showToast("请先粘贴 Clash YAML、Base64 或代理 URI 文本", "warn");
+      appActions.showToast("请先粘贴配置文件内容或节点链接", "warn");
       return;
     }
     try {
       let parsed: MigrationPreviewItem;
       if (isTauriEnv()) {
         const res = await catcloudApi.previewMigrationFromText(
-          customSubName.trim() || "剪贴板只读迁移源",
+          customSubName.trim() || "粘贴导入的节点",
           pasteText
         );
         parsed = {
           id: `mig-clip-${Date.now()}`,
           source_kind: "clipboard_text",
-          client_label: res.name || "粘贴文本 / 剪贴板",
+          client_label: res.name || "粘贴的配置文本",
           source_path: null,
           nodes: Array.isArray(res.nodes) ? res.nodes : [],
           prepend_rules: Array.isArray(res.prepend_rules) ? res.prepend_rules : [],
@@ -1087,24 +1174,24 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         parsed = parsePastedConfigPreview(pasteText);
       }
       setPastePreview(parsed);
-      setCustomSubName(parsed.client_label || "剪贴板只读迁移源");
+      setCustomSubName(parsed.client_label || "粘贴导入的节点");
       if (parsed.nodes.length > 0) {
         appActions.showToast(
-          `只读解析成功：提取 ${parsed.nodes.length} 个节点`,
+          `解析成功：找到 ${parsed.nodes.length} 个可用节点`,
           "ok"
         );
       } else {
-        appActions.showToast("未识别到有效节点，请检查文本格式", "warn");
+        appActions.showToast("没有识别出可用节点，请检查粘贴的内容是否完整", "warn");
       }
     } catch (err) {
-      appActions.showToast(`只读解析失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`解析失败：${formatErrorMessage(err)}`, "warn");
     }
   };
 
   const handleConfirmImport = () => {
     if (!activePreview || activePreview.nodes.length === 0) return;
     const finalName =
-      customSubName.trim() || `迁移 · ${activePreview.client_label}`;
+      customSubName.trim() || `导入 · ${activePreview.client_label}`;
     onImport(activePreview, finalName, includeRules);
     onClose();
   };
@@ -1114,7 +1201,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
       className="fixed inset-0 z-50 flex justify-end bg-black/45"
       role="dialog"
       aria-modal="true"
-      aria-label="老配置一键只读迁移"
+      aria-label="从电脑已有梯子导入"
       onClick={onClose}
     >
       <div
@@ -1127,18 +1214,18 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
             <div className="flex items-center gap-2">
               <FolderOpen className="h-4 w-4 text-[var(--accent)]" />
               <h2 className="text-sm font-semibold text-[var(--text)]">
-                老配置一键只读迁移
+                从电脑已有梯子导入
               </h2>
             </div>
             <p className="mt-1 text-xs text-[var(--muted)]">
-              支持只读扫描 Clash Verge / FlClash / v2rayN 或粘贴 YAML / URI 文本。
+              自动查找 Clash Verge / 落云 / v2rayN 的已有配置，也支持直接粘贴配置或节点链接。
             </p>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
-            aria-label="关闭迁移抽屉"
+            aria-label="关闭导入窗口"
           >
             <X className="h-4 w-4" />
           </button>
@@ -1148,7 +1235,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         <div className="mx-5 mt-3 flex items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--green-soft)] px-3 py-2 text-xs text-[var(--green)]">
           <ShieldCheck className="h-4 w-4 shrink-0" />
           <span>
-            严格只读模式：仅读取配置副本并导入猫猫云梯本地存储，绝不修改原客户端目录或文件。
+            只读安全复制：只会把节点复制一份进猫猫云梯，绝不改动你原来的软件和配置文件。
           </span>
         </div>
 
@@ -1164,7 +1251,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
             }`}
           >
             <Search className="h-3.5 w-3.5" />
-            只读扫描本地客户端
+            自动找电脑里的梯子
           </button>
           <button
             type="button"
@@ -1176,7 +1263,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
             }`}
           >
             <FileText className="h-3.5 w-3.5" />
-            粘贴 YAML / URI 文本
+            粘贴配置文本 / 节点链接
           </button>
         </div>
 
@@ -1186,18 +1273,18 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
             <>
               <div className="flex items-center justify-between">
                 <span className="text-xs font-medium text-[var(--text-secondary)]">
-                  标准开源客户端配置目录
+                  常见梯子软件配置位置
                 </span>
                 <button
                   type="button"
                   disabled={scanningKind !== null}
-                  onClick={() => void runScanClient("all")}
+                  onClick={() => void runScanClient("all", false)}
                   className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)] bg-[var(--accent-soft)] px-2.5 py-1 text-xs font-medium text-[var(--accent)] hover:opacity-90 disabled:opacity-50"
                 >
                   <RefreshCw
                     className={`h-3.5 w-3.5 ${scanningKind === "all" ? "animate-spin" : ""}`}
                   />
-                  一键只读扫描全部
+                  {scanningKind === "all" ? "正在扫描..." : "重新扫描全部"}
                 </button>
               </div>
 
@@ -1245,17 +1332,17 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                               type="button"
                               onClick={() => {
                                 setSelectedPreviewId(found.id);
-                                setCustomSubName(`迁移 · ${found.client_label}`);
+                                setCustomSubName(`导入 · ${found.client_label}`);
                               }}
                               className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
                             >
-                              预览
+                              查看
                             </button>
                           )}
                           <button
                             type="button"
                             disabled={isBusy}
-                            onClick={() => void runScanClient(spec.kind)}
+                            onClick={() => void runScanClient(spec.kind, false)}
                             className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
                           >
                             <Search className="h-3 w-3" />
@@ -1275,14 +1362,14 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                   htmlFor="cc-migration-paste"
                   className="text-xs font-medium text-[var(--text-secondary)]"
                 >
-                  支持 Clash/Mihomo YAML、Base64 或多行代理 URI（vless / trojan / anytls / hy2 / tuic / vmess / ss）
+                  支持粘贴其他软件的配置文件内容、编码文本或单条/多条节点分享链接
                 </label>
                 <button
                   type="button"
                   onClick={() => setPasteText(DEMO_PASTE_SAMPLE)}
                   className="shrink-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--accent)] hover:border-[var(--accent)]"
                 >
-                  填入脱敏示例
+                  填入示例内容
                 </button>
               </div>
               <textarea
@@ -1290,7 +1377,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                 value={pasteText}
                 onChange={(e) => setPasteText(e.target.value)}
                 rows={8}
-                placeholder="粘贴 YAML 配置片段或 vless:// / trojan:// / anytls:// 节点行..."
+                placeholder="在这里粘贴配置内容，或者粘贴 vless:// / trojan:// / ss:// 等节点链接..."
                 className="cc-selectable w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3 cc-mono text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
               <div className="flex items-center justify-end gap-2">
@@ -1310,7 +1397,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                   className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
                 >
                   <Upload className="h-3.5 w-3.5" />
-                  只读解析预览
+                  解析并预览节点
                 </button>
               </div>
             </div>
@@ -1370,7 +1457,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                         </span>
                         {node.is_443_native && (
                           <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[var(--green)]">
-                            443 原生
+                            直连 443
                           </span>
                         )}
                       </div>
@@ -1384,7 +1471,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                 <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5 text-[11px]">
                   <div className="flex items-center justify-between">
                     <span className="font-medium text-[var(--text)]">
-                      可合并分流规则（前置 {activePreview.prepend_rules.length} 条 / 后置{" "}
+                      检测到分流规则（优先 {activePreview.prepend_rules.length} 条 / 兜底{" "}
                       {activePreview.append_rules.length} 条）
                     </span>
                     <label className="inline-flex cursor-pointer items-center gap-1.5 text-[var(--text-secondary)]">
@@ -1411,12 +1498,12 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
 
               <div className="grid grid-cols-1 gap-2 pt-1">
                 <label className="text-[11px] text-[var(--muted)]">
-                  导入后的订阅来源名称
+                  导入后的订阅名称
                   <input
                     type="text"
                     value={customSubName}
                     onChange={(e) => setCustomSubName(e.target.value)}
-                    placeholder={`迁移 · ${activePreview.client_label}`}
+                    placeholder={`导入 · ${activePreview.client_label}`}
                     className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
                   />
                 </label>
@@ -1428,7 +1515,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         {/* Footer */}
         <div className="flex items-center justify-between border-t border-[var(--line)] px-5 py-3">
           <span className="text-[11px] text-[var(--muted)]">
-            导入仅写入猫猫云梯 SQLite，原客户端零修改
+            只复制到猫猫云梯本地，不会修改原软件
           </span>
           <div className="flex items-center gap-2">
             <button
@@ -1445,7 +1532,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
               className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
             >
               <Check className="h-3.5 w-3.5" />
-              确认只读导入
+              确认导入
             </button>
           </div>
         </div>
@@ -1527,7 +1614,7 @@ function ProcessAttachDrawer({
       })
       .catch((err) => {
         if (!cancelled) {
-          appActions.showToast(`拉取进程列表失败：${formatErrorMessage(err)}`, "warn");
+          appActions.showToast(`读取运行中的软件列表失败：${formatErrorMessage(err)}`, "warn");
         }
       })
       .finally(() => {
@@ -1563,13 +1650,13 @@ function ProcessAttachDrawer({
         const ipcList = await catcloudApi.listRunningProcesses(false);
         const mapped = ipcList.map(mapProcessCandidateDto);
         setCandidates(mapped);
-        appActions.showToast(`已刷新本机进程清单（共 ${mapped.length} 项）`, "info");
+        appActions.showToast(`已刷新运行中的软件列表（共 ${mapped.length} 项）`, "info");
       } else {
         setCandidates(DEMO_PROCESS_CANDIDATES);
-        appActions.showToast(`预览模式：共 ${DEMO_PROCESS_CANDIDATES.length} 项演示进程`, "info");
+        appActions.showToast(`演示模式：共找到 ${DEMO_PROCESS_CANDIDATES.length} 个示例软件`, "info");
       }
     } catch (err) {
-      appActions.showToast(`刷新进程清单失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`刷新软件列表失败：${formatErrorMessage(err)}`, "warn");
     } finally {
       setLoadingList(false);
     }
@@ -1591,14 +1678,13 @@ function ProcessAttachDrawer({
       setInspection(report);
       if (report.recommendation.mode === "external_adapter_template") {
         setAdapterCmd(report.recommendation.suggested_command);
-        setShowAdapterSlot(true);
       } else {
         setAdapterCmd(
           `python3 adapters/${proc.name.replace(/\.exe$/i, "")}_adapter.py`
         );
       }
     } catch (err) {
-      appActions.showToast(`探测进程失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`识别该软件失败：${formatErrorMessage(err)}`, "warn");
     } finally {
       setInspecting(false);
     }
@@ -1613,7 +1699,7 @@ function ProcessAttachDrawer({
     try {
       await navigator.clipboard.writeText(activeTemplateScript);
       setCopiedScript(true);
-      appActions.showToast("已复制 catcloud-adapter/v1 脚本模板", "ok");
+      appActions.showToast("已复制自定义刷新脚本模板", "ok");
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
       }
@@ -1641,14 +1727,14 @@ function ProcessAttachDrawer({
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-    appActions.showToast("已导出 catcloud-adapter/v1 模板文件", "ok");
+    appActions.showToast("已下载自定义刷新脚本模板", "ok");
   };
 
   const handleBindReadOnlySource = () => {
     if (!inspection) return;
     if (inspection.recommendation.mode === "read_only_local_file") {
       onAttachSource({
-        name: `进程只读 · ${inspection.process_name} (PID ${inspection.pid})`,
+        name: `软件抓取 · ${inspection.process_name}`,
         source: inspection.recommendation.path,
         kind: "file",
         nodes: inTauri ? [] : inspection.preview_nodes,
@@ -1657,19 +1743,20 @@ function ProcessAttachDrawer({
       return;
     }
     if (inspection.recommendation.mode === "public_controller_api") {
-      if (
-        inspection.recommendation.requires_secret &&
-        !bearerSecret.trim()
-      ) {
+      const trimmedSecret = bearerSecret.trim();
+      if (inspection.recommendation.requires_secret && !trimmedSecret) {
         appActions.showToast(
-          "该控制口返回 401，请先填入只读 Bearer Secret",
+          "该软件的本地接口需要口令，请先填入后再抓取",
           "warn"
         );
         return;
       }
+      const sourceWithSecret = trimmedSecret
+        ? `${inspection.recommendation.endpoint_url}|secret=${trimmedSecret}`
+        : inspection.recommendation.endpoint_url;
       onAttachSource({
-        name: `控制口只读 · ${inspection.process_name} (PID ${inspection.pid})`,
-        source: inspection.recommendation.endpoint_url,
+        name: `接口抓取 · ${inspection.process_name}`,
+        source: sourceWithSecret,
         kind: "process_adapter",
         nodes: inTauri ? [] : inspection.preview_nodes,
       });
@@ -1680,7 +1767,7 @@ function ProcessAttachDrawer({
   const handleRegisterAdapterSlot = () => {
     const trimmedCmd = adapterCmd.trim();
     if (!trimmedCmd) {
-      appActions.showToast("请输入外挂适配器执行命令", "warn");
+      appActions.showToast("请先填写自定义刷新脚本的执行命令", "warn");
       return;
     }
     const safeCooldown = Math.max(60, Math.round(adapterCooldownSec));
@@ -1688,7 +1775,7 @@ function ProcessAttachDrawer({
     const procLabel = selectedProc?.name ?? "external";
     const subId = `sub-adapter-${Date.now()}`;
     onAttachSource({
-      name: `外挂槽位 · ${procLabel} (${ADAPTER_SCHEMA_V1})`,
+      name: `自定义脚本 · ${procLabel}`,
       source: inTauri ? trimmedCmd : `${trimmedCmd} [timeout=${safeTimeout}s, cooldown=${safeCooldown}s]`,
       kind: "process_adapter",
       nodes: inTauri
@@ -1697,7 +1784,7 @@ function ProcessAttachDrawer({
             {
               id: `${subId}-sample-1`,
               sub_id: subId,
-              name: `JP-Adapter-${procLabel.replace(/\.exe$/i, "")} · 1x`,
+              name: `JP-Script-${procLabel.replace(/\.exe$/i, "")} · 1x`,
               protocol: "vless",
               server: "203.0.113.90",
               port: 443,
@@ -1718,7 +1805,7 @@ function ProcessAttachDrawer({
       className="fixed inset-0 z-50 flex justify-end bg-black/45"
       role="dialog"
       aria-modal="true"
-      aria-label="手动选择运行中进程智能对口"
+      aria-label="从正在运行的软件抓节点"
       onClick={onClose}
     >
       <div
@@ -1731,22 +1818,18 @@ function ProcessAttachDrawer({
             <div className="flex items-center gap-2">
               <Cpu className="h-4 w-4 text-[var(--accent)]" />
               <h2 className="text-sm font-semibold text-[var(--text)]">
-                手动选择运行中进程智能对口
+                从正在运行的软件抓节点
               </h2>
             </div>
             <p className="mt-1 text-xs text-[var(--muted)]">
-              只读解析命令行参数（-d / -f / -ext-ctl）与公开环回控制口，或生成开放{" "}
-              <span className="cc-mono text-[var(--accent)]">
-                {ADAPTER_SCHEMA_V1}
-              </span>{" "}
-              外挂脚本槽位。
+              先打开你的专用梯子软件，点选左侧对应程序，自动识别并安全抓取可用节点（只读，不修改原软件）。
             </p>
           </div>
           <button
             type="button"
             onClick={onClose}
             className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
-            aria-label="关闭进程对口抽屉"
+            aria-label="关闭软件抓取窗口"
           >
             <X className="h-4 w-4" />
           </button>
@@ -1760,7 +1843,7 @@ function ProcessAttachDrawer({
               type="text"
               value={keyword}
               onChange={(e) => setKeyword(e.target.value)}
-              placeholder="按 PID、进程名或命令行参数筛选..."
+              placeholder="搜索软件名称或进程号..."
               className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
             />
           </div>
@@ -1772,7 +1855,7 @@ function ProcessAttachDrawer({
                 onChange={(e) => setOnlyLikelyProxy(e.target.checked)}
                 className="accent-[var(--accent)]"
               />
-              仅显示疑似代理进程
+              只看常见代理软件
             </label>
             <button
               type="button"
@@ -1783,7 +1866,7 @@ function ProcessAttachDrawer({
               <RefreshCw
                 className={`h-3.5 w-3.5 ${loadingList ? "animate-spin" : ""}`}
               />
-              刷新进程
+              重新扫描
             </button>
           </div>
         </div>
@@ -1793,11 +1876,11 @@ function ProcessAttachDrawer({
           {/* Left: Process Candidate List */}
           <div className="space-y-2 border-b border-[var(--line)] p-4 md:col-span-5 md:border-b-0 md:border-r md:overflow-y-auto">
             <div className="text-[11px] font-medium text-[var(--muted)]">
-              运行中候选进程（{filteredCandidates.length}）
+              正在运行的软件（{filteredCandidates.length}）
             </div>
             {filteredCandidates.length === 0 ? (
               <div className="rounded-xl border border-dashed border-[var(--line)] p-4 text-center text-xs text-[var(--muted)]">
-                无匹配进程，可取消勾选“仅显示疑似代理进程”
+                没找到匹配的程序，请先打开你的梯子软件，或取消勾选「只看常见代理软件」
               </div>
             ) : (
               filteredCandidates.map((proc) => {
@@ -1818,36 +1901,32 @@ function ProcessAttachDrawer({
                         {proc.name}
                       </span>
                       <span className="cc-mono shrink-0 rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                        PID {proc.pid}
+                        #{proc.pid}
                       </span>
                     </div>
 
                     <div className="mt-1.5 flex flex-wrap gap-1">
                       {proc.detected_config_dir && (
-                        <span className="rounded bg-[var(--sky-soft)] px-1.5 py-0.5 cc-mono text-[10px] text-[var(--sky)]">
-                          -d
+                        <span className="rounded bg-[var(--sky-soft)] px-1.5 py-0.5 text-[10px] text-[var(--sky)]">
+                          有配置目录
                         </span>
                       )}
                       {proc.detected_config_file && (
-                        <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 cc-mono text-[10px] text-[var(--green)]">
-                          -f YAML
+                        <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] text-[var(--green)]">
+                          找到配置文件
                         </span>
                       )}
                       {proc.detected_controller_addr && (
-                        <span className="rounded bg-[var(--accent-soft)] px-1.5 py-0.5 cc-mono text-[10px] text-[var(--accent)]">
-                          -ext-ctl {proc.detected_controller_addr}
+                        <span className="rounded bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] text-[var(--accent)]">
+                          找到本地接口
                         </span>
                       )}
                       {!proc.detected_config_file &&
                         !proc.detected_controller_addr && (
                           <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                            需外挂槽位
+                            未发现公开配置
                           </span>
                         )}
-                    </div>
-
-                    <div className="mt-1.5 line-clamp-2 break-all cc-mono text-[10px] text-[var(--muted)]">
-                      {proc.cmdline.join(" ")}
                     </div>
                   </button>
                 );
@@ -1859,11 +1938,11 @@ function ProcessAttachDrawer({
           <div className="space-y-3.5 p-4 md:col-span-7 md:overflow-y-auto">
             {!selectedProc ? (
               <div className="rounded-xl border border-dashed border-[var(--line)] p-6 text-center text-xs text-[var(--muted)]">
-                请从左侧选择一个运行中进程以执行只读探测
+                请点击左侧正在运行的软件，自动识别可用的节点来源
               </div>
             ) : (
               <>
-                {/* Selected Process Cmdline Breakdown */}
+                {/* Selected Software Summary */}
                 <div className="rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5">
                   <div className="flex items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
@@ -1872,7 +1951,7 @@ function ProcessAttachDrawer({
                         {selectedProc.name}
                       </span>
                       <span className="cc-mono text-[11px] text-[var(--muted)]">
-                        PID {selectedProc.pid}
+                        进程 #{selectedProc.pid}
                       </span>
                     </div>
                     <button
@@ -1884,27 +1963,25 @@ function ProcessAttachDrawer({
                       <RefreshCw
                         className={`h-3 w-3 ${inspecting ? "animate-spin" : ""}`}
                       />
-                      重新探测
+                      重新识别
                     </button>
                   </div>
 
                   <dl className="mt-2.5 space-y-1.5 text-[11px]">
                     <div className="flex items-start justify-between gap-3">
-                      <dt className="shrink-0 text-[var(--muted)]">配置目录 (-d)</dt>
+                      <dt className="shrink-0 text-[var(--muted)]">配置目录</dt>
                       <dd className="cc-selectable break-all text-right cc-mono text-[var(--text-secondary)]">
-                        {selectedProc.detected_config_dir ?? "未显式指定"}
+                        {selectedProc.detected_config_dir ?? "未检测到"}
                       </dd>
                     </div>
                     <div className="flex items-start justify-between gap-3">
-                      <dt className="shrink-0 text-[var(--muted)]">配置文件 (-f)</dt>
+                      <dt className="shrink-0 text-[var(--muted)]">配置文件</dt>
                       <dd className="cc-selectable break-all text-right cc-mono text-[var(--text-secondary)]">
-                        {selectedProc.detected_config_file ?? "未显式指定"}
+                        {selectedProc.detected_config_file ?? "未检测到"}
                       </dd>
                     </div>
                     <div className="flex items-start justify-between gap-3">
-                      <dt className="shrink-0 text-[var(--muted)]">
-                        公开控制口 (-ext-ctl)
-                      </dt>
+                      <dt className="shrink-0 text-[var(--muted)]">本地接口</dt>
                       <dd className="cc-selectable text-right cc-mono text-[var(--accent)]">
                         {selectedProc.detected_controller_addr ?? "未检测到"}
                       </dd>
@@ -1917,7 +1994,7 @@ function ProcessAttachDrawer({
                   <div className="space-y-3 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] p-3.5">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <span className="text-xs font-semibold text-[var(--text)]">
-                        只读探测结论与推荐接入方式
+                        识别结果与抓取方式
                       </span>
                       <span
                         className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
@@ -1928,11 +2005,11 @@ function ProcessAttachDrawer({
                         }`}
                       >
                         {inspection.recommendation.mode === "read_only_local_file"
-                          ? "推荐：只读明文 YAML"
+                          ? "可直接读取配置文件"
                           : inspection.recommendation.mode ===
                               "public_controller_api"
-                            ? "推荐：公开控制口 REST"
-                            : `推荐：${ADAPTER_SCHEMA_V1} 外挂槽位`}
+                            ? "可直接通过本地接口抓取"
+                            : "暂不支持直接自动抓取"}
                       </span>
                     </div>
 
@@ -1943,21 +2020,21 @@ function ProcessAttachDrawer({
                     {/* Probe Telemetry Summary */}
                     <div className="grid grid-cols-2 gap-2 text-[11px]">
                       <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2">
-                        <div className="text-[var(--muted)]">本地 YAML 探测</div>
+                        <div className="text-[var(--muted)]">配置文件识别</div>
                         <div className="mt-0.5 cc-mono font-medium text-[var(--text)]">
                           {inspection.readable_yaml_file
-                            ? `可读 · ${inspection.yaml_node_count} 节点`
-                            : "无明文可读文件"}
+                            ? `可读取 · ${inspection.yaml_node_count} 个节点`
+                            : "未发现可读配置文件"}
                         </div>
                       </div>
                       <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2">
-                        <div className="text-[var(--muted)]">公开控制口探测</div>
+                        <div className="text-[var(--muted)]">本地接口识别</div>
                         <div className="mt-0.5 cc-mono font-medium text-[var(--text)]">
                           {inspection.controller_reachable
                             ? inspection.controller_requires_secret
-                              ? "可达 (401 需 Secret)"
-                              : `可达 · ${inspection.controller_proxy_count} 代理`
-                            : "未监听或不可达"}
+                              ? "已开启（需要访问口令）"
+                              : `已开启 · ${inspection.controller_proxy_count} 个节点`
+                            : "未开启或不可访问"}
                         </div>
                       </div>
                     </div>
@@ -1975,7 +2052,7 @@ function ProcessAttachDrawer({
                           className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
                         >
                           <Link2 className="h-3.5 w-3.5" />
-                          一键关联为只读配置文件源（{inspection.recommendation.node_count} 节点）
+                          一键抓取这些节点（{inspection.recommendation.node_count} 个）
                         </button>
                       </div>
                     )}
@@ -1984,14 +2061,14 @@ function ProcessAttachDrawer({
                       "public_controller_api" && (
                       <div className="space-y-2 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5">
                         <div className="cc-mono text-[11px] text-[var(--accent)]">
-                          GET {inspection.recommendation.endpoint_url}
+                          {inspection.recommendation.endpoint_url}
                         </div>
                         {inspection.recommendation.requires_secret && (
                           <input
                             type="password"
                             value={bearerSecret}
                             onChange={(e) => setBearerSecret(e.target.value)}
-                            placeholder="填入控制口只读 Bearer Secret..."
+                            placeholder="填入该软件的本地接口访问口令..."
                             className="w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
                           />
                         )}
@@ -2001,7 +2078,7 @@ function ProcessAttachDrawer({
                           className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
                         >
                           <Link2 className="h-3.5 w-3.5" />
-                          一键关联公开控制口只读源
+                          一键从本地接口抓取节点
                         </button>
                       </div>
                     )}
@@ -2015,122 +2092,122 @@ function ProcessAttachDrawer({
                         </li>
                       ))}
                     </ul>
+                  </div>
+                )}
 
-                    {/* Toggle External Adapter Slot View */}
-                    {inspection.recommendation.mode !==
-                      "external_adapter_template" && (
-                      <button
-                        type="button"
-                        onClick={() => setShowAdapterSlot((v) => !v)}
-                        className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[var(--accent)] hover:underline"
-                      >
-                        <FileCode2 className="h-3.5 w-3.5" />
-                        {showAdapterSlot
-                          ? "收起 catcloud-adapter/v1 外挂脚本槽位"
-                          : "或者生成开放 catcloud-adapter/v1 外挂脚本槽位模板"}
-                      </button>
+                {/* Collapsible Advanced: Custom Refresh Script */}
+                <div className="overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--card)]">
+                  <button
+                    type="button"
+                    onClick={() => setShowAdapterSlot((v) => !v)}
+                    className="flex w-full items-center justify-between gap-2 px-3.5 py-2.5 text-left text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-elevated)]/60 hover:text-[var(--text)]"
+                  >
+                    <span className="inline-flex items-center gap-1.5">
+                      <FileCode2 className="h-3.5 w-3.5 text-[var(--muted)]" />
+                      高级：自定义刷新脚本
+                    </span>
+                    {showAdapterSlot ? (
+                      <ChevronDown className="h-3.5 w-3.5 text-[var(--muted)]" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5 text-[var(--muted)]" />
                     )}
-                  </div>
-                )}
+                  </button>
 
-                {/* Open External Adapter v1 Slot & Template Generator */}
-                {showAdapterSlot && (
-                  <div className="space-y-3 rounded-xl border border-[var(--accent)]/60 bg-[var(--card)] p-3.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-1.5">
-                        <FileCode2 className="h-4 w-4 text-[var(--accent)]" />
-                        <span className="text-xs font-semibold text-[var(--text)]">
-                          开放外挂脚本槽位（{ADAPTER_SCHEMA_V1}）
+                  {showAdapterSlot && (
+                    <div className="space-y-3 border-t border-[var(--line)] p-3.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-[11px] text-[var(--muted)]">
+                          供熟悉编程的用户接入自定义来源（协议：{ADAPTER_SCHEMA_V1}）
                         </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => void handleCopyScript()}
+                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
+                          >
+                            {copiedScript ? (
+                              <Check className="h-3 w-3 text-[var(--green)]" />
+                            ) : (
+                              <Copy className="h-3 w-3" />
+                            )}
+                            {copiedScript ? "已复制" : "复制模板"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleDownloadScript}
+                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
+                          >
+                            <Download className="h-3 w-3" />
+                            下载 .py
+                          </button>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-1.5">
+
+                      <div className="rounded-lg bg-[var(--bg-elevated)] p-2.5 text-[11px] text-[var(--muted)]">
+                        标准协议：<span className="cc-mono text-[var(--text)]">stdin</span> 传入{" "}
+                        <span className="cc-mono">{`{"reason","sub_id","failed_servers"}`}</span>，
+                        <span className="cc-mono text-[var(--text)]">stdout</span> 返回{" "}
+                        <span className="cc-mono">{`{"schema":"catcloud-adapter/v1","nodes":[...],"yaml":null}`}</span>
+                        （上限 16 MiB，冷却 &gt;= 60s）。
+                      </div>
+
+                      <pre className="cc-selectable max-h-52 overflow-auto rounded-lg border border-[var(--line)] bg-[var(--bg)] p-3 cc-mono text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                        {activeTemplateScript}
+                      </pre>
+
+                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
+                        <label className="text-[11px] text-[var(--muted)] sm:col-span-6">
+                          脚本启动命令
+                          <input
+                            type="text"
+                            value={adapterCmd}
+                            onChange={(e) => setAdapterCmd(e.target.value)}
+                            className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
+                          />
+                        </label>
+                        <label className="text-[11px] text-[var(--muted)] sm:col-span-3">
+                          超时 (秒)
+                          <input
+                            type="number"
+                            min={5}
+                            max={300}
+                            value={adapterTimeoutSec}
+                            onChange={(e) =>
+                              setAdapterTimeoutSec(Number(e.target.value) || 30)
+                            }
+                            className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
+                          />
+                        </label>
+                        <label className="text-[11px] text-[var(--muted)] sm:col-span-3">
+                          冷却 (&gt;=60s)
+                          <input
+                            type="number"
+                            min={60}
+                            max={86400}
+                            value={adapterCooldownSec}
+                            onChange={(e) =>
+                              setAdapterCooldownSec(
+                                Math.max(60, Number(e.target.value) || 60)
+                              )
+                            }
+                            className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
+                          />
+                        </label>
+                      </div>
+
+                      <div className="flex justify-end">
                         <button
                           type="button"
-                          onClick={() => void handleCopyScript()}
-                          className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
+                          onClick={handleRegisterAdapterSlot}
+                          className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
                         >
-                          {copiedScript ? (
-                            <Check className="h-3 w-3 text-[var(--green)]" />
-                          ) : (
-                            <Copy className="h-3 w-3" />
-                          )}
-                          {copiedScript ? "已复制" : "复制模板"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={handleDownloadScript}
-                          className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
-                        >
-                          <Download className="h-3 w-3" />
-                          下载 .py
+                          <Plus className="h-3.5 w-3.5" />
+                          添加自定义刷新脚本
                         </button>
                       </div>
                     </div>
-
-                    <div className="rounded-lg bg-[var(--bg-elevated)] p-2.5 text-[11px] text-[var(--muted)]">
-                      标准进程协议：<span className="cc-mono text-[var(--text)]">stdin</span> 传入{" "}
-                      <span className="cc-mono">{`{"reason","sub_id","failed_servers"}`}</span>，
-                      <span className="cc-mono text-[var(--text)]">stdout</span> 返回{" "}
-                      <span className="cc-mono">{`{"schema":"catcloud-adapter/v1","nodes":[...],"yaml":null}`}</span>
-                      （上限 16 MiB，防风暴冷却 &gt;= 60s）。
-                    </div>
-
-                    <pre className="cc-selectable max-h-52 overflow-auto rounded-lg border border-[var(--line)] bg-[var(--bg)] p-3 cc-mono text-[11px] leading-relaxed text-[var(--text-secondary)]">
-                      {activeTemplateScript}
-                    </pre>
-
-                    <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
-                      <label className="text-[11px] text-[var(--muted)] sm:col-span-6">
-                        适配器启动命令
-                        <input
-                          type="text"
-                          value={adapterCmd}
-                          onChange={(e) => setAdapterCmd(e.target.value)}
-                          className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                        />
-                      </label>
-                      <label className="text-[11px] text-[var(--muted)] sm:col-span-3">
-                        超时 (秒)
-                        <input
-                          type="number"
-                          min={5}
-                          max={300}
-                          value={adapterTimeoutSec}
-                          onChange={(e) =>
-                            setAdapterTimeoutSec(Number(e.target.value) || 30)
-                          }
-                          className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                        />
-                      </label>
-                      <label className="text-[11px] text-[var(--muted)] sm:col-span-3">
-                        冷却 (&gt;=60s)
-                        <input
-                          type="number"
-                          min={60}
-                          max={86400}
-                          value={adapterCooldownSec}
-                          onChange={(e) =>
-                            setAdapterCooldownSec(
-                              Math.max(60, Number(e.target.value) || 60)
-                            )
-                          }
-                          className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                        />
-                      </label>
-                    </div>
-
-                    <div className="flex justify-end">
-                      <button
-                        type="button"
-                        onClick={handleRegisterAdapterSlot}
-                        className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        注册外挂适配器订阅源
-                      </button>
-                    </div>
-                  </div>
-                )}
+                  )}
+                </div>
               </>
             )}
           </div>
@@ -2151,56 +2228,29 @@ export function NodesSubsPage() {
   const storeGroups = useAppSelector((s) => s.groups);
   const globalPreAccel = useAppSelector((s) => s.config.preaccel);
 
-  // Interactive page state synced cleanly with initial store hydration
-  const [subscriptions, setSubscriptions] = useState<SubscriptionRecord[]>(() => [
-    ...storeSubs,
-  ]);
-  const [nodes, setNodes] = useState<ProxyNode[]>(() => [...storeNodes]);
-  const [groups, setGroups] = useState<MultiGroup[]>(() => [...storeGroups]);
-  const [hydratedKey, setHydratedKey] = useState<string>(
-    () => `${storeSubs.length}:${storeNodes.length}:${storeGroups.length}`
-  );
+  // Directly subscribe to appStore so edits on other pages always stay in sync
+  const subscriptions = storeSubs;
+  const nodes = storeNodes;
+  const groups = storeGroups;
 
-  useEffect(() => {
-    const incomingKey = `${storeSubs.length}:${storeNodes.length}:${storeGroups.length}`;
-    if (incomingKey === hydratedKey) return;
-    if (
-      subscriptions.length === 0 &&
-      nodes.length === 0 &&
-      (storeSubs.length > 0 || storeNodes.length > 0 || storeGroups.length > 0)
-    ) {
-      setSubscriptions([...storeSubs]);
-      setNodes([...storeNodes]);
-      setGroups([...storeGroups]);
-      setHydratedKey(incomingKey);
-    } else if (groups.length === 0 && storeGroups.length > 0) {
-      setGroups([...storeGroups]);
-      setHydratedKey(incomingKey);
-    }
-  }, [
-    storeSubs,
-    storeNodes,
-    storeGroups,
-    hydratedKey,
-    subscriptions.length,
-    nodes.length,
-    groups.length,
-  ]);
-
-  // Top subscription controls & add-subscription form
+  // Top subscription controls & quick import form
   const [refreshingIds, setRefreshingIds] = useState<Record<string, boolean>>({});
   const [refreshingAll, setRefreshingAll] = useState(false);
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [addKind, setAddKind] = useState<"url" | "file">("url");
+  const [importingSub, setImportingSub] = useState(false);
+  const [showLocalFileForm, setShowLocalFileForm] = useState(false);
   const [newSubName, setNewSubName] = useState("");
   const [newSubSource, setNewSubSource] = useState("");
+  const [localFileName, setLocalFileName] = useState("");
+  const [localFilePath, setLocalFilePath] = useState("");
   const [newSubIntervalSec, setNewSubIntervalSec] = useState(21600);
 
   // Drawers
   const [migrationOpen, setMigrationOpen] = useState(false);
   const [processAttachOpen, setProcessAttachOpen] = useState(false);
+  const closeMigration = useCallback(() => setMigrationOpen(false), []);
+  const closeProcessAttach = useCallback(() => setProcessAttachOpen(false), []);
 
-  // Multi-dimensional node filters
+  // Multi-dimensional node filters & pagination
   const [keyword, setKeyword] = useState("");
   const [filterSubId, setFilterSubId] = useState<string>("all");
   const [filterRegion, setFilterRegion] = useState<string>("all");
@@ -2213,6 +2263,9 @@ export function NodesSubsPage() {
     keepalive60s: false,
     aiUnlocked: false,
   });
+  const [showMoreFilters, setShowMoreFilters] = useState(false);
+  const [pageSize, setPageSize] = useState<30 | 50 | 100>(30);
+  const [currentPage, setCurrentPage] = useState<number>(1);
 
   // Cross-subscription batch selection & target multi-group
   const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(
@@ -2227,6 +2280,38 @@ export function NodesSubsPage() {
       setTargetGroupId(groups[0].id);
     }
   }, [groups, targetGroupId]);
+
+  // Prune stale selected node IDs whenever the backing node list shrinks
+  useEffect(() => {
+    setSelectedNodeIds((prev) => {
+      if (prev.size === 0) return prev;
+      const validIds = new Set(nodes.map((n) => n.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (validIds.has(id)) {
+          next.add(id);
+        } else {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [nodes]);
+
+  // Reset pagination to page 1 when filters or page size change
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [
+    keyword,
+    filterSubId,
+    filterRegion,
+    filterMultiplier,
+    filterProtocol,
+    filter443,
+    healthFilters,
+    pageSize,
+  ]);
 
   // Derived lookup maps
   const subNameMap = useMemo(() => {
@@ -2352,16 +2437,37 @@ export function NodesSubsPage() {
     return subSet.size;
   }, [nodes, selectedNodeIds]);
 
+  const targetGroup = useMemo(
+    () => groups.find((g) => g.id === targetGroupId) ?? null,
+    [groups, targetGroupId]
+  );
+
+  const targetGroupMemberSet = useMemo(
+    () => new Set(targetGroup?.member_node_ids ?? []),
+    [targetGroup]
+  );
+
+  const advancedFilterCount =
+    (filterMultiplier !== "all" ? 1 : 0) +
+    (filterProtocol !== "all" ? 1 : 0) +
+    (filter443 !== "all" ? 1 : 0) +
+    (healthFilters.googleClean ? 1 : 0) +
+    (healthFilters.keepalive60s ? 1 : 0) +
+    (healthFilters.aiUnlocked ? 1 : 0);
+
   const hasActiveFilters =
     keyword.trim().length > 0 ||
     filterSubId !== "all" ||
     filterRegion !== "all" ||
-    filterMultiplier !== "all" ||
-    filterProtocol !== "all" ||
-    filter443 !== "all" ||
-    healthFilters.googleClean ||
-    healthFilters.keepalive60s ||
-    healthFilters.aiUnlocked;
+    advancedFilterCount > 0;
+
+  const totalPages = Math.max(1, Math.ceil(filteredNodes.length / pageSize));
+  const safePage = Math.min(currentPage, totalPages);
+  const pageStartIndex = (safePage - 1) * pageSize;
+  const pagedNodes = useMemo(
+    () => filteredNodes.slice(pageStartIndex, pageStartIndex + pageSize),
+    [filteredNodes, pageStartIndex, pageSize]
+  );
 
   const allFilteredSelected =
     filteredNodes.length > 0 &&
@@ -2387,9 +2493,6 @@ export function NodesSubsPage() {
       catcloudApi.listNodes(),
       catcloudApi.listGroups(),
     ]);
-    setSubscriptions(latestSubs);
-    setNodes(latestNodes);
-    setGroups(latestGroups);
     appActions.syncSubscriptions(latestSubs);
     appActions.syncNodes(latestNodes);
     appActions.syncGroups(latestGroups);
@@ -2422,8 +2525,8 @@ export function NodesSubsPage() {
         );
       } catch (err) {
         const errMsg = formatErrorMessage(err);
-        setSubscriptions((prev) =>
-          prev.map((item) =>
+        appActions.syncSubscriptions(
+          subscriptions.map((item) =>
             item.id === sub.id ? { ...item, last_error: errMsg } : item
           )
         );
@@ -2443,9 +2546,9 @@ export function NodesSubsPage() {
     const nowIso = new Date().toISOString();
     if (simulateFault) {
       const errMsg =
-        "远端返回 HTTP 503 或 0 节点，已自动中止覆盖并保留现有老节点与自建规则";
-      setSubscriptions((prev) =>
-        prev.map((item) =>
+        "远端返回异常或 0 个节点，已自动中止覆盖并保留现有老节点与自建规则";
+      appActions.syncSubscriptions(
+        subscriptions.map((item) =>
           item.id === sub.id ? { ...item, last_error: errMsg } : item
         )
       );
@@ -2454,8 +2557,8 @@ export function NodesSubsPage() {
         "warn"
       );
     } else {
-      setSubscriptions((prev) =>
-        prev.map((item) =>
+      appActions.syncSubscriptions(
+        subscriptions.map((item) =>
           item.id === sub.id
             ? { ...item, last_ok_at: nowIso, last_error: null }
             : item
@@ -2499,36 +2602,50 @@ export function NodesSubsPage() {
 
     await waitManaged(300);
     const nowIso = new Date().toISOString();
-    setSubscriptions((prev) =>
-      prev.map((item) =>
+    appActions.syncSubscriptions(
+      subscriptions.map((item) =>
         item.enabled ? { ...item, last_ok_at: nowIso, last_error: null } : item
       )
     );
     setRefreshingAll(false);
     appActions.setMascotState("idle");
     appActions.showToast(
-      `已并发校验并刷新 ${subscriptions.filter((s) => s.enabled).length} 个启用订阅`,
+      `已刷新 ${subscriptions.filter((s) => s.enabled).length} 个已启用的订阅`,
       "ok"
     );
   };
 
-  const handleAddSubscription = async () => {
-    const name = newSubName.trim();
-    const source = newSubSource.trim();
-    if (!name || !source) {
-      appActions.showToast("请填写订阅名称与来源地址 / 文件路径", "warn");
+  const submitSubscriptionSource = async (
+    kind: "url" | "file",
+    rawSource: string,
+    rawName: string
+  ) => {
+    if (importingSub) return;
+    const source = rawSource.trim();
+    if (!source) {
+      appActions.showToast(
+        kind === "url"
+          ? "请先粘贴你的订阅链接"
+          : "请填写本地配置文件路径",
+        "warn"
+      );
       return;
     }
-    if (addKind === "url" && !/^https?:\/\//i.test(source)) {
-      appActions.showToast("URL 订阅请以 http:// 或 https:// 开头", "warn");
+    if (kind === "url" && !/^https?:\/\//i.test(source)) {
+      appActions.showToast("订阅链接需要以 http:// 或 https:// 开头", "warn");
       return;
     }
+    const name =
+      rawName.trim() ||
+      (kind === "url"
+        ? inferSubNameFromUrl(source)
+        : source.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "本地配置");
 
-    const subId = `sub-${addKind}-${Date.now()}`;
+    const subId = `sub-${kind}-${Date.now()}`;
     const nextSub: SubscriptionRecord = {
       id: subId,
       name,
-      kind: addKind,
+      kind,
       url_or_cmd: source,
       source,
       refresh_interval_sec: newSubIntervalSec,
@@ -2540,88 +2657,93 @@ export function NodesSubsPage() {
       enabled: true,
     };
 
-    if (inTauri) {
-      try {
-        const saved = await catcloudApi.upsertSubscription(nextSub);
-        let refreshNotice = "";
-        let refreshWarn = false;
+    setImportingSub(true);
+    appActions.setMascotState("searching");
+    try {
+      if (inTauri) {
         try {
-          const res = await catcloudApi.refreshSubscription(saved.id);
-          refreshNotice = `，已拉取 ${res.node_count} 个节点`;
-        } catch (refreshErr) {
-          refreshWarn = true;
-          refreshNotice = `，首次拉取失败（${formatErrorMessage(refreshErr)}）`;
+          const saved = await catcloudApi.upsertSubscription(nextSub);
+          let refreshNotice = "";
+          let refreshWarn = false;
+          try {
+            const res = await catcloudApi.refreshSubscription(saved.id);
+            refreshNotice = `，已拉回 ${res.node_count} 个节点`;
+          } catch (refreshErr) {
+            refreshWarn = true;
+            refreshNotice = `，拉取失败（${formatErrorMessage(refreshErr)}）`;
+          }
+          await syncListsFromBackend();
+          if (kind === "url") {
+            setNewSubName("");
+            setNewSubSource("");
+          } else {
+            setLocalFileName("");
+            setLocalFilePath("");
+            setShowLocalFileForm(false);
+          }
+          appActions.showToast(
+            `已导入「${name}」${refreshNotice}`,
+            refreshWarn ? "warn" : "ok"
+          );
+        } catch (err) {
+          appActions.showToast(`导入订阅失败：${formatErrorMessage(err)}`, "warn");
         }
-        await syncListsFromBackend();
+        return;
+      }
+
+      const previewSub: SubscriptionRecord = {
+        ...nextSub,
+        traffic_total_bytes: 300 * 1024 * 1024 * 1024,
+        expires_at: "2027-12-31",
+        last_ok_at: new Date().toISOString(),
+      };
+      const seedNode: ProxyNode = {
+        id: `${subId}-node-1`,
+        sub_id: subId,
+        name: `${name} · JP-01 · 1x`,
+        protocol: kind === "url" ? "vless" : "trojan",
+        server: kind === "url" ? "203.0.113.55" : "198.51.100.56",
+        port: 443,
+        region_code: "JP",
+        multiplier: 1.0,
+        is_443_native: true,
+        preaccel_override: null,
+        tags: ["native-443"],
+        enabled: true,
+      };
+
+      appActions.syncSubscriptions([...subscriptions, previewSub]);
+      appActions.syncNodes([...nodes, seedNode]);
+      if (kind === "url") {
         setNewSubName("");
         setNewSubSource("");
-        setShowAddForm(false);
-        appActions.showToast(
-          `已保存${SUB_KIND_LABELS[addKind]}：${name}${refreshNotice}`,
-          refreshWarn ? "warn" : "ok"
-        );
-      } catch (err) {
-        appActions.showToast(`新增订阅失败：${formatErrorMessage(err)}`, "warn");
+      } else {
+        setLocalFileName("");
+        setLocalFilePath("");
+        setShowLocalFileForm(false);
       }
-      return;
+      appActions.showToast(`已导入「${name}」（演示预览）`, "ok");
+    } finally {
+      setImportingSub(false);
+      appActions.setMascotState("idle");
     }
-
-    const previewSub: SubscriptionRecord = {
-      ...nextSub,
-      traffic_total_bytes: 300 * 1024 * 1024 * 1024,
-      expires_at: "2027-12-31",
-      last_ok_at: new Date().toISOString(),
-    };
-    const seedNode: ProxyNode = {
-      id: `${subId}-node-1`,
-      sub_id: subId,
-      name: `${name} · JP-01 · 1x`,
-      protocol: addKind === "url" ? "vless" : "trojan",
-      server: addKind === "url" ? "203.0.113.55" : "198.51.100.56",
-      port: 443,
-      region_code: "JP",
-      multiplier: 1.0,
-      is_443_native: true,
-      preaccel_override: null,
-      tags: ["native-443"],
-      enabled: true,
-    };
-
-    setSubscriptions((prev) => {
-      const next = [...prev, previewSub];
-      appActions.syncSubscriptions(next);
-      return next;
-    });
-    setNodes((prev) => {
-      const next = [...prev, seedNode];
-      appActions.syncNodes(next);
-      return next;
-    });
-    setNewSubName("");
-    setNewSubSource("");
-    setShowAddForm(false);
-    appActions.showToast(`已新增${SUB_KIND_LABELS[addKind]}（预览）：${name}`, "ok");
   };
 
   const handleRemoveSubscription = async (sub: SubscriptionRecord) => {
+    const removedIds = new Set(
+      nodes.filter((n) => n.sub_id === sub.id).map((n) => n.id)
+    );
     try {
       await catcloudApi.deleteSubscription(sub.id);
       if (inTauri) {
         await syncListsFromBackend();
       } else {
-        setSubscriptions((prev) => {
-          const next = prev.filter((item) => item.id !== sub.id);
-          appActions.syncSubscriptions(next);
-          return next;
-        });
-        const removedIds = new Set(
-          nodes.filter((n) => n.sub_id === sub.id).map((n) => n.id)
+        appActions.syncSubscriptions(
+          subscriptions.filter((item) => item.id !== sub.id)
         );
-        setNodes((prev) => {
-          const next = prev.filter((n) => n.sub_id !== sub.id);
-          appActions.syncNodes(next);
-          return next;
-        });
+        appActions.syncNodes(nodes.filter((n) => n.sub_id !== sub.id));
+      }
+      if (removedIds.size > 0) {
         setSelectedNodeIds((prev) => {
           const next = new Set(prev);
           for (const id of removedIds) next.delete(id);
@@ -2637,6 +2759,45 @@ export function NodesSubsPage() {
 
   /* ---------- Drawer Callbacks ---------- */
 
+  const persistMigratedRules = async (
+    prependRules: string[],
+    appendRules: string[]
+  ): Promise<{ savedCount: number; error: string | null }> => {
+    if (prependRules.length === 0 && appendRules.length === 0) {
+      return { savedCount: 0, error: null };
+    }
+    try {
+      const fullCfg = await catcloudApi.getFullConfig();
+      const prevPrepend = Array.isArray(fullCfg.rules_override?.global_prepend_rules)
+        ? fullCfg.rules_override.global_prepend_rules
+        : [];
+      const prevAppend = Array.isArray(fullCfg.rules_override?.global_append_rules)
+        ? fullCfg.rules_override.global_append_rules
+        : [];
+      const global_prepend_rules = Array.from(
+        new Set([...prevPrepend, ...prependRules])
+      );
+      const global_append_rules = Array.from(
+        new Set([...prevAppend, ...appendRules])
+      );
+      await catcloudApi.saveExtendedSettings({
+        rules_override: {
+          global_prepend_rules,
+          global_append_rules,
+        },
+      });
+      return {
+        savedCount: prependRules.length + appendRules.length,
+        error: null,
+      };
+    } catch (err) {
+      return {
+        savedCount: 0,
+        error: formatErrorMessage(err),
+      };
+    }
+  };
+
   const handleMigrationImport = async (
     preview: MigrationPreviewItem,
     customName: string,
@@ -2645,13 +2806,23 @@ export function NodesSubsPage() {
     if (inTauri) {
       try {
         const count = await catcloudApi.applyMigrationNodes(customName, preview.nodes);
+        const ruleRes = includeRules
+          ? await persistMigratedRules(preview.prepend_rules, preview.append_rules)
+          : { savedCount: 0, error: null };
         await syncListsFromBackend();
-        appActions.showToast(
-          `只读迁移完成：已落盘 ${count} 个节点（原目录零改动）`,
-          "ok"
-        );
+        if (ruleRes.error) {
+          appActions.showToast(
+            `已导入 ${count} 个节点，但分流规则保存失败：${ruleRes.error}`,
+            "warn"
+          );
+        } else {
+          appActions.showToast(
+            `导入完成：已保存 ${count} 个节点${ruleRes.savedCount > 0 ? `、${ruleRes.savedCount} 条分流规则` : ""}（原软件未改动）`,
+            "ok"
+          );
+        }
       } catch (err) {
-        appActions.showToast(`导入迁移节点失败：${formatErrorMessage(err)}`, "warn");
+        appActions.showToast(`导入节点失败：${formatErrorMessage(err)}`, "warn");
       }
       return;
     }
@@ -2677,15 +2848,16 @@ export function NodesSubsPage() {
       last_error: null,
       enabled: true,
     };
-    setSubscriptions((prev) => [...prev, nextSub]);
-    setNodes((prev) => [...prev, ...importedNodes]);
+    appActions.syncSubscriptions([...subscriptions, nextSub]);
+    appActions.syncNodes([...nodes, ...importedNodes]);
     setFilterSubId(subId);
 
-    const ruleCount = includeRules
-      ? preview.prepend_rules.length + preview.append_rules.length
-      : 0;
+    const ruleRes = includeRules
+      ? await persistMigratedRules(preview.prepend_rules, preview.append_rules)
+      : { savedCount: 0, error: null };
+
     appActions.showToast(
-      `只读迁移完成：导入 ${importedNodes.length} 个节点${ruleCount > 0 ? `、${ruleCount} 条规则` : ""}（原目录零改动）`,
+      `导入完成：已保存 ${importedNodes.length} 个节点${ruleRes.savedCount > 0 ? `、${ruleRes.savedCount} 条分流规则` : ""}（原软件未改动）`,
       "ok"
     );
   };
@@ -2716,22 +2888,30 @@ export function NodesSubsPage() {
       try {
         const saved = await catcloudApi.upsertSubscription(nextSub);
         let note = "";
+        let refreshErrMsg: string | null = null;
         if (payload.nodes.length > 0) {
           const imported = await catcloudApi.applyMigrationNodes(payload.name, payload.nodes);
-          note = `（已落盘 ${imported} 节点）`;
+          note = `（已保存 ${imported} 个节点）`;
         } else {
           try {
             const refreshed = await catcloudApi.refreshSubscription(saved.id);
-            note = `（已拉取 ${refreshed.node_count} 节点）`;
-          } catch {
-            note = "（已注册来源，可点击刷新拉取）";
+            note = `（已抓回 ${refreshed.node_count} 个节点）`;
+          } catch (refreshErr) {
+            refreshErrMsg = formatErrorMessage(refreshErr);
           }
         }
         await syncListsFromBackend();
         setFilterSubId(saved.id);
-        appActions.showToast(`已关联 ${payload.name}${note}`, "ok");
+        if (refreshErrMsg) {
+          appActions.showToast(
+            `已添加「${payload.name}」，但抓节点失败：${refreshErrMsg}`,
+            "warn"
+          );
+        } else {
+          appActions.showToast(`已关联 ${payload.name}${note}`, "ok");
+        }
       } catch (err) {
-        appActions.showToast(`关联进程源失败：${formatErrorMessage(err)}`, "warn");
+        appActions.showToast(`抓取软件节点失败：${formatErrorMessage(err)}`, "warn");
       }
       return;
     }
@@ -2745,16 +2925,16 @@ export function NodesSubsPage() {
       ...nextSub,
       last_ok_at: new Date().toISOString(),
     };
-    setSubscriptions((prev) => [...prev, previewSub]);
-    setNodes((prev) => [...prev, ...boundNodes]);
+    appActions.syncSubscriptions([...subscriptions, previewSub]);
+    appActions.syncNodes([...nodes, ...boundNodes]);
     setFilterSubId(subId);
     appActions.showToast(
-      `已关联 ${payload.name}（引入 ${boundNodes.length} 个节点）`,
+      `已抓取 ${payload.name}（共 ${boundNodes.length} 个节点）`,
       "ok"
     );
   };
 
-  /* ---------- Node Selection, Batch Group Join & PreAccel Override ---------- */
+  /* ---------- Node Selection, Batch Group Join/Remove & PreAccel Override ---------- */
 
   const toggleSelectNode = (nodeId: string) => {
     setSelectedNodeIds((prev) => {
@@ -2779,16 +2959,14 @@ export function NodesSubsPage() {
 
   const handleBatchAddToGroup = async () => {
     if (selectedNodeIds.size === 0) return;
-    const targetGroup = groups.find((g) => g.id === targetGroupId);
     if (!targetGroup) {
       appActions.showToast("请先选择目标多选组", "warn");
       return;
     }
 
-    const existing = new Set(targetGroup.member_node_ids);
     const toAdd: string[] = [];
     for (const nid of selectedNodeIds) {
-      if (!existing.has(nid)) toAdd.push(nid);
+      if (!targetGroupMemberSet.has(nid)) toAdd.push(nid);
     }
 
     if (toAdd.length === 0) {
@@ -2805,24 +2983,61 @@ export function NodesSubsPage() {
         targetGroup.id,
         updatedMemberIds
       );
-      setGroups((prev) => {
-        const next = prev.map((g) => (g.id === updated.id ? updated : g));
-        appActions.syncGroups(next);
-        return next;
-      });
+      appActions.syncGroups(
+        groups.map((g) => (g.id === updated.id ? updated : g))
+      );
       appActions.showToast(
-        `已将 ${toAdd.length} 个节点批量加入「${targetGroup.name}」`,
+        `已将 ${toAdd.length} 个节点加入「${targetGroup.name}」`,
         "ok"
       );
     } catch (err) {
-      appActions.showToast(`批量入组失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`加入多选组失败：${formatErrorMessage(err)}`, "warn");
+    }
+  };
+
+  const handleBatchRemoveFromGroup = async () => {
+    if (selectedNodeIds.size === 0) return;
+    if (!targetGroup) {
+      appActions.showToast("请先选择目标多选组", "warn");
+      return;
+    }
+
+    let removeCount = 0;
+    for (const nid of selectedNodeIds) {
+      if (targetGroupMemberSet.has(nid)) removeCount += 1;
+    }
+
+    if (removeCount === 0) {
+      appActions.showToast(
+        `所选节点都不在「${targetGroup.name}」中`,
+        "info"
+      );
+      return;
+    }
+
+    const updatedMemberIds = targetGroup.member_node_ids.filter(
+      (id) => !selectedNodeIds.has(id)
+    );
+    try {
+      const updated = await catcloudApi.updateMultiGroupMembers(
+        targetGroup.id,
+        updatedMemberIds
+      );
+      appActions.syncGroups(
+        groups.map((g) => (g.id === updated.id ? updated : g))
+      );
+      appActions.showToast(
+        `已将 ${removeCount} 个节点移出「${targetGroup.name}」`,
+        "ok"
+      );
+    } catch (err) {
+      appActions.showToast(`移出多选组失败：${formatErrorMessage(err)}`, "warn");
     }
   };
 
   const handleToggleSingleGroupMember = async (nodeId: string) => {
-    const targetGroup = groups.find((g) => g.id === targetGroupId);
     if (!targetGroup) return;
-    const inGroup = targetGroup.member_node_ids.includes(nodeId);
+    const inGroup = targetGroupMemberSet.has(nodeId);
     const nextMembers = inGroup
       ? targetGroup.member_node_ids.filter((id) => id !== nodeId)
       : [...targetGroup.member_node_ids, nodeId];
@@ -2832,11 +3047,9 @@ export function NodesSubsPage() {
         targetGroup.id,
         nextMembers
       );
-      setGroups((prev) => {
-        const next = prev.map((g) => (g.id === updated.id ? updated : g));
-        appActions.syncGroups(next);
-        return next;
-      });
+      appActions.syncGroups(
+        groups.map((g) => (g.id === updated.id ? updated : g))
+      );
       appActions.showToast(
         inGroup
           ? `已从「${targetGroup.name}」移出该节点`
@@ -2863,25 +3076,24 @@ export function NodesSubsPage() {
     const optimistic = nodes.map((n) =>
       idSet.has(n.id) ? { ...n, preaccel_override: overrideValue } : n
     );
-    setNodes(optimistic);
+    appActions.syncNodes(optimistic);
     try {
       await catcloudApi.setNodesPreAccelOverride(nodeIds, overrideMode);
-      appActions.syncNodes(optimistic);
       const label =
         overrideValue === null
-          ? "跟随全局"
+          ? "自动跟随全局"
           : overrideValue
-            ? "强制开启预加速"
-            : "强制关闭预加速";
+            ? "强制开启中转加速"
+            : "强制关闭中转加速";
       appActions.showToast(
         nodeIds.length > 1
-          ? `已将 ${nodeIds.length} 个节点预加速策略设为「${label}」`
-          : `已更新单节点预加速策略：${label}`,
+          ? `已将 ${nodeIds.length} 个节点的中转加速设为「${label}」`
+          : `已更新中转加速方式：${label}`,
         "ok"
       );
     } catch (err) {
-      setNodes(prevNodes);
-      appActions.showToast(`设置预加速覆写失败：${formatErrorMessage(err)}`, "warn");
+      appActions.syncNodes(prevNodes);
+      appActions.showToast(`设置中转加速失败：${formatErrorMessage(err)}`, "warn");
     }
   };
 
@@ -2900,115 +3112,202 @@ export function NodesSubsPage() {
   };
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-3">
       {/* ====================================================================
-       * 1. Page Header & Quick Entry Toolbar
+       * 1. Compact Header & Refresh All Bar
        * ==================================================================== */}
-      <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
+      <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-2.5 rounded-2xl px-4 py-2.5">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="text-base font-semibold tracking-tight text-[var(--text)]">
-              节点与多订阅混池
+              节点与订阅
             </h1>
-            <span className="rounded-full bg-[var(--accent-soft)] px-2 py-0.5 cc-mono text-[11px] font-medium text-[var(--accent)]">
-              {subscriptions.length} 订阅 · {nodes.length} 节点 · {native443Count} 个 443 原生
+            <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-0.5 cc-mono text-[11px] font-medium text-[var(--accent)]">
+              {subscriptions.length} 个订阅 · {nodes.length} 个节点 · {native443Count} 个直连 443
             </span>
           </div>
-          <div className="mt-1.5 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
-            <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--green)]">
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
+            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-[var(--green)]">
               <ShieldCheck className="h-3.5 w-3.5" />
-              刷新异常自动保护老节点与自建规则
-            </span>
-            <span>
-              支持多云混合筛选、跨家一键入组、只读迁移与进程外挂对口
+              刷新失败时自动保留原有节点，不会清空
             </span>
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          disabled={refreshingAll || subscriptions.length === 0}
+          onClick={() => void refreshAllSubscriptions()}
+          className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
+        >
+          <RefreshCw
+            className={`h-3.5 w-3.5 text-[var(--accent)] ${refreshingAll ? "animate-spin" : ""}`}
+          />
+          全部刷新
+        </button>
+      </section>
+
+      {/* ====================================================================
+       * 2. Beginner-Friendly 3-Card Quick Import Hub
+       * ==================================================================== */}
+      <section
+        aria-label="快速导入节点入口"
+        className="grid grid-cols-1 gap-3.5 lg:grid-cols-3"
+      >
+        {/* Card 1: Paste Subscription URL */}
+        <div className="cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl border-[var(--accent)]/45 p-4">
+          <div className="space-y-2.5">
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                  <Link2 className="h-4 w-4" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--accent)] text-[10px] font-bold text-[var(--accent-ink)]">
+                      1
+                    </span>
+                    <h2 className="text-sm font-semibold text-[var(--text)]">
+                      粘贴订阅链接
+                    </h2>
+                  </div>
+                  <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                    贴上机场给的订阅地址，点一下立刻拉回节点
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowLocalFileForm((v) => !v)}
+                className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                  showLocalFileForm
+                    ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                    : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                }`}
+              >
+                <FileText className="h-3 w-3" />
+                {showLocalFileForm ? "收起本地文件" : "本地文件"}
+              </button>
+            </div>
+
+            <input
+              type="text"
+              value={newSubSource}
+              onChange={(e) => setNewSubSource(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  void submitSubscriptionSource("url", newSubSource, newSubName);
+                }
+              }}
+              placeholder="粘贴 https:// 开头的订阅链接..."
+              className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 cc-mono text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+            />
+          </div>
+
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={newSubName}
+              onChange={(e) => setNewSubName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  void submitSubscriptionSource("url", newSubSource, newSubName);
+                }
+              }}
+              placeholder="名称（可选，留空自动命名）"
+              className="min-w-0 flex-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+            />
+            <button
+              type="button"
+              disabled={importingSub}
+              onClick={() =>
+                void submitSubscriptionSource("url", newSubSource, newSubName)
+              }
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              {importingSub ? (
+                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Check className="h-3.5 w-3.5" />
+              )}
+              {importingSub ? "导入中..." : "一键导入"}
+            </button>
+          </div>
+        </div>
+
+        {/* Card 2: Import from Existing VPN Client */}
+        <div className="cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl p-4">
+          <div className="space-y-2">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--green-soft)] text-[var(--green)]">
+                <FolderOpen className="h-4 w-4" />
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--green)] text-[10px] font-bold text-[var(--accent-ink)]">
+                  2
+                </span>
+                <h2 className="text-sm font-semibold text-[var(--text)]">
+                  从电脑已有梯子导入
+                </h2>
+              </div>
+            </div>
+            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+              自动找 Clash Verge / 落云 / v2rayN 已有配置，只读安全复制，不改你原来的软件。
+            </p>
+          </div>
+
           <button
             type="button"
             onClick={() => setMigrationOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)]"
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--green)]/50 bg-[var(--green-soft)] px-4 py-2 text-xs font-semibold text-[var(--green)] transition-opacity hover:opacity-90"
           >
-            <FolderOpen className="h-3.5 w-3.5 text-[var(--accent)]" />
-            老配置只读迁移
+            <Search className="h-3.5 w-3.5" />
+            自动扫描并导入
           </button>
+        </div>
+
+        {/* Card 3: Capture Nodes from Running Software */}
+        <div className="cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl p-4">
+          <div className="space-y-2">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--sky-soft)] text-[var(--sky)]">
+                <Cpu className="h-4 w-4" />
+              </div>
+              <div className="flex items-center gap-1.5">
+                <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--sky)] text-[10px] font-bold text-[var(--accent-ink)]">
+                  3
+                </span>
+                <h2 className="text-sm font-semibold text-[var(--text)]">
+                  从正在运行的软件抓节点
+                </h2>
+              </div>
+            </div>
+            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+              先打开你的专用梯子软件，点这里自动识别并抓取可用节点。
+            </p>
+          </div>
 
           <button
             type="button"
             onClick={() => setProcessAttachOpen(true)}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)]"
+            className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--sky)]/50 bg-[var(--sky-soft)] px-4 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90"
           >
-            <Cpu className="h-3.5 w-3.5 text-[var(--sky)]" />
-            选进程智能对口
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setShowAddForm((v) => !v)}
-            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
-              showAddForm
-                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)]"
-            }`}
-          >
-            <Plus className="h-3.5 w-3.5" />
-            新增订阅
-          </button>
-
-          <button
-            type="button"
-            disabled={refreshingAll || subscriptions.length === 0}
-            onClick={() => void refreshAllSubscriptions()}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            <RefreshCw
-              className={`h-3.5 w-3.5 ${refreshingAll ? "animate-spin" : ""}`}
-            />
-            全部刷新
+            <Cpu className="h-3.5 w-3.5" />
+            识别运行中的软件
           </button>
         </div>
       </section>
 
-      {/* ====================================================================
-       * 2. Collapsible Add URL / Local File Subscription Form
-       * ==================================================================== */}
-      {showAddForm && (
-        <section className="cc-card cc-glass space-y-3 rounded-2xl border-[var(--accent)]/60 p-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <span className="text-xs font-semibold text-[var(--text)]">
-                新增订阅来源
-              </span>
-              <div className="inline-flex rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]">
-                <button
-                  type="button"
-                  onClick={() => setAddKind("url")}
-                  className={`rounded-md px-2.5 py-1 font-medium transition-colors ${
-                    addKind === "url"
-                      ? "bg-[var(--accent)] text-[var(--accent-ink)]"
-                      : "text-[var(--muted)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  URL 远程订阅
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setAddKind("file")}
-                  className={`rounded-md px-2.5 py-1 font-medium transition-colors ${
-                    addKind === "file"
-                      ? "bg-[var(--accent)] text-[var(--accent-ink)]"
-                      : "text-[var(--muted)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  本地配置文件
-                </button>
-              </div>
-            </div>
+      {/* Optional Collapsible Local File Import Form */}
+      {showLocalFileForm && (
+        <section className="cc-card cc-glass space-y-3 rounded-2xl border-[var(--accent)]/50 p-4">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-xs font-semibold text-[var(--text)]">
+              导入电脑里的本地配置文件（只读）
+            </span>
             <button
               type="button"
-              onClick={() => setShowAddForm(false)}
+              onClick={() => setShowLocalFileForm(false)}
               className="text-xs text-[var(--muted)] hover:text-[var(--text)]"
             >
               收起
@@ -3017,29 +3316,23 @@ export function NodesSubsPage() {
 
           <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
             <label className="text-[11px] text-[var(--muted)] md:col-span-3">
-              订阅名称
+              名称（可选）
               <input
                 type="text"
-                value={newSubName}
-                onChange={(e) => setNewSubName(e.target.value)}
-                placeholder={
-                  addKind === "url" ? "例如：Demo Cloud Beta" : "例如：本地原生节点集"
-                }
+                value={localFileName}
+                onChange={(e) => setLocalFileName(e.target.value)}
+                placeholder="例如：我的本地节点"
                 className="mt-1 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
             </label>
 
             <label className="text-[11px] text-[var(--muted)] md:col-span-6">
-              {addKind === "url" ? "订阅链接（支持 Clash YAML / Base64 / URI）" : "本地只读配置文件路径"}
+              本地配置文件路径
               <input
                 type="text"
-                value={newSubSource}
-                onChange={(e) => setNewSubSource(e.target.value)}
-                placeholder={
-                  addKind === "url"
-                    ? "https://example.invalid/sub/demo-provider.yaml"
-                    : "data/subs/demo-custom.yaml"
-                }
+                value={localFilePath}
+                onChange={(e) => setLocalFilePath(e.target.value)}
+                placeholder="例如：data/subs/my-nodes.yaml"
                 className="mt-1 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 cc-mono text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
             </label>
@@ -3061,25 +3354,34 @@ export function NodesSubsPage() {
 
           <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px] text-[var(--muted)]">
             <span>
-              单次拉取严格限制 &lt;= 16 MiB；若返回非 2xx、空节点或解析失败，自动中止覆盖保护现有老节点。
+              如果文件暂时读不到或内容为空，会自动保留原有节点不会丢失。
             </span>
             <button
               type="button"
-              onClick={() => void handleAddSubscription()}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
+              disabled={importingSub}
+              onClick={() =>
+                void submitSubscriptionSource("file", localFilePath, localFileName)
+              }
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50"
             >
               <Check className="h-3.5 w-3.5" />
-              保存并校验拉取
+              保存并读取节点
             </button>
           </div>
         </section>
       )}
 
       {/* ====================================================================
-       * 3. Horizontal Multi-Cloud Subscription Cards Strip
+       * 3. Adaptive Subscription Cards Grid
        * ==================================================================== */}
-      <section aria-label="多云订阅卡片">
-        <div className="flex gap-3 overflow-x-auto pb-1.5">
+      <section aria-label="已导入订阅卡片">
+        <div
+          className={
+            subscriptions.length >= 3
+              ? "grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3"
+              : "grid grid-cols-1 gap-3 md:grid-cols-2"
+          }
+        >
           {subscriptions.map((sub) => {
             const hasQuota = sub.traffic_total_bytes > 0;
             const usedBytes = Math.max(0, sub.traffic_used_bytes);
@@ -3099,11 +3401,12 @@ export function NodesSubsPage() {
             const nodeCount = subNodeCountMap.get(sub.id) ?? 0;
             const isSelectedFilter = filterSubId === sub.id;
             const isRefreshing = Boolean(refreshingIds[sub.id]) || refreshingAll;
+            const maskedSource = maskSubscriptionSource(getSubSource(sub));
 
             return (
               <article
                 key={sub.id}
-                className={`cc-card cc-glass flex min-w-[300px] max-w-[360px] flex-1 flex-col justify-between rounded-2xl p-3.5 ${
+                className={`cc-card cc-glass flex min-w-0 flex-col justify-between rounded-2xl p-3.5 ${
                   isSelectedFilter ? "border-[var(--accent)]" : ""
                 }`}
               >
@@ -3116,7 +3419,7 @@ export function NodesSubsPage() {
                         setFilterSubId(isSelectedFilter ? "all" : sub.id)
                       }
                       className="min-w-0 text-left"
-                      title="点击按此订阅筛选下方节点库"
+                      title="点击只看这个订阅的节点"
                     >
                       <div className="flex items-center gap-1.5">
                         <span className="truncate text-sm font-semibold text-[var(--text)]">
@@ -3127,7 +3430,7 @@ export function NodesSubsPage() {
                         </span>
                       </div>
                       <div className="mt-0.5 truncate cc-mono text-[11px] text-[var(--muted)]">
-                        {getSubSource(sub)}
+                        {maskedSource}
                       </div>
                     </button>
 
@@ -3137,7 +3440,7 @@ export function NodesSubsPage() {
                         disabled={isRefreshing}
                         onClick={() => void refreshSingleSubscription(sub, false)}
                         className="inline-flex h-7 items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
-                        title="单卡安全刷新（异常自动保护老节点与自建规则）"
+                        title="刷新节点列表（失败自动保留原有节点）"
                       >
                         <RefreshCw
                           className={`h-3 w-3 ${isRefreshing ? "animate-spin" : ""}`}
@@ -3150,7 +3453,7 @@ export function NodesSubsPage() {
                           disabled={isRefreshing}
                           onClick={() => void refreshSingleSubscription(sub, true)}
                           className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:border-[var(--amber)] hover:text-[var(--amber)] disabled:opacity-50"
-                          title="演练刷新异常保护（预览演示：验证老节点不被清空）"
+                          title="演示刷新失败保护效果"
                         >
                           <ShieldAlert className="h-3.5 w-3.5" />
                         </button>
@@ -3160,7 +3463,7 @@ export function NodesSubsPage() {
                           type="button"
                           onClick={() => void handleRemoveSubscription(sub)}
                           className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:border-[var(--red)] hover:text-[var(--red)]"
-                          title="移除此订阅源"
+                          title="删除此订阅"
                         >
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
@@ -3176,12 +3479,12 @@ export function NodesSubsPage() {
                           <span className="text-[var(--muted)]">
                             已用{" "}
                             <span className="cc-mono text-[var(--text)]">
-                              {formatBytes(usedBytes)}
+                              {formatQuotaBytes(usedBytes)}
                             </span>{" "}
-                            / {formatBytes(sub.traffic_total_bytes)}
+                            / {formatQuotaBytes(sub.traffic_total_bytes)}
                           </span>
                           <span className="cc-mono font-medium text-[var(--text-secondary)]">
-                            余 {formatBytes(remainingBytes)} ({100 - usagePct}%)
+                            余 {formatQuotaBytes(remainingBytes)} ({100 - usagePct}%)
                           </span>
                         </div>
                         <div className="mt-1.5 h-1.5 w-full overflow-hidden rounded-full bg-[var(--bg-elevated)]">
@@ -3196,11 +3499,11 @@ export function NodesSubsPage() {
                       </>
                     ) : (
                       <div className="rounded-lg bg-[var(--bg-elevated)] px-2.5 py-1.5 text-[11px] text-[var(--muted)]">
-                        无远端流量配额头 · 当前已托管{" "}
+                        暂未提供流量统计 · 当前共{" "}
                         <span className="cc-mono text-[var(--text)]">
                           {nodeCount}
                         </span>{" "}
-                        个只读节点
+                        个节点
                       </div>
                     )}
                   </div>
@@ -3247,17 +3550,17 @@ export function NodesSubsPage() {
       </section>
 
       {/* ====================================================================
-       * 4. Multi-Dimensional Filter Matrix
+       * 4. Compact Node Filter Bar (Primary: Search + Source + Region; More Filters Collapsible)
        * ==================================================================== */}
-      <section className="cc-card cc-glass space-y-3 rounded-2xl p-4">
+      <section className="cc-card cc-glass space-y-2.5 rounded-2xl p-3.5">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex items-center gap-2">
             <Filter className="h-4 w-4 text-[var(--accent)]" />
             <h2 className="text-xs font-semibold text-[var(--text)]">
-              多维节点库叠加筛选
+              筛选节点
             </h2>
             <span className="cc-mono text-[11px] text-[var(--muted)]">
-              命中 {filteredNodes.length} / {nodes.length}
+              显示 {filteredNodes.length} / {nodes.length}
             </span>
           </div>
 
@@ -3268,10 +3571,32 @@ export function NodesSubsPage() {
                 type="text"
                 value={keyword}
                 onChange={(e) => setKeyword(e.target.value)}
-                placeholder="搜节点名、地区、协议、标签或域名..."
+                placeholder="搜节点名称、地区、协议或地址..."
                 className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
             </div>
+
+            <button
+              type="button"
+              onClick={() => setShowMoreFilters((v) => !v)}
+              className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                showMoreFilters || advancedFilterCount > 0
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+              }`}
+            >
+              <span>更多筛选</span>
+              {advancedFilterCount > 0 && (
+                <span className="cc-mono rounded-full bg-[var(--accent)] px-1.5 py-0.2 text-[10px] font-semibold text-[var(--accent-ink)]">
+                  {advancedFilterCount}
+                </span>
+              )}
+              {showMoreFilters ? (
+                <ChevronDown className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" />
+              )}
+            </button>
 
             {hasActiveFilters && (
               <button
@@ -3291,7 +3616,7 @@ export function NodesSubsPage() {
           {/* Row A: Subscription Source & Region */}
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
             <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[var(--muted)]">来源订阅</span>
+              <span className="text-[var(--muted)]">来源</span>
               <button
                 type="button"
                 onClick={() => setFilterSubId("all")}
@@ -3350,124 +3675,126 @@ export function NodesSubsPage() {
             </div>
           </div>
 
-          {/* Row B: Multiplier Range, Protocol, 443 Native & Health Checks */}
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-[var(--line)]/70 pt-2">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[var(--muted)]">倍率区间</span>
-              {(
-                [
-                  { id: "all", label: "全部" },
-                  { id: "le1", label: "<= 1x" },
-                  { id: "1to2", label: "1x..2x" },
-                  { id: "ge3", label: "3x+" },
-                ] as const
-              ).map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => setFilterMultiplier(opt.id)}
-                  className={`rounded-lg border px-2 py-0.5 cc-mono transition-colors ${
-                    filterMultiplier === opt.id
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[var(--muted)]">协议</span>
-              <button
-                type="button"
-                onClick={() => setFilterProtocol("all")}
-                className={`rounded-lg border px-2 py-0.5 transition-colors ${
-                  filterProtocol === "all"
-                    ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                }`}
-              >
-                全部
-              </button>
-              {protocolStats.map(([proto, count]) => (
-                <button
-                  key={proto}
-                  type="button"
-                  onClick={() => setFilterProtocol(proto)}
-                  className={`rounded-lg border px-2 py-0.5 cc-mono uppercase transition-colors ${
-                    filterProtocol === proto
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  {proto} ({count})
-                </button>
-              ))}
-            </div>
-
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[var(--muted)]">443 原生</span>
-              {(
-                [
-                  { id: "all", label: "全部" },
-                  { id: "only_443", label: "仅 443 原生" },
-                  { id: "non_443", label: "非 443" },
-                ] as const
-              ).map((opt) => (
-                <button
-                  key={opt.id}
-                  type="button"
-                  onClick={() => setFilter443(opt.id)}
-                  className={`rounded-lg border px-2 py-0.5 transition-colors ${
-                    filter443 === opt.id
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex flex-wrap items-center gap-1.5">
-              <span className="text-[var(--muted)]">体检状态</span>
-              {(
-                [
-                  { key: "googleClean", label: "零送中" },
-                  { key: "keepalive60s", label: "60s 保活" },
-                  { key: "aiUnlocked", label: "AI 解锁" },
-                ] as const
-              ).map((item) => {
-                const active = healthFilters[item.key];
-                return (
+          {/* Collapsible Row B: Multiplier Range, Protocol, Direct 443 & Health Checks */}
+          {showMoreFilters && (
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-[var(--line)]/70 pt-2">
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[var(--muted)]">流量倍率</span>
+                {(
+                  [
+                    { id: "all", label: "全部" },
+                    { id: "le1", label: "<= 1x" },
+                    { id: "1to2", label: "1x..2x" },
+                    { id: "ge3", label: "3x+" },
+                  ] as const
+                ).map((opt) => (
                   <button
-                    key={item.key}
+                    key={opt.id}
                     type="button"
-                    onClick={() =>
-                      setHealthFilters((prev) => ({
-                        ...prev,
-                        [item.key]: !prev[item.key],
-                      }))
-                    }
-                    className={`inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 transition-colors ${
-                      active
-                        ? "border-[var(--green)] bg-[var(--green-soft)] font-medium text-[var(--green)]"
+                    onClick={() => setFilterMultiplier(opt.id)}
+                    className={`rounded-lg border px-2 py-0.5 cc-mono transition-colors ${
+                      filterMultiplier === opt.id
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
                         : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
                     }`}
                   >
-                    {active && <Check className="h-3 w-3" />}
-                    {item.label}
+                    {opt.label}
                   </button>
-                );
-              })}
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[var(--muted)]">协议</span>
+                <button
+                  type="button"
+                  onClick={() => setFilterProtocol("all")}
+                  className={`rounded-lg border px-2 py-0.5 transition-colors ${
+                    filterProtocol === "all"
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                  }`}
+                >
+                  全部
+                </button>
+                {protocolStats.map(([proto, count]) => (
+                  <button
+                    key={proto}
+                    type="button"
+                    onClick={() => setFilterProtocol(proto)}
+                    className={`rounded-lg border px-2 py-0.5 cc-mono uppercase transition-colors ${
+                      filterProtocol === proto
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    {proto} ({count})
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[var(--muted)]">端口类型</span>
+                {(
+                  [
+                    { id: "all", label: "全部" },
+                    { id: "only_443", label: "仅直连 443" },
+                    { id: "non_443", label: "其他端口" },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setFilter443(opt.id)}
+                    className={`rounded-lg border px-2 py-0.5 transition-colors ${
+                      filter443 === opt.id
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-medium text-[var(--accent)]"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5">
+                <span className="text-[var(--muted)]">可用性</span>
+                {(
+                  [
+                    { key: "googleClean", label: "Google 正常" },
+                    { key: "keepalive60s", label: "长连接稳定" },
+                    { key: "aiUnlocked", label: "AI 解锁" },
+                  ] as const
+                ).map((item) => {
+                  const active = healthFilters[item.key];
+                  return (
+                    <button
+                      key={item.key}
+                      type="button"
+                      onClick={() =>
+                        setHealthFilters((prev) => ({
+                          ...prev,
+                          [item.key]: !prev[item.key],
+                        }))
+                      }
+                      className={`inline-flex items-center gap-1 rounded-lg border px-2 py-0.5 transition-colors ${
+                        active
+                          ? "border-[var(--green)] bg-[var(--green-soft)] font-medium text-[var(--green)]"
+                          : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                      }`}
+                    >
+                      {active && <Check className="h-3 w-3" />}
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </section>
 
       {/* ====================================================================
-       * 5. Cross-Subscription Batch Grouping & PreAccel Override Bar
+       * 5. Batch Group Add/Remove & Relay Override Bar
        * ==================================================================== */}
       <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl px-4 py-3">
         <div className="flex flex-wrap items-center gap-2.5 text-xs">
@@ -3477,7 +3804,9 @@ export function NodesSubsPage() {
             className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
           >
             <Check className="h-3 w-3 text-[var(--accent)]" />
-            {allFilteredSelected ? "取消全选当前页" : "全选当前筛选结果"}
+            {allFilteredSelected
+              ? "取消全选筛选结果"
+              : `全选当前筛选 (${filteredNodes.length})`}
           </button>
 
           {selectedNodeIds.size > 0 ? (
@@ -3485,7 +3814,7 @@ export function NodesSubsPage() {
               <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-0.5 cc-mono text-[11px] font-medium text-[var(--accent)]">
                 已勾选 {selectedNodeIds.size} 个节点
                 {selectedCrossSubCount > 1
-                  ? `（跨 ${selectedCrossSubCount} 家订阅）`
+                  ? `（来自 ${selectedCrossSubCount} 个订阅）`
                   : ""}
               </span>
               <button
@@ -3498,7 +3827,7 @@ export function NodesSubsPage() {
             </>
           ) : (
             <span className="text-[11px] text-[var(--muted)]">
-              可跨多家订阅自由勾选节点，一键批量编入指定智能多选组
+              勾选下方节点，可批量加入或移出指定多选组
             </span>
           )}
         </div>
@@ -3524,10 +3853,28 @@ export function NodesSubsPage() {
             type="button"
             disabled={selectedNodeIds.size === 0 || groups.length === 0}
             onClick={() => void handleBatchAddToGroup()}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl px-3 py-1.5 text-xs font-semibold transition-colors ${
+              selectedNodeIds.size === 0 || groups.length === 0
+                ? "cursor-not-allowed border border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)]"
+                : "bg-[var(--accent)] text-[var(--accent-ink)] hover:opacity-90"
+            }`}
           >
-            <Plus className="h-3.5 w-3.5" />
-            批量加入所选多选组
+            <Plus className="h-3.5 w-3.5 shrink-0" />
+            加入多选组
+          </button>
+
+          <button
+            type="button"
+            disabled={selectedNodeIds.size === 0 || groups.length === 0}
+            onClick={() => void handleBatchRemoveFromGroup()}
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
+              selectedNodeIds.size === 0 || groups.length === 0
+                ? "cursor-not-allowed border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)]"
+                : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--red)] hover:text-[var(--red)]"
+            }`}
+          >
+            <Minus className="h-3.5 w-3.5 shrink-0" />
+            移出多选组
           </button>
 
           {selectedNodeIds.size > 0 && (
@@ -3538,9 +3885,9 @@ export function NodesSubsPage() {
                   void handleSetPreAccelOverride(Array.from(selectedNodeIds), true)
                 }
                 className="rounded-lg px-2 py-1 text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--accent)]"
-                title="将所选节点批量设为强制开启国内预加速"
+                title="让所选节点强制走中转加速"
               >
-                批量预加速开
+                中转开
               </button>
               <button
                 type="button"
@@ -3548,9 +3895,9 @@ export function NodesSubsPage() {
                   void handleSetPreAccelOverride(Array.from(selectedNodeIds), false)
                 }
                 className="rounded-lg px-2 py-1 text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--red)]"
-                title="将所选节点批量设为强制关闭国内预加速"
+                title="让所选节点强制直连不走中转"
               >
-                强制关
+                中转关
               </button>
               <button
                 type="button"
@@ -3558,9 +3905,9 @@ export function NodesSubsPage() {
                   void handleSetPreAccelOverride(Array.from(selectedNodeIds), null)
                 }
                 className="rounded-lg px-2 py-1 text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--text)]"
-                title="将所选节点恢复为跟随全局预加速策略"
+                title="恢复为自动跟随全局设置"
               >
-                跟全局
+                自动
               </button>
             </div>
           )}
@@ -3568,11 +3915,58 @@ export function NodesSubsPage() {
       </section>
 
       {/* ====================================================================
-       * 6. Mixed Node Pool Table with Single-Node PreAccel Override
+       * 6. Node List Table (Paginated + Fixed-Width Right Controls)
        * ==================================================================== */}
       <section className="cc-card cc-glass overflow-hidden rounded-2xl">
+        {filteredNodes.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 px-4 py-2 text-[11px] text-[var(--muted)]">
+            <span className="cc-mono">
+              显示第 {pageStartIndex + 1}-{Math.min(pageStartIndex + pageSize, filteredNodes.length)} 条，共 {filteredNodes.length} 个节点
+            </span>
+            <div className="flex items-center gap-2">
+              <div className="inline-flex items-center gap-1">
+                <span>每页</span>
+                {([30, 50, 100] as const).map((size) => (
+                  <button
+                    key={size}
+                    type="button"
+                    onClick={() => setPageSize(size)}
+                    className={`cc-mono rounded-md border px-1.5 py-0.5 text-[11px] transition-colors ${
+                      pageSize === size
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
+                        : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
+                    }`}
+                  >
+                    {size}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  disabled={safePage <= 1}
+                  onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
+                  className="rounded-md border border-[var(--line-strong)] bg-[var(--card)] px-2 py-0.5 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
+                >
+                  上一页
+                </button>
+                <span className="cc-mono px-1 text-[var(--text-secondary)]">
+                  {safePage}/{totalPages}
+                </span>
+                <button
+                  type="button"
+                  disabled={safePage >= totalPages}
+                  onClick={() => setCurrentPage(Math.min(totalPages, safePage + 1))}
+                  className="rounded-md border border-[var(--line-strong)] bg-[var(--card)] px-2 py-0.5 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[920px] border-collapse text-left text-xs">
+          <table className="w-full min-w-[980px] border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--muted)]">
                 <th className="w-10 px-3.5 py-2.5">
@@ -3584,39 +3978,45 @@ export function NodesSubsPage() {
                     className="accent-[var(--accent)]"
                   />
                 </th>
-                <th className="px-3 py-2.5">节点名称 / 来源订阅 / 所属多选组</th>
-                <th className="px-3 py-2.5">地区 · 倍率 · 协议</th>
-                <th className="px-3 py-2.5">体检真值（延迟 / 零送中 / 60s 保活 / AI）</th>
-                <th className="px-3 py-2.5">
-                  <div className="inline-flex items-center gap-1">
-                    <Zap className="h-3.5 w-3.5 text-[var(--accent)]" />
-                    国内预加速单节点覆写
+                <th className="max-w-[260px] whitespace-nowrap px-3 py-2.5">
+                  节点名称 / 来源 / 分组
+                </th>
+                <th className="min-w-[168px] whitespace-nowrap px-3 py-2.5">
+                  地区 · 倍率 · 协议
+                </th>
+                <th className="min-w-[180px] whitespace-nowrap px-3 py-2.5">
+                  延迟与可用性
+                </th>
+                <th className="min-w-[196px] whitespace-nowrap px-3 py-2.5">
+                  <div className="inline-flex items-center gap-1 whitespace-nowrap">
+                    <Zap className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                    国内提速
                   </div>
                 </th>
-                <th className="px-3.5 py-2.5 text-right">快捷编组</th>
+                <th className="w-[108px] min-w-[108px] whitespace-nowrap px-3.5 py-2.5 text-right">
+                  分组
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-[var(--line)]/70">
-              {filteredNodes.length === 0 ? (
+              {pagedNodes.length === 0 ? (
                 <tr>
                   <td
                     colSpan={6}
                     className="px-6 py-10 text-center text-xs text-[var(--muted)]"
                   >
                     <Globe className="mx-auto mb-2 h-6 w-6 opacity-50" />
-                    当前多维筛选条件下暂无匹配节点，请放宽筛选条件或新增/迁移订阅。
+                    暂无符合条件的节点，可以在上方导入订阅链接或放宽筛选条件。
                   </td>
                 </tr>
               ) : (
-                filteredNodes.map((node) => {
+                pagedNodes.map((node) => {
                   const selected = selectedNodeIds.has(node.id);
                   const probe = storeProbes[node.id];
                   const aiInfo = countAiUnlocked(probe);
                   const subName = subNameMap.get(node.sub_id) ?? node.sub_id;
                   const memberGroups = nodeGroupMembership.get(node.id) ?? [];
-                  const targetGroup = groups.find((g) => g.id === targetGroupId);
-                  const inTargetGroup =
-                    targetGroup?.member_node_ids.includes(node.id) ?? false;
+                  const inTargetGroup = targetGroupMemberSet.has(node.id);
 
                   const effectiveGlobalPreAccel =
                     globalPreAccel.enabled &&
@@ -3632,7 +4032,7 @@ export function NodesSubsPage() {
                       }`}
                     >
                       {/* Checkbox */}
-                      <td className="px-3.5 py-3 align-middle">
+                      <td className="w-10 px-3.5 py-3 align-middle">
                         <input
                           type="checkbox"
                           checked={selected}
@@ -3643,24 +4043,27 @@ export function NodesSubsPage() {
                       </td>
 
                       {/* Node Name, Source Sub & Group Membership */}
-                      <td className="px-3 py-3 align-middle">
-                        <div className="flex items-center gap-2">
+                      <td className="max-w-[260px] px-3 py-3 align-middle">
+                        <div className="flex min-w-0 items-center gap-2">
                           <Server className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-                          <span className="font-semibold text-[var(--text)]">
+                          <span
+                            title={node.name}
+                            className="block max-w-[228px] truncate font-semibold text-[var(--text)]"
+                          >
                             {node.name}
                           </span>
                         </div>
-                        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px]">
-                          <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--text-secondary)]">
+                        <div className="mt-1 flex max-w-[252px] flex-wrap items-center gap-1.5 text-[10px]">
+                          <span className="max-w-[112px] truncate rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--text-secondary)]">
                             {subName}
                           </span>
-                          <span className="cc-mono text-[var(--muted)]">
+                          <span className="max-w-[130px] truncate cc-mono text-[var(--muted)]">
                             {node.server}:{node.port}
                           </span>
                           {memberGroups.map((g) => (
                             <span
                               key={g.id}
-                              className="rounded-full bg-[var(--sky-soft)] px-1.5 py-0.5 font-medium text-[var(--sky)]"
+                              className="max-w-[116px] truncate rounded-full bg-[var(--sky-soft)] px-1.5 py-0.5 font-medium text-[var(--sky)]"
                             >
                               {g.name}
                             </span>
@@ -3668,8 +4071,8 @@ export function NodesSubsPage() {
                         </div>
                       </td>
 
-                      {/* Region, Multiplier, Protocol & 443 Native */}
-                      <td className="px-3 py-3 align-middle">
+                      {/* Region, Multiplier, Protocol & Direct 443 */}
+                      <td className="min-w-[168px] px-3 py-3 align-middle">
                         <div className="flex flex-wrap items-center gap-1.5 cc-mono text-[11px]">
                           <span className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 font-medium text-[var(--text)]">
                             {node.region_code}
@@ -3689,8 +4092,8 @@ export function NodesSubsPage() {
                             {node.protocol}
                           </span>
                           {node.is_443_native ? (
-                            <span className="rounded-md bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                              443 原生
+                            <span className="whitespace-nowrap rounded-md bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                              直连 443
                             </span>
                           ) : (
                             <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
@@ -3701,19 +4104,19 @@ export function NodesSubsPage() {
                       </td>
 
                       {/* Health Snapshot Badges */}
-                      <td className="px-3 py-3 align-middle">
+                      <td className="min-w-[180px] px-3 py-3 align-middle">
                         <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
-                          <span className="cc-mono rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--text)]">
+                          <span className="cc-mono whitespace-nowrap rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--text)]">
                             {probe?.latency_ms != null
                               ? `${probe.latency_ms} ms`
-                              : "未测"}
+                              : "未测速"}
                             {probe?.up_mbps != null
                               ? ` · ↑${probe.up_mbps.toFixed(1)}M`
                               : ""}
                           </span>
 
                           <span
-                            className={`rounded-md px-1.5 py-0.5 font-medium ${
+                            className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
                               probe?.google_clean === true &&
                               !probe.google_risk_mismatch
                                 ? "bg-[var(--green-soft)] text-[var(--green)]"
@@ -3725,16 +4128,16 @@ export function NodesSubsPage() {
                           >
                             {probe?.google_clean === true &&
                             !probe.google_risk_mismatch
-                              ? "零送中"
+                              ? "Google 正常"
                               : probe?.google_risk_mismatch
-                                ? "风控告警"
+                                ? "存在风控"
                                 : probe?.google_clean === false
-                                  ? "送中"
-                                  : "未验送中"}
+                                  ? "地区异常"
+                                  : "未检测"}
                           </span>
 
                           <span
-                            className={`rounded-md px-1.5 py-0.5 font-medium ${
+                            className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
                               probe?.keepalive_60s_ok === true
                                 ? "bg-[var(--green-soft)] text-[var(--green)]"
                                 : probe?.keepalive_60s_ok === false
@@ -3743,15 +4146,15 @@ export function NodesSubsPage() {
                             }`}
                           >
                             {probe?.keepalive_60s_ok === true
-                              ? "60s 保活"
+                              ? "长连接稳"
                               : probe?.keepalive_60s_ok === false
-                                ? "断流风险"
-                                : "未验保活"}
+                                ? "易断连"
+                                : "未测稳定"}
                           </span>
 
                           <span
                             title={aiInfo.detail}
-                            className={`rounded-md px-1.5 py-0.5 font-medium ${
+                            className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
                               aiInfo.passed > 0
                                 ? "bg-[var(--accent-soft)] text-[var(--accent)]"
                                 : "bg-[var(--bg-elevated)] text-[var(--muted)]"
@@ -3764,13 +4167,13 @@ export function NodesSubsPage() {
                         </div>
                       </td>
 
-                      {/* Single-Node PreAccel 3-State Override */}
-                      <td className="px-3 py-3 align-middle">
+                      {/* Single-Node Relay 3-State Override */}
+                      <td className="min-w-[196px] whitespace-nowrap px-3 py-3 align-middle">
                         <div className="flex flex-col gap-1">
-                          <div className="inline-flex w-fit rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[10px]">
+                          <div className="inline-flex w-fit shrink-0 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[10px]">
                             {(
                               [
-                                { value: null, label: "跟随全局" },
+                                { value: null, label: "自动" },
                                 { value: true, label: "强制开" },
                                 { value: false, label: "强制关" },
                               ] as const
@@ -3789,7 +4192,7 @@ export function NodesSubsPage() {
                                   onClick={() =>
                                     void handleSetPreAccelOverride([node.id], opt.value)
                                   }
-                                  className={`rounded-md px-2 py-0.5 transition-colors ${
+                                  className={`shrink-0 whitespace-nowrap rounded-md px-2 py-0.5 transition-colors ${
                                     active
                                       ? activeClass
                                       : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -3801,40 +4204,40 @@ export function NodesSubsPage() {
                             })}
                           </div>
                           {node.preaccel_override === null && (
-                            <span className="text-[10px] text-[var(--muted)]">
-                              当前全局生效：
+                            <span className="whitespace-nowrap text-[10px] text-[var(--muted)]">
+                              当前：
                               {effectiveGlobalPreAccel
-                                ? "启用预加速"
+                                ? "自动走中转加速"
                                 : node.is_443_native &&
                                     globalPreAccel.skip_443_native
-                                  ? "443 原生自动直连跳过"
-                                  : "全局已关"}
+                                  ? "高速直连免中转"
+                                  : "全局中转已关"}
                             </span>
                           )}
                         </div>
                       </td>
 
                       {/* Single-Node Quick Group Action */}
-                      <td className="px-3.5 py-3 text-right align-middle">
+                      <td className="w-[108px] min-w-[108px] whitespace-nowrap px-3.5 py-3 text-right align-middle">
                         <button
                           type="button"
                           disabled={!targetGroup}
                           onClick={() => void handleToggleSingleGroupMember(node.id)}
-                          className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                          className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
                             inTargetGroup
                               ? "border-[var(--green)] bg-[var(--green-soft)] text-[var(--green)] hover:opacity-85"
-                              : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)]"
+                              : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)]"
                           }`}
                         >
                           {inTargetGroup ? (
                             <>
-                              <Check className="h-3 w-3" />
+                              <Check className="h-3 w-3 shrink-0" />
                               已在组
                             </>
                           ) : (
                             <>
-                              <Plus className="h-3 w-3" />
-                              入组
+                              <Plus className="h-3 w-3 shrink-0" />
+                              加组
                             </>
                           )}
                         </button>
@@ -3846,6 +4249,59 @@ export function NodesSubsPage() {
             </tbody>
           </table>
         </div>
+
+        {/* Pagination Bar */}
+        {filteredNodes.length > 0 && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] bg-[var(--bg-elevated)]/60 px-4 py-2.5 text-xs">
+            <div className="flex flex-wrap items-center gap-3 text-[11px] text-[var(--muted)]">
+              <span className="cc-mono">
+                第 {pageStartIndex + 1} -{" "}
+                {Math.min(pageStartIndex + pageSize, filteredNodes.length)} 条，共{" "}
+                {filteredNodes.length} 个节点
+              </span>
+              <div className="inline-flex items-center gap-1">
+                <span>每页</span>
+                {([30, 50, 100] as const).map((size) => (
+                  <button
+                    key={size}
+                    type="button"
+                    onClick={() => setPageSize(size)}
+                    className={`cc-mono rounded-md border px-2 py-0.5 text-[11px] transition-colors ${
+                      pageSize === size
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
+                        : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
+                    }`}
+                  >
+                    {size}
+                  </button>
+                ))}
+                <span>条</span>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                disabled={safePage <= 1}
+                onClick={() => setCurrentPage(Math.max(1, safePage - 1))}
+                className="rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
+              >
+                上一页
+              </button>
+              <span className="cc-mono px-2 text-[11px] text-[var(--text-secondary)]">
+                第 {safePage} / {totalPages} 页
+              </span>
+              <button
+                type="button"
+                disabled={safePage >= totalPages}
+                onClick={() => setCurrentPage(Math.min(totalPages, safePage + 1))}
+                className="rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)]"
+              >
+                下一页
+              </button>
+            </div>
+          </div>
+        )}
       </section>
 
       {/* ====================================================================
@@ -3853,13 +4309,13 @@ export function NodesSubsPage() {
        * ==================================================================== */}
       <MigrationDrawer
         open={migrationOpen}
-        onClose={() => setMigrationOpen(false)}
+        onClose={closeMigration}
         onImport={handleMigrationImport}
       />
 
       <ProcessAttachDrawer
         open={processAttachOpen}
-        onClose={() => setProcessAttachOpen(false)}
+        onClose={closeProcessAttach}
         onAttachSource={handleProcessAttach}
       />
     </div>

@@ -43,11 +43,10 @@ type RuleMatchType =
 interface ManagedRuleItem {
   id: string;
   layer: RuleLayer;
-  ruleType: RuleMatchType;
+  ruleType: RuleMatchType | string;
   value: string;
   target: string;
   noResolve?: boolean;
-  builtin?: boolean;
   groupId?: string;
 }
 
@@ -77,39 +76,43 @@ interface LiveConnection {
   startedAtMs: number;
 }
 
-const AI_PRESETS_INITIAL: AiPresetBundle[] = [
+const RULE_TYPE_LABELS: Record<RuleMatchType, string> = {
+  "DOMAIN-SUFFIX": "域名后缀",
+  DOMAIN: "完整域名",
+  "DOMAIN-KEYWORD": "域名关键词",
+  "IP-CIDR": "IP 网段",
+  "PROCESS-NAME": "软件进程",
+  GEOSITE: "网站集合",
+  GEOIP: "地区 IP",
+};
+
+const AI_PRESETS_TEMPLATE: ReadonlyArray<Omit<AiPresetBundle, "targetGroup" | "enabled">> = [
   {
     id: "ai-openai",
     name: "OpenAI / ChatGPT",
-    desc: "ChatGPT 网页端、API 及静态资源域",
+    desc: "ChatGPT 网页端、接口及静态资源",
     domains: ["openai.com", "chatgpt.com", "oaistatic.com", "oaiusercontent.com"],
-    targetGroup: "AI 专线粘性组",
-    enabled: true,
   },
   {
     id: "ai-anthropic",
     name: "Anthropic / Claude",
-    desc: "Claude 对话与 API 端点",
+    desc: "Claude 对话网页与接口",
     domains: ["anthropic.com", "claude.ai"],
-    targetGroup: "AI 专线粘性组",
-    enabled: true,
   },
   {
     id: "ai-gemini",
     name: "Google Gemini / AI Studio",
-    desc: "Gemini、AI Studio 与 Generative Language 接口",
+    desc: "Gemini、AI Studio 与相关接口",
     domains: [
       "gemini.google.com",
       "aistudio.google.com",
       "generativelanguage.googleapis.com",
     ],
-    targetGroup: "AI 专线粘性组",
-    enabled: true,
   },
   {
     id: "ai-windsurf",
-    name: "Windsurf & Codeium（5 域名完整预设）",
-    desc: "覆盖 Windsurf、Codeium、Devin 与 Cognition 全系编码服务",
+    name: "Windsurf & Codeium",
+    desc: "Windsurf、Codeium 与 Devin 编程工具相关域名",
     domains: [
       "codeium.com",
       "windsurf.com",
@@ -117,53 +120,203 @@ const AI_PRESETS_INITIAL: AiPresetBundle[] = [
       "cognition.ai",
       "exafunction.com",
     ],
-    targetGroup: "AI 专线粘性组",
-    enabled: true,
   },
 ];
 
-const INITIAL_USER_RULES: ManagedRuleItem[] = [
-  {
-    id: "rule-pre-1",
-    layer: "prepend",
-    ruleType: "IP-CIDR",
-    value: "198.51.100.10/32",
-    target: "DIRECT",
-    noResolve: true,
-    builtin: true,
-  },
-  {
-    id: "rule-pre-2",
-    layer: "prepend",
-    ruleType: "DOMAIN",
-    value: "connectivitycheck.platform.hicloud.com",
-    target: "DIRECT",
-    builtin: true,
-  },
-  {
-    id: "rule-pre-3",
-    layer: "prepend",
-    ruleType: "PROCESS-NAME",
-    value: "catcloud.exe",
-    target: "DIRECT",
-    builtin: true,
-  },
-  {
-    id: "rule-app-1",
-    layer: "append",
-    ruleType: "GEOSITE",
-    value: "cn",
-    target: "DIRECT",
-  },
-  {
-    id: "rule-app-2",
-    layer: "append",
-    ruleType: "GEOIP",
-    value: "CN",
-    target: "DIRECT",
-    noResolve: true,
-  },
-];
+function serializeRuleItem(r: ManagedRuleItem): string {
+  const typeUpper = r.ruleType.trim().toUpperCase();
+  const value = r.value.trim();
+  const target = r.target.trim();
+  if (typeUpper === "MATCH") {
+    return `MATCH,${target}`;
+  }
+  return `${typeUpper},${value},${target}${r.noResolve ? ",no-resolve" : ""}`;
+}
+
+function parseRuleString(
+  raw: string,
+  layer: "prepend" | "append",
+  id: string
+): ManagedRuleItem | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const parts = trimmed.split(",").map((p) => p.trim());
+  if (parts.length < 2) return null;
+  const ruleType = parts[0].toUpperCase();
+  if (ruleType === "MATCH") {
+    return {
+      id,
+      layer,
+      ruleType,
+      value: "*",
+      target: parts[1] || "DIRECT",
+    };
+  }
+  if (parts.length < 3) return null;
+  const value = parts[1];
+  const target = parts[2];
+  if (!value || !target) return null;
+  const noResolve = parts.slice(3).some((p) => p.toLowerCase() === "no-resolve");
+  return {
+    id,
+    layer,
+    ruleType,
+    value,
+    target,
+    noResolve,
+  };
+}
+
+function hydrateRulesFromConfig(
+  prependLines: string[],
+  appendLines: string[],
+  fallbackTarget: string
+): { presets: AiPresetBundle[]; userRules: ManagedRuleItem[] } {
+  const consumedPrepend = new Set<number>();
+
+  const presets: AiPresetBundle[] = AI_PRESETS_TEMPLATE.map((tpl) => {
+    const domainSet = new Set(tpl.domains.map((d) => d.toLowerCase()));
+    let matchedTarget: string | null = null;
+    const matchedIndices: number[] = [];
+
+    prependLines.forEach((raw, idx) => {
+      const parts = raw.split(",").map((p) => p.trim());
+      if (parts.length < 3) return;
+      if (parts[0].toUpperCase() !== "DOMAIN-SUFFIX") return;
+      if (!domainSet.has(parts[1].toLowerCase())) return;
+      if (matchedTarget === null) {
+        matchedTarget = parts[2];
+      }
+      if (parts[2] === matchedTarget) {
+        matchedIndices.push(idx);
+      }
+    });
+
+    if (matchedTarget !== null && matchedIndices.length > 0) {
+      for (const idx of matchedIndices) consumedPrepend.add(idx);
+      return {
+        ...tpl,
+        targetGroup: matchedTarget,
+        enabled: true,
+      };
+    }
+
+    return {
+      ...tpl,
+      targetGroup: fallbackTarget,
+      enabled: false,
+    };
+  });
+
+  const userRules: ManagedRuleItem[] = [];
+  prependLines.forEach((raw, idx) => {
+    if (consumedPrepend.has(idx)) return;
+    const parsed = parseRuleString(raw, "prepend", `rule-pre-${idx}-${raw}`);
+    if (parsed) userRules.push(parsed);
+  });
+  appendLines.forEach((raw, idx) => {
+    const parsed = parseRuleString(raw, "append", `rule-app-${idx}-${raw}`);
+    if (parsed) userRules.push(parsed);
+  });
+
+  return { presets, userRules };
+}
+
+function buildRulesOverridePayload(
+  presets: AiPresetBundle[],
+  userRules: ManagedRuleItem[]
+): { global_prepend_rules: string[]; global_append_rules: string[] } {
+  const global_prepend_rules: string[] = [];
+  const seenPrepend = new Set<string>();
+  const pushPrepend = (line: string) => {
+    const trimmed = line.trim();
+    if (trimmed && !seenPrepend.has(trimmed)) {
+      seenPrepend.add(trimmed);
+      global_prepend_rules.push(trimmed);
+    }
+  };
+
+  for (const r of userRules) {
+    if (r.layer === "prepend") {
+      pushPrepend(serializeRuleItem(r));
+    }
+  }
+  for (const preset of presets) {
+    if (!preset.enabled) continue;
+    const target = preset.targetGroup.trim() || "DIRECT";
+    for (const domain of preset.domains) {
+      pushPrepend(`DOMAIN-SUFFIX,${domain},${target}`);
+    }
+  }
+
+  const global_append_rules: string[] = [];
+  const seenAppend = new Set<string>();
+  for (const r of userRules) {
+    if (r.layer === "append") {
+      const line = serializeRuleItem(r).trim();
+      if (line && !seenAppend.has(line)) {
+        seenAppend.add(line);
+        global_append_rules.push(line);
+      }
+    }
+  }
+
+  return { global_prepend_rules, global_append_rules };
+}
+
+function formatRuleTargetLabel(target: string): string {
+  if (target === "DIRECT") return "直接连接";
+  if (target === "REJECT") return "拦截阻止";
+  return target;
+}
+
+function formatConnectionRuleLabel(rawRule: string): string {
+  const trimmed = rawRule.trim();
+  if (!trimmed) return "默认走代理";
+  const commaIdx = trimmed.indexOf(",");
+  const rawType = (commaIdx >= 0 ? trimmed.slice(0, commaIdx) : trimmed).trim();
+  const payload = commaIdx >= 0 ? trimmed.slice(commaIdx + 1).trim() : "";
+  const normalized = rawType.toUpperCase().replace(/[-_\s]/g, "");
+
+  if (normalized === "MATCH" || normalized === "FINAL") {
+    if (payload.toUpperCase() === "DIRECT") return "默认直接连接";
+    if (payload.toUpperCase() === "REJECT") return "默认拦截阻止";
+    return "默认走代理";
+  }
+  if (normalized === "DOMAINSUFFIX") {
+    return payload ? `按域名匹配：${payload}` : "按域名匹配";
+  }
+  if (normalized === "DOMAIN") {
+    return payload ? `完整域名：${payload}` : "完整域名";
+  }
+  if (normalized === "DOMAINKEYWORD") {
+    return payload ? `域名关键词：${payload}` : "域名关键词";
+  }
+  if (normalized === "IPCIDR" || normalized === "IPCIDR6") {
+    return payload ? `IP 网段：${payload}` : "IP 网段";
+  }
+  if (normalized === "PROCESSNAME") {
+    return payload ? `按软件匹配：${payload}` : "按软件匹配";
+  }
+  if (normalized === "GEOSITE") {
+    const label = payload.toLowerCase() === "cn" ? "国内常用网站" : payload;
+    return label ? `网站集合：${label}` : "网站集合";
+  }
+  if (normalized === "GEOIP") {
+    const label = payload.toUpperCase() === "CN" ? "中国大陆" : payload;
+    return label ? `地区 IP：${label}` : "地区 IP";
+  }
+  if (normalized === "RULESET") {
+    return payload ? `规则集合：${payload}` : "规则集合";
+  }
+  if (normalized === "DSTPORT") {
+    return payload ? `目标端口：${payload}` : "目标端口";
+  }
+  if (normalized === "SRCIPCIDR") {
+    return payload ? `来源网段：${payload}` : "来源网段";
+  }
+  return payload ? `${rawType}：${payload}` : rawType;
+}
 
 function buildPreviewConnections(): LiveConnection[] {
   const now = Date.now();
@@ -261,21 +414,31 @@ export function RulesConnsPage() {
   const runtime = useAppSelector((s) => s.runtime);
   const inTauri = isTauriEnv();
 
+  const defaultGroupTarget = groups[0]?.name || "DIRECT";
+
   const [activeTab, setActiveTab] = useState<ActiveTab>("rules");
 
-  // --- Tab A: Rules State ---
-  const [aiPresets, setAiPresets] = useState<AiPresetBundle[]>(AI_PRESETS_INITIAL);
-  const [userRules, setUserRules] = useState<ManagedRuleItem[]>(INITIAL_USER_RULES);
+  // --- Tab A: Rules State (hydrated from catcloudApi.getFullConfig) ---
+  const [aiPresets, setAiPresets] = useState<AiPresetBundle[]>(() =>
+    AI_PRESETS_TEMPLATE.map((tpl) => ({
+      ...tpl,
+      targetGroup: defaultGroupTarget,
+      enabled: false,
+    }))
+  );
+  const [userRules, setUserRules] = useState<ManagedRuleItem[]>([]);
+  const [loadingRules, setLoadingRules] = useState<boolean>(true);
+  const [savingRules, setSavingRules] = useState<boolean>(false);
   const [ruleSearch, setRuleSearch] = useState<string>("");
   const [ruleLayerFilter, setRuleLayerFilter] = useState<"all" | RuleLayer>("all");
   const [showYamlPreview, setShowYamlPreview] = useState<boolean>(false);
   const [copiedYaml, setCopiedYaml] = useState<boolean>(false);
 
   // New rule composer state
-  const [newLayer, setNewLayer] = useState<RuleLayer>("prepend");
+  const [newLayer, setNewLayer] = useState<"prepend" | "append">("prepend");
   const [newType, setNewType] = useState<RuleMatchType>("DOMAIN-SUFFIX");
   const [newValue, setNewValue] = useState<string>("");
-  const [newTarget, setNewTarget] = useState<string>("AI 专线粘性组");
+  const [newTarget, setNewTarget] = useState<string>(defaultGroupTarget);
   const [newNoResolve, setNewNoResolve] = useState<boolean>(false);
 
   // --- Tab B: Connections State ---
@@ -294,6 +457,11 @@ export function RulesConnsPage() {
   const confirmCloseAllTimerRef = useRef<number | null>(null);
   const groupsRef = useRef<MultiGroup[]>(groups);
   groupsRef.current = groups;
+  const aiPresetsRef = useRef<AiPresetBundle[]>(aiPresets);
+  aiPresetsRef.current = aiPresets;
+  const userRulesRef = useRef<ManagedRuleItem[]>(userRules);
+  userRulesRef.current = userRules;
+  const userPickedNewTargetRef = useRef<boolean>(false);
 
   useEffect(() => {
     return () => {
@@ -305,6 +473,114 @@ export function RulesConnsPage() {
       }
     };
   }, []);
+
+  // Load persisted rules_override from backend config on mount
+  useEffect(() => {
+    let cancelled = false;
+    setLoadingRules(true);
+    void catcloudApi
+      .getFullConfig()
+      .then((fullCfg) => {
+        if (cancelled) return;
+        const fallbackTarget = groupsRef.current[0]?.name || "DIRECT";
+        const savedOverride = fullCfg.rules_override;
+        const hasSavedOverride =
+          savedOverride !== undefined &&
+          (Array.isArray(savedOverride.global_prepend_rules) ||
+            Array.isArray(savedOverride.global_append_rules));
+
+        if (!inTauri && !hasSavedOverride) {
+          // Browser preview demo defaults before first save
+          const demoPrepend = AI_PRESETS_TEMPLATE.flatMap((tpl) =>
+            tpl.domains.map((d) => `DOMAIN-SUFFIX,${d},${fallbackTarget}`)
+          );
+          const demoAppend = ["GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT,no-resolve"];
+          const hydrated = hydrateRulesFromConfig(demoPrepend, demoAppend, fallbackTarget);
+          setAiPresets(hydrated.presets);
+          setUserRules(hydrated.userRules);
+          return;
+        }
+
+        const prependList = Array.isArray(savedOverride?.global_prepend_rules)
+          ? savedOverride.global_prepend_rules
+          : [];
+        const appendList = Array.isArray(savedOverride?.global_append_rules)
+          ? savedOverride.global_append_rules
+          : [];
+        const hydrated = hydrateRulesFromConfig(prependList, appendList, fallbackTarget);
+        setAiPresets(hydrated.presets);
+        setUserRules(hydrated.userRules);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          appActions.showToast(`读取已保存的分流规则失败：${formatErrorMessage(err)}`, "warn");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingRules(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [inTauri]);
+
+  const targetChoices = useMemo(() => {
+    const names = groups
+      .map((g) => g.name.trim())
+      .filter((name) => name.length > 0);
+    return Array.from(new Set([...names, "DIRECT", "REJECT"]));
+  }, [groups]);
+
+  const hadRealGroupsRef = useRef<boolean>(groups.length > 0);
+
+  // Keep default target synced to real groups once loaded
+  useEffect(() => {
+    const firstGroup = groups[0]?.name?.trim();
+    if (!firstGroup) return;
+    const justLoadedGroups = !hadRealGroupsRef.current;
+    hadRealGroupsRef.current = true;
+
+    if ((justLoadedGroups && !userPickedNewTargetRef.current) || !targetChoices.includes(newTarget)) {
+      setNewTarget(firstGroup);
+    }
+    setAiPresets((prev) =>
+      prev.map((p) => {
+        if (p.enabled) return p;
+        if (!p.targetGroup || !targetChoices.includes(p.targetGroup) || (justLoadedGroups && p.targetGroup === "DIRECT")) {
+          return { ...p, targetGroup: firstGroup };
+        }
+        return p;
+      })
+    );
+  }, [groups, newTarget, targetChoices]);
+
+  const persistRulesOverride = useCallback(
+    async (
+      nextPresets: AiPresetBundle[],
+      nextUserRules: ManagedRuleItem[],
+      successToast: string
+    ): Promise<boolean> => {
+      const prevPresets = aiPresetsRef.current;
+      const prevUserRules = userRulesRef.current;
+      setAiPresets(nextPresets);
+      setUserRules(nextUserRules);
+      setSavingRules(true);
+      try {
+        const payload = buildRulesOverridePayload(nextPresets, nextUserRules);
+        await catcloudApi.saveExtendedSettings({ rules_override: payload });
+        appActions.showToast(successToast, "ok");
+        return true;
+      } catch (err) {
+        setAiPresets(prevPresets);
+        setUserRules(prevUserRules);
+        appActions.showToast(`保存分流规则失败：${formatErrorMessage(err)}`, "warn");
+        return false;
+      } finally {
+        setSavingRules(false);
+      }
+    },
+    []
+  );
 
   const fetchLiveConnections = useCallback(
     async (notifyOnError = false) => {
@@ -319,7 +595,7 @@ export function RulesConnsPage() {
         setNowTick(Date.now());
       } catch (err) {
         if (notifyOnError) {
-          appActions.showToast(`拉取活跃连接失败：${formatErrorMessage(err)}`, "warn");
+          appActions.showToast(`获取当前连接失败：${formatErrorMessage(err)}`, "warn");
         }
       } finally {
         setRefreshingConns(false);
@@ -354,18 +630,13 @@ export function RulesConnsPage() {
     return () => window.clearInterval(timer);
   }, [activeTab, connPaused, fetchLiveConnections, inTauri]);
 
-  const targetChoices = useMemo(() => {
-    const names = groups.map((g) => g.name);
-    return Array.from(new Set([...names, "AI 专线粘性组", "DIRECT", "REJECT"]));
-  }, [groups]);
-
   // Combine group match_rules from store with editable local rules
   const groupBoundRules = useMemo<ManagedRuleItem[]>(() => {
     const list: ManagedRuleItem[] = [];
     for (const grp of groups) {
       grp.match_rules.forEach((raw, idx) => {
         const parts = raw.split(",");
-        const rType = (parts[0] ?? "DOMAIN-SUFFIX").trim().toUpperCase() as RuleMatchType;
+        const rType = (parts[0] ?? "DOMAIN-SUFFIX").trim().toUpperCase();
         const val = (parts[1] ?? raw).trim();
         list.push({
           id: `grp-${grp.id}-${idx}`,
@@ -395,85 +666,105 @@ export function RulesConnsPage() {
   }, [groupBoundRules, ruleLayerFilter, ruleSearch, userRules]);
 
   const compiledOverrideYaml = useMemo(() => {
+    const payload = buildRulesOverridePayload(aiPresets, userRules);
+    const defaultMatch = runtime.active_group_name || groups[0]?.name || "DIRECT";
     const lines: string[] = [
-      "# CatCloud Declarative Rules Override Preview (Sanitized)",
-      "# Precedence: Prepend (Anti-Loop & User) -> Built-in AI Presets -> Multi-Group Rules -> Append -> MATCH",
-      "",
-      "prepend-rules:",
+      "# 当前生效分流规则顺序预览（从上到下依次匹配）",
+      "rules:",
+      "  # 1. 优先匹配与常用网站分流",
     ];
-    for (const r of userRules.filter((x) => x.layer === "prepend")) {
-      lines.push(
-        `  - ${r.ruleType},${r.value},${r.target}${r.noResolve ? ",no-resolve" : ""}`
-      );
+    for (const line of payload.global_prepend_rules) {
+      lines.push(`  - ${line}`);
     }
-    lines.push("");
-    lines.push("ai-preset-rules:");
-    for (const preset of aiPresets.filter((p) => p.enabled)) {
-      lines.push(`  # ${preset.name}`);
-      for (const domain of preset.domains) {
-        lines.push(`  - DOMAIN-SUFFIX,${domain},${preset.targetGroup}`);
+    if (groupBoundRules.length > 0) {
+      lines.push("  # 2. 分组自带规则");
+      for (const r of groupBoundRules) {
+        lines.push(`  - ${serializeRuleItem(r)}`);
       }
     }
-    lines.push("");
-    lines.push("group-bound-rules:");
-    for (const r of [...groupBoundRules, ...userRules.filter((x) => x.layer === "group")]) {
-      lines.push(
-        `  - ${r.ruleType},${r.value},${r.target}${r.noResolve ? ",no-resolve" : ""}`
-      );
+    if (payload.global_append_rules.length > 0) {
+      lines.push("  # 3. 兜底匹配规则");
+      for (const line of payload.global_append_rules) {
+        lines.push(`  - ${line}`);
+      }
     }
-    lines.push("");
-    lines.push("append-rules:");
-    for (const r of userRules.filter((x) => x.layer === "append")) {
-      lines.push(
-        `  - ${r.ruleType},${r.value},${r.target}${r.noResolve ? ",no-resolve" : ""}`
-      );
-    }
-    lines.push(`  - MATCH,${runtime.active_group_name || "AI 专线粘性组"}`);
+    lines.push("  # 4. 其他未命中流量");
+    lines.push(`  - MATCH,${defaultMatch}`);
     return lines.join("\n");
-  }, [aiPresets, groupBoundRules, runtime.active_group_name, userRules]);
+  }, [aiPresets, groupBoundRules, groups, runtime.active_group_name, userRules]);
 
-  const handleAddRule = () => {
+  const handleAddRule = async () => {
+    if (savingRules) return;
     const val = newValue.trim();
     if (!val) {
-      appActions.showToast("请填写规则匹配内容（如域名、CIDR 或进程名）", "warn");
+      appActions.showToast("请填写要匹配的网址、IP 或软件名", "warn");
       return;
     }
+    const effectiveTarget = newTarget.trim() || targetChoices[0] || "DIRECT";
     const created: ManagedRuleItem = {
       id: `rule-custom-${Date.now()}`,
       layer: newLayer,
       ruleType: newType,
       value: val,
-      target: newTarget,
+      target: effectiveTarget,
       noResolve: (newType === "IP-CIDR" || newType === "GEOIP") && newNoResolve,
     };
-    setUserRules((prev) => [created, ...prev]);
-    setNewValue("");
-    appActions.showToast(`已新增规则：${created.ruleType},${created.value},${created.target}`, "ok");
+    const nextRules = [created, ...userRules];
+    const ok = await persistRulesOverride(
+      aiPresets,
+      nextRules,
+      `已保存并生效：${created.value} → ${formatRuleTargetLabel(created.target)}`
+    );
+    if (ok) {
+      setNewValue("");
+    }
   };
 
-  const handleDeleteRule = (id: string) => {
+  const handleDeleteRule = async (id: string) => {
+    if (savingRules) return;
     const found = userRules.find((r) => r.id === id);
     if (!found) {
-      appActions.showToast("多选组绑定规则请前往「智能多选组」页调整", "info");
+      appActions.showToast("分组自带规则请前往「智能多选组」页面修改", "info");
       return;
     }
-    if (found.builtin) {
-      appActions.showToast("预加速防环保护规则不可删除，防止回环断网", "warn");
-      return;
-    }
-    setUserRules((prev) => prev.filter((r) => r.id !== id));
-    appActions.showToast("已删除该分流规则", "info");
+    const nextRules = userRules.filter((r) => r.id !== id);
+    await persistRulesOverride(aiPresets, nextRules, "已删除规则并保存生效");
   };
 
-  const handleToggleAiPreset = (id: string) => {
-    setAiPresets((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, enabled: !p.enabled } : p))
+  const handleToggleAiPreset = async (id: string) => {
+    if (savingRules) return;
+    const targetPreset = aiPresets.find((p) => p.id === id);
+    if (!targetPreset) return;
+    const nextEnabled = !targetPreset.enabled;
+    const nextTarget =
+      targetPreset.targetGroup.trim() || groups[0]?.name || "DIRECT";
+    const nextPresets = aiPresets.map((p) =>
+      p.id === id ? { ...p, enabled: nextEnabled, targetGroup: nextTarget } : p
+    );
+    await persistRulesOverride(
+      nextPresets,
+      userRules,
+      nextEnabled
+        ? `已开启「${targetPreset.name}」分流并保存生效`
+        : `已关闭「${targetPreset.name}」分流并保存生效`
     );
   };
 
-  const handleChangeAiPresetTarget = (id: string, targetGroup: string) => {
-    setAiPresets((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, targetGroup } : p))
+  const handleChangeAiPresetTarget = async (id: string, targetGroup: string) => {
+    if (savingRules) return;
+    const targetPreset = aiPresets.find((p) => p.id === id);
+    if (!targetPreset) return;
+    const nextPresets = aiPresets.map((p) =>
+      p.id === id ? { ...p, targetGroup } : p
+    );
+    if (!targetPreset.enabled) {
+      setAiPresets(nextPresets);
+      return;
+    }
+    await persistRulesOverride(
+      nextPresets,
+      userRules,
+      `已将「${targetPreset.name}」指向「${formatRuleTargetLabel(targetGroup)}」并保存生效`
     );
   };
 
@@ -481,7 +772,7 @@ export function RulesConnsPage() {
     try {
       await navigator.clipboard.writeText(compiledOverrideYaml);
       setCopiedYaml(true);
-      appActions.showToast("已复制声明式规则覆写 YAML 预览", "ok");
+      appActions.showToast("已复制当前分流规则预览", "ok");
       if (copiedYamlTimerRef.current !== null) {
         window.clearTimeout(copiedYamlTimerRef.current);
       }
@@ -500,11 +791,13 @@ export function RulesConnsPage() {
     const list = connections.filter((c) => {
       if (connGroupFilter !== "all" && c.groupId !== connGroupFilter) return false;
       if (!kw) return true;
+      const friendlyRule = formatConnectionRuleLabel(c.rule).toLowerCase();
       return (
         c.process.toLowerCase().includes(kw) ||
         c.host.toLowerCase().includes(kw) ||
         c.dstIp.includes(kw) ||
         c.rule.toLowerCase().includes(kw) ||
+        friendlyRule.includes(kw) ||
         c.nodeName.toLowerCase().includes(kw) ||
         c.groupName.toLowerCase().includes(kw)
       );
@@ -532,7 +825,7 @@ export function RulesConnsPage() {
     try {
       await catcloudApi.closeConnection(conn.id);
       setConnections((prev) => prev.filter((c) => c.id !== conn.id));
-      appActions.showToast(`已精准踢断连接：${conn.process} -> ${conn.host}`, "ok");
+      appActions.showToast(`已断开连接：${conn.process} -> ${conn.host}`, "ok");
     } catch (err) {
       appActions.showToast(`断开连接失败：${formatErrorMessage(err)}`, "warn");
     }
@@ -547,7 +840,7 @@ export function RulesConnsPage() {
       targetGroupId;
 
     if (!targetGroupName) {
-      appActions.showToast("请先选择要清理连接的策略组", "warn");
+      appActions.showToast("请先选择要清理连接的分组", "warn");
       return;
     }
 
@@ -557,11 +850,11 @@ export function RulesConnsPage() {
         prev.filter((c) => c.groupId !== targetGroupId && c.groupName !== targetGroupName)
       );
       appActions.showToast(
-        `已按组踢断「${targetGroupName}」的 ${closed} 条旧连接`,
+        `已断开「${targetGroupName}」的 ${closed} 条旧连接`,
         "ok"
       );
     } catch (err) {
-      appActions.showToast(`按组断开连接失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`按分组断开连接失败：${formatErrorMessage(err)}`, "warn");
     }
   };
 
@@ -586,7 +879,7 @@ export function RulesConnsPage() {
       const shownCount = inTauri ? closed : connections.length;
       setConnections([]);
       setConfirmCloseAll(false);
-      appActions.showToast(`已断开全部 ${shownCount} 条活跃连接`, "ok");
+      appActions.showToast(`已断开全部 ${shownCount} 条连接`, "ok");
     } catch (err) {
       setConfirmCloseAll(false);
       appActions.showToast(`断开全部连接失败：${formatErrorMessage(err)}`, "warn");
@@ -595,7 +888,7 @@ export function RulesConnsPage() {
 
   const handleRefreshConns = async () => {
     await fetchLiveConnections(true);
-    appActions.showToast("已刷新实时活跃连接快照", "info");
+    appActions.showToast("已刷新当前连接列表", "info");
   };
 
   const enabledAiDomainCount = aiPresets
@@ -604,16 +897,16 @@ export function RulesConnsPage() {
 
   return (
     <div className="space-y-4">
-      {/* Top Tab Bar & Quick Overview */}
+      {/* 顶部标题与标签切换 */}
       <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
         <div className="flex items-center gap-3">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--accent)]">
             <Network className="h-5 w-5" />
           </div>
           <div>
-            <h1 className="text-sm font-semibold text-[var(--text)]">分流规则与实时活跃连接</h1>
+            <h1 className="text-sm font-semibold text-[var(--text)]">分流规则与当前连接</h1>
             <p className="mt-0.5 text-xs text-[var(--muted)]">
-              声明式分流覆写管线（含内置 AI 预设）与按进程 / 规则 / 多选组精准踢断僵尸连接。
+              决定哪些网站走哪组节点或直接连接，也可以随时查看并断开正在进行的网络连接。
             </p>
           </div>
         </div>
@@ -629,7 +922,7 @@ export function RulesConnsPage() {
             }`}
           >
             <Layers className="h-3.5 w-3.5" />
-            分流规则管理
+            分流规则
             <span className="cc-mono rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px]">
               {userRules.length + groupBoundRules.length + enabledAiDomainCount}
             </span>
@@ -644,7 +937,7 @@ export function RulesConnsPage() {
             }`}
           >
             <Activity className="h-3.5 w-3.5" />
-            实时活跃连接
+            当前连接
             <span className="cc-mono rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px]">
               {connections.length}
             </span>
@@ -654,97 +947,114 @@ export function RulesConnsPage() {
 
       {activeTab === "rules" ? (
         <div className="space-y-4">
-          {/* Built-in AI Routing Presets */}
+          {/* 常用网站分流 */}
           <section className="cc-card cc-glass rounded-2xl p-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Sparkles className="h-4 w-4 text-[var(--accent)]" />
                 <h2 className="text-sm font-semibold text-[var(--text)]">
-                  内置 AI 分流预设（OpenAI / Anthropic / Gemini / Windsurf & Codeium）
+                  常用网站分流
                 </h2>
+                <span className="text-[11px] text-[var(--muted)]">
+                  打开开关即可自动保存，让常用 AI 与开发网站走指定分组
+                </span>
               </div>
-              <button
-                type="button"
-                onClick={() => setShowYamlPreview((v) => !v)}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
-              >
-                <Code2 className="h-3.5 w-3.5 text-[var(--accent)]" />
-                {showYamlPreview ? "收起覆写 YAML 预览" : "声明式覆写 YAML 预览"}
-              </button>
+              <div className="flex items-center gap-2">
+                {savingRules && (
+                  <span className="text-[11px] text-[var(--accent)]">保存中...</span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setShowYamlPreview((v) => !v)}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
+                >
+                  <Code2 className="h-3.5 w-3.5 text-[var(--accent)]" />
+                  {showYamlPreview ? "收起规则预览" : "查看规则预览"}
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
-              {aiPresets.map((preset) => (
-                <div
-                  key={preset.id}
-                  className={`rounded-xl border p-3.5 transition-colors ${
-                    preset.enabled
-                      ? "border-[var(--line-strong)] bg-[var(--bg-elevated)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)]/50 opacity-70"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <div>
-                      <div className="text-xs font-semibold text-[var(--text)]">
-                        {preset.name}
+              {aiPresets.map((preset) => {
+                const presetOptions = targetChoices.includes(preset.targetGroup)
+                  ? targetChoices
+                  : [preset.targetGroup, ...targetChoices].filter(Boolean);
+                return (
+                  <div
+                    key={preset.id}
+                    className={`rounded-xl border p-3.5 transition-colors ${
+                      preset.enabled
+                        ? "border-[var(--line-strong)] bg-[var(--bg-elevated)]"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)]/50 opacity-75"
+                    }`}
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold text-[var(--text)]">
+                          {preset.name}
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-[var(--muted)]">
+                          {preset.desc}
+                        </div>
                       </div>
-                      <div className="mt-0.5 text-[11px] text-[var(--muted)]">
-                        {preset.desc}
-                      </div>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => handleToggleAiPreset(preset.id)}
-                      className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors ${
-                        preset.enabled ? "bg-[var(--accent)]" : "bg-[var(--line-strong)]"
-                      }`}
-                      aria-label={`切换 ${preset.name}`}
-                    >
-                      <span
-                        className={`h-4 w-4 rounded-full bg-[var(--card)] transition-transform ${
-                          preset.enabled ? "translate-x-4" : "translate-x-0"
+                      <button
+                        type="button"
+                        disabled={savingRules || loadingRules}
+                        onClick={() => void handleToggleAiPreset(preset.id)}
+                        className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors disabled:opacity-50 ${
+                          preset.enabled ? "bg-[var(--accent)]" : "bg-[var(--line-strong)]"
                         }`}
-                      />
-                    </button>
-                  </div>
-
-                  <div className="mt-2.5 flex flex-wrap gap-1">
-                    {preset.domains.map((d) => (
-                      <span
-                        key={d}
-                        className="cc-mono rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                        aria-label={`切换 ${preset.name}`}
                       >
-                        {d}
-                      </span>
-                    ))}
-                  </div>
+                        <span
+                          className={`h-4 w-4 rounded-full bg-[var(--card)] transition-transform ${
+                            preset.enabled ? "translate-x-4" : "translate-x-0"
+                          }`}
+                        />
+                      </button>
+                    </div>
 
-                  <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-[var(--line)] pt-2 text-[11px]">
-                    <span className="text-[var(--muted)]">命中策略组</span>
-                    <select
-                      value={preset.targetGroup}
-                      onChange={(e) => handleChangeAiPresetTarget(preset.id, e.target.value)}
-                      className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                    >
-                      {targetChoices.map((t) => (
-                        <option key={t} value={t}>
-                          {t}
-                        </option>
+                    <div className="mt-2.5 flex flex-wrap gap-1">
+                      {preset.domains.map((d) => (
+                        <span
+                          key={d}
+                          className="cc-mono rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                        >
+                          {d}
+                        </span>
                       ))}
-                    </select>
+                    </div>
+
+                    <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-[var(--line)] pt-2 text-[11px]">
+                      <span className="text-[var(--muted)]">走哪个分组</span>
+                      <select
+                        value={preset.targetGroup}
+                        disabled={savingRules || loadingRules}
+                        onChange={(e) =>
+                          void handleChangeAiPresetTarget(preset.id, e.target.value)
+                        }
+                        className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
+                      >
+                        {presetOptions.map((t) => (
+                          <option key={t} value={t}>
+                            {formatRuleTargetLabel(t)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </section>
 
-          {/* Declarative Override YAML Preview */}
+          {/* 完整规则预览 */}
           {showYamlPreview && (
             <section className="cc-card cc-glass overflow-hidden rounded-2xl">
               <div className="flex items-center justify-between border-b border-[var(--line)] bg-[var(--bg-elevated)] px-4 py-2.5">
                 <div className="flex items-center gap-2 text-xs font-semibold text-[var(--text)]">
                   <Eye className="h-3.5 w-3.5 text-[var(--accent)]" />
-                  声明式规则覆写编译预览（YAML）
+                  当前生效规则顺序预览
                 </div>
                 <button
                   type="button"
@@ -756,7 +1066,7 @@ export function RulesConnsPage() {
                   ) : (
                     <Copy className="h-3 w-3 text-[var(--accent)]" />
                   )}
-                  复制 YAML
+                  {copiedYaml ? "已复制" : "复制规则"}
                 </button>
               </div>
               <pre className="cc-selectable cc-mono max-h-[260px] overflow-auto p-4 text-[11px] leading-relaxed text-[var(--text-secondary)]">
@@ -765,32 +1075,35 @@ export function RulesConnsPage() {
             </section>
           )}
 
-          {/* Add New Rule Form */}
+          {/* 自定义分流规则表单 */}
           <section className="cc-card cc-glass rounded-2xl p-4">
-            <h2 className="mb-3 text-xs font-semibold text-[var(--text)]">新增自定义分流规则</h2>
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-xs font-semibold text-[var(--text)]">自定义分流规则</h2>
+              <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] text-[var(--green)]">
+                <Shield className="h-3 w-3" />
+                系统已自动保护本机直连与防回环，添加规则后立即保存生效
+              </span>
+            </div>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-12">
               <select
                 value={newLayer}
-                onChange={(e) => setNewLayer(e.target.value as RuleLayer)}
+                onChange={(e) => setNewLayer(e.target.value as "prepend" | "append")}
                 className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none lg:col-span-2"
               >
-                <option value="prepend">全局前置规则</option>
-                <option value="group">自定义组绑定</option>
-                <option value="append">全局附加规则</option>
+                <option value="prepend">优先匹配（最先判断）</option>
+                <option value="append">兜底匹配（最后判断）</option>
               </select>
 
               <select
                 value={newType}
                 onChange={(e) => setNewType(e.target.value as RuleMatchType)}
-                className="cc-mono rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none lg:col-span-2"
+                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none lg:col-span-2"
               >
-                <option value="DOMAIN-SUFFIX">DOMAIN-SUFFIX</option>
-                <option value="DOMAIN">DOMAIN</option>
-                <option value="DOMAIN-KEYWORD">DOMAIN-KEYWORD</option>
-                <option value="IP-CIDR">IP-CIDR</option>
-                <option value="PROCESS-NAME">PROCESS-NAME</option>
-                <option value="GEOSITE">GEOSITE</option>
-                <option value="GEOIP">GEOIP</option>
+                {(Object.keys(RULE_TYPE_LABELS) as RuleMatchType[]).map((key) => (
+                  <option key={key} value={key}>
+                    {RULE_TYPE_LABELS[key]}
+                  </option>
+                ))}
               </select>
 
               <input
@@ -798,31 +1111,35 @@ export function RulesConnsPage() {
                 value={newValue}
                 onChange={(e) => setNewValue(e.target.value)}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") handleAddRule();
+                  if (e.key === "Enter") void handleAddRule();
                 }}
-                placeholder="匹配值，例如 example.com 或 203.0.113.0/24"
+                placeholder="填写网址或内容，例如 github.com、cn 或 chrome.exe"
                 className="cc-mono rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none lg:col-span-4"
               />
 
               <select
                 value={newTarget}
-                onChange={(e) => setNewTarget(e.target.value)}
+                onChange={(e) => {
+                  userPickedNewTargetRef.current = true;
+                  setNewTarget(e.target.value);
+                }}
                 className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none lg:col-span-2"
               >
                 {targetChoices.map((t) => (
                   <option key={t} value={t}>
-                    {t}
+                    {formatRuleTargetLabel(t)}
                   </option>
                 ))}
               </select>
 
               <button
                 type="button"
-                onClick={handleAddRule}
-                className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 lg:col-span-2"
+                disabled={savingRules || loadingRules}
+                onClick={() => void handleAddRule()}
+                className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50 lg:col-span-2"
               >
                 <Plus className="h-3.5 w-3.5" />
-                加入规则
+                添加并保存
               </button>
             </div>
 
@@ -834,21 +1151,21 @@ export function RulesConnsPage() {
                   onChange={(e) => setNewNoResolve(e.target.checked)}
                   className="accent-[var(--accent)]"
                 />
-                附加 <span className="cc-mono text-[var(--text)]">no-resolve</span>（不触发远程 DNS 解析，直连防环推荐）
+                跳过域名解析（直连规则推荐勾选，避免多余 DNS 查询）
               </label>
             )}
           </section>
 
-          {/* Rule List with Search & Layer Filter */}
+          {/* 已保存规则列表 */}
           <section className="cc-card cc-glass overflow-hidden rounded-2xl">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] bg-[var(--bg-elevated)]/60 px-4 py-3">
               <div className="flex flex-wrap items-center gap-1.5 text-xs">
                 {(
                   [
-                    { id: "all", label: "全部层级" },
-                    { id: "prepend", label: "全局前置" },
-                    { id: "group", label: "多选组绑定" },
-                    { id: "append", label: "全局附加" },
+                    { id: "all", label: "全部规则" },
+                    { id: "prepend", label: "优先匹配" },
+                    { id: "group", label: "分组自带" },
+                    { id: "append", label: "兜底匹配" },
                   ] as const
                 ).map((tab) => (
                   <button
@@ -872,7 +1189,7 @@ export function RulesConnsPage() {
                   type="text"
                   value={ruleSearch}
                   onChange={(e) => setRuleSearch(e.target.value)}
-                  placeholder="快速搜索规则域名、类型或目标组..."
+                  placeholder="搜索网址、类型或目标分组..."
                   className="w-full rounded-xl border border-[var(--line)] bg-[var(--card)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
                 />
                 {ruleSearch && (
@@ -888,97 +1205,99 @@ export function RulesConnsPage() {
             </div>
 
             <div className="divide-y divide-[var(--line)]">
-              {allDisplayRules.length === 0 ? (
+              {loadingRules ? (
                 <div className="py-10 text-center text-xs text-[var(--muted)]">
-                  暂无匹配的分流规则
+                  正在读取已保存的分流规则...
+                </div>
+              ) : allDisplayRules.length === 0 ? (
+                <div className="py-10 text-center text-xs text-[var(--muted)]">
+                  暂无自定义分流规则，可在上方直接添加或开启「常用网站分流」
                 </div>
               ) : (
-                allDisplayRules.map((item) => (
-                  <div
-                    key={item.id}
-                    className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 text-xs hover:bg-[var(--card-hover)]"
-                  >
-                    <div className="flex min-w-0 flex-wrap items-center gap-2">
-                      <span
-                        className="rounded-md px-2 py-0.5 text-[10px] font-medium"
-                        style={{
-                          backgroundColor:
-                            item.layer === "prepend"
-                              ? "var(--accent-soft)"
-                              : item.layer === "group"
-                                ? "var(--sky-soft)"
-                                : "var(--bg-elevated)",
-                          color:
-                            item.layer === "prepend"
-                              ? "var(--accent)"
-                              : item.layer === "group"
-                                ? "var(--sky)"
-                                : "var(--muted)",
-                        }}
-                      >
-                        {item.layer === "prepend"
-                          ? "全局前置"
-                          : item.layer === "group"
-                            ? "组绑定"
-                            : "全局附加"}
-                      </span>
-
-                      <span className="cc-mono rounded border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]">
-                        {item.ruleType}
-                      </span>
-
-                      <span className="cc-mono cc-selectable font-medium text-[var(--text)]">
-                        {item.value}
-                      </span>
-
-                      {item.noResolve && (
-                        <span className="cc-mono text-[10px] text-[var(--muted)]">
-                          no-resolve
+                allDisplayRules.map((item) => {
+                  const typeLabel =
+                    RULE_TYPE_LABELS[item.ruleType as RuleMatchType] ?? item.ruleType;
+                  return (
+                    <div
+                      key={item.id}
+                      className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 text-xs hover:bg-[var(--card-hover)]"
+                    >
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span
+                          className="rounded-md px-2 py-0.5 text-[10px] font-medium"
+                          style={{
+                            backgroundColor:
+                              item.layer === "prepend"
+                                ? "var(--accent-soft)"
+                                : item.layer === "group"
+                                  ? "var(--sky-soft)"
+                                  : "var(--bg-elevated)",
+                            color:
+                              item.layer === "prepend"
+                                ? "var(--accent)"
+                                : item.layer === "group"
+                                  ? "var(--sky)"
+                                  : "var(--muted)",
+                          }}
+                        >
+                          {item.layer === "prepend"
+                            ? "优先匹配"
+                            : item.layer === "group"
+                              ? "分组自带"
+                              : "兜底匹配"}
                         </span>
-                      )}
 
-                      {item.builtin && (
-                        <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] text-[var(--green)]">
-                          <Shield className="h-2.5 w-2.5" />
-                          防环锁定
+                        <span
+                          title={item.ruleType}
+                          className="rounded border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                        >
+                          {typeLabel}
                         </span>
-                      )}
-                    </div>
 
-                    <div className="flex items-center gap-2.5">
-                      <span className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)]">
-                        → {item.target}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteRule(item.id)}
-                        disabled={Boolean(item.builtin)}
-                        className="rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--red-soft)] hover:text-[var(--red)] disabled:cursor-not-allowed disabled:opacity-35"
-                        title={
-                          item.builtin
-                            ? "内置防环保护规则不可删除"
-                            : item.groupId
-                              ? "多选组绑定规则"
+                        <span className="cc-mono cc-selectable font-medium text-[var(--text)]">
+                          {item.value}
+                        </span>
+
+                        {item.noResolve && (
+                          <span className="text-[10px] text-[var(--muted)]">
+                            跳过域名解析
+                          </span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2.5">
+                        <span className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)]">
+                          → {formatRuleTargetLabel(item.target)}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => void handleDeleteRule(item.id)}
+                          disabled={savingRules || Boolean(item.groupId)}
+                          className="rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--red-soft)] hover:text-[var(--red)] disabled:cursor-not-allowed disabled:opacity-35"
+                          title={
+                            item.groupId
+                              ? "分组自带规则请前往「智能多选组」页调整"
                               : "删除此规则"
-                        }
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+                          }
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </section>
         </div>
       ) : (
-        /* ======================== TAB B: LIVE CONNECTIONS ======================== */
+        /* ======================== TAB B: 当前连接 ======================== */
         <div className="space-y-4">
-          {/* Connections KPI & Batch Teardown Controls */}
+          {/* 连接概览与批量操作 */}
           <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
             <div className="flex flex-wrap items-center gap-4 text-xs">
               <div>
-                <span className="text-[var(--muted)]">筛选活跃连接</span>
+                <span className="text-[var(--muted)]">当前连接数</span>
                 <div className="cc-mono mt-0.5 text-base font-semibold text-[var(--text)]">
                   {filteredConnections.length}
                   <span className="ml-1 text-[11px] font-normal text-[var(--muted)]">
@@ -988,13 +1307,13 @@ export function RulesConnsPage() {
               </div>
               <div className="h-7 w-px bg-[var(--line)]" />
               <div>
-                <span className="text-[var(--muted)]">连接累计上传</span>
+                <span className="text-[var(--muted)]">累计上传</span>
                 <div className="cc-mono mt-0.5 text-sm font-semibold text-[var(--coral)]">
                   ↑ {formatBytes(totalConnUpload)}
                 </div>
               </div>
               <div>
-                <span className="text-[var(--muted)]">连接累计下载</span>
+                <span className="text-[var(--muted)]">累计下载</span>
                 <div className="cc-mono mt-0.5 text-sm font-semibold text-[var(--sky)]">
                   ↓ {formatBytes(totalConnDownload)}
                 </div>
@@ -1012,17 +1331,17 @@ export function RulesConnsPage() {
                 ) : (
                   <Pause className="h-3.5 w-3.5 text-[var(--muted)]" />
                 )}
-                {connPaused ? "恢复刷新" : "暂停刷新"}
+                {connPaused ? "继续刷新" : "暂停刷新"}
               </button>
 
               <button
                 type="button"
                 onClick={() => void handleCloseByGroup()}
                 className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--amber)]/50 bg-[var(--amber-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--amber)] hover:opacity-90"
-                title="断开所选多选组下的全部旧连接，解决切节点后 HTTP/2 长连接粘滞"
+                title="断开所选分组下的旧连接，切换节点后可让新线路立刻生效"
               >
                 <Zap className="h-3.5 w-3.5" />
-                按组批量踢断旧连接
+                按分组断开旧连接
               </button>
 
               <button
@@ -1035,12 +1354,12 @@ export function RulesConnsPage() {
                 }`}
               >
                 <Trash2 className="h-3.5 w-3.5" />
-                {confirmCloseAll ? "再次点击确认断开全部" : "断开全部连接"}
+                {confirmCloseAll ? "再点一次确认全部断开" : "断开全部连接"}
               </button>
             </div>
           </section>
 
-          {/* Connections Filter & Sort Bar */}
+          {/* 筛选与排序栏 */}
           <section className="cc-card cc-glass flex flex-wrap items-center gap-2.5 rounded-2xl p-3.5">
             <div className="relative min-w-[240px] flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
@@ -1048,7 +1367,7 @@ export function RulesConnsPage() {
                 type="text"
                 value={connSearch}
                 onChange={(e) => setConnSearch(e.target.value)}
-                placeholder="按进程名、目标域名/IP、命中规则或当前节点过滤..."
+                placeholder="按软件名、目标网址/IP、规则或节点搜索..."
                 className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
               {connSearch && (
@@ -1069,7 +1388,7 @@ export function RulesConnsPage() {
                 onChange={(e) => setConnGroupFilter(e.target.value)}
                 className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
               >
-                <option value="all">全部多选组</option>
+                <option value="all">全部分组</option>
                 {groups.map((g) => (
                   <option key={g.id} value={g.id}>
                     {g.name}
@@ -1084,10 +1403,10 @@ export function RulesConnsPage() {
                 }
                 className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
               >
-                <option value="down">按下载流量排序</option>
-                <option value="up">按上传流量排序</option>
-                <option value="age">按持续时长排序</option>
-                <option value="process">按进程名排序</option>
+                <option value="down">按下载量排序</option>
+                <option value="up">按上传量排序</option>
+                <option value="age">按连接时长排序</option>
+                <option value="process">按软件名排序</option>
               </select>
 
               <button
@@ -1095,23 +1414,23 @@ export function RulesConnsPage() {
                 disabled={refreshingConns}
                 onClick={() => void handleRefreshConns()}
                 className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
-                title="重新拉取连接快照"
+                title="刷新当前连接"
               >
                 <RefreshCw className={`h-3.5 w-3.5 ${refreshingConns ? "animate-spin" : ""}`} />
               </button>
             </div>
           </section>
 
-          {/* Connections Data Table */}
+          {/* 当前连接表格 */}
           <section className="cc-card cc-glass overflow-hidden rounded-2xl">
             <div className="overflow-x-auto">
               <table className="w-full min-w-[820px] border-collapse text-left text-xs">
                 <thead>
                   <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[11px] text-[var(--muted)]">
-                    <th className="px-4 py-2.5 font-medium">进程 / 协议</th>
-                    <th className="px-3 py-2.5 font-medium">目标主机与端口</th>
+                    <th className="px-4 py-2.5 font-medium">软件 / 协议</th>
+                    <th className="px-3 py-2.5 font-medium">访问地址与端口</th>
                     <th className="px-3 py-2.5 font-medium">命中规则</th>
-                    <th className="px-3 py-2.5 font-medium">策略组与当前节点</th>
+                    <th className="px-3 py-2.5 font-medium">分组与当前节点</th>
                     <th className="px-3 py-2.5 text-right font-medium">上传 / 下载</th>
                     <th className="px-3 py-2.5 text-right font-medium">时长</th>
                     <th className="px-4 py-2.5 text-right font-medium">操作</th>
@@ -1124,7 +1443,7 @@ export function RulesConnsPage() {
                         colSpan={7}
                         className="py-10 text-center text-xs text-[var(--muted)]"
                       >
-                        当前无匹配的活跃连接
+                        当前没有进行中的连接
                       </td>
                     </tr>
                   ) : (
@@ -1149,24 +1468,27 @@ export function RulesConnsPage() {
                         </td>
 
                         <td className="px-3 py-2.5">
-                          <span className="cc-mono inline-block max-w-[210px] truncate rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10.5px] text-[var(--text-secondary)]">
-                            {conn.rule}
+                          <span
+                            title={conn.rule}
+                            className="inline-block max-w-[220px] truncate rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]"
+                          >
+                            {formatConnectionRuleLabel(conn.rule)}
                           </span>
                         </td>
 
                         <td className="px-3 py-2.5">
                           <div className="flex items-center gap-1.5">
                             <span className="text-[11px] font-medium text-[var(--accent)]">
-                              {conn.groupName}
+                              {formatRuleTargetLabel(conn.groupName)}
                             </span>
                             {conn.viaPreAccel && (
                               <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] text-[var(--green)]">
-                                预加速
+                                国内提速
                               </span>
                             )}
                           </div>
                           <div className="cc-mono mt-0.5 text-[11px] text-[var(--text-secondary)]">
-                            {conn.nodeName}
+                            {formatRuleTargetLabel(conn.nodeName)}
                           </div>
                         </td>
 
@@ -1190,7 +1512,7 @@ export function RulesConnsPage() {
                             className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--red)] hover:bg-[var(--red-soft)] hover:text-[var(--red)]"
                           >
                             <X className="h-3 w-3" />
-                            踢断
+                            断开
                           </button>
                         </td>
                       </tr>

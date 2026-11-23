@@ -1,16 +1,21 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use catcloud_core::config;
 use catcloud_core::core_adapter::binary_resolver::{
     compute_file_sha256, mihomo_binary_name, resolve_mihomo_binary,
 };
 use catcloud_core::core_adapter::config_compiler::{
     CompileInput, CompileStats, StaticValidationReport, compile_mihomo_config,
+    redact_compiled_yaml_for_preview,
 };
-use catcloud_core::core_adapter::hot_reload::{DiskReloadOptions, HotReloadCoordinator};
+use catcloud_core::core_adapter::hot_reload::{
+    DiskReloadOptions, HotReloadCoordinator, has_core_config_changes,
+};
 use catcloud_core::core_adapter::mihomo::{
     MihomoAdapter, generate_controller_secret, verify_config_with_binary,
 };
@@ -20,12 +25,13 @@ use catcloud_core::core_adapter::stream_client::{
 };
 use catcloud_core::core_adapter::{
     ConnectionsSnapshot, CoreAdapter, CoreLogLine, CoreRuntimeStatus, CoreStartRequest,
-    ReloadOutcome,
+    ReloadLevel, ReloadOutcome,
 };
 use catcloud_core::models::{
-    AppConfig, MemoryLimitTier, MultiGroup, PersonalizationConfig, PreAccelConfig, PreAccelRelay,
-    ProbeDefinition, ProbeSnapshot, ProxyMode, ProxyNode, SubscriptionKind, SubscriptionRecord,
-    SwitchMode, ThemeDaySchedule, ThemeMode, TrayIconMode, TunStackMode, UpdateApplyMode,
+    AppConfig, CoreLogLevel, MemoryLimitTier, MultiGroup, MultiGroupMode, PersonalizationConfig,
+    PreAccelConfig, PreAccelRelay, ProbeDefinition, ProbeSnapshot, ProxyMode, ProxyNode,
+    SubscriptionKind, SubscriptionRecord, SwitchMode, ThemeDaySchedule, ThemeMode,
+    TrayClickAction as CoreTrayClickAction, TrayIconMode, TunStackMode, UpdateApplyMode,
     UpdateConfig,
 };
 use catcloud_core::platform::default_platform;
@@ -33,14 +39,16 @@ use catcloud_core::preaccel::campus::{
     CampusBypassTracker, CampusPortalState, probe_campus_portal_with_fallback,
 };
 use catcloud_core::probe::{
-    FunnelOptions, IsolatedProbeCore, ProbeRegistry, run_funnel_for_node,
+    FunnelOptions, FunnelTier, IsolatedProbeCore, ProbeRegistry, run_funnel_for_node,
 };
 use catcloud_core::process_guard::JobGuard;
 use catcloud_core::storage::Storage;
 use catcloud_core::strategy::evaluator::evaluate_group_candidates;
 use catcloud_core::subscription::{
-    FetchOptions, apply_parsed_subscription, fetch_and_parse_subscription_with_options,
-    inspect_process_source as core_inspect_process_source, parse_subscription_payload,
+    ADAPTER_REASON_MANUAL, AdapterConfig, AdapterCooldownGuard, AdapterRequest, FetchOptions,
+    ParsedSubscription, SubscriptionPayloadFormat, apply_parsed_subscription,
+    fetch_and_parse_subscription_with_options, inspect_process_source as core_inspect_process_source,
+    invoke_external_adapter, parse_controller_proxies_json, parse_subscription_payload,
     preview_from_text as core_preview_from_text,
 };
 use catcloud_core::updater::Updater;
@@ -51,8 +59,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::net::TcpStream;
 
 use crate::lifecycle;
+use crate::shortcuts::{self, ShortcutAction, ShortcutBindings};
 use crate::tray::{
-    self, TrayGroupSummary, TrayHealthState, TrayMenuState, TrayNodeCandidate,
+    self, TrayClickAction, TrayGroupSummary, TrayHealthState, TrayMenuState, TrayNodeCandidate,
     TrayPreAccelRelayItem, TrayPreAccelSummary, TrayProxyMode, TraySubscriptionItem,
     TraySubscriptionSummary, TrayVisualState,
 };
@@ -60,6 +69,7 @@ use crate::tray::{
 pub const EVENT_TRAFFIC: &str = "catcloud://traffic";
 pub const EVENT_RUNTIME: &str = "catcloud://runtime";
 pub const EVENT_CORE_LOG: &str = "catcloud://core-log";
+pub const EVENT_PROBE_PROGRESS: &str = "catcloud://probe-progress";
 
 /// Shared backend state managed by Tauri across commands, tray callbacks, streams, and shortcuts.
 pub struct AppState {
@@ -75,6 +85,11 @@ pub struct AppState {
     pub resource_dir: RwLock<Option<PathBuf>>,
     pub cached_runtime: RwLock<CoreRuntimeStatus>,
     pub cached_metrics: RwLock<CachedRealtimeMetrics>,
+    pub probe_running: Arc<AtomicBool>,
+    pub probe_cancel_tx: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    pub core_session_gen: Arc<AtomicU64>,
+    pub last_hotkey_bindings: Mutex<Option<ShortcutBindings>>,
+    pub adapter_cooldown: Arc<AdapterCooldownGuard>,
     pub started_at: Instant,
 }
 
@@ -111,7 +126,41 @@ impl AppState {
             resource_dir: RwLock::new(None),
             cached_runtime: RwLock::new(CoreRuntimeStatus::default()),
             cached_metrics: RwLock::new(CachedRealtimeMetrics::default()),
+            probe_running: Arc::new(AtomicBool::new(false)),
+            probe_cancel_tx: Arc::new(Mutex::new(None)),
+            core_session_gen: Arc::new(AtomicU64::new(0)),
+            last_hotkey_bindings: Mutex::new(None),
+            adapter_cooldown: Arc::new(AdapterCooldownGuard::new()),
             started_at: Instant::now(),
+        }
+    }
+
+    pub fn core_session_generation(&self) -> u64 {
+        self.core_session_gen.load(Ordering::SeqCst)
+    }
+
+    pub fn bump_core_session_generation(&self) -> u64 {
+        self.core_session_gen
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    }
+
+    pub fn attach_streams(
+        &self,
+        controller_host: &str,
+        controller_port: u16,
+        secret: &str,
+        log_level: CoreLogLevel,
+    ) {
+        self.stop_streams();
+        if let Ok(stream_client) =
+            MihomoStreamClient::new(controller_host, controller_port, secret)
+        {
+            let session = stream_client
+                .spawn_background_streams(log_level, Arc::clone(&self.telemetry));
+            if let Ok(mut guard) = self.stream_session.lock() {
+                *guard = Some(session);
+            }
         }
     }
 
@@ -473,8 +522,23 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
     let node_by_id: HashMap<&str, &ProxyNode> =
         nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
+    let primary_idx = cfg
+        .active_group_id
+        .as_deref()
+        .and_then(|aid| groups.iter().position(|g| g.id == aid))
+        .unwrap_or(0);
+    let mut ordered_groups: Vec<&MultiGroup> = Vec::with_capacity(groups.len().min(6));
+    if let Some(primary) = groups.get(primary_idx) {
+        ordered_groups.push(primary);
+    }
+    for (idx, g) in groups.iter().enumerate() {
+        if idx != primary_idx && ordered_groups.len() < 6 {
+            ordered_groups.push(g);
+        }
+    }
+
     let mut group_summaries: Vec<TrayGroupSummary> = Vec::new();
-    for g in groups.iter().take(6) {
+    for g in ordered_groups {
         let member_nodes: Vec<&ProxyNode> = if g.member_node_ids.is_empty() {
             nodes.iter().filter(|n| n.enabled).take(8).collect()
         } else {
@@ -626,7 +690,11 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
 
     let primary_group_summary = state.storage.lock().ok().and_then(|db| {
         let groups = db.list_multi_groups().ok()?;
-        let g = groups.first()?;
+        let g = cfg
+            .active_group_id
+            .as_deref()
+            .and_then(|gid| groups.iter().find(|g| g.id == gid))
+            .or_else(|| groups.first())?;
         let node_name = g
             .active_node_id
             .as_deref()
@@ -661,7 +729,7 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         tun_enabled: cfg.tun.enabled,
         system_proxy_enabled: cfg.system_proxy.enabled,
         preaccel_summary: if cfg.preaccel.enabled {
-            Some("国内 443 预加速已启用".to_string())
+            Some("国内加速入口已开启".to_string())
         } else {
             None
         },
@@ -691,10 +759,19 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         let groups = db.list_multi_groups().unwrap_or_default();
         let nodes = db.list_nodes().unwrap_or_default();
         let relays = db.list_preaccel_relays(true).unwrap_or_default();
-        let primary_group = groups.first();
+        let primary_group = cfg
+            .active_group_id
+            .as_deref()
+            .and_then(|gid| groups.iter().find(|g| g.id == gid))
+            .or_else(|| groups.first());
         let active_node = primary_group
             .and_then(|g| g.active_node_id.as_deref())
             .and_then(|id| nodes.iter().find(|n| n.id == id))
+            .or_else(|| {
+                primary_group
+                    .and_then(|g| g.member_node_ids.first())
+                    .and_then(|id| nodes.iter().find(|n| n.id == *id))
+            })
             .or_else(|| nodes.first());
         let snap = active_node.and_then(|n| {
             db.get_probe_snapshot(&n.id, primary_group.and_then(|g| g.primary_probe_id.as_deref()))
@@ -704,10 +781,19 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         (groups, nodes, relays, snap)
     };
 
-    let primary_group = groups.first();
+    let primary_group = cfg
+        .active_group_id
+        .as_deref()
+        .and_then(|gid| groups.iter().find(|g| g.id == gid))
+        .or_else(|| groups.first());
     let active_node = primary_group
         .and_then(|g| g.active_node_id.as_deref())
         .and_then(|id| nodes.iter().find(|n| n.id == id))
+        .or_else(|| {
+            primary_group
+                .and_then(|g| g.member_node_ids.first())
+                .and_then(|id| nodes.iter().find(|n| n.id == *id))
+        })
         .or_else(|| nodes.first());
 
     let active_relay_name = cfg
@@ -763,7 +849,7 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         active_group_id: primary_group.map(|g| g.id.clone()).unwrap_or_default(),
         active_group_name: primary_group
             .map(|g| g.name.clone())
-            .unwrap_or_else(|| "默认多选组".to_string()),
+            .unwrap_or_else(|| "默认路线".to_string()),
         active_node_id: active_node.map(|n| n.id.clone()).unwrap_or_default(),
         active_node_name: active_node
             .map(|n| n.name.clone())
@@ -793,17 +879,146 @@ pub fn emit_runtime_snapshot(app: &AppHandle, state: &AppState) {
     }
 }
 
+pub fn map_tray_click(action: &CoreTrayClickAction) -> TrayClickAction {
+    match action {
+        CoreTrayClickAction::ToggleCapsule => TrayClickAction::ToggleCapsule,
+        CoreTrayClickAction::None => TrayClickAction::ShowMenu,
+        _ => TrayClickAction::ToggleMain,
+    }
+}
+
+fn shortcut_bindings_from_config(cfg: &AppConfig) -> ShortcutBindings {
+    if !cfg.behavior.hotkeys.enabled {
+        return ShortcutBindings {
+            switch_next_best: None,
+            toggle_capsule: None,
+            toggle_main_window: None,
+            toggle_system_proxy: None,
+        };
+    }
+    ShortcutBindings {
+        switch_next_best: cfg.behavior.hotkeys.switch_next_best.clone(),
+        toggle_capsule: cfg.behavior.hotkeys.toggle_capsule.clone(),
+        toggle_main_window: cfg.behavior.hotkeys.show_main_window.clone(),
+        toggle_system_proxy: cfg.behavior.hotkeys.toggle_system_proxy.clone(),
+    }
+}
+
+pub fn apply_configured_shortcuts(
+    app: &AppHandle,
+    state: &AppState,
+    cfg: &AppConfig,
+    force: bool,
+) {
+    let bindings = shortcut_bindings_from_config(cfg);
+    if !force {
+        if let Ok(guard) = state.last_hotkey_bindings.lock() {
+            if guard.as_ref() == Some(&bindings) {
+                return;
+            }
+        }
+    }
+    let _ = shortcuts::register_shortcuts(app, &bindings, |app_h, action| {
+        let app_async = app_h.clone();
+        match action {
+            ShortcutAction::ToggleCapsule => lifecycle::toggle_capsule_window(app_h),
+            ShortcutAction::ToggleMainWindow => {
+                if lifecycle::window_mode_snapshot(app_h).main_open {
+                    lifecycle::enter_windowless_mode(app_h);
+                } else {
+                    lifecycle::show_or_rebuild_main_window(app_h);
+                }
+            }
+            ShortcutAction::ToggleSystemProxy => {
+                tauri::async_runtime::spawn(async move {
+                    if let Some(st) = app_async.try_state::<AppState>() {
+                        let next = !st.snapshot_config().system_proxy.enabled;
+                        let _ = apply_system_proxy_internal(&app_async, &st, next).await;
+                    }
+                });
+            }
+            ShortcutAction::SwitchNextBestNode => {
+                tauri::async_runtime::spawn(async move {
+                    if let Some(st) = app_async.try_state::<AppState>() {
+                        let target_group = st
+                            .snapshot_config()
+                            .active_group_id
+                            .unwrap_or_else(|| "default".to_string());
+                        let _ = switch_next_best_internal(&app_async, &st, target_group).await;
+                    }
+                });
+            }
+        }
+    });
+    if let Ok(mut guard) = state.last_hotkey_bindings.lock() {
+        *guard = Some(bindings);
+    }
+}
+
+/// Auto-create a default "默认路线" multi-group when nodes exist but no multi-group is configured yet.
+fn ensure_default_group_if_empty(state: &AppState) {
+    let created_group_id = {
+        let Ok(db) = state.storage.lock() else {
+            return;
+        };
+        let Ok(groups) = db.list_multi_groups() else {
+            return;
+        };
+        if !groups.is_empty() {
+            return;
+        }
+        let Ok(nodes) = db.list_nodes() else {
+            return;
+        };
+        if nodes.is_empty() {
+            return;
+        }
+        let member_node_ids: Vec<String> = nodes
+            .iter()
+            .filter(|n| n.enabled)
+            .map(|n| n.id.clone())
+            .collect();
+        let active_node_id = member_node_ids.first().cloned();
+        let group = MultiGroup {
+            id: format!("grp-{}", uuid::Uuid::new_v4().simple()),
+            name: "默认路线".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            hard_gates: Vec::new(),
+            member_node_ids,
+            active_node_id,
+            ..MultiGroup::default()
+        };
+        if db.upsert_multi_group(&group).is_err() {
+            return;
+        }
+        group.id
+    };
+
+    let mut cfg = state.snapshot_config();
+    cfg.active_group_id = Some(created_group_id);
+    if config::save(&state.paths, &cfg).is_ok() {
+        if let Ok(mut guard) = state.config.write() {
+            *guard = cfg;
+        }
+    }
+}
+
 fn sync_app_side_effects(app: &AppHandle, state: &AppState, cfg: &AppConfig) {
     if let Some(win_state) = app.try_state::<lifecycle::WindowLifecycleState>() {
         win_state.set_destroy_on_close(cfg.behavior.minimize_to_tray_on_close);
     }
+    tray::set_tray_left_click_action(app, map_tray_click(&cfg.behavior.tray_click_action));
+    apply_configured_shortcuts(app, state, cfg, false);
     let _ = tray::sync_tray_menu(app, &build_tray_menu_state(app, state));
     let _ = tray::sync_tray_visual(app, &build_tray_visual_state(state));
     emit_runtime_snapshot(app, state);
 }
 
-fn sync_autostart_if_changed(old_autostart: bool, cfg: &AppConfig) {
-    if old_autostart == cfg.behavior.autostart {
+fn sync_autostart_if_changed(old: &AppConfig, cfg: &AppConfig) {
+    let autostart_changed = old.behavior.autostart != cfg.behavior.autostart;
+    let silent_changed_while_enabled =
+        cfg.behavior.autostart && old.behavior.silent_start != cfg.behavior.silent_start;
+    if !autostart_changed && !silent_changed_while_enabled {
         return;
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -935,19 +1150,16 @@ pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<Co
         .hot_reload
         .seed_active_state(cfg.clone(), compiled.sha256, allocated.clone(), secret.clone())
         .await;
+    state.bump_core_session_generation();
     state.update_cached_runtime(status.clone());
 
     // Attach bounded background telemetry streams (`/traffic`, `/memory`, `/logs`).
-    state.stop_streams();
-    if let Ok(stream_client) =
-        MihomoStreamClient::new(&status.controller_host, status.controller_port, &secret)
-    {
-        let session = stream_client
-            .spawn_background_streams(cfg.log_level.clone(), Arc::clone(&state.telemetry));
-        if let Ok(mut guard) = state.stream_session.lock() {
-            *guard = Some(session);
-        }
-    }
+    state.attach_streams(
+        &status.controller_host,
+        status.controller_port,
+        &secret,
+        cfg.log_level.clone(),
+    );
 
     sync_app_side_effects(app, state, &cfg);
     build_runtime_info_dto(state)
@@ -957,11 +1169,24 @@ pub async fn start_core_internal(app: &AppHandle, state: &AppState) -> Result<Co
 pub async fn stop_core_internal(app: &AppHandle, state: &AppState) -> Result<CoreRuntimeInfoDto, String> {
     state.stop_streams();
     state.adapter.stop().await.map_err(|e| e.to_string())?;
+    state.bump_core_session_generation();
     let status = state.adapter.status().await;
     state.update_cached_runtime(status);
     if let Ok(mut m) = state.cached_metrics.write() {
         *m = CachedRealtimeMetrics::default();
     }
+    let _ = app.emit(
+        EVENT_TRAFFIC,
+        TrafficEventPayload {
+            up_bps: 0,
+            down_bps: 0,
+            up_total_bytes: 0,
+            down_total_bytes: 0,
+            active_connections: 0,
+            core_memory_mb: 0.0,
+            timestamp_ms: Utc::now().timestamp_millis(),
+        },
+    );
     let cfg = state.snapshot_config();
     sync_app_side_effects(app, state, &cfg);
     build_runtime_info_dto(state)
@@ -976,6 +1201,9 @@ pub async fn trigger_reload_if_running(
     if !state.adapter.has_live_controller().await {
         return None;
     }
+    let prev_status = state.adapter.status().await;
+    let prev_secret = state.adapter.controller_secret().await;
+
     let (extra_rules, extra_filters) = state
         .campus_tracker
         .lock()
@@ -1000,8 +1228,27 @@ pub async fn trigger_reload_if_running(
         .await;
 
     let status = state.adapter.status().await;
-    state.update_cached_runtime(status);
+    let new_secret = state.adapter.controller_secret().await;
+    state.update_cached_runtime(status.clone());
     let cfg = state.snapshot_config();
+
+    let endpoint_changed = prev_status.controller_host != status.controller_host
+        || prev_status.controller_port != status.controller_port;
+    let secret_changed = prev_secret != new_secret;
+    let is_l3_restart = outcome.level == ReloadLevel::L3CoreRestart;
+
+    if outcome.applied && status.running && (is_l3_restart || endpoint_changed || secret_changed) {
+        if is_l3_restart {
+            state.bump_core_session_generation();
+        }
+        state.attach_streams(
+            &status.controller_host,
+            status.controller_port,
+            &new_secret,
+            cfg.log_level.clone(),
+        );
+    }
+
     sync_app_side_effects(app, state, &cfg);
     Some(outcome)
 }
@@ -1059,22 +1306,32 @@ pub async fn switch_next_best_internal(
     state: &AppState,
     group_id: String,
 ) -> Result<SwitchResultDto, String> {
+    let cfg = state.snapshot_config();
     let (group, nodes, snaps) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let nodes = db.list_nodes().map_err(|e| e.to_string())?;
         if nodes.is_empty() {
-            return Err("no nodes available in storage".to_string());
+            return Err("暂无可用节点，请先导入订阅".to_string());
         }
         let requested_id = group_id.trim();
+        let active_gid = cfg
+            .active_group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let found_group = if !requested_id.is_empty() && requested_id != "default" {
-            db.get_multi_group(requested_id).map_err(|e| e.to_string())?
-        } else {
-            db.get_multi_group("default")
+            db.get_multi_group(requested_id)
                 .map_err(|e| e.to_string())?
+                .or_else(|| active_gid.and_then(|aid| db.get_multi_group(aid).ok().flatten()))
+                .or_else(|| db.list_multi_groups().ok().and_then(|mut v| v.drain(..).next()))
+        } else {
+            active_gid
+                .and_then(|aid| db.get_multi_group(aid).ok().flatten())
+                .or_else(|| db.get_multi_group("default").ok().flatten())
                 .or_else(|| db.list_multi_groups().ok().and_then(|mut v| v.drain(..).next()))
         };
         let Some(group) = found_group else {
-            return Err("no configured multi-group available to switch".to_string());
+            return Err("暂无可切换的路线分组，请先创建分组".to_string());
         };
         let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
         let snaps = db
@@ -1177,6 +1434,11 @@ pub async fn select_group_node_internal(
         (group, target_node, prev_id, prev_node_name, snap)
     };
 
+    let mut members_changed = false;
+    if !group.member_node_ids.iter().any(|id| id == &target_node.id) {
+        group.member_node_ids.push(target_node.id.clone());
+        members_changed = true;
+    }
     group.active_node_id = Some(target_node.id.clone());
     {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
@@ -1185,10 +1447,29 @@ pub async fn select_group_node_internal(
 
     let mut closed_connections = 0usize;
     if state.adapter.has_live_controller().await {
-        let _ = state
+        if members_changed {
+            if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
+                if outcome.rejected {
+                    let detail = outcome
+                        .error
+                        .unwrap_or_else(|| "未知原因".to_string());
+                    return Err(format!(
+                        "已将节点「{}」加入分组「{}」，但重载核心配置失败：{detail}",
+                        target_node.name, group.name
+                    ));
+                }
+            }
+        }
+        state
             .adapter
             .select_group_proxy(&group.name, &target_node.name)
-            .await;
+            .await
+            .map_err(|e| {
+                format!(
+                    "切换核心节点「{}」失败，请确认该节点已启用且核心运行正常：{e}",
+                    target_node.name
+                )
+            })?;
         let should_close =
             close_old.unwrap_or_else(|| matches!(group.switch_mode, SwitchMode::ForceCloseOld));
         if should_close {
@@ -1322,12 +1603,22 @@ pub async fn save_app_config(
     if let Ok(mut guard) = state.config.write() {
         *guard = cfg.clone();
     }
-    sync_autostart_if_changed(old.behavior.autostart, &cfg);
-    if old.system_proxy.enabled != cfg.system_proxy.enabled {
-        let spec = cfg.system_proxy.to_platform_spec("127.0.0.1", cfg.mixed_port);
+    sync_autostart_if_changed(&old, &cfg);
+    if has_core_config_changes(&old, &cfg) {
+        let _ = trigger_reload_if_running(&app, &state, false).await;
+    }
+    if old.system_proxy.enabled != cfg.system_proxy.enabled
+        || (cfg.system_proxy.enabled && old.mixed_port != cfg.mixed_port)
+    {
+        let effective_port = {
+            let rt = state.snapshot_runtime();
+            if rt.running { rt.mixed_port } else { cfg.mixed_port }
+        };
+        let spec = cfg
+            .system_proxy
+            .to_platform_spec("127.0.0.1", effective_port);
         let _ = default_platform().apply_system_proxy(&spec);
     }
-    let _ = trigger_reload_if_running(&app, &state, false).await;
     sync_app_side_effects(&app, &state, &cfg);
     Ok(UiAppConfigDto::from(&cfg))
 }
@@ -1348,18 +1639,49 @@ pub async fn save_full_config(
     if let Ok(mut guard) = state.config.write() {
         *guard = next.clone();
     }
-    sync_autostart_if_changed(old.behavior.autostart, &next);
-    let _ = trigger_reload_if_running(&app, &state, false).await;
+    sync_autostart_if_changed(&old, &next);
+    if has_core_config_changes(&old, &next) {
+        let _ = trigger_reload_if_running(&app, &state, false).await;
+    }
+    if old.system_proxy != next.system_proxy
+        || (next.system_proxy.enabled && old.mixed_port != next.mixed_port)
+    {
+        let effective_port = {
+            let rt = state.snapshot_runtime();
+            if rt.running { rt.mixed_port } else { next.mixed_port }
+        };
+        let spec = next
+            .system_proxy
+            .to_platform_spec("127.0.0.1", effective_port);
+        let _ = default_platform().apply_system_proxy(&spec);
+    }
     sync_app_side_effects(&app, &state, &next);
     Ok(next)
 }
 
-fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+fn is_replace_map_path(path: &str) -> bool {
+    matches!(path, "dns.nameserver_policy" | "dns.hosts")
+}
+
+fn json_deep_merge_inner(
+    target: &mut serde_json::Value,
+    patch: &serde_json::Value,
+    path: &str,
+) {
     match (target, patch) {
         (serde_json::Value::Object(t_map), serde_json::Value::Object(p_map)) => {
+            if !path.is_empty() && (is_replace_map_path(path) || p_map.is_empty()) {
+                *t_map = p_map.clone();
+                return;
+            }
             for (k, v) in p_map {
+                let child_path = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
                 if let Some(existing) = t_map.get_mut(k) {
-                    json_deep_merge(existing, v);
+                    json_deep_merge_inner(existing, v, &child_path);
                 } else {
                     t_map.insert(k.clone(), v.clone());
                 }
@@ -1369,6 +1691,10 @@ fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
             *slot = new_val.clone();
         }
     }
+}
+
+fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    json_deep_merge_inner(target, patch, "");
 }
 
 #[tauri::command]
@@ -1385,8 +1711,22 @@ pub async fn save_extended_settings(
     if let Ok(mut guard) = state.config.write() {
         *guard = next.clone();
     }
-    sync_autostart_if_changed(old.behavior.autostart, &next);
-    let _ = trigger_reload_if_running(&app, &state, false).await;
+    sync_autostart_if_changed(&old, &next);
+    if has_core_config_changes(&old, &next) {
+        let _ = trigger_reload_if_running(&app, &state, false).await;
+    }
+    if old.system_proxy != next.system_proxy
+        || (next.system_proxy.enabled && old.mixed_port != next.mixed_port)
+    {
+        let effective_port = {
+            let rt = state.snapshot_runtime();
+            if rt.running { rt.mixed_port } else { next.mixed_port }
+        };
+        let spec = next
+            .system_proxy
+            .to_platform_spec("127.0.0.1", effective_port);
+        let _ = default_platform().apply_system_proxy(&spec);
+    }
     sync_app_side_effects(&app, &state, &next);
     Ok(next)
 }
@@ -1523,6 +1863,40 @@ pub async fn select_group_node(
 }
 
 #[tauri::command]
+pub async fn set_active_group(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    group_id: String,
+) -> Result<CoreRuntimeInfoDto, String> {
+    let trimmed = group_id.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("group_id cannot be empty".to_string());
+    }
+    {
+        let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let exists = db
+            .get_multi_group(&trimmed)
+            .map_err(|e| e.to_string())?
+            .is_some();
+        if !exists {
+            return Err(format!("multi-group `{trimmed}` not found"));
+        }
+    }
+    let mut cfg = state.snapshot_config();
+    let changed = cfg.active_group_id.as_deref() != Some(trimmed.as_str());
+    cfg.active_group_id = Some(trimmed);
+    config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    if let Ok(mut guard) = state.config.write() {
+        *guard = cfg.clone();
+    }
+    if changed {
+        let _ = trigger_reload_if_running(&app, &state, false).await;
+    }
+    sync_app_side_effects(&app, &state, &cfg);
+    build_runtime_info_dto(&state)
+}
+
+#[tauri::command]
 pub fn toggle_capsule_window(app: AppHandle) -> Result<bool, String> {
     let was_open = lifecycle::window_mode_snapshot(&app).capsule_open;
     lifecycle::toggle_capsule_window(&app);
@@ -1574,14 +1948,31 @@ pub async fn delete_multi_group(
     state: State<'_, AppState>,
     group_id: String,
 ) -> Result<bool, String> {
-    let deleted = {
+    let (deleted, next_fallback_group_id) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        db.delete_multi_group(&group_id).map_err(|e| e.to_string())?
+        let deleted = db.delete_multi_group(&group_id).map_err(|e| e.to_string())?;
+        let next_id = if deleted {
+            db.list_multi_groups()
+                .ok()
+                .and_then(|v| v.into_iter().next())
+                .map(|g| g.id)
+        } else {
+            None
+        };
+        (deleted, next_id)
     };
     if deleted {
+        let mut cfg = state.snapshot_config();
+        if cfg.active_group_id.as_deref() == Some(group_id.as_str()) {
+            cfg.active_group_id = next_fallback_group_id;
+            config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+            if let Ok(mut guard) = state.config.write() {
+                *guard = cfg.clone();
+            }
+        }
         let _ = trigger_reload_if_running(&app, &state, false).await;
-        let cfg = state.snapshot_config();
-        sync_app_side_effects(&app, &state, &cfg);
+        let latest_cfg = state.snapshot_config();
+        sync_app_side_effects(&app, &state, &latest_cfg);
     }
     Ok(deleted)
 }
@@ -1690,29 +2081,88 @@ pub fn list_probe_snapshots(
         .map_err(|e| e.to_string())
 }
 
+struct ProbeRunningGuard {
+    running: Arc<AtomicBool>,
+    cancel_tx: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+}
+
+impl Drop for ProbeRunningGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.cancel_tx.lock() {
+            *guard = None;
+        }
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+#[tauri::command]
+pub fn cancel_isolated_probes(state: State<'_, AppState>) -> Result<bool, String> {
+    let was_running = state.probe_running.load(Ordering::SeqCst);
+    if let Ok(guard) = state.probe_cancel_tx.lock() {
+        if let Some(ref tx) = *guard {
+            let _ = tx.send(true);
+        }
+    }
+    Ok(was_running)
+}
+
 #[tauri::command]
 pub async fn run_isolated_probes(
+    app: AppHandle,
     state: State<'_, AppState>,
     node_ids: Vec<String>,
     probe_ids: Vec<String>,
+    max_tier: Option<String>,
+    include_keepalive: Option<bool>,
 ) -> Result<serde_json::Value, String> {
+    let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    if state
+        .probe_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("已有测速任务正在进行，请先暂停或等待完成".to_string());
+    }
+    if let Ok(mut guard) = state.probe_cancel_tx.lock() {
+        *guard = Some(cancel_tx);
+    }
+    let _running_guard = ProbeRunningGuard {
+        running: Arc::clone(&state.probe_running),
+        cancel_tx: Arc::clone(&state.probe_cancel_tx),
+    };
+
     let cfg = state.snapshot_config();
     let extra_candidates = state.extra_binary_candidates();
     let resolution = resolve_mihomo_binary(&cfg, &state.paths, &extra_candidates, false)
         .map_err(|e| e.to_string())?;
     let Some(mihomo_bin) = resolution.path else {
-        return Err("mihomo binary not found for isolated probing".to_string());
+        return Err("未找到 Mihomo 内核文件，无法执行隔离测速".to_string());
     };
+
+    let resolved_tier = match max_tier
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("full")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "latency" | "fast" | "l0" => FunnelTier::L0Connectivity,
+        "unlock" | "clean" | "lite" | "l1" => FunnelTier::L1CleanAndUnlock,
+        _ => FunnelTier::L2ThroughputAndKeepalive,
+    };
+    let keepalive_enabled = include_keepalive.unwrap_or(false);
 
     let (target_nodes, probe_defs) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let all_nodes = db.list_nodes().map_err(|e| e.to_string())?;
         let target_nodes: Vec<ProxyNode> = if node_ids.is_empty() {
-            all_nodes.into_iter().filter(|n| n.enabled).take(24).collect()
+            all_nodes.into_iter().filter(|n| n.enabled).collect()
         } else {
-            all_nodes
-                .into_iter()
-                .filter(|n| node_ids.contains(&n.id))
+            let id_map: HashMap<&str, &ProxyNode> =
+                all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+            node_ids
+                .iter()
+                .filter_map(|id| id_map.get(id.as_str()).map(|n| (*n).clone()))
                 .collect()
         };
         let all_defs = db.list_probe_definitions().map_err(|e| e.to_string())?;
@@ -1724,71 +2174,463 @@ pub async fn run_isolated_probes(
                 .filter(|d| probe_ids.contains(&d.id))
                 .collect()
         };
-        (target_nodes, selected_defs)
+        let filtered_defs: Vec<ProbeDefinition> = selected_defs
+            .into_iter()
+            .filter(|d| keepalive_enabled || d.kind != catcloud_core::models::ProbeKind::Keepalive)
+            .collect();
+        (target_nodes, filtered_defs)
     };
 
     if target_nodes.is_empty() {
-        return Err("no target nodes selected for probing".to_string());
+        return Err("请先选择至少一个节点后再开始测速".to_string());
     }
     if probe_defs.is_empty() {
-        return Err("no probe definitions available".to_string());
+        return Err("当前没有可用的测速项目".to_string());
     }
 
     let mut registry = ProbeRegistry::new();
     for def in probe_defs {
         registry.register(def).map_err(|e| e.to_string())?;
     }
+    let registry = Arc::new(registry);
 
     let temp_root = state.paths.runtime_dir.join("probe_sandbox");
     std::fs::create_dir_all(&temp_root).map_err(|e| e.to_string())?;
 
-    let probe_core =
-        IsolatedProbeCore::spawn(&mihomo_bin, &temp_root, &state.job_guard, &target_nodes)
-            .await
-            .map_err(|e| e.to_string())?;
+    let options = Arc::new(FunnelOptions {
+        max_tier: resolved_tier,
+        ..FunnelOptions::default()
+    });
 
-    let options = FunnelOptions::default();
-    let mut all_records = Vec::new();
+    let total_count = target_nodes.len();
+    let mut completed_count: usize = 0;
+    let mut cancelled = false;
     let mut snapshots: HashMap<String, ProbeSnapshot> = HashMap::new();
     let mut errors: Vec<String> = Vec::new();
 
-    for node in &target_nodes {
-        let Some(port) = probe_core.port_for_node(&node.id) else {
-            continue;
-        };
-        match run_funnel_for_node(
-            &registry,
-            &node.id,
-            port,
-            &options,
-            Some(&state.job_guard),
-            None,
-        )
-        .await
-        {
-            Ok(report) => {
-                all_records.extend(report.records);
-                snapshots.insert(node.id.clone(), report.snapshot);
+    const BATCH_SIZE: usize = 12;
+    const CONCURRENCY: usize = 4;
+
+    for chunk in target_nodes.chunks(BATCH_SIZE) {
+        if *cancel_rx.borrow() {
+            cancelled = true;
+            break;
+        }
+
+        let probe_core = match tokio::select! {
+            biased;
+            _ = cancel_rx.wait_for(|&c| c) => Err("cancelled".to_string()),
+            res = IsolatedProbeCore::spawn(&mihomo_bin, &temp_root, &state.job_guard, chunk) => {
+                res.map_err(|e| e.to_string())
+            }
+        } {
+            Ok(core) => core,
+            Err(err) if err == "cancelled" => {
+                cancelled = true;
+                break;
             }
             Err(err) => {
-                errors.push(format!("{}: {err}", node.name));
+                errors.push(format!("隔离测速核心启动失败：{err}"));
+                break;
             }
+        };
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(CONCURRENCY));
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(
+            String,
+            String,
+            Result<catcloud_core::probe::FunnelRunReport, String>,
+        )>(chunk.len().max(1));
+
+        let mut spawned = 0usize;
+        let mut join_handles = Vec::with_capacity(chunk.len());
+        for node in chunk {
+            let Some(port) = probe_core.port_for_node(&node.id) else {
+                continue;
+            };
+            spawned += 1;
+            let sem_ref = Arc::clone(&sem);
+            let reg_ref = Arc::clone(&registry);
+            let opt_ref = Arc::clone(&options);
+            let job_ref = Arc::clone(&state.job_guard);
+            let mut worker_cancel_rx = cancel_rx.clone();
+            let tx_ref = tx.clone();
+            let nid = node.id.clone();
+            let nname = node.name.clone();
+
+            join_handles.push(tokio::spawn(async move {
+                let permit = tokio::select! {
+                    biased;
+                    _ = worker_cancel_rx.wait_for(|&c| c) => return,
+                    p = sem_ref.acquire_owned() => match p {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    }
+                };
+                if *worker_cancel_rx.borrow() {
+                    drop(permit);
+                    return;
+                }
+                let res = tokio::select! {
+                    biased;
+                    _ = worker_cancel_rx.wait_for(|&c| c) => {
+                        drop(permit);
+                        return;
+                    }
+                    r = run_funnel_for_node(&reg_ref, &nid, port, &opt_ref, Some(&job_ref), None) => {
+                        r.map_err(|e| e.to_string())
+                    }
+                };
+                drop(permit);
+                let _ = tx_ref.send((nid, nname, res)).await;
+            }));
+        }
+        drop(tx);
+
+        let mut batch_received = 0usize;
+        while batch_received < spawned {
+            let recv_item = tokio::select! {
+                biased;
+                _ = cancel_rx.wait_for(|&c| c) => {
+                    cancelled = true;
+                    break;
+                }
+                item = rx.recv() => item,
+            };
+            let Some((nid, nname, outcome)) = recv_item else {
+                cancelled |= *cancel_rx.borrow();
+                break;
+            };
+            batch_received += 1;
+            completed_count += 1;
+
+            match outcome {
+                Ok(report) => {
+                    if !report.records.is_empty() {
+                        if let Ok(mut db) = state.storage.lock() {
+                            let _ = db.insert_probe_results_batch(&report.records);
+                        }
+                    }
+                    let snap = report.snapshot;
+                    snapshots.insert(nid.clone(), snap.clone());
+                    let _ = app.emit(
+                        EVENT_PROBE_PROGRESS,
+                        serde_json::json!({
+                            "node_id": nid,
+                            "node_name": nname,
+                            "completed": completed_count,
+                            "total": total_count,
+                            "cancelled": false,
+                            "done": false,
+                            "snapshot": snap,
+                            "error": null
+                        }),
+                    );
+                }
+                Err(err) => {
+                    errors.push(format!("{nname}: {err}"));
+                    let _ = app.emit(
+                        EVENT_PROBE_PROGRESS,
+                        serde_json::json!({
+                            "node_id": nid,
+                            "node_name": nname,
+                            "completed": completed_count,
+                            "total": total_count,
+                            "cancelled": false,
+                            "done": false,
+                            "snapshot": null,
+                            "error": err
+                        }),
+                    );
+                }
+            }
+
+            if *cancel_rx.borrow() {
+                cancelled = true;
+                break;
+            }
+        }
+
+        if cancelled {
+            for h in &join_handles {
+                h.abort();
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(150), async {
+                for h in join_handles {
+                    let _ = h.await;
+                }
+            })
+            .await;
+        } else {
+            for h in join_handles {
+                let _ = h.await;
+            }
+        }
+        let _ = probe_core.shutdown().await;
+        if cancelled {
+            break;
         }
     }
 
-    let _ = probe_core.shutdown().await;
-
-    if !all_records.is_empty() {
-        let mut db = state.storage.lock().map_err(|e| e.to_string())?;
-        let _ = db.insert_probe_results_batch(&all_records);
-    }
+    let _ = app.emit(
+        EVENT_PROBE_PROGRESS,
+        serde_json::json!({
+            "node_id": null,
+            "node_name": null,
+            "completed": completed_count,
+            "total": total_count,
+            "cancelled": cancelled,
+            "done": true,
+            "snapshot": null,
+            "error": null
+        }),
+    );
 
     Ok(serde_json::json!({
         "probed_count": snapshots.len(),
+        "total_count": total_count,
+        "cancelled": cancelled,
         "snapshots": snapshots,
         "errors": errors,
         "core_available": true
     }))
+}
+
+fn prune_wallpaper_cache(cache_dir: &std::path::Path, max_files: usize) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_file() {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?;
+            if !name.starts_with("wp_") || !name.ends_with(".jpg") {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    if files.len() <= max_files {
+        return;
+    }
+    files.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, old_path) in files.into_iter().skip(max_files) {
+        let _ = std::fs::remove_file(old_path);
+    }
+}
+
+fn encode_wallpaper_data_url_from_path(
+    raw_path: &str,
+    cache_dir: &std::path::Path,
+) -> Result<String, String> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err("壁纸图片路径不能为空".to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return Ok(trimmed.to_string());
+    }
+    if lower.starts_with("data:") {
+        const ALLOWED_BITMAP_PREFIXES: &[&str] = &[
+            "data:image/png;",
+            "data:image/png,",
+            "data:image/jpeg;",
+            "data:image/jpeg,",
+            "data:image/jpg;",
+            "data:image/jpg,",
+            "data:image/webp;",
+            "data:image/webp,",
+            "data:image/gif;",
+            "data:image/gif,",
+            "data:image/bmp;",
+            "data:image/bmp,",
+        ];
+        if ALLOWED_BITMAP_PREFIXES.iter().any(|p| lower.starts_with(p)) {
+            return Ok(trimmed.to_string());
+        }
+        return Err(
+            "不支持的图片数据格式：仅允许 PNG/JPEG/WebP/GIF/BMP 位图，已拒绝 SVG 等非位图数据"
+                .to_string(),
+        );
+    }
+    let src_path = PathBuf::from(trimmed);
+    if !src_path.is_file() {
+        return Err(format!("找不到壁纸图片：{trimmed}"));
+    }
+    let meta = std::fs::metadata(&src_path).map_err(|e| format!("无法读取壁纸文件：{e}"))?;
+    if meta.len() > 32 * 1024 * 1024 {
+        return Err("壁纸图片超过 32 MB 上限，请选择更轻量的图片".to_string());
+    }
+    let mtime_secs = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(trimmed.as_bytes());
+    hasher.update(mtime_secs.to_le_bytes());
+    hasher.update(meta.len().to_le_bytes());
+    let key = hex::encode(hasher.finalize());
+    let cached_jpg = cache_dir.join(format!("wp_{}.jpg", &key[..16]));
+
+    if cached_jpg.is_file() {
+        if let Ok(bytes) = std::fs::read(&cached_jpg) {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            return Ok(format!("data:image/jpeg;base64,{b64}"));
+        }
+    }
+
+    let mut reader = image::ImageReader::open(&src_path)
+        .map_err(|e| format!("无法打开壁纸图片：{e}"))?
+        .with_guessed_format()
+        .map_err(|e| format!("无法识别壁纸图片格式：{e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let img = reader
+        .decode()
+        .map_err(|e| format!("无法解析图片格式（或超出 8192×8192 / 128 MiB 安全上限）：{e}"))?;
+
+    let resized = if img.width() > 1920 || img.height() > 1920 {
+        img.thumbnail(1920, 1920)
+    } else {
+        img
+    };
+
+    let rgb = if resized.color().has_alpha() {
+        // Composite transparent pixels over a warm neutral cream matte (#F7F2EA)
+        // so transparent PNG/WebP wallpapers never turn solid black in JPEG output.
+        const BG_R: u32 = 247;
+        const BG_G: u32 = 242;
+        const BG_B: u32 = 234;
+        let rgba = resized.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let mut out = image::RgbImage::new(w, h);
+        for (x, y, px) in rgba.enumerate_pixels() {
+            let a = u32::from(px[3]);
+            let inv = 255 - a;
+            let r = ((u32::from(px[0]) * a + BG_R * inv + 127) / 255) as u8;
+            let g = ((u32::from(px[1]) * a + BG_G * inv + 127) / 255) as u8;
+            let b = ((u32::from(px[2]) * a + BG_B * inv + 127) / 255) as u8;
+            out.put_pixel(x, y, image::Rgb([r, g, b]));
+        }
+        out
+    } else {
+        resized.to_rgb8()
+    };
+
+    let mut out_bytes = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out_bytes, 86);
+    encoder
+        .encode_image(&rgb)
+        .map_err(|e| format!("壁纸编码失败：{e}"))?;
+
+    let _ = std::fs::create_dir_all(cache_dir);
+    let tmp_jpg = cache_dir.join(format!(
+        "wp_{}.{}.tmp",
+        &key[..16],
+        uuid::Uuid::new_v4().simple()
+    ));
+    if std::fs::write(&tmp_jpg, &out_bytes).is_ok() {
+        #[cfg(target_os = "windows")]
+        {
+            if cached_jpg.exists() {
+                let _ = std::fs::remove_file(&cached_jpg);
+            }
+        }
+        if std::fs::rename(&tmp_jpg, &cached_jpg).is_err() {
+            let _ = std::fs::remove_file(&tmp_jpg);
+        } else {
+            prune_wallpaper_cache(cache_dir, 16);
+        }
+    }
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&out_bytes);
+    Ok(format!("data:image/jpeg;base64,{b64}"))
+}
+
+#[tauri::command]
+pub async fn pick_wallpaper_image(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("选择背景壁纸图片")
+        .add_filter("图片文件", &["png", "jpg", "jpeg", "webp"])
+        .pick_file(move |file_path| {
+            let _ = tx.send(file_path);
+        });
+
+    let picked = rx.await.map_err(|_| "文件选择已取消".to_string())?;
+    let Some(file_path) = picked else {
+        return Ok(serde_json::json!({
+            "cancelled": true,
+            "path": null,
+            "data_url": null
+        }));
+    };
+    let path_buf = file_path
+        .into_path()
+        .map_err(|e| format!("无法获取所选图片路径：{e}"))?;
+    let path_str = path_buf.display().to_string();
+    let path_for_encode = path_str.clone();
+    let cache_dir = state.paths.root_data_dir.join("wallpaper_cache");
+    let data_url = tokio::task::spawn_blocking(move || {
+        encode_wallpaper_data_url_from_path(&path_for_encode, &cache_dir)
+    })
+    .await
+    .map_err(|e| format!("壁纸后台解码任务异常中止：{e}"))??;
+
+    let mut cfg = state.snapshot_config();
+    cfg.personalization.wallpaper_path = Some(path_str.clone());
+    config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    if let Ok(mut guard) = state.config.write() {
+        *guard = cfg.clone();
+    }
+    sync_app_side_effects(&app, &state, &cfg);
+
+    Ok(serde_json::json!({
+        "cancelled": false,
+        "path": path_str,
+        "data_url": data_url
+    }))
+}
+
+#[tauri::command]
+pub async fn resolve_wallpaper_data_url(
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Option<String>, String> {
+    let trimmed = path.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let cache_dir = state.paths.root_data_dir.join("wallpaper_cache");
+    let url = tokio::task::spawn_blocking(move || {
+        encode_wallpaper_data_url_from_path(&trimmed, &cache_dir)
+    })
+    .await
+    .map_err(|e| format!("壁纸后台解码任务异常中止：{e}"))??;
+    Ok(Some(url))
 }
 
 #[tauri::command]
@@ -1810,6 +2652,7 @@ pub fn upsert_subscription(
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         db.upsert_subscription(&record).map_err(|e| e.to_string())?;
     }
+    ensure_default_group_if_empty(&state);
     let cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &cfg);
     Ok(record)
@@ -1833,6 +2676,185 @@ pub async fn delete_subscription(
     Ok(deleted)
 }
 
+fn parse_controller_endpoint_and_secret(raw: &str) -> (String, Option<String>) {
+    let trimmed = raw.trim();
+    let (url_part, pipe_secret) = if let Some((left, right)) = trimmed.split_once("|secret=") {
+        let sec = right.trim();
+        (
+            left.trim().to_string(),
+            (!sec.is_empty()).then(|| sec.to_string()),
+        )
+    } else {
+        (trimmed.to_string(), None)
+    };
+
+    let (clean_url, query_secret) = if let Some((base, query)) = url_part.split_once('?') {
+        let mut kept_pairs = Vec::new();
+        let mut found_secret = None;
+        for pair in query.split('&') {
+            if pair.is_empty() {
+                continue;
+            }
+            if let Some((k, v)) = pair.split_once('=') {
+                if k.eq_ignore_ascii_case("secret") {
+                    let val = v.trim();
+                    if !val.is_empty() {
+                        found_secret = Some(val.to_string());
+                    }
+                    continue;
+                }
+            }
+            kept_pairs.push(pair);
+        }
+        let rebuilt = if kept_pairs.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}?{}", kept_pairs.join("&"))
+        };
+        (rebuilt, found_secret)
+    } else {
+        (url_part, None)
+    };
+
+    let base_no_slash = clean_url.trim_end_matches('/');
+    let endpoint = if let Some((path_only, query)) = base_no_slash.split_once('?') {
+        let p = path_only.trim_end_matches('/');
+        if p.ends_with("/proxies") {
+            format!("{p}?{query}")
+        } else {
+            format!("{p}/proxies?{query}")
+        }
+    } else if base_no_slash.ends_with("/proxies") {
+        base_no_slash.to_string()
+    } else {
+        format!("{base_no_slash}/proxies")
+    };
+
+    (endpoint, pipe_secret.or(query_secret))
+}
+
+async fn refresh_process_adapter_subscription(
+    state: &AppState,
+    sub: &SubscriptionRecord,
+) -> Result<ParsedSubscription, String> {
+    let raw = sub.url_or_cmd.trim();
+    if raw.is_empty() {
+        return Err("来源地址或外部脚本命令不能为空，请先填写公开控制接口地址或适配器命令".to_string());
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        let (endpoint, secret) = parse_controller_endpoint_and_secret(raw);
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .map_err(|e| format!("初始化控制接口请求客户端失败：{e}"))?;
+        let mut req = client.get(&endpoint);
+        if let Some(ref sec) = secret {
+            req = req.bearer_auth(sec);
+        }
+        let mut resp = req.send().await.map_err(|e| {
+            if e.is_timeout() {
+                format!("连接控制接口（{endpoint}）超时，请确认目标代理软件正在运行")
+            } else {
+                format!("无法连接到控制接口（{endpoint}），请确认地址端口正确且目标程序已启动：{e}")
+            }
+        })?;
+        let status = resp.status();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            return Err(format!(
+                "控制接口需要口令认证（HTTP {}），请在地址末尾附加 |secret=你的口令 后重试",
+                status.as_u16()
+            ));
+        }
+        if !status.is_success() {
+            return Err(format!(
+                "控制接口返回异常状态（HTTP {}），请确认该地址为有效的代理控制接口",
+                status.as_u16()
+            ));
+        }
+        const MAX_CTRL_BYTES: usize = 16 * 1024 * 1024;
+        if let Some(len) = resp.content_length() {
+            if len > MAX_CTRL_BYTES as u64 {
+                return Err("控制接口返回数据超过 16 MiB 上限，已安全终止读取".to_string());
+            }
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("读取控制接口响应失败：{e}"))?
+        {
+            if body.len().saturating_add(chunk.len()) > MAX_CTRL_BYTES {
+                return Err("控制接口返回数据超过 16 MiB 上限，已安全终止读取".to_string());
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let (nodes, meta_only_count, total_entries, mut warnings) =
+            parse_controller_proxies_json(&sub.id, &body).map_err(|e| e.to_string())?;
+        if nodes.is_empty() {
+            if meta_only_count > 0 {
+                return Err(format!(
+                    "已连通控制接口并识别到 {meta_only_count} 个节点名称，但该接口未公开服务器地址与端口（缺少 server/port），无法直接抓取可连接节点；请改用目标软件的本地 YAML 配置文件或外挂脚本适配器导入"
+                ));
+            }
+            return Err(format!(
+                "已连通控制接口，但未发现可用代理节点（共 {total_entries} 项均为内置项或分组）"
+            ));
+        }
+        if meta_only_count > 0 {
+            warnings.push(format!(
+                "另有 {meta_only_count} 个节点因控制接口未公开 server/port 已跳过"
+            ));
+        }
+        return Ok(ParsedSubscription {
+            format: SubscriptionPayloadFormat::ClashYaml,
+            nodes,
+            userinfo: None,
+            etag: None,
+            warnings,
+        });
+    }
+
+    let adapter_cfg = AdapterConfig::from_command_line(raw)
+        .map_err(|e| format!("外部适配器命令格式不正确，请检查路径与引号配对：{e}"))?;
+    let req = AdapterRequest::new(ADAPTER_REASON_MANUAL, sub.id.clone(), Vec::new());
+    let nodes = invoke_external_adapter(&adapter_cfg, &req, Some(&state.adapter_cooldown))
+        .await
+        .map_err(|e| {
+            let msg = e.to_string();
+            if !msg.contains("cooldown") {
+                state.adapter_cooldown.reset(&sub.id);
+            }
+            if msg.contains("cooldown") {
+                format!("外部适配器刷新过于频繁，请稍候片刻再试（{msg}）")
+            } else if msg.contains("failed to spawn") {
+                format!(
+                    "无法启动外部适配器程序「{}」，请确认命令路径正确且具有可执行权限：{msg}",
+                    adapter_cfg.program
+                )
+            } else if msg.contains("timed out") {
+                format!(
+                    "外部适配器执行超时（超过 {} 秒），请检查脚本是否卡住",
+                    adapter_cfg.timeout_sec
+                )
+            } else {
+                format!(
+                    "外部适配器未能返回有效节点，请确认脚本输出符合 catcloud-adapter/v1 规范：{msg}"
+                )
+            }
+        })?;
+    Ok(ParsedSubscription {
+        format: SubscriptionPayloadFormat::ClashYaml,
+        nodes,
+        userinfo: None,
+        etag: None,
+        warnings: Vec::new(),
+    })
+}
+
 async fn refresh_single_subscription_inner(
     state: &AppState,
     sub: &SubscriptionRecord,
@@ -1848,11 +2870,12 @@ async fn refresh_single_subscription_inner(
             .map_err(|e| e.to_string())?
         }
         SubscriptionKind::File | SubscriptionKind::Migrated => {
-            let raw = std::fs::read(&sub.url_or_cmd).map_err(|e| e.to_string())?;
+            let raw = std::fs::read(&sub.url_or_cmd)
+                .map_err(|e| format!("无法读取本地订阅文件「{}」：{e}", sub.url_or_cmd))?;
             parse_subscription_payload(&sub.id, &raw, None).map_err(|e| e.to_string())?
         }
         SubscriptionKind::ProcessAdapter => {
-            return Err("process adapter subscriptions refresh via external adapter command".to_string());
+            refresh_process_adapter_subscription(state, sub).await?
         }
     };
 
@@ -1860,6 +2883,7 @@ async fn refresh_single_subscription_inner(
         let mut db = state.storage.lock().map_err(|e| e.to_string())?;
         apply_parsed_subscription(&mut db, sub, &parsed).map_err(|e| e.to_string())?
     };
+    ensure_default_group_if_empty(state);
     Ok(serde_json::json!({
         "sub_id": sub.id,
         "node_count": node_count,
@@ -2179,9 +3203,15 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
         .send()
         .await;
 
+    let cfg = state.snapshot_config();
     let google_clean = state.storage.lock().ok().and_then(|db| {
         let groups = db.list_multi_groups().ok()?;
-        let active_id = groups.first()?.active_node_id.as_deref()?;
+        let primary = cfg
+            .active_group_id
+            .as_deref()
+            .and_then(|gid| groups.iter().find(|g| g.id == gid))
+            .or_else(|| groups.first())?;
+        let active_id = primary.active_node_id.as_deref()?;
         db.get_probe_snapshot(active_id, None)
             .ok()
             .flatten()
@@ -2212,12 +3242,12 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
                 ip_masked: masked,
                 ip_raw: if ip.is_empty() { None } else { Some(ip) },
                 isp: if colo.is_empty() {
-                    "Cloudflare Trace".to_string()
+                    "网络出口已连通".to_string()
                 } else {
-                    format!("Edge {colo}")
+                    format!("接入节点 {colo}")
                 },
                 location: if loc.is_empty() {
-                    "Unknown".to_string()
+                    "未知地区".to_string()
                 } else {
                     loc
                 },
@@ -2229,8 +3259,8 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
         Ok(resp) => Ok(ExitIpInfoDto {
             ip_masked: "--.--.--.***".to_string(),
             ip_raw: None,
-            isp: format!("HTTP {}", resp.status().as_u16()),
-            location: "探测失败".to_string(),
+            isp: format!("出口检测响应异常（HTTP {}）", resp.status().as_u16()),
+            location: "暂未获取到位置".to_string(),
             timezone: "UTC+8".to_string(),
             google_clean,
             core_running: true,
@@ -2238,8 +3268,12 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
         Err(err) => Ok(ExitIpInfoDto {
             ip_masked: "--.--.--.***".to_string(),
             ip_raw: None,
-            isp: format!("探测超时/不可达 ({})", err.is_timeout()),
-            location: "探测失败".to_string(),
+            isp: if err.is_timeout() {
+                "出口检测超时，请检查当前路线是否可用".to_string()
+            } else {
+                "无法连接出口检测服务，请切换路线后重试".to_string()
+            },
+            location: "暂未获取到位置".to_string(),
             timezone: "UTC+8".to_string(),
             google_clean,
             core_running: true,
@@ -2453,8 +3487,10 @@ pub fn compile_preview_yaml(state: State<'_, AppState>) -> Result<CompiledYamlPr
         group_filtered_members: &empty_filter,
     };
     let compiled = compile_mihomo_config(&input).map_err(|e| e.to_string())?;
+    let redacted_yaml =
+        redact_compiled_yaml_for_preview(&compiled, &relays).map_err(|e| e.to_string())?;
     Ok(CompiledYamlPreviewDto {
-        yaml: compiled.yaml,
+        yaml: redacted_yaml,
         sha256: compiled.sha256,
         stats: compiled.stats,
         validation: compiled.validation,
@@ -2536,6 +3572,7 @@ pub async fn apply_migration_nodes(
         db.upsert_subscription(&sub).map_err(|e| e.to_string())?;
         db.upsert_nodes_batch(&nodes).map_err(|e| e.to_string())?
     };
+    ensure_default_group_if_empty(&state);
     let _ = trigger_reload_if_running(&app, &state, false).await;
     let cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &cfg);
@@ -2705,8 +3742,15 @@ pub fn export_backup_bundle(
     state: State<'_, AppState>,
     target_path: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let cfg = state.snapshot_config();
-    let (groups, relays, probes) = {
+    let mut cfg = state.snapshot_config();
+    if cfg
+        .controller_secret
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty())
+    {
+        cfg.controller_secret = Some("<REDACTED>".to_string());
+    }
+    let (groups, mut relays, probes) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         (
             db.list_multi_groups().map_err(|e| e.to_string())?,
@@ -2714,11 +3758,20 @@ pub fn export_backup_bundle(
             db.list_probe_definitions().map_err(|e| e.to_string())?,
         )
     };
+    for relay in &mut relays {
+        if !relay.server.trim().is_empty() {
+            relay.server = "<REDACTED>".to_string();
+        }
+        if !relay.password.trim().is_empty() {
+            relay.password = "<REDACTED>".to_string();
+        }
+    }
     let exported_at = Utc::now().to_rfc3339();
     let bundle = serde_json::json!({
         "schema": "catcloud-backup/v1",
         "exported_at": exported_at,
         "app_version": env!("CARGO_PKG_VERSION"),
+        "sanitized": true,
         "config": cfg,
         "multi_groups": groups,
         "preaccel_relays": relays,
@@ -2828,7 +3881,7 @@ pub fn launch_uwp_loopback() -> Result<serde_json::Value, String> {
             "supported": true,
             "launched": output.status.success(),
             "exempt_count": exempt_count,
-            "message": format!("CheckNetIsolation inspected ({exempt_count} UWP loopback exemptions)")
+            "message": format!("已检查 Windows 应用本地回环放行状态（当前已放行 {exempt_count} 项）")
         }))
     }
     #[cfg(not(target_os = "windows"))]
@@ -2836,7 +3889,7 @@ pub fn launch_uwp_loopback() -> Result<serde_json::Value, String> {
         Ok(serde_json::json!({
             "supported": false,
             "launched": false,
-            "message": "UWP Loopback exemption is Windows-only"
+            "message": "应用本地回环放行仅支持 Windows 系统"
         }))
     }
 }
@@ -2984,5 +4037,95 @@ mod tests {
         assert_eq!(mask_ip_address("203.0.113.42"), "203.0.113.***");
         assert_eq!(mask_ip_address("2001:db8::1"), "2001:db8::***");
         assert_eq!(mask_ip_address(""), "--.--.--.***");
+    }
+
+    #[test]
+    fn wallpaper_encoder_resizes_and_caches_local_png_to_data_url() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_wp_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let cache = tmp.join("cache");
+        std::fs::create_dir_all(&tmp).expect("mkdir tmp");
+        let img_path = tmp.join("sample.png");
+        let img = image::RgbImage::from_pixel(64, 48, image::Rgb([223, 183, 130]));
+        img.save(&img_path).expect("save png");
+
+        let url1 = encode_wallpaper_data_url_from_path(
+            &img_path.display().to_string(),
+            &cache,
+        )
+        .expect("encode first");
+        assert!(url1.starts_with("data:image/jpeg;base64,"));
+        let url2 = encode_wallpaper_data_url_from_path(
+            &img_path.display().to_string(),
+            &cache,
+        )
+        .expect("encode cached");
+        assert_eq!(url1, url2);
+
+        let remote = encode_wallpaper_data_url_from_path("https://example.invalid/bg.jpg", &cache)
+            .expect("remote passthrough");
+        assert_eq!(remote, "https://example.invalid/bg.jpg");
+
+        assert!(
+            encode_wallpaper_data_url_from_path("data:image/svg+xml;base64,PHN2Zz48L3N2Zz4=", &cache)
+                .is_err()
+        );
+        assert!(
+            encode_wallpaper_data_url_from_path("data:image/png;base64,iVBORw0KGgo=", &cache)
+                .is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn json_deep_merge_replaces_nameserver_policy_and_empty_objects() {
+        let mut base = serde_json::json!({
+            "dns": {
+                "ipv6": false,
+                "nameserver_policy": {
+                    "old.example": ["1.1.1.1"],
+                    "keep.example": ["8.8.8.8"]
+                }
+            }
+        });
+        let patch = serde_json::json!({
+            "dns": {
+                "nameserver_policy": {
+                    "keep.example": ["9.9.9.9"]
+                }
+            }
+        });
+        json_deep_merge(&mut base, &patch);
+        assert_eq!(base["dns"]["ipv6"], false);
+        assert!(base["dns"]["nameserver_policy"].get("old.example").is_none());
+        assert_eq!(base["dns"]["nameserver_policy"]["keep.example"][0], "9.9.9.9");
+
+        let clear_patch = serde_json::json!({
+            "dns": { "nameserver_policy": {} }
+        });
+        json_deep_merge(&mut base, &clear_patch);
+        assert_eq!(
+            base["dns"]["nameserver_policy"].as_object().map(|m| m.len()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn controller_endpoint_and_secret_parser_handles_pipe_and_query_tokens() {
+        assert_eq!(
+            parse_controller_endpoint_and_secret("http://127.0.0.1:9090|secret=abc123"),
+            ("http://127.0.0.1:9090/proxies".to_string(), Some("abc123".to_string()))
+        );
+        assert_eq!(
+            parse_controller_endpoint_and_secret("http://127.0.0.1:9090/proxies?secret=xyz"),
+            ("http://127.0.0.1:9090/proxies".to_string(), Some("xyz".to_string()))
+        );
+        assert_eq!(
+            parse_controller_endpoint_and_secret("http://127.0.0.1:9090/"),
+            ("http://127.0.0.1:9090/proxies".to_string(), None)
+        );
     }
 }

@@ -246,6 +246,7 @@ pub fn compile_mihomo_config(input: &CompileInput<'_>) -> CatResult<CompiledCore
     root.insert(str_val("profile"), Value::Mapping(profile_map));
 
     insert_bool(&mut root, "geodata-mode", cfg.geodata.geodata_mode);
+    insert_bool(&mut root, "geo-auto-update", cfg.geodata.auto_update);
     if cfg.geodata.geodata_mode {
         // Hard rule: whenever geodata-mode is enabled, enforce memconservative streaming loader.
         insert_str(&mut root, "geodata-loader", "memconservative");
@@ -448,6 +449,11 @@ pub fn compile_mihomo_config(input: &CompileInput<'_>) -> CatResult<CompiledCore
     }
 
     let mut default_match_target: Option<String> = None;
+    let preferred_active_group_id = cfg
+        .active_group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     for group in input.groups {
         let group_name = if group.name.trim().is_empty() {
@@ -458,7 +464,9 @@ pub fn compile_mihomo_config(input: &CompileInput<'_>) -> CatResult<CompiledCore
         if group_name.is_empty() {
             continue;
         }
-        if default_match_target.is_none() {
+        if preferred_active_group_id == Some(group.id.as_str()) {
+            default_match_target = Some(group_name.clone());
+        } else if default_match_target.is_none() {
             default_match_target = Some(group_name.clone());
         }
 
@@ -732,6 +740,62 @@ pub fn compile_mihomo_config(input: &CompileInput<'_>) -> CatResult<CompiledCore
         validation,
         sha256,
     })
+}
+
+/// Redact sensitive credential fields (`password`, `uuid`, `token`, `private-key`, `auth-str`)
+/// across all compiled `proxies` entries and mask domestic pre-acceleration relay `server`
+/// addresses with `<REDACTED>` for safe UI/diagnostics preview.
+pub fn redact_compiled_yaml_for_preview(
+    compiled: &CompiledCoreConfig,
+    relays: &[PreAccelRelay],
+) -> CatResult<String> {
+    const SENSITIVE_KEYS: &[&str] = &[
+        "password",
+        "uuid",
+        "token",
+        "private-key",
+        "auth-str",
+        "obfs-password",
+    ];
+    let relay_servers: HashSet<String> = relays
+        .iter()
+        .map(|r| r.server.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut doc = compiled.value.clone();
+    if let Some(root) = doc.as_mapping_mut() {
+        let proxies_key = str_val("proxies");
+        if let Some(proxies) = root.get_mut(&proxies_key).and_then(Value::as_sequence_mut) {
+            let server_key = str_val("server");
+            for (idx, item) in proxies.iter_mut().enumerate() {
+                let Some(map) = item.as_mapping_mut() else {
+                    continue;
+                };
+                for &key in SENSITIVE_KEYS {
+                    let yaml_key = str_val(key);
+                    if let Some(val) = map.get_mut(&yaml_key) {
+                        if !val.is_null() {
+                            *val = Value::String("<REDACTED>".to_string());
+                        }
+                    }
+                }
+                let is_relay = idx < compiled.stats.relay_proxies
+                    || map
+                        .get(&server_key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| relay_servers.contains(&s.trim().to_ascii_lowercase()));
+                if is_relay {
+                    if let Some(server_val) = map.get_mut(&server_key) {
+                        if !server_val.is_null() {
+                            *server_val = Value::String("<REDACTED>".to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(serde_yaml_ng::to_string(&doc)?)
 }
 
 /// Apply a declarative RFC 7396 style YAML Merge Patch onto a cloned copy of `base`.
@@ -1993,5 +2057,46 @@ rules:
                 .iter()
                 .any(|i| i.code == "missing_relay_direct_rule")
         );
+    }
+
+    #[test]
+    fn compiles_geo_auto_update_false_and_honors_active_group_id_for_match() {
+        let mut cfg = AppConfig::default();
+        cfg.active_group_id = Some("grp-second".to_string());
+        let node = sample_node("n1", "Node-JP", 443, true);
+        let mut g1 = MultiGroup::default();
+        g1.id = "grp-first".to_string();
+        g1.name = "First-Group".to_string();
+        g1.member_node_ids = vec![node.id.clone()];
+        let mut g2 = MultiGroup::default();
+        g2.id = "grp-second".to_string();
+        g2.name = "Second-Group".to_string();
+        g2.member_node_ids = vec![node.id.clone()];
+
+        let ports = AllocatedPorts {
+            bind_host: "127.0.0.1".to_string(),
+            mixed_port: 27890,
+            controller_port: 29090,
+            dns_port: 21053,
+            shifted: Vec::new(),
+        };
+        let empty = HashMap::new();
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &[node],
+            groups: &[g1, g2],
+            relays: &[],
+            controller_secret: "secret",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile ok");
+
+        assert_eq!(compiled.value["geo-auto-update"], Value::Bool(false));
+        let rules = compiled.value["rules"].as_sequence().expect("rules seq");
+        let last = rules.last().and_then(|v| v.as_str()).unwrap_or("");
+        assert_eq!(last, "MATCH,Second-Group");
     }
 }

@@ -61,6 +61,7 @@ export interface PreAccelConfig {
   skip_443_native: boolean;
   probe_url: string;
   fallback_probe_url: string;
+  campus_portal_guard?: boolean;
 }
 
 export interface UpdateConfig {
@@ -165,6 +166,12 @@ export interface FullAppConfig {
     memory_tier?: string;
     startup_script_path?: string | null;
     quick_check_sites?: QuickCheckSiteConfig[];
+  };
+  preaccel?: Partial<PreAccelConfig> & {
+    probe_interval_sec?: number;
+    active_relay_id?: string | null;
+    auto_failover?: boolean;
+    campus_direct_domains?: string[];
   };
   behavior?: {
     autostart?: boolean;
@@ -405,9 +412,28 @@ export interface ReloadOutcome {
 
 export interface RunIsolatedProbesResult {
   probed_count: number;
+  total_count?: number;
+  cancelled?: boolean;
   snapshots: Record<string, ProbeSnapshot>;
   errors: string[];
   core_available: boolean;
+}
+
+export interface ProbeProgressEvent {
+  node_id: string | null;
+  node_name: string | null;
+  completed: number;
+  total: number;
+  cancelled: boolean;
+  done: boolean;
+  snapshot: ProbeSnapshot | null;
+  error: string | null;
+}
+
+export interface PickWallpaperResult {
+  cancelled: boolean;
+  path: string | null;
+  data_url: string | null;
 }
 
 export interface RefreshSubscriptionResult {
@@ -714,6 +740,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     skip_443_native: true,
     probe_url: "http://connectivitycheck.platform.hicloud.com/generate_204",
     fallback_probe_url: "http://connect.rom.miui.com/generate_204",
+    campus_portal_guard: true,
   },
   personalization: {
     theme_mode: "auto_time",
@@ -1017,7 +1044,7 @@ const MOCK_GROUPS: MultiGroup[] = [
   },
   {
     id: "grp-media",
-    name: "流媒体与下载受控均衡",
+    name: "影音下载均衡组",
     mode: "load_balance_consistent_hash",
     match_rules: ["DOMAIN-SUFFIX,github.com", "DOMAIN-SUFFIX,youtube.com"],
     member_node_ids: ["node-jp-01", "node-sg-02"],
@@ -1038,7 +1065,7 @@ const MOCK_GROUPS: MultiGroup[] = [
   },
   {
     id: "grp-backup-3x",
-    name: "高优家宽备援池",
+    name: "备用精选组",
     mode: "sticky_best",
     match_rules: [],
     member_node_ids: ["node-tw-04"],
@@ -1097,7 +1124,7 @@ const MOCK_PREACCEL_RELAYS: PreAccelRelay[] = [
 const MOCK_EXIT_IP: ExitIpInfo = {
   ip_masked: "203.0.113.***",
   ip_raw: "203.0.113.10",
-  isp: "Example Transit Network",
+  isp: "东京示例线路",
   location: "Tokyo, JP",
   timezone: "Asia/Tokyo (UTC+9)",
   google_clean: true,
@@ -1105,7 +1132,7 @@ const MOCK_EXIT_IP: ExitIpInfo = {
 };
 
 const MOCK_QUICK_SITES: SiteCheckItem[] = [
-  { id: "site-google", name: "Google 204", url: "https://www.google.com/generate_204", latency_ms: 69, ok: true },
+  { id: "site-google", name: "Google 连通", url: "https://www.google.com/generate_204", latency_ms: 69, ok: true },
   { id: "site-github", name: "GitHub", url: "https://github.com", latency_ms: 112, ok: true },
   { id: "site-youtube", name: "YouTube", url: "https://www.youtube.com", latency_ms: 84, ok: true },
   { id: "site-chatgpt", name: "OpenAI", url: "https://chatgpt.com", latency_ms: 95, ok: true },
@@ -1141,6 +1168,9 @@ let mockFullConfig: FullAppConfig = {
     memory_tier: "48MiB",
     startup_script_path: null,
     quick_check_sites: MOCK_QUICK_SITES.map((s) => ({ id: s.id, name: s.name, url: s.url })),
+  },
+  preaccel: {
+    ...DEFAULT_APP_CONFIG.preaccel,
   },
 };
 let mockGroups: MultiGroup[] = structuredClone(MOCK_GROUPS);
@@ -1255,7 +1285,28 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<FullAppConfig>("save_extended_settings", { patch });
     }
-    mockFullConfig = { ...mockFullConfig, ...patch };
+    mockFullConfig = {
+      ...mockFullConfig,
+      ...patch,
+      behavior:
+        patch.behavior && typeof patch.behavior === "object"
+          ? { ...mockFullConfig.behavior, ...(patch.behavior as FullAppConfig["behavior"]) }
+          : mockFullConfig.behavior,
+      preaccel:
+        patch.preaccel && typeof patch.preaccel === "object"
+          ? { ...mockFullConfig.preaccel, ...(patch.preaccel as FullAppConfig["preaccel"]) }
+          : mockFullConfig.preaccel,
+    };
+    if (patch.preaccel && typeof patch.preaccel === "object") {
+      const prePatch = patch.preaccel as Partial<PreAccelConfig>;
+      mockConfig = {
+        ...mockConfig,
+        preaccel: {
+          ...mockConfig.preaccel,
+          ...prePatch,
+        },
+      };
+    }
     const nestedSites =
       patch.core_runtime &&
       typeof patch.core_runtime === "object" &&
@@ -1389,6 +1440,16 @@ export const catcloudApi = {
     if (group) group.active_node_id = nodeId;
     const node = mockNodes.find((n) => n.id === nodeId) ?? mockNodes[0];
     const snap = mockProbes[nodeId];
+    mockRuntime = {
+      ...mockRuntime,
+      active_group_id: groupId,
+      active_group_name: group?.name ?? mockRuntime.active_group_name,
+      active_node_id: node.id,
+      active_node_name: node.name,
+      active_node_region: node.region_code,
+      active_node_latency_ms: snap?.latency_ms ?? null,
+      active_node_up_mbps: snap?.up_mbps ?? null,
+    };
     return {
       group_id: groupId,
       previous_node_id: prevId,
@@ -1399,6 +1460,31 @@ export const catcloudApi = {
       up_mbps: snap?.up_mbps ?? null,
       closed_connections: closeOld ? 2 : 0,
     };
+  },
+
+  async setActiveGroup(groupId: string): Promise<CoreRuntimeInfo> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<CoreRuntimeInfo>("set_active_group", { groupId });
+    }
+    const group = mockGroups.find((g) => g.id === groupId);
+    if (group) {
+      const node =
+        mockNodes.find((n) => n.id === group.active_node_id) ??
+        mockNodes.find((n) => group.member_node_ids.includes(n.id)) ??
+        mockNodes[0];
+      const snap = node ? mockProbes[node.id] : undefined;
+      mockRuntime = {
+        ...mockRuntime,
+        active_group_id: group.id,
+        active_group_name: group.name,
+        active_node_id: node?.id ?? "",
+        active_node_name: node?.name ?? "待选节点",
+        active_node_region: node?.region_code ?? "--",
+        active_node_latency_ms: snap?.latency_ms ?? null,
+        active_node_up_mbps: snap?.up_mbps ?? null,
+      };
+    }
+    return { ...mockRuntime };
   },
 
   async toggleCapsuleWindow(): Promise<boolean> {
@@ -1517,12 +1603,16 @@ export const catcloudApi = {
 
   async runIsolatedProbes(
     nodeIds: string[],
-    probeIds: string[]
+    probeIds: string[],
+    maxTier: "latency" | "unlock" | "full" = "full",
+    includeKeepalive = false
   ): Promise<RunIsolatedProbesResult> {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<RunIsolatedProbesResult>("run_isolated_probes", {
         nodeIds,
         probeIds,
+        maxTier,
+        includeKeepalive,
       });
     }
     const nowIso = new Date().toISOString();
@@ -1537,14 +1627,17 @@ export const catcloudApi = {
         latency_ms: existing?.latency_ms ?? 72,
         jitter_ms: existing?.jitter_ms ?? 4.1,
         loss_pct: existing?.loss_pct ?? 0,
-        up_mbps: existing?.up_mbps ?? 12.0,
-        down_mbps: existing?.down_mbps ?? 150.0,
-        cf_loc: existing?.cf_loc ?? "NRT",
-        yt_gl: existing?.yt_gl ?? "JP",
-        google_clean: existing?.google_clean ?? true,
+        up_mbps: maxTier === "full" ? (existing?.up_mbps ?? 12.0) : (existing?.up_mbps ?? null),
+        down_mbps: maxTier === "full" ? (existing?.down_mbps ?? 150.0) : (existing?.down_mbps ?? null),
+        cf_loc: maxTier === "latency" ? (existing?.cf_loc ?? null) : (existing?.cf_loc ?? "NRT"),
+        yt_gl: maxTier === "latency" ? (existing?.yt_gl ?? null) : (existing?.yt_gl ?? "JP"),
+        google_clean: maxTier === "latency" ? (existing?.google_clean ?? null) : (existing?.google_clean ?? true),
         google_risk_mismatch: existing?.google_risk_mismatch ?? false,
-        keepalive_60s_ok: existing?.keepalive_60s_ok ?? true,
-        unlocked_sites: existing?.unlocked_sites ?? { gemini: true, chatgpt: true, claude: true, windsurf: true },
+        keepalive_60s_ok: includeKeepalive ? (existing?.keepalive_60s_ok ?? true) : (existing?.keepalive_60s_ok ?? null),
+        unlocked_sites:
+          maxTier === "latency"
+            ? (existing?.unlocked_sites ?? {})
+            : (existing?.unlocked_sites ?? { gemini: true, chatgpt: true, claude: true, windsurf: true }),
         per_probe_ok: existing?.per_probe_ok ?? {},
         per_probe_up_mbps: existing?.per_probe_up_mbps ?? {},
         per_probe_down_mbps: existing?.per_probe_down_mbps ?? {},
@@ -1554,10 +1647,112 @@ export const catcloudApi = {
     }
     return {
       probed_count: targetIds.length,
+      total_count: targetIds.length,
+      cancelled: false,
       snapshots: out,
       errors: [],
       core_available: true,
     };
+  },
+
+  async cancelIsolatedProbes(): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("cancel_isolated_probes");
+    }
+    return true;
+  },
+
+  async pickWallpaperImage(): Promise<PickWallpaperResult> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<PickWallpaperResult>("pick_wallpaper_image");
+    }
+    if (typeof document === "undefined" || typeof window === "undefined") {
+      throw new Error("当前浏览器预览环境不支持选择本地图片");
+    }
+    return new Promise<PickWallpaperResult>((resolve, reject) => {
+      const input = document.createElement("input");
+      input.type = "file";
+      input.accept = "image/png,image/jpeg,image/webp,image/gif,image/bmp";
+      input.style.position = "fixed";
+      input.style.left = "-9999px";
+      input.style.opacity = "0";
+
+      let settled = false;
+      const cleanup = () => {
+        window.removeEventListener("focus", onWindowFocus);
+        input.remove();
+      };
+      const finish = (res: PickWallpaperResult) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(res);
+      };
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+
+      const onWindowFocus = () => {
+        window.setTimeout(() => {
+          if (!settled && (!input.files || input.files.length === 0)) {
+            finish({ cancelled: true, path: null, data_url: null });
+          }
+        }, 400);
+      };
+
+      input.addEventListener("cancel", () => {
+        finish({ cancelled: true, path: null, data_url: null });
+      });
+
+      input.addEventListener("change", () => {
+        const file = input.files?.[0];
+        if (!file) {
+          finish({ cancelled: true, path: null, data_url: null });
+          return;
+        }
+        if (!/^image\/(png|jpe?g|webp|gif|bmp)$/i.test(file.type)) {
+          fail(new Error("仅支持 PNG、JPG、WebP、GIF 或 BMP 格式图片"));
+          return;
+        }
+        if (file.size > 16 * 1024 * 1024) {
+          fail(new Error("图片体积超过 16 MB，请换一张更轻量的图片"));
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = () => {
+          const dataUrl = typeof reader.result === "string" ? reader.result : null;
+          if (!dataUrl || !/^data:image\/(png|jpe?g|webp|gif|bmp);base64,/i.test(dataUrl)) {
+            fail(new Error("读取图片失败或格式不受支持"));
+            return;
+          }
+          mockConfig.personalization.wallpaper_path = dataUrl;
+          finish({ cancelled: false, path: dataUrl, data_url: dataUrl });
+        };
+        reader.onerror = () => {
+          fail(new Error("读取本地图片文件失败"));
+        };
+        reader.readAsDataURL(file);
+      });
+
+      document.body.appendChild(input);
+      window.addEventListener("focus", onWindowFocus, { once: true });
+      input.click();
+    });
+  },
+
+  async resolveWallpaperDataUrl(path: string): Promise<string | null> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<string | null>("resolve_wallpaper_data_url", { path });
+    }
+    const trimmed = path.trim();
+    if (!trimmed) return null;
+    if (/^data:image\/(png|jpe?g|webp|gif|bmp);base64,/i.test(trimmed)) {
+      return trimmed;
+    }
+    return null;
   },
 
   async listSubscriptions(): Promise<SubscriptionRecord[]> {
@@ -1592,9 +1787,19 @@ export const catcloudApi = {
     return mockSubscriptions.length < before;
   },
 
-  async refreshSubscription(subId: string): Promise<RefreshSubscriptionResult> {
+  async refreshSubscription(
+    subId: string,
+    options?: { bearerSecret?: string | null; endpointUrl?: string | null }
+  ): Promise<RefreshSubscriptionResult> {
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<RefreshSubscriptionResult>("refresh_subscription", { subId });
+      const args: Record<string, unknown> = { subId };
+      if (options?.bearerSecret !== undefined) {
+        args.bearerSecret = options.bearerSecret;
+      }
+      if (options?.endpointUrl !== undefined) {
+        args.endpointUrl = options.endpointUrl;
+      }
+      return tauriInvokeOrThrow<RefreshSubscriptionResult>("refresh_subscription", args);
     }
     const nowIso = new Date().toISOString();
     mockSubscriptions = mockSubscriptions.map((s) =>
@@ -2053,6 +2258,26 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       void tauriListen<CoreRuntimeInfo>("catcloud://runtime", (payload) => {
         if (!disposed) onUpdate(payload);
+      }).then((fn) => {
+        if (disposed) {
+          fn?.();
+        } else {
+          unlisten = fn;
+        }
+      });
+    }
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
+
+  subscribeProbeProgress(onProgress: (ev: ProbeProgressEvent) => void): () => void {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    if (isTauriEnv()) {
+      void tauriListen<ProbeProgressEvent>("catcloud://probe-progress", (payload) => {
+        if (!disposed && payload) onProgress(payload);
       }).then((fn) => {
         if (disposed) {
           fn?.();

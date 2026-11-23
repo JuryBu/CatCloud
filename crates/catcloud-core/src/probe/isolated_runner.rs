@@ -412,6 +412,31 @@ pub fn generate_controller_secret() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+/// RAII cleanup guard active during `IsolatedProbeCore::spawn_with_options`.
+/// Ensures that if the spawn future is cancelled/dropped mid-flight (e.g., via `tokio::select!`),
+/// any spawned child process is immediately killed and the temporary plaintext YAML/work_dir is removed.
+struct SpawnCleanupGuard {
+    config_path: PathBuf,
+    work_dir: PathBuf,
+    child: Option<Child>,
+    armed: bool,
+}
+
+impl Drop for SpawnCleanupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+            let _ = child.try_wait();
+            drop(child);
+        }
+        cleanup_work_dir_nonblocking(&self.config_path, &self.work_dir);
+        self.armed = false;
+    }
+}
+
 /// Managed ephemeral Mihomo probe core process with guaranteed cleanup on `shutdown()` and `Drop`.
 pub struct IsolatedProbeCore {
     child: Option<Child>,
@@ -502,10 +527,14 @@ impl IsolatedProbeCore {
         let config_path = work_dir.join("isolated-probe.yaml");
         let log_path = work_dir.join("probe-core.log");
 
-        if let Err(err) = std::fs::write(&config_path, yaml.as_bytes()) {
-            let _ = std::fs::remove_dir_all(&work_dir);
-            return Err(err.into());
-        }
+        let mut cleanup_guard = SpawnCleanupGuard {
+            config_path: config_path.clone(),
+            work_dir: work_dir.clone(),
+            child: None,
+            armed: true,
+        };
+
+        std::fs::write(&config_path, yaml.as_bytes())?;
 
         let stderr_stdio = match std::fs::File::create(&log_path) {
             Ok(file) => Stdio::from(file),
@@ -529,33 +558,49 @@ impl IsolatedProbeCore {
             .kill_on_drop(true);
         JobGuard::configure_tokio_command(&mut cmd);
 
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&work_dir);
-                return Err(CatError::Process(format!(
-                    "failed to spawn isolated probe core `{}`: {err}",
-                    mihomo_bin.display()
-                )));
-            }
-        };
+        let child = cmd.spawn().map_err(|err| {
+            CatError::Process(format!(
+                "failed to spawn isolated probe core `{}`: {err}",
+                mihomo_bin.display()
+            ))
+        })?;
+        cleanup_guard.child = Some(child);
 
-        if let Err(err) = job_guard.assign_tokio_child(&mut child) {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            let _ = std::fs::remove_dir_all(&work_dir);
+        if let Err(err) = job_guard.assign_tokio_child(
+            cleanup_guard
+                .child
+                .as_mut()
+                .expect("child assigned to spawn cleanup guard"),
+        ) {
+            if let Some(mut c) = cleanup_guard.child.take() {
+                let _ = c.kill().await;
+                let _ = c.wait().await;
+            }
+            remove_work_dir_async(&config_path, &work_dir).await;
+            cleanup_guard.armed = false;
             return Err(err);
         }
 
-        let child_pid = child.id();
+        let child_pid = cleanup_guard.child.as_ref().and_then(Child::id);
 
-        if let Err(err) =
-            wait_for_controller_ready(controller_port, &secret, &mut child, &log_path, ready_timeout)
-                .await
+        if let Err(err) = wait_for_controller_ready(
+            controller_port,
+            &secret,
+            cleanup_guard
+                .child
+                .as_mut()
+                .expect("child held by spawn cleanup guard"),
+            &log_path,
+            ready_timeout,
+        )
+        .await
         {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            if let Some(mut c) = cleanup_guard.child.take() {
+                let _ = c.kill().await;
+                let _ = c.wait().await;
+            }
             remove_work_dir_async(&config_path, &work_dir).await;
+            cleanup_guard.armed = false;
             return Err(err);
         }
 
@@ -571,8 +616,11 @@ impl IsolatedProbeCore {
             ordered_bindings.push(binding);
         }
 
+        let child = cleanup_guard.child.take();
+        cleanup_guard.armed = false;
+
         Ok(Self {
-            child: Some(child),
+            child,
             child_pid,
             controller_port,
             secret,

@@ -1,26 +1,32 @@
 import {
+  Activity,
   AlertTriangle,
-  ArrowRightLeft,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Copy,
   FileCode2,
   Filter,
+  Globe,
   Layers,
-  Lock,
+  Loader2,
+  Pencil,
+  Play,
   Plus,
   RefreshCw,
   RotateCcw,
   Save,
-  ShieldAlert,
+  Search,
+  Settings2,
   ShieldCheck,
-  SlidersHorizontal,
   Sparkles,
+  Star,
   Trash2,
   X,
   Zap,
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   type DynamicFilterSpec,
   type FallbackPolicy,
@@ -29,13 +35,16 @@ import {
   type MultiGroupMode,
   type ProbeSnapshot,
   type ProxyNode,
-  type SwitchMode,
   type TriggerRule,
   catcloudApi,
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
-import { appActions, useAppSelector } from "../store/appStore";
+import { appActions, appStore, useAppSelector } from "../store/appStore";
+
+/* ============================================================================
+ * Constants & Human-Friendly Presets
+ * ============================================================================ */
 
 const FORMULA_COST_EFFECTIVE =
   "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08 - jitter_ms * 0.15) / max(multiplier, 0.25)";
@@ -46,59 +55,167 @@ const FORMULA_MAX_PERF =
 const DEFAULT_MISSING_PING_MS = 9999;
 const EPSILON_ZERO = 1e-12;
 const EPSILON_EQ = 1e-9;
+const NODE_PAGE_SIZE = 120;
+
+const FRIENDLY_GROUP_NAME_MAP: Record<string, string> = {
+  流媒体与下载受控均衡: "影音下载均衡组",
+  高优家宽备援池: "备用精选组",
+};
+
+function formatGroupDisplayName(name: string): string {
+  return FRIENDLY_GROUP_NAME_MAP[name] ?? name;
+}
+
+const REGION_LABELS: Record<string, string> = {
+  JP: "日本",
+  SG: "新加坡",
+  US: "美国",
+  TW: "台湾",
+  HK: "香港",
+  UK: "英国",
+  GB: "英国",
+  DE: "德国",
+  KR: "韩国",
+  NL: "荷兰",
+  CA: "加拿大",
+  AU: "澳大利亚",
+  FR: "法国",
+  IN: "印度",
+  TR: "土耳其",
+  MY: "马来西亚",
+  TH: "泰国",
+  UNK: "其他",
+};
+
+type CreateTemplateId = "manual" | "ai" | "download";
+
+interface CreateTemplateMeta {
+  id: CreateTemplateId;
+  title: string;
+  desc: string;
+  mode: MultiGroupMode;
+  switchMode: "force_close_old" | "graceful_new_only";
+  formula: string;
+  matchRules: string[];
+}
+
+const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
+  {
+    id: "manual",
+    title: "通用手动组",
+    desc: "零门槛，挑喜欢的节点随时用",
+    mode: "sticky_best",
+    switchMode: "graceful_new_only",
+    formula: FORMULA_COST_EFFECTIVE,
+    matchRules: [],
+  },
+  {
+    id: "ai",
+    title: "AI 专线组",
+    desc: "稳选最好防跳 IP，切线断旧连接",
+    mode: "sticky_best",
+    switchMode: "force_close_old",
+    formula: FORMULA_COST_EFFECTIVE,
+    matchRules: [
+      "DOMAIN-SUFFIX,openai.com",
+      "DOMAIN-SUFFIX,claude.ai",
+      "DOMAIN-SUFFIX,googleapis.com",
+    ],
+  },
+  {
+    id: "download",
+    title: "均衡下载组",
+    desc: "多条线路轮流分摊，下载更稳",
+    mode: "load_balance_round_robin",
+    switchMode: "graceful_new_only",
+    formula: FORMULA_MAX_PERF,
+    matchRules: [],
+  },
+];
 
 interface ModeMeta {
   id: MultiGroupMode;
   title: string;
   shortLabel: string;
-  badge: string;
   desc: string;
 }
 
 const GROUP_MODES: readonly ModeMeta[] = [
   {
     id: "sticky_best",
-    title: "AI 专线粘性优选",
-    shortLabel: "粘性优选",
-    badge: "硬门禁过滤 · 防 IP 漂移",
-    desc: "锁定综合分最高的合规节点，维持会话稳定不乱跳；仅在触发门槛或断连时自动切至次优。",
-  },
-  {
-    id: "conditional_pool",
-    title: "动态条件池",
-    shortLabel: "动态条件池",
-    badge: "硬门禁过滤 · 跨订阅动态入池",
-    desc: "按倍率、地区与探针条件动态计算候选节点集合，订阅更新后自动吸纳达标新节点。",
+    title: "平时稳选最好（推荐 · 防跳 IP）",
+    shortLabel: "稳选最好",
+    desc: "一直稳用综合表现最好的一条线，不乱跳地区，减少网站风控。",
   },
   {
     id: "load_balance_consistent_hash",
-    title: "一致性哈希受控均衡",
-    shortLabel: "哈希均衡",
-    badge: "硬门禁过滤 · 同域会话粘性",
-    desc: "先经硬门禁剔除送中与高抖动节点，再按目标域名哈希分摊至多条合规线路。",
+    title: "同网站固定、多路分摊",
+    shortLabel: "同站分摊",
+    desc: "同一个网站走固定线路，不同网站自动分摊到组内多条线路。",
   },
   {
     id: "load_balance_round_robin",
-    title: "轮询受控均衡",
-    shortLabel: "轮询均衡",
-    badge: "硬门禁过滤 · 并发轮询分发",
-    desc: "仅在通过全部硬门禁的高分节点间轮询分发并发连接，适合大文件下载与高频抓取。",
+    title: "多线路轮流分摊（下载提速）",
+    shortLabel: "轮流分摊",
+    desc: "多个连接轮流走不同线路，适合并发下载和大流量拉取。",
+  },
+  {
+    id: "conditional_pool",
+    title: "按条件自动吸纳节点",
+    shortLabel: "自动吸纳",
+    desc: "订阅更新后，按倍率或谷歌地区条件自动把达标新节点收进本组。",
   },
 ];
 
 interface GatePreset {
   expr: string;
   label: string;
-  desc: string;
+  failText: string;
 }
 
 const HARD_GATE_PRESETS: readonly GatePreset[] = [
-  { expr: "google_clean == 1", label: "Google 零送中", desc: "仅保留 Google 侧真值洁净节点" },
-  { expr: "keepalive_ok == 1", label: "60s 保活通过", desc: "排除静默长连接黑洞节点" },
-  { expr: 'site_unlocked("chatgpt") == 1', label: "ChatGPT 解锁", desc: "要求 ChatGPT 站点探针通过" },
-  { expr: 'site_unlocked("google_ai") == 1', label: "Google AI 解锁", desc: "要求 Gemini / Google AI 可达" },
-  { expr: 'site_unlocked("claude") == 1', label: "Claude 解锁", desc: "要求 Anthropic / Claude 解锁" },
-  { expr: 'site_unlocked("windsurf") == 1', label: "Windsurf 解锁", desc: "要求 Windsurf / Codeium 可达" },
+  { expr: "google_clean == 1", label: "谷歌地区正常", failText: "谷歌地区异常" },
+  { expr: "keepalive_ok == 1", label: "长连接稳定(60秒)", failText: "60秒长连接未通过" },
+  { expr: 'site_unlocked("chatgpt") == 1', label: "ChatGPT 可用", failText: "ChatGPT 未解锁" },
+  { expr: 'site_unlocked("google_ai") == 1', label: "Gemini 可用", failText: "Gemini 未解锁" },
+  { expr: 'site_unlocked("claude") == 1', label: "Claude 可用", failText: "Claude 未解锁" },
+  { expr: 'site_unlocked("windsurf") == 1', label: "Windsurf 可用", failText: "Windsurf 未解锁" },
+];
+
+const SITE_FRIENDLY_NAMES: Record<string, string> = {
+  chatgpt: "ChatGPT",
+  google_ai: "Gemini",
+  gemini: "Gemini",
+  claude: "Claude",
+  windsurf: "Windsurf",
+};
+
+interface FallbackMeta {
+  id: FallbackPolicy;
+  title: string;
+  desc: string;
+  tone: "amber" | "accent" | "red";
+}
+
+const FALLBACK_POLICIES: readonly FallbackMeta[] = [
+  {
+    id: "degrade_best_warn",
+    title: "先挑最好的顶着，提醒我（推荐）",
+    desc: "即使暂时都不达标也不断网，挑相对最好的一条继续用并提醒你。",
+    tone: "amber",
+  },
+  {
+    id: "cross_pool_escalate",
+    title: "临时借用备用组",
+    desc: "主组撑不住时先借用下面选好的备用组，主组恢复后自动切回。",
+    tone: "accent",
+  },
+  {
+    id: "strict_circuit_break",
+    title: "暂停连接，防止走错线路",
+    desc: "严格防风控模式：没有符合要求的节点时宁可断开也不乱走出口。",
+    tone: "red",
+  },
 ];
 
 const FORMULA_VARIABLES: ReadonlyArray<{ token: string; label: string }> = [
@@ -108,8 +225,8 @@ const FORMULA_VARIABLES: ReadonlyArray<{ token: string; label: string }> = [
   { token: "jitter_ms", label: "抖动 ms" },
   { token: "loss_pct", label: "丢包 %" },
   { token: "multiplier", label: "倍率" },
-  { token: "keepalive_ok", label: "60s 保活" },
-  { token: "google_clean", label: "Google 洁净" },
+  { token: "keepalive_ok", label: "60秒保活" },
+  { token: "google_clean", label: "谷歌地区正常" },
   { token: "unlocked", label: "全站点解锁" },
 ];
 
@@ -119,39 +236,7 @@ const PROBE_ADDRESS_SNIPPETS: ReadonlyArray<{ token: string; desc: string }> = [
   { token: 'probe_ping("chatgpt")', desc: "指定探针延迟 ms" },
   { token: 'probe_ok("builtin_unlock_windsurf")', desc: "指定探针通过 (1/0)" },
   { token: 'site_unlocked("chatgpt")', desc: "ChatGPT 解锁 (1/0)" },
-  { token: 'site_unlocked("google_ai")', desc: "Google AI 解锁 (1/0)" },
-];
-
-interface FallbackMeta {
-  id: FallbackPolicy;
-  title: string;
-  badge: string;
-  desc: string;
-  tone: "amber" | "accent" | "red";
-}
-
-const FALLBACK_POLICIES: readonly FallbackMeta[] = [
-  {
-    id: "degrade_best_warn",
-    title: "降级择优预警",
-    badge: "默认稳妥 · 不断网",
-    desc: "全员未达门槛时仍择当前综合分最高者维持连通，并在主界面与托盘标记降级预警。",
-    tone: "amber",
-  },
-  {
-    id: "cross_pool_escalate",
-    title: "跨池求助（自动回切）",
-    badge: "借调高优备援池",
-    desc: "临时借调指定备援池节点承接流量，后台按设定间隔探活主池，恢复后带滞回自动切回。",
-    tone: "accent",
-  },
-  {
-    id: "strict_circuit_break",
-    title: "红线熔断至 REJECT",
-    badge: "零妥协防风控",
-    desc: "所有候选均不满足硬门禁或门槛时立即切换为 REJECT 并断开连接，杜绝误走不合规出口。",
-    tone: "red",
-  },
+  { token: 'site_unlocked("google_ai")', desc: "Gemini 解锁 (1/0)" },
 ];
 
 interface TriggerMeta {
@@ -159,8 +244,10 @@ interface TriggerMeta {
   bypassCooldownOnDisconnect: boolean;
 }
 
+type NodeViewMode = "all" | "members";
+
 /* ============================================================================
- * Safe Formatting Helpers for dynamic_filter & trigger_rules
+ * Safe Formatting Helpers for dynamic_filter, trigger_rules & match_rules
  * ============================================================================ */
 
 function formatDynamicFilter(filter: MultiGroup["dynamic_filter"]): string {
@@ -247,6 +334,79 @@ function getPrimaryTriggerMeta(group: MultiGroup): TriggerMeta {
   };
 }
 
+function parseUploadTriggerInfo(expr: string): {
+  enabled: boolean;
+  threshold: number;
+  prefix: string;
+  isSimple: boolean;
+} {
+  const trimmed = expr.trim();
+  if (!trimmed) {
+    return { enabled: false, threshold: 2.0, prefix: "up_mbps", isSimple: true };
+  }
+  const simpleMatch = /^(up_mbps|probe_up\(\s*["'][^"']+["']\s*\))\s*<\s*(\d+(?:\.\d+)?)$/.exec(
+    trimmed
+  );
+  if (simpleMatch) {
+    return {
+      enabled: true,
+      threshold: Number(simpleMatch[2]) || 2.0,
+      prefix: simpleMatch[1],
+      isSimple: true,
+    };
+  }
+  const partialMatch = /(up_mbps|probe_up\(\s*["'][^"']+["']\s*\))\s*<\s*(\d+(?:\.\d+)?)/.exec(
+    trimmed
+  );
+  if (partialMatch) {
+    return {
+      enabled: true,
+      threshold: Number(partialMatch[2]) || 2.0,
+      prefix: partialMatch[1],
+      isSimple: false,
+    };
+  }
+  return { enabled: false, threshold: 2.0, prefix: "up_mbps", isSimple: false };
+}
+
+function formatMatchRuleChip(rule: string): { display: string; tag: string | null } {
+  const trimmed = rule.trim();
+  const upper = trimmed.toUpperCase();
+  if (upper.startsWith("DOMAIN-SUFFIX,")) {
+    return { display: trimmed.slice("DOMAIN-SUFFIX,".length).trim(), tag: null };
+  }
+  if (upper.startsWith("DOMAIN,")) {
+    return { display: trimmed.slice("DOMAIN,".length).trim(), tag: "精确" };
+  }
+  if (upper.startsWith("DOMAIN-KEYWORD,")) {
+    return { display: trimmed.slice("DOMAIN-KEYWORD,".length).trim(), tag: "关键词" };
+  }
+  if (upper.startsWith("PROCESS-NAME,")) {
+    return { display: trimmed.slice("PROCESS-NAME,".length).trim(), tag: "程序" };
+  }
+  if (upper.startsWith("IP-CIDR,") || upper.startsWith("IP-CIDR6,")) {
+    const idx = trimmed.indexOf(",");
+    return { display: trimmed.slice(idx + 1).trim(), tag: "IP" };
+  }
+  return { display: trimmed, tag: null };
+}
+
+function normalizeUserMatchRule(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "";
+  if (trimmed.includes(",")) {
+    return trimmed;
+  }
+  const cleaned = trimmed
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/.*$/, "")
+    .replace(/:\d+$/, "")
+    .replace(/^\.+/, "")
+    .trim();
+  if (!cleaned) return "";
+  return `DOMAIN-SUFFIX,${cleaned}`;
+}
+
 function normalizeGroupForBackend(group: MultiGroup, meta: TriggerMeta): MultiGroup {
   const expr = getPrimaryTriggerExpr(group).trim();
   const triggerRules: TriggerRule[] = expr
@@ -297,9 +457,6 @@ function normalizeGroupForBackend(group: MultiGroup, meta: TriggerMeta): MultiGr
 /* ============================================================================
  * Zero-eval Safe Recursive-Descent AST Formula Parser & Evaluator
  * 100% semantically aligned with Rust `crates/catcloud-core/src/strategy/formula.rs`
- * - Division by zero returns 0
- * - Missing probe_up / probe_down / probe_ok / site_unlocked returns 0
- * - Missing probe_ping returns 9999
  * ============================================================================ */
 
 type OpValue =
@@ -460,17 +617,20 @@ function tokenizeFormula(input: string): { tokens: Token[]; error: string | null
   return { tokens, error: null };
 }
 
-function lookupSiteUnlocked(unlockedSites: Record<string, boolean>, siteName: string): number {
+function lookupSiteUnlockedRaw(
+  unlockedSites: Record<string, boolean>,
+  siteName: string
+): boolean | null {
   if (siteName in unlockedSites) {
-    return unlockedSites[siteName] ? 1 : 0;
+    return unlockedSites[siteName];
   }
   const lower = siteName.toLowerCase();
   for (const [k, v] of Object.entries(unlockedSites)) {
     if (k.toLowerCase() === lower) {
-      return v ? 1 : 0;
+      return v;
     }
   }
-  return 0;
+  return null;
 }
 
 function evaluateFormulaSafely(expr: string, ctx: EvalContext): EvalOutcome {
@@ -589,7 +749,10 @@ function evaluateFormulaSafely(expr: string, ctx: EvalContext): EvalOutcome {
         consume();
         const right = parseUnary();
         if (t.value === "/") {
-          left = !Number.isFinite(right) || Math.abs(right) <= EPSILON_ZERO ? 0 : sanitizeNumber(left / right);
+          left =
+            !Number.isFinite(right) || Math.abs(right) <= EPSILON_ZERO
+              ? 0
+              : sanitizeNumber(left / right);
         } else {
           left = sanitizeNumber(left * right);
         }
@@ -661,7 +824,7 @@ function evaluateFormulaSafely(expr: string, ctx: EvalContext): EvalOutcome {
           if (name === "probe_ok") {
             return ctx.probeOk[arg.value] === true ? 1 : 0;
           }
-          return lookupSiteUnlocked(ctx.unlockedSites, arg.value);
+          return lookupSiteUnlockedRaw(ctx.unlockedSites, arg.value) === true ? 1 : 0;
         }
 
         const args: number[] = [];
@@ -757,6 +920,87 @@ function checkHardGate(gate: string, ctx: EvalContext): boolean {
   return res.ok && isTruthy(res.value);
 }
 
+/**
+ * Human-friendly gate check:
+ * - Never marks untested nodes as "failed" or "rejected"!
+ * - Only returns `failedReasons` when the node has an actual measured value that violates a gate.
+ */
+interface NodeGateAssessment {
+  hasMeasuredFailure: boolean;
+  failedReasons: string[];
+  allMeasuredAndPassed: boolean;
+}
+
+function assessNodeAgainstGates(
+  node: ProxyNode,
+  snap: ProbeSnapshot | undefined,
+  hardGates: string[]
+): NodeGateAssessment {
+  if (hardGates.length === 0 || !snap) {
+    return { hasMeasuredFailure: false, failedReasons: [], allMeasuredAndPassed: false };
+  }
+
+  const failedReasons: string[] = [];
+  let untestedCount = 0;
+  let lazyCtx: EvalContext | null = null;
+
+  for (const gate of hardGates) {
+    const compact = gate.replace(/\s+/g, "");
+    if (compact === "google_clean==1") {
+      if (snap.google_clean === null || snap.google_clean === undefined) {
+        untestedCount += 1;
+      } else if (snap.google_clean === false) {
+        failedReasons.push("谷歌地区异常");
+      }
+      continue;
+    }
+    if (compact === "keepalive_ok==1") {
+      if (snap.keepalive_60s_ok === null || snap.keepalive_60s_ok === undefined) {
+        untestedCount += 1;
+      } else if (snap.keepalive_60s_ok === false) {
+        failedReasons.push("60秒长连接未通过");
+      }
+      continue;
+    }
+    const siteMatch = /^site_unlocked\(["']([^"']+)["']\)==1$/.exec(compact);
+    if (siteMatch) {
+      const siteKey = siteMatch[1];
+      const measured = lookupSiteUnlockedRaw(snap.unlocked_sites ?? {}, siteKey);
+      if (measured === null) {
+        untestedCount += 1;
+      } else if (measured === false) {
+        const label = SITE_FRIENDLY_NAMES[siteKey.toLowerCase()] ?? siteKey;
+        failedReasons.push(`${label} 未解锁`);
+      }
+      continue;
+    }
+    // Custom gate expression: evaluate only when snapshot exists
+    if (!lazyCtx) {
+      lazyCtx = buildEvalContextForNode(node, snap);
+    }
+    if (!checkHardGate(gate, lazyCtx)) {
+      failedReasons.push(gate);
+    }
+  }
+
+  return {
+    hasMeasuredFailure: failedReasons.length > 0,
+    failedReasons,
+    allMeasuredAndPassed: failedReasons.length === 0 && untestedCount === 0,
+  };
+}
+
+function formatLatencyTone(ms: number): string {
+  if (ms <= 140) return "var(--green)";
+  if (ms <= 300) return "var(--amber)";
+  return "var(--red)";
+}
+
+function formatMultiplierLabel(multiplier: number): string {
+  if (!Number.isFinite(multiplier)) return "1x";
+  return Number.isInteger(multiplier) ? `${multiplier}x` : `${Number(multiplier.toFixed(2))}x`;
+}
+
 function buildMultiGroupAgentMarkdown(group: MultiGroup, meta: TriggerMeta): string {
   const normalized = normalizeGroupForBackend(group, meta);
   const snippet = JSON.stringify(
@@ -786,17 +1030,17 @@ function buildMultiGroupAgentMarkdown(group: MultiGroup, meta: TriggerMeta): str
     "",
     "## 1. 适用场景与量化触发信号",
     "- AI / 编程客户端（OpenAI、Claude、Gemini、Windsurf）因随机切节点导致 IP 漂移风控或静默区域受限时，应启用 `sticky_best` 并开启 `google_clean == 1` 与 `keepalive_ok == 1` 硬门禁。",
-    "- 需混合多家订阅并优先消耗 0.5x/1x 低倍率节点，仅在主池全员不达标时短暂借调 3x 高优备援池，并按回切间隔自动恢复。",
+    "- 需混合多家订阅并优先消耗 0.5x/1x 低倍率节点，仅在主池全员不达标时短暂借调高优备援池，并按回切间隔自动恢复。",
     "- 流媒体与并发下载站点可使用 `load_balance_consistent_hash` 或 `load_balance_round_robin`，所有入池节点均须先通过硬门禁过滤。",
     "",
     "## 2. 外部前提与安全 AST 公式规范",
     "- 节点库至少导入 2 条可用节点，并完成一次零干扰隔离测速以生成最新 `ProbeSnapshot`。",
     "- 加权公式由纯 AST 解释器求值（零 `eval`），可用变量：`up_mbps`, `down_mbps`, `ping_ms`, `jitter_ms`, `loss_pct`, `multiplier`, `keepalive_ok`, `google_clean`, `unlocked`, `is_443_native`, `ok`。",
     '- 支持按探针/站点寻址：`probe_up("id")`, `probe_down("id")`, `probe_ping("id")`, `probe_ok("id")`, `site_unlocked("chatgpt")`；内置函数：`min`, `max`, `clamp`, `abs`, `if`。',
-    "- 兜底策略三选一：`degrade_best_warn`（降级择优预警）/ `cross_pool_escalate`（跨池求助自动回切）/ `strict_circuit_break`（红线熔断至 `REJECT`）。",
+    "- 兜底策略三选一：`degrade_best_warn` / `cross_pool_escalate` / `strict_circuit_break`。",
     "",
     "## 3. GUI 路径与 Headless CLI 热写入验收命令",
-    "- GUI 路径：左侧「智能多选组」→ 选择策略组 → 配置模式、AST 公式、硬门禁、兜底与旧连接切换模式 → 保存策略组。",
+    "- GUI 路径：左侧「智能多选组」→ 选择多选组 → 点击节点加入/切换 → 展开右侧「策略与标准」微调并应用。",
     "- 查看全部策略组：`catcloud group list --json`",
     `- 一键切换次优节点并核验连接清理：\`catcloud group switch --group ${group.id} --json\``,
     "- 热重载生效配置：`catcloud config reload --json`",
@@ -837,75 +1081,155 @@ async function copyToClipboard(text: string): Promise<boolean> {
   }
 }
 
+/* ============================================================================
+ * Main Component: Three-Column Human-Friendly Smart Multi-Group Workbench
+ * ============================================================================ */
+
 export function MultiGroupPage() {
   const storeGroups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
+  const probeProgress = useAppSelector((s) => s.probeProgress);
+  const subscriptions = useAppSelector((s) => s.subscriptions);
+  const runtime = useAppSelector((s) => s.runtime);
   const initialized = useAppSelector((s) => s.initialized);
   const inTauri = isTauriEnv();
 
+  // Local group drafts (keeps unsaved strategy edits per group while syncing live active_node_id & members)
   const [groups, setGroups] = useState<MultiGroup[]>(storeGroups);
-  const [selectedId, setSelectedId] = useState<string>(storeGroups[0]?.id ?? "");
+  const [selectedId, setSelectedId] = useState<string>(
+    runtime.active_group_id || storeGroups[0]?.id || ""
+  );
   const [triggerMetas, setTriggerMetas] = useState<Record<string, TriggerMeta>>({});
   const [dirtyGroupIds, setDirtyGroupIds] = useState<Record<string, boolean>>({});
+
+  // Left sidebar: create form & two-step delete confirmation
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [newGroupTemplate, setNewGroupTemplate] = useState<CreateTemplateId>("manual");
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingGroupId, setDeletingGroupId] = useState<string | null>(null);
+
+  // Center pane: inline rename, filters, pagination, batch clear confirm, single-node actions
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [selectedSubId, setSelectedSubId] = useState<string>("all");
+  const [selectedRegion, setSelectedRegion] = useState<string>("all");
+  const [searchQuery, setSearchQuery] = useState("");
+  const [viewMode, setViewMode] = useState<NodeViewMode>("all");
+  const [visibleCount, setVisibleCount] = useState(NODE_PAGE_SIZE);
+  const [confirmClearMembers, setConfirmClearMembers] = useState(false);
+  const [switchingNext, setSwitchingNext] = useState(false);
+  const [selectingNodeId, setSelectingNodeId] = useState<string | null>(null);
+  const [probingNodeIds, setProbingNodeIds] = useState<Record<string, boolean>>({});
+
+  // Right strategy drawer: collapsed by default so node grid gets huge breathing room
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [savingGroup, setSavingGroup] = useState(false);
-  const [deletingGroup, setDeletingGroup] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
   const [evalReport, setEvalReport] = useState<GroupEvaluationReport | null>(null);
+  const [newRuleInput, setNewRuleInput] = useState("");
+  const [customGateInput, setCustomGateInput] = useState("");
+  const [copiedGuide, setCopiedGuide] = useState(false);
   const [backendFormulaValidation, setBackendFormulaValidation] = useState<{
     checkedExpr: string;
     ok: boolean;
     error: string | null;
   } | null>(null);
 
-  const [showCreateForm, setShowCreateForm] = useState(false);
-  const [newGroupName, setNewGroupName] = useState("");
-  const [newGroupMode, setNewGroupMode] = useState<MultiGroupMode>("sticky_best");
-  const [newGroupDomains, setNewGroupDomains] = useState("DOMAIN-SUFFIX,anthropic.com");
-  const [customGateInput, setCustomGateInput] = useState("");
-  const [newRuleInput, setNewRuleInput] = useState("");
-  const [copiedGuide, setCopiedGuide] = useState(false);
-  const [switchingNext, setSwitchingNext] = useState(false);
+  // Stable order snapshot so clicking node cards in "all" view toggles colors in-place without jumping!
+  const [pinnedOrder, setPinnedOrder] = useState<{
+    groupId: string;
+    activeId: string | null;
+    memberIds: Set<string>;
+  }>({
+    groupId: "",
+    activeId: null,
+    memberIds: new Set<string>(),
+  });
 
-  const syncedRef = useRef(false);
+  const dirtyGroupIdsRef = useRef(dirtyGroupIds);
+  dirtyGroupIdsRef.current = dirtyGroupIds;
+  const latestMembersRef = useRef<Record<string, string[]>>({});
+  const memberReqSeqRef = useRef<Record<string, number>>({});
   const copyTimerRef = useRef<number | null>(null);
+  const deleteConfirmTimerRef = useRef<number | null>(null);
+  const clearConfirmTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
-      if (copyTimerRef.current !== null) {
-        window.clearTimeout(copyTimerRef.current);
-      }
+      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
+      if (deleteConfirmTimerRef.current !== null) window.clearTimeout(deleteConfirmTimerRef.current);
+      if (clearConfirmTimerRef.current !== null) window.clearTimeout(clearConfirmTimerRef.current);
     };
   }, []);
 
+  // Sync store groups smoothly without wiping unsaved strategy drafts
   useEffect(() => {
-    if (initialized && !syncedRef.current) {
-      syncedRef.current = true;
-      setGroups(storeGroups);
-      setSelectedId((prev) => prev || storeGroups[0]?.id || "");
-    }
-  }, [storeGroups, initialized]);
+    if (!initialized && storeGroups.length === 0) return;
+    setGroups((prev) => {
+      const prevById = new Map(prev.map((g) => [g.id, g]));
+      return storeGroups.map((sg) => {
+        const local = prevById.get(sg.id);
+        if (local && dirtyGroupIdsRef.current[sg.id]) {
+          return {
+            ...local,
+            member_node_ids: latestMembersRef.current[sg.id] ?? sg.member_node_ids,
+            active_node_id: sg.active_node_id,
+          };
+        }
+        return sg;
+      });
+    });
+    setSelectedId((prev) => {
+      if (prev && storeGroups.some((g) => g.id === prev)) return prev;
+      if (runtime.active_group_id && storeGroups.some((g) => g.id === runtime.active_group_id)) {
+        return runtime.active_group_id;
+      }
+      return storeGroups[0]?.id ?? "";
+    });
+  }, [storeGroups, initialized, runtime.active_group_id]);
 
   const selectedGroup = useMemo(
     () => groups.find((g) => g.id === selectedId) ?? groups[0] ?? null,
     [groups, selectedId]
   );
 
-  // Reset backend evaluation report when switching groups
+  // Refresh pinned display ordering when switching groups or changing view/filters
   useEffect(() => {
+    if (!selectedGroup) return;
+    setPinnedOrder({
+      groupId: selectedGroup.id,
+      activeId: selectedGroup.active_node_id,
+      memberIds: new Set(selectedGroup.member_node_ids),
+    });
+    setEditingName(false);
+    setConfirmClearMembers(false);
     setEvalReport(null);
-  }, [selectedGroup?.id]);
+    setVisibleCount(NODE_PAGE_SIZE);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedGroup?.id, viewMode]);
 
-  // Debounced backend authoritative formula validation in Tauri runtime
+  useEffect(() => {
+    setVisibleCount(NODE_PAGE_SIZE);
+  }, [selectedSubId, selectedRegion, searchQuery]);
+
+  // Debounced backend authoritative formula validation in Tauri runtime (only when advanced panel is open or dirty)
   const currentFormulaExpr = selectedGroup?.formula_expr ?? "";
   useEffect(() => {
-    if (!inTauri || !selectedGroup) {
+    if (!inTauri || !selectedGroup || !advancedOpen) {
       setBackendFormulaValidation(null);
       return;
     }
     const expr = currentFormulaExpr.trim();
     if (!expr) {
-      setBackendFormulaValidation({ checkedExpr: currentFormulaExpr, ok: false, error: "公式不能为空" });
+      setBackendFormulaValidation({
+        checkedExpr: currentFormulaExpr,
+        ok: false,
+        error: "公式不能为空",
+      });
       return;
     }
     let cancelled = false;
@@ -917,7 +1241,7 @@ export function MultiGroupPage() {
             setBackendFormulaValidation({
               checkedExpr: currentFormulaExpr,
               ok,
-              error: ok ? null : "后端 AST 校验未通过",
+              error: ok ? null : "后端公式校验未通过",
             });
           }
         })
@@ -930,184 +1254,202 @@ export function MultiGroupPage() {
             });
           }
         });
-    }, 260);
+    }, 280);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [currentFormulaExpr, inTauri, selectedGroup?.id]);
+  }, [currentFormulaExpr, inTauri, selectedGroup?.id, advancedOpen]);
 
+  // Fast lookup maps for 430+ nodes (zero O(N^2) loops)
+  const nodeById = useMemo(() => {
+    const map = new Map<string, ProxyNode>();
+    for (const n of nodes) map.set(n.id, n);
+    return map;
+  }, [nodes]);
+
+  const subNameById = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const s of subscriptions) map.set(s.id, s.name);
+    return map;
+  }, [subscriptions]);
+
+  const providerTabs = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const n of nodes) {
+      if (!n.enabled) continue;
+      const sid = n.sub_id || "__unknown__";
+      counts.set(sid, (counts.get(sid) ?? 0) + 1);
+    }
+    const items: Array<{ id: string; name: string; count: number }> = [];
+    const seen = new Set<string>();
+    for (const sub of subscriptions) {
+      const cnt = counts.get(sub.id) ?? 0;
+      if (cnt > 0) {
+        items.push({ id: sub.id, name: sub.name, count: cnt });
+        seen.add(sub.id);
+      }
+    }
+    for (const [sid, cnt] of counts.entries()) {
+      if (!seen.has(sid)) {
+        items.push({
+          id: sid,
+          name: sid === "__unknown__" ? "其他来源" : sid,
+          count: cnt,
+        });
+      }
+    }
+    return items;
+  }, [nodes, subscriptions]);
+
+  const enabledNodes = useMemo(() => nodes.filter((n) => n.enabled), [nodes]);
+
+  const regionOptions = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const n of enabledNodes) {
+      if (selectedSubId !== "all" && (n.sub_id || "__unknown__") !== selectedSubId) continue;
+      const code = (n.region_code || "UNK").toUpperCase();
+      counts.set(code, (counts.get(code) ?? 0) + 1);
+    }
+    return Array.from(counts.entries())
+      .map(([code, count]) => ({
+        code,
+        label: REGION_LABELS[code] ? `${code} ${REGION_LABELS[code]}` : code,
+        count,
+      }))
+      .sort((a, b) => b.count - a.count);
+  }, [enabledNodes, selectedSubId]);
+
+  const memberIdSet = useMemo(
+    () => new Set(selectedGroup?.member_node_ids ?? []),
+    [selectedGroup?.member_node_ids]
+  );
+
+  // Only bind live probe/member/active dependencies when sorting inside "members" view
+  // so streaming probe updates never re-filter/re-sort all 430+ nodes in default "all" view.
+  const memberFilterSet = viewMode === "members" ? memberIdSet : null;
+  const memberActiveId =
+    viewMode === "members" ? (selectedGroup?.active_node_id ?? null) : null;
+  const memberSortProbes = viewMode === "members" ? probes : null;
+  const selectedGroupId = selectedGroup?.id ?? null;
+
+  // Filter & stably sort nodes for the main grid
+  const filteredNodes = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    const list = enabledNodes.filter((node) => {
+      if (memberFilterSet && !memberFilterSet.has(node.id)) return false;
+      if (selectedSubId !== "all" && (node.sub_id || "__unknown__") !== selectedSubId) return false;
+      if (selectedRegion !== "all" && (node.region_code || "UNK").toUpperCase() !== selectedRegion) {
+        return false;
+      }
+      if (q) {
+        const subName = (subNameById.get(node.sub_id) ?? "").toLowerCase();
+        const regionCn = (REGION_LABELS[(node.region_code || "").toUpperCase()] ?? "").toLowerCase();
+        const hay = `${node.name} ${node.region_code} ${regionCn} ${node.protocol} ${subName}`.toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
+      return true;
+    });
+
+    const usePinned = pinnedOrder.groupId === selectedGroupId;
+    const pinnedActive = usePinned ? pinnedOrder.activeId : null;
+    const pinnedMembers = usePinned ? pinnedOrder.memberIds : null;
+
+    const sorted = [...list];
+    sorted.sort((a, b) => {
+      if (viewMode === "members") {
+        const aAct = memberActiveId === a.id ? 1 : 0;
+        const bAct = memberActiveId === b.id ? 1 : 0;
+        if (aAct !== bAct) return bAct - aAct;
+        const aSnap = memberSortProbes?.[a.id];
+        const bSnap = memberSortProbes?.[b.id];
+        const aLat = aSnap?.ok ? (aSnap.latency_ms ?? 99999) : 99999;
+        const bLat = bSnap?.ok ? (bSnap.latency_ms ?? 99999) : 99999;
+        if (aLat !== bLat) return aLat - bLat;
+        return a.name.localeCompare(b.name);
+      }
+      // In "all" view, keep active/initial members upfront without jumping mid-click
+      if (!pinnedMembers) return 0;
+      const aWeight = a.id === pinnedActive ? 2 : pinnedMembers.has(a.id) ? 1 : 0;
+      const bWeight = b.id === pinnedActive ? 2 : pinnedMembers.has(b.id) ? 1 : 0;
+      if (aWeight !== bWeight) return bWeight - aWeight;
+      return 0;
+    });
+
+    return sorted;
+  }, [
+    enabledNodes,
+    viewMode,
+    memberFilterSet,
+    selectedSubId,
+    selectedRegion,
+    searchQuery,
+    subNameById,
+    pinnedOrder,
+    selectedGroupId,
+    memberActiveId,
+    memberSortProbes,
+  ]);
+
+  const displayedNodes = useMemo(
+    () => filteredNodes.slice(0, visibleCount),
+    [filteredNodes, visibleCount]
+  );
+
+  // Count how many nodes in current filter are not yet in the active group
+  const unjoinedInFilterIds = useMemo(() => {
+    const ids: string[] = [];
+    for (const n of filteredNodes) {
+      if (!memberIdSet.has(n.id)) ids.push(n.id);
+    }
+    return ids;
+  }, [filteredNodes, memberIdSet]);
+
+  // Gentle group-level health notice: ONLY warn if gates exist AND tested members exist AND all tested members failed
+  const measuredMemberNotice = useMemo(() => {
+    if (!selectedGroup || selectedGroup.hard_gates.length === 0) return null;
+    let testedMemberCount = 0;
+    let failedTestedCount = 0;
+    for (const id of selectedGroup.member_node_ids) {
+      const node = nodeById.get(id);
+      const snap = probes[id];
+      if (!node || !snap) continue;
+      testedMemberCount += 1;
+      const res = assessNodeAgainstGates(node, snap, selectedGroup.hard_gates);
+      if (res.hasMeasuredFailure) failedTestedCount += 1;
+    }
+    if (testedMemberCount > 0 && failedTestedCount === testedMemberCount) {
+      return "组内已测速的节点暂未满足右侧勾选的要求，建议测速其他节点或放宽右侧标准";
+    }
+    return null;
+  }, [selectedGroup, nodeById, probes]);
+
+  // Derived strategy values for right drawer
   const currentTriggerMeta: TriggerMeta = selectedGroup
     ? triggerMetas[selectedGroup.id] ?? getPrimaryTriggerMeta(selectedGroup)
     : { consecutiveFailures: 2, bypassCooldownOnDisconnect: true };
 
   const currentTriggerExpr = selectedGroup ? getPrimaryTriggerExpr(selectedGroup) : "";
+  const uploadTriggerInfo = useMemo(
+    () => parseUploadTriggerInfo(currentTriggerExpr),
+    [currentTriggerExpr]
+  );
   const isSelectedDirty = selectedGroup ? Boolean(dirtyGroupIds[selectedGroup.id]) : false;
 
-  const updateSelectedGroup = (updater: (group: MultiGroup) => MultiGroup) => {
-    if (!selectedGroup) return;
-    setGroups((prev) => prev.map((g) => (g.id === selectedGroup.id ? updater(g) : g)));
-    setDirtyGroupIds((prev) => ({ ...prev, [selectedGroup.id]: true }));
-  };
+  const activeRuleCount = useMemo(() => {
+    if (!selectedGroup) return 0;
+    let count = selectedGroup.hard_gates.length;
+    if (currentTriggerExpr.trim()) count += 1;
+    if (selectedGroup.match_rules.length > 0) count += 1;
+    return count;
+  }, [selectedGroup, currentTriggerExpr]);
 
-  const updateTriggerMeta = (patch: Partial<TriggerMeta>) => {
-    if (!selectedGroup) return;
-    const nextMeta = { ...currentTriggerMeta, ...patch };
-    setTriggerMetas((prev) => ({
-      ...prev,
-      [selectedGroup.id]: nextMeta,
-    }));
-    updateSelectedGroup((g) => {
-      const expr = getPrimaryTriggerExpr(g).trim();
-      if (!expr) return g;
-      const rest = Array.isArray(g.trigger_rules) ? g.trigger_rules.slice(1) : [];
-      return {
-        ...g,
-        trigger_rules: [
-          {
-            expr,
-            consecutive_failures: nextMeta.consecutiveFailures,
-            bypass_cooldown_on_disconnect: nextMeta.bypassCooldownOnDisconnect,
-          },
-          ...rest,
-        ],
-      };
-    });
-  };
+  const otherGroups = useMemo(
+    () => groups.filter((g) => g.id !== selectedGroup?.id),
+    [groups, selectedGroup]
+  );
 
-  const handleSaveSelectedGroup = async () => {
-    if (!selectedGroup || savingGroup) return;
-    setSavingGroup(true);
-    try {
-      const payload = normalizeGroupForBackend(selectedGroup, currentTriggerMeta);
-      const saved = await catcloudApi.upsertMultiGroup(payload);
-      setGroups((prev) => {
-        const next = prev.map((g) => (g.id === saved.id ? saved : g));
-        appActions.syncGroups(next);
-        return next;
-      });
-      setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
-      appActions.showToast(`已保存策略组：${saved.name}`, "ok");
-    } catch (err) {
-      appActions.showToast(`保存策略组失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setSavingGroup(false);
-    }
-  };
-
-  const handleDeleteSelectedGroup = async () => {
-    if (!selectedGroup || deletingGroup) return;
-    setDeletingGroup(true);
-    try {
-      await catcloudApi.deleteMultiGroup(selectedGroup.id);
-      const next = groups.filter((g) => g.id !== selectedGroup.id);
-      setGroups(next);
-      appActions.syncGroups(next);
-      setSelectedId(next[0]?.id ?? "");
-      appActions.showToast(`已删除策略组：${selectedGroup.name}`, "info");
-    } catch (err) {
-      appActions.showToast(`删除策略组失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setDeletingGroup(false);
-    }
-  };
-
-  const handleEvaluateBackend = async () => {
-    if (!selectedGroup || evaluating) return;
-    setEvaluating(true);
-    try {
-      if (isSelectedDirty) {
-        const payload = normalizeGroupForBackend(selectedGroup, currentTriggerMeta);
-        const saved = await catcloudApi.upsertMultiGroup(payload);
-        setGroups((prev) => {
-          const next = prev.map((g) => (g.id === saved.id ? saved : g));
-          appActions.syncGroups(next);
-          return next;
-        });
-        setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
-      }
-      const report = await catcloudApi.evaluateMultiGroup(selectedGroup.id);
-      setEvalReport(report);
-      appActions.showToast(
-        `后端评估完成：候选池 ${report.pool_size} / 过门禁 ${report.gate_passed.length} / 健康 ${report.healthy_candidates.length}`,
-        report.all_failed_hard_gates ? "warn" : "ok"
-      );
-    } catch (err) {
-      appActions.showToast(`评估策略组失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setEvaluating(false);
-    }
-  };
-
-  const handleCreateGroup = async (ev: FormEvent) => {
-    ev.preventDefault();
-    const name = newGroupName.trim();
-    if (!name) {
-      appActions.showToast("请填写多选组名称", "warn");
-      return;
-    }
-    const id = `grp-${Date.now().toString(36)}`;
-    const parsedRules = newGroupDomains
-      .split(/[\n,]/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const defaultMemberIds = nodes.filter((n) => n.enabled).map((n) => n.id);
-    const created: MultiGroup = {
-      id,
-      name,
-      mode: newGroupMode,
-      match_rules: parsedRules,
-      member_node_ids: defaultMemberIds,
-      dynamic_filter:
-        newGroupMode === "conditional_pool"
-          ? {
-              expr: "multiplier <= 1.5 && google_clean == 1",
-              sub_ids: [],
-              region_codes: [],
-              max_multiplier: null,
-              protocols: [],
-              require_google_clean: true,
-              require_443_native: null,
-            }
-          : null,
-      primary_probe_id: "antigravity",
-      hard_gates: ["google_clean == 1", "keepalive_ok == 1"],
-      trigger_rules: [
-        {
-          expr: 'probe_up("antigravity") < 2.0',
-          consecutive_failures: 2,
-          bypass_cooldown_on_disconnect: true,
-        },
-      ],
-      trigger_expr: 'probe_up("antigravity") < 2.0',
-      formula_expr: FORMULA_COST_EFFECTIVE,
-      fallback_policy: "degrade_best_warn",
-      fallback_pool_id: null,
-      escalated_since: null,
-      recover_probe_interval_sec: 120,
-      switch_mode: newGroupMode === "sticky_best" ? "force_close_old" : "graceful_new_only",
-      cooldown_sec: 60,
-      hysteresis_pct: 20,
-      active_node_id: defaultMemberIds[0] ?? null,
-    };
-
-    try {
-      const saved = await catcloudApi.upsertMultiGroup(created);
-      setGroups((prev) => {
-        const next = [...prev, saved];
-        appActions.syncGroups(next);
-        return next;
-      });
-      setSelectedId(saved.id);
-      setNewGroupName("");
-      setShowCreateForm(false);
-      appActions.showToast(`已新建智能多选组：${saved.name}`, "ok");
-    } catch (err) {
-      appActions.showToast(`创建策略组失败：${formatErrorMessage(err)}`, "warn");
-    }
-  };
-
-  // Offline syntax check synchronized with Rust `strategy/formula.rs`, superseded by backend result when fresh
+  // Formula syntax check (only needed for advanced section)
   const formulaSyntaxCheck = useMemo(() => {
     if (!selectedGroup) return { ok: true, error: null as string | null, source: "local" as const };
     if (
@@ -1145,49 +1487,227 @@ export function MultiGroupPage() {
     return { ok: sampleOutcome.ok, error: sampleOutcome.error, source: "local" as const };
   }, [selectedGroup, inTauri, backendFormulaValidation]);
 
-  // Real-time candidate node scoring queue
-  const scoredCandidates = useMemo(() => {
-    if (!selectedGroup) return [];
-    const candidateNodes =
-      selectedGroup.member_node_ids.length > 0
-        ? nodes.filter((n) => selectedGroup.member_node_ids.includes(n.id))
-        : nodes;
+  const formattedDynamicFilter = selectedGroup
+    ? formatDynamicFilter(selectedGroup.dynamic_filter)
+    : "";
 
-    const evaluated = candidateNodes.map((node) => {
-      const snap = probes[node.id];
-      const ctx = buildEvalContextForNode(node, snap);
-      const failedGates = selectedGroup.hard_gates.filter((gate) => !checkHardGate(gate, ctx));
-      const passedAllGates = failedGates.length === 0;
-      const scoreResult = evaluateFormulaSafely(selectedGroup.formula_expr, ctx);
+  /* ============================================================================
+   * Action Handlers
+   * ============================================================================ */
+
+  const updateSelectedGroup = (updater: (group: MultiGroup) => MultiGroup) => {
+    if (!selectedGroup) return;
+    setGroups((prev) => prev.map((g) => (g.id === selectedGroup.id ? updater(g) : g)));
+    setDirtyGroupIds((prev) => ({ ...prev, [selectedGroup.id]: true }));
+  };
+
+  const updateTriggerMeta = (patch: Partial<TriggerMeta>) => {
+    if (!selectedGroup) return;
+    const nextMeta = { ...currentTriggerMeta, ...patch };
+    setTriggerMetas((prev) => ({
+      ...prev,
+      [selectedGroup.id]: nextMeta,
+    }));
+    updateSelectedGroup((g) => {
+      const expr = getPrimaryTriggerExpr(g).trim();
+      if (!expr) return g;
+      const rest = Array.isArray(g.trigger_rules) ? g.trigger_rules.slice(1) : [];
       return {
-        node,
-        snap,
-        passedAllGates,
-        failedGates,
-        score: scoreResult.ok ? scoreResult.value : 0,
+        ...g,
+        trigger_rules: [
+          {
+            expr,
+            consecutive_failures: nextMeta.consecutiveFailures,
+            bypass_cooldown_on_disconnect: nextMeta.bypassCooldownOnDisconnect,
+          },
+          ...rest,
+        ],
       };
     });
+  };
 
-    evaluated.sort((a, b) => {
-      if (a.passedAllGates !== b.passedAllGates) return a.passedAllGates ? -1 : 1;
-      return b.score - a.score;
-    });
-    return evaluated;
-  }, [nodes, probes, selectedGroup]);
+  /** Optimistically update member_node_ids with sequence guard to survive rapid multi-clicks */
+  const persistGroupMembers = async (
+    groupId: string,
+    nextMemberIds: string[],
+    toastText?: string
+  ): Promise<boolean> => {
+    const prevIds =
+      latestMembersRef.current[groupId] ??
+      groups.find((g) => g.id === groupId)?.member_node_ids ??
+      [];
+    const uniqueNext = Array.from(new Set(nextMemberIds));
+    latestMembersRef.current[groupId] = uniqueNext;
 
-  const maxScore = useMemo(() => {
-    let peak = 1;
-    for (const item of scoredCandidates) {
-      if (item.score > peak) peak = item.score;
+    const seq = (memberReqSeqRef.current[groupId] ?? 0) + 1;
+    memberReqSeqRef.current[groupId] = seq;
+
+    // Optimistic state + store sync
+    setGroups((prev) =>
+      prev.map((g) => (g.id === groupId ? { ...g, member_node_ids: uniqueNext } : g))
+    );
+    appActions.syncGroups(
+      appStore
+        .getState()
+        .groups.map((g) => (g.id === groupId ? { ...g, member_node_ids: uniqueNext } : g))
+    );
+
+    try {
+      const saved = await catcloudApi.updateMultiGroupMembers(groupId, uniqueNext);
+      if (memberReqSeqRef.current[groupId] === seq) {
+        latestMembersRef.current[groupId] = saved.member_node_ids;
+        setGroups((prev) =>
+          prev.map((g) =>
+            g.id === groupId
+              ? {
+                  ...g,
+                  member_node_ids: saved.member_node_ids,
+                  active_node_id: saved.active_node_id,
+                }
+              : g
+          )
+        );
+        appActions.syncGroups(
+          appStore.getState().groups.map((g) =>
+            g.id === groupId
+              ? {
+                  ...g,
+                  member_node_ids: saved.member_node_ids,
+                  active_node_id: saved.active_node_id,
+                }
+              : g
+          )
+        );
+        if (toastText) appActions.showToast(toastText, "ok");
+      }
+      return true;
+    } catch (err) {
+      if (memberReqSeqRef.current[groupId] === seq) {
+        latestMembersRef.current[groupId] = prevIds;
+        setGroups((prev) =>
+          prev.map((g) => (g.id === groupId ? { ...g, member_node_ids: prevIds } : g))
+        );
+        appActions.syncGroups(
+          appStore
+            .getState()
+            .groups.map((g) => (g.id === groupId ? { ...g, member_node_ids: prevIds } : g))
+        );
+        appActions.showToast(`更新组成员失败：${formatErrorMessage(err)}`, "warn");
+      }
+      return false;
     }
-    return peak;
-  }, [scoredCandidates]);
+  };
+
+  const handleToggleNodeMembership = (node: ProxyNode) => {
+    if (!selectedGroup) return;
+    const currentIds =
+      latestMembersRef.current[selectedGroup.id] ?? selectedGroup.member_node_ids;
+    const exists = currentIds.includes(node.id);
+    if (exists && selectedGroup.active_node_id === node.id) {
+      appActions.showToast("当前正在使用这个节点，请先切到其它节点再移出", "info");
+      return;
+    }
+    const nextIds = exists
+      ? currentIds.filter((id) => id !== node.id)
+      : [...currentIds, node.id];
+    void persistGroupMembers(selectedGroup.id, nextIds);
+  };
+
+  const handleUseNode = async (node: ProxyNode) => {
+    if (!selectedGroup || selectingNodeId === node.id) return;
+    setSelectingNodeId(node.id);
+    try {
+      const currentIds =
+        latestMembersRef.current[selectedGroup.id] ?? selectedGroup.member_node_ids;
+      if (!currentIds.includes(node.id)) {
+        const joined = await persistGroupMembers(selectedGroup.id, [...currentIds, node.id]);
+        if (!joined) return;
+      }
+      if (appStore.getState().runtime.active_group_id !== selectedGroup.id) {
+        await appActions.setActiveGroup(selectedGroup.id);
+      }
+      const closeOld = selectedGroup.switch_mode === "force_close_old";
+      await appActions.selectGroupNode(selectedGroup.id, node.id, closeOld);
+      setGroups((prev) =>
+        prev.map((g) => (g.id === selectedGroup.id ? { ...g, active_node_id: node.id } : g))
+      );
+    } finally {
+      setSelectingNodeId(null);
+    }
+  };
+
+  const handleProbeSingleNode = async (node: ProxyNode) => {
+    if (probingNodeIds[node.id] || probeProgress.running) return;
+    setProbingNodeIds((prev) => ({ ...prev, [node.id]: true }));
+    try {
+      const res = await catcloudApi.runIsolatedProbes([node.id], [], "unlock", false);
+      if (res.snapshots && Object.keys(res.snapshots).length > 0) {
+        const merged = { ...appStore.getState().probes, ...res.snapshots };
+        appActions.syncProbes(merged);
+      }
+      const snap = res.snapshots?.[node.id];
+      if (snap && snap.ok && snap.latency_ms !== null) {
+        appActions.showToast(`测速完成：${node.name} · ${Math.round(snap.latency_ms)} ms`, "ok");
+      } else if (res.errors.length > 0) {
+        appActions.showToast(`测速提示：${res.errors[0]}`, "warn");
+      } else {
+        appActions.showToast(`${node.name} 暂时连接超时，可稍后再试`, "warn");
+      }
+    } catch (err) {
+      appActions.showToast(`测速失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setProbingNodeIds((prev) => {
+        const next = { ...prev };
+        delete next[node.id];
+        return next;
+      });
+    }
+  };
+
+  const handleAddFilteredToGroup = () => {
+    if (!selectedGroup || unjoinedInFilterIds.length === 0) return;
+    const currentIds =
+      latestMembersRef.current[selectedGroup.id] ?? selectedGroup.member_node_ids;
+    const nextIds = [...currentIds, ...unjoinedInFilterIds];
+    void persistGroupMembers(
+      selectedGroup.id,
+      nextIds,
+      `已将 ${unjoinedInFilterIds.length} 个节点加入「${formatGroupDisplayName(selectedGroup.name)}」`
+    );
+  };
+
+  const handleClearGroupMembers = () => {
+    if (!selectedGroup || selectedGroup.member_node_ids.length === 0) return;
+    if (!confirmClearMembers) {
+      setConfirmClearMembers(true);
+      if (clearConfirmTimerRef.current !== null) {
+        window.clearTimeout(clearConfirmTimerRef.current);
+      }
+      clearConfirmTimerRef.current = window.setTimeout(() => {
+        setConfirmClearMembers(false);
+        clearConfirmTimerRef.current = null;
+      }, 3500);
+      return;
+    }
+    setConfirmClearMembers(false);
+    void persistGroupMembers(
+      selectedGroup.id,
+      [],
+      `已清空「${formatGroupDisplayName(selectedGroup.name)}」中的节点`
+    );
+  };
 
   const handleSwitchNextBestInGroup = async () => {
     if (!selectedGroup || switchingNext) return;
+    if (selectedGroup.member_node_ids.length === 0 && selectedGroup.mode !== "conditional_pool") {
+      appActions.showToast("当前组里还没有节点，请先点击下方节点卡片加入本组", "warn");
+      return;
+    }
     setSwitchingNext(true);
     try {
       const res = await catcloudApi.switchNextBestNode(selectedGroup.id);
+      const rt = await catcloudApi.getRuntimeInfo();
+      appActions.syncRuntime(rt);
       setGroups((prev) => {
         const next = prev.map((g) =>
           g.id === selectedGroup.id ? { ...g, active_node_id: res.active_node_id } : g
@@ -1195,37 +1715,147 @@ export function MultiGroupPage() {
         appActions.syncGroups(next);
         return next;
       });
-      appActions.showToast(
-        `${selectedGroup.name} 已切至次优：${res.active_node_name}（清理 ${res.closed_connections} 条旧连接）`,
-        "ok"
-      );
+      appActions.showToast(`已切至下一个最快节点：${res.active_node_name}`, "ok");
     } catch (err) {
-      appActions.showToast(`切换次优节点失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`切换失败：${formatErrorMessage(err)}`, "warn");
     } finally {
       setSwitchingNext(false);
     }
   };
 
-  const handleManualSelectNode = async (node: ProxyNode) => {
-    if (!selectedGroup) return;
-    const closeOld = selectedGroup.switch_mode === "force_close_old";
+  const handleCreateGroup = async (ev: FormEvent) => {
+    ev.preventDefault();
+    const name = newGroupName.trim();
+    if (!name) {
+      appActions.showToast("请先给新多选组起个名字", "warn");
+      return;
+    }
+    if (creatingGroup) return;
+    setCreatingGroup(true);
+
+    const tpl = CREATE_TEMPLATES.find((t) => t.id === newGroupTemplate) ?? CREATE_TEMPLATES[0];
+    // Always start clean: zero hard_gates, zero trigger_rules, zero member_node_ids!
+    const created: MultiGroup = {
+      id: `grp-${Date.now().toString(36)}`,
+      name,
+      mode: tpl.mode,
+      match_rules: [...tpl.matchRules],
+      member_node_ids: [],
+      dynamic_filter: null,
+      primary_probe_id: null,
+      hard_gates: [],
+      trigger_rules: [],
+      trigger_expr: null,
+      formula_expr: tpl.formula,
+      fallback_policy: "degrade_best_warn",
+      fallback_pool_id: null,
+      escalated_since: null,
+      recover_probe_interval_sec: 120,
+      switch_mode: tpl.switchMode,
+      cooldown_sec: 60,
+      hysteresis_pct: 20,
+      active_node_id: null,
+    };
+
     try {
-      const res = await catcloudApi.selectGroupNode(selectedGroup.id, node.id, closeOld);
+      const saved = await catcloudApi.upsertMultiGroup(created);
+      latestMembersRef.current[saved.id] = saved.member_node_ids;
       setGroups((prev) => {
-        const next = prev.map((g) =>
-          g.id === selectedGroup.id ? { ...g, active_node_id: res.active_node_id } : g
-        );
+        const next = [...prev, saved];
         appActions.syncGroups(next);
         return next;
       });
-      appActions.showToast(
-        `已切换 ${selectedGroup.name} → ${res.active_node_name}（${
-          closeOld ? `踢断 ${res.closed_connections} 条旧连接` : "温和切换"
-        }）`,
-        "ok"
-      );
+      setSelectedId(saved.id);
+      setNewGroupName("");
+      setShowCreateForm(false);
+      setViewMode("all");
+      appActions.showToast(`已新建「${saved.name}」，点击中间节点卡片即可加入`, "ok");
     } catch (err) {
-      appActions.showToast(`手动切换节点失败：${formatErrorMessage(err)}`, "warn");
+      appActions.showToast(`新建失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setCreatingGroup(false);
+    }
+  };
+
+  const handleRequestDeleteGroup = (groupId: string) => {
+    if (groups.length <= 1) return;
+    setConfirmDeleteId(groupId);
+    if (deleteConfirmTimerRef.current !== null) {
+      window.clearTimeout(deleteConfirmTimerRef.current);
+    }
+    deleteConfirmTimerRef.current = window.setTimeout(() => {
+      setConfirmDeleteId(null);
+      deleteConfirmTimerRef.current = null;
+    }, 4000);
+  };
+
+  const handleConfirmDeleteGroup = async (group: MultiGroup) => {
+    if (deletingGroupId || groups.length <= 1) return;
+    setDeletingGroupId(group.id);
+    try {
+      await catcloudApi.deleteMultiGroup(group.id);
+      const next = groups.filter((g) => g.id !== group.id);
+      delete latestMembersRef.current[group.id];
+      setGroups(next);
+      appActions.syncGroups(next);
+      if (selectedGroup?.id === group.id) {
+        setSelectedId(next[0]?.id ?? "");
+      }
+      setConfirmDeleteId(null);
+      appActions.showToast(`已删除多选组：${formatGroupDisplayName(group.name)}`, "info");
+    } catch (err) {
+      appActions.showToast(`删除失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setDeletingGroupId(null);
+    }
+  };
+
+  const handleCommitRename = async () => {
+    if (!selectedGroup) return;
+    const trimmed = nameDraft.trim();
+    setEditingName(false);
+    if (
+      !trimmed ||
+      trimmed === selectedGroup.name ||
+      trimmed === formatGroupDisplayName(selectedGroup.name)
+    ) {
+      return;
+    }
+
+    const updated: MultiGroup = { ...selectedGroup, name: trimmed };
+    try {
+      const payload = normalizeGroupForBackend(updated, currentTriggerMeta);
+      const saved = await catcloudApi.upsertMultiGroup(payload);
+      setGroups((prev) => {
+        const next = prev.map((g) => (g.id === saved.id ? saved : g));
+        appActions.syncGroups(next);
+        return next;
+      });
+      setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
+      appActions.showToast(`已重命名为：${formatGroupDisplayName(saved.name)}`, "ok");
+    } catch (err) {
+      appActions.showToast(`重命名失败：${formatErrorMessage(err)}`, "warn");
+    }
+  };
+
+  const handleSaveSelectedGroup = async () => {
+    if (!selectedGroup || savingGroup) return;
+    setSavingGroup(true);
+    try {
+      const payload = normalizeGroupForBackend(selectedGroup, currentTriggerMeta);
+      const saved = await catcloudApi.upsertMultiGroup(payload);
+      latestMembersRef.current[saved.id] = saved.member_node_ids;
+      setGroups((prev) => {
+        const next = prev.map((g) => (g.id === saved.id ? saved : g));
+        appActions.syncGroups(next);
+        return next;
+      });
+      setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
+      appActions.showToast(`策略已保存并生效：${formatGroupDisplayName(saved.name)}`, "ok");
+    } catch (err) {
+      appActions.showToast(`保存策略失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setSavingGroup(false);
     }
   };
 
@@ -1251,12 +1881,62 @@ export function MultiGroupPage() {
     setCustomGateInput("");
   };
 
+  const setPrimaryTriggerExpr = (nextExpr: string) => {
+    updateSelectedGroup((g) => {
+      const rest = Array.isArray(g.trigger_rules) ? g.trigger_rules.slice(1) : [];
+      const trimmed = nextExpr.trim();
+      return {
+        ...g,
+        trigger_expr: trimmed ? nextExpr : null,
+        trigger_rules: trimmed
+          ? [
+              {
+                expr: nextExpr,
+                consecutive_failures: currentTriggerMeta.consecutiveFailures,
+                bypass_cooldown_on_disconnect: currentTriggerMeta.bypassCooldownOnDisconnect,
+              },
+              ...rest,
+            ]
+          : rest,
+      };
+    });
+  };
+
+  const handleToggleUploadTrigger = () => {
+    if (!selectedGroup) return;
+    if (uploadTriggerInfo.enabled) {
+      if (uploadTriggerInfo.isSimple) {
+        setPrimaryTriggerExpr("");
+      } else {
+        setPrimaryTriggerExpr("");
+      }
+    } else {
+      const val = Number.isFinite(uploadTriggerInfo.threshold) ? uploadTriggerInfo.threshold : 2.0;
+      setPrimaryTriggerExpr(`${uploadTriggerInfo.prefix} < ${val}`);
+    }
+  };
+
+  const handleUploadThresholdChange = (raw: string) => {
+    const num = Number(raw);
+    if (!Number.isFinite(num) || num < 0) return;
+    if (uploadTriggerInfo.isSimple || !currentTriggerExpr.trim()) {
+      setPrimaryTriggerExpr(`${uploadTriggerInfo.prefix} < ${num}`);
+    } else {
+      const replaced = currentTriggerExpr.replace(
+        /(up_mbps|probe_up\(\s*["'][^"']+["']\s*\))\s*<\s*\d+(?:\.\d+)?/,
+        `$1 < ${num}`
+      );
+      setPrimaryTriggerExpr(replaced);
+    }
+  };
+
   const handleAddMatchRule = (ev: FormEvent) => {
     ev.preventDefault();
-    const rule = newRuleInput.trim();
-    if (!rule || !selectedGroup) return;
-    if (!selectedGroup.match_rules.includes(rule)) {
-      updateSelectedGroup((g) => ({ ...g, match_rules: [...g.match_rules, rule] }));
+    if (!selectedGroup) return;
+    const normalized = normalizeUserMatchRule(newRuleInput);
+    if (!normalized) return;
+    if (!selectedGroup.match_rules.includes(normalized)) {
+      updateSelectedGroup((g) => ({ ...g, match_rules: [...g.match_rules, normalized] }));
     }
     setNewRuleInput("");
   };
@@ -1272,6 +1952,46 @@ export function MultiGroupPage() {
     });
   };
 
+  const handleEvaluateBackend = async () => {
+    if (!selectedGroup || evaluating) return;
+    setEvaluating(true);
+    try {
+      if (isSelectedDirty) {
+        const payload = normalizeGroupForBackend(selectedGroup, currentTriggerMeta);
+        const saved = await catcloudApi.upsertMultiGroup(payload);
+        setGroups((prev) => {
+          const next = prev.map((g) => (g.id === saved.id ? saved : g));
+          appActions.syncGroups(next);
+          return next;
+        });
+        setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
+      }
+      const report = await catcloudApi.evaluateMultiGroup(selectedGroup.id);
+      setEvalReport(report);
+      const latestProbes = appStore.getState().probes;
+      const evalIds = new Set<string>();
+      for (const c of report.gate_passed) evalIds.add(c.node_id);
+      for (const c of report.gate_rejected) evalIds.add(c.node_id);
+      if (evalIds.size === 0) {
+        for (const id of selectedGroup.member_node_ids) evalIds.add(id);
+      }
+      let untestedCnt = 0;
+      for (const id of evalIds) {
+        if (!latestProbes[id]) untestedCnt += 1;
+      }
+      appActions.showToast(
+        untestedCnt > 0
+          ? `评估完成：候选 ${report.pool_size} 个 · 达标 ${report.healthy_candidates.length} 个（其中 ${untestedCnt} 个尚未测速）`
+          : `评估完成：候选 ${report.pool_size} 个 · 达标 ${report.healthy_candidates.length} 个`,
+        "ok"
+      );
+    } catch (err) {
+      appActions.showToast(`后端评估失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setEvaluating(false);
+    }
+  };
+
   const handleCopyAgentGuide = async () => {
     if (!selectedGroup) return;
     let md = buildMultiGroupAgentMarkdown(selectedGroup, currentTriggerMeta);
@@ -1282,13 +2002,13 @@ export function MultiGroupPage() {
           md = exported;
         }
       } catch {
-        /* fallback to local guide markdown */
+        /* fallback to local markdown */
       }
     }
     const ok = await copyToClipboard(md);
     if (ok) {
       setCopiedGuide(true);
-      appActions.showToast("已复制智能多选组四段式 Agent 指南（Markdown）", "ok");
+      appActions.showToast("已复制 AI 助手协同指南（Markdown）", "ok");
       if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
       copyTimerRef.current = window.setTimeout(() => {
         setCopiedGuide(false);
@@ -1299,434 +2019,915 @@ export function MultiGroupPage() {
     }
   };
 
-  const otherGroups = useMemo(
-    () => groups.filter((g) => g.id !== selectedGroup?.id),
-    [groups, selectedGroup]
-  );
+  const handleCardKeyDown = (ev: KeyboardEvent<HTMLDivElement>, onTrigger: () => void) => {
+    if (ev.key === "Enter" || ev.key === " ") {
+      ev.preventDefault();
+      onTrigger();
+    }
+  };
 
-  const passingCount = scoredCandidates.filter((c) => c.passedAllGates).length;
-  const formattedDynamicFilter = selectedGroup ? formatDynamicFilter(selectedGroup.dynamic_filter) : "";
+  const activeNodeInSelectedGroup = selectedGroup?.active_node_id
+    ? nodeById.get(selectedGroup.active_node_id) ?? null
+    : null;
+
+  const isRuntimeActiveGroup =
+    Boolean(selectedGroup) && runtime.active_group_id === selectedGroup?.id;
+
+  const customHardGates = useMemo(() => {
+    if (!selectedGroup) return [];
+    const presetSet = new Set(HARD_GATE_PRESETS.map((p) => p.expr));
+    return selectedGroup.hard_gates.filter((expr) => !presetSet.has(expr));
+  }, [selectedGroup]);
+
+  const evalUntestedCount = useMemo(() => {
+    if (!evalReport) return 0;
+    const candidateIds = new Set<string>();
+    for (const c of evalReport.gate_passed) candidateIds.add(c.node_id);
+    for (const c of evalReport.gate_rejected) candidateIds.add(c.node_id);
+    if (candidateIds.size === 0 && selectedGroup) {
+      for (const id of selectedGroup.member_node_ids) candidateIds.add(id);
+    }
+    let untested = 0;
+    for (const id of candidateIds) {
+      if (!probes[id]) untested += 1;
+    }
+    return untested;
+  }, [evalReport, selectedGroup, probes]);
+
+  const selectedGroupDisplayName = selectedGroup
+    ? formatGroupDisplayName(selectedGroup.name)
+    : "";
+
+  /* ============================================================================
+   * Render: Three-Column Workbench (Left Groups | Center Nodes | Right Drawer)
+   * ============================================================================ */
 
   return (
-    <div className="grid grid-cols-1 gap-4 xl:grid-cols-12">
-      {/* Left / Top Multi-Group Selector Sidebar + Create Form */}
-      <aside className="space-y-3 xl:col-span-3">
-        <div className="cc-card cc-glass rounded-2xl p-3.5">
-          <div className="mb-3 flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2">
-              <Layers className="h-4 w-4 text-[var(--accent)]" />
-              <h1 className="text-sm font-semibold text-[var(--text)]">多选组列表</h1>
-            </div>
-            <button
-              type="button"
-              onClick={() => setShowCreateForm((v) => !v)}
-              className="inline-flex items-center gap-1 rounded-lg bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-medium text-[var(--accent)] transition-opacity hover:opacity-85"
-            >
-              {showCreateForm ? <X className="h-3 w-3" /> : <Plus className="h-3 w-3" />}
-              <span>{showCreateForm ? "取消" : "新建组"}</span>
-            </button>
-          </div>
+    <div className="flex min-h-[calc(100vh-2rem)] flex-col gap-3.5 lg:flex-row lg:items-stretch">
+      {/* =====================================================================
+          COLUMN 1: LEFT SIDEBAR (232px) — Create Group & Existing Groups List
+         ===================================================================== */}
+      <aside className="flex w-full shrink-0 flex-col lg:w-[232px]">
+        <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl p-3">
+          {/* Prominent "+ 新建多选组" primary button */}
+          <button
+            type="button"
+            onClick={() => setShowCreateForm((v) => !v)}
+            className={`flex w-full items-center justify-center gap-1.5 rounded-xl px-3.5 py-2.5 text-xs font-semibold transition-opacity ${
+              showCreateForm
+                ? "border border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                : "bg-[var(--accent)] text-[var(--accent-ink)] shadow-sm hover:opacity-90"
+            }`}
+          >
+            {showCreateForm ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
+            <span>{showCreateForm ? "取消新建" : "新建多选组"}</span>
+          </button>
 
+          {/* Ultra-simple inline create form */}
           {showCreateForm && (
             <form
               onSubmit={(ev) => void handleCreateGroup(ev)}
-              className="mb-3 space-y-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5 text-xs"
+              className="mt-3 space-y-2.5 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] p-2.5"
             >
-              <input
-                type="text"
-                value={newGroupName}
-                onChange={(e) => setNewGroupName(e.target.value)}
-                placeholder="策略组名称（如 Claude 专用池）"
-                className="w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-              />
-              <select
-                value={newGroupMode}
-                onChange={(e) => setNewGroupMode(e.target.value as MultiGroupMode)}
-                className="w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-              >
-                {GROUP_MODES.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.title}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="text"
-                value={newGroupDomains}
-                onChange={(e) => setNewGroupDomains(e.target.value)}
-                placeholder="匹配规则（逗号分隔）"
-                className="cc-mono w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
-              />
+              <div>
+                <label className="mb-1 block text-[11px] font-medium text-[var(--text-secondary)]">
+                  多选组名称
+                </label>
+                <input
+                  type="text"
+                  autoFocus
+                  value={newGroupName}
+                  onChange={(e) => setNewGroupName(e.target.value)}
+                  placeholder="例如：日常主力、AI 专线"
+                  className="w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                />
+              </div>
+
+              <div>
+                <div className="mb-1 text-[11px] font-medium text-[var(--text-secondary)]">
+                  快捷场景（可选）
+                </div>
+                <div className="space-y-1.5">
+                  {CREATE_TEMPLATES.map((tpl) => {
+                    const picked = newGroupTemplate === tpl.id;
+                    return (
+                      <button
+                        key={tpl.id}
+                        type="button"
+                        onClick={() => setNewGroupTemplate(tpl.id)}
+                        className={`w-full rounded-lg border px-2.5 py-1.5 text-left transition-colors ${
+                          picked
+                            ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                            : "border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)]"
+                        }`}
+                      >
+                        <div className="text-[11px] font-semibold text-[var(--text)]">
+                          {tpl.title}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-[var(--muted)]">{tpl.desc}</div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div className="text-[10px] leading-relaxed text-[var(--muted)]">
+                新建后不设限制门槛，直接去中间点选节点加入即可。
+              </div>
+
               <button
                 type="submit"
-                className="w-full rounded-lg bg-[var(--accent)] py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                disabled={creatingGroup}
+                className="w-full rounded-lg bg-[var(--accent)] py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
               >
-                创建多选组
+                {creatingGroup ? "创建中..." : "确认创建"}
               </button>
             </form>
           )}
 
-          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-1">
+          {/* Section heading */}
+          <div className="mt-3.5 mb-2 flex items-center justify-between px-0.5">
+            <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--text-secondary)]">
+              <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <span>我的多选组</span>
+            </div>
+            <span className="cc-mono text-[10px] text-[var(--muted)]">{groups.length} 组</span>
+          </div>
+
+          {/* Existing multi-groups list */}
+          <div className="space-y-1.5">
             {groups.map((g) => {
-              const active = selectedGroup?.id === g.id;
+              const isSelected = selectedGroup?.id === g.id;
+              const isSystemActive = runtime.active_group_id === g.id;
+              const activeNode = g.active_node_id ? nodeById.get(g.active_node_id) : null;
               const modeMeta = GROUP_MODES.find((m) => m.id === g.mode) ?? GROUP_MODES[0];
-              const activeNode = nodes.find((n) => n.id === g.active_node_id);
-              const filterSummary = formatDynamicFilter(g.dynamic_filter);
+              const isDirty = Boolean(dirtyGroupIds[g.id]);
+              const isConfirmingDel = confirmDeleteId === g.id;
+              const displayName = formatGroupDisplayName(g.name);
+
               return (
-                <button
+                <div
                   key={g.id}
-                  type="button"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => setSelectedId(g.id)}
-                  className={`w-full rounded-xl border p-3 text-left transition-colors ${
-                    active
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                  onKeyDown={(ev) => handleCardKeyDown(ev, () => setSelectedId(g.id))}
+                  className={`group relative cursor-pointer rounded-xl border p-2.5 transition-colors ${
+                    isSelected
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] shadow-xs"
                       : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
                   }`}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="truncate text-xs font-semibold text-[var(--text)]">
-                      {g.name}
-                    </span>
-                    <span className="shrink-0 rounded-full bg-[var(--card)] px-2 py-0.5 text-[10px] font-medium text-[var(--accent)]">
-                      {modeMeta.shortLabel}
-                    </span>
-                  </div>
-                  <div className="mt-1.5 flex items-center justify-between gap-2 text-[11px] text-[var(--muted)]">
-                    <span className="truncate cc-mono">
-                      {activeNode ? activeNode.name : "待择优"}
-                    </span>
-                    <span className="shrink-0 cc-mono">{g.member_node_ids.length} 节点</span>
-                  </div>
-                  {filterSummary && (
-                    <div className="mt-1 truncate cc-mono text-[10px] text-[var(--muted)]">
-                      {filterSummary}
+                  <div className="flex items-start justify-between gap-1.5">
+                    <div className="flex min-w-0 items-center gap-1.5">
+                      {isSystemActive && (
+                        <span
+                          className="h-2 w-2 shrink-0 rounded-full bg-[var(--green)]"
+                          title="当前系统正在使用此组"
+                        />
+                      )}
+                      <span className="truncate text-xs font-semibold text-[var(--text)]">
+                        {displayName}
+                      </span>
+                      {isDirty && (
+                        <span
+                          className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]"
+                          title="右侧策略尚未点应用"
+                        />
+                      )}
                     </div>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        </div>
 
-        {/* Agent Four-Section Guide Copy Card */}
-        {selectedGroup && (
-          <div className="cc-card cc-glass rounded-2xl p-3.5">
-            <div className="flex items-center gap-2 text-xs font-semibold text-[var(--text)]">
-              <FileCode2 className="h-4 w-4 text-[var(--accent)]" />
-              <span>AI Agent 协同配置</span>
-            </div>
-            <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
-              导出包含触发信号、AST 公式字段、CLI 热写入验收与回退清单的四段式指南，直接交付任意 AI Agent 协助调参。
-            </p>
-            <button
-              type="button"
-              onClick={() => void handleCopyAgentGuide()}
-              className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-            >
-              {copiedGuide ? (
-                <Check className="h-3.5 w-3.5 text-[var(--green)]" />
-              ) : (
-                <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
-              )}
-              <span>{copiedGuide ? "已复制四段式指南" : "复制给 AI Agent 四段式指南"}</span>
-            </button>
-          </div>
-        )}
-      </aside>
-
-      {/* Right Main Configuration & Live Ranking Workbench */}
-      {selectedGroup ? (
-        <div className="space-y-4 xl:col-span-9">
-          {/* Header Banner: Active Group Summary, Save/Delete & One-Click Next Best */}
-          <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
-            <div className="min-w-0">
-              <div className="flex flex-wrap items-center gap-2">
-                <h2 className="text-base font-semibold tracking-tight text-[var(--text)]">
-                  {selectedGroup.name}
-                </h2>
-                <span className="rounded-full bg-[var(--green-soft)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--green)]">
-                  硬门禁通过 {passingCount}/{scoredCandidates.length}
-                </span>
-                {selectedGroup.escalated_since && (
-                  <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--amber)]">
-                    已跨池借调中
-                  </span>
-                )}
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-[var(--muted)]">
-                <span>规则：</span>
-                {selectedGroup.match_rules.length > 0 ? (
-                  selectedGroup.match_rules.map((rule) => (
-                    <span
-                      key={rule}
-                      className="inline-flex items-center gap-1 rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 cc-mono text-[11px] text-[var(--text-secondary)]"
-                    >
-                      {rule}
+                    {groups.length > 1 && !isConfirmingDel && (
                       <button
                         type="button"
-                        onClick={() =>
-                          updateSelectedGroup((g) => ({
-                            ...g,
-                            match_rules: g.match_rules.filter((r) => r !== rule),
-                          }))
-                        }
-                        className="text-[var(--muted)] hover:text-[var(--red)]"
-                        aria-label={`移除规则 ${rule}`}
+                        onClick={(ev) => {
+                          ev.stopPropagation();
+                          handleRequestDeleteGroup(g.id);
+                        }}
+                        className="shrink-0 rounded-md p-0.5 text-[var(--muted)] opacity-0 transition-opacity hover:bg-[var(--red-soft)] hover:text-[var(--red)] group-hover:opacity-100 focus:opacity-100"
+                        title="删除此多选组"
+                        aria-label={`删除多选组 ${displayName}`}
                       >
-                        <X className="h-3 w-3" />
+                        <Trash2 className="h-3.5 w-3.5" />
                       </button>
+                    )}
+                  </div>
+
+                  {isConfirmingDel ? (
+                    <div
+                      className="mt-2 flex items-center justify-between gap-1.5 rounded-lg border border-[var(--red)]/40 bg-[var(--red-soft)] px-2 py-1"
+                      onClick={(ev) => ev.stopPropagation()}
+                    >
+                      <span className="text-[10px] font-medium text-[var(--red)]">确认删除？</span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          disabled={deletingGroupId === g.id}
+                          onClick={() => void handleConfirmDeleteGroup(g)}
+                          className="rounded bg-[var(--red)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50"
+                        >
+                          {deletingGroupId === g.id ? "..." : "删"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(null)}
+                          className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="mt-1.5 flex items-center justify-between gap-1.5 text-[11px]">
+                        <span className="cc-mono font-medium text-[var(--text-secondary)]">
+                          {g.member_node_ids.length} 个节点
+                        </span>
+                        <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                          {modeMeta.shortLabel}
+                        </span>
+                      </div>
+                      <div className="mt-1 truncate text-[11px] text-[var(--muted)]">
+                        {activeNode ? `正在用：${activeNode.name}` : "尚未选定节点"}
+                      </div>
+                    </>
+                  )}
+                </div>
+              );
+            })}
+
+            {groups.length === 0 && (
+              <div className="rounded-xl border border-dashed border-[var(--line)] px-3 py-5 text-center text-[11px] text-[var(--muted)]">
+                还没有多选组，点上方按钮新建一个吧
+              </div>
+            )}
+          </div>
+        </div>
+      </aside>
+
+      {/* =====================================================================
+          COLUMN 2: CENTER MAIN STAGE — Huge, Airy Node Grid & Instant Actions
+         ===================================================================== */}
+      {selectedGroup ? (
+        <section className="flex min-w-0 flex-1 flex-col gap-3">
+          {/* Compact Top Header Bar */}
+          <div className="cc-card cc-glass rounded-2xl px-4 py-3">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-3">
+                  {editingName ? (
+                    <form
+                      onSubmit={(ev) => {
+                        ev.preventDefault();
+                        void handleCommitRename();
+                      }}
+                      className="flex items-center gap-1.5"
+                    >
+                      <input
+                        type="text"
+                        autoFocus
+                        value={nameDraft}
+                        onChange={(e) => setNameDraft(e.target.value)}
+                        onBlur={() => void handleCommitRename()}
+                        onKeyDown={(e) => {
+                          if (e.key === "Escape") {
+                            setEditingName(false);
+                          }
+                        }}
+                        className="rounded-lg border border-[var(--accent)] bg-[var(--bg-elevated)] px-2.5 py-1 text-sm font-semibold text-[var(--text)] outline-none"
+                      />
+                    </form>
+                  ) : (
+                    <div className="inline-flex min-w-0 max-w-full items-center gap-2">
+                      <h1 className="truncate text-base font-semibold tracking-tight text-[var(--text)]">
+                        {selectedGroupDisplayName}
+                      </h1>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setNameDraft(selectedGroupDisplayName);
+                          setEditingName(true);
+                        }}
+                        title="点击修改多选组名称"
+                        aria-label="修改多选组名称"
+                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--accent)]"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                  )}
+
+                  {isRuntimeActiveGroup ? (
+                    <span className="inline-flex shrink-0 items-center gap-1.5 rounded-full bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--green)]">
+                      <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                      当前生效组
                     </span>
-                  ))
-                ) : (
-                  <span className="text-[11px]">作为备援池（无直接分流规则）</span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void appActions.setActiveGroup(selectedGroup.id)}
+                      className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    >
+                      设为当前组
+                    </button>
+                  )}
+                </div>
+
+                {/* Plain-language status summary */}
+                <p className="mt-1 truncate text-xs text-[var(--muted)]">
+                  {selectedGroup.member_node_ids.length > 0 ? (
+                    <>
+                      已加入{" "}
+                      <span className="cc-mono font-semibold text-[var(--text)]">
+                        {selectedGroup.member_node_ids.length}
+                      </span>{" "}
+                      个节点
+                      <span className="mx-1.5 opacity-50">·</span>
+                      正在用：
+                      <span className="font-medium text-[var(--green)]">
+                        {activeNodeInSelectedGroup ? activeNodeInSelectedGroup.name : "尚未选定"}
+                      </span>
+                    </>
+                  ) : (
+                    <span>本组还没有节点 · 直接点击下方任意节点卡片即可加入</span>
+                  )}
+                </p>
+              </div>
+
+              {/* Two prominent top-right action buttons */}
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={switchingNext}
+                  onClick={() => void handleSwitchNextBestInGroup()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:opacity-60"
+                >
+                  {switchingNext ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Zap className="h-3.5 w-3.5" />
+                  )}
+                  <span>{switchingNext ? "切换中..." : "换下一个最快"}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => setDrawerOpen((v) => !v)}
+                  className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+                    drawerOpen
+                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                      : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                  }`}
+                >
+                  <Settings2 className="h-3.5 w-3.5" />
+                  <span>{drawerOpen ? "收起策略与标准" : "策略与标准"}</span>
+                  {activeRuleCount > 0 && (
+                    <span className="cc-mono rounded-full bg-[var(--card)] px-1.5 py-0.2 text-[10px] font-semibold text-[var(--accent)]">
+                      {activeRuleCount}
+                    </span>
+                  )}
+                  {isSelectedDirty && (
+                    <span
+                      className="h-1.5 w-1.5 rounded-full bg-[var(--amber)]"
+                      title="有未应用的策略改动"
+                    />
+                  )}
+                </button>
+              </div>
+            </div>
+
+            {measuredMemberNotice && (
+              <div className="mt-2.5 flex items-center gap-2 rounded-xl border border-[var(--amber)]/35 bg-[var(--amber-soft)] px-3 py-1.5 text-[11px] text-[var(--amber)]">
+                <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                <span>{measuredMemberNotice}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Spacious Two-Row Filter, Legend & Batch Action Bar */}
+          <div className="cc-card cc-glass space-y-2.5 rounded-2xl px-4 py-3">
+            {/* Row 1: Wide Search Box + Source & Region Filter Dropdowns */}
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="relative min-w-[200px] flex-1">
+                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="搜索节点名、地区或来源..."
+                  className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={() => setSearchQuery("")}
+                    aria-label="清空搜索"
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted)] hover:text-[var(--text)]"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                )}
+              </div>
+
+              {/* Source (Subscription) dropdown */}
+              <div className="relative shrink-0">
+                <Filter className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+                <select
+                  value={selectedSubId}
+                  onChange={(e) => setSelectedSubId(e.target.value)}
+                  aria-label="按来源筛选"
+                  className="max-w-[190px] rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                >
+                  <option value="all">全部来源 ({enabledNodes.length})</option>
+                  {providerTabs.map((sub) => (
+                    <option key={sub.id} value={sub.id}>
+                      {sub.name} ({sub.count})
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Region dropdown */}
+              <div className="relative shrink-0">
+                <Globe className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+                <select
+                  value={selectedRegion}
+                  onChange={(e) => setSelectedRegion(e.target.value)}
+                  aria-label="按地区筛选"
+                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                >
+                  <option value="all">全部地区</option>
+                  {regionOptions.map((r) => (
+                    <option key={r.code} value={r.code}>
+                      {r.label} ({r.count})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            {/* Row 2: View Mode Switch + Solid Color Legend + Batch Actions */}
+            <div className="flex flex-wrap items-center justify-between gap-2.5 border-t border-[var(--line)]/60 pt-2.5">
+              <div className="flex flex-wrap items-center gap-3">
+                {/* View mode segmented switch */}
+                <div className="inline-flex rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("all")}
+                    className={`rounded-lg px-2.5 py-1 font-medium transition-colors ${
+                      viewMode === "all"
+                        ? "bg-[var(--card)] text-[var(--text)] shadow-xs"
+                        : "text-[var(--muted)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    全部节点
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setViewMode("members")}
+                    className={`rounded-lg px-2.5 py-1 font-medium transition-colors ${
+                      viewMode === "members"
+                        ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
+                        : "text-[var(--muted)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    仅看本组 ({selectedGroup.member_node_ids.length})
+                  </button>
+                </div>
+
+                {/* Clear solid / thick-bordered swatch legend */}
+                <div className="flex flex-wrap items-center gap-3 text-[11px]">
+                  <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
+                    <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--green)] shadow-xs" />
+                    <span className="font-medium">正在用</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
+                    <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--accent)] shadow-xs" />
+                    <span className="font-medium">已在本组</span>
+                  </span>
+                  <span className="inline-flex items-center gap-1.5 text-[var(--muted)]">
+                    <span className="h-3 w-3 shrink-0 rounded-[4px] border-2 border-[var(--line-strong)] bg-[var(--card)]" />
+                    <span>未加入</span>
+                  </span>
+                  <span className="cc-mono text-[11px] text-[var(--muted)]">
+                    · 匹配 {filteredNodes.length} 个
+                    {filteredNodes.length > displayedNodes.length
+                      ? `（展示 ${displayedNodes.length} 个）`
+                      : ""}
+                  </span>
+                </div>
+              </div>
+
+              {/* Batch quick actions */}
+              <div className="flex items-center gap-1.5">
+                {viewMode === "all" && unjoinedInFilterIds.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleAddFilteredToGroup}
+                    className="inline-flex items-center gap-1 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85"
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    <span>当前筛选全加入 ({unjoinedInFilterIds.length})</span>
+                  </button>
+                )}
+
+                {selectedGroup.member_node_ids.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleClearGroupMembers}
+                    className={`rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                      confirmClearMembers
+                        ? "border-[var(--red)] bg-[var(--red-soft)] text-[var(--red)]"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--red)]/50 hover:text-[var(--red)]"
+                    }`}
+                  >
+                    {confirmClearMembers ? "再点一次确认清空" : "清空本组"}
+                  </button>
                 )}
               </div>
             </div>
+          </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <form onSubmit={handleAddMatchRule} className="flex items-center gap-1">
-                <input
-                  type="text"
-                  value={newRuleInput}
-                  onChange={(e) => setNewRuleInput(e.target.value)}
-                  placeholder="DOMAIN-SUFFIX,..."
-                  className="cc-mono w-40 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-                <button
-                  type="submit"
-                  className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1.5 text-[11px] text-[var(--muted)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
-                >
-                  加规则
-                </button>
-              </form>
-              <button
-                type="button"
-                disabled={savingGroup}
-                onClick={() => void handleSaveSelectedGroup()}
-                className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-semibold transition-colors disabled:opacity-60 ${
-                  isSelectedDirty
-                    ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)]"
-                }`}
-              >
-                <Save className="h-3.5 w-3.5" />
-                <span>{savingGroup ? "保存中..." : isSelectedDirty ? "保存修改" : "已保存"}</span>
-              </button>
-              <button
-                type="button"
-                disabled={switchingNext}
-                onClick={() => void handleSwitchNextBestInGroup()}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-              >
-                <Zap className="h-3.5 w-3.5" />
-                <span>{switchingNext ? "切换中..." : "一键切至次优"}</span>
-              </button>
-              {groups.length > 1 && (
-                <button
-                  type="button"
-                  disabled={deletingGroup}
-                  onClick={() => void handleDeleteSelectedGroup()}
-                  className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--muted)] hover:border-[var(--red)] hover:text-[var(--red)] disabled:opacity-50"
-                  title="删除当前策略组"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              )}
-            </div>
-          </section>
+          {/* Responsive Node Card Grid Container (Stretches to align bottom edge with left & right columns) */}
+          <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl p-3">
+          {displayedNodes.length > 0 ? (
+            <div
+              className={`grid grid-cols-1 gap-2.5 sm:grid-cols-2 ${
+                drawerOpen ? "2xl:grid-cols-3" : "xl:grid-cols-3 2xl:grid-cols-4"
+              }`}
+            >
+              {displayedNodes.map((node) => {
+                const isActive = selectedGroup.active_node_id === node.id;
+                const isLiveActive = isActive && isRuntimeActiveGroup;
+                const isMember = memberIdSet.has(node.id);
+                const snap = probes[node.id];
+                const subName = subNameById.get(node.sub_id) ?? "订阅节点";
+                const isProbing = Boolean(probingNodeIds[node.id]);
+                const isSelecting = selectingNodeId === node.id;
+                const gateEval = assessNodeAgainstGates(node, snap, selectedGroup.hard_gates);
+                const regionCode = (node.region_code || "UNK").toUpperCase();
+                const isHighMult = node.multiplier > 1.05;
+                const isLowMult = node.multiplier < 0.95;
 
-          {/* 4 Per-Site Independent Mode Selector Cards */}
-          <section className="cc-card cc-glass rounded-2xl p-4">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="text-sm font-semibold text-[var(--text)]">
-                  按站点独立调度模式（4 选 1）
-                </h3>
-                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                  所有模式均在调度前执行硬门禁过滤，杜绝送中或失活节点混入活跃池
-                </p>
-              </div>
-              <span className="inline-flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] text-[var(--green)]">
-                <ShieldCheck className="h-3.5 w-3.5" />
-                前置硬门禁保护
-              </span>
-            </div>
+                // Distinct visual framing: Active (emerald thick border) > Member (warm-gold thick border) > Non-member (subtle gray)
+                const cardClass = isActive
+                  ? "border-2 border-[var(--green)] bg-[var(--green-soft)] shadow-sm"
+                  : isMember
+                    ? "border-2 border-[var(--accent)] bg-[var(--accent-soft)]"
+                    : "border border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)] hover:bg-[var(--card-hover)]";
 
-            <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
-              {GROUP_MODES.map((m) => {
-                const selected = selectedGroup.mode === m.id;
                 return (
-                  <button
-                    key={m.id}
-                    type="button"
-                    onClick={() => updateSelectedGroup((g) => ({ ...g, mode: m.id }))}
-                    className={`rounded-xl border p-3.5 text-left transition-colors ${
-                      selected
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                        : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                    }`}
+                  <div
+                    key={node.id}
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => handleToggleNodeMembership(node)}
+                    onKeyDown={(ev) =>
+                      handleCardKeyDown(ev, () => handleToggleNodeMembership(node))
+                    }
+                    className={`group relative flex cursor-pointer flex-col justify-between gap-2.5 rounded-xl p-3 transition-all ${cardClass}`}
                   >
-                    <div className="flex flex-wrap items-center justify-between gap-1.5">
-                      <span className="text-xs font-semibold text-[var(--text)]">{m.title}</span>
-                      <span className="inline-flex items-center gap-1 rounded-full bg-[var(--card)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                        <Filter className="h-2.5 w-2.5" />
-                        {m.badge}
-                      </span>
+                    {/* Top row: region badge + node name + membership badge */}
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <span className="cc-mono shrink-0 rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-secondary)]">
+                          {regionCode}
+                        </span>
+                        <span
+                          title={node.name}
+                          className="truncate text-xs font-semibold text-[var(--text)]"
+                        >
+                          {node.name}
+                        </span>
+                      </div>
+
+                      {isActive ? (
+                        <span className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-[var(--green)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
+                          <Star className="h-2.5 w-2.5 fill-current" />
+                          <span>正在用</span>
+                        </span>
+                      ) : isMember ? (
+                        <span className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-[var(--accent)]/50 bg-[var(--card)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
+                          <Check className="h-2.5 w-2.5" />
+                          <span>在组内</span>
+                        </span>
+                      ) : (
+                        <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)] opacity-0 transition-opacity group-hover:opacity-100 group-hover:text-[var(--accent)]">
+                          + 加入本组
+                        </span>
+                      )}
                     </div>
-                    <div className="mt-1 cc-mono text-[10px] text-[var(--accent)]">{m.id}</div>
-                    <p className="mt-1.5 text-[11px] leading-relaxed text-[var(--muted)]">
-                      {m.desc}
-                    </p>
-                  </button>
+
+                    {/* Middle row: provider + multiplier */}
+                    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                      <span
+                        title={subName}
+                        className="max-w-[140px] truncate rounded-md bg-[var(--bg-elevated)]/90 px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                      >
+                        {subName}
+                      </span>
+
+                      {isLowMult ? (
+                        <span className="cc-mono rounded-md bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                          {formatMultiplierLabel(node.multiplier)}
+                        </span>
+                      ) : isHighMult ? (
+                        <span className="cc-mono rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
+                          {formatMultiplierLabel(node.multiplier)}
+                        </span>
+                      ) : (
+                        <span className="cc-mono text-[10px] text-[var(--muted)]/80">1x</span>
+                      )}
+                    </div>
+
+                    {/* Bottom row: gentle probe status + 2 quick actions ("测" & "用它") */}
+                    <div className="flex items-center justify-between gap-2 pt-0.5">
+                      <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px]">
+                        {!snap ? (
+                          <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                            待测
+                          </span>
+                        ) : !snap.ok ? (
+                          <span
+                            title="最近一次测速未连通，可点右侧「测」重测"
+                            className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
+                          >
+                            暂不可达
+                          </span>
+                        ) : (
+                          <>
+                            {snap.latency_ms !== null && (
+                              <span
+                                className="cc-mono cc-tabular font-semibold"
+                                style={{ color: formatLatencyTone(snap.latency_ms) }}
+                              >
+                                {Math.round(snap.latency_ms)} ms
+                              </span>
+                            )}
+                            {snap.up_mbps !== null && (
+                              <span className="cc-mono cc-tabular text-[10px] text-[var(--text-secondary)]">
+                                ↑{snap.up_mbps.toFixed(1)}M
+                              </span>
+                            )}
+                            {gateEval.hasMeasuredFailure && (
+                              <span
+                                title={`实测未达标：${gateEval.failedReasons.join("、")}`}
+                                className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                              >
+                                实测未达标
+                              </span>
+                            )}
+                          </>
+                        )}
+                      </div>
+
+                      <div
+                        className="flex shrink-0 items-center gap-1"
+                        onClick={(ev) => ev.stopPropagation()}
+                      >
+                        <button
+                          type="button"
+                          disabled={isProbing || probeProgress.running}
+                          onClick={() => void handleProbeSingleNode(node)}
+                          title={
+                            probeProgress.running
+                              ? "测速任务进行中，请等待当前测速完成"
+                              : "快速测一下这个节点的延迟与解锁"
+                          }
+                          className="inline-flex items-center gap-0.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {isProbing ? (
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          ) : (
+                            <Activity className="h-3 w-3" />
+                          )}
+                          <span>测</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={isLiveActive || isSelecting}
+                          onClick={() => void handleUseNode(node)}
+                          title={
+                            isLiveActive
+                              ? "当前正在使用此节点"
+                              : isActive
+                                ? "启用此组并立即切换为当前使用节点"
+                                : isMember
+                                  ? "立即切换为当前使用节点"
+                                  : "加入本组并立即切换为当前使用节点"
+                          }
+                          className={`inline-flex items-center gap-0.5 rounded-lg px-2 py-1 text-[11px] font-semibold transition-colors ${
+                            isLiveActive
+                              ? "border border-[var(--green)]/40 bg-[var(--card)] text-[var(--green)] opacity-85"
+                              : "bg-[var(--accent)] text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50"
+                          }`}
+                        >
+                          {isSelecting ? (
+                            <Loader2 className="h-3 w-3 animate-spin" />
+                          ) : isLiveActive ? (
+                            <Check className="h-3 w-3" />
+                          ) : (
+                            <Play className="h-2.5 w-2.5 fill-current" />
+                          )}
+                          <span>{isLiveActive ? "在用" : "用它"}</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 );
               })}
             </div>
-
-            {selectedGroup.mode === "conditional_pool" && (
-              <label className="mt-3 block rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3 text-xs">
-                <span className="text-[11px] font-medium text-[var(--text-secondary)]">
-                  动态条件池入池过滤表达式（跨订阅自动匹配）
-                </span>
-                <input
-                  type="text"
-                  value={formattedDynamicFilter}
-                  onChange={(e) =>
-                    updateSelectedGroup((g) => ({
-                      ...g,
-                      dynamic_filter: buildDynamicFilterUpdate(e.target.value, g.dynamic_filter),
-                    }))
-                  }
-                  placeholder="multiplier <= 1.5 && google_clean == 1"
-                  className="cc-mono mt-1.5 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-              </label>
-            )}
-          </section>
-
-          {/* Safe AST Custom Weighting Formula Editor */}
-          <section className="cc-card cc-glass rounded-2xl p-4">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="text-sm font-semibold text-[var(--text)]">
-                  安全自定义加权公式（纯 AST 解析 · 零 eval）
-                </h3>
-                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                  编辑后立即校验语法并试算候选排名，支持按探针 ID 与站点解锁精确引用实测指标
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5">
+          ) : (
+            <div className="flex flex-1 flex-col items-center justify-center px-6 py-12 text-center">
+              <p className="text-xs font-medium text-[var(--text-secondary)]">
+                {viewMode === "members"
+                  ? "当前多选组里还没有节点"
+                  : enabledNodes.length === 0
+                    ? "节点库里还没有节点，请先去「节点与订阅」导入订阅"
+                    : "没有找到符合当前筛选条件的节点"}
+              </p>
+              {viewMode === "members" && enabledNodes.length > 0 && (
                 <button
                   type="button"
-                  onClick={() =>
-                    updateSelectedGroup((g) => ({ ...g, formula_expr: FORMULA_COST_EFFECTIVE }))
-                  }
-                  className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors ${
-                    selectedGroup.formula_expr.trim() === FORMULA_COST_EFFECTIVE
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
-                  }`}
+                  onClick={() => setViewMode("all")}
+                  className="mt-3 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
                 >
-                  <Sparkles className="h-3 w-3" />
-                  低倍率性价比优先
+                  切到「全部节点」挑选加入
                 </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    updateSelectedGroup((g) => ({ ...g, formula_expr: FORMULA_MAX_PERF }))
-                  }
-                  className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors ${
-                    selectedGroup.formula_expr.trim() === FORMULA_MAX_PERF
-                      ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
-                  }`}
-                >
-                  <Zap className="h-3 w-3" />
-                  纯性能最快
-                </button>
-              </div>
-            </div>
-
-            <textarea
-              rows={3}
-              value={selectedGroup.formula_expr}
-              onChange={(e) =>
-                updateSelectedGroup((g) => ({ ...g, formula_expr: e.target.value }))
-              }
-              spellCheck={false}
-              className="cc-mono cc-selectable w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3 text-xs leading-relaxed text-[var(--text)] outline-none focus:border-[var(--accent)]"
-            />
-
-            <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px]">
-              {formulaSyntaxCheck.ok ? (
-                <span className="inline-flex items-center gap-1.5 text-[var(--green)]">
-                  <CheckCircle2 className="h-3.5 w-3.5" />
-                  {formulaSyntaxCheck.source === "backend" ? "后端 AST 校验通过" : "AST 语法校验通过"} · 已实时计算{" "}
-                  {scoredCandidates.length} 个候选节点得分
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-1.5 text-[var(--red)]">
-                  <AlertTriangle className="h-3.5 w-3.5" />
-                  公式语法提示：{formulaSyntaxCheck.error}
-                </span>
               )}
+              {viewMode === "all" && (searchQuery || selectedSubId !== "all" || selectedRegion !== "all") && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSearchQuery("");
+                    setSelectedSubId("all");
+                    setSelectedRegion("all");
+                  }}
+                  className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                >
+                  重置全部筛选
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* On-demand pagination footer for 430+ node lists */}
+          {filteredNodes.length > visibleCount && (
+            <div className="mt-3 flex items-center justify-center gap-2 pt-1">
               <button
                 type="button"
-                onClick={() =>
-                  updateSelectedGroup((g) => ({ ...g, formula_expr: FORMULA_COST_EFFECTIVE }))
-                }
-                className="inline-flex items-center gap-1 text-[var(--muted)] hover:text-[var(--text)]"
+                onClick={() => setVisibleCount((c) => c + NODE_PAGE_SIZE)}
+                className="rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-4 py-2 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
               >
-                <RotateCcw className="h-3 w-3" />
-                重置默认
+                加载更多节点（还有 {filteredNodes.length - visibleCount} 个）
+              </button>
+              <button
+                type="button"
+                onClick={() => setVisibleCount(filteredNodes.length)}
+                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--text)]"
+              >
+                全部展开
+              </button>
+            </div>
+          )}
+          </div>
+        </section>
+      ) : (
+        <section className="cc-card cc-glass flex flex-1 items-center justify-center rounded-2xl p-10 text-center text-xs text-[var(--muted)]">
+          暂无多选组，请点击左侧「+ 新建多选组」创建首个分组。
+        </section>
+      )}
+
+      {/* =====================================================================
+          COLUMN 3: RIGHT COLLAPSIBLE STRATEGY DRAWER (Collapsed strip / 332px)
+         ===================================================================== */}
+      {selectedGroup && !drawerOpen && (
+        <aside className="hidden lg:flex lg:shrink-0 lg:flex-col">
+          <button
+            type="button"
+            onClick={() => setDrawerOpen(true)}
+            title="点击展开右侧策略与标准设置"
+            className="cc-card cc-glass flex w-[44px] flex-1 flex-col items-center justify-start gap-3 rounded-2xl py-4 text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+          >
+            <span className="flex flex-col items-center gap-3 lg:sticky lg:top-4">
+              <Settings2 className="h-4 w-4 text-[var(--accent)]" />
+              <span
+                className="text-xs font-medium tracking-widest"
+                style={{ writingMode: "vertical-rl" }}
+              >
+                点击展开策略与标准
+              </span>
+              {activeRuleCount > 0 && (
+                <span className="cc-mono flex h-5 w-5 items-center justify-center rounded-full bg-[var(--accent-soft)] text-[10px] font-semibold text-[var(--accent)]">
+                  {activeRuleCount}
+                </span>
+              )}
+            </span>
+          </button>
+        </aside>
+      )}
+
+      {selectedGroup && drawerOpen && (
+        <aside className="flex w-full shrink-0 flex-col lg:w-[332px]">
+          <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl">
+            {/* Drawer Header */}
+            <div className="flex items-center justify-between gap-2 border-b border-[var(--line)] px-4 py-3">
+              <div className="flex items-center gap-2">
+                <Settings2 className="h-4 w-4 text-[var(--accent)]" />
+                <div>
+                  <h2 className="text-xs font-semibold text-[var(--text)]">策略与标准</h2>
+                  <p className="text-[10px] text-[var(--muted)]">
+                    针对「{selectedGroupDisplayName}」的选点规则
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDrawerOpen(false)}
+                className="rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
+                title="收起策略面板"
+                aria-label="收起策略面板"
+              >
+                <X className="h-4 w-4" />
               </button>
             </div>
 
-            {/* Variables & Per-Probe Addressing Hints */}
-            <div className="mt-3 space-y-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3">
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] font-medium text-[var(--muted)]">可用变量：</span>
-                {FORMULA_VARIABLES.map((v) => (
-                  <button
-                    key={v.token}
-                    type="button"
-                    onClick={() => handleInsertFormulaToken(v.token)}
-                    title={`点击追加 ${v.label}`}
-                    className="rounded-md border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 cc-mono text-[11px] text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                  >
-                    {v.token}
-                  </button>
-                ))}
-              </div>
-              <div className="flex flex-wrap items-center gap-1.5">
-                <span className="text-[11px] font-medium text-[var(--muted)]">按探针 / 站点寻址：</span>
-                {PROBE_ADDRESS_SNIPPETS.map((p) => (
-                  <button
-                    key={p.token}
-                    type="button"
-                    onClick={() => handleInsertFormulaToken(p.token)}
-                    title={p.desc}
-                    className="rounded-md border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 cc-mono text-[11px] text-[var(--accent)] transition-colors hover:border-[var(--accent)]"
-                  >
-                    {p.token}
-                  </button>
-                ))}
-              </div>
-            </div>
-          </section>
-
-          {/* Hard Gates & Threshold Trigger Parameters */}
-          <section className="cc-card cc-glass rounded-2xl p-4">
-            <div className="mb-3 flex items-center gap-2">
-              <SlidersHorizontal className="h-4 w-4 text-[var(--accent)]" />
-              <h3 className="text-sm font-semibold text-[var(--text)]">硬门禁与阈值触发</h3>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-              {/* Hard Gates */}
-              <div className="space-y-2.5">
-                <div className="text-xs font-medium text-[var(--text-secondary)]">
-                  硬门禁条件（任一不满足即剔除候选）
+            <div className="flex-1 space-y-5 p-4">
+              {/* 1. 选点模式 */}
+              <div className="space-y-2">
+                <div className="text-xs font-semibold text-[var(--text)]">1. 选点模式</div>
+                <div className="space-y-1.5">
+                  {GROUP_MODES.map((m) => {
+                    const active = selectedGroup.mode === m.id;
+                    return (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => updateSelectedGroup((g) => ({ ...g, mode: m.id }))}
+                        className={`w-full rounded-xl border px-3 py-2.5 text-left transition-colors ${
+                          active
+                            ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                            : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-semibold text-[var(--text)]">
+                            {m.title}
+                          </span>
+                          {active && <Check className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />}
+                        </div>
+                        <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
+                          {m.desc}
+                        </p>
+                      </button>
+                    );
+                  })}
                 </div>
+
+                {selectedGroup.mode === "conditional_pool" && (
+                  <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-[11px]">
+                    <span className="text-[var(--text-secondary)]">
+                      {formattedDynamicFilter
+                        ? "已配置自动吸纳筛选条件，订阅更新时自动生效"
+                        : "订阅更新后将按条件自动吸纳达标节点"}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setAdvancedOpen(true)}
+                      className="shrink-0 rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-[10px] font-medium text-[var(--accent)] hover:border-[var(--accent)]"
+                    >
+                      去高级设置编辑
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* 2. 必须满足的要求（门槛） */}
+              <div className="space-y-2 border-t border-[var(--line)]/70 pt-4">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold text-[var(--text)]">
+                    2. 必须满足的要求（门槛）
+                  </div>
+                  {selectedGroup.hard_gates.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => updateSelectedGroup((g) => ({ ...g, hard_gates: [] }))}
+                      className="text-[10px] text-[var(--muted)] hover:text-[var(--accent)]"
+                    >
+                      全部取消
+                    </button>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
+                  勾选后，自动选点时只优先挑满足下面条件的节点；
+                  <span className="font-medium text-[var(--text-secondary)]">
+                    还没测过速的节点标「待测」，不会直接判淘汰
+                  </span>
+                  。
+                </div>
+
                 <div className="flex flex-wrap gap-1.5">
                   {HARD_GATE_PRESETS.map((preset) => {
                     const enabled = selectedGroup.hard_gates.includes(preset.expr);
@@ -1735,141 +2936,168 @@ export function MultiGroupPage() {
                         key={preset.expr}
                         type="button"
                         onClick={() => handleToggleGate(preset.expr)}
-                        title={preset.desc}
-                        className={`inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                        className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
                           enabled
-                            ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
-                            : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+                            ? "border-[var(--green)]/60 bg-[var(--green-soft)] text-[var(--green)]"
+                            : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
                         }`}
                       >
-                        <Lock className="h-3 w-3" />
+                        {enabled ? (
+                          <ShieldCheck className="h-3 w-3 shrink-0" />
+                        ) : (
+                          <Plus className="h-3 w-3 shrink-0 opacity-60" />
+                        )}
                         <span>{preset.label}</span>
                       </button>
                     );
                   })}
                 </div>
 
-                {/* Active gate expressions list + add custom */}
-                <div className="flex flex-wrap gap-1.5">
-                  {selectedGroup.hard_gates.map((expr) => (
-                    <span
-                      key={expr}
-                      className="inline-flex items-center gap-1 rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 cc-mono text-[11px] text-[var(--text-secondary)]"
-                    >
-                      {expr}
-                      <button
-                        type="button"
-                        onClick={() => handleToggleGate(expr)}
-                        className="text-[var(--muted)] hover:text-[var(--red)]"
-                        aria-label={`移除门禁 ${expr}`}
+                {customHardGates.length > 0 && (
+                  <div className="flex flex-wrap gap-1 pt-1">
+                    {customHardGates.map((expr) => (
+                      <span
+                        key={expr}
+                        className="cc-mono inline-flex items-center gap-1 rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]"
                       >
-                        <Trash2 className="h-3 w-3" />
-                      </button>
-                    </span>
-                  ))}
-                </div>
-
-                <form onSubmit={handleAddCustomGate} className="flex gap-1.5">
-                  <input
-                    type="text"
-                    value={customGateInput}
-                    onChange={(e) => setCustomGateInput(e.target.value)}
-                    placeholder='自定义门禁（如 site_unlocked("chatgpt") == 1）'
-                    className="cc-mono flex-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  />
-                  <button
-                    type="submit"
-                    className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
-                  >
-                    添加
-                  </button>
-                </form>
+                        {expr}
+                        <button
+                          type="button"
+                          onClick={() => handleToggleGate(expr)}
+                          aria-label={`移除条件 ${expr}`}
+                          className="text-[var(--muted)] hover:text-[var(--red)]"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
 
-              {/* Threshold Trigger & Anti-Flapping Parameters */}
-              <div className="space-y-2.5">
-                <label className="block">
-                  <span className="text-xs font-medium text-[var(--text-secondary)]">
-                    劣化触发表达式（满足条件时重新评优切换）
-                  </span>
-                  <input
-                    type="text"
-                    value={currentTriggerExpr}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      updateSelectedGroup((g) => {
-                        const rest = Array.isArray(g.trigger_rules) ? g.trigger_rules.slice(1) : [];
-                        return {
-                          ...g,
-                          trigger_expr: val.trim() ? val : null,
-                          trigger_rules: val.trim()
-                            ? [
-                                {
-                                  expr: val,
-                                  consecutive_failures: currentTriggerMeta.consecutiveFailures,
-                                  bypass_cooldown_on_disconnect:
-                                    currentTriggerMeta.bypassCooldownOnDisconnect,
-                                },
-                                ...rest,
-                              ]
-                            : rest,
-                        };
-                      });
-                    }}
-                    placeholder='probe_up("antigravity") < 2.0 || latency_ms > 1500'
-                    className="cc-mono mt-1.5 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  />
-                </label>
+              {/* 3. 什么时候自动换节点 */}
+              <div className="space-y-2.5 border-t border-[var(--line)]/70 pt-4">
+                <div className="text-xs font-semibold text-[var(--text)]">
+                  3. 什么时候自动换节点
+                </div>
 
-                <div className="grid grid-cols-3 gap-2">
+                {/* Upload speed threshold switch + inline number */}
+                <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-medium text-[var(--text-secondary)]">
+                      上行速度太慢时自动切
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleToggleUploadTrigger}
+                      className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold transition-colors ${
+                        uploadTriggerInfo.enabled
+                          ? "bg-[var(--green-soft)] text-[var(--green)]"
+                          : "bg-[var(--card)] text-[var(--muted)]"
+                      }`}
+                    >
+                      {uploadTriggerInfo.enabled ? "已开启" : "未开启"}
+                    </button>
+                  </div>
+
+                  {uploadTriggerInfo.enabled && (
+                    <div className="mt-2 space-y-1">
+                      <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[var(--text-secondary)]">
+                        <span>上行低于</span>
+                        <input
+                          type="number"
+                          step="0.5"
+                          min="0.1"
+                          max="500"
+                          value={uploadTriggerInfo.threshold}
+                          onChange={(e) => handleUploadThresholdChange(e.target.value)}
+                          className="cc-mono w-16 rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-center text-xs font-semibold text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                        />
+                        <span>Mbps 自动切换</span>
+                      </div>
+                      <div className="text-[10px] text-[var(--muted)]">
+                        约{" "}
+                        {uploadTriggerInfo.threshold / 8 >= 1
+                          ? (uploadTriggerInfo.threshold / 8).toFixed(1)
+                          : (uploadTriggerInfo.threshold / 8).toFixed(2)}{" "}
+                        MB/s（8 Mbps ≈ 1 MB/s）
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
                   <label className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2">
-                    <span className="block text-[10px] text-[var(--muted)]">连续失败次数</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={10}
-                      value={currentTriggerMeta.consecutiveFailures}
-                      onChange={(e) =>
-                        updateTriggerMeta({
-                          consecutiveFailures: Math.max(1, Number(e.target.value) || 1),
-                        })
-                      }
-                      className="cc-mono mt-1 w-full bg-transparent text-sm font-semibold text-[var(--text)] outline-none"
-                    />
+                    <span className="block text-[10px] text-[var(--muted)]">连续失败几次换</span>
+                    <div className="mt-1 flex items-baseline gap-1">
+                      <input
+                        type="number"
+                        min={1}
+                        max={10}
+                        value={currentTriggerMeta.consecutiveFailures}
+                        onChange={(e) =>
+                          updateTriggerMeta({
+                            consecutiveFailures: Math.max(1, Number(e.target.value) || 1),
+                          })
+                        }
+                        className="cc-mono w-full bg-transparent text-sm font-semibold text-[var(--text)] outline-none"
+                      />
+                      <span className="text-[10px] text-[var(--muted)]">次</span>
+                    </div>
                   </label>
+
                   <label className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2">
-                    <span className="block text-[10px] text-[var(--muted)]">冷却时间 (秒)</span>
-                    <input
-                      type="number"
-                      min={10}
-                      max={600}
-                      value={selectedGroup.cooldown_sec}
-                      onChange={(e) =>
-                        updateSelectedGroup((g) => ({
-                          ...g,
-                          cooldown_sec: Math.max(10, Number(e.target.value) || 60),
-                        }))
-                      }
-                      className="cc-mono mt-1 w-full bg-transparent text-sm font-semibold text-[var(--text)] outline-none"
-                    />
-                  </label>
-                  <label className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2">
-                    <span className="block text-[10px] text-[var(--muted)]">滞回幅度 (%)</span>
-                    <input
-                      type="number"
-                      min={0}
-                      max={100}
-                      value={selectedGroup.hysteresis_pct}
-                      onChange={(e) =>
-                        updateSelectedGroup((g) => ({
-                          ...g,
-                          hysteresis_pct: Math.max(0, Math.min(100, Number(e.target.value) || 0)),
-                        }))
-                      }
-                      className="cc-mono mt-1 w-full bg-transparent text-sm font-semibold text-[var(--text)] outline-none"
-                    />
+                    <span className="block text-[10px] text-[var(--muted)]">换完冷静多久</span>
+                    <div className="mt-1 flex items-baseline gap-1">
+                      <input
+                        type="number"
+                        min={10}
+                        max={600}
+                        value={selectedGroup.cooldown_sec}
+                        onChange={(e) =>
+                          updateSelectedGroup((g) => ({
+                            ...g,
+                            cooldown_sec: Math.max(10, Number(e.target.value) || 60),
+                          }))
+                        }
+                        className="cc-mono w-full bg-transparent text-sm font-semibold text-[var(--text)] outline-none"
+                      />
+                      <span className="text-[10px] text-[var(--muted)]">秒</span>
+                    </div>
                   </label>
                 </div>
+
+                <button
+                  type="button"
+                  onClick={() =>
+                    updateSelectedGroup((g) => ({
+                      ...g,
+                      switch_mode:
+                        g.switch_mode === "force_close_old"
+                          ? "graceful_new_only"
+                          : "force_close_old",
+                    }))
+                  }
+                  className="flex w-full items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-left text-[11px] hover:border-[var(--line-strong)]"
+                >
+                  <div>
+                    <div className="font-medium text-[var(--text-secondary)]">
+                      切节点时立即断开旧连接
+                    </div>
+                    <div className="text-[10px] text-[var(--muted)]">
+                      AI 聊天推荐开启，防止卡死在旧线路
+                    </div>
+                  </div>
+                  <span
+                    className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
+                      selectedGroup.switch_mode === "force_close_old"
+                        ? "bg-[var(--green-soft)] text-[var(--green)]"
+                        : "bg-[var(--card)] text-[var(--muted)]"
+                    }`}
+                  >
+                    {selectedGroup.switch_mode === "force_close_old" ? "开启" : "温和"}
+                  </span>
+                </button>
 
                 <button
                   type="button"
@@ -1878,351 +3106,450 @@ export function MultiGroupPage() {
                       bypassCooldownOnDisconnect: !currentTriggerMeta.bypassCooldownOnDisconnect,
                     })
                   }
-                  className="flex w-full items-center justify-between rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs hover:border-[var(--line-strong)]"
+                  className="flex w-full items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-left text-[11px] hover:border-[var(--line-strong)]"
                 >
-                  <span className="text-[var(--text-secondary)]">
-                    节点彻底断连时跳过冷却立即切换
-                  </span>
+                  <span className="text-[var(--text-secondary)]">彻底断连时跳过冷却立刻换</span>
                   <span
-                    className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                    className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
                       currentTriggerMeta.bypassCooldownOnDisconnect
                         ? "bg-[var(--green-soft)] text-[var(--green)]"
                         : "bg-[var(--card)] text-[var(--muted)]"
                     }`}
                   >
-                    {currentTriggerMeta.bypassCooldownOnDisconnect ? "已开启" : "已关闭"}
+                    {currentTriggerMeta.bypassCooldownOnDisconnect ? "开启" : "关闭"}
                   </span>
                 </button>
               </div>
-            </div>
-          </section>
 
-          {/* 3-Way Fallback Policy + Per-Group Switch Mode */}
-          <section className="grid grid-cols-1 gap-4 lg:grid-cols-12">
-            {/* Fallback Policy 3-in-1 */}
-            <div className="cc-card cc-glass rounded-2xl p-4 lg:col-span-7">
-              <div className="mb-3 flex items-center justify-between gap-2">
-                <div>
-                  <h3 className="text-sm font-semibold text-[var(--text)]">
-                    全员低于门槛兜底策略（3 选 1）
-                  </h3>
-                  <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                    当组内所有节点同时低于设定门槛或未通过硬门禁时的自动处置
-                  </p>
-                </div>
-                <ShieldAlert className="h-4 w-4 text-[var(--amber)]" />
-              </div>
-
-              <div className="space-y-2">
-                {FALLBACK_POLICIES.map((pol) => {
-                  const selected = selectedGroup.fallback_policy === pol.id;
-                  const toneVar =
-                    pol.tone === "red"
-                      ? "var(--red)"
-                      : pol.tone === "amber"
-                        ? "var(--amber)"
-                        : "var(--accent)";
-                  return (
-                    <button
-                      key={pol.id}
-                      type="button"
-                      onClick={() =>
-                        updateSelectedGroup((g) => ({
-                          ...g,
-                          fallback_policy: pol.id,
-                          fallback_pool_id:
-                            pol.id === "cross_pool_escalate"
-                              ? g.fallback_pool_id ?? otherGroups[0]?.id ?? null
-                              : g.fallback_pool_id,
-                        }))
-                      }
-                      className={`w-full rounded-xl border p-3 text-left transition-colors ${
-                        selected
-                          ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                          : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                      }`}
-                    >
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-xs font-semibold text-[var(--text)]">
-                          {pol.title}
-                        </span>
-                        <span
-                          className="rounded-full bg-[var(--card)] px-2 py-0.5 text-[10px] font-medium"
-                          style={{ color: toneVar }}
-                        >
-                          {pol.badge}
-                        </span>
-                      </div>
-                      <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
-                        {pol.desc}
-                      </p>
-                    </button>
-                  );
-                })}
-              </div>
-
-              {/* Extra controls when cross_pool_escalate is active */}
-              {selectedGroup.fallback_policy === "cross_pool_escalate" && (
-                <div className="mt-3 grid grid-cols-1 gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3 text-xs sm:grid-cols-2">
-                  <label>
-                    <span className="text-[11px] text-[var(--muted)]">目标备援池</span>
-                    <select
-                      value={selectedGroup.fallback_pool_id ?? ""}
-                      onChange={(e) =>
-                        updateSelectedGroup((g) => ({
-                          ...g,
-                          fallback_pool_id: e.target.value || null,
-                        }))
-                      }
-                      className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                    >
-                      <option value="">选择备援策略组</option>
-                      {otherGroups.map((og) => (
-                        <option key={og.id} value={og.id}>
-                          {og.name}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label>
-                    <span className="text-[11px] text-[var(--muted)]">
-                      主池自动回切探测间隔 (秒)
-                    </span>
-                    <input
-                      type="number"
-                      min={30}
-                      max={1800}
-                      value={selectedGroup.recover_probe_interval_sec}
-                      onChange={(e) =>
-                        updateSelectedGroup((g) => ({
-                          ...g,
-                          recover_probe_interval_sec: Math.max(30, Number(e.target.value) || 120),
-                        }))
-                      }
-                      className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                    />
-                  </label>
-                </div>
-              )}
-            </div>
-
-            {/* Per-Group Switch Mode (force_close_old vs graceful_new_only) */}
-            <div className="cc-card cc-glass flex flex-col justify-between rounded-2xl p-4 lg:col-span-5">
-              <div>
-                <div className="mb-3 flex items-center justify-between gap-2">
-                  <div>
-                    <h3 className="text-sm font-semibold text-[var(--text)]">
-                      本组旧连接切换模式
-                    </h3>
-                    <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                      按策略组独立生效，互不干扰其他分流组连接
-                    </p>
-                  </div>
-                  <ArrowRightLeft className="h-4 w-4 text-[var(--accent)]" />
-                </div>
-
-                <div className="space-y-2.5">
-                  {(
-                    [
-                      {
-                        id: "force_close_old",
-                        title: "强力踢断旧连接",
-                        tag: "AI 专线推荐",
-                        desc: "切节点后立刻通过核心 API 关闭本组旧节点存量 TCP/HTTP2 僵尸连接，消除长请求卡死。",
-                      },
-                      {
-                        id: "graceful_new_only",
-                        title: "温和切换（仅新连接）",
-                        tag: "流媒体 / 下载推荐",
-                        desc: "保留正在传输的旧连接直至自然结束，仅将后续新建连接路由至切换后的优选节点。",
-                      },
-                    ] as ReadonlyArray<{
-                      id: SwitchMode;
-                      title: string;
-                      tag: string;
-                      desc: string;
-                    }>
-                  ).map((mode) => {
-                    const active = selectedGroup.switch_mode === mode.id;
+              {/* 4. 全部不达标怎么办 */}
+              <div className="space-y-2 border-t border-[var(--line)]/70 pt-4">
+                <div className="text-xs font-semibold text-[var(--text)]">4. 全部不达标怎么办</div>
+                <div className="space-y-1.5">
+                  {FALLBACK_POLICIES.map((pol) => {
+                    const selected = selectedGroup.fallback_policy === pol.id;
                     return (
                       <button
-                        key={mode.id}
+                        key={pol.id}
                         type="button"
                         onClick={() =>
-                          updateSelectedGroup((g) => ({ ...g, switch_mode: mode.id }))
+                          updateSelectedGroup((g) => ({
+                            ...g,
+                            fallback_policy: pol.id,
+                            fallback_pool_id:
+                              pol.id === "cross_pool_escalate"
+                                ? g.fallback_pool_id ?? otherGroups[0]?.id ?? null
+                                : g.fallback_pool_id,
+                          }))
                         }
-                        className={`w-full rounded-xl border p-3 text-left transition-colors ${
-                          active
+                        className={`w-full rounded-xl border px-3 py-2 text-left transition-colors ${
+                          selected
                             ? "border-[var(--accent)] bg-[var(--accent-soft)]"
                             : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
                         }`}
                       >
                         <div className="flex items-center justify-between gap-2">
                           <span className="text-xs font-semibold text-[var(--text)]">
-                            {mode.title}
+                            {pol.title}
                           </span>
-                          <span className="rounded-full bg-[var(--card)] px-2 py-0.5 text-[10px] font-medium text-[var(--accent)]">
-                            {mode.tag}
-                          </span>
+                          {selected && (
+                            <Check className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                          )}
                         </div>
-                        <div className="mt-1 cc-mono text-[10px] text-[var(--muted)]">
-                          {mode.id}
-                        </div>
-                        <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
-                          {mode.desc}
+                        <p className="mt-0.5 text-[10px] leading-relaxed text-[var(--muted)]">
+                          {pol.desc}
                         </p>
                       </button>
                     );
                   })}
                 </div>
-              </div>
 
-              <div className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] text-[var(--muted)]">
-                当前策略：
-                <span className="cc-mono ml-1 font-medium text-[var(--text)]">
-                  {selectedGroup.switch_mode === "force_close_old"
-                    ? "仅精准清理本组旧连接（不影响其他组）"
-                    : "零中断平滑过渡"}
-                </span>
-              </div>
-            </div>
-          </section>
-
-          {/* Real-Time Candidate Scoring Queue */}
-          <section className="cc-card cc-glass rounded-2xl p-4">
-            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <div>
-                <h3 className="text-sm font-semibold text-[var(--text)]">候选节点实时评分队列</h3>
-                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                  实时结合最新探针快照与当前 AST 公式动态排序，点击任意达标节点可立即切换
-                </p>
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                {passingCount === 0 && (
-                  <span className="inline-flex items-center gap-1 rounded-full bg-[var(--red-soft)] px-2.5 py-1 text-[11px] font-medium text-[var(--red)]">
-                    <AlertTriangle className="h-3.5 w-3.5" />
-                    当前无节点通过硬门禁 · 将触发「
-                    {FALLBACK_POLICIES.find((p) => p.id === selectedGroup.fallback_policy)?.title}」
-                  </span>
+                {selectedGroup.fallback_policy === "cross_pool_escalate" && (
+                  <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5 text-xs">
+                    <label className="block">
+                      <span className="text-[11px] text-[var(--muted)]">选择备用组</span>
+                      <select
+                        value={selectedGroup.fallback_pool_id ?? ""}
+                        onChange={(e) =>
+                          updateSelectedGroup((g) => ({
+                            ...g,
+                            fallback_pool_id: e.target.value || null,
+                          }))
+                        }
+                        className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                      >
+                        <option value="">请选择一个备用多选组</option>
+                        {otherGroups.map((og) => (
+                          <option key={og.id} value={og.id}>
+                            {formatGroupDisplayName(og.name)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="text-[11px] text-[var(--muted)]">
+                        每隔多久探测主组恢复（秒）
+                      </span>
+                      <input
+                        type="number"
+                        min={30}
+                        max={1800}
+                        value={selectedGroup.recover_probe_interval_sec}
+                        onChange={(e) =>
+                          updateSelectedGroup((g) => ({
+                            ...g,
+                            recover_probe_interval_sec: Math.max(
+                              30,
+                              Number(e.target.value) || 120
+                            ),
+                          }))
+                        }
+                        className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                      />
+                    </label>
+                  </div>
                 )}
+              </div>
+
+              {/* 5. 适用网站 */}
+              <div className="space-y-2 border-t border-[var(--line)]/70 pt-4">
+                <div className="text-xs font-semibold text-[var(--text)]">
+                  5. 适用网站（哪些网站走这个组）
+                </div>
+
+                <div className="flex flex-wrap gap-1.5">
+                  {selectedGroup.match_rules.length > 0 ? (
+                    selectedGroup.match_rules.map((rule) => {
+                      const chip = formatMatchRuleChip(rule);
+                      return (
+                        <span
+                          key={rule}
+                          title={rule}
+                          className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text-secondary)]"
+                        >
+                          {chip.tag && (
+                            <span className="rounded bg-[var(--card)] px-1 text-[9px] text-[var(--muted)]">
+                              {chip.tag}
+                            </span>
+                          )}
+                          <span className="cc-mono">{chip.display}</span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              updateSelectedGroup((g) => ({
+                                ...g,
+                                match_rules: g.match_rules.filter((r) => r !== rule),
+                              }))
+                            }
+                            aria-label={`移除网站 ${chip.display}`}
+                            className="text-[var(--muted)] hover:text-[var(--red)]"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      );
+                    })
+                  ) : (
+                    <span className="text-[11px] text-[var(--muted)]">
+                      暂未限定网站（可作手动主力组或备用组）
+                    </span>
+                  )}
+                </div>
+
+                <form onSubmit={handleAddMatchRule} className="flex gap-1.5">
+                  <input
+                    type="text"
+                    value={newRuleInput}
+                    onChange={(e) => setNewRuleInput(e.target.value)}
+                    placeholder="输入域名，如 openai.com"
+                    className="min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  />
+                  <button
+                    type="submit"
+                    className="shrink-0 rounded-lg border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                  >
+                    添加
+                  </button>
+                </form>
+                <div className="text-[10px] text-[var(--muted)]">
+                  直接填域名会自动匹配子域名；输入完整规则（含逗号）也会原样保留。
+                </div>
+              </div>
+
+              {/* 6. 高级设置（默认折叠：自定义 AST 公式、后端校验与 AI 协同） */}
+              <div className="border-t border-[var(--line)]/70 pt-3">
                 <button
                   type="button"
-                  disabled={evaluating}
-                  onClick={() => void handleEvaluateBackend()}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                  onClick={() => setAdvancedOpen((v) => !v)}
+                  className="flex w-full items-center justify-between rounded-xl px-1 py-1.5 text-left text-xs font-medium text-[var(--muted)] transition-colors hover:text-[var(--text)]"
                 >
-                  <RefreshCw className={`h-3.5 w-3.5 ${evaluating ? "animate-spin" : ""}`} />
-                  <span>{evaluating ? "评估中..." : "后端权威评估"}</span>
-                </button>
-              </div>
-            </div>
-
-            {evalReport && (
-              <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] text-[var(--text-secondary)]">
-                <span className="cc-mono">
-                  后端评估结论：候选池 {evalReport.pool_size} · 门禁通过 {evalReport.gate_passed.length} · 健康候选{" "}
-                  {evalReport.healthy_candidates.length} · 淘汰 {evalReport.gate_rejected.length}
-                </span>
-                {evalReport.all_below_threshold && (
-                  <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--amber)]">
-                    全员低于门槛
+                  <span className="inline-flex items-center gap-1.5">
+                    {advancedOpen ? (
+                      <ChevronDown className="h-3.5 w-3.5 text-[var(--accent)]" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )}
+                    <span>高级：自定义评分公式与 AI 协同</span>
                   </span>
-                )}
-              </div>
-            )}
+                </button>
 
-            <div className="space-y-2">
-              {scoredCandidates.map((item, idx) => {
-                const isActive = selectedGroup.active_node_id === item.node.id;
-                const barWidth = Math.max(4, Math.min(100, (item.score / maxScore) * 100));
-                return (
-                  <div
-                    key={item.node.id}
-                    className={`rounded-xl border px-3.5 py-2.5 transition-colors ${
-                      isActive
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                        : "border-[var(--line)] bg-[var(--bg-elevated)]"
-                    }`}
-                  >
-                    <div className="flex flex-wrap items-center justify-between gap-3">
-                      <div className="flex min-w-0 items-center gap-2.5">
-                        <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-[var(--card)] cc-mono text-[11px] font-semibold text-[var(--accent)]">
-                          #{idx + 1}
+                {advancedOpen && (
+                  <div className="mt-2.5 space-y-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3">
+                    {/* Formula presets */}
+                    <div className="space-y-1.5">
+                      <div className="flex flex-wrap items-center justify-between gap-1.5">
+                        <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
+                          节点评分公式（安全 AST 解析）
                         </span>
-                        <div className="min-w-0">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="truncate text-xs font-semibold text-[var(--text)]">
-                              {item.node.name}
-                            </span>
-                            {isActive && (
-                              <span className="rounded-full bg-[var(--accent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
-                                当前活跃
-                              </span>
-                            )}
-                            {item.passedAllGates ? (
-                              <span className="rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                                门禁通过
-                              </span>
-                            ) : (
-                              <span className="rounded-full bg-[var(--red-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--red)]">
-                                淘汰：{item.failedGates.join(" / ")}
-                              </span>
-                            )}
-                          </div>
-                          <div className="mt-1 flex flex-wrap items-center gap-3 cc-mono text-[11px] text-[var(--muted)]">
-                            <span>{item.node.region_code}</span>
-                            <span>{item.node.multiplier.toFixed(1)}x</span>
-                            <span>↑ {item.snap?.up_mbps?.toFixed(1) ?? "--"} Mbps</span>
-                            <span>↓ {item.snap?.down_mbps?.toFixed(1) ?? "--"} Mbps</span>
-                            <span>{item.snap?.latency_ms ?? "--"} ms</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-3">
-                        <div className="w-28 text-right">
-                          <div className="cc-mono cc-tabular text-sm font-semibold text-[var(--text)]">
-                            {item.score.toFixed(1)}
-                          </div>
-                          <div className="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                            <div
-                              className="h-full rounded-full"
-                              style={{
-                                width: `${barWidth}%`,
-                                backgroundColor: item.passedAllGates
-                                  ? "var(--accent)"
-                                  : "var(--muted)",
-                              }}
-                            />
-                          </div>
-                        </div>
-
                         <button
                           type="button"
-                          disabled={isActive}
-                          onClick={() => void handleManualSelectNode(item.node)}
-                          className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                          onClick={() =>
+                            updateSelectedGroup((g) => ({
+                              ...g,
+                              formula_expr: FORMULA_COST_EFFECTIVE,
+                            }))
+                          }
+                          className="inline-flex items-center gap-1 text-[10px] text-[var(--muted)] hover:text-[var(--text)]"
                         >
-                          {isActive ? "使用中" : "切换"}
+                          <RotateCcw className="h-3 w-3" />
+                          <span>重置</span>
                         </button>
                       </div>
+
+                      <div className="flex flex-wrap gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateSelectedGroup((g) => ({
+                              ...g,
+                              formula_expr: FORMULA_COST_EFFECTIVE,
+                            }))
+                          }
+                          className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-medium ${
+                            selectedGroup.formula_expr.trim() === FORMULA_COST_EFFECTIVE
+                              ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                              : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)]"
+                          }`}
+                        >
+                          <Sparkles className="h-3 w-3" />
+                          <span>低倍率性价比</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateSelectedGroup((g) => ({ ...g, formula_expr: FORMULA_MAX_PERF }))
+                          }
+                          className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-medium ${
+                            selectedGroup.formula_expr.trim() === FORMULA_MAX_PERF
+                              ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                              : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)]"
+                          }`}
+                        >
+                          <Zap className="h-3 w-3" />
+                          <span>纯性能最快</span>
+                        </button>
+                      </div>
+
+                      <textarea
+                        rows={3}
+                        value={selectedGroup.formula_expr}
+                        onChange={(e) =>
+                          updateSelectedGroup((g) => ({ ...g, formula_expr: e.target.value }))
+                        }
+                        spellCheck={false}
+                        className="cc-mono cc-selectable w-full rounded-lg border border-[var(--line)] bg-[var(--card)] p-2 text-[11px] leading-relaxed text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                      />
+
+                      <div className="text-[10px]">
+                        {formulaSyntaxCheck.ok ? (
+                          <span className="inline-flex items-center gap-1 text-[var(--green)]">
+                            <CheckCircle2 className="h-3 w-3 shrink-0" />
+                            <span>
+                              {formulaSyntaxCheck.source === "backend"
+                                ? "后端公式校验通过"
+                                : "公式语法校验通过"}
+                            </span>
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[var(--red)]">
+                            <AlertTriangle className="h-3 w-3 shrink-0" />
+                            <span>{formulaSyntaxCheck.error}</span>
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Quick insert variable & probe snippets */}
+                      <div className="flex flex-wrap gap-1 pt-1">
+                        {FORMULA_VARIABLES.map((v) => (
+                          <button
+                            key={v.token}
+                            type="button"
+                            onClick={() => handleInsertFormulaToken(v.token)}
+                            title={`点击插入 ${v.label}`}
+                            className="cc-mono rounded border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                          >
+                            {v.token}
+                          </button>
+                        ))}
+                        {PROBE_ADDRESS_SNIPPETS.map((p) => (
+                          <button
+                            key={p.token}
+                            type="button"
+                            onClick={() => handleInsertFormulaToken(p.token)}
+                            title={p.desc}
+                            className="cc-mono rounded border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--accent)] hover:border-[var(--accent)]"
+                          >
+                            {p.token}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    {/* Advanced trigger expr, dynamic filter, hysteresis & custom gate */}
+                    <div className="space-y-2 border-t border-[var(--line)]/70 pt-2.5">
+                      {selectedGroup.mode === "conditional_pool" && (
+                        <label className="block">
+                          <span className="text-[10px] text-[var(--muted)]">
+                            自动吸纳筛选条件（留空则不限）
+                          </span>
+                          <input
+                            type="text"
+                            value={formattedDynamicFilter}
+                            onChange={(e) =>
+                              updateSelectedGroup((g) => ({
+                                ...g,
+                                dynamic_filter: buildDynamicFilterUpdate(
+                                  e.target.value,
+                                  g.dynamic_filter
+                                ),
+                              }))
+                            }
+                            placeholder="例如：限制倍率上限或要求谷歌地区正常"
+                            className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                          />
+                        </label>
+                      )}
+
+                      <label className="block">
+                        <span className="text-[10px] text-[var(--muted)]">
+                          自定义切换触发表达式
+                        </span>
+                        <input
+                          type="text"
+                          value={currentTriggerExpr}
+                          onChange={(e) => setPrimaryTriggerExpr(e.target.value)}
+                          placeholder="留空或输入自定义触发规则"
+                          className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                        />
+                      </label>
+
+                      <label className="block">
+                        <span className="text-[10px] text-[var(--muted)]">
+                          防抖动滞回幅度 (%)
+                        </span>
+                        <input
+                          type="number"
+                          min={0}
+                          max={100}
+                          value={selectedGroup.hysteresis_pct}
+                          onChange={(e) =>
+                            updateSelectedGroup((g) => ({
+                              ...g,
+                              hysteresis_pct: Math.max(
+                                0,
+                                Math.min(100, Number(e.target.value) || 0)
+                              ),
+                            }))
+                          }
+                          className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                        />
+                      </label>
+
+                      <form onSubmit={handleAddCustomGate} className="flex gap-1">
+                        <input
+                          type="text"
+                          value={customGateInput}
+                          onChange={(e) => setCustomGateInput(e.target.value)}
+                          placeholder="添加自定义门槛表达式..."
+                          className="cc-mono min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[10px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                        />
+                        <button
+                          type="submit"
+                          className="shrink-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[10px] text-[var(--text-secondary)] hover:border-[var(--accent)]"
+                        >
+                          加门槛
+                        </button>
+                      </form>
+                    </div>
+
+                    {/* Backend evaluation & AI assistant collaboration guide */}
+                    <div className="space-y-2 border-t border-[var(--line)]/70 pt-2.5">
+                      <button
+                        type="button"
+                        disabled={evaluating}
+                        onClick={() => void handleEvaluateBackend()}
+                        className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                      >
+                        <RefreshCw className={`h-3 w-3 ${evaluating ? "animate-spin" : ""}`} />
+                        <span>{evaluating ? "后端评估中..." : "运行后端权威评估"}</span>
+                      </button>
+
+                      {evalReport && (
+                        <div className="space-y-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-2 text-[10px] text-[var(--text-secondary)]">
+                          <div className="cc-mono">
+                            候选 {evalReport.pool_size} · 过门槛 {evalReport.gate_passed.length} ·
+                            健康 {evalReport.healthy_candidates.length}
+                          </div>
+                          {evalUntestedCount > 0 && (
+                            <div className="text-[var(--amber)]">
+                              其中 {evalUntestedCount} 个尚未测速（先测速再按门槛筛）
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={() => void handleCopyAgentGuide()}
+                        className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                      >
+                        {copiedGuide ? (
+                          <Check className="h-3.5 w-3.5 text-[var(--green)]" />
+                        ) : (
+                          <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
+                        )}
+                        <FileCode2 className="h-3 w-3 opacity-70" />
+                        <span>{copiedGuide ? "已复制 AI 协同指南" : "复制 AI 助手协同指南"}</span>
+                      </button>
                     </div>
                   </div>
-                );
-              })}
-
-              {scoredCandidates.length === 0 && (
-                <div className="rounded-xl border border-dashed border-[var(--line)] py-6 text-center text-xs text-[var(--muted)]">
-                  暂无候选节点，请先在「节点与订阅」页面导入节点。
-                </div>
-              )}
+                )}
+              </div>
             </div>
-          </section>
-        </div>
-      ) : (
-        <div className="cc-card cc-glass rounded-2xl p-8 text-center text-xs text-[var(--muted)] xl:col-span-9">
-          暂无智能多选组，请点击左侧「新建组」创建首个策略组。
-        </div>
+
+            {/* Sticky Bottom Apply Strategy Bar */}
+            <div className="sticky bottom-0 border-t border-[var(--line)] bg-[var(--card)]/95 px-4 py-3 backdrop-blur-xs rounded-b-2xl">
+              <button
+                type="button"
+                disabled={savingGroup || !formulaSyntaxCheck.ok}
+                onClick={() => void handleSaveSelectedGroup()}
+                className={`inline-flex w-full items-center justify-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-opacity disabled:opacity-50 ${
+                  isSelectedDirty
+                    ? "bg-[var(--accent)] text-[var(--accent-ink)] shadow-xs hover:opacity-90"
+                    : "border border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                }`}
+              >
+                <Save className="h-3.5 w-3.5" />
+                <span>
+                  {savingGroup
+                    ? "正在应用..."
+                    : isSelectedDirty
+                      ? "应用策略（有未保存改动）"
+                      : "应用策略"}
+                </span>
+              </button>
+            </div>
+          </div>
+        </aside>
       )}
     </div>
   );

@@ -177,7 +177,7 @@ pub enum TrayOpenDirKind {
 pub struct TrayNodeCandidate {
     pub node_id: String,
     pub label: String,
-    /// Last probed upload speed in hundredths of MB/s (e.g., `268` => `↑2.68 MB/s`).
+    /// Last probed upload speed in hundredths of Mbps (e.g., `268` => `↑2.68 Mbps`).
     /// Uses cached probe telemetry rather than live 1s traffic jitter to prevent menu churn.
     pub up_mbps_x100: Option<u32>,
     pub ping_ms: Option<u32>,
@@ -566,7 +566,7 @@ fn format_candidate_label(c: &TrayNodeCandidate) -> String {
         (Some(up_x100), _) => {
             let whole = up_x100 / 100;
             let frac = up_x100 % 100;
-            format!("{}  (↑{whole}.{frac:02} MB/s)", c.label)
+            format!("{}  (↑{whole}.{frac:02} Mbps)", c.label)
         }
         (None, Some(ms)) => format!("{}  ({ms} ms)", c.label),
         (None, None) => c.label.clone(),
@@ -668,13 +668,13 @@ pub fn build_tray_menu<R: Runtime>(
         None::<&str>,
     )?;
 
-    // Multi-group quick-switch submenu (with ⚡ next-best + ↑ MB/s telemetry)
+    // Multi-group quick-switch submenu (with ⚡ next-best + ↑ Mbps telemetry)
     let group_submenu = if let Some(ref primary) = state.primary_group {
         let title = if primary.active_node_label.trim().is_empty() {
-            format!("多选组快切 ({})", primary.group_name)
+            format!("路线分组快切 ({})", primary.group_name)
         } else {
             format!(
-                "多选组快切 ({}: {})",
+                "路线分组快切 ({}: {})",
                 primary.group_name, primary.active_node_label
             )
         };
@@ -693,7 +693,7 @@ pub fn build_tray_menu<R: Runtime>(
         }
         sub
     } else {
-        let sub = Submenu::new(app, "多选组快切", true)?;
+        let sub = Submenu::new(app, "路线分组快切", true)?;
         let quick = MenuItem::with_id(
             app,
             format!("{}default", menu_id::QUICK_SWITCH_NEXT_BEST_PREFIX),
@@ -701,7 +701,7 @@ pub fn build_tray_menu<R: Runtime>(
             true,
             None::<&str>,
         )?;
-        let empty = MenuItem::new(app, "暂未配置多选组", false, None::<&str>)?;
+        let empty = MenuItem::new(app, "暂未配置路线分组", false, None::<&str>)?;
         sub.append(&quick)?;
         sub.append(&PredefinedMenuItem::separator(app)?)?;
         sub.append(&empty)?;
@@ -711,16 +711,16 @@ pub fn build_tray_menu<R: Runtime>(
     // Domestic Pre-Acceleration submenu
     let preaccel_title = match (&state.preaccel.enabled, &state.preaccel.active_label) {
         (true, Some(label)) if !label.trim().is_empty() => {
-            format!("国内预加速 (开 · {})", label.trim())
+            format!("国内加速入口 (已开启 · {})", label.trim())
         }
-        (true, _) => "国内预加速 (已开启)".to_string(),
-        (false, _) => "国内预加速 (已关闭)".to_string(),
+        (true, _) => "国内加速入口 (已开启)".to_string(),
+        (false, _) => "国内加速入口 (已关闭)".to_string(),
     };
     let preaccel_submenu = Submenu::new(app, preaccel_title, true)?;
     let preaccel_toggle = CheckMenuItem::with_id(
         app,
         menu_id::PREACCEL_TOGGLE,
-        "启用国内预加速",
+        "启用国内加速入口",
         true,
         state.preaccel.enabled,
         None::<&str>,
@@ -728,7 +728,7 @@ pub fn build_tray_menu<R: Runtime>(
     let preaccel_failover = MenuItem::with_id(
         app,
         menu_id::PREACCEL_FAILOVER_NEXT,
-        "⚡ 切换备援中继",
+        "⚡ 切换备用加速入口",
         state.preaccel.relays.len() > 1,
         None::<&str>,
     )?;
@@ -736,7 +736,7 @@ pub fn build_tray_menu<R: Runtime>(
     preaccel_submenu.append(&preaccel_failover)?;
     preaccel_submenu.append(&PredefinedMenuItem::separator(app)?)?;
     if state.preaccel.relays.is_empty() {
-        let empty = MenuItem::new(app, "暂未配置国内预加速节点", false, None::<&str>)?;
+        let empty = MenuItem::new(app, "暂未配置国内加速入口", false, None::<&str>)?;
         preaccel_submenu.append(&empty)?;
     } else {
         for relay in &state.preaccel.relays {
@@ -754,8 +754,8 @@ pub fn build_tray_menu<R: Runtime>(
 
     // Merged Subscription Pool submenu
     let subs_title = match &state.subscriptions.total_remaining_label {
-        Some(total) if !total.trim().is_empty() => format!("订阅混池 ({})", total.trim()),
-        _ => "订阅混池".to_string(),
+        Some(total) if !total.trim().is_empty() => format!("节点订阅 ({})", total.trim()),
+        _ => "节点订阅".to_string(),
     };
     let subs_submenu = Submenu::new(app, subs_title, true)?;
     let subs_refresh = MenuItem::with_id(
@@ -1241,6 +1241,6 @@ mod tests {
             ping_ms: Some(42),
             selected: true,
         };
-        assert_eq!(format_candidate_label(&cand), "节点 01  (↑2.68 MB/s)");
+        assert_eq!(format_candidate_label(&cand), "节点 01  (↑2.68 Mbps)");
     }
 }

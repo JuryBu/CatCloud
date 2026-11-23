@@ -201,6 +201,12 @@ function detectNavFromHash(): NavRouteId {
   return VALID_ROUTES.has(raw) ? raw : "overview";
 }
 
+function hasExplicitRouteHash(): boolean {
+  if (typeof window === "undefined") return false;
+  const raw = window.location.hash.replace(/^#\/?/, "").toLowerCase();
+  return raw.length > 0 && (raw === "capsule" || VALID_ROUTES.has(raw as NavRouteId));
+}
+
 function loadCachedUiPrefs(): Partial<AppConfig["personalization"]> {
   if (typeof window === "undefined") return {};
   try {
@@ -236,10 +242,72 @@ function sanitizeCssUrl(raw: string): string {
   return raw.replace(/["\\\n\r]/g, "");
 }
 
+export const BUILTIN_WALLPAPER_PRESETS: ReadonlyArray<{
+  id: string;
+  label: string;
+  cssBackground: string;
+  previewStyle: string;
+}> = [
+  {
+    id: "preset:sunset-cloud",
+    label: "晚霞猫云",
+    cssBackground:
+      "radial-gradient(circle at 18% 20%, rgba(242, 165, 114, 0.55), transparent 52%), radial-gradient(circle at 82% 28%, rgba(132, 179, 232, 0.5), transparent 56%), linear-gradient(135deg, #2b2338 0%, #5c3e4f 45%, #c77d5c 100%)",
+    previewStyle:
+      "linear-gradient(135deg, #2b2338 0%, #5c3e4f 45%, #c77d5c 100%)",
+  },
+  {
+    id: "preset:warm-paper",
+    label: "晨光暖雾",
+    cssBackground:
+      "radial-gradient(circle at 22% 18%, rgba(236, 189, 128, 0.55), transparent 55%), radial-gradient(circle at 80% 78%, rgba(164, 191, 159, 0.45), transparent 55%), linear-gradient(135deg, #f8f1e4 0%, #eadac2 55%, #dfcbb0 100%)",
+    previewStyle:
+      "linear-gradient(135deg, #f8f1e4 0%, #eadac2 55%, #dfcbb0 100%)",
+  },
+  {
+    id: "preset:moss-gold",
+    label: "深苔流金",
+    cssBackground:
+      "radial-gradient(circle at 20% 25%, rgba(223, 183, 130, 0.35), transparent 50%), radial-gradient(circle at 78% 72%, rgba(130, 175, 145, 0.3), transparent 55%), linear-gradient(135deg, #121716 0%, #1d2624 52%, #2c251c 100%)",
+    previewStyle:
+      "linear-gradient(135deg, #121716 0%, #1d2624 52%, #2c251c 100%)",
+  },
+  {
+    id: "preset:midnight-star",
+    label: "午夜星海",
+    cssBackground:
+      "radial-gradient(circle at 24% 22%, rgba(96, 165, 250, 0.4), transparent 48%), radial-gradient(circle at 80% 76%, rgba(223, 183, 130, 0.28), transparent 52%), linear-gradient(135deg, #0b1224 0%, #162447 55%, #1e315c 100%)",
+    previewStyle:
+      "linear-gradient(135deg, #0b1224 0%, #162447 55%, #1e315c 100%)",
+  },
+];
+
+const SAFE_BITMAP_DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif|bmp);base64,/i;
+
+let resolvedWallpaperCache: { rawPath: string; cssValue: string } | null = null;
+
+function resolveImmediateWallpaperCss(rawPath: string | null | undefined): string | null {
+  const trimmed = rawPath?.trim() ?? "";
+  if (!trimmed) return null;
+  const preset = BUILTIN_WALLPAPER_PRESETS.find((item) => item.id === trimmed);
+  if (preset) return preset.cssBackground;
+  if (
+    /^https?:\/\//i.test(trimmed) ||
+    SAFE_BITMAP_DATA_URL_RE.test(trimmed)
+  ) {
+    return `url("${sanitizeCssUrl(trimmed)}")`;
+  }
+  if (resolvedWallpaperCache && resolvedWallpaperCache.rawPath === trimmed) {
+    return resolvedWallpaperCache.cssValue;
+  }
+  return null;
+}
+
 function applyPersonalizationToDom(
   resolvedTheme: ResolvedTheme,
   p: AppConfig["personalization"],
-  windowMode: WindowMode
+  windowMode: WindowMode,
+  explicitCssValue?: string | null
 ): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
@@ -251,14 +319,14 @@ function applyPersonalizationToDom(
     root.removeAttribute("data-window");
   }
 
-  const hasWallpaper = Boolean(p.wallpaper_path && p.wallpaper_path.trim().length > 0);
-  if (hasWallpaper && p.wallpaper_path) {
-    const safeUrl = sanitizeCssUrl(p.wallpaper_path.trim());
+  const rawPath = p.wallpaper_path?.trim() ?? "";
+  const cssBg = explicitCssValue ?? resolveImmediateWallpaperCss(rawPath);
+  if (rawPath && cssBg) {
     const opacity = Math.max(0.05, Math.min(0.65, p.wallpaper_opacity));
     const blurPx = Math.max(0, Math.min(24, Math.round(p.glass_blur_px)));
     root.setAttribute("data-wallpaper", "on");
     root.setAttribute("data-glass", blurPx > 0 ? "on" : "off");
-    root.style.setProperty("--wallpaper-image", `url("${safeUrl}")`);
+    root.style.setProperty("--wallpaper-image", cssBg);
     root.style.setProperty("--wallpaper-opacity", String(opacity));
     root.style.setProperty("--surface-alpha", blurPx > 0 ? "0.82" : "0.90");
     root.style.setProperty("--card-alpha", blurPx > 0 ? "0.78" : "0.88");
@@ -274,22 +342,103 @@ function applyPersonalizationToDom(
   }
 }
 
+async function ensureLocalWallpaperLoaded(
+  rawPath: string | null | undefined,
+  resolvedTheme: ResolvedTheme,
+  p: AppConfig["personalization"],
+  windowMode: WindowMode
+): Promise<void> {
+  const trimmed = rawPath?.trim() ?? "";
+  if (!trimmed) {
+    setState((prev) => (prev.wallpaperError === null ? prev : { ...prev, wallpaperError: null }));
+    return;
+  }
+  if (/^data:/i.test(trimmed) && !SAFE_BITMAP_DATA_URL_RE.test(trimmed)) {
+    applyPersonalizationToDom(resolvedTheme, { ...p, wallpaper_path: null }, windowMode, null);
+    setState((prev) => ({
+      ...prev,
+      wallpaperPreviewUrl: null,
+      wallpaperError: "不支持此图片格式，请选择 PNG、JPG、WebP、GIF 或 BMP 图片",
+    }));
+    return;
+  }
+  if (resolveImmediateWallpaperCss(trimmed)) {
+    setState((prev) => {
+      const nextPreview = SAFE_BITMAP_DATA_URL_RE.test(trimmed) ? trimmed : prev.wallpaperPreviewUrl;
+      if (prev.wallpaperError === null && prev.wallpaperPreviewUrl === nextPreview) {
+        return prev;
+      }
+      return {
+        ...prev,
+        wallpaperPreviewUrl: nextPreview,
+        wallpaperError: null,
+      };
+    });
+    return;
+  }
+  setState((prev) => (prev.wallpaperError === null ? prev : { ...prev, wallpaperError: null }));
+  try {
+    const dataUrl = await catcloudApi.resolveWallpaperDataUrl(trimmed);
+    if ((state.config.personalization.wallpaper_path?.trim() ?? "") !== trimmed) {
+      return;
+    }
+    if (!dataUrl || !SAFE_BITMAP_DATA_URL_RE.test(dataUrl)) {
+      applyPersonalizationToDom(resolvedTheme, { ...p, wallpaper_path: null }, windowMode, null);
+      setState((prev) => ({
+        ...prev,
+        wallpaperPreviewUrl: null,
+        wallpaperError: "本地壁纸加载失败：原图片可能已移动、删除或格式不受支持，可重新选择或恢复纯色背景",
+      }));
+      return;
+    }
+    const cssVal = `url("${sanitizeCssUrl(dataUrl)}")`;
+    resolvedWallpaperCache = { rawPath: trimmed, cssValue: cssVal };
+    applyPersonalizationToDom(resolvedTheme, p, windowMode, cssVal);
+    setState((prev) => ({ ...prev, wallpaperPreviewUrl: dataUrl, wallpaperError: null }));
+  } catch (err) {
+    if ((state.config.personalization.wallpaper_path?.trim() ?? "") !== trimmed) {
+      return;
+    }
+    const detail = formatErrorMessage(err);
+    applyPersonalizationToDom(resolvedTheme, { ...p, wallpaper_path: null }, windowMode, null);
+    setState((prev) => ({
+      ...prev,
+      wallpaperPreviewUrl: null,
+      wallpaperError: detail
+        ? `本地壁纸加载失败（${detail}），可重新选择图片或恢复纯色背景`
+        : "本地壁纸加载失败：无法读取图片文件，可重新选择或恢复纯色背景",
+    }));
+  }
+}
+
 /* ============================================================================
  * Reactive External Store (Zero extra dependencies, React 19 useSyncExternalStore)
  * ============================================================================ */
+
+export interface ProbeRunProgressState {
+  running: boolean;
+  completed: number;
+  total: number;
+  currentNodeName: string | null;
+  cancelled: boolean;
+}
 
 export interface AppState {
   initialized: boolean;
   isTauri: boolean;
   windowMode: WindowMode;
   activeNav: NavRouteId;
+  settingsTabHint: "system" | "appearance" | "dns" | "core" | "updates" | null;
   config: AppConfig;
   resolvedTheme: ResolvedTheme;
+  wallpaperPreviewUrl: string | null;
+  wallpaperError: string | null;
   mascotState: MascotState;
   runtime: CoreRuntimeInfo;
   groups: MultiGroup[];
   nodes: ProxyNode[];
   probes: Record<string, ProbeSnapshot>;
+  probeProgress: ProbeRunProgressState;
   subscriptions: SubscriptionRecord[];
   preAccelRelays: PreAccelRelay[];
   exitIp: ExitIpInfo;
@@ -426,7 +575,7 @@ const initialExitIp: ExitIpInfo = runningInTauri
   : {
       ip_masked: "203.0.113.***",
       ip_raw: "203.0.113.10",
-      isp: "Example Transit Network",
+      isp: "东京示例线路",
       location: "Tokyo, JP",
       timezone: "Asia/Tokyo (UTC+9)",
       google_clean: true,
@@ -438,13 +587,23 @@ let state: AppState = {
   isTauri: runningInTauri,
   windowMode: initialWindowMode,
   activeNav: detectNavFromHash(),
+  settingsTabHint: null,
   config: initialConfig,
   resolvedTheme: initialResolvedTheme,
+  wallpaperPreviewUrl: null,
+  wallpaperError: null,
   mascotState: "idle",
   runtime: initialRuntime,
   groups: [],
   nodes: [],
   probes: {},
+  probeProgress: {
+    running: false,
+    completed: 0,
+    total: 0,
+    currentNodeName: null,
+    cancelled: false,
+  },
   subscriptions: [],
   preAccelRelays: [],
   exitIp: initialExitIp,
@@ -490,8 +649,12 @@ function pushToast(text: string, tone: ToastNotice["tone"] = "info"): void {
 }
 
 let bootStarted = false;
+let startupPageApplied = false;
+let userNavigatedManually = false;
+let personalizationReqSeq = 0;
 let disposeTraffic: (() => void) | null = null;
 let disposeRuntime: (() => void) | null = null;
+let disposeProbeProgress: (() => void) | null = null;
 let themeClockTimer: number | null = null;
 
 function syncResolvedThemeFromClock(): void {
@@ -526,6 +689,9 @@ function handleVisibilityChange(): void {
 }
 
 async function hydrateFromBackend(): Promise<void> {
+  const inDesktop = isTauriEnv();
+  // Never fire outbound network requests (exit IP / site checks) on startup in desktop mode
+  // so launching the app consumes 0 B of unexpected traffic until the user explicitly requests a check.
   const results = await Promise.allSettled([
     catcloudApi.getConfig(),
     catcloudApi.getRuntimeInfo(),
@@ -534,8 +700,9 @@ async function hydrateFromBackend(): Promise<void> {
     catcloudApi.listProbeSnapshots(),
     catcloudApi.listSubscriptions(),
     catcloudApi.listPreAccelRelays(),
-    catcloudApi.getExitIpInfo(),
-    catcloudApi.checkQuickSites(),
+    catcloudApi.getFullConfig(),
+    inDesktop ? Promise.resolve(null) : catcloudApi.getExitIpInfo(),
+    inDesktop ? Promise.resolve(null) : catcloudApi.checkQuickSites(),
   ]);
 
   const [
@@ -546,12 +713,13 @@ async function hydrateFromBackend(): Promise<void> {
     probesRes,
     subsRes,
     relaysRes,
+    fullCfgRes,
     exitIpRes,
     quickSitesRes,
   ] = results;
 
   const cfg = cfgRes.status === "fulfilled" ? cfgRes.value : state.config;
-  const mergedConfig: AppConfig = isTauriEnv()
+  const mergedConfig: AppConfig = inDesktop
     ? cfg
     : {
         ...cfg,
@@ -566,10 +734,55 @@ async function hydrateFromBackend(): Promise<void> {
     mergedConfig.personalization.theme_schedule
   );
   applyPersonalizationToDom(resolved, mergedConfig.personalization, state.windowMode);
+  void ensureLocalWallpaperLoaded(
+    mergedConfig.personalization.wallpaper_path,
+    resolved,
+    mergedConfig.personalization,
+    state.windowMode
+  );
+
+  let hydratedSites: SiteCheckItem[] = state.quickSites;
+  if (!inDesktop && quickSitesRes.status === "fulfilled" && Array.isArray(quickSitesRes.value)) {
+    hydratedSites = quickSitesRes.value;
+  } else if (
+    inDesktop &&
+    fullCfgRes.status === "fulfilled" &&
+    fullCfgRes.value &&
+    Array.isArray(fullCfgRes.value.core_runtime?.quick_check_sites)
+  ) {
+    const existingById = new Map(state.quickSites.map((s) => [s.id, s]));
+    hydratedSites = fullCfgRes.value.core_runtime.quick_check_sites.map((s) => {
+      const prev = existingById.get(s.id);
+      return {
+        id: s.id,
+        name: s.name,
+        url: s.url,
+        latency_ms: prev?.latency_ms ?? null,
+        ok: prev?.ok ?? null,
+      };
+    });
+  }
+
+  let startupNav: NavRouteId | null = null;
+  if (
+    !startupPageApplied &&
+    !userNavigatedManually &&
+    state.windowMode === "main" &&
+    !hasExplicitRouteHash() &&
+    fullCfgRes.status === "fulfilled" &&
+    fullCfgRes.value
+  ) {
+    const rawStartup = fullCfgRes.value.behavior?.startup_page?.trim().toLowerCase();
+    if (rawStartup && VALID_ROUTES.has(rawStartup as NavRouteId)) {
+      startupNav = rawStartup as NavRouteId;
+    }
+  }
+  startupPageApplied = true;
 
   setState((prev) => ({
     ...prev,
     initialized: true,
+    activeNav: startupNav ?? prev.activeNav,
     config: mergedConfig,
     resolvedTheme: resolved,
     runtime: runtimeRes.status === "fulfilled" ? runtimeRes.value : prev.runtime,
@@ -578,8 +791,11 @@ async function hydrateFromBackend(): Promise<void> {
     probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
     subscriptions: subsRes.status === "fulfilled" ? subsRes.value : prev.subscriptions,
     preAccelRelays: relaysRes.status === "fulfilled" ? relaysRes.value : prev.preAccelRelays,
-    exitIp: exitIpRes.status === "fulfilled" ? exitIpRes.value : prev.exitIp,
-    quickSites: quickSitesRes.status === "fulfilled" ? quickSitesRes.value : prev.quickSites,
+    exitIp:
+      !inDesktop && exitIpRes.status === "fulfilled" && exitIpRes.value
+        ? exitIpRes.value
+        : prev.exitIp,
+    quickSites: hydratedSites,
   }));
 }
 
@@ -643,14 +859,28 @@ export const appStore = {
     });
 
     disposeRuntime = catcloudApi.subscribeRuntimeUpdate((info) => {
-      const becameRunning = !state.runtime.running && info.running;
       setState((prev) => ({ ...prev, runtime: info }));
-      if (becameRunning) {
-        void catcloudApi
-          .getExitIpInfo()
-          .then((exitIp) => setState((prev) => ({ ...prev, exitIp })))
-          .catch(() => {});
-      }
+    });
+
+    disposeProbeProgress = catcloudApi.subscribeProbeProgress((ev) => {
+      setState((prev) => {
+        const nextProbes =
+          ev.node_id && ev.snapshot
+            ? { ...prev.probes, [ev.node_id]: ev.snapshot }
+            : prev.probes;
+        return {
+          ...prev,
+          probes: nextProbes,
+          mascotState: ev.done ? "idle" : "searching",
+          probeProgress: {
+            running: !ev.done,
+            completed: ev.completed,
+            total: ev.total,
+            currentNodeName: ev.done ? null : ev.node_name,
+            cancelled: ev.cancelled,
+          },
+        };
+      });
     });
 
     void hydrateFromBackend().catch((err) => {
@@ -666,6 +896,8 @@ export const appStore = {
     disposeTraffic = null;
     disposeRuntime?.();
     disposeRuntime = null;
+    disposeProbeProgress?.();
+    disposeProbeProgress = null;
     if (typeof window !== "undefined") {
       window.removeEventListener("hashchange", handleHashChange);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
@@ -683,11 +915,14 @@ export const appStore = {
       mascotResetTimer = null;
     }
     bootStarted = false;
+    startupPageApplied = false;
+    userNavigatedManually = false;
   },
 };
 
 export const appActions = {
   setNav(nav: NavRouteId): void {
+    userNavigatedManually = true;
     if (typeof window !== "undefined" && state.windowMode === "main") {
       const targetHash = `#${nav}`;
       if (window.location.hash !== targetHash) {
@@ -695,6 +930,15 @@ export const appActions = {
       }
     }
     setState((prev) => (prev.activeNav === nav ? prev : { ...prev, activeNav: nav }));
+  },
+
+  openSettingsTab(tab: "system" | "appearance" | "dns" | "core" | "updates"): void {
+    setState((prev) => ({ ...prev, settingsTabHint: tab }));
+    appActions.setNav("settings");
+  },
+
+  consumeSettingsTabHint(): void {
+    setState((prev) => (prev.settingsTabHint === null ? prev : { ...prev, settingsTabHint: null }));
   },
 
   setMascotState(next: MascotState): void {
@@ -746,10 +990,32 @@ export const appActions = {
     await hydrateFromBackend();
   },
 
+  previewPersonalization(patch: Partial<AppConfig["personalization"]>): void {
+    personalizationReqSeq += 1;
+    const nextConfig: AppConfig = {
+      ...state.config,
+      personalization: {
+        ...state.config.personalization,
+        ...patch,
+      },
+    };
+    const resolved = resolveThemeBySchedule(
+      nextConfig.personalization.theme_mode,
+      nextConfig.personalization.theme_schedule
+    );
+    applyPersonalizationToDom(resolved, nextConfig.personalization, state.windowMode);
+    setState((prev) => ({
+      ...prev,
+      config: nextConfig,
+      resolvedTheme: resolved,
+    }));
+  },
+
   async updatePersonalization(
     patch: Partial<AppConfig["personalization"]>,
     notice?: string
   ): Promise<void> {
+    const reqSeq = ++personalizationReqSeq;
     const prevConfig = state.config;
     const prevResolved = state.resolvedTheme;
     const nextConfig: AppConfig = {
@@ -772,9 +1038,21 @@ export const appActions = {
     }));
     try {
       const saved = await catcloudApi.saveConfig(nextConfig);
-      setState((prev) => ({ ...prev, config: saved }));
+      if (reqSeq !== personalizationReqSeq) {
+        return;
+      }
+      const savedResolved = resolveThemeBySchedule(
+        saved.personalization.theme_mode,
+        saved.personalization.theme_schedule
+      );
+      saveCachedUiPrefs(saved.personalization);
+      applyPersonalizationToDom(savedResolved, saved.personalization, state.windowMode);
+      setState((prev) => ({ ...prev, config: saved, resolvedTheme: savedResolved }));
       if (notice) pushToast(notice, "info");
     } catch (err) {
+      if (reqSeq !== personalizationReqSeq) {
+        return;
+      }
       applyPersonalizationToDom(prevResolved, prevConfig.personalization, state.windowMode);
       setState((prev) => ({ ...prev, config: prevConfig, resolvedTheme: prevResolved }));
       pushToast(`个性化配置保存失败：${formatErrorMessage(err)}`, "warn");
@@ -782,16 +1060,134 @@ export const appActions = {
   },
 
   cycleThemeMode(): void {
-    const order: ThemeMode[] = ["auto_time", "light", "warm_dark", "midnight_blue"];
+    const manualOrder: ThemeMode[] = ["light", "warm_dark", "midnight_blue"];
     const labels: Record<ThemeMode, string> = {
-      auto_time: "自动三段昼夜主题（按北京时间）",
-      light: "清爽暖纸浅色",
+      auto_time: "按时间自动切换",
+      light: "浅色暖纸",
       warm_dark: "深苔暖金",
       midnight_blue: "午夜星蓝",
     };
-    const current = state.config.personalization.theme_mode;
-    const next = order[(order.indexOf(current) + 1) % order.length];
+    // Jump directly to a visibly different theme so the very first click always gives instant feedback
+    const currentVisual: ThemeMode =
+      state.resolvedTheme === "light"
+        ? "light"
+        : state.resolvedTheme === "warm-dark"
+          ? "warm_dark"
+          : "midnight_blue";
+    const next = manualOrder[(manualOrder.indexOf(currentVisual) + 1) % manualOrder.length];
     void appActions.updatePersonalization({ theme_mode: next }, `已切换主题：${labels[next]}`);
+  },
+
+  async setThemeMode(mode: ThemeMode): Promise<void> {
+    const labels: Record<ThemeMode, string> = {
+      auto_time: "按时间自动切换",
+      light: "浅色暖纸",
+      warm_dark: "深苔暖金",
+      midnight_blue: "午夜星蓝",
+    };
+    await appActions.updatePersonalization({ theme_mode: mode }, `已切换主题：${labels[mode]}`);
+  },
+
+  async pickWallpaperImage(): Promise<boolean> {
+    try {
+      const picked = await catcloudApi.pickWallpaperImage();
+      if (picked.cancelled || !picked.path) {
+        return false;
+      }
+      if (picked.data_url && !SAFE_BITMAP_DATA_URL_RE.test(picked.data_url)) {
+        const msg = "不支持此图片格式，请选择 PNG、JPG、WebP、GIF 或 BMP 图片";
+        setState((prev) => ({ ...prev, wallpaperError: msg }));
+        pushToast(msg, "warn");
+        return false;
+      }
+      const cssVal = picked.data_url ? `url("${sanitizeCssUrl(picked.data_url)}")` : null;
+      if (cssVal) {
+        resolvedWallpaperCache = { rawPath: picked.path, cssValue: cssVal };
+      }
+      const nextConfig: AppConfig = {
+        ...state.config,
+        personalization: {
+          ...state.config.personalization,
+          wallpaper_path: picked.path,
+        },
+      };
+      applyPersonalizationToDom(
+        state.resolvedTheme,
+        nextConfig.personalization,
+        state.windowMode,
+        cssVal
+      );
+      setState((prev) => ({
+        ...prev,
+        config: nextConfig,
+        wallpaperPreviewUrl: picked.data_url ?? prev.wallpaperPreviewUrl,
+        wallpaperError: null,
+      }));
+      pushToast("背景壁纸已更换", "ok");
+      return true;
+    } catch (err) {
+      const msg = `选择壁纸失败：${formatErrorMessage(err)}`;
+      setState((prev) => ({ ...prev, wallpaperError: msg }));
+      pushToast(msg, "warn");
+      return false;
+    }
+  },
+
+  async setWallpaperPath(path: string | null, notice?: string): Promise<void> {
+    const trimmed = path?.trim() || null;
+    if (!trimmed) {
+      resolvedWallpaperCache = null;
+      setState((prev) => ({ ...prev, wallpaperPreviewUrl: null, wallpaperError: null }));
+    } else {
+      setState((prev) => ({
+        ...prev,
+        wallpaperPreviewUrl: SAFE_BITMAP_DATA_URL_RE.test(trimmed) ? trimmed : null,
+        wallpaperError: null,
+      }));
+    }
+    await appActions.updatePersonalization({ wallpaper_path: trimmed }, notice);
+    if (trimmed) {
+      void ensureLocalWallpaperLoaded(
+        trimmed,
+        state.resolvedTheme,
+        state.config.personalization,
+        state.windowMode
+      );
+    }
+  },
+
+  async setActiveGroup(groupId: string): Promise<void> {
+    try {
+      const rt = await catcloudApi.setActiveGroup(groupId);
+      setState((prev) => ({ ...prev, runtime: rt }));
+      pushToast(`已切换当前分组：${rt.active_group_name}`, "ok");
+    } catch (err) {
+      pushToast(`切换分组失败：${formatErrorMessage(err)}`, "warn");
+    }
+  },
+
+  async selectGroupNode(groupId: string, nodeId: string, closeOld = true): Promise<void> {
+    try {
+      const res = await catcloudApi.selectGroupNode(groupId, nodeId, closeOld);
+      const rt = await catcloudApi.getRuntimeInfo();
+      setState((prev) => ({
+        ...prev,
+        runtime: rt,
+        groups: prev.groups.map((g) =>
+          g.id === res.group_id ? { ...g, active_node_id: res.active_node_id } : g
+        ),
+      }));
+      pushToast(`已切换至：${res.active_node_name}`, "ok");
+    } catch (err) {
+      pushToast(`切换节点失败：${formatErrorMessage(err)}`, "warn");
+    }
+  },
+
+  setProbeProgress(patch: Partial<ProbeRunProgressState>): void {
+    setState((prev) => ({
+      ...prev,
+      probeProgress: { ...prev.probeProgress, ...patch },
+    }));
   },
 
   async setProxyMode(mode: ProxyMode): Promise<void> {
@@ -813,7 +1209,7 @@ export const appActions = {
     }
   },
 
-  async toggleSystemProxy(next?: boolean): Promise<void> {
+  async toggleSystemProxy(next?: boolean, silent = false): Promise<boolean> {
     const target = next ?? !state.runtime.system_proxy_enabled;
     try {
       const applied = await catcloudApi.toggleSystemProxy(target);
@@ -822,13 +1218,17 @@ export const appActions = {
         config: { ...prev.config, system_proxy_enabled: applied },
         runtime: { ...prev.runtime, system_proxy_enabled: applied },
       }));
-      pushToast(applied ? "系统代理已开启" : "系统代理已关闭", applied ? "ok" : "info");
+      if (!silent) {
+        pushToast(applied ? "系统代理已开启" : "系统代理已关闭", applied ? "ok" : "info");
+      }
+      return true;
     } catch (err) {
       pushToast(`切换系统代理失败：${formatErrorMessage(err)}`, "warn");
+      return false;
     }
   },
 
-  async toggleTun(next?: boolean): Promise<void> {
+  async toggleTun(next?: boolean, silent = false): Promise<boolean> {
     const target = next ?? !state.runtime.tun_enabled;
     try {
       const applied = await catcloudApi.toggleTun(target);
@@ -837,9 +1237,13 @@ export const appActions = {
         config: { ...prev.config, tun_enabled: applied },
         runtime: { ...prev.runtime, tun_enabled: applied },
       }));
-      pushToast(applied ? "TUN 虚拟网卡已启用" : "TUN 虚拟网卡已关闭", applied ? "ok" : "info");
+      if (!silent) {
+        pushToast(applied ? "虚拟网卡已开启" : "虚拟网卡已关闭", applied ? "ok" : "info");
+      }
+      return true;
     } catch (err) {
-      pushToast(`切换 TUN 失败：${formatErrorMessage(err)}`, "warn");
+      pushToast(`切换虚拟网卡失败：${formatErrorMessage(err)}`, "warn");
+      return false;
     }
   },
 
@@ -889,7 +1293,7 @@ export const appActions = {
       try {
         await catcloudApi.toggleCapsuleWindow();
       } catch (err) {
-        pushToast(`切换悬浮胶囊失败：${formatErrorMessage(err)}`, "warn");
+        pushToast(`切换悬浮小窗失败：${formatErrorMessage(err)}`, "warn");
       }
       return;
     }

@@ -415,7 +415,7 @@ impl Default for GeoDataConfig {
         Self {
             geodata_mode: false,
             geodata_loader: "memconservative".to_string(),
-            auto_update: true,
+            auto_update: false,
             update_interval_hours: 168,
             geoip_url: "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat".to_string(),
             geosite_url: "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat".to_string(),
@@ -787,6 +787,8 @@ pub struct WebDavReserveConfig {
 pub struct AppConfig {
     pub schema_version: u32,
     pub proxy_mode: ProxyMode,
+    #[serde(default)]
+    pub active_group_id: Option<String>,
     pub mixed_port: u16,
     pub socks_port: Option<u16>,
     pub http_port: Option<u16>,
@@ -825,6 +827,7 @@ impl Default for AppConfig {
         Self {
             schema_version: CONFIG_SCHEMA_VERSION,
             proxy_mode: ProxyMode::Rule,
+            active_group_id: None,
             mixed_port: 7890,
             socks_port: None,
             http_port: None,
