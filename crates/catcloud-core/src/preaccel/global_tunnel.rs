@@ -1539,11 +1539,15 @@ impl ActiveConnGuard {
 
 impl Drop for ActiveConnGuard {
     fn drop(&mut self) {
-        let _ = self.metrics.active_connections.fetch_update(
+        let mut cur = self.metrics.active_connections.load(Ordering::Relaxed);
+        while let Err(actual) = self.metrics.active_connections.compare_exchange_weak(
+            cur,
+            cur.saturating_sub(1),
             Ordering::Relaxed,
             Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(1)),
-        );
+        ) {
+            cur = actual;
+        }
     }
 }
 

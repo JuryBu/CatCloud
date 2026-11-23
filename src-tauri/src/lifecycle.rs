@@ -819,7 +819,7 @@ mod tests {
     #[test]
     fn apply_portable_overrides_updates_tauri_context_only_when_portable() {
         let portable_paths = make_temp_paths("ctx_portable", true);
-        let mut ctx: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let mut ctx: tauri::Context<tauri::Wry> = crate::build_app_context();
         apply_portable_overrides(&mut ctx, &portable_paths);
 
         match ctx.config().app.app_directories_override.as_ref() {
@@ -844,7 +844,7 @@ mod tests {
         }
 
         let standard_paths = make_temp_paths("ctx_standard", false);
-        let mut std_ctx: tauri::Context<tauri::Wry> = tauri::generate_context!();
+        let mut std_ctx: tauri::Context<tauri::Wry> = crate::build_app_context();
         apply_portable_overrides(&mut std_ctx, &standard_paths);
         assert!(std_ctx.config().app.app_directories_override.is_none());
 

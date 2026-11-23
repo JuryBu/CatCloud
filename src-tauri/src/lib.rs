@@ -37,6 +37,12 @@ pub fn run() {
     run_with_paths(paths);
 }
 
+/// Build the Tauri context from a single `tauri::generate_context!()` macro expansion
+/// crate-wide so macOS builds never emit duplicate `_EMBED_INFO_PLIST` symbols during tests.
+pub(crate) fn build_app_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
 fn has_cli_flag(flag: &str) -> bool {
     std::env::args().skip(1).any(|a| a == flag)
 }
@@ -146,7 +152,7 @@ pub fn run_with_paths(paths: AppPaths) {
         ),
     );
 
-    let mut context = tauri::generate_context!();
+    let mut context = build_app_context();
     lifecycle::apply_portable_overrides(&mut context, &paths);
     #[cfg(target_os = "macos")]
     {
