@@ -1,8 +1,10 @@
 import {
   ArrowDownToLine,
+  BookOpen,
   Check,
   Copy,
   Download,
+  Network,
   Pause,
   Play,
   ScrollText,
@@ -87,12 +89,66 @@ interface RawLogPayload {
 
 const RAW_CORE_MODULE_RE = /^(mihomo|clash|meta|core|kernel|engine|unknown)$/i;
 
+const APP_LOG_MODULE_MAP: Record<string, string> = {
+  应用: "应用",
+  通用: "应用",
+  核心: "内核",
+  内核: "内核",
+  热重载: "内核",
+  配置: "配置",
+  系统代理: "代理",
+  代理: "代理",
+  代理模式: "代理",
+  虚拟网卡: "虚拟网卡",
+  tun: "虚拟网卡",
+  提速: "提速",
+  国内提速: "提速",
+  预加速: "提速",
+  中转: "提速",
+  多选组: "多选组",
+  分组: "多选组",
+  策略择优: "多选组",
+  节点切换: "多选组",
+  单节点: "单节点",
+  订阅: "订阅",
+  测速: "测速",
+  探针: "测速",
+  分流: "分流",
+  规则: "分流",
+  更新: "更新",
+};
+
+function classifyAppLogTag(rawTag: string): string {
+  const trimmed = rawTag.trim();
+  if (!trimmed) return "应用";
+  const exact = APP_LOG_MODULE_MAP[trimmed] ?? APP_LOG_MODULE_MAP[trimmed.toLowerCase()];
+  if (exact) return exact;
+  if (/(提速|预加速|中转|preaccel)/i.test(trimmed)) return "提速";
+  if (/(单节点|single)/i.test(trimmed)) return "单节点";
+  if (/(多选组|分组|策略|择优|切换|group)/i.test(trimmed)) return "多选组";
+  if (/(核心|内核|重载|mihomo|core)/i.test(trimmed)) return "内核";
+  if (/(虚拟网卡|\btun\b)/i.test(trimmed)) return "虚拟网卡";
+  if (/(代理|proxy)/i.test(trimmed)) return "代理";
+  if (/(订阅|sub)/i.test(trimmed)) return "订阅";
+  if (/(测速|探针|probe)/i.test(trimmed)) return "测速";
+  if (/(分流|规则|rule)/i.test(trimmed)) return "分流";
+  return trimmed;
+}
+
 function classifyLogModule(message: string, rawModule?: string): string {
+  const text = message.trim();
+  const appMatch = /^\[应用\/([^\]]+)\]/.exec(text);
+  if (appMatch) {
+    return classifyAppLogTag(appMatch[1]);
+  }
   const cleanedModule = rawModule?.trim() ?? "";
   if (cleanedModule && !RAW_CORE_MODULE_RE.test(cleanedModule)) {
+    const modAppMatch = /^应用\/(.+)$/.exec(cleanedModule);
+    if (modAppMatch) {
+      return classifyAppLogTag(modAppMatch[1]);
+    }
     return cleanedModule;
   }
-  const text = message.trim();
   if (/(\btun\b|wintun|gvisor|utun|sing-tun|虚拟网卡|网卡)/i.test(text)) {
     return "虚拟网卡";
   }
@@ -162,6 +218,85 @@ function dedupeEarlyQueueAgainstHistory(
   return earlyQueue;
 }
 
+function mergeBackfilledLogEntries(
+  prevEntries: CoreLogEntry[],
+  snapshot: RawLogPayload[],
+  allocId: () => number
+): { entries: CoreLogEntry[]; overflow: number } {
+  if (snapshot.length === 0) {
+    return { entries: prevEntries, overflow: 0 };
+  }
+  const toEntries = (raws: RawLogPayload[]): CoreLogEntry[] =>
+    raws.map((raw) => ({
+      id: allocId(),
+      time: raw.time,
+      level: raw.level,
+      module: raw.module,
+      message: raw.message,
+    }));
+
+  if (prevEntries.length === 0) {
+    const next = toEntries(snapshot);
+    if (next.length > MAX_LOG_LINES) {
+      const overflow = next.length - MAX_LOG_LINES;
+      return { entries: next.slice(overflow), overflow };
+    }
+    return { entries: next, overflow: 0 };
+  }
+
+  const dedupedStandard = dedupeEarlyQueueAgainstHistory(prevEntries, snapshot);
+  if (dedupedStandard.length === 0) {
+    return { entries: prevEntries, overflow: 0 };
+  }
+
+  let baseEntries = prevEntries;
+  let toAppend = dedupedStandard;
+
+  if (dedupedStandard.length === snapshot.length) {
+    const prevKeys = prevEntries.map(logEntryKey);
+    const snapKeySet = new Set(snapshot.map(logEntryKey));
+    const maxSkip = Math.min(prevEntries.length, 64);
+    let aligned = false;
+    for (let skip = 1; skip <= maxSkip; skip++) {
+      if (!snapKeySet.has(prevKeys[prevKeys.length - skip])) {
+        break;
+      }
+      const trimmedPrev = prevEntries.slice(0, prevEntries.length - skip);
+      const remainder = dedupeEarlyQueueAgainstHistory(trimmedPrev, snapshot);
+      if (remainder.length < snapshot.length) {
+        baseEntries = trimmedPrev;
+        toAppend = remainder;
+        aligned = true;
+        break;
+      }
+    }
+    if (!aligned && prevEntries.length <= snapshot.length) {
+      let allInSnap = true;
+      for (let i = 0; i < prevKeys.length; i++) {
+        if (!snapKeySet.has(prevKeys[i])) {
+          allInSnap = false;
+          break;
+        }
+      }
+      if (allInSnap) {
+        baseEntries = [];
+        toAppend = snapshot;
+      }
+    }
+  }
+
+  if (toAppend.length === 0 && baseEntries === prevEntries) {
+    return { entries: prevEntries, overflow: 0 };
+  }
+
+  const merged = baseEntries.concat(toEntries(toAppend));
+  if (merged.length > MAX_LOG_LINES) {
+    const overflow = merged.length - MAX_LOG_LINES;
+    return { entries: merged.slice(overflow), overflow };
+  }
+  return { entries: merged, overflow: 0 };
+}
+
 function formatLogTimestamp(ts?: string): string {
   if (!ts) return formatNowClock();
   const parsed = new Date(ts);
@@ -172,8 +307,8 @@ function formatLogTimestamp(ts?: string): string {
 }
 
 /**
- * Sanitize exported or copied logs so credentials, bearer secrets, user paths,
- * and unexpected non-documentation public IPv4 addresses are never leaked.
+ * Sanitize exported or copied logs so credentials, URL query tokens, bearer secrets,
+ * user paths, and unexpected non-documentation public IPv4/IPv6 addresses are never leaked.
  */
 function sanitizeLogLine(raw: string): string {
   const safeDnsIps = new Set([
@@ -201,12 +336,39 @@ function sanitizeLogLine(raw: string): string {
     "224.",
     "255.",
   ];
+  const safeDnsIpv6s = new Set([
+    "2606:4700:4700::1111",
+    "2606:4700:4700::1001",
+    "2001:4860:4860::8888",
+    "2001:4860:4860::8844",
+    "2400:3200::1",
+    "2400:3200:baba::1",
+    "2402:4e00::",
+  ]);
 
   let out = raw
+    // Redact custom CatCloud relay import tokens (`mmrelay://v1/...`) and opaque `vmess://` base64 payloads
+    .replace(/(mmrelay:\/\/(?:v\d+\/)?)[^\s"'<>]+/gi, "$1<REDACTED>")
+    .replace(/(vmess:\/\/)[^\s"'<>#]+/gi, "$1<REDACTED>")
+    // Redact userinfo credentials in proxy & HTTP(S) URLs (`scheme://user:pass@host`)
+    .replace(
+      /((?:https?|socks5h?|trojan|vless|vmess|ssr?|hysteria2|hy2|tuic|anytls):\/\/)([^/\s"'<>?#]+)@/gi,
+      "$1<REDACTED>@"
+    )
+    // Redact opaque base64-only Shadowsocks/SSR payloads (`ss://<base64>#tag`)
+    .replace(/(ssr?:\/\/)(?!<REDACTED>@)[^\s"'<>#]+/gi, "$1<REDACTED>")
     .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1<REDACTED>")
-    .replace(/((?:password|secret|token|key)\s*[=:]\s*)([^\s,&"']+)/gi, "$1<REDACTED>")
-    .replace(/[A-Za-z]:[\\/]Users[\\/][A-Za-z0-9_.-]+/gi, "C:\\Users\\<USER>")
-    .replace(/\/(?:Users|home)\/[A-Za-z0-9_.-]+/g, "/home/<USER>");
+    .replace(
+      /([?&](?:token|access_token|refresh_token|key|api_?key|secret|controller_secret|password|obfs[-_]?password|passwd|pwd|auth|auth_token|authorization|uuid)=)([^&#\s"'<>]+)/gi,
+      "$1<REDACTED>"
+    )
+    .replace(
+      /((?:password|obfs[-_]?password|passwd|secret|controller_secret|token|access_token|refresh_token|api_?key|key|auth|auth_token|authorization|uuid)\s*[=:]\s*)([^\s,&"'<>#]+)/gi,
+      "$1<REDACTED>"
+    )
+    // Redact Windows & Unix user directories (supporting CJK and other non-ASCII usernames)
+    .replace(/[A-Za-z]:([\\/])Users([\\/])[^\\/\s"'<>|:*?\r\n]+/gi, "C:$1Users$2<USER>")
+    .replace(/\/(Users|home)\/[^\\/\s"'<>|:*?\r\n]+/g, "/$1/<USER>");
 
   out = out.replace(/\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g, (full, a, b, c, d) => {
     const nums = [Number(a), Number(b), Number(c), Number(d)];
@@ -216,6 +378,40 @@ function sanitizeLogLine(raw: string): string {
     if (nums[0] === 172 && nums[1] >= 16 && nums[1] <= 31) return full;
     return `${a}.${b}.***.***`;
   });
+
+  // Mask public IPv6 literals (both full 8-hextet and compressed `::` forms) without touching HH:MM:SS timestamps or 6-byte MACs
+  out = out.replace(
+    /(?<![0-9a-fA-F:])(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4})(?![0-9a-fA-F:])/g,
+    (full) => {
+      const lower = full.toLowerCase();
+      if (lower === "::" || lower === "::1") return full;
+      if (safeDnsIpv6s.has(lower)) return full;
+      if (
+        lower.startsWith("fe80:") ||
+        lower.startsWith("fc") ||
+        lower.startsWith("fd") ||
+        lower.startsWith("ff") ||
+        lower.startsWith("2001:db8:") ||
+        lower.startsWith("2001:0db8:") ||
+        lower.startsWith("::ffff:")
+      ) {
+        return full;
+      }
+      if (lower.includes("::")) {
+        const parts = lower.split("::");
+        if (parts.length > 2) return full;
+        const left = parts[0] ? parts[0].split(":") : [];
+        const right = parts[1] ? parts[1].split(":") : [];
+        if (left.length + right.length > 7) return full;
+        if (left.length >= 2) return `${left[0]}:${left[1]}::***`;
+        if (left.length === 1) return `${left[0]}::***`;
+        return "<REDACTED_IPV6>";
+      }
+      const segments = lower.split(":");
+      if (segments.length !== 8) return full;
+      return `${segments[0]}:${segments[1]}:***:***`;
+    }
+  );
 
   return out;
 }
@@ -302,15 +498,20 @@ export function LogsPage() {
     error: true,
   });
   const [copied, setCopied] = useState<boolean>(false);
+  const [copyingAiDiag, setCopyingAiDiag] = useState<boolean>(false);
+  const [copiedAiDiag, setCopiedAiDiag] = useState<boolean>(false);
 
   const nextIdRef = useRef<number>(100);
   const sampleCursorRef = useRef<number>(0);
   const pausedRef = useRef<boolean>(paused);
+  const entriesRef = useRef<CoreLogEntry[]>(logState.entries);
   const pendingBufferRef = useRef<CoreLogEntry[]>([]);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
+  const copiedAiTimerRef = useRef<number | null>(null);
 
   pausedRef.current = paused;
+  entriesRef.current = logState.entries;
 
   const { entries, truncatedCount } = logState;
 
@@ -337,6 +538,9 @@ export function LogsPage() {
     return () => {
       if (copiedTimerRef.current !== null) {
         window.clearTimeout(copiedTimerRef.current);
+      }
+      if (copiedAiTimerRef.current !== null) {
+        window.clearTimeout(copiedAiTimerRef.current);
       }
     };
   }, []);
@@ -392,9 +596,90 @@ export function LogsPage() {
       }, 2800);
     };
 
+    let removeVisibilityListener: (() => void) | null = null;
+
     if (inTauri) {
       let historyLoaded = false;
       let earlyQueue: RawLogPayload[] = [];
+      let backfilling = false;
+      let backfillQueuedAgain = false;
+      let backfillEarlyQueue: RawLogPayload[] = [];
+
+      const mapRecentLines = (
+        lines: Array<{ level?: string; payload?: string; timestamp?: string }>
+      ): RawLogPayload[] =>
+        lines.map((line) => {
+          const message = line.payload ?? "";
+          return {
+            time: formatLogTimestamp(line.timestamp),
+            level: normalizeLogLevel(line.level),
+            module: classifyLogModule(message),
+            message,
+          };
+        });
+
+      const backfillOnResume = async () => {
+        if (disposed || !historyLoaded) return;
+        if (backfilling) {
+          backfillQueuedAgain = true;
+          return;
+        }
+        backfilling = true;
+        backfillEarlyQueue = [];
+        try {
+          const lines = await catcloudApi.getRecentLogs(500);
+          if (disposed) return;
+          const snapshotBatch = mapRecentLines(lines);
+          const dedupedLive = dedupeEarlyQueueAgainstHistory(snapshotBatch, backfillEarlyQueue);
+          backfillEarlyQueue = [];
+          const authoritative = snapshotBatch.concat(dedupedLive);
+          if (authoritative.length === 0) return;
+
+          if (pausedRef.current) {
+            const combinedExisting = entriesRef.current.concat(pendingBufferRef.current);
+            const netNew = dedupeEarlyQueueAgainstHistory(combinedExisting, authoritative);
+            if (netNew.length > 0) {
+              enqueueEntries(netNew);
+            }
+            return;
+          }
+
+          setLogState((prev) => {
+            const res = mergeBackfilledLogEntries(prev.entries, authoritative, () => {
+              nextIdRef.current += 1;
+              return nextIdRef.current;
+            });
+            if (res.entries === prev.entries) return prev;
+            return {
+              entries: res.entries,
+              truncatedCount: prev.truncatedCount + res.overflow,
+            };
+          });
+        } catch {
+          if (!disposed && backfillEarlyQueue.length > 0) {
+            const pendingLive = backfillEarlyQueue;
+            backfillEarlyQueue = [];
+            enqueueEntries(pendingLive);
+          }
+        } finally {
+          backfilling = false;
+          if (!disposed && backfillQueuedAgain) {
+            backfillQueuedAgain = false;
+            void backfillOnResume();
+          }
+        }
+      };
+
+      const handleVisibilityChange = () => {
+        if (document.visibilityState === "visible") {
+          void backfillOnResume();
+        }
+      };
+      if (typeof document !== "undefined") {
+        document.addEventListener("visibilitychange", handleVisibilityChange);
+        removeVisibilityListener = () =>
+          document.removeEventListener("visibilitychange", handleVisibilityChange);
+      }
 
       const bootRealLogStream = async () => {
         // 1. Register real-time listener FIRST so no lines are missed while fetching history.
@@ -423,6 +708,13 @@ export function LogsPage() {
               }
               return;
             }
+            if (backfilling) {
+              backfillEarlyQueue.push(item);
+              if (backfillEarlyQueue.length > MAX_LOG_LINES) {
+                backfillEarlyQueue = backfillEarlyQueue.slice(-MAX_LOG_LINES);
+              }
+              return;
+            }
             enqueueEntries([item]);
           });
 
@@ -440,15 +732,7 @@ export function LogsPage() {
         try {
           const lines = await catcloudApi.getRecentLogs(500);
           if (disposed) return;
-          historyBatch = lines.map((line) => {
-            const message = line.payload ?? "";
-            return {
-              time: formatLogTimestamp(line.timestamp),
-              level: normalizeLogLevel(line.level),
-              module: classifyLogModule(message),
-              message,
-            };
-          });
+          historyBatch = mapRecentLines(lines);
         } catch {
           /* core may not have emitted logs yet */
         }
@@ -467,6 +751,7 @@ export function LogsPage() {
 
     return () => {
       disposed = true;
+      removeVisibilityListener?.();
       unlisten?.();
       if (mockTimer !== null) {
         window.clearInterval(mockTimer);
@@ -559,6 +844,36 @@ export function LogsPage() {
     return header.concat(body).join("\n");
   };
 
+  const handleCopyAiDiagnosticBundle = async () => {
+    if (copyingAiDiag) return;
+    setCopyingAiDiag(true);
+    try {
+      const recentViewLines = filteredEntries
+        .slice(-40)
+        .map((item) =>
+          sanitizeLogLine(
+            `[${item.time}] [${LEVEL_META[item.level].label}] [${item.module}] ${item.message}`
+          )
+        )
+        .join("\n");
+      const ok = await appActions.copySanitizedDiagnosticsForAi(
+        recentViewLines || undefined
+      );
+      if (ok) {
+        setCopiedAiDiag(true);
+        if (copiedAiTimerRef.current !== null) {
+          window.clearTimeout(copiedAiTimerRef.current);
+        }
+        copiedAiTimerRef.current = window.setTimeout(() => {
+          copiedAiTimerRef.current = null;
+          setCopiedAiDiag(false);
+        }, 2000);
+      }
+    } finally {
+      setCopyingAiDiag(false);
+    }
+  };
+
   const handleCopySanitized = async () => {
     const text = formatSanitizedLogText();
     try {
@@ -649,6 +964,41 @@ export function LogsPage() {
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            disabled={copyingAiDiag}
+            onClick={() => void handleCopyAiDiagnosticBundle()}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+            title="一键打包当前代理状态与脱敏日志，直接粘给 AI 助手排查"
+          >
+            {copiedAiDiag ? (
+              <>
+                <Check className="h-3.5 w-3.5" />
+                <span>已复制诊断包</span>
+              </>
+            ) : (
+              <span>{copyingAiDiag ? "正在打包…" : "🤖 复制诊断包发给 AI"}</span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => appActions.setNav("rules")}
+            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+          >
+            <Network className="h-3.5 w-3.5 text-[var(--muted)]" />
+            <span>分流与连接</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => appActions.openSettingsAgentDocs()}
+            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+          >
+            <BookOpen className="h-3.5 w-3.5 text-[var(--accent)]" />
+            <span>AI 协作指南</span>
+          </button>
+
+          <button
+            type="button"
             onClick={handleTogglePause}
             className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
               paused
@@ -670,7 +1020,7 @@ export function LogsPage() {
             ) : (
               <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
             )}
-            {copied ? "已复制" : "复制（已自动打码隐私）"}
+            {copied ? "已复制" : "仅复制日志"}
           </button>
 
           <button

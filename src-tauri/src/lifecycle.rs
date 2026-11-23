@@ -14,6 +14,10 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 pub const CAPSULE_WINDOW_LABEL: &str = "capsule";
 /// Event emitted whenever main/capsule window presence transitions.
 pub const EVENT_WINDOW_MODE_CHANGED: &str = "catcloud://window-mode-changed";
+/// Lightweight Chromium/WebView2 arguments injected only when the user has not set
+/// `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS`, trimming resident disk/media caches and unused
+/// browser features without degrading rendering quality or interactivity.
+pub const DEFAULT_WEBVIEW2_BROWSER_ARGS: &str = "--disk-cache-size=10485760 --media-cache-size=1048576 --disable-features=msWebOOUI,msPdfOOUI,Translate,BackForwardCache";
 
 /// Minimum cooldown between destroying a WebView2 window and rebuilding it, preventing
 /// Windows `EBWebView` UserData directory lock contention during rapid toggle loops.
@@ -21,6 +25,8 @@ const REBUILD_COOLDOWN_MS: u64 = 220;
 /// Maximum wait budget when a rebuild collides with an in-flight destroy.
 const MAX_DESTROY_WAIT_MS: u64 = 650;
 const DESTROY_POLL_INTERVAL_MS: u64 = 25;
+/// Minimum interval between consecutive OS working-set trims to coalesce bursty minimize/hide events.
+const WORKING_SET_TRIM_COOLDOWN_MS: u64 = 1500;
 
 static REBUILDING_MAIN: AtomicBool = AtomicBool::new(false);
 static DESTROYING_MAIN: AtomicBool = AtomicBool::new(false);
@@ -29,6 +35,7 @@ static LAST_MAIN_DESTROY_MS: AtomicU64 = AtomicU64::new(0);
 static TOGGLING_CAPSULE: AtomicBool = AtomicBool::new(false);
 static DESTROYING_CAPSULE: AtomicBool = AtomicBool::new(false);
 static LAST_CAPSULE_DESTROY_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_WORKING_SET_TRIM_MS: AtomicU64 = AtomicU64::new(0);
 
 static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 
@@ -164,9 +171,20 @@ pub fn apply_directory_overrides_always<R: Runtime>(
         Some(AppDirectoriesOverride::Directories(overrides));
 }
 
-/// Helper for single-threaded bootstrap paths to set `WEBVIEW2_USER_DATA_FOLDER` before Tauri
-/// initializes. Elevated processes always receive an isolated `webview2_elevated` directory so
-/// High IL and Medium IL WebView2 instances never contend on `EBWebView` locks or ACLs.
+/// Resolve default lightweight WebView2 browser arguments unless the caller already provided
+/// a non-empty custom `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` override.
+pub fn resolve_webview2_browser_args(existing: Option<&str>) -> Option<&'static str> {
+    if existing.is_some_and(|v| !v.trim().is_empty()) {
+        None
+    } else {
+        Some(DEFAULT_WEBVIEW2_BROWSER_ARGS)
+    }
+}
+
+/// Helper for single-threaded bootstrap paths to set `WEBVIEW2_USER_DATA_FOLDER` and lightweight
+/// WebView2 browser arguments before Tauri initializes. Elevated processes always receive an
+/// isolated `webview2_elevated` directory so High IL and Medium IL WebView2 instances never
+/// contend on `EBWebView` locks or ACLs.
 ///
 /// # Safety
 /// Must only be invoked while the process is single-threaded prior to spawning threads.
@@ -181,6 +199,40 @@ pub unsafe fn set_webview2_user_data_env(paths: &AppPaths) {
             std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_dir);
         }
     }
+    let existing_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok();
+    if let Some(default_args) = resolve_webview2_browser_args(existing_args.as_deref()) {
+        unsafe {
+            std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", default_args);
+        }
+    }
+}
+
+/// Ask Windows to reclaim idle working-set pages for the current process so background/tray
+/// residency returns unused RAM to the OS immediately.
+#[cfg(target_os = "windows")]
+pub fn trim_process_working_set() -> bool {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+    let ok = unsafe { SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX) };
+    ok != 0
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn trim_process_working_set() -> bool {
+    false
+}
+
+fn trim_process_working_set_throttled() {
+    let now = monotonic_now_ms();
+    let prev = LAST_WORKING_SET_TRIM_MS.load(Ordering::Relaxed);
+    if prev != 0 && now.saturating_sub(prev) < WORKING_SET_TRIM_COOLDOWN_MS {
+        return;
+    }
+    if LAST_WORKING_SET_TRIM_MS
+        .compare_exchange(prev, now, Ordering::SeqCst, Ordering::Relaxed)
+        .is_ok()
+    {
+        let _ = trim_process_working_set();
+    }
 }
 
 /// Query current live window state, excluding windows that are actively being destroyed.
@@ -194,6 +246,32 @@ pub fn window_mode_snapshot<R: Runtime>(app: &AppHandle<R>) -> WindowModeSnapsho
         capsule_open,
         windowless: !main_open && !capsule_open,
     }
+}
+
+/// Returns `true` when the main window exists, is visible, and is not minimized.
+pub fn is_main_window_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if DESTROYING_MAIN.load(Ordering::SeqCst) {
+        return false;
+    }
+    app.get_webview_window(MAIN_WINDOW_LABEL).is_some_and(|win| {
+        win.is_visible().unwrap_or(false) && !win.is_minimized().unwrap_or(false)
+    })
+}
+
+/// Returns `true` when the floating capsule window exists and is visible.
+pub fn is_capsule_window_visible<R: Runtime>(app: &AppHandle<R>) -> bool {
+    if DESTROYING_CAPSULE.load(Ordering::SeqCst) {
+        return false;
+    }
+    app.get_webview_window(CAPSULE_WINDOW_LABEL)
+        .is_some_and(|win| {
+            win.is_visible().unwrap_or(false) && !win.is_minimized().unwrap_or(false)
+        })
+}
+
+/// Returns `true` when at least one GUI window (main or capsule) is currently visible and not minimized.
+pub fn has_visible_gui_window<R: Runtime>(app: &AppHandle<R>) -> bool {
+    is_main_window_visible(app) || is_capsule_window_visible(app)
 }
 
 /// Returns `true` when neither main nor capsule WebView window exists (pure windowless mode).
@@ -327,6 +405,9 @@ fn schedule_destroy_flag_clear<R: Runtime>(
         flag.store(false, Ordering::SeqCst);
         sync_macos_activation_policy(&app_handle);
         emit_window_mode_changed(&app_handle);
+        if is_windowless_mode(&app_handle) || label == MAIN_WINDOW_LABEL {
+            trim_process_working_set_throttled();
+        }
     });
 }
 
@@ -345,6 +426,7 @@ pub fn enter_windowless_mode<R: Runtime>(app: &AppHandle<R>) {
     }
     sync_macos_activation_policy(app);
     emit_window_mode_changed(app);
+    trim_process_working_set_throttled();
 }
 
 /// Destroy both main and capsule WebView windows to reach the minimal pure windowless footprint.
@@ -502,18 +584,38 @@ pub fn handle_window_event<R: Runtime>(
             }
             _ => {}
         },
+        WindowEvent::Resized(size) => {
+            if window.label() == MAIN_WINDOW_LABEL
+                && ((size.width == 0 && size.height == 0)
+                    || window.is_minimized().unwrap_or(false))
+            {
+                trim_process_working_set_throttled();
+            }
+        }
+        WindowEvent::Focused(false) => {
+            if window.label() == MAIN_WINDOW_LABEL
+                && (!window.is_visible().unwrap_or(true)
+                    || window.is_minimized().unwrap_or(false))
+            {
+                trim_process_working_set_throttled();
+            }
+        }
         WindowEvent::Destroyed => match window.label() {
             MAIN_WINDOW_LABEL => {
                 DESTROYING_MAIN.store(false, Ordering::SeqCst);
                 let app = window.app_handle();
                 sync_macos_activation_policy(app);
                 emit_window_mode_changed(app);
+                trim_process_working_set_throttled();
             }
             CAPSULE_WINDOW_LABEL => {
                 DESTROYING_CAPSULE.store(false, Ordering::SeqCst);
                 let app = window.app_handle();
                 sync_macos_activation_policy(app);
                 emit_window_mode_changed(app);
+                if is_windowless_mode(app) {
+                    trim_process_working_set_throttled();
+                }
             }
             _ => {}
         },
@@ -725,5 +827,30 @@ mod tests {
         }
         assert!(!TEST_FLAG.load(Ordering::SeqCst));
         assert!(AtomicFlagGuard::try_acquire(&TEST_FLAG).is_some());
+    }
+
+    #[test]
+    fn resolve_webview2_browser_args_injects_defaults_only_when_unset() {
+        assert_eq!(
+            resolve_webview2_browser_args(None),
+            Some(DEFAULT_WEBVIEW2_BROWSER_ARGS)
+        );
+        assert_eq!(
+            resolve_webview2_browser_args(Some("   ")),
+            Some(DEFAULT_WEBVIEW2_BROWSER_ARGS)
+        );
+        assert_eq!(
+            resolve_webview2_browser_args(Some("--remote-debugging-port=9222")),
+            None
+        );
+    }
+
+    #[test]
+    fn trim_process_working_set_executes_safely() {
+        let trimmed = trim_process_working_set();
+        #[cfg(target_os = "windows")]
+        assert!(trimmed);
+        #[cfg(not(target_os = "windows"))]
+        assert!(!trimmed);
     }
 }

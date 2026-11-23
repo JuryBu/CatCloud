@@ -197,9 +197,9 @@ export function Sidebar() {
   };
 
   return (
-    <aside className="cc-surface cc-glass relative z-20 flex h-full w-[236px] shrink-0 flex-col border-r border-[var(--line)] px-3 py-3.5">
+    <aside className="cc-surface cc-glass relative z-20 flex h-full w-[236px] shrink-0 flex-col border-r border-[var(--line)] px-3 pb-3 pt-2.5">
       {/* Brand header with animated cream-cat MascotSprite & theme/wallpaper popover */}
-      <div className="mb-3 flex items-center justify-between gap-1.5 px-0.5">
+      <div className="mb-2.5 flex items-center justify-between gap-1.5 px-0.5">
         <div className="flex min-w-0 items-center gap-1.5">
           <div className="relative flex h-10 w-[62px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)] px-0.5">
             <MascotSprite state="idle" scale={2} title="猫猫云梯 · 奶油猫饼" />
@@ -253,7 +253,7 @@ export function Sidebar() {
             <div
               role="dialog"
               aria-label="主题与壁纸快捷设置"
-              className="absolute right-0 top-[calc(100%+8px)] z-50 w-[212px] rounded-2xl border border-[var(--line-strong)] bg-[var(--surface)] p-2.5 text-[var(--text)]"
+              className="absolute right-0 top-[calc(100%+6px)] z-50 max-h-[calc(100vh-100px)] w-[212px] overflow-y-auto rounded-2xl border border-[var(--line-strong)] bg-[var(--surface)] p-2.5 text-[var(--text)]"
               style={{ boxShadow: "var(--shadow-popover)" }}
             >
               <div className="mb-1.5 flex items-center justify-between px-1">

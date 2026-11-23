@@ -89,6 +89,9 @@ export interface AppConfig {
   silent_start: boolean;
   gomemlimit_mb: 0 | 48 | 64 | 96;
   memory_tier?: MemoryTier;
+  behavior?: {
+    minimize_to_tray_on_close?: boolean;
+  };
   preaccel: PreAccelConfig;
   personalization: PersonalizationConfig;
   update: UpdateConfig;
@@ -169,6 +172,7 @@ export interface FullAppConfig {
   core_runtime?: {
     custom_binary_path?: string | null;
     memory_tier?: string;
+    compile_all_nodes?: boolean;
     startup_script_path?: string | null;
     quick_check_sites?: QuickCheckSiteConfig[];
   };
@@ -339,8 +343,14 @@ export interface TrafficSample {
   up_total_bytes: number;
   down_total_bytes: number;
   connections: number;
+  tunnel_connections?: number;
   memory_mb: number;
   timestamp_ms: number;
+}
+
+export interface SanitizedDiagnosticsDto {
+  ai_prompt_markdown?: string;
+  [key: string]: unknown;
 }
 
 export interface CoreRuntimeInfo {
@@ -786,6 +796,9 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
   silent_start: false,
   gomemlimit_mb: 48,
   memory_tier: "mb48",
+  behavior: {
+    minimize_to_tray_on_close: true,
+  },
   preaccel: {
     enabled: true,
     skip_443_native: true,
@@ -1220,6 +1233,7 @@ let mockFullConfig: FullAppConfig = {
   },
   core_runtime: {
     memory_tier: "48MiB",
+    compile_all_nodes: false,
     startup_script_path: null,
     quick_check_sites: MOCK_QUICK_SITES.map((s) => ({ id: s.id, name: s.name, url: s.url })),
   },
@@ -1296,6 +1310,7 @@ export function generateSeedTrafficSamples(count = 75, intervalMs = 2000): Traff
       up_total_bytes: Math.round(upAccum),
       down_total_bytes: Math.round(downAccum),
       connections: 18 + Math.round(burst * 24),
+      tunnel_connections: mockConfig.preaccel.enabled ? 4 : 0,
       memory_mb: Number((34.2 + burst * 4.8).toFixed(1)),
       timestamp_ms: t,
     });
@@ -1313,7 +1328,9 @@ export const catcloudApi = {
 
   async saveConfig(next: AppConfig): Promise<AppConfig> {
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<AppConfig>("save_app_config", { config: next });
+      const wireConfig: AppConfig = { ...next };
+      delete wireConfig.behavior;
+      return tauriInvokeOrThrow<AppConfig>("save_app_config", { config: wireConfig });
     }
     mockConfig = structuredClone(next);
     mockRuntime = {
@@ -1354,6 +1371,13 @@ export const catcloudApi = {
         patch.behavior && typeof patch.behavior === "object"
           ? { ...mockFullConfig.behavior, ...(patch.behavior as FullAppConfig["behavior"]) }
           : mockFullConfig.behavior,
+      core_runtime:
+        patch.core_runtime && typeof patch.core_runtime === "object"
+          ? {
+              ...mockFullConfig.core_runtime,
+              ...(patch.core_runtime as FullAppConfig["core_runtime"]),
+            }
+          : mockFullConfig.core_runtime,
       preaccel:
         patch.preaccel && typeof patch.preaccel === "object"
           ? { ...mockFullConfig.preaccel, ...(patch.preaccel as FullAppConfig["preaccel"]) }
@@ -2253,11 +2277,35 @@ export const catcloudApi = {
     return `export http_proxy="http://127.0.0.1:${mockConfig.mixed_port}"`;
   },
 
-  async exportSanitizedDiagnostics(): Promise<Record<string, unknown>> {
+  async exportSanitizedDiagnostics(): Promise<SanitizedDiagnosticsDto> {
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<Record<string, unknown>>("export_sanitized_diagnostics");
+      return tauriInvokeOrThrow<SanitizedDiagnosticsDto>("export_sanitized_diagnostics");
     }
-    return { sanitized: true, preview: true, mixed_port: mockConfig.mixed_port };
+    const aiPromptMarkdown = [
+      "# 请帮我排查猫猫云梯（CatCloud）当前问题",
+      "",
+      "> 以下为自动脱敏后的运行状态与排障指引（演示预览环境）。",
+      "",
+      "## 1. 当前运行状态摘要",
+      `- 版本：v${mockRuntime.app_version}（${mockRuntime.os_label}）`,
+      `- 代理核心：${mockRuntime.core_name} ${mockRuntime.core_version}（${mockRuntime.running ? "运行中" : "已停止"}）`,
+      `- 代理模式：${mockRuntime.proxy_mode} | 系统代理：${mockRuntime.system_proxy_enabled ? "已开启" : "未开启"} | 虚拟网卡：${mockRuntime.tun_enabled ? "已开启" : "未开启"}`,
+      `- 当前路线：${mockRuntime.route_mode === "single" ? "单节点模式" : `智能多选组（${mockRuntime.active_group_name}）`} → ${mockRuntime.active_node_name}`,
+      `- 国内提速：${mockRuntime.preaccel_active ? `已开启（${mockRuntime.preaccel_relay_name ?? "主力中转"}）` : "未开启"}`,
+      `- 本地端口：混合 ${mockConfig.mixed_port} / 控制 127.0.0.1:${mockConfig.controller_port} / DNS ${mockConfig.dns_listen_port}`,
+      "",
+      "## 2. 本机只读排查 CLI 命令参考",
+      "- 查看状态：`catcloud status --json`",
+      "- 导出诊断：`catcloud config diag --json`",
+      "- 查看多选组：`catcloud group list --json`",
+      "- 校验配置：`catcloud config validate --json`",
+    ].join("\n");
+    return {
+      sanitized: true,
+      preview: true,
+      mixed_port: mockConfig.mixed_port,
+      ai_prompt_markdown: aiPromptMarkdown,
+    };
   },
 
   async refreshGeoDb(targets: string[] | null = null): Promise<RefreshGeoDbResult> {
@@ -2393,6 +2441,7 @@ export const catcloudApi = {
     }
     type RawTrafficPayload = Partial<TrafficSample> & {
       active_connections?: number;
+      tunnel_connections?: number;
       core_memory_mb?: number;
     };
     let rows: RawTrafficPayload[];
@@ -2411,6 +2460,7 @@ export const catcloudApi = {
         up_total_bytes: safeNum(r.up_total_bytes),
         down_total_bytes: safeNum(r.down_total_bytes),
         connections: safeNum(r.connections ?? r.active_connections),
+        tunnel_connections: safeNum(r.tunnel_connections),
         memory_mb: safeNum(r.memory_mb ?? r.core_memory_mb),
         timestamp_ms: safeNum(r.timestamp_ms),
       }))
@@ -2444,6 +2494,7 @@ export const catcloudApi = {
           up_total_bytes: Math.round(mockUpTotal),
           down_total_bytes: Math.round(mockDownTotal),
           connections: 16 + Math.round(wave * 26 + jitter * 4),
+          tunnel_connections: mockConfig.preaccel.enabled ? 4 : 0,
           memory_mb: Number((34.4 + wave * 4.5 + jitter * 0.6).toFixed(1)),
           timestamp_ms: Date.now(),
         });
@@ -2453,6 +2504,7 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       type RawTrafficPayload = Partial<TrafficSample> & {
         active_connections?: number;
+        tunnel_connections?: number;
         core_memory_mb?: number;
       };
       void tauriListen<RawTrafficPayload>("catcloud://traffic", (payload) => {
@@ -2465,6 +2517,7 @@ export const catcloudApi = {
           up_total_bytes: safeNum(payload.up_total_bytes),
           down_total_bytes: safeNum(payload.down_total_bytes),
           connections: safeNum(payload.connections ?? payload.active_connections),
+          tunnel_connections: safeNum(payload.tunnel_connections),
           memory_mb: safeNum(payload.memory_mb ?? payload.core_memory_mb),
           timestamp_ms: safeNum(payload.timestamp_ms) || Date.now(),
         });
@@ -2535,6 +2588,26 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       void tauriListen<StrategySwitchEvent>("catcloud://strategy-switch", (payload) => {
         if (!disposed && payload) onSwitch(payload);
+      }).then((fn) => {
+        if (disposed) {
+          fn?.();
+        } else {
+          unlisten = fn;
+        }
+      });
+    }
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  },
+
+  subscribeConfigUpdate(onUpdate: (cfg: AppConfig) => void): () => void {
+    let disposed = false;
+    let unlisten: (() => void) | null = null;
+    if (isTauriEnv()) {
+      void tauriListen<AppConfig>("catcloud://config-updated", (payload) => {
+        if (!disposed && payload) onUpdate(payload);
       }).then((fn) => {
         if (disposed) {
           fn?.();

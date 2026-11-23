@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronLeft, ChevronRight, Globe } from "lucide-react";
+import { ChevronLeft, ChevronRight, Globe } from "lucide-react";
 import { useState } from "react";
 import {
   CONTINENT_ORDER,
@@ -6,6 +6,7 @@ import {
   type ContinentStatsSummary,
   getContinentLabel,
 } from "../utils/regions";
+import { AppSelect, type AppSelectOption } from "./AppSelect";
 
 export interface ContinentRegionFilterProps {
   variant: "pills" | "select";
@@ -55,59 +56,60 @@ export function ContinentRegionFilter({
         (stats.regionsByContinent[c.id]?.length ?? 0) > 0
     );
 
+    const continentOptions: AppSelectOption[] = visibleContinents.map((c) => ({
+      value: c.id,
+      label:
+        c.id === "all"
+          ? `全部大洲 (${stats.total})`
+          : `${c.label} (${stats.continentCounts[c.id]})`,
+    }));
+
+    const regionOptions: AppSelectOption[] = [
+      {
+        value: "all",
+        label:
+          continent === "all"
+            ? "全部国家/地区"
+            : `全部${getContinentLabel(continent)} (${stats.continentCounts[continent]})`,
+      },
+      ...(continent === "all"
+        ? groupedContinents.flatMap((c) => {
+            const groupLabel = `${c.label} (${stats.continentCounts[c.id]})`;
+            return stats.regionsByContinent[c.id].map((r) => ({
+              value: r.code,
+              label: `${r.label} (${r.count})`,
+              group: groupLabel,
+            }));
+          })
+        : activeContinentRegions.map((r) => ({
+            value: r.code,
+            label: `${r.label} (${r.count})`,
+          }))),
+    ];
+
     return (
       <div className={`flex flex-wrap items-center gap-2 ${className}`}>
         {/* 1. Continent Select */}
-        <div className="relative">
-          <Globe className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-          <select
+        <div className="relative inline-flex items-center">
+          <Globe className="pointer-events-none absolute left-2.5 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+          <AppSelect
             value={continent}
-            onChange={(e) => handleContinentSelect(e.target.value as ContinentId)}
+            onChange={(val) => handleContinentSelect(val as ContinentId)}
+            options={continentOptions}
             aria-label="按大洲筛选"
-            className="h-9 cursor-pointer appearance-none rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs font-medium text-[var(--text)] outline-none transition-colors hover:border-[var(--line-strong)] focus:border-[var(--accent)]"
-          >
-            {visibleContinents.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.id === "all"
-                  ? `全部大洲 (${stats.total})`
-                  : `${c.label} (${stats.continentCounts[c.id]})`}
-              </option>
-            ))}
-          </select>
-          <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+            size="md"
+            buttonClassName="pl-8"
+          />
         </div>
 
         {/* 2. Country / Region Select (linked to selected continent) */}
-        <div className="relative">
-          <select
-            value={region}
-            onChange={(e) => onRegionChange(e.target.value)}
-            aria-label="按国家或地区筛选"
-            className="h-9 cursor-pointer appearance-none rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-3 pr-7 text-xs font-medium text-[var(--text)] outline-none transition-colors hover:border-[var(--line-strong)] focus:border-[var(--accent)]"
-          >
-            <option value="all">
-              {continent === "all"
-                ? "全部国家/地区"
-                : `全部${getContinentLabel(continent)} (${stats.continentCounts[continent]})`}
-            </option>
-            {continent === "all"
-              ? groupedContinents.map((c) => (
-                  <optgroup key={c.id} label={`${c.label} (${stats.continentCounts[c.id]})`}>
-                    {stats.regionsByContinent[c.id].map((r) => (
-                      <option key={r.code} value={r.code}>
-                        {r.label} ({r.count})
-                      </option>
-                    ))}
-                  </optgroup>
-                ))
-              : activeContinentRegions.map((r) => (
-                  <option key={r.code} value={r.code}>
-                    {r.label} ({r.count})
-                  </option>
-                ))}
-          </select>
-          <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-        </div>
+        <AppSelect
+          value={region}
+          onChange={onRegionChange}
+          options={regionOptions}
+          aria-label="按国家或地区筛选"
+          size="md"
+        />
       </div>
     );
   }

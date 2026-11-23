@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertTriangle,
   Check,
@@ -47,6 +48,7 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { AppSelect } from "../components/AppSelect";
 import {
   BUILTIN_WALLPAPER_PRESETS,
   appActions,
@@ -89,6 +91,7 @@ interface ExtendedSettings {
   appendRules: string;
   overrideScriptPath: string;
   startupScriptPath: string;
+  compileAllNodes: boolean;
   startupPage: string;
   trayClickAction: string;
   closeToWindowless: boolean;
@@ -138,6 +141,7 @@ const DEFAULT_EXTENDED: ExtendedSettings = {
   appendRules: "",
   overrideScriptPath: "",
   startupScriptPath: "",
+  compileAllNodes: false,
   startupPage: "overview",
   trayClickAction: "toggle_main_window",
   closeToWindowless: true,
@@ -295,52 +299,52 @@ function renderGeoStatusSummary(
 
 const AGENT_DOCS = [
   {
-    id: "system",
-    title: "1. 常规与代理",
-    goal: "管理系统代理、防篡改守护、PAC 分流、虚拟网卡与本地监听端口。",
-    keys: "mixed_port, controller_port, controller_secret, dns_listen_port, system_proxy_enabled, proxy_guard_*, tun_stack_mode",
-    workflow: "确认端口空闲后开启系统代理；仅需接管非代理软件时再提权开启虚拟网卡。",
-    guardrails: "Windows 启用虚拟网卡需管理员权限；改动端口后记得刷新终端代理变量。",
+    id: "preaccel",
+    title: "1. 国内提速",
+    goal: "为非原生 443 节点提供国内中转加速，自动豁免原生 443 并防校园网门户误判。",
+    keys: "preaccel.enabled, preaccel.skip_443_native, preaccel.probe_url, preaccel.fallback_probe_url, relays[]",
+    workflow: "先测通国内中转节点并按优先级启用，故障时自动切换备线或回落直连。",
+    guardrails: "导出备份与诊断快照会自动脱敏，绝不泄露真实中转地址、端口与密码。",
   },
   {
-    id: "dns",
-    title: "2. 网络与 DNS",
-    goal: "独立控制核心与 DNS 的 IPv6 行为，精细配置 Fake-IP 与防污染上游。",
-    keys: "ipv6_core_enabled, ipv6_dns_enabled, enhanced-mode, fake-ip-filter, nameserver-policy, fallback-filter",
-    workflow: "开启 DNS 覆写与分流协同；内网与校时域名写入排除列表，国内走策略直连。",
-    guardrails: "遇到 IPv6 卡顿时先关闭 DNS 返回 IPv6，再单独排查核心 IPv6 转发。",
-  },
-  {
-    id: "core",
-    title: "3. 内核与工具",
-    goal: "维护附加规则、覆写/启动脚本、地理数据库更新及内核内存上限与热换。",
-    keys: "gomemlimit_mb (auto/48/64/96), append_rules, override_script_path, startup_script_path, compile_preview_yaml",
-    workflow: "改动规则或 DNS 后先预览最终编译配置，再重载内核或导出本地备份。",
-    guardrails: "日常轻载推荐自动或 48 MB 挡位；大规则集或高速下载可调至 64/96 MB。",
-  },
-  {
-    id: "groups",
-    title: "4. 多选组与测速",
-    goal: "配置粘性最优、条件池与负载均衡策略，配合隔离测速稳态选路。",
+    id: "multigroup",
+    title: "2. 智能多选组",
+    goal: "配置粘性最优、条件池与负载均衡策略，支持自定义权重公式与跨池兜底。",
     keys: "mode, hard_gates, trigger_rules, formula_expr, fallback_policy, cooldown_sec, hysteresis_pct",
     workflow: "先执行隔离测速获取节点指标，再调整评分权重、冷却时间与切换门槛。",
-    guardrails: "保持冷却秒数与切换门槛，避免短时网络波动触发频繁来回切换。",
+    guardrails: "保持合理的冷却秒数与切换迟滞门槛，避免短时网络抖动导致反复切节点。",
   },
   {
-    id: "preaccel",
-    title: "5. 国内提速",
-    goal: "为非原生 443 节点提供国内中转加速，自动豁免原生 443 并防门户误判。",
-    keys: "preaccel.enabled, skip_443_native, probe_url, fallback_probe_url",
-    workflow: "先测通中转节点再按优先级启用，故障时自动切换备线或回落直连。",
-    guardrails: "导出备份与诊断快照会自动脱敏，不会泄露真实中转地址与密钥。",
+    id: "probes",
+    title: "3. 隔离探针测速",
+    goal: "基于零干扰隔离注册表运行延迟、上下行速率、AI 解锁与 60 秒长连接稳定性探针。",
+    keys: "probes[], probe_kind (latency/upload/download/unlock_regex/keepalive/google_cn/external_cmd)",
+    workflow: "优先跑延迟或解锁档快速筛选，需要选路对比时再跑完整上下行与保活探针。",
+    guardrails: "外部脚本探针严禁携带明文密钥，所有测速均在独立隔离通道执行不影响主流量。",
   },
   {
-    id: "ui-cli",
-    title: "6. 外观与 CLI",
-    goal: "支持昼夜自动主题、本地壁纸与毛玻璃、无窗省内存及无头命令行。",
-    keys: "personalization.*, startup_page, tray_click_action, update.repo (JuryBu/CatCloud), catcloud CLI",
-    workflow: "日常建议开启关闭进无窗；自动化脚本与 AI 协作统一使用 catcloud --json。",
-    guardrails: "恢复纯色背景时自动关闭毛玻璃滤镜，保持零额外显存占用。",
+    id: "nodes_ingest",
+    title: "4. 节点导入与抓取",
+    goal: "支持多源订阅聚合、本地配置导入、友商配置迁移及只读进程/代理适配器抓取。",
+    keys: "subscriptions[], nodes[], update_interval_sec, multiplier, is_443_native, preaccel_override",
+    workflow: "导入或刷新订阅后按大洲/地区、协议和原生 443 标签筛选，批量加入智能多选组。",
+    guardrails: "拉取失败或内容为空时自动保留旧节点；所有导入凭据仅保存在本机隔离配置。",
+  },
+  {
+    id: "network_reload",
+    title: "5. 网络、DNS 与热重载",
+    goal: "管理系统代理、防篡改守护、虚拟网卡 TUN、独立 IPv6/Fake-IP 策略与三级热重载。",
+    keys: "mixed_port, controller_port, dns_listen_port, ipv6_core_enabled, ipv6_dns_enabled, tun_stack_mode, append_rules",
+    workflow: "改动规则或 DNS 后先预览最终编译 YAML，确认无误再触发内核热重载。",
+    guardrails: "Windows 启用 TUN 需管理员权限；遇到 IPv6 异常时先关闭 DNS 返回 IPv6 再排查。",
+  },
+  {
+    id: "updater_lifecycle",
+    title: "6. 无窗省内存与自动更新",
+    goal: "支持关闭进无窗省内存驻留、流式 GeoData 内存档位、下次启动自动更新及无头 CLI。",
+    keys: "gomemlimit_mb (auto/48/64/96), close_to_windowless, update.mode, update.repo, catcloud --json",
+    workflow: "日常建议开启关闭进无窗与自动省内存档；排障和 AI 协作统一用只读 CLI 与脱敏诊断包。",
+    guardrails: "自动更新仅在下次启动安全替换，不会在后台传输或代理高峰期强行打断网络连接。",
   },
 ] as const;
 
@@ -485,6 +489,7 @@ function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
       : "",
     overrideScriptPath: rules?.override_script_path ?? "",
     startupScriptPath: cr?.startup_script_path ?? "",
+    compileAllNodes: cr?.compile_all_nodes ?? false,
     startupPage: (() => {
       const raw = beh?.startup_page?.trim().toLowerCase();
       if (!raw || raw === "home") return "overview";
@@ -548,6 +553,7 @@ function buildExtendedPatch(ext: ExtendedSettings): Record<string, unknown> {
       block_quic_udp_443: ext.blockQuicUdp443,
     },
     core_runtime: {
+      compile_all_nodes: ext.compileAllNodes,
       startup_script_path: ext.startupScriptPath.trim() ? ext.startupScriptPath.trim() : null,
     },
     behavior: {
@@ -817,9 +823,13 @@ export function SettingsPage() {
   const wallpaperPreviewUrl = useAppSelector((s) => s.wallpaperPreviewUrl);
   const wallpaperError = useAppSelector((s) => s.wallpaperError);
   const settingsTabHint = useAppSelector((s) => s.settingsTabHint);
+  const settingsOpenAgentDocs = useAppSelector((s) => s.settingsOpenAgentDocs);
   const inTauri = isTauriEnv();
 
-  const [tab, setTab] = useState<SettingsTabId>(() => settingsTabHint ?? "system");
+  const [tab, setTab] = useState<SettingsTabId>(() =>
+    settingsOpenAgentDocs ? "updates" : (settingsTabHint ?? "system")
+  );
+  const devToolsSectionRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (settingsTabHint) {
@@ -843,7 +853,30 @@ export function SettingsPage() {
   const [wallpaperUrlInput, setWallpaperUrlInput] = useState("");
   const [imgLoadFailed, setImgLoadFailed] = useState(false);
   const [showAdvancedDns, setShowAdvancedDns] = useState(false);
-  const [showDevTools, setShowDevTools] = useState(false);
+  const [showDevTools, setShowDevTools] = useState(() => settingsOpenAgentDocs);
+  const [pendingScrollToDevTools, setPendingScrollToDevTools] = useState(
+    () => settingsOpenAgentDocs
+  );
+
+  useEffect(() => {
+    if (!settingsOpenAgentDocs) return;
+    setTab("updates");
+    setShowDevTools(true);
+    setPendingScrollToDevTools(true);
+    appActions.consumeSettingsOpenAgentDocs();
+  }, [settingsOpenAgentDocs]);
+
+  useEffect(() => {
+    if (!pendingScrollToDevTools || tab !== "updates" || !showDevTools) return;
+    const timerId = window.setTimeout(() => {
+      devToolsSectionRef.current?.scrollIntoView({
+        behavior: "smooth",
+        block: "start",
+      });
+      setPendingScrollToDevTools(false);
+    }, 80);
+    return () => window.clearTimeout(timerId);
+  }, [tab, showDevTools, pendingScrollToDevTools]);
   const [yamlPreview, setYamlPreview] = useState<string | null>(null);
   const [yamlSha, setYamlSha] = useState<string | null>(null);
   const [yamlLoading, setYamlLoading] = useState(false);
@@ -1021,10 +1054,19 @@ export function SettingsPage() {
         savedBasic = await catcloudApi.saveConfig(payload);
         await catcloudApi.saveExtendedSettings(buildExtendedPatch(ext));
       }
+      const syncedConfig: AppConfig = extDirty
+        ? {
+            ...savedBasic,
+            behavior: {
+              ...savedBasic.behavior,
+              minimize_to_tray_on_close: ext.closeToWindowless,
+            },
+          }
+        : savedBasic;
       dirtyRef.current = false;
       setDraftDirty(false);
       setExtDirty(false);
-      appActions.syncConfig(savedBasic);
+      appActions.syncConfig(syncedConfig);
       const rt = await catcloudApi.getRuntimeInfo();
       appActions.syncRuntime(rt);
       appActions.showToast("设置已保存并生效", "ok");
@@ -1325,24 +1367,7 @@ export function SettingsPage() {
   };
 
   const handleCopyDiagnostics = async () => {
-    let text = [
-      `CatCloud Diagnostic Snapshot (Sanitized)`,
-      `App: v${runtime.app_version} (${runtime.os_label}) | Core: ${runtime.core_name} ${runtime.core_version}`,
-      `Ports: mixed=${draft.mixed_port}, controller=127.0.0.1:${draft.controller_port}, dns=${draft.dns_listen_port}`,
-      `Mode: ${draft.proxy_mode} | SystemProxy=${draft.system_proxy_enabled} (guard=${draft.proxy_guard_enabled}/${draft.proxy_guard_interval_sec}s)`,
-      `TUN: ${draft.tun_enabled} (${draft.tun_stack_mode}, admin=${runtime.tun_admin_ready}) | UnifiedDelay=${draft.unified_delay}`,
-      `IPv6: core=${draft.ipv6_core_enabled}, dns=${draft.ipv6_dns_enabled} | GOMEMLIMIT=${draft.gomemlimit_mb === 0 ? "auto" : `${draft.gomemlimit_mb}MiB`}`,
-    ].join("\n");
-    if (inTauri) {
-      try {
-        const diag = await catcloudApi.exportSanitizedDiagnostics();
-        text = JSON.stringify(diag, null, 2);
-      } catch (err) {
-        appActions.showToast(`采集诊断报告失败：${formatErrorMessage(err)}`, "warn");
-        return;
-      }
-    }
-    await copyText(text, "脱敏诊断报告");
+    await appActions.copySanitizedDiagnosticsForAi();
   };
 
   const handleCopyAgentDoc = async (moduleId: string, label: string, fallbackMd: string) => {
@@ -1608,20 +1633,21 @@ export function SettingsPage() {
                 />
               </div>
               <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                <label className="flex items-center gap-2 text-xs text-[var(--muted)]">
+                <div className="flex items-center gap-2 text-xs text-[var(--muted)]">
                   <span>日志详细度</span>
-                  <select
+                  <AppSelect
+                    aria-label="内核日志详细度"
+                    size="sm"
                     value={ext.logLevel}
-                    onChange={(e) => patchExt("logLevel", e.target.value as LogLevel)}
-                    className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-xs text-[var(--text)]"
-                  >
-                    {LOG_LEVEL_OPTIONS.map((lv) => (
-                      <option key={lv.value} value={lv.value}>
-                        {lv.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    onChange={(v) => patchExt("logLevel", v as LogLevel)}
+                    options={LOG_LEVEL_OPTIONS.map((lv) => ({
+                      value: lv.value,
+                      label: lv.label,
+                    }))}
+                    className="min-w-[116px]"
+                    buttonClassName="rounded-lg"
+                  />
+                </div>
                 <button type="button" onClick={() => void handleLaunchUwp()} className={BTN_CLS}>
                   <Shield className="h-3.5 w-3.5" />
                   <span>查看本机应用网络放行状态</span>
@@ -1674,34 +1700,34 @@ export function SettingsPage() {
                 </div>
               </div>
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                <label className="text-[11px] text-[var(--muted)]">
-                  启动默认页面
-                  <select
+                <div className="text-[11px] text-[var(--muted)]">
+                  <span className="block">启动默认页面</span>
+                  <AppSelect
+                    aria-label="启动默认页面"
+                    size="sm"
                     value={ext.startupPage}
-                    onChange={(e) => patchExt("startupPage", e.target.value)}
-                    className={`${INPUT_CLS} mt-1`}
-                  >
-                    {STARTUP_PAGE_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="text-[11px] text-[var(--muted)]">
-                  单击托盘图标
-                  <select
+                    onChange={(v) => patchExt("startupPage", v)}
+                    options={STARTUP_PAGE_OPTIONS.map((opt) => ({
+                      value: opt.value,
+                      label: opt.label,
+                    }))}
+                    className="mt-1 w-full"
+                  />
+                </div>
+                <div className="text-[11px] text-[var(--muted)]">
+                  <span className="block">单击托盘图标</span>
+                  <AppSelect
+                    aria-label="单击托盘图标"
+                    size="sm"
                     value={ext.trayClickAction}
-                    onChange={(e) => patchExt("trayClickAction", e.target.value)}
-                    className={`${INPUT_CLS} mt-1`}
-                  >
-                    {TRAY_CLICK_OPTIONS.map((opt) => (
-                      <option key={opt.value} value={opt.value}>
-                        {opt.label}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                    onChange={(v) => patchExt("trayClickAction", v)}
+                    options={TRAY_CLICK_OPTIONS.map((opt) => ({
+                      value: opt.value,
+                      label: opt.label,
+                    }))}
+                    className="mt-1 w-full"
+                  />
+                </div>
               </div>
             </Card>
 
@@ -2557,6 +2583,15 @@ export function SettingsPage() {
                     ]}
                   />
                 </div>
+                <p className="text-[11px] leading-relaxed text-[var(--muted)]">
+                  「自动」省内存档已自动启用流式 GeoData 加载与活跃节点精简编译，大幅降低内核常驻内存，无需额外手动调优。
+                </p>
+                <SwitchRow
+                  title="全量加载所有订阅节点（兼容模式）"
+                  desc="默认仅加载当前要用的节点大幅省内存；仅当你在外部控制器里要一次看到几百个节点时才需开启"
+                  checked={ext.compileAllNodes}
+                  onChange={(v) => patchExt("compileAllNodes", v)}
+                />
                 <div className="flex flex-wrap items-center gap-2 border-t border-[var(--line)]/60 pt-2">
                   <input
                     value={coreBinaryPath}
@@ -2612,17 +2647,22 @@ export function SettingsPage() {
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex flex-wrap items-center gap-2 text-xs">
                   <span className="font-medium text-[var(--text)]">外部控制面板：</span>
-                  <select
-                    value={Math.min(selectedWebUiIdx, Math.max(0, ext.webuiUrls.length - 1))}
-                    onChange={(e) => setSelectedWebUiIdx(Number(e.target.value) || 0)}
-                    className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  >
-                    {ext.webuiUrls.map((item, idx) => (
-                      <option key={`${item.name}-${idx}`} value={idx}>
-                        {item.name}
-                      </option>
-                    ))}
-                  </select>
+                  <AppSelect
+                    aria-label="外部控制面板"
+                    size="sm"
+                    value={String(
+                      Math.min(selectedWebUiIdx, Math.max(0, ext.webuiUrls.length - 1))
+                    )}
+                    onChange={(v) => setSelectedWebUiIdx(Number(v) || 0)}
+                    options={ext.webuiUrls.map((item, idx) => ({
+                      value: String(idx),
+                      label: item.name,
+                    }))}
+                    placeholder="暂无面板书签"
+                    disabled={ext.webuiUrls.length === 0}
+                    className="min-w-[150px]"
+                    buttonClassName="rounded-lg"
+                  />
                 </div>
                 <button type="button" onClick={() => void handleOpenWebUi()} className={BTN_CLS}>
                   <ExternalLink className="h-3.5 w-3.5" />
@@ -2672,7 +2712,7 @@ export function SettingsPage() {
                 className={BTN_CLS}
               >
                 <Copy className="h-3.5 w-3.5" />
-                <span>复制脱敏诊断报告</span>
+                <span>🤖 复制诊断包给 AI</span>
               </button>
             </div>
           </Card>
@@ -2708,25 +2748,28 @@ export function SettingsPage() {
                   className={`${INPUT_CLS} mt-1 cc-mono`}
                 />
               </label>
-              <label className="text-[11px] text-[var(--muted)]">
-                自动更新模式
-                <select
+              <div className="text-[11px] text-[var(--muted)]">
+                <span className="block">自动更新模式</span>
+                <AppSelect
+                  aria-label="自动更新模式"
+                  size="sm"
                   value={draft.update.mode}
-                  onChange={(e) =>
+                  onChange={(v) =>
                     patchDraft({
                       update: {
                         ...draft.update,
-                        mode: e.target.value as AppConfig["update"]["mode"],
+                        mode: v as AppConfig["update"]["mode"],
                       },
                     })
                   }
-                  className={`${INPUT_CLS} mt-1`}
-                >
-                  <option value="next_launch">下次启动自动更新（推荐）</option>
-                  <option value="manual">仅手动检查提醒</option>
-                  <option value="auto_restart">下载后自动重启</option>
-                </select>
-              </label>
+                  options={[
+                    { value: "next_launch", label: "下次启动自动更新（推荐）" },
+                    { value: "manual", label: "仅手动检查提醒" },
+                    { value: "auto_restart", label: "下载后自动重启" },
+                  ]}
+                  className="mt-1 w-full"
+                />
+              </div>
               <label className="text-[11px] text-[var(--muted)]">
                 自动检查间隔（分钟）
                 <input
@@ -2763,7 +2806,10 @@ export function SettingsPage() {
           </Card>
 
           {/* Collapsible Developer & AI Assistant Integration Tools */}
-          <section className="cc-card cc-glass overflow-hidden rounded-2xl">
+          <section
+            ref={devToolsSectionRef}
+            className="cc-card cc-glass overflow-hidden rounded-2xl"
+          >
             <button
               type="button"
               onClick={() => setShowDevTools((open) => !open)}
@@ -2774,7 +2820,7 @@ export function SettingsPage() {
                   开发者与 AI 助手集成工具
                 </div>
                 <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                  包含 AI 协作说明文档与命令行速查，普通使用无需展开
+                  包含一键脱敏诊断包、AI 协作说明文档与只读命令行速查，普通使用无需展开
                 </p>
               </div>
               <span className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
@@ -2788,7 +2834,22 @@ export function SettingsPage() {
             </button>
 
             {showDevTools && (
-              <div className="grid grid-cols-1 gap-4 border-t border-[var(--line)] p-4 lg:grid-cols-2">
+              <div className="space-y-4 border-t border-[var(--line)] p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--accent)]/30 bg-[var(--accent-soft)]/35 px-3.5 py-2.5">
+                  <div className="text-xs text-[var(--text-secondary)]">
+                    <strong className="text-[var(--text)]">需要 AI 帮你排障或调分流？</strong>
+                    一键复制脱敏后的运行状态、最近日志与只读命令指引，直接粘贴给 Antigravity / Codex / ChatGPT。
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleCopyDiagnostics()}
+                    className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                  >
+                    <Copy className="h-3.5 w-3.5" />
+                    <span>🤖 复制诊断包给 AI</span>
+                  </button>
+                </div>
+                <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
                 <Card
                   title="AI 协作说明文档"
                   sub="点选模块预览，或一键复制发给 AI 辅助排障与配置"
@@ -2891,6 +2952,7 @@ export function SettingsPage() {
                     ))}
                   </div>
                 </Card>
+                </div>
               </div>
             )}
           </section>
@@ -2898,65 +2960,68 @@ export function SettingsPage() {
       )}
 
       {/* Backup Import Two-Step Confirmation Modal */}
-      {confirmImportBackupOpen && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-          onClick={() => setConfirmImportBackupOpen(false)}
-        >
+      {confirmImportBackupOpen &&
+        typeof document !== "undefined" &&
+        createPortal(
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="确认导入备份配置"
-            onClick={(e) => e.stopPropagation()}
-            className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => setConfirmImportBackupOpen(false)}
           >
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-start gap-3">
-                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--amber-soft)] text-[var(--amber)]">
-                  <AlertTriangle className="h-4 w-4" />
-                </span>
-                <div className="min-w-0">
-                  <h3 className="text-sm font-semibold text-[var(--text)]">
-                    确认导入配置备份？
-                  </h3>
-                  <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                    导入备份将会覆盖当前的代理参数、智能多选组和国内中转配置。建议先点「导出备份」保留一份当前配置，再继续导入。
-                  </p>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="确认导入备份配置"
+              onClick={(e) => e.stopPropagation()}
+              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--amber-soft)] text-[var(--amber)]">
+                    <AlertTriangle className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                      确认导入配置备份？
+                    </h3>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                      导入备份将会覆盖当前的代理参数、智能多选组和国内中转配置。建议先点「导出备份」保留一份当前配置，再继续导入。
+                    </p>
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  onClick={() => setConfirmImportBackupOpen(false)}
+                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
+                  aria-label="关闭弹窗"
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
-              <button
-                type="button"
-                onClick={() => setConfirmImportBackupOpen(false)}
-                className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
-                aria-label="关闭弹窗"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
 
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setConfirmImportBackupOpen(false)}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)]"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setConfirmImportBackupOpen(false);
-                  openImportBackupPicker();
-                }}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-              >
-                <Upload className="h-3.5 w-3.5" />
-                <span>确认覆盖并选择文件</span>
-              </button>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setConfirmImportBackupOpen(false)}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)]"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setConfirmImportBackupOpen(false);
+                    openImportBackupPicker();
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                >
+                  <Upload className="h-3.5 w-3.5" />
+                  <span>确认覆盖并选择文件</span>
+                </button>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

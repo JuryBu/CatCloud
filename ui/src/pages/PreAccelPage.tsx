@@ -25,6 +25,7 @@ import {
   Zap,
 } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   type AppConfig,
   type PreAccelComparisonResult,
@@ -33,6 +34,7 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { AppSelect } from "../components/AppSelect";
 import { appActions, useAppSelector } from "../store/appStore";
 
 type AddModalTab = "manual" | "import";
@@ -190,10 +192,24 @@ function computeExpiryInfo(expiresAt: string | null): {
 }
 
 function getRelayLatencyColor(ms: number | null): string {
-  if (ms === null) return "var(--muted)";
+  if (ms === null || !Number.isFinite(ms) || ms <= 0) return "var(--muted)";
   if (ms <= 60) return "var(--green)";
   if (ms <= 150) return "var(--amber)";
   return "var(--red)";
+}
+
+function formatLatencyDisplay(ms: number | null | undefined, emptyLabel = "--"): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms <= 0) {
+    return emptyLabel;
+  }
+  if (ms < 0.5) {
+    return "<1 ms";
+  }
+  return `${Math.round(ms)} ms`;
+}
+
+function hasValidLatency(ms: number | null | undefined): ms is number {
+  return ms !== null && ms !== undefined && Number.isFinite(ms) && ms > 0;
 }
 
 interface RawRelayInput {
@@ -603,7 +619,7 @@ export function PreAccelPage() {
 
   const relayLatencyStats = useMemo(() => {
     const enabledList = sortedRelays.filter((r) => r.enabled);
-    const probed = enabledList.filter((r) => r.last_probe_ms !== null);
+    const probed = enabledList.filter((r) => hasValidLatency(r.last_probe_ms));
     const bestMs =
       probed.length > 0
         ? Math.min(...probed.map((r) => r.last_probe_ms as number))
@@ -1097,7 +1113,9 @@ export function PreAccelPage() {
       if (item && !item.ok) {
         appActions.showToast(`测速失败：${item.error ?? "连接超时"}`, "warn");
       } else {
-        const msText = item?.latency_ms != null ? `（${Math.round(item.latency_ms)} ms）` : "";
+        const msText = hasValidLatency(item?.latency_ms)
+          ? `（${formatLatencyDisplay(item.latency_ms)}）`
+          : "";
         appActions.showToast(`中转线路连通正常${msText}`, "ok");
       }
     } catch (err) {
@@ -1236,10 +1254,18 @@ export function PreAccelPage() {
       } else {
         const errParts: string[] = [];
         if (!result.accelerated.ok) {
-          errParts.push(`走中转失败（${result.accelerated.error ?? "连接超时"}）`);
+          const latHint = hasValidLatency(result.accelerated.latency_ms)
+            ? `延迟 ${formatLatencyDisplay(result.accelerated.latency_ms)}，`
+            : "";
+          const reason = result.accelerated.error?.trim() || "连接超时";
+          errParts.push(`走中转（${latHint}${reason}）`);
         }
         if (!result.direct.ok) {
-          errParts.push(`普通直连失败（${result.direct.error ?? "连接超时"}）`);
+          const latHint = hasValidLatency(result.direct.latency_ms)
+            ? `延迟 ${formatLatencyDisplay(result.direct.latency_ms)}，`
+            : "";
+          const reason = result.direct.error?.trim() || "连接超时";
+          errParts.push(`普通直连（${latHint}${reason}）`);
         }
         appActions.showToast(
           errParts.length > 0 ? errParts.join("；") : "本次对比测速未全部成功，请检查中转与节点状态",
@@ -1662,7 +1688,7 @@ export function PreAccelPage() {
                       style={{ color: getRelayLatencyColor(relay.last_probe_ms) }}
                     >
                       {relay.last_probe_ms !== null
-                        ? `${Math.round(relay.last_probe_ms)} ms`
+                        ? formatLatencyDisplay(relay.last_probe_ms, "--")
                         : "待测速"}
                     </div>
                     <div className="mt-0.5 text-[10px] text-[var(--muted)]">
@@ -1795,40 +1821,38 @@ export function PreAccelPage() {
                 {relayLatencyStats.probedCount}
               </strong>{" "}
               条
-              {relayLatencyStats.bestMs !== null && (
+              {hasValidLatency(relayLatencyStats.bestMs) && (
                 <span className="cc-mono text-[var(--muted)]">
                   {" "}
-                  · 最快 {Math.round(relayLatencyStats.bestMs)} ms
+                  · 最快 {formatLatencyDisplay(relayLatencyStats.bestMs)}
                 </span>
               )}
             </span>
 
             <div className="flex items-center gap-1.5">
-              <label
-                htmlFor="preaccel-compare-node"
-                className="shrink-0 text-[11px] text-[var(--muted)]"
-              >
-                对照节点
-              </label>
+              <span className="shrink-0 text-[11px] text-[var(--muted)]">对照节点</span>
               {benchmarkableNodes.length > 0 || homeCurrentNode ? (
-                <select
-                  id="preaccel-compare-node"
+                <AppSelect
+                  aria-label="对照节点"
+                  size="xs"
                   value={resolvedCompareNodeId}
                   disabled={benchmarking}
-                  onChange={(e) => setSelectedCompareNodeId(e.target.value)}
-                  className="max-w-[240px] truncate rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none transition-colors focus:border-[var(--accent)] disabled:opacity-60"
-                >
-                  <option value="">
-                    {homeCurrentNode
-                      ? `跟随首页当前节点（${homeCurrentNode.name}）`
-                      : "跟随首页当前节点"}
-                  </option>
-                  {otherBenchmarkableNodes.map((node) => (
-                    <option key={node.id} value={node.id}>
-                      {node.name}
-                    </option>
-                  ))}
-                </select>
+                  onChange={setSelectedCompareNodeId}
+                  options={[
+                    {
+                      value: "",
+                      label: homeCurrentNode
+                        ? `跟随首页当前节点（${homeCurrentNode.name}）`
+                        : "跟随首页当前节点",
+                    },
+                    ...otherBenchmarkableNodes.map((node) => ({
+                      value: node.id,
+                      label: node.name,
+                    })),
+                  ]}
+                  className="max-w-[240px]"
+                  buttonClassName="bg-[var(--card)]"
+                />
               ) : (
                 <span className="text-[11px] text-[var(--muted)]">暂未导入海外节点</span>
               )}
@@ -1933,168 +1957,224 @@ export function PreAccelPage() {
 
               <div className="space-y-3">
                 {/* 走国内中转 */}
-                <div className="rounded-xl border border-[var(--green)]/35 bg-[var(--bg-elevated)] p-3.5">
-                  <div className="flex items-center justify-between gap-2 text-xs">
-                    <span className="font-semibold text-[var(--text)]">
-                      开启国内提速（走国内中转）
-                    </span>
-                    <span
-                      className={`cc-mono text-[11px] ${
-                        comparison.accelerated.ok ? "text-[var(--green)]" : "text-[var(--red)]"
-                      }`}
-                    >
-                      {comparison.accelerated.ok
-                        ? comparison.accelerated.latency_ms !== null
-                          ? `延迟 ${Math.round(comparison.accelerated.latency_ms)} ms`
-                          : "测速成功"
-                        : "测速失败"}
-                    </span>
-                  </div>
-                  <div className="mt-2.5 space-y-2">
-                    <div>
-                      <div className="mb-1 flex justify-between text-[11px]">
-                        <span className="text-[var(--muted)]">上传速度</span>
-                        <span className="cc-mono cc-tabular font-semibold text-[var(--green)]">
-                          {comparison.accelerated.up_mbps !== null
-                            ? `${comparison.accelerated.up_mbps.toFixed(1)} Mbps`
-                            : "测速失败"}
+                {(() => {
+                  const side = comparison.accelerated;
+                  const sideHasLatency = hasValidLatency(side.latency_ms);
+                  const sideError = side.error?.trim() || "";
+                  return (
+                    <div className="rounded-xl border border-[var(--green)]/35 bg-[var(--bg-elevated)] p-3.5">
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="font-semibold text-[var(--text)]">
+                          开启国内提速（走国内中转）
+                        </span>
+                        <span
+                          className={`cc-mono text-[11px] ${
+                            side.ok
+                              ? "text-[var(--green)]"
+                              : sideHasLatency
+                                ? "text-[var(--amber)]"
+                                : "text-[var(--red)]"
+                          }`}
+                        >
+                          {sideHasLatency
+                            ? `延迟 ${formatLatencyDisplay(side.latency_ms)}${
+                                side.ok ? "" : " · 部分超时"
+                              }`
+                            : side.ok
+                              ? "测速成功"
+                              : "测速失败"}
                         </span>
                       </div>
-                      <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                        <div
-                          className="h-full rounded-full bg-[var(--green)] transition-all duration-300"
-                          style={{
-                            width:
-                              comparison.accelerated.up_mbps !== null &&
-                              comparison.accelerated.up_mbps > 0
-                                ? `${Math.max(
-                                    3,
-                                    Math.min(
-                                      100,
-                                      (comparison.accelerated.up_mbps / maxCompareUpMbps) * 100
-                                    )
-                                  )}%`
-                                : "0%",
-                          }}
-                        />
+                      <div className="mt-2.5 space-y-2">
+                        <div>
+                          <div className="mb-1 flex justify-between text-[11px]">
+                            <span className="text-[var(--muted)]">上传速度</span>
+                            <span
+                              className={`cc-mono cc-tabular font-semibold ${
+                                side.up_mbps !== null
+                                  ? "text-[var(--green)]"
+                                  : "text-[var(--muted)]"
+                              }`}
+                            >
+                              {side.up_mbps !== null
+                                ? `${side.up_mbps.toFixed(1)} Mbps`
+                                : sideHasLatency
+                                  ? "测速超时"
+                                  : "未测出"}
+                            </span>
+                          </div>
+                          <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                            <div
+                              className="h-full rounded-full bg-[var(--green)] transition-all duration-300"
+                              style={{
+                                width:
+                                  side.up_mbps !== null && side.up_mbps > 0
+                                    ? `${Math.max(
+                                        3,
+                                        Math.min(100, (side.up_mbps / maxCompareUpMbps) * 100)
+                                      )}%`
+                                    : "0%",
+                              }}
+                            />
+                          </div>
+                        </div>
+                        <div>
+                          <div className="mb-1 flex justify-between text-[11px]">
+                            <span className="text-[var(--muted)]">下载速度</span>
+                            <span
+                              className={`cc-mono cc-tabular font-medium ${
+                                side.down_mbps !== null
+                                  ? "text-[var(--sky)]"
+                                  : "text-[var(--muted)]"
+                              }`}
+                            >
+                              {side.down_mbps !== null
+                                ? `${side.down_mbps.toFixed(1)} Mbps`
+                                : sideHasLatency
+                                  ? "测速超时"
+                                  : "未测出"}
+                            </span>
+                          </div>
+                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                            <div
+                              className="h-full rounded-full bg-[var(--sky)] transition-all duration-300"
+                              style={{
+                                width:
+                                  side.down_mbps !== null && side.down_mbps > 0
+                                    ? `${Math.max(
+                                        3,
+                                        Math.min(100, (side.down_mbps / maxCompareDownMbps) * 100)
+                                      )}%`
+                                    : "0%",
+                              }}
+                            />
+                          </div>
+                        </div>
+                        {sideError && (
+                          <p
+                            className={`text-[11px] leading-relaxed ${
+                              !side.ok && !sideHasLatency
+                                ? "text-[var(--red)]"
+                                : "text-[var(--amber)]"
+                            }`}
+                          >
+                            {!side.ok && !sideHasLatency ? "失败原因：" : "异常说明："}
+                            {sideError}
+                          </p>
+                        )}
                       </div>
                     </div>
-                    <div>
-                      <div className="mb-1 flex justify-between text-[11px]">
-                        <span className="text-[var(--muted)]">下载速度</span>
-                        <span className="cc-mono cc-tabular font-medium text-[var(--sky)]">
-                          {comparison.accelerated.down_mbps !== null
-                            ? `${comparison.accelerated.down_mbps.toFixed(1)} Mbps`
-                            : "测速失败"}
-                        </span>
-                      </div>
-                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                        <div
-                          className="h-full rounded-full bg-[var(--sky)] transition-all duration-300"
-                          style={{
-                            width:
-                              comparison.accelerated.down_mbps !== null &&
-                              comparison.accelerated.down_mbps > 0
-                                ? `${Math.max(
-                                    3,
-                                    Math.min(
-                                      100,
-                                      (comparison.accelerated.down_mbps / maxCompareDownMbps) * 100
-                                    )
-                                  )}%`
-                                : "0%",
-                          }}
-                        />
-                      </div>
-                    </div>
-                    {!comparison.accelerated.ok && comparison.accelerated.error && (
-                      <p className="text-[11px] text-[var(--red)]">
-                        失败原因：{comparison.accelerated.error}
-                      </p>
-                    )}
-                  </div>
-                </div>
+                  );
+                })()}
 
                 {/* 普通直连 */}
-                <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3.5">
-                  <div className="flex items-center justify-between gap-2 text-xs">
-                    <span className="font-semibold text-[var(--text)]">普通线路直连</span>
-                    <span
-                      className={`cc-mono text-[11px] ${
-                        comparison.direct.ok ? "text-[var(--amber)]" : "text-[var(--red)]"
-                      }`}
-                    >
-                      {comparison.direct.ok
-                        ? comparison.direct.latency_ms !== null
-                          ? `延迟 ${Math.round(comparison.direct.latency_ms)} ms`
-                          : "测速成功"
-                        : "测速失败"}
-                    </span>
-                  </div>
-                  <div className="mt-2.5 space-y-2">
-                    <div>
-                      <div className="mb-1 flex justify-between text-[11px]">
-                        <span className="text-[var(--muted)]">上传速度</span>
-                        <span className="cc-mono cc-tabular font-semibold text-[var(--amber)]">
-                          {comparison.direct.up_mbps !== null
-                            ? `${comparison.direct.up_mbps.toFixed(1)} Mbps`
-                            : "测速失败"}
+                {(() => {
+                  const side = comparison.direct;
+                  const sideHasLatency = hasValidLatency(side.latency_ms);
+                  const sideError = side.error?.trim() || "";
+                  return (
+                    <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3.5">
+                      <div className="flex items-center justify-between gap-2 text-xs">
+                        <span className="font-semibold text-[var(--text)]">普通线路直连</span>
+                        <span
+                          className={`cc-mono text-[11px] ${
+                            side.ok
+                              ? "text-[var(--amber)]"
+                              : sideHasLatency
+                                ? "text-[var(--amber)]"
+                                : "text-[var(--red)]"
+                          }`}
+                        >
+                          {sideHasLatency
+                            ? `延迟 ${formatLatencyDisplay(side.latency_ms)}${
+                                side.ok ? "" : " · 部分超时"
+                              }`
+                            : side.ok
+                              ? "测速成功"
+                              : "测速失败"}
                         </span>
                       </div>
-                      <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                        <div
-                          className="h-full rounded-full bg-[var(--amber)] transition-all duration-300"
-                          style={{
-                            width:
-                              comparison.direct.up_mbps !== null &&
-                              comparison.direct.up_mbps > 0
-                                ? `${Math.max(
-                                    3,
-                                    Math.min(
-                                      100,
-                                      (comparison.direct.up_mbps / maxCompareUpMbps) * 100
-                                    )
-                                  )}%`
-                                : "0%",
-                          }}
-                        />
+                      <div className="mt-2.5 space-y-2">
+                        <div>
+                          <div className="mb-1 flex justify-between text-[11px]">
+                            <span className="text-[var(--muted)]">上传速度</span>
+                            <span
+                              className={`cc-mono cc-tabular font-semibold ${
+                                side.up_mbps !== null
+                                  ? "text-[var(--amber)]"
+                                  : "text-[var(--muted)]"
+                              }`}
+                            >
+                              {side.up_mbps !== null
+                                ? `${side.up_mbps.toFixed(1)} Mbps`
+                                : sideHasLatency
+                                  ? "测速超时"
+                                  : "未测出"}
+                            </span>
+                          </div>
+                          <div className="h-2 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                            <div
+                              className="h-full rounded-full bg-[var(--amber)] transition-all duration-300"
+                              style={{
+                                width:
+                                  side.up_mbps !== null && side.up_mbps > 0
+                                    ? `${Math.max(
+                                        3,
+                                        Math.min(100, (side.up_mbps / maxCompareUpMbps) * 100)
+                                      )}%`
+                                    : "0%",
+                              }}
+                            />
+                          </div>
+                        </div>
+                        <div>
+                          <div className="mb-1 flex justify-between text-[11px]">
+                            <span className="text-[var(--muted)]">下载速度</span>
+                            <span
+                              className={`cc-mono cc-tabular font-medium ${
+                                side.down_mbps !== null
+                                  ? "text-[var(--text-secondary)]"
+                                  : "text-[var(--muted)]"
+                              }`}
+                            >
+                              {side.down_mbps !== null
+                                ? `${side.down_mbps.toFixed(1)} Mbps`
+                                : sideHasLatency
+                                  ? "测速超时"
+                                  : "未测出"}
+                            </span>
+                          </div>
+                          <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
+                            <div
+                              className="h-full rounded-full bg-[var(--text-secondary)]/65 transition-all duration-300"
+                              style={{
+                                width:
+                                  side.down_mbps !== null && side.down_mbps > 0
+                                    ? `${Math.max(
+                                        3,
+                                        Math.min(100, (side.down_mbps / maxCompareDownMbps) * 100)
+                                      )}%`
+                                    : "0%",
+                              }}
+                            />
+                          </div>
+                        </div>
+                        {sideError && (
+                          <p
+                            className={`text-[11px] leading-relaxed ${
+                              !side.ok && !sideHasLatency
+                                ? "text-[var(--red)]"
+                                : "text-[var(--amber)]"
+                            }`}
+                          >
+                            {!side.ok && !sideHasLatency ? "失败原因：" : "异常说明："}
+                            {sideError}
+                          </p>
+                        )}
                       </div>
                     </div>
-                    <div>
-                      <div className="mb-1 flex justify-between text-[11px]">
-                        <span className="text-[var(--muted)]">下载速度</span>
-                        <span className="cc-mono cc-tabular font-medium text-[var(--text-secondary)]">
-                          {comparison.direct.down_mbps !== null
-                            ? `${comparison.direct.down_mbps.toFixed(1)} Mbps`
-                            : "测速失败"}
-                        </span>
-                      </div>
-                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-[var(--card)]">
-                        <div
-                          className="h-full rounded-full bg-[var(--text-secondary)]/65 transition-all duration-300"
-                          style={{
-                            width:
-                              comparison.direct.down_mbps !== null &&
-                              comparison.direct.down_mbps > 0
-                                ? `${Math.max(
-                                    3,
-                                    Math.min(
-                                      100,
-                                      (comparison.direct.down_mbps / maxCompareDownMbps) * 100
-                                    )
-                                  )}%`
-                                : "0%",
-                          }}
-                        />
-                      </div>
-                    </div>
-                    {!comparison.direct.ok && comparison.direct.error && (
-                      <p className="text-[11px] text-[var(--red)]">
-                        失败原因：{comparison.direct.error}
-                      </p>
-                    )}
-                  </div>
-                </div>
+                  );
+                })()}
               </div>
 
               {comparisonError && (
@@ -2266,13 +2346,15 @@ export function PreAccelPage() {
       {/* ====================================================================
        * 弹窗 1：添加中转线路（手动填表添加 + 粘贴导入码 / JSON 双标签）
        * ==================================================================== */}
-      {showAddModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-          onClick={() => {
-            if (!savingManual && !importing) setShowAddModal(false);
-          }}
-        >
+      {showAddModal &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => {
+              if (!savingManual && !importing) setShowAddModal(false);
+            }}
+          >
           <div
             role="dialog"
             aria-modal="true"
@@ -2426,23 +2508,24 @@ export function PreAccelPage() {
 
                 <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                   <div>
-                    <label className="mb-1 block text-[11px] font-medium text-[var(--text-secondary)]">
+                    <span className="mb-1 block text-[11px] font-medium text-[var(--text-secondary)]">
                       连接协议
-                    </label>
-                    <select
+                    </span>
+                    <AppSelect
+                      aria-label="连接协议"
+                      size="md"
                       value={manualProtocol}
-                      onChange={(e) => {
-                        setManualProtocol(e.target.value);
+                      onChange={(v) => {
+                        setManualProtocol(v);
                         setManualError(null);
                       }}
-                      className={INPUT_CLS}
-                    >
-                      {RELAY_PROTOCOL_OPTIONS.map((opt) => (
-                        <option key={opt.value} value={opt.value}>
-                          {opt.label}
-                        </option>
-                      ))}
-                    </select>
+                      options={RELAY_PROTOCOL_OPTIONS.map((opt) => ({
+                        value: opt.value,
+                        label: opt.label,
+                      }))}
+                      className="w-full"
+                      buttonClassName="bg-[var(--card)]"
+                    />
                   </div>
 
                   <div>
@@ -2604,17 +2687,20 @@ export function PreAccelPage() {
               </form>
             )}
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* ====================================================================
        * 弹窗 2：国内连通检测地址（华为 / 小米 204 + 自定义）
        * ==================================================================== */}
-      {showProbeModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-          onClick={() => setShowProbeModal(false)}
-        >
+      {showProbeModal &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => setShowProbeModal(false)}
+          >
           <div
             role="dialog"
             aria-modal="true"
@@ -2708,27 +2794,30 @@ export function PreAccelPage() {
                 >
                   关闭
                 </button>
-                <button
-                  type="submit"
-                  disabled={!probeValidation.ok}
-                  className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-45"
-                >
-                  保存地址
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+                  <button
+                    type="submit"
+                    disabled={!probeValidation.ok}
+                    className="rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-45"
+                  >
+                    保存地址
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>,
+          document.body
+        )}
 
       {/* ====================================================================
        * 弹窗 3：给 AI 助手的部署说明
        * ==================================================================== */}
-      {showGuideModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-          onClick={() => setShowGuideModal(false)}
-        >
+      {showGuideModal &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => setShowGuideModal(false)}
+          >
           <div
             role="dialog"
             aria-modal="true"
@@ -2777,78 +2866,82 @@ export function PreAccelPage() {
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
 
       {/* ====================================================================
        * 弹窗 4：删除中转线路二次确认
        * ==================================================================== */}
-      {pendingDeleteRelay && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-          onClick={() => {
-            if (!deletingRelay) setPendingDeleteRelay(null);
-          }}
-        >
+      {pendingDeleteRelay &&
+        typeof document !== "undefined" &&
+        createPortal(
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="确认删除国内中转机"
-            onClick={(e) => e.stopPropagation()}
-            className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => {
+              if (!deletingRelay) setPendingDeleteRelay(null);
+            }}
           >
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-start gap-3">
-                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--red-soft)] text-[var(--red)]">
-                  <AlertTriangle className="h-4 w-4" />
-                </span>
-                <div className="min-w-0">
-                  <h3 className="text-sm font-semibold text-[var(--text)]">
-                    确认删除国内中转机？
-                  </h3>
-                  <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                    即将移除中转线路「
-                    <span className="font-semibold text-[var(--text)]">
-                      {pendingDeleteRelay.name}
-                    </span>
-                    」（<span className="cc-mono">{pendingDeleteRelay.server}:{pendingDeleteRelay.port}</span>
-                    ）。删除后无法撤销，如仍在使用将自动回落至其它中转或直连。
-                  </p>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="确认删除国内中转机"
+              onClick={(e) => e.stopPropagation()}
+              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--red-soft)] text-[var(--red)]">
+                    <AlertTriangle className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                      确认删除国内中转机？
+                    </h3>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                      即将移除中转线路「
+                      <span className="font-semibold text-[var(--text)]">
+                        {pendingDeleteRelay.name}
+                      </span>
+                      」（<span className="cc-mono">{pendingDeleteRelay.server}:{pendingDeleteRelay.port}</span>
+                      ）。删除后无法撤销，如仍在使用将自动回落至其它中转或直连。
+                    </p>
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  disabled={deletingRelay}
+                  onClick={() => setPendingDeleteRelay(null)}
+                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+                  aria-label="关闭弹窗"
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
-              <button
-                type="button"
-                disabled={deletingRelay}
-                onClick={() => setPendingDeleteRelay(null)}
-                className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
-                aria-label="关闭弹窗"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
 
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                disabled={deletingRelay}
-                onClick={() => setPendingDeleteRelay(null)}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                disabled={deletingRelay}
-                onClick={() => void handleConfirmRemoveRelay()}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--red)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                <span>{deletingRelay ? "删除中…" : "确认删除"}</span>
-              </button>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={deletingRelay}
+                  onClick={() => setPendingDeleteRelay(null)}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={deletingRelay}
+                  onClick={() => void handleConfirmRemoveRelay()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--red)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>{deletingRelay ? "删除中…" : "确认删除"}</span>
+                </button>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

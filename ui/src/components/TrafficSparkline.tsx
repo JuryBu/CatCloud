@@ -101,17 +101,65 @@ interface SmoothPathResult {
   ys: Float64Array;
 }
 
+interface SparklineScratch {
+  capacity: number;
+  xs: Float64Array;
+  upSlice: Float64Array;
+  downSlice: Float64Array;
+  tsSlice: Float64Array;
+  downYs: Float64Array;
+  upYs: Float64Array;
+  dx: Float64Array;
+  slope: Float64Array;
+  m: Float64Array;
+}
+
+const EMPTY_F64 = new Float64Array(0);
+const EMPTY_GEOM: SmoothPathResult = {
+  linePath: "",
+  areaPath: "",
+  xs: EMPTY_F64,
+  ys: EMPTY_F64,
+};
+
+function ensureScratchCapacity(
+  existing: SparklineScratch | null,
+  needed: number
+): SparklineScratch {
+  if (existing && existing.capacity >= needed) {
+    return existing;
+  }
+  const capacity = Math.max(needed, 64);
+  return {
+    capacity,
+    xs: new Float64Array(capacity),
+    upSlice: new Float64Array(capacity),
+    downSlice: new Float64Array(capacity),
+    tsSlice: new Float64Array(capacity),
+    downYs: new Float64Array(capacity),
+    upYs: new Float64Array(capacity),
+    dx: new Float64Array(capacity),
+    slope: new Float64Array(capacity),
+    m: new Float64Array(capacity),
+  };
+}
+
 /**
  * Fritsch-Carlson Monotone Cubic Hermite Spline builder over timestamp-aligned coordinates.
  * Guarantees:
  * 1) Curve passes EXACTLY through every (xs[i], ys[i]) — zero peak shrinkage, hover dots sit right on the stroke.
  * 2) Strictly monotone between samples — never overshoots below baseline or above ceiling.
  * 3) Automatically splits across time gaps (> SEGMENT_GAP_MS) so restarts/pauses never draw fake diagonal bridges.
+ * 4) Reuses caller-provided scratch Float64Arrays for zero steady-state typed-array allocations.
  */
 function buildTimeAlignedPath(
   xs: Float64Array,
   values: Float64Array,
   ts: Float64Array,
+  ysOut: Float64Array,
+  dxBuf: Float64Array,
+  slopeBuf: Float64Array,
+  mBuf: Float64Array,
   count: number,
   scaleMax: number,
   scaleMode: ScaleMode,
@@ -119,9 +167,8 @@ function buildTimeAlignedPath(
   padTop: number,
   padBottom: number
 ): SmoothPathResult {
-  const ys = new Float64Array(count);
   if (count === 0) {
-    return { linePath: "", areaPath: "", xs, ys };
+    return EMPTY_GEOM;
   }
 
   const innerH = Math.max(1, height - padTop - padBottom);
@@ -129,11 +176,12 @@ function buildTimeAlignedPath(
 
   for (let i = 0; i < count; i++) {
     const ratio = mapValueToRatio(values[i], scaleMax, scaleMode);
-    ys[i] = baseY - ratio * innerH;
+    ysOut[i] = baseY - ratio * innerH;
   }
 
   const lineSegs: string[] = [];
   const areaSegs: string[] = [];
+  const baseYF = baseY.toFixed(1);
 
   let segStart = 0;
   while (segStart < count) {
@@ -149,79 +197,76 @@ function buildTimeAlignedPath(
     const len = segEnd - segStart + 1;
     if (len === 1) {
       const x = xs[segStart];
-      const y = ys[segStart];
+      const y = ysOut[segStart];
       const x0 = Math.max(0, x - 1.5).toFixed(1);
       const x1 = x.toFixed(1);
       const yf = y.toFixed(1);
       lineSegs.push(`M${x0},${yf} L${x1},${yf}`);
-      areaSegs.push(`M${x0},${yf} L${x1},${yf} L${x1},${baseY.toFixed(1)} L${x0},${baseY.toFixed(1)} Z`);
+      areaSegs.push(`M${x0},${yf} L${x1},${yf} L${x1},${baseYF} L${x0},${baseYF} Z`);
     } else if (len === 2) {
       const x0 = xs[segStart].toFixed(1);
-      const y0 = ys[segStart].toFixed(1);
+      const y0 = ysOut[segStart].toFixed(1);
       const x1 = xs[segEnd].toFixed(1);
-      const y1 = ys[segEnd].toFixed(1);
+      const y1 = ysOut[segEnd].toFixed(1);
       const segLine = `M${x0},${y0} L${x1},${y1}`;
       lineSegs.push(segLine);
-      areaSegs.push(`${segLine} L${x1},${baseY.toFixed(1)} L${x0},${baseY.toFixed(1)} Z`);
+      areaSegs.push(`${segLine} L${x1},${baseYF} L${x0},${baseYF} Z`);
     } else {
-      // Fritsch-Carlson monotone tangents
-      const dx = new Float64Array(len - 1);
-      const slope = new Float64Array(len - 1);
+      // Fritsch-Carlson monotone tangents using pre-allocated scratch buffers
       for (let k = 0; k < len - 1; k++) {
         const i0 = segStart + k;
         const d = Math.max(0.001, xs[i0 + 1] - xs[i0]);
-        dx[k] = d;
-        slope[k] = (ys[i0 + 1] - ys[i0]) / d;
+        dxBuf[k] = d;
+        slopeBuf[k] = (ysOut[i0 + 1] - ysOut[i0]) / d;
       }
 
-      const m = new Float64Array(len);
-      m[0] = slope[0];
-      m[len - 1] = slope[len - 2];
+      mBuf[0] = slopeBuf[0];
+      mBuf[len - 1] = slopeBuf[len - 2];
       for (let k = 1; k < len - 1; k++) {
-        if (slope[k - 1] * slope[k] <= 0) {
-          m[k] = 0;
+        if (slopeBuf[k - 1] * slopeBuf[k] <= 0) {
+          mBuf[k] = 0;
         } else {
-          const w1 = 2 * dx[k] + dx[k - 1];
-          const w2 = dx[k] + 2 * dx[k - 1];
-          m[k] = (w1 + w2) / (w1 / slope[k - 1] + w2 / slope[k]);
+          const w1 = 2 * dxBuf[k] + dxBuf[k - 1];
+          const w2 = dxBuf[k] + 2 * dxBuf[k - 1];
+          mBuf[k] = (w1 + w2) / (w1 / slopeBuf[k - 1] + w2 / slopeBuf[k]);
         }
       }
 
       // Clamp tangents to preserve monotonicity
       for (let k = 0; k < len - 1; k++) {
-        if (Math.abs(slope[k]) < 1e-9) {
-          m[k] = 0;
-          m[k + 1] = 0;
+        if (Math.abs(slopeBuf[k]) < 1e-9) {
+          mBuf[k] = 0;
+          mBuf[k + 1] = 0;
         } else {
-          const a = m[k] / slope[k];
-          const b = m[k + 1] / slope[k];
+          const a = mBuf[k] / slopeBuf[k];
+          const b = mBuf[k + 1] / slopeBuf[k];
           const sumSq = a * a + b * b;
           if (sumSq > 9) {
             const tau = 3 / Math.sqrt(sumSq);
-            m[k] = tau * a * slope[k];
-            m[k + 1] = tau * b * slope[k];
+            mBuf[k] = tau * a * slopeBuf[k];
+            mBuf[k + 1] = tau * b * slopeBuf[k];
           }
         }
       }
 
-      const parts: string[] = [`M${xs[segStart].toFixed(1)},${ys[segStart].toFixed(1)}`];
+      const parts: string[] = [`M${xs[segStart].toFixed(1)},${ysOut[segStart].toFixed(1)}`];
       for (let k = 0; k < len - 1; k++) {
         const i0 = segStart + k;
         const i1 = i0 + 1;
-        const h = dx[k];
+        const h = dxBuf[k];
         const cp1x = xs[i0] + h / 3;
-        const cp1y = Math.min(baseY, Math.max(padTop, ys[i0] + (m[k] * h) / 3));
+        const cp1y = Math.min(baseY, Math.max(padTop, ysOut[i0] + (mBuf[k] * h) / 3));
         const cp2x = xs[i1] - h / 3;
-        const cp2y = Math.min(baseY, Math.max(padTop, ys[i1] - (m[k + 1] * h) / 3));
+        const cp2y = Math.min(baseY, Math.max(padTop, ysOut[i1] - (mBuf[k + 1] * h) / 3));
         parts.push(
-          `C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${xs[i1].toFixed(1)},${ys[i1].toFixed(1)}`
+          `C${cp1x.toFixed(1)},${cp1y.toFixed(1)} ${cp2x.toFixed(1)},${cp2y.toFixed(1)} ${xs[i1].toFixed(1)},${ysOut[i1].toFixed(1)}`
         );
       }
 
       const segLine = parts.join(" ");
       lineSegs.push(segLine);
       areaSegs.push(
-        `${segLine} L${xs[segEnd].toFixed(1)},${baseY.toFixed(1)} L${xs[segStart].toFixed(1)},${baseY.toFixed(1)} Z`
+        `${segLine} L${xs[segEnd].toFixed(1)},${baseYF} L${xs[segStart].toFixed(1)},${baseYF} Z`
       );
     }
 
@@ -232,7 +277,7 @@ function buildTimeAlignedPath(
     linePath: lineSegs.join(" "),
     areaPath: areaSegs.join(" "),
     xs,
-    ys,
+    ys: ysOut,
   };
 }
 
@@ -264,6 +309,7 @@ export function TrafficSparkline({
   const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const scratchRef = useRef<SparklineScratch | null>(null);
   const lastRenderedVersionRef = useRef<number>(liveVersion);
 
   useEffect(() => {
@@ -293,7 +339,7 @@ export function TrafficSparkline({
   const padBottom = isFull ? 10 : 3;
   const innerW = Math.max(1, vbWidth - padX * 2);
 
-  // Extract timestamp-aligned slice within [endTs - windowMs, endTs]
+  // Extract timestamp-aligned slice within [endTs - windowMs, endTs] using reusable scratch buffers
   const computed = useMemo(() => {
     const total = ring.length;
     if (total === 0) {
@@ -305,12 +351,12 @@ export function TrafficSparkline({
         spanSec: 0,
         rawPeak: 0,
         scaleMax: 64 * 1024,
-        xs: new Float64Array(0),
-        upSlice: new Float64Array(0),
-        downSlice: new Float64Array(0),
-        tsSlice: new Float64Array(0),
-        upGeom: { linePath: "", areaPath: "", xs: new Float64Array(0), ys: new Float64Array(0) },
-        downGeom: { linePath: "", areaPath: "", xs: new Float64Array(0), ys: new Float64Array(0) },
+        xs: EMPTY_F64,
+        upSlice: EMPTY_F64,
+        downSlice: EMPTY_F64,
+        tsSlice: EMPTY_F64,
+        upGeom: EMPTY_GEOM,
+        downGeom: EMPTY_GEOM,
         version: effectiveVersion,
       };
     }
@@ -329,10 +375,27 @@ export function TrafficSparkline({
     }
 
     const count = firstValid < total ? total - firstValid : 0;
-    const xs = new Float64Array(count);
-    const upSlice = new Float64Array(count);
-    const downSlice = new Float64Array(count);
-    const tsSlice = new Float64Array(count);
+    if (count === 0) {
+      return {
+        count: 0,
+        startTs,
+        endTs,
+        spanSec: 0,
+        rawPeak: 0,
+        scaleMax: 64 * 1024,
+        xs: EMPTY_F64,
+        upSlice: EMPTY_F64,
+        downSlice: EMPTY_F64,
+        tsSlice: EMPTY_F64,
+        upGeom: EMPTY_GEOM,
+        downGeom: EMPTY_GEOM,
+        version: effectiveVersion,
+      };
+    }
+
+    const scratch = ensureScratchCapacity(scratchRef.current, count);
+    scratchRef.current = scratch;
+    const { xs, upSlice, downSlice, tsSlice, downYs, upYs, dx, slope, m } = scratch;
 
     let rawPeak = 0;
     for (let i = 0; i < count; i++) {
@@ -350,12 +413,17 @@ export function TrafficSparkline({
     }
 
     const scaleMax = niceCeilRate(rawPeak);
-    const spanSec = count >= 2 ? Math.max(1, Math.round((tsSlice[count - 1] - tsSlice[0]) / 1000)) : count;
+    const spanSec =
+      count >= 2 ? Math.max(1, Math.round((tsSlice[count - 1] - tsSlice[0]) / 1000)) : count;
 
     const downGeom = buildTimeAlignedPath(
       xs,
       downSlice,
       tsSlice,
+      downYs,
+      dx,
+      slope,
+      m,
       count,
       scaleMax,
       activeScaleMode,
@@ -367,6 +435,10 @@ export function TrafficSparkline({
       xs,
       upSlice,
       tsSlice,
+      upYs,
+      dx,
+      slope,
+      m,
       count,
       scaleMax,
       activeScaleMode,
@@ -441,15 +513,24 @@ export function TrafficSparkline({
 
   const gradDownId = `cc-down-${uid}`;
   const gradUpId = `cc-up-${uid}`;
+  const rawTunnelConnections = (latest as { tunnel_connections?: number }).tunnel_connections;
+  const tunnelConnections =
+    typeof rawTunnelConnections === "number" && Number.isFinite(rawTunnelConnections)
+      ? Math.max(0, Math.round(rawTunnelConnections))
+      : 0;
+  const connSummaryTooltip =
+    tunnelConnections > 0
+      ? `${latest.connections} 个应用连接（另含 ${tunnelConnections} 条提速隧道）`
+      : `${latest.connections} 个应用连接`;
 
   if (!isFull) {
     return (
       <div
-        className={`cc-card cc-glass rounded-xl px-3 py-2.5 ${className}`}
+        className={`cc-card rounded-xl px-3 py-2.5 ${className}`}
         title={
           redrawPaused
             ? "流量动画已暂停（省电模式）"
-            : `近 2 分钟实时流量 · 内核内存 ${latest.memory_mb.toFixed(1)} MB`
+            : `近 2 分钟实时流量 · ${connSummaryTooltip} · 内核内存 ${latest.memory_mb.toFixed(1)} MB`
         }
       >
         <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--muted)]">
@@ -460,7 +541,10 @@ export function TrafficSparkline({
               已暂停
             </span>
           ) : (
-            <span className="cc-tabular text-[10px] text-[var(--muted)]">
+            <span
+              className="cc-tabular text-[10px] text-[var(--muted)]"
+              title={connSummaryTooltip}
+            >
               {latest.connections} 个连接
             </span>
           )}
@@ -581,7 +665,7 @@ export function TrafficSparkline({
   const titleLabel = activeWindowSec === 600 ? "近 10 分钟流量走势" : "近 2 分钟流量走势";
 
   return (
-    <div className={`cc-card cc-glass rounded-2xl p-4 ${className}`}>
+    <div className={`cc-card rounded-2xl p-4 ${className}`}>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <div className="flex flex-wrap items-center gap-2">
           <h2 className="text-sm font-semibold tracking-tight text-[var(--text)]">{titleLabel}</h2>

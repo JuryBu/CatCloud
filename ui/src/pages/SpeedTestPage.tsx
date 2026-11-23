@@ -46,6 +46,7 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { AppSelect } from "../components/AppSelect";
 import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
 import { MascotSprite } from "../components/MascotSprite";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
@@ -2328,22 +2329,26 @@ export function SpeedTestPage({
               </div>
 
               <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-4">
-                <label>
-                  <span className="text-[11px] text-[var(--muted)]">测速类型</span>
-                  <select
+                <div>
+                  <span className="block text-[11px] text-[var(--muted)]">测速类型</span>
+                  <AppSelect
+                    aria-label="测速类型"
+                    size="sm"
                     value={newProbeKind}
-                    onChange={(e) => setNewProbeKind(e.target.value as ProbeKind)}
-                    className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  >
-                    <option value="latency">基础延迟网址</option>
-                    <option value="upload">上传测速网址</option>
-                    <option value="download">下载测速网址</option>
-                    <option value="unlock_regex">网站解锁检测</option>
-                    <option value="keepalive">60 秒长连接</option>
-                    <option value="google_cn">谷歌地区检测</option>
-                    <option value="external_cmd">自定义外部脚本</option>
-                  </select>
-                </label>
+                    onChange={(v) => setNewProbeKind(v as ProbeKind)}
+                    options={[
+                      { value: "latency", label: "基础延迟网址" },
+                      { value: "upload", label: "上传测速网址" },
+                      { value: "download", label: "下载测速网址" },
+                      { value: "unlock_regex", label: "网站解锁检测" },
+                      { value: "keepalive", label: "60 秒长连接" },
+                      { value: "google_cn", label: "谷歌地区检测" },
+                      { value: "external_cmd", label: "自定义外部脚本" },
+                    ]}
+                    className="mt-1 w-full"
+                    buttonClassName="rounded-lg bg-[var(--card)]"
+                  />
+                </div>
 
                 <label>
                   <span className="text-[11px] text-[var(--muted)]">显示名称</span>
@@ -2546,44 +2551,45 @@ export function SpeedTestPage({
             )}
           </div>
 
-          <div className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
+          <div className="inline-flex items-center gap-1.5">
             <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-            <select
+            <AppSelect
               aria-label="按来源筛选"
+              size="sm"
               value={sourceFilter}
-              onChange={(e) => {
-                setSourceFilter(e.target.value);
+              onChange={(v) => {
+                setSourceFilter(v);
                 setPage(1);
               }}
-              className="bg-transparent text-xs text-[var(--text)] outline-none"
-            >
-              <option value="all">全部来源</option>
-              {sourceOptions.map((sub) => (
-                <option key={sub.id} value={sub.id}>
-                  {sub.name}
-                </option>
-              ))}
-            </select>
+              options={[
+                { value: "all", label: "全部来源" },
+                ...sourceOptions.map((sub) => ({ value: sub.id, label: sub.name })),
+              ]}
+              className="min-w-[120px] max-w-[190px]"
+              buttonClassName="rounded-lg"
+            />
           </div>
 
-          <div className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
+          <div className="inline-flex items-center gap-1.5">
             <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-            <select
+            <AppSelect
               aria-label="按多选组筛选"
+              size="sm"
               value={groupFilter}
-              onChange={(e) => {
-                setGroupFilter(e.target.value);
+              onChange={(v) => {
+                setGroupFilter(v);
                 setPage(1);
               }}
-              className="bg-transparent text-xs text-[var(--text)] outline-none"
-            >
-              <option value="all">全部多选组</option>
-              {groups.map((grp) => (
-                <option key={grp.id} value={grp.id}>
-                  {formatGroupDisplayName(grp.name)}
-                </option>
-              ))}
-            </select>
+              options={[
+                { value: "all", label: "全部多选组" },
+                ...groups.map((grp) => ({
+                  value: grp.id,
+                  label: formatGroupDisplayName(grp.name),
+                })),
+              ]}
+              className="min-w-[128px] max-w-[200px]"
+              buttonClassName="rounded-lg"
+            />
           </div>
 
           <ContinentRegionFilter

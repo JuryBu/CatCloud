@@ -228,6 +228,8 @@ function saveCachedUiPrefs(p: AppConfig["personalization"]): void {
       UI_PREFS_STORAGE_KEY,
       JSON.stringify({
         theme_mode: p.theme_mode,
+        theme_schedule: p.theme_schedule,
+        tray_icon_mode: p.tray_icon_mode,
         animations_enabled: p.animations_enabled,
         mascot_enabled: p.mascot_enabled,
         sparkline_enabled: p.sparkline_enabled,
@@ -317,9 +319,16 @@ function applyPersonalizationToDom(
   root.setAttribute("data-animations", p.animations_enabled ? "on" : "off");
   if (windowMode === "capsule") {
     root.setAttribute("data-window", "capsule");
-  } else {
-    root.removeAttribute("data-window");
+    root.setAttribute("data-wallpaper", "off");
+    root.setAttribute("data-glass", "off");
+    root.style.setProperty("--wallpaper-image", "none");
+    root.style.setProperty("--wallpaper-opacity", "0");
+    root.style.setProperty("--surface-alpha", "1");
+    root.style.setProperty("--card-alpha", "1");
+    root.style.setProperty("--glass-blur", "0px");
+    return;
   }
+  root.removeAttribute("data-window");
 
   const rawPath = p.wallpaper_path?.trim() ?? "";
   const cssBg = explicitCssValue ?? resolveImmediateWallpaperCss(rawPath);
@@ -350,6 +359,15 @@ async function ensureLocalWallpaperLoaded(
   p: AppConfig["personalization"],
   windowMode: WindowMode
 ): Promise<void> {
+  if (windowMode === "capsule") {
+    applyPersonalizationToDom(
+      resolvedTheme,
+      { ...p, wallpaper_path: null, glass_blur_px: 0 },
+      windowMode,
+      null
+    );
+    return;
+  }
   const trimmed = rawPath?.trim() ?? "";
   if (!trimmed) {
     setState((prev) => (prev.wallpaperError === null ? prev : { ...prev, wallpaperError: null }));
@@ -431,6 +449,7 @@ export interface AppState {
   windowMode: WindowMode;
   activeNav: NavRouteId;
   settingsTabHint: "system" | "appearance" | "dns" | "core" | "updates" | null;
+  settingsOpenAgentDocs: boolean;
   nodesTabHint: { tab: "nodes" | "subs"; subId?: string | null } | null;
   config: AppConfig;
   resolvedTheme: ResolvedTheme;
@@ -493,6 +512,7 @@ const EMPTY_TRAFFIC: TrafficSample = {
   up_total_bytes: 0,
   down_total_bytes: 0,
   connections: 0,
+  tunnel_connections: 0,
   memory_mb: 0,
   timestamp_ms: 0,
 };
@@ -651,6 +671,7 @@ let state: AppState = {
   windowMode: initialWindowMode,
   activeNav: detectNavFromHash(),
   settingsTabHint: null,
+  settingsOpenAgentDocs: false,
   nodesTabHint: null,
   config: initialConfig,
   resolvedTheme: initialResolvedTheme,
@@ -727,8 +748,10 @@ let disposeTraffic: (() => void) | null = null;
 let disposeRuntime: (() => void) | null = null;
 let disposeProbeProgress: (() => void) | null = null;
 let disposeStrategySwitch: (() => void) | null = null;
+let disposeConfigUpdate: (() => void) | null = null;
 let disposeTunNeedsAdmin: (() => void) | null = null;
 let themeClockTimer: number | null = null;
+let trafficBackfillInFlight = false;
 
 function syncResolvedThemeFromClock(): void {
   const p = state.config.personalization;
@@ -736,6 +759,76 @@ function syncResolvedThemeFromClock(): void {
   applyPersonalizationToDom(resolved, p, state.windowMode);
   if (resolved !== state.resolvedTheme) {
     setState((prev) => ({ ...prev, resolvedTheme: resolved }));
+  }
+}
+
+async function backfillTrafficHistory(coreRunning: boolean): Promise<void> {
+  if (!isTauriEnv() || !coreRunning || trafficBackfillInFlight) return;
+  trafficBackfillInFlight = true;
+  try {
+    const history = await catcloudApi.getTrafficHistory();
+    if (history.length === 0) return;
+
+    const merged = new Map<number, { up: number; down: number; ts: number }>();
+    for (const pt of history) {
+      if (pt.timestamp_ms > 0) {
+        merged.set(pt.timestamp_ms, {
+          up: pt.up_bps,
+          down: pt.down_bps,
+          ts: pt.timestamp_ms,
+        });
+      }
+    }
+    const existingLen = trafficBuffer.length;
+    for (let i = 0; i < existingLen; i++) {
+      const ts = trafficBuffer.tsAt(i);
+      if (ts > 0) {
+        merged.set(ts, {
+          up: trafficBuffer.upAt(i),
+          down: trafficBuffer.downAt(i),
+          ts,
+        });
+      }
+    }
+    const sorted = Array.from(merged.values()).sort((a, b) => a.ts - b.ts);
+    const tailSlice =
+      sorted.length > TRAFFIC_HISTORY_CAPACITY
+        ? sorted.slice(sorted.length - TRAFFIC_HISTORY_CAPACITY)
+        : sorted;
+    trafficBuffer.clear();
+    for (const pt of tailSlice) {
+      trafficBuffer.push(pt.up, pt.down, pt.ts);
+    }
+    const lastHist = history[history.length - 1];
+    const newest = tailSlice[tailSlice.length - 1];
+    const hasNewerLive = state.latestTraffic.timestamp_ms > lastHist.timestamp_ms;
+    state = {
+      ...state,
+      latestTraffic: hasNewerLive
+        ? {
+            ...state.latestTraffic,
+            up_bps: newest ? newest.up : state.latestTraffic.up_bps,
+            down_bps: newest ? newest.down : state.latestTraffic.down_bps,
+            timestamp_ms: newest ? newest.ts : state.latestTraffic.timestamp_ms,
+          }
+        : {
+            ...state.latestTraffic,
+            up_bps: newest ? newest.up : lastHist.up_bps,
+            down_bps: newest ? newest.down : lastHist.down_bps,
+            up_total_bytes: lastHist.up_total_bytes || state.latestTraffic.up_total_bytes,
+            down_total_bytes: lastHist.down_total_bytes || state.latestTraffic.down_total_bytes,
+            connections: lastHist.connections,
+            tunnel_connections: lastHist.tunnel_connections ?? 0,
+            memory_mb: lastHist.memory_mb,
+            timestamp_ms: newest ? newest.ts : lastHist.timestamp_ms,
+          },
+      trafficVersion: state.trafficVersion + 1,
+    };
+    emitTraffic();
+  } catch {
+    /* ignore optional history backfill failure on older backend */
+  } finally {
+    trafficBackfillInFlight = false;
   }
 }
 
@@ -758,6 +851,40 @@ function handleVisibilityChange(): void {
   if (document.visibilityState === "visible") {
     syncResolvedThemeFromClock();
     emitTraffic();
+    if (isTauriEnv() && state.runtime.running) {
+      void backfillTrafficHistory(true);
+    }
+  }
+}
+
+function handleStorageSync(ev: StorageEvent): void {
+  if (ev.key !== UI_PREFS_STORAGE_KEY || !ev.newValue) return;
+  try {
+    const parsed = JSON.parse(ev.newValue) as Partial<AppConfig["personalization"]>;
+    if (!parsed || typeof parsed !== "object") return;
+    const nextPersonalization: AppConfig["personalization"] = {
+      ...state.config.personalization,
+      ...parsed,
+      theme_schedule: parsed.theme_schedule
+        ? { ...state.config.personalization.theme_schedule, ...parsed.theme_schedule }
+        : state.config.personalization.theme_schedule,
+    };
+    const nextConfig: AppConfig = {
+      ...state.config,
+      personalization: nextPersonalization,
+    };
+    const resolved = resolveThemeBySchedule(
+      nextPersonalization.theme_mode,
+      nextPersonalization.theme_schedule
+    );
+    applyPersonalizationToDom(resolved, nextPersonalization, state.windowMode);
+    setState((prev) => ({
+      ...prev,
+      config: nextConfig,
+      resolvedTheme: resolved,
+    }));
+  } catch {
+    /* ignore malformed storage sync payload */
   }
 }
 
@@ -792,10 +919,27 @@ async function hydrateFromBackend(): Promise<void> {
   ] = results;
 
   const cfg = cfgRes.status === "fulfilled" ? cfgRes.value : state.config;
+  const hydratedMinimizeToTray =
+    fullCfgRes.status === "fulfilled" &&
+    fullCfgRes.value?.behavior?.minimize_to_tray_on_close !== undefined
+      ? fullCfgRes.value.behavior.minimize_to_tray_on_close
+      : (cfg.behavior?.minimize_to_tray_on_close ??
+        state.config.behavior?.minimize_to_tray_on_close ??
+        true);
   const mergedConfig: AppConfig = inDesktop
-    ? cfg
+    ? {
+        ...cfg,
+        behavior: {
+          ...cfg.behavior,
+          minimize_to_tray_on_close: hydratedMinimizeToTray,
+        },
+      }
     : {
         ...cfg,
+        behavior: {
+          ...cfg.behavior,
+          minimize_to_tray_on_close: hydratedMinimizeToTray,
+        },
         personalization: {
           ...cfg.personalization,
           ...loadCachedUiPrefs(),
@@ -807,12 +951,14 @@ async function hydrateFromBackend(): Promise<void> {
     mergedConfig.personalization.theme_schedule
   );
   applyPersonalizationToDom(resolved, mergedConfig.personalization, state.windowMode);
-  void ensureLocalWallpaperLoaded(
-    mergedConfig.personalization.wallpaper_path,
-    resolved,
-    mergedConfig.personalization,
-    state.windowMode
-  );
+  if (state.windowMode !== "capsule") {
+    void ensureLocalWallpaperLoaded(
+      mergedConfig.personalization.wallpaper_path,
+      resolved,
+      mergedConfig.personalization,
+      state.windowMode
+    );
+  }
 
   let hydratedSites: SiteCheckItem[] = state.quickSites;
   if (!inDesktop && quickSitesRes.status === "fulfilled" && Array.isArray(quickSitesRes.value)) {
@@ -859,57 +1005,7 @@ async function hydrateFromBackend(): Promise<void> {
   // main window opens/reopens while the core is running. Merge by timestamp_ms so early live
   // ticks arriving via `subscribeTraffic` before IPC returns never cause history to be dropped.
   if (inDesktop && resolvedRuntime.running) {
-    try {
-      const history = await catcloudApi.getTrafficHistory();
-      if (history.length > 0) {
-        const merged = new Map<number, { up: number; down: number; ts: number }>();
-        for (const pt of history) {
-          if (pt.timestamp_ms > 0) {
-            merged.set(pt.timestamp_ms, {
-              up: pt.up_bps,
-              down: pt.down_bps,
-              ts: pt.timestamp_ms,
-            });
-          }
-        }
-        const existingLen = trafficBuffer.length;
-        for (let i = 0; i < existingLen; i++) {
-          const ts = trafficBuffer.tsAt(i);
-          if (ts > 0) {
-            merged.set(ts, {
-              up: trafficBuffer.upAt(i),
-              down: trafficBuffer.downAt(i),
-              ts,
-            });
-          }
-        }
-        const sorted = Array.from(merged.values()).sort((a, b) => a.ts - b.ts);
-        const tailSlice =
-          sorted.length > TRAFFIC_HISTORY_CAPACITY
-            ? sorted.slice(sorted.length - TRAFFIC_HISTORY_CAPACITY)
-            : sorted;
-        trafficBuffer.clear();
-        for (const pt of tailSlice) {
-          trafficBuffer.push(pt.up, pt.down, pt.ts);
-        }
-        const lastHist = history[history.length - 1];
-        const newest = tailSlice[tailSlice.length - 1];
-        state = {
-          ...state,
-          latestTraffic: {
-            ...state.latestTraffic,
-            up_bps: newest ? newest.up : state.latestTraffic.up_bps,
-            down_bps: newest ? newest.down : state.latestTraffic.down_bps,
-            memory_mb: state.latestTraffic.memory_mb || lastHist.memory_mb,
-            timestamp_ms: newest ? newest.ts : state.latestTraffic.timestamp_ms,
-          },
-          trafficVersion: state.trafficVersion + 1,
-        };
-        emitTraffic();
-      }
-    } catch {
-      /* ignore optional history backfill failure on older backend */
-    }
+    await backfillTrafficHistory(true);
   }
 
   setState((prev) => ({
@@ -967,6 +1063,7 @@ export const appStore = {
 
     if (typeof window !== "undefined") {
       window.addEventListener("hashchange", handleHashChange);
+      window.addEventListener("storage", handleStorageSync);
       document.addEventListener("visibilitychange", handleVisibilityChange);
 
       themeClockTimer = window.setInterval(() => {
@@ -976,7 +1073,7 @@ export const appStore = {
         ) {
           syncResolvedThemeFromClock();
         }
-      }, 60_000);
+      }, 30_000);
     }
 
     disposeTraffic = catcloudApi.subscribeTraffic((sample) => {
@@ -1006,6 +1103,7 @@ export const appStore = {
             up_bps: 0,
             down_bps: 0,
             connections: 0,
+            tunnel_connections: 0,
             memory_mb: 0,
             timestamp_ms: stopTs,
           },
@@ -1088,6 +1186,32 @@ export const appStore = {
       });
     });
 
+    disposeConfigUpdate = catcloudApi.subscribeConfigUpdate((incomingCfg) => {
+      const mergedConfig: AppConfig = {
+        ...incomingCfg,
+        behavior: incomingCfg.behavior ?? state.config.behavior,
+      };
+      const resolved = resolveThemeBySchedule(
+        mergedConfig.personalization.theme_mode,
+        mergedConfig.personalization.theme_schedule
+      );
+      saveCachedUiPrefs(mergedConfig.personalization);
+      applyPersonalizationToDom(resolved, mergedConfig.personalization, state.windowMode);
+      if (state.windowMode !== "capsule") {
+        void ensureLocalWallpaperLoaded(
+          mergedConfig.personalization.wallpaper_path,
+          resolved,
+          mergedConfig.personalization,
+          state.windowMode
+        );
+      }
+      setState((prev) => ({
+        ...prev,
+        config: mergedConfig,
+        resolvedTheme: resolved,
+      }));
+    });
+
     if (isTauriEnv()) {
       let tunAdminDisposed = false;
       let tunAdminUnlisten: (() => void) | null = null;
@@ -1152,10 +1276,13 @@ export const appStore = {
     disposeProbeProgress = null;
     disposeStrategySwitch?.();
     disposeStrategySwitch = null;
+    disposeConfigUpdate?.();
+    disposeConfigUpdate = null;
     disposeTunNeedsAdmin?.();
     disposeTunNeedsAdmin = null;
     if (typeof window !== "undefined") {
       window.removeEventListener("hashchange", handleHashChange);
+      window.removeEventListener("storage", handleStorageSync);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     }
     if (themeClockTimer !== null) {
@@ -1210,6 +1337,111 @@ export const appActions = {
     setState((prev) => (prev.settingsTabHint === null ? prev : { ...prev, settingsTabHint: null }));
   },
 
+  openSettingsAgentDocs(): void {
+    setState((prev) => ({
+      ...prev,
+      settingsTabHint: "updates",
+      settingsOpenAgentDocs: true,
+    }));
+    appActions.setNav("settings");
+  },
+
+  consumeSettingsOpenAgentDocs(): void {
+    setState((prev) =>
+      prev.settingsOpenAgentDocs ? { ...prev, settingsOpenAgentDocs: false } : prev
+    );
+  },
+
+  async copySanitizedDiagnosticsForAi(extraSanitizedLogs?: string): Promise<boolean> {
+    const writeClipboard = async (text: string): Promise<boolean> => {
+      try {
+        if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        /* fallback to textarea execCommand */
+      }
+      if (typeof document === "undefined") return false;
+      try {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.style.position = "fixed";
+        el.style.left = "-9999px";
+        el.style.opacity = "0";
+        document.body.appendChild(el);
+        el.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(el);
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      const diag = await catcloudApi.exportSanitizedDiagnostics();
+      const rawMd =
+        typeof diag.ai_prompt_markdown === "string" ? diag.ai_prompt_markdown.trim() : "";
+
+      let markdown: string;
+      if (rawMd.length > 0) {
+        markdown = rawMd;
+      } else {
+        const rt = state.runtime;
+        const cfg = state.config;
+        const routeLine =
+          rt.route_mode === "single"
+            ? `单节点模式 → ${rt.active_node_name || "--"}`
+            : `智能多选组（${rt.active_group_name || "--"}）→ ${rt.active_node_name || "--"}`;
+        markdown = [
+          "# 请帮我排查猫猫云梯（CatCloud）当前问题",
+          "",
+          "> 以下信息已自动脱敏（不含真实密钥、账号、用户名和公网 IP）。请根据状态与日志帮我分析原因并给出排查/配置建议。",
+          "",
+          "## 1. 运行状态摘要",
+          `- 版本：v${rt.app_version}（${rt.os_label}）`,
+          `- 代理核心：${rt.core_name} ${rt.core_version}（${rt.running ? "运行中" : "已停止"}）`,
+          `- 代理模式：${rt.proxy_mode} | 系统代理：${rt.system_proxy_enabled ? "已开启" : "未开启"} | 虚拟网卡：${rt.tun_enabled ? "已开启" : "未开启"}`,
+          `- 当前路线：${routeLine}`,
+          `- 国内提速：${rt.preaccel_active ? `已开启（${rt.preaccel_relay_name ?? "已启用中转"}）` : "未开启"}`,
+          `- 本地端口：混合 ${cfg.mixed_port} / 控制 127.0.0.1:${cfg.controller_port} / DNS ${cfg.dns_listen_port}`,
+          "",
+          "## 2. 本机只读排查 CLI 命令",
+          "- `catcloud status --json`",
+          "- `catcloud config diag --json`",
+          "- `catcloud group list --json`",
+          "- `catcloud config validate --json`",
+          "",
+          "## 3. 脱敏诊断快照（JSON）",
+          "```json",
+          JSON.stringify(diag, null, 2),
+          "```",
+        ].join("\n");
+      }
+
+      const trimmedExtra = extraSanitizedLogs?.trim();
+      if (trimmedExtra) {
+        markdown = `${markdown}\n\n## 当前日志视图补充（已自动打码隐私）\n\`\`\`text\n${trimmedExtra}\n\`\`\``;
+      }
+
+      const copied = await writeClipboard(markdown);
+      if (copied) {
+        pushToast(
+          "已复制脱敏诊断包！直接粘贴给你的 AI 助手（Antigravity / Codex / ChatGPT 等）就能帮你排查",
+          "ok",
+          4500
+        );
+        return true;
+      }
+      pushToast("无法写入剪贴板，请在「运行日志」页点击导出或检查剪贴板权限", "warn");
+      return false;
+    } catch (err) {
+      pushToast(`生成脱敏诊断包失败：${formatErrorMessage(err)}`, "warn");
+      return false;
+    }
+  },
+
   setMascotState(next: MascotState): void {
     setState((prev) => (prev.mascotState === next ? prev : { ...prev, mascotState: next }));
   },
@@ -1220,7 +1452,16 @@ export const appActions = {
       nextConfig.personalization.theme_schedule
     );
     applyPersonalizationToDom(resolved, nextConfig.personalization, state.windowMode);
-    setState((prev) => ({ ...prev, config: nextConfig, resolvedTheme: resolved }));
+    setState((prev) => ({
+      ...prev,
+      config:
+        nextConfig.behavior !== undefined
+          ? nextConfig
+          : prev.config.behavior !== undefined
+            ? { ...nextConfig, behavior: prev.config.behavior }
+            : nextConfig,
+      resolvedTheme: resolved,
+    }));
   },
 
   syncRuntime(nextRuntime: CoreRuntimeInfo): void {
@@ -1316,7 +1557,16 @@ export const appActions = {
       );
       saveCachedUiPrefs(saved.personalization);
       applyPersonalizationToDom(savedResolved, saved.personalization, state.windowMode);
-      setState((prev) => ({ ...prev, config: saved, resolvedTheme: savedResolved }));
+      setState((prev) => ({
+        ...prev,
+        config:
+          saved.behavior !== undefined
+            ? saved
+            : prev.config.behavior !== undefined
+              ? { ...saved, behavior: prev.config.behavior }
+              : saved,
+        resolvedTheme: savedResolved,
+      }));
       if (notice) pushToast(notice, "info");
     } catch (err) {
       if (reqSeq !== personalizationReqSeq) {

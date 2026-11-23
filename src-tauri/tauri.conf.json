@@ -19,19 +19,24 @@
         "minWidth": 920,
         "minHeight": 620,
         "center": true,
-        "resizable": true
+        "resizable": true,
+        "decorations": false
       },
       {
         "label": "capsule",
         "title": "CatCloud Capsule",
         "url": "index.html#capsule",
         "create": false,
-        "width": 300,
+        "width": 344,
         "height": 64,
+        "minWidth": 280,
+        "minHeight": 56,
+        "maxWidth": 560,
+        "maxHeight": 140,
         "decorations": false,
         "transparent": true,
         "shadow": false,
-        "resizable": false,
+        "resizable": true,
         "skipTaskbar": true,
         "alwaysOnTop": true,
         "visible": false

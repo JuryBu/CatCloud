@@ -1462,36 +1462,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             }
 
             ConfigCommand::Diag => {
-                let cfg = config::load_or_init(paths)?;
-                let db = open_storage(paths)?;
-                let plat = default_platform();
-                let caps = plat.capabilities();
-                let out = json!({
-                    "ok": true,
-                    "sanitized": true,
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "os": caps.os,
-                    "arch": caps.arch,
-                    "is_elevated": caps.is_elevated,
-                    "is_portable": paths.is_portable,
-                    "instance_hash": paths.instance_hash,
-                    "proxy_mode": cfg.proxy_mode,
-                    "mixed_port": cfg.mixed_port,
-                    "controller_port": cfg.controller_port,
-                    "dns_listen_port": cfg.dns_listen_port,
-                    "core_ipv6": cfg.core_ipv6,
-                    "dns_ipv6": cfg.dns.ipv6,
-                    "tun_enabled": cfg.tun.enabled,
-                    "tun_stack": cfg.tun.stack_mode,
-                    "preaccel_enabled": cfg.preaccel.enabled,
-                    "skip_443_native": cfg.preaccel.skip_443_native,
-                    "counts": {
-                        "subscriptions": db.list_subscriptions()?.len(),
-                        "nodes": db.list_nodes()?.len(),
-                        "multi_groups": db.list_multi_groups()?.len(),
-                        "preaccel_relays": db.list_preaccel_relays(false)?.len(),
-                    }
-                });
+                let out = build_diag_payload(paths)?;
                 emit_output(as_json, &out, &serde_json::to_string_pretty(&out)?)
             }
         },
@@ -1657,5 +1628,515 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 )
             }
         },
+    }
+}
+
+const MAX_DIAG_LOG_LINES: usize = 40;
+const MAX_DIAG_LOG_TAIL_READ_BYTES: u64 = 64 * 1024;
+
+fn inspect_geodata_file(runtime_dir: &std::path::Path, candidates: &[&str]) -> Value {
+    for name in candidates {
+        let path = runtime_dir.join(name);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.is_file() {
+                let updated_at = meta
+                    .modified()
+                    .ok()
+                    .map(|t| chrono::DateTime::<Utc>::from(t).to_rfc3339());
+                return json!({
+                    "exists": true,
+                    "size_bytes": meta.len(),
+                    "updated_at": updated_at
+                });
+            }
+        }
+    }
+    json!({
+        "exists": false,
+        "size_bytes": 0u64,
+        "updated_at": null
+    })
+}
+
+fn collect_geodata_status(runtime_dir: &std::path::Path) -> Value {
+    json!({
+        "country_mmdb": inspect_geodata_file(runtime_dir, &["Country.mmdb", "country.mmdb", "country-lite.mmdb"]),
+        "geoip_dat": inspect_geodata_file(runtime_dir, &["geoip.dat", "GeoIP.dat"]),
+        "geosite_dat": inspect_geodata_file(runtime_dir, &["geosite.dat", "GeoSite.dat"]),
+        "asn_mmdb": inspect_geodata_file(runtime_dir, &["GeoLite2-ASN.mmdb", "geolite2-asn.mmdb", "asn.mmdb"]),
+    })
+}
+
+fn build_diag_payload(paths: &AppPaths) -> Result<Value> {
+    let cfg = config::load_or_init(paths)?;
+    let db = open_storage(paths)?;
+    let plat = default_platform();
+    let caps = plat.capabilities();
+    let geodata_status = collect_geodata_status(&paths.runtime_dir);
+    let recent_logs =
+        read_sanitized_log_tail(&paths.logs_dir.join("catcloud.log"), MAX_DIAG_LOG_LINES);
+    Ok(json!({
+        "ok": true,
+        "sanitized": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "os": caps.os,
+        "arch": caps.arch,
+        "is_elevated": caps.is_elevated,
+        "is_portable": paths.is_portable,
+        "instance_hash": paths.instance_hash,
+        "proxy_mode": cfg.proxy_mode,
+        "route_mode": cfg.route_mode,
+        "active_group_id": cfg.active_group_id,
+        "active_single_node_id": cfg.active_single_node_id,
+        "mixed_port": cfg.mixed_port,
+        "controller_port": cfg.controller_port,
+        "dns_listen_port": cfg.dns_listen_port,
+        "core_ipv6": cfg.core_ipv6,
+        "dns_ipv6": cfg.dns.ipv6,
+        "system_proxy_enabled": cfg.system_proxy.enabled,
+        "tun_enabled": cfg.tun.enabled,
+        "tun_stack": cfg.tun.stack_mode,
+        "domestic_direct_enabled": cfg.rules_override.domestic_direct_enabled,
+        "block_quic_udp_443": cfg.rules_override.block_quic_udp_443,
+        "preaccel_enabled": cfg.preaccel.enabled,
+        "skip_443_native": cfg.preaccel.skip_443_native,
+        "compile_all_nodes": cfg.core_runtime.compile_all_nodes,
+        "geodata_status": geodata_status,
+        "recent_logs": recent_logs,
+        "counts": {
+            "subscriptions": db.list_subscriptions()?.len(),
+            "nodes": db.list_nodes()?.len(),
+            "multi_groups": db.list_multi_groups()?.len(),
+            "preaccel_relays": db.list_preaccel_relays(false)?.len(),
+        }
+    }))
+}
+
+fn read_sanitized_log_tail(log_path: &std::path::Path, max_lines: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let Ok(mut file) = std::fs::File::open(log_path) else {
+        return Vec::new();
+    };
+    let Ok(meta) = file.metadata() else {
+        return Vec::new();
+    };
+    let len = meta.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let start = len.saturating_sub(MAX_DIAG_LOG_TAIL_READ_BYTES);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::with_capacity((len - start).min(MAX_DIAG_LOG_TAIL_READ_BYTES) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let content = if start > 0 {
+        match raw.find('\n') {
+            Some(pos) => &raw[pos + 1..],
+            None => raw.as_ref(),
+        }
+    } else {
+        raw.as_ref()
+    };
+
+    let mut lines: Vec<String> = content
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(max_lines)
+        .map(sanitize_log_line)
+        .collect();
+    lines.reverse();
+    lines
+}
+
+fn sanitize_log_line(line: &str) -> String {
+    let step1 = redact_sensitive_fields(line);
+    redact_ipv6_addresses(&step1)
+}
+
+fn is_sensitive_key(key_lower: &str) -> bool {
+    matches!(
+        key_lower,
+        "secret"
+            | "password"
+            | "passwd"
+            | "pwd"
+            | "token"
+            | "auth"
+            | "authorization"
+            | "uuid"
+            | "apikey"
+            | "api_key"
+            | "api-key"
+            | "private_key"
+            | "private-key"
+            | "auth_str"
+            | "auth-str"
+    ) || key_lower.ends_with("_secret")
+        || key_lower.ends_with("-secret")
+        || key_lower.ends_with("_password")
+        || key_lower.ends_with("-password")
+        || key_lower.ends_with("_token")
+        || key_lower.ends_with("-token")
+        || key_lower.ends_with("api_key")
+        || key_lower.ends_with("api-key")
+        || key_lower.ends_with("private_key")
+        || key_lower.ends_with("private-key")
+}
+
+fn is_key_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+fn is_value_boundary(b: u8) -> bool {
+    b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b',' | b'&' | b';' | b'"' | b'\'' | b'}' | b']' | b')' | b'>'
+        )
+}
+
+fn redact_sensitive_fields(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+
+    while i < len {
+        // Standalone `Bearer <token>` (case-insensitive)
+        let prev_is_key = i > 0 && is_key_char(bytes[i - 1]);
+        if !prev_is_key && i + 7 <= len && input[i..].len() >= 7 {
+            if bytes[i..i + 6].eq_ignore_ascii_case(b"bearer")
+                && (bytes[i + 6] == b' ' || bytes[i + 6] == b'\t')
+            {
+                let mut v_start = i + 6;
+                while v_start < len && (bytes[v_start] == b' ' || bytes[v_start] == b'\t') {
+                    v_start += 1;
+                }
+                if v_start < len && !is_value_boundary(bytes[v_start]) {
+                    let mut v_end = v_start;
+                    while v_end < len && !is_value_boundary(bytes[v_end]) {
+                        v_end += 1;
+                    }
+                    out.push_str(&input[i..v_start]);
+                    out.push_str("<REDACTED>");
+                    i = v_end;
+                    continue;
+                }
+            }
+        }
+
+        // Key-value pair: optional quote + sensitive key + optional quote + optional spaces + (`=` | `:`)
+        let quote_ch = if bytes[i] == b'"' || bytes[i] == b'\'' {
+            Some(bytes[i])
+        } else {
+            None
+        };
+        let key_start = if quote_ch.is_some() { i + 1 } else { i };
+        let valid_key_boundary = quote_ch.is_some() || !prev_is_key;
+
+        if valid_key_boundary && key_start < len && is_key_char(bytes[key_start]) {
+            let mut key_end = key_start;
+            while key_end < len && is_key_char(bytes[key_end]) {
+                key_end += 1;
+            }
+            let after_key = match quote_ch {
+                Some(q) if key_end < len && bytes[key_end] == q => Some(key_end + 1),
+                Some(_) => None,
+                None => Some(key_end),
+            };
+            if let Some(mut sep_pos) = after_key {
+                let key_lower = input[key_start..key_end].to_ascii_lowercase();
+                if is_sensitive_key(&key_lower) {
+                    while sep_pos < len && (bytes[sep_pos] == b' ' || bytes[sep_pos] == b'\t') {
+                        sep_pos += 1;
+                    }
+                    if sep_pos < len && (bytes[sep_pos] == b'=' || bytes[sep_pos] == b':') {
+                        let mut v_start = sep_pos + 1;
+                        while v_start < len && (bytes[v_start] == b' ' || bytes[v_start] == b'\t') {
+                            v_start += 1;
+                        }
+                        if v_start < len {
+                            if bytes[v_start] == b'"' || bytes[v_start] == b'\'' {
+                                let vq = bytes[v_start];
+                                let mut v_end = v_start + 1;
+                                while v_end < len {
+                                    if bytes[v_end] == b'\\' && v_end + 1 < len {
+                                        v_end += 2;
+                                        continue;
+                                    }
+                                    if bytes[v_end] == vq {
+                                        break;
+                                    }
+                                    v_end += 1;
+                                }
+                                out.push_str(&input[i..=v_start]);
+                                if v_end > v_start + 1 {
+                                    out.push_str("<REDACTED>");
+                                }
+                                if v_end < len && bytes[v_end] == vq {
+                                    out.push(vq as char);
+                                    i = v_end + 1;
+                                } else {
+                                    i = v_end;
+                                }
+                                continue;
+                            } else if !is_value_boundary(bytes[v_start]) {
+                                // Preserve `Bearer ` prefix inside `Authorization: Bearer <val>`.
+                                let mut actual_start = v_start;
+                                if actual_start + 7 <= len
+                                    && bytes[actual_start..actual_start + 6]
+                                        .eq_ignore_ascii_case(b"bearer")
+                                    && (bytes[actual_start + 6] == b' '
+                                        || bytes[actual_start + 6] == b'\t')
+                                {
+                                    actual_start += 6;
+                                    while actual_start < len
+                                        && (bytes[actual_start] == b' '
+                                            || bytes[actual_start] == b'\t')
+                                    {
+                                        actual_start += 1;
+                                    }
+                                }
+                                if actual_start < len && !is_value_boundary(bytes[actual_start]) {
+                                    let mut v_end = actual_start;
+                                    while v_end < len && !is_value_boundary(bytes[v_end]) {
+                                        v_end += 1;
+                                    }
+                                    out.push_str(&input[i..actual_start]);
+                                    out.push_str("<REDACTED>");
+                                    i = v_end;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Advance one UTF-8 character safely.
+        let ch = input[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+
+    out
+}
+
+fn try_redact_bare_ipv6(tok: &str) -> Option<String> {
+    let trimmed_end = tok.trim_end_matches('.');
+    let trailing_dots = &tok[trimmed_end.len()..];
+    if trimmed_end.is_empty() || !trimmed_end.contains(':') {
+        return None;
+    }
+
+    let (addr_and_zone, cidr_suffix) = match trimmed_end.rsplit_once('/') {
+        Some((left, prefix))
+            if !prefix.is_empty() && prefix.parse::<u8>().is_ok_and(|p| p <= 128) =>
+        {
+            (left, Some(prefix))
+        }
+        _ => (trimmed_end, None),
+    };
+    let addr_part = addr_and_zone
+        .split_once('%')
+        .map_or(addr_and_zone, |(a, _)| a);
+    if addr_part.parse::<std::net::Ipv6Addr>().is_ok() {
+        let mut res = "<REDACTED_IPV6>".to_string();
+        if let Some(prefix) = cidr_suffix {
+            res.push('/');
+            res.push_str(prefix);
+        }
+        res.push_str(trailing_dots);
+        return Some(res);
+    }
+    None
+}
+
+fn redact_ipv6_token(tok: &str) -> Option<String> {
+    // 1. Bracketed IPv6 such as `[2001:db8::1]:443` or `http://[2001:db8::1]:9090/version`
+    if let Some(open) = tok.find('[') {
+        if let Some(rel_close) = tok[open + 1..].find(']') {
+            let close = open + 1 + rel_close;
+            let inner = &tok[open + 1..close];
+            let addr_part = inner.split_once('%').map_or(inner, |(a, _)| a);
+            if addr_part.parse::<std::net::Ipv6Addr>().is_ok() {
+                let mut res = String::with_capacity(tok.len());
+                res.push_str(&tok[..=open]);
+                res.push_str("<REDACTED_IPV6>");
+                res.push_str(&tok[close..]);
+                return Some(res);
+            }
+        }
+    }
+
+    // 2. Bare IPv6 / IPv6+zone / IPv6 CIDR
+    if let Some(redacted) = try_redact_bare_ipv6(tok) {
+        return Some(redacted);
+    }
+
+    // 3. `label:ipv6` (e.g. `src:2001:db8::1`)
+    if let Some((prefix, rest)) = tok.split_once(':') {
+        if !prefix.is_empty() && prefix.bytes().all(is_key_char) {
+            if let Some(redacted_rest) = try_redact_bare_ipv6(rest) {
+                return Some(format!("{prefix}:{redacted_rest}"));
+            }
+        }
+    }
+
+    None
+}
+
+fn is_ipv6_tok_sep(b: u8) -> bool {
+    b.is_ascii_whitespace()
+        || matches!(
+            b,
+            b',' | b';' | b'"' | b'\'' | b'(' | b')' | b'{' | b'}' | b'<' | b'>' | b'=' | b'&'
+        )
+}
+
+fn redact_ipv6_addresses(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut i = 0usize;
+
+    while i < len {
+        if is_ipv6_tok_sep(bytes[i]) {
+            out.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < len && !is_ipv6_tok_sep(bytes[i]) {
+            i += 1;
+        }
+        let tok = &input[start..i];
+        if let Some(redacted) = redact_ipv6_token(tok) {
+            out.push_str(&redacted);
+        } else {
+            out.push_str(tok);
+        }
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use catcloud_core::models::RouteTargetMode;
+
+    #[test]
+    fn sanitize_log_line_redacts_secrets_passwords_tokens_and_ipv6_without_breaking_timestamps() {
+        let raw = concat!(
+            "2026-11-24T03:20:00Z INFO auth failed ",
+            "controller_secret=deadbeef01234567 ",
+            "\"password\": \"myS3cr3t!\", ",
+            "url=https://sub.example.com/api?token=tok_999888&ok=1 ",
+            "Authorization: Bearer eyJhbGci.payload.sig ",
+            "peer=[2001:db8:85a3::8a2e:370:7334]:443 ",
+            "src=fe80::1%12 net=2001:db8::/48 local=::1 ",
+            "mod=catcloud_core::config"
+        );
+        let sanitized = sanitize_log_line(raw);
+
+        assert!(sanitized.contains("2026-11-24T03:20:00Z"));
+        assert!(sanitized.contains("mod=catcloud_core::config"));
+        assert!(sanitized.contains("ok=1"));
+
+        assert!(!sanitized.contains("deadbeef01234567"));
+        assert!(!sanitized.contains("myS3cr3t!"));
+        assert!(!sanitized.contains("tok_999888"));
+        assert!(!sanitized.contains("eyJhbGci.payload.sig"));
+        assert!(!sanitized.contains("2001:db8:85a3::8a2e:370:7334"));
+        assert!(!sanitized.contains("fe80::1"));
+        assert!(!sanitized.contains("2001:db8::/48"));
+
+        assert!(sanitized.contains("controller_secret=<REDACTED>"));
+        assert!(sanitized.contains("\"password\": \"<REDACTED>\""));
+        assert!(sanitized.contains("token=<REDACTED>&ok=1"));
+        assert!(sanitized.contains("Authorization: Bearer <REDACTED>"));
+        assert!(sanitized.contains("peer=[<REDACTED_IPV6>]:443"));
+        assert!(sanitized.contains("src=<REDACTED_IPV6>"));
+        assert!(sanitized.contains("net=<REDACTED_IPV6>/48"));
+        assert!(sanitized.contains("local=<REDACTED_IPV6>"));
+    }
+
+    #[test]
+    fn diag_payload_includes_rich_routing_geodata_and_bounded_sanitized_log_tail() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-diag-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        let mut cfg = config::load_or_init(&paths).expect("init config");
+        cfg.route_mode = RouteTargetMode::Single;
+        cfg.active_group_id = Some("grp-tw".to_string());
+        cfg.active_single_node_id = Some("node-tw-01".to_string());
+        cfg.system_proxy.enabled = true;
+        cfg.tun.enabled = true;
+        cfg.rules_override.domestic_direct_enabled = true;
+        cfg.rules_override.block_quic_udp_443 = true;
+        cfg.preaccel.enabled = true;
+        config::save(&paths, &cfg).expect("save config");
+
+        // Place country-lite.mmdb + geosite.dat so geodata_status reflects disk reality.
+        std::fs::write(paths.runtime_dir.join("country-lite.mmdb"), b"stub-mmdb").unwrap();
+        std::fs::write(paths.runtime_dir.join("geosite.dat"), b"stub-geosite").unwrap();
+
+        // Write 55 log lines containing sensitive tokens and IPv6 addresses.
+        let mut log_content = String::new();
+        for idx in 1..=55 {
+            log_content.push_str(&format!(
+                "2026-11-24T03:00:{:02}Z INFO line={} secret=sec_{idx} token=tok_{idx} ip=2001:db8::{idx:x}\n",
+                idx % 60,
+                idx
+            ));
+        }
+        std::fs::write(paths.logs_dir.join("catcloud.log"), log_content).unwrap();
+
+        let diag = build_diag_payload(&paths).expect("build diag payload");
+        assert_eq!(diag["ok"], json!(true));
+        assert_eq!(diag["sanitized"], json!(true));
+        assert_eq!(diag["route_mode"], json!("single"));
+        assert_eq!(diag["active_group_id"], json!("grp-tw"));
+        assert_eq!(diag["active_single_node_id"], json!("node-tw-01"));
+        assert_eq!(diag["system_proxy_enabled"], json!(true));
+        assert_eq!(diag["tun_enabled"], json!(true));
+        assert_eq!(diag["domestic_direct_enabled"], json!(true));
+        assert_eq!(diag["block_quic_udp_443"], json!(true));
+        assert_eq!(diag["preaccel_enabled"], json!(true));
+
+        assert_eq!(diag["geodata_status"]["country_mmdb"]["exists"], json!(true));
+        assert_eq!(diag["geodata_status"]["geosite_dat"]["exists"], json!(true));
+        assert_eq!(diag["geodata_status"]["geoip_dat"]["exists"], json!(false));
+
+        let logs = diag["recent_logs"].as_array().expect("recent_logs array");
+        assert_eq!(logs.len(), MAX_DIAG_LOG_LINES);
+        assert!(logs[0].as_str().unwrap().contains("line=16"));
+        assert!(logs[39].as_str().unwrap().contains("line=55"));
+        for entry in logs {
+            let s = entry.as_str().unwrap();
+            assert!(!s.contains("sec_"));
+            assert!(!s.contains("tok_"));
+            assert!(!s.contains("2001:db8::"));
+            assert!(s.contains("secret=<REDACTED>"));
+            assert!(s.contains("token=<REDACTED>"));
+            assert!(s.contains("ip=<REDACTED_IPV6>"));
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

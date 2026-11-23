@@ -4,7 +4,7 @@ use crate::core_adapter::port_guard::AllocatedPorts;
 use crate::error::{CatError, CatResult};
 use crate::models::{
     AppConfig, DEFAULT_AI_ROUTING_DOMAINS, FallbackPolicy, MultiGroup, MultiGroupMode,
-    MultiGroupState, OverrideMode, PreAccelRelay, ProxyNode, RouteTargetMode,
+    MultiGroupState, OverrideMode, PreAccelRelay, ProxyMode, ProxyNode, RouteTargetMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Number, Value};
@@ -276,6 +276,83 @@ fn is_plausible_global_rule(rule: &str) -> bool {
     parts.len() >= 3 && parts.iter().all(|p| !p.is_empty())
 }
 
+fn is_builtin_rule_action(target: &str) -> bool {
+    let upper = target.trim().to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "DIRECT" | "REJECT" | "REJECT-DROP" | "PASS" | "COMPATIBLE"
+    )
+}
+
+fn is_mihomo_rule_flag(token: &str) -> bool {
+    token.eq_ignore_ascii_case("no-resolve") || token.eq_ignore_ascii_case("src")
+}
+
+/// Extract the raw proxy or proxy-group target from a Mihomo rule line (including built-in
+/// actions such as `DIRECT`/`REJECT`). Returns `None` for blank lines, `#` comments,
+/// `SUB-RULE` entries, or malformed rules without a target segment.
+fn extract_mihomo_rule_raw_target(rule: &str) -> Option<&str> {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let (raw_type, rest) = trimmed.split_once(',')?;
+    let rule_type = raw_type.trim();
+    if rule_type.is_empty() || rule_type.eq_ignore_ascii_case("SUB-RULE") {
+        return None;
+    }
+    if rule_type.eq_ignore_ascii_case("MATCH") {
+        let target = rest.trim();
+        if target.is_empty() || target.contains(',') {
+            return None;
+        }
+        return Some(target);
+    }
+    if is_logical_rule_type(rule_type) {
+        let mut remainder = rest.trim();
+        while let Some((head, tail)) = remainder.rsplit_once(',') {
+            let candidate = tail.trim();
+            if candidate.is_empty() {
+                return None;
+            }
+            if is_mihomo_rule_flag(candidate) {
+                remainder = head.trim();
+                continue;
+            }
+            if !candidate.contains('(')
+                && !candidate.contains(')')
+                && has_balanced_parens(head)
+            {
+                return Some(candidate);
+            }
+            return None;
+        }
+        return None;
+    }
+
+    let mut parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    if parts.len() < 3 || parts[1].is_empty() {
+        return None;
+    }
+    while parts.len() > 2 && parts.last().is_some_and(|tok| is_mihomo_rule_flag(tok)) {
+        parts.pop();
+    }
+    if parts.len() < 3 {
+        return None;
+    }
+    let target = *parts.last()?;
+    if target.is_empty() {
+        return None;
+    }
+    Some(target)
+}
+
+/// Extract a non-builtin proxy or proxy-group target name from a Mihomo rule line, ignoring
+/// built-in actions (`DIRECT`, `REJECT`, `REJECT-DROP`, `PASS`, `COMPATIBLE`, case-insensitive).
+fn extract_mihomo_rule_target(rule: &str) -> Option<&str> {
+    extract_mihomo_rule_raw_target(rule).filter(|target| !is_builtin_rule_action(target))
+}
+
 /// Expand a multi-group match rule into one or more Mihomo rule strings.
 ///
 /// - `@ai_domains` or `PRESET:AI` expands into `DEFAULT_AI_ROUTING_DOMAINS` bound to `group_name`.
@@ -382,8 +459,8 @@ pub fn compile_mihomo_config(input: &CompileInput<'_>) -> CatResult<CompiledCore
 }
 
 /// Compile a full Mihomo YAML configuration while optionally inspecting `runtime_dir` for
-/// locally installed `geosite.dat` / `geoip.dat` / `Country.mmdb` databases so GeoSite/GeoIP
-/// rules and filters are only emitted when their backing files actually exist on disk.
+/// locally installed `geosite.dat` / `geoip.dat` / `Country.mmdb` databases
+/// so GeoSite/GeoIP rules and filters are only emitted when their backing files actually exist on disk.
 pub fn compile_mihomo_config_with_runtime_dir(
     input: &CompileInput<'_>,
     runtime_dir: Option<&Path>,
@@ -417,6 +494,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
         input.relays.iter().filter(|r| r.enabled).collect();
     enabled_relays.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
     let preaccel_active = cfg.preaccel.enabled && !enabled_relays.is_empty();
+
+    // Determine which enabled business nodes (and optional active group subset) need compilation.
+    let (compiled_nodes, allowed_group_ids) = select_nodes_and_groups_for_compile(input);
 
     let mut root = Mapping::new();
 
@@ -456,6 +536,8 @@ pub fn compile_mihomo_config_with_runtime_dir(
     insert_bool(&mut root, "ipv6", cfg.core_ipv6);
     insert_bool(&mut root, "unified-delay", cfg.unified_delay);
     insert_bool(&mut root, "tcp-concurrent", cfg.tcp_concurrent);
+    insert_u64(&mut root, "keep-alive-idle", 15);
+    insert_u64(&mut root, "keep-alive-interval", 15);
     insert_str(
         &mut root,
         "find-process-mode",
@@ -489,10 +571,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
 
     insert_bool(&mut root, "geodata-mode", cfg.geodata.geodata_mode);
     insert_bool(&mut root, "geo-auto-update", cfg.geodata.auto_update);
-    if cfg.geodata.geodata_mode {
-        // Hard rule: whenever geodata-mode is enabled, enforce memconservative streaming loader.
-        insert_str(&mut root, "geodata-loader", "memconservative");
-    }
+    // Unconditionally enforce memconservative streaming loader so geosite.dat never expands
+    // fully onto the Go heap (even when geodata-mode is false and only geosite rules are loaded).
+    insert_str(&mut root, "geodata-loader", "memconservative");
 
     let mut geox_url = Mapping::new();
     if !cfg.geodata.geoip_url.trim().is_empty() {
@@ -511,7 +592,10 @@ pub fn compile_mihomo_config_with_runtime_dir(
         root.insert(str_val("geox-url"), Value::Mapping(geox_url));
     }
 
-    root.insert(str_val("sniffer"), Value::Mapping(build_sniffer_section()));
+    root.insert(
+        str_val("sniffer"),
+        Value::Mapping(build_sniffer_section(cfg.rules_override.block_quic_udp_443)),
+    );
 
     if cfg.dns.use_hosts && !cfg.dns.hosts.is_empty() {
         let mut hosts_map = Mapping::new();
@@ -571,10 +655,10 @@ pub fn compile_mihomo_config_with_runtime_dir(
         }
     }
 
-    // Add all enabled business proxy node domain servers to fake-ip-filter to prevent TUN
+    // Add compiled business proxy node domain servers to fake-ip-filter to prevent TUN
     // Fake-IP resolution loops. Do NOT force DIRECT rules on business nodes (otherwise nodes
     // wrapped with domestic :443 relays would bypass pre-acceleration).
-    for node in input.nodes.iter().filter(|n| n.enabled) {
+    for &node in &compiled_nodes {
         let server_candidate = {
             let s = node.server.trim();
             if !s.is_empty() {
@@ -636,7 +720,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
     let mut dialer_wrapped_proxies = 0usize;
     let mut skipped_443_native_proxies = 0usize;
 
-    for node in input.nodes.iter().filter(|n| n.enabled) {
+    for &node in &compiled_nodes {
         let base_name = if node.name.trim().is_empty() {
             format!("Node-{}", node.id)
         } else {
@@ -760,6 +844,11 @@ pub fn compile_mihomo_config_with_runtime_dir(
         .filter(|s| !s.is_empty());
 
     for group in input.groups {
+        if let Some(ref allowed_groups) = allowed_group_ids {
+            if !allowed_groups.contains(group.id.trim()) {
+                continue;
+            }
+        }
         let group_name = if group.name.trim().is_empty() {
             group.id.trim().to_string()
         } else {
@@ -1038,14 +1127,28 @@ pub fn compile_mihomo_config_with_runtime_dir(
     const PRIVATE_LAN_DIRECT_RULES: &[&str] = &[
         "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
         "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+        "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
         "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
         "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
         "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
+        "IP-CIDR,224.0.0.0/4,DIRECT,no-resolve",
+        "IP-CIDR,255.255.255.255/32,DIRECT,no-resolve",
         "IP-CIDR6,::1/128,DIRECT,no-resolve",
         "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
         "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
     ];
     for r in PRIVATE_LAN_DIRECT_RULES {
+        push_unique(&mut rules, (*r).to_string());
+    }
+    const PRIVATE_LOCAL_DOMAIN_DIRECT_RULES: &[&str] = &[
+        "DOMAIN-SUFFIX,local,DIRECT",
+        "DOMAIN-SUFFIX,localhost,DIRECT",
+        "DOMAIN-SUFFIX,localdomain,DIRECT",
+        "DOMAIN-SUFFIX,home.arpa,DIRECT",
+        "DOMAIN-SUFFIX,lan,DIRECT",
+        "DOMAIN-SUFFIX,internal,DIRECT",
+    ];
+    for r in PRIVATE_LOCAL_DOMAIN_DIRECT_RULES {
         push_unique(&mut rules, (*r).to_string());
     }
     if has_geosite {
@@ -1062,9 +1165,14 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "IP-CIDR,114.114.114.114/32,DIRECT,no-resolve",
         "IP-CIDR,114.114.115.115/32,DIRECT,no-resolve",
         "IP-CIDR,180.76.76.76/32,DIRECT,no-resolve",
+        "IP-CIDR,180.184.1.1/32,DIRECT,no-resolve",
+        "IP-CIDR,180.184.2.2/32,DIRECT,no-resolve",
+        "IP-CIDR,1.2.4.8/32,DIRECT,no-resolve",
+        "IP-CIDR,210.2.4.8/32,DIRECT,no-resolve",
         "DOMAIN,dns.alidns.com,DIRECT",
         "DOMAIN,doh.pub,DIRECT",
         "DOMAIN,dot.pub,DIRECT",
+        "DOMAIN,dns.pub,DIRECT",
     ];
     for r in DOMESTIC_PUBLIC_DNS_DIRECT_RULES {
         push_unique(&mut rules, (*r).to_string());
@@ -1127,24 +1235,149 @@ pub fn compile_mihomo_config_with_runtime_dir(
         }
     }
 
+    // Group A: Always-emitted strictly domestic / system download CDN & NTP whitelist
+    // (placed before `GEOSITE,cn,DIRECT` even when `geosite.dat` is present).
+    // Conservative red line: never include broad overseas/hybrid root domains such as
+    // `microsoft.com`, `apple.com`, `steampowered.com`, `steamcommunity.com`, `github.com`, etc.
+    const ALWAYS_DOMESTIC_AND_SYSTEM_CDN_DOMAINS: &[&str] = &[
+        // Microsoft connectivity checks & Windows Update download CDNs
+        "msftconnecttest.com",
+        "msftncsi.com",
+        "time.windows.com",
+        "windowsupdate.com",
+        "update.microsoft.com",
+        "dl.delivery.mp.microsoft.com",
+        "tlu.dl.delivery.mp.microsoft.com",
+        // Apple China downloads, push notifications & NTP
+        "icloud.com.cn",
+        "push.apple.com",
+        "time.apple.com",
+        "swcdn.apple.com",
+        "appldnld.apple.com",
+        "mesu.apple.com",
+        "updates-http.cdn-apple.com",
+        "osxapps.itunes.apple.com",
+        // Steam pure download CDNs (excluding store/community)
+        "steamcontent.com",
+        "steamserver.net",
+        "dl.steam.clngaa.com",
+        "dl.steam.ksyna.com",
+        "st.dl.eccdnx.com",
+        "st.dl.pinyuncloud.com",
+        "st.dl.bscstorage.net",
+        "xz.pphimalayanrt.com",
+        // Domestic NTP
+        "ntp.aliyun.com",
+        "ntp.tencent.com",
+        "cn.pool.ntp.org",
+    ];
+
+    // Group B: Expanded fallback whitelist for strictly domestic sites and core CDNs
+    // used when `geosite.dat` is absent.
     const FALLBACK_DOMESTIC_DIRECT_DOMAINS: &[&str] = &[
+        // Core domestic portals & Tencent / QQ / WeChat
         "qq.com",
         "weixin.qq.com",
-        "bilibili.com",
-        "baidu.com",
-        "taobao.com",
-        "jd.com",
-        "163.com",
-        "zhihu.com",
-        "douyin.com",
-        "alibaba.com",
+        "gtimg.com",
+        "qpic.cn",
+        "qlogo.cn",
+        "wechat.com",
+        "wechatpay.com",
+        "tenpay.com",
         "tencent.com",
+        "myqcloud.com",
+        "qcloud.com",
+        // Taobao / Aliyun / Alipay / DingTalk / Amap (excluding international alibaba.com)
+        "taobao.com",
+        "tmall.com",
+        "alicdn.com",
+        "aliyuncs.com",
+        "aliyun.com",
+        "alipay.com",
+        "alipayobjects.com",
+        "dingtalk.com",
+        "amap.com",
+        "autonavi.com",
+        // ByteDance / Douyin / Feishu (strictly domestic; never tiktok.com / larksuite.com)
+        "douyin.com",
+        "bytedance.com",
+        "byteimg.com",
+        "pstatp.com",
+        "snssdk.com",
+        "toutiao.com",
+        "iesdouyin.com",
+        "douyinvod.com",
+        "volces.com",
+        "volcengine.com",
+        "feishu.cn",
+        // Bilibili & video CDNs
+        "bilibili.com",
+        "bilivideo.com",
+        "bilivideo.cn",
+        "hdslb.com",
+        "biliapi.com",
+        "biliapi.net",
+        "b23.tv",
+        // NetEase / Youdao
+        "163.com",
+        "126.net",
+        "126.com",
+        "netease.com",
+        "ydstatic.com",
+        "youdao.com",
+        // Baidu & Baidu Netdisk
+        "baidu.com",
+        "bdimg.com",
+        "bdstatic.com",
+        "bcebos.com",
+        "baidupcs.com",
+        // JD / Zhihu / Xiaohongshu / Weibo / Douban
+        "jd.com",
+        "360buyimg.com",
+        "zhihu.com",
+        "zhimg.com",
+        "xiaohongshu.com",
+        "xhscdn.com",
+        "weibo.com",
+        "sinaimg.cn",
+        "douban.com",
+        "doubanio.com",
+        // Local services & e-commerce
+        "meituan.com",
+        "meituan.net",
+        "dianping.com",
+        "pinduoduo.com",
+        // Domestic video / livestreaming
+        "iqiyi.com",
+        "youku.com",
+        "mgtv.com",
+        "huya.com",
+        "douyu.com",
+        "kuaishou.com",
+        // Cloud drives & domestic developer mirrors (excluding international wps.com)
+        "aliyundrive.com",
+        "alipan.com",
+        "quark.cn",
+        "csdn.net",
+        "gitee.com",
+        "juejin.cn",
+        "npmmirror.com",
+        // OEMs, logistics & education
         "mi.com",
+        "xiaomi.com",
+        "miui.com",
         "huawei.com",
+        "hicloud.com",
+        "vmall.com",
+        "sf-express.com",
+        "cainiao.com",
         "edu.cn",
     ];
     if cfg.rules_override.domestic_direct_enabled {
         push_unique(&mut rules, "DOMAIN-SUFFIX,cn,DIRECT".to_string());
+        for domain in ALWAYS_DOMESTIC_AND_SYSTEM_CDN_DOMAINS {
+            push_unique(&mut rules, format!("DOMAIN-SUFFIX,{domain},DIRECT"));
+        }
         if has_geosite {
             push_unique(&mut rules, "GEOSITE,cn,DIRECT".to_string());
         } else {
@@ -1344,6 +1577,7 @@ fn merge_yaml_values(target: &mut Value, patch: Value) {
 /// - Cyclic references between `proxy-groups`
 /// - Overseas `gstatic`/`google`/`cloudflare` URLs mistakenly assigned to domestic pre-accel groups
 /// - Missing `DIRECT` loop-prevention rules for pre-acceleration relay servers
+/// - Rules referencing unknown proxies or proxy-groups outside built-in actions
 pub fn validate_compiled_yaml(
     yaml_str: &str,
     relay_servers: &[String],
@@ -1366,13 +1600,19 @@ pub fn validate_compiled_yaml(
 
     let mut issues: Vec<StaticCheckIssue> = Vec::new();
 
-    // Map proxy name -> server for discovering relay servers referenced via dialer-proxy.
+    // Map proxy name -> server for discovering relay servers referenced via dialer-proxy,
+    // and collect every valid proxy/proxy-group target name referenced by `rules`.
+    let mut valid_rule_targets: HashSet<String> = HashSet::new();
     let mut proxy_server_map: HashMap<String, String> = HashMap::new();
     let mut dialer_targets: HashSet<String> = HashSet::new();
     if let Some(proxies) = root.get("proxies").and_then(Value::as_sequence) {
         for item in proxies {
             if let Some(map) = item.as_mapping() {
                 if let Some(name) = map.get("name").and_then(Value::as_str) {
+                    let trimmed_name = name.trim();
+                    if !trimmed_name.is_empty() {
+                        valid_rule_targets.insert(trimmed_name.to_string());
+                    }
                     if let Some(server) = map.get("server").and_then(Value::as_str) {
                         proxy_server_map.insert(name.to_string(), server.to_string());
                     }
@@ -1398,13 +1638,15 @@ pub fn validate_compiled_yaml(
                 });
                 continue;
             };
-            let group_name = map
+            let raw_group_name = map
                 .get("name")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("<unnamed>")
-                .to_string();
+                .filter(|s| !s.is_empty());
+            if let Some(name) = raw_group_name {
+                valid_rule_targets.insert(name.to_string());
+            }
+            let group_name = raw_group_name.unwrap_or("<unnamed>").to_string();
 
             let members: Vec<String> = map
                 .get("proxies")
@@ -1503,6 +1745,21 @@ pub fn validate_compiled_yaml(
         }
     }
 
+    // Verify every rule target resolves to a built-in action or an existing proxy / proxy-group.
+    for rule in &rules {
+        if let Some(target) = extract_mihomo_rule_target(rule) {
+            if !valid_rule_targets.contains(target) {
+                issues.push(StaticCheckIssue {
+                    code: "unknown_rule_target".to_string(),
+                    severity: StaticCheckSeverity::Error,
+                    message: format!(
+                        "rule `{rule}` references unknown proxy or proxy-group `{target}`"
+                    ),
+                });
+            }
+        }
+    }
+
     if !rules
         .iter()
         .any(|r| r.to_ascii_uppercase().starts_with("MATCH,"))
@@ -1539,7 +1796,271 @@ pub fn validate_compiled_yaml(
 // Internal section builders & helpers
 // ============================================================================
 
-fn build_sniffer_section() -> Mapping {
+/// Select enabled business nodes (and optional active group-ID subset) for compilation.
+///
+/// When `!compile_all_nodes`, `proxy_mode != ProxyMode::Global`, and `input.nodes.len() > 32`,
+/// trims compiled proxies and `fake-ip-filter` entries down to nodes referenced by:
+/// - `RouteTargetMode::Single`: `active_single_node_id` (if enabled), plus any user multi-groups
+///   (and their transitive `fallback_pool_id` / members) or nodes referenced by global/extra rules;
+/// - `RouteTargetMode::Group` (or Single fallback): the active home group, every
+///   `independent_routing == true` group, any user multi-groups/nodes referenced by global/extra
+///   rules or emitted group `match_rules`, and any transitive `fallback_pool_id` backup groups,
+///   plus any chained `dialer-proxy` node references.
+///
+/// Safety fallback: if the active referenced set is empty (or an active `ConditionalPool`
+/// consumes all enabled nodes dynamically), all enabled nodes and groups are preserved.
+fn select_nodes_and_groups_for_compile<'a>(
+    input: &CompileInput<'a>,
+) -> (Vec<&'a ProxyNode>, Option<HashSet<String>>) {
+    let cfg = input.config;
+    let enabled_nodes: Vec<&'a ProxyNode> = input.nodes.iter().filter(|n| n.enabled).collect();
+    let should_prune = !cfg.core_runtime.compile_all_nodes
+        && cfg.proxy_mode != ProxyMode::Global
+        && input.nodes.len() > 32;
+    if !should_prune || enabled_nodes.is_empty() {
+        return (enabled_nodes, None);
+    }
+
+    let enabled_node_ids: HashSet<&'a str> = enabled_nodes.iter().map(|n| n.id.as_str()).collect();
+    let mut enabled_nodes_by_name: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+    for &node in &enabled_nodes {
+        let trimmed = node.name.trim();
+        if !trimmed.is_empty() {
+            enabled_nodes_by_name
+                .entry(trimmed)
+                .or_default()
+                .push(node.id.as_str());
+        }
+    }
+
+    let mut active_node_ids: HashSet<&'a str> = HashSet::new();
+
+    // Index all valid user multi-groups by ID and compiled name, and resolve effective active group.
+    let preferred_active_group_id = cfg
+        .active_group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let mut effective_active_group_id: Option<&'a str> = None;
+    let mut group_by_id: HashMap<&'a str, &'a MultiGroup> = HashMap::new();
+    let mut group_ids_by_name: HashMap<&'a str, Vec<&'a str>> = HashMap::new();
+    for group in input.groups {
+        let g_id = group.id.trim();
+        let g_name = if group.name.trim().is_empty() {
+            g_id
+        } else {
+            group.name.trim()
+        };
+        if g_name.is_empty() {
+            continue;
+        }
+        group_by_id.insert(g_id, group);
+        group_ids_by_name.entry(g_name).or_default().push(g_id);
+        if preferred_active_group_id == Some(g_id) {
+            effective_active_group_id = Some(g_id);
+        } else if effective_active_group_id.is_none() {
+            effective_active_group_id = Some(g_id);
+        }
+    }
+
+    // 1. Determine whether direct single-node mode has a valid enabled single node selected.
+    let single_mode_node_id: Option<&'a str> = if cfg.route_mode == RouteTargetMode::Single {
+        cfg.active_single_node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|single_id| enabled_node_ids.get(single_id).copied())
+    } else {
+        None
+    };
+
+    let mut active_group_ids: HashSet<String> = HashSet::new();
+    let mut queue: Vec<&'a str> = Vec::new();
+
+    if let Some(single_id) = single_mode_node_id {
+        // Direct single-node mode: always keep the selected single node; unrelated groups are
+        // pruned unless referenced by global/extra rules below.
+        active_node_ids.insert(single_id);
+    } else {
+        // Group mode (or Single fallback when active_single_node_id is absent/disabled).
+        if let Some(active_gid) = effective_active_group_id {
+            queue.push(active_gid);
+        }
+        for group in input.groups {
+            if group.independent_routing {
+                let g_id = group.id.trim();
+                if !g_id.is_empty() {
+                    queue.push(g_id);
+                }
+            }
+        }
+    }
+
+    // 2. Regardless of Single or Group mode, scan global/extra rules so AI preset and custom
+    //    routing rules targeting any user multi-group (or proxy node) never become dangling.
+    let global_rule_iter = input
+        .extra_prepend_rules
+        .iter()
+        .chain(cfg.rules_override.global_prepend_rules.iter())
+        .chain(cfg.rules_override.global_append_rules.iter())
+        .chain(
+            cfg.preaccel
+                .campus_direct_domains
+                .iter()
+                .filter(|entry| entry.contains(',')),
+        );
+    for raw_rule in global_rule_iter {
+        if let Some(target) = extract_mihomo_rule_target(raw_rule) {
+            if let Some(gids) = group_ids_by_name.get(target) {
+                for &gid in gids {
+                    queue.push(gid);
+                }
+            }
+            if let Some(nids) = enabled_nodes_by_name.get(target) {
+                for &nid in nids {
+                    active_node_ids.insert(nid);
+                }
+            }
+        }
+    }
+
+    // 3. Transitively expand active groups via `fallback_pool_id` and emitted `match_rules`.
+    while let Some(gid) = queue.pop() {
+        if !active_group_ids.insert(gid.to_string()) {
+            continue;
+        }
+        if let Some(group) = group_by_id.get(gid) {
+            if let Some(fb_id) = group
+                .fallback_pool_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if !active_group_ids.contains(fb_id) {
+                    queue.push(fb_id);
+                }
+            }
+            if single_mode_node_id.is_none()
+                && (effective_active_group_id == Some(gid) || group.independent_routing)
+            {
+                let g_name = if group.name.trim().is_empty() {
+                    gid
+                } else {
+                    group.name.trim()
+                };
+                for raw_rule in &group.match_rules {
+                    for expanded in expand_group_match_rule(raw_rule, g_name) {
+                        if let Some(target) = extract_mihomo_rule_target(&expanded) {
+                            if let Some(target_gids) = group_ids_by_name.get(target) {
+                                for &target_gid in target_gids {
+                                    if !active_group_ids.contains(target_gid) {
+                                        queue.push(target_gid);
+                                    }
+                                }
+                            }
+                            if let Some(nids) = enabled_nodes_by_name.get(target) {
+                                for &nid in nids {
+                                    active_node_ids.insert(nid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut need_all_enabled = false;
+    for group in input.groups {
+        let g_id = group.id.trim();
+        if !active_group_ids.contains(g_id) {
+            continue;
+        }
+        let group_name = if group.name.trim().is_empty() {
+            g_id
+        } else {
+            group.name.trim()
+        };
+        let explicit_filtered = input
+            .group_filtered_members
+            .get(&group.id)
+            .or_else(|| input.group_filtered_members.get(group_name));
+        if let Some(filtered_ids) = explicit_filtered {
+            for nid in filtered_ids {
+                if let Some(&id_ref) = enabled_node_ids.get(nid.as_str()) {
+                    active_node_ids.insert(id_ref);
+                }
+            }
+        } else if !group.member_node_ids.is_empty() {
+            for nid in &group.member_node_ids {
+                if let Some(&id_ref) = enabled_node_ids.get(nid.as_str()) {
+                    active_node_ids.insert(id_ref);
+                }
+            }
+        } else if group.mode == MultiGroupMode::ConditionalPool {
+            need_all_enabled = true;
+            break;
+        }
+    }
+
+    if need_all_enabled || active_node_ids.is_empty() {
+        return (enabled_nodes, None);
+    }
+
+    expand_chained_dialer_nodes(&enabled_nodes, &mut active_node_ids);
+    let selected: Vec<&'a ProxyNode> = enabled_nodes
+        .into_iter()
+        .filter(|n| active_node_ids.contains(n.id.as_str()))
+        .collect();
+    if selected.is_empty() {
+        let all_enabled: Vec<&'a ProxyNode> = input.nodes.iter().filter(|n| n.enabled).collect();
+        return (all_enabled, None);
+    }
+    (selected, Some(active_group_ids))
+}
+
+fn expand_chained_dialer_nodes<'a>(
+    enabled_nodes: &[&'a ProxyNode],
+    active_node_ids: &mut HashSet<&'a str>,
+) {
+    let mut by_name: HashMap<&str, Vec<&'a ProxyNode>> = HashMap::new();
+    for &node in enabled_nodes {
+        let trimmed = node.name.trim();
+        if !trimmed.is_empty() {
+            by_name.entry(trimmed).or_default().push(node);
+        }
+    }
+    loop {
+        let mut added = false;
+        let snapshot: Vec<&'a str> = active_node_ids.iter().copied().collect();
+        for &node in enabled_nodes {
+            if !snapshot.contains(&node.id.as_str()) {
+                continue;
+            }
+            let Some(dp) = node
+                .raw_config
+                .get("dialer-proxy")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && *s != PREACCEL_SELECT_GROUP_NAME)
+            else {
+                continue;
+            };
+            if let Some(targets) = by_name.get(dp) {
+                for target in targets {
+                    if active_node_ids.insert(target.id.as_str()) {
+                        added = true;
+                    }
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
+}
+
+fn build_sniffer_section(block_quic_udp_443: bool) -> Mapping {
     let mut map = Mapping::new();
     insert_bool(&mut map, "enable", true);
     insert_bool(&mut map, "force-dns-mapping", true);
@@ -1569,15 +2090,17 @@ fn build_sniffer_section() -> Mapping {
     );
     sniff.insert(str_val("TLS"), Value::Mapping(tls));
 
-    let mut quic = Mapping::new();
-    quic.insert(
-        str_val("ports"),
-        Value::Sequence(vec![
-            Value::Number(Number::from(443u64)),
-            Value::Number(Number::from(8443u64)),
-        ]),
-    );
-    sniff.insert(str_val("QUIC"), Value::Mapping(quic));
+    if !block_quic_udp_443 {
+        let mut quic = Mapping::new();
+        quic.insert(
+            str_val("ports"),
+            Value::Sequence(vec![
+                Value::Number(Number::from(443u64)),
+                Value::Number(Number::from(8443u64)),
+            ]),
+        );
+        sniff.insert(str_val("QUIC"), Value::Mapping(quic));
+    }
 
     map.insert(str_val("sniff"), Value::Mapping(sniff));
     map.insert(
@@ -1703,7 +2226,8 @@ fn build_dns_section(
         push_unique(&mut merged_fake_ip_filter, "geosite:cn".to_string());
         push_unique(&mut merged_fake_ip_filter, "geosite:private".to_string());
     }
-    const DOMESTIC_DNS_FAKE_IP_FILTERS: &[&str] = &["dns.alidns.com", "doh.pub", "dot.pub"];
+    const DOMESTIC_DNS_FAKE_IP_FILTERS: &[&str] =
+        &["dns.alidns.com", "doh.pub", "dot.pub", "dns.pub"];
     for item in DOMESTIC_DNS_FAKE_IP_FILTERS {
         push_unique(&mut merged_fake_ip_filter, (*item).to_string());
     }
@@ -1864,9 +2388,14 @@ fn is_domestic_default_nameserver(entry: &str) -> bool {
             | "114.114.114.114"
             | "114.114.115.115"
             | "180.76.76.76"
+            | "180.184.1.1"
+            | "180.184.2.2"
+            | "1.2.4.8"
+            | "210.2.4.8"
             | "dns.alidns.com"
             | "doh.pub"
             | "dot.pub"
+            | "dns.pub"
     )
 }
 
@@ -3801,5 +4330,754 @@ rules:
                 "compiled @ai_domains rules missing `{codex_rule}`"
             );
         }
+    }
+
+    #[test]
+    fn compiles_country_lite_mmdb_and_conservative_domestic_direct_rules() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-compiler-country-lite-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = AppConfig::default();
+        let ports = sample_ports();
+        let nodes = vec![sample_node("n1", "Node-TW-01", 443, true)];
+        let empty = HashMap::new();
+        let input = CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        };
+
+        // 1. country-lite.mmdb alone (geodata_mode == false) must NOT activate GeoIP rules or DNS filter
+        //    because Mihomo only reads `Country.mmdb` / `country.mmdb`.
+        std::fs::write(dir.join("country-lite.mmdb"), b"stub").unwrap();
+        let lite_only = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(lite_only.validation.ok);
+        assert_eq!(
+            lite_only.value["dns"]["fallback-filter"]["geoip"],
+            Value::Bool(false)
+        );
+        let rules_no_geosite: Vec<&str> = lite_only.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!rules_no_geosite.contains(&"GEOIP,CN,DIRECT,no-resolve"));
+
+        // Unconditional private LAN / reserved CIDR / local domain / expanded domestic DNS rules.
+        for expected in [
+            "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
+            "IP-CIDR,224.0.0.0/4,DIRECT,no-resolve",
+            "IP-CIDR,255.255.255.255/32,DIRECT,no-resolve",
+            "DOMAIN-SUFFIX,local,DIRECT",
+            "DOMAIN-SUFFIX,localhost,DIRECT",
+            "DOMAIN-SUFFIX,localdomain,DIRECT",
+            "DOMAIN-SUFFIX,home.arpa,DIRECT",
+            "DOMAIN-SUFFIX,lan,DIRECT",
+            "DOMAIN-SUFFIX,internal,DIRECT",
+            "IP-CIDR,180.184.1.1/32,DIRECT,no-resolve",
+            "IP-CIDR,180.184.2.2/32,DIRECT,no-resolve",
+            "IP-CIDR,1.2.4.8/32,DIRECT,no-resolve",
+            "IP-CIDR,210.2.4.8/32,DIRECT,no-resolve",
+            "DOMAIN,dns.pub,DIRECT",
+        ] {
+            assert!(
+                rules_no_geosite.contains(&expected),
+                "missing unconditional rule `{expected}`"
+            );
+        }
+        // Strictly forbidden: never bypass CatCloud.exe so dashboard proxy checks stay routed via proxy.
+        assert!(
+            !rules_no_geosite.iter().any(|r| r.contains("CatCloud.exe")),
+            "CatCloud.exe must never be added to DIRECT rules"
+        );
+
+        // Both Group A (system/download CDN) and Group B (fallback domestic sites) present without geosite.dat.
+        for expected_domestic in [
+            "DOMAIN-SUFFIX,msftconnecttest.com,DIRECT",
+            "DOMAIN-SUFFIX,dl.delivery.mp.microsoft.com,DIRECT",
+            "DOMAIN-SUFFIX,icloud.com.cn,DIRECT",
+            "DOMAIN-SUFFIX,push.apple.com,DIRECT",
+            "DOMAIN-SUFFIX,steamcontent.com,DIRECT",
+            "DOMAIN-SUFFIX,dl.steam.clngaa.com,DIRECT",
+            "DOMAIN-SUFFIX,ntp.aliyun.com,DIRECT",
+            "DOMAIN-SUFFIX,gtimg.com,DIRECT",
+            "DOMAIN-SUFFIX,alicdn.com,DIRECT",
+            "DOMAIN-SUFFIX,bilivideo.com,DIRECT",
+            "DOMAIN-SUFFIX,xiaohongshu.com,DIRECT",
+            "DOMAIN-SUFFIX,npmmirror.com,DIRECT",
+            "DOMAIN-SUFFIX,cainiao.com,DIRECT",
+        ] {
+            assert!(
+                rules_no_geosite.contains(&expected_domestic),
+                "missing domestic direct rule `{expected_domestic}`"
+            );
+        }
+
+        // Conservative red line: overseas or hybrid root domains must NEVER appear as DIRECT rules.
+        for forbidden in [
+            "github.com",
+            "google.com",
+            "googleapis.com",
+            "openai.com",
+            "chatgpt.com",
+            "anthropic.com",
+            "claude.ai",
+            "x.com",
+            "twitter.com",
+            "cloudflare.com",
+            "microsoft.com",
+            "live.com",
+            "bing.com",
+            "apple.com",
+            "steampowered.com",
+            "steamcommunity.com",
+            "larksuite.com",
+            "tiktok.com",
+            "linux.do",
+            "alibaba.com",
+            "wps.com",
+        ] {
+            let suffix_rule = format!("DOMAIN-SUFFIX,{forbidden},DIRECT");
+            let exact_rule = format!("DOMAIN,{forbidden},DIRECT");
+            assert!(
+                !rules_no_geosite.contains(&suffix_rule.as_str())
+                    && !rules_no_geosite.contains(&exact_rule.as_str()),
+                "conservative red line violated by `{forbidden}`"
+            );
+        }
+
+        // 2. With geosite.dat present: Group A stays BEFORE GEOSITE,cn,DIRECT while Group B is omitted.
+        std::fs::write(dir.join("geosite.dat"), b"stub").unwrap();
+        let with_geosite = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        let rules_with_geosite: Vec<&str> = with_geosite.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let idx_steam_cdn = rules_with_geosite
+            .iter()
+            .position(|r| *r == "DOMAIN-SUFFIX,steamcontent.com,DIRECT")
+            .expect("Group A system/CDN rule must still be emitted with geosite.dat");
+        let idx_geosite_cn = rules_with_geosite
+            .iter()
+            .position(|r| *r == "GEOSITE,cn,DIRECT")
+            .expect("GEOSITE,cn,DIRECT must be present");
+        assert!(idx_steam_cdn < idx_geosite_cn);
+        assert!(rules_with_geosite.contains(&"DOMAIN-SUFFIX,msftconnecttest.com,DIRECT"));
+        assert!(rules_with_geosite.contains(&"DOMAIN-SUFFIX,icloud.com.cn,DIRECT"));
+        assert!(!rules_with_geosite.contains(&"DOMAIN-SUFFIX,gtimg.com,DIRECT"));
+        assert!(!rules_with_geosite.contains(&"DOMAIN-SUFFIX,bilivideo.com,DIRECT"));
+
+        // 3. When domestic_direct_enabled == false, LAN & local domains remain while Groups A/B are omitted.
+        let mut cfg_off = AppConfig::default();
+        cfg_off.rules_override.domestic_direct_enabled = false;
+        let input_off = CompileInput {
+            config: &cfg_off,
+            ..input
+        };
+        let off_compiled = compile_mihomo_config_with_runtime_dir(&input_off, Some(&dir)).unwrap();
+        let rules_off: Vec<&str> = off_compiled.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(rules_off.contains(&"IP-CIDR,100.64.0.0/10,DIRECT,no-resolve"));
+        assert!(rules_off.contains(&"DOMAIN-SUFFIX,local,DIRECT"));
+        assert!(rules_off.contains(&"DOMAIN-SUFFIX,home.arpa,DIRECT"));
+        assert!(!rules_off.contains(&"DOMAIN-SUFFIX,steamcontent.com,DIRECT"));
+        assert!(!rules_off.contains(&"GEOSITE,cn,DIRECT"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prunes_inactive_nodes_when_over_32_and_honors_compile_all_nodes_and_memory_tunings() {
+        let mut nodes: Vec<ProxyNode> = Vec::with_capacity(40);
+        for i in 0..40 {
+            let id = format!("n-{i:02}");
+            let name = format!("Node-{i:02}");
+            let host = format!("node-{i:02}.provider.test");
+            let mut n = sample_node(&id, &name, 443, true);
+            n.server = host.clone();
+            n.raw_config = serde_json::json!({
+                "name": name,
+                "type": "trojan",
+                "server": host,
+                "port": 443,
+                "password": "demo-password",
+                "udp": true
+            });
+            nodes.push(n);
+        }
+
+        let g_active = MultiGroup {
+            id: "g-tw".to_string(),
+            name: "TW-Active".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-00".into(), "n-01".into(), "n-02".into(), "n-03".into()],
+            active_node_id: Some("n-01".to_string()),
+            ..Default::default()
+        };
+        let g_idle = MultiGroup {
+            id: "g-idle".to_string(),
+            name: "Idle-Group".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-10".into(), "n-11".into(), "n-12".into()],
+            independent_routing: false,
+            ..Default::default()
+        };
+        let g_independent = MultiGroup {
+            id: "g-ai".to_string(),
+            name: "AI-Split".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            match_rules: vec!["DOMAIN-SUFFIX,openai.com".to_string()],
+            member_node_ids: vec!["n-04".into(), "n-05".into()],
+            fallback_pool_id: Some("g-backup".to_string()),
+            independent_routing: true,
+            ..Default::default()
+        };
+        let g_backup = MultiGroup {
+            id: "g-backup".to_string(),
+            name: "AI-Backup".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-06".into()],
+            independent_routing: false,
+            ..Default::default()
+        };
+
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        // 1. Pure active group (4 members out of 40 nodes) -> compiles strictly 4 proxies.
+        let mut cfg_simple = AppConfig::default();
+        cfg_simple.active_group_id = Some("g-tw".to_string());
+        let simple_groups = vec![g_active.clone(), g_idle.clone()];
+        let compiled_4 = compile_mihomo_config(&CompileInput {
+            config: &cfg_simple,
+            nodes: &nodes,
+            groups: &simple_groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("pruned 4-node compile must succeed");
+        assert!(compiled_4.validation.ok);
+        assert_eq!(compiled_4.stats.total_proxies, 4);
+        assert_eq!(compiled_4.value["proxies"].as_sequence().unwrap().len(), 4);
+
+        // Unconditional memory tunings: geodata-loader=memconservative even when geodata_mode=false,
+        // keep-alive-idle=15, keep-alive-interval=15, and QUIC sniffer skipped when block_quic_udp_443=true.
+        assert_eq!(compiled_4.value["geodata-mode"], Value::Bool(false));
+        assert_eq!(compiled_4.value["geodata-loader"], "memconservative");
+        assert_eq!(compiled_4.value["keep-alive-idle"], 15);
+        assert_eq!(compiled_4.value["keep-alive-interval"], 15);
+        assert!(compiled_4.value["sniffer"]["sniff"].get("QUIC").is_none());
+        assert!(compiled_4.value["sniffer"]["sniff"].get("TLS").is_some());
+
+        // fake-ip-filter only includes domains of compiled active nodes, not pruned nodes.
+        let fake_filters: Vec<&str> = compiled_4.value["dns"]["fake-ip-filter"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(fake_filters.contains(&"node-00.provider.test"));
+        assert!(fake_filters.contains(&"node-03.provider.test"));
+        assert!(!fake_filters.contains(&"node-10.provider.test"));
+        assert!(!fake_filters.contains(&"node-39.provider.test"));
+
+        // 2. Active group + independent_routing group + transitive fallback_pool_id group -> 7 nodes.
+        let rich_groups = vec![g_active.clone(), g_idle.clone(), g_independent, g_backup];
+        let compiled_7 = compile_mihomo_config(&CompileInput {
+            config: &cfg_simple,
+            nodes: &nodes,
+            groups: &rich_groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("pruned 7-node compile must succeed");
+        assert!(compiled_7.validation.ok);
+        assert_eq!(compiled_7.stats.total_proxies, 7);
+        let pg_names: Vec<&str> = compiled_7.value["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|g| g["name"].as_str())
+            .collect();
+        assert!(pg_names.contains(&"TW-Active"));
+        assert!(pg_names.contains(&"AI-Split"));
+        assert!(pg_names.contains(&"AI-Backup"));
+        assert!(!pg_names.contains(&"Idle-Group"));
+
+        // 3. compile_all_nodes == true compiles all 40 nodes (and block_quic_udp_443 == false keeps QUIC sniffer).
+        let mut cfg_all = cfg_simple.clone();
+        cfg_all.core_runtime.compile_all_nodes = true;
+        cfg_all.rules_override.block_quic_udp_443 = false;
+        let compiled_all = compile_mihomo_config(&CompileInput {
+            config: &cfg_all,
+            nodes: &nodes,
+            groups: &simple_groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile_all_nodes=true must succeed");
+        assert_eq!(compiled_all.stats.total_proxies, 40);
+        assert!(compiled_all.value["sniffer"]["sniff"].get("QUIC").is_some());
+
+        // 4. ProxyMode::Global compiles all 40 nodes even when compile_all_nodes == false.
+        let mut cfg_global = cfg_simple.clone();
+        cfg_global.proxy_mode = ProxyMode::Global;
+        let compiled_global = compile_mihomo_config(&CompileInput {
+            config: &cfg_global,
+            nodes: &nodes,
+            groups: &simple_groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("global mode compile must succeed");
+        assert_eq!(compiled_global.stats.total_proxies, 40);
+
+        // 5. Single route mode prunes down to only the selected single node.
+        let mut cfg_single = cfg_simple.clone();
+        cfg_single.route_mode = RouteTargetMode::Single;
+        cfg_single.active_single_node_id = Some("n-15".to_string());
+        let compiled_single = compile_mihomo_config(&CompileInput {
+            config: &cfg_single,
+            nodes: &nodes,
+            groups: &simple_groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("pruned single mode compile must succeed");
+        assert!(compiled_single.validation.ok);
+        assert_eq!(compiled_single.stats.total_proxies, 1);
+        assert_eq!(
+            compiled_single.value["proxies"][0]["name"].as_str(),
+            Some("Node-15")
+        );
+
+        // 6. Empty active reference set falls back safely to compiling all 40 enabled nodes.
+        let compiled_fallback = compile_mihomo_config(&CompileInput {
+            config: &cfg_simple,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("empty ref fallback compile must succeed");
+        assert_eq!(compiled_fallback.stats.total_proxies, 40);
+    }
+
+    #[test]
+    fn extract_mihomo_rule_target_and_static_validator_catch_unknown_rule_targets() {
+        // Blank, comment, built-in actions, and SUB-RULE return None.
+        assert_eq!(extract_mihomo_rule_target(""), None);
+        assert_eq!(extract_mihomo_rule_target("   "), None);
+        assert_eq!(extract_mihomo_rule_target("# DOMAIN-SUFFIX,openai.com,AI-Group"), None);
+        assert_eq!(extract_mihomo_rule_target("DOMAIN-SUFFIX,cn,DIRECT"), None);
+        assert_eq!(extract_mihomo_rule_target("DOMAIN-SUFFIX,cn,direct"), None);
+        assert_eq!(extract_mihomo_rule_target("DOMAIN,ad.example,REJECT"), None);
+        assert_eq!(extract_mihomo_rule_target("DOMAIN,ad.example,reject-drop"), None);
+        assert_eq!(extract_mihomo_rule_target("DOMAIN,ok.example,PASS"), None);
+        assert_eq!(extract_mihomo_rule_target("DOMAIN,ok.example,compatible"), None);
+        assert_eq!(
+            extract_mihomo_rule_target("AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"),
+            None
+        );
+        assert_eq!(
+            extract_mihomo_rule_target("SUB-RULE,((DOMAIN,example.com)),sub-chain"),
+            None
+        );
+        assert_eq!(
+            extract_mihomo_rule_target("IP-CIDR,198.51.100.0/24,no-resolve"),
+            None
+        );
+
+        // Standard, flag-suffixed, logical, and MATCH rules extract custom targets accurately.
+        assert_eq!(
+            extract_mihomo_rule_target("MATCH, AI-Group "),
+            Some("AI-Group")
+        );
+        assert_eq!(
+            extract_mihomo_rule_target("DOMAIN-SUFFIX, openai.com , AI-Group"),
+            Some("AI-Group")
+        );
+        assert_eq!(
+            extract_mihomo_rule_target("IP-CIDR,198.51.100.0/24,AI-Group,no-resolve"),
+            Some("AI-Group")
+        );
+        assert_eq!(
+            extract_mihomo_rule_target("IP-CIDR,198.51.100.0/24,AI-Group,src"),
+            Some("AI-Group")
+        );
+        assert_eq!(
+            extract_mihomo_rule_target("IP-CIDR,198.51.100.0/24,AI-Group,no-resolve,src"),
+            Some("AI-Group")
+        );
+        assert_eq!(
+            extract_mihomo_rule_target("AND,((NETWORK,TCP),(DST-PORT,443)),AI-Group"),
+            Some("AI-Group")
+        );
+
+        // Static validator rejects rules referencing missing proxy-groups while accepting proxies,
+        // proxy-groups, and built-in actions.
+        let yaml_with_missing_target = r#"
+proxies:
+  - name: Node-1
+    type: trojan
+    server: 203.0.113.55
+    port: 443
+    password: demo
+proxy-groups:
+  - name: Main-Group
+    type: select
+    proxies:
+      - Node-1
+rules:
+  - DOMAIN-SUFFIX,openai.com,Missing-Group
+  - IP-CIDR,198.51.100.0/24,Node-1,no-resolve
+  - DOMAIN,ads.example,REJECT-DROP
+  - MATCH,Main-Group
+"#;
+        let report_bad = validate_compiled_yaml(yaml_with_missing_target, &[]).unwrap();
+        assert!(!report_bad.ok);
+        let unknown_errors: Vec<&StaticCheckIssue> = report_bad
+            .errors()
+            .into_iter()
+            .filter(|i| i.code == "unknown_rule_target")
+            .collect();
+        assert_eq!(unknown_errors.len(), 1);
+        assert!(unknown_errors[0].message.contains("Missing-Group"));
+
+        let yaml_valid = r#"
+proxies:
+  - name: Node-1
+    type: trojan
+    server: 203.0.113.55
+    port: 443
+    password: demo
+proxy-groups:
+  - name: Main-Group
+    type: select
+    proxies:
+      - Node-1
+rules:
+  - IP-CIDR,198.51.100.0/24,Node-1,no-resolve
+  - DOMAIN,ads.example,REJECT-DROP
+  - DOMAIN,pass.example,PASS
+  - DOMAIN,compat.example,COMPATIBLE
+  - MATCH,Main-Group
+"#;
+        let report_ok = validate_compiled_yaml(yaml_valid, &[]).unwrap();
+        assert!(report_ok.ok, "unexpected issues: {:?}", report_ok.issues);
+    }
+
+    #[test]
+    fn prunes_over_32_nodes_retains_global_rule_referenced_groups_in_single_and_group_modes() {
+        let mut nodes: Vec<ProxyNode> = Vec::with_capacity(40);
+        for i in 0..40 {
+            let id = format!("n-{i:02}");
+            let name = format!("Node-{i:02}");
+            let host = format!("node-{i:02}.provider.test");
+            let mut n = sample_node(&id, &name, 443, true);
+            n.server = host.clone();
+            let mut raw = serde_json::json!({
+                "name": name,
+                "type": "trojan",
+                "server": host,
+                "port": 443,
+                "password": "demo-password",
+                "udp": true
+            });
+            // Chain n-04 onto n-20 via dialer-proxy to verify transitive node dependencies stay intact.
+            if i == 4 {
+                raw["dialer-proxy"] = serde_json::Value::String("Node-20".to_string());
+            }
+            n.raw_config = raw;
+            nodes.push(n);
+        }
+
+        let g_main_a = MultiGroup {
+            id: "g-a".to_string(),
+            name: "Main-A".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-00".into(), "n-01".into(), "n-02".into(), "n-03".into()],
+            active_node_id: Some("n-00".to_string()),
+            independent_routing: false,
+            ..Default::default()
+        };
+        let g_ai_b = MultiGroup {
+            id: "g-b".to_string(),
+            name: "AI-Target-B".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-04".into(), "n-05".into()],
+            fallback_pool_id: Some("g-b-fb".to_string()),
+            independent_routing: false,
+            ..Default::default()
+        };
+        let g_ai_b_fb = MultiGroup {
+            id: "g-b-fb".to_string(),
+            name: "AI-Backup-B".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-06".into()],
+            independent_routing: false,
+            ..Default::default()
+        };
+        let g_extra_c = MultiGroup {
+            id: "g-c".to_string(),
+            name: "Extra-Target-C".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-10".into(), "n-11".into()],
+            independent_routing: false,
+            ..Default::default()
+        };
+        let g_idle = MultiGroup {
+            id: "g-idle".to_string(),
+            name: "Unused-Idle".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-30".into(), "n-31".into()],
+            independent_routing: false,
+            ..Default::default()
+        };
+
+        let groups = vec![g_main_a, g_ai_b, g_ai_b_fb, g_extra_c, g_idle];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        // 1. >32 nodes + !compile_all_nodes + Single mode + global_prepend_rules targeting AI-Target-B:
+        //    must retain AI-Target-B, its fallback AI-Backup-B, their members, chained dialer Node-20,
+        //    and selected single node Node-15, while pruning unrelated groups and passing validation.
+        let mut cfg_single = AppConfig::default();
+        cfg_single.proxy_mode = ProxyMode::Rule;
+        cfg_single.core_runtime.compile_all_nodes = false;
+        cfg_single.route_mode = RouteTargetMode::Single;
+        cfg_single.active_single_node_id = Some("n-15".to_string());
+        cfg_single.rules_override.global_prepend_rules = vec![
+            "# user AI preset".to_string(),
+            "DOMAIN,node-20.provider.test,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,openai.com,AI-Target-B".to_string(),
+            "IP-CIDR,198.51.100.0/24,AI-Target-B,no-resolve".to_string(),
+        ];
+
+        let compiled_single = compile_mihomo_config(&CompileInput {
+            config: &cfg_single,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("single mode with global_prepend_rules group ref must compile");
+        assert!(
+            compiled_single.validation.ok,
+            "single mode validation failed: {:?}",
+            compiled_single.validation.issues
+        );
+
+        let single_pg_names: Vec<&str> = compiled_single.value["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|g| g["name"].as_str())
+            .collect();
+        assert!(single_pg_names.contains(&SINGLE_NODE_GROUP_NAME));
+        assert!(single_pg_names.contains(&"AI-Target-B"));
+        assert!(single_pg_names.contains(&"AI-Backup-B"));
+        assert!(!single_pg_names.contains(&"Main-A"));
+        assert!(!single_pg_names.contains(&"Extra-Target-C"));
+        assert!(!single_pg_names.contains(&"Unused-Idle"));
+
+        let single_proxy_names: Vec<&str> = compiled_single.value["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(single_proxy_names.len(), 5);
+        for expected in ["Node-04", "Node-05", "Node-06", "Node-15", "Node-20"] {
+            assert!(
+                single_proxy_names.contains(&expected),
+                "missing expected proxy `{expected}` in {single_proxy_names:?}"
+            );
+        }
+        assert!(!single_proxy_names.contains(&"Node-00"));
+        assert!(!single_proxy_names.contains(&"Node-30"));
+
+        // 2. >32 nodes + !compile_all_nodes + Group mode switched to Main-A + global_append_rules
+        //    targeting inactive AI-Target-B + extra_prepend_rules targeting inactive Extra-Target-C:
+        //    must retain Main-A, AI-Target-B, AI-Backup-B, Extra-Target-C and all their members.
+        let mut cfg_group = AppConfig::default();
+        cfg_group.proxy_mode = ProxyMode::Rule;
+        cfg_group.core_runtime.compile_all_nodes = false;
+        cfg_group.route_mode = RouteTargetMode::Group;
+        cfg_group.active_group_id = Some("g-a".to_string());
+        cfg_group.rules_override.global_prepend_rules =
+            vec!["DOMAIN,node-20.provider.test,DIRECT".to_string()];
+        cfg_group.rules_override.global_append_rules =
+            vec!["DOMAIN-SUFFIX,claude.ai,AI-Target-B".to_string()];
+        let extra_rules = vec!["IP-CIDR,203.0.113.0/24,Extra-Target-C,no-resolve".to_string()];
+
+        let compiled_group = compile_mihomo_config(&CompileInput {
+            config: &cfg_group,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &extra_rules,
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("group mode with global_append_rules & extra_prepend_rules must compile");
+        assert!(
+            compiled_group.validation.ok,
+            "group mode validation failed: {:?}",
+            compiled_group.validation.issues
+        );
+
+        let group_pg_names: Vec<&str> = compiled_group.value["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|g| g["name"].as_str())
+            .collect();
+        assert!(group_pg_names.contains(&"Main-A"));
+        assert!(group_pg_names.contains(&"AI-Target-B"));
+        assert!(group_pg_names.contains(&"AI-Backup-B"));
+        assert!(group_pg_names.contains(&"Extra-Target-C"));
+        assert!(!group_pg_names.contains(&"Unused-Idle"));
+
+        let group_proxy_names: Vec<&str> = compiled_group.value["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(group_proxy_names.len(), 10);
+        for expected in [
+            "Node-00", "Node-01", "Node-02", "Node-03", "Node-04", "Node-05", "Node-06", "Node-10",
+            "Node-11", "Node-20",
+        ] {
+            assert!(
+                group_proxy_names.contains(&expected),
+                "missing expected proxy `{expected}` in {group_proxy_names:?}"
+            );
+        }
+        assert!(!group_proxy_names.contains(&"Node-30"));
+    }
+
+    #[test]
+    fn country_lite_mmdb_alone_does_not_enable_geoip_cn() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-compiler-mmdb-regression-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = AppConfig::default();
+        let ports = sample_ports();
+        let nodes = vec![sample_node("n1", "Node-TW-01", 443, true)];
+        let empty = HashMap::new();
+        let input = CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        };
+
+        // 1. Only `country-lite.mmdb` present -> Mihomo will not load it as `Country.mmdb`,
+        //    so `GEOIP,CN` and `fallback-filter.geoip` must stay disabled.
+        std::fs::write(dir.join("country-lite.mmdb"), b"stub").unwrap();
+        let compiled_lite = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(compiled_lite.validation.ok);
+        assert_eq!(
+            compiled_lite.value["dns"]["fallback-filter"]["geoip"],
+            Value::Bool(false)
+        );
+        let rules_lite: Vec<&str> = compiled_lite.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(!rules_lite.contains(&"GEOIP,CN,DIRECT,no-resolve"));
+
+        // 2. Lowercase `country.mmdb` enables GeoIP cleanly.
+        std::fs::write(dir.join("country.mmdb"), b"stub").unwrap();
+        let compiled_lower = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(compiled_lower.validation.ok);
+        assert_eq!(
+            compiled_lower.value["dns"]["fallback-filter"]["geoip"],
+            Value::Bool(true)
+        );
+        let rules_lower: Vec<&str> = compiled_lower.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(rules_lower.contains(&"GEOIP,CN,DIRECT,no-resolve"));
+
+        // 3. Canonical `Country.mmdb` enables GeoIP cleanly.
+        let _ = std::fs::remove_file(dir.join("country.mmdb"));
+        std::fs::write(dir.join("Country.mmdb"), b"stub").unwrap();
+        let compiled_upper = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(compiled_upper.validation.ok);
+        assert_eq!(
+            compiled_upper.value["dns"]["fallback-filter"]["geoip"],
+            Value::Bool(true)
+        );
+        let rules_upper: Vec<&str> = compiled_upper.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(rules_upper.contains(&"GEOIP,CN,DIRECT,no-resolve"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

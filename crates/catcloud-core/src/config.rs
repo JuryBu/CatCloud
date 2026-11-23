@@ -631,9 +631,14 @@ mod tests {
         assert!(!cfg.dns.ipv6);
         assert!(!cfg.geodata.geodata_mode);
         assert_eq!(cfg.core_runtime.memory_tier, MemoryLimitTier::Auto);
-        assert_eq!(cfg.resolve_gomemlimit(50, 200), "48MiB");
-        assert_eq!(cfg.resolve_gomemlimit(250, 200), "64MiB");
-        assert_eq!(cfg.resolve_gomemlimit(700, 200), "96MiB");
+        assert_eq!(cfg.core_runtime.gogc, 25);
+        assert!(!cfg.core_runtime.compile_all_nodes);
+        assert_eq!(cfg.resolve_gomemlimit(50, 200), "40MiB");
+        assert_eq!(cfg.resolve_gomemlimit(250, 200), "56MiB");
+        assert_eq!(cfg.resolve_gomemlimit(700, 200), "88MiB");
+        assert_eq!(MemoryLimitTier::Mb48.resolve_env_value(10, 10), "48MiB");
+        assert_eq!(MemoryLimitTier::Mb64.resolve_env_value(10, 10), "64MiB");
+        assert_eq!(MemoryLimitTier::Mb96.resolve_env_value(10, 10), "96MiB");
         assert_eq!(cfg.personalization.theme_mode, ThemeMode::AutoTime);
         assert_eq!(cfg.personalization.day_schedule.light_start, "07:00");
         assert_eq!(cfg.personalization.day_schedule.warm_dark_start, "18:30");

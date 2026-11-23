@@ -178,7 +178,8 @@ pub fn classify_config_diff(old: &AppConfig, new: &AppConfig) -> ReloadLevel {
         || old.geodata != new.geodata
         || old.preaccel != new.preaccel
         || old.core_runtime.store_selected != new.core_runtime.store_selected
-        || old.core_runtime.store_fake_ip != new.core_runtime.store_fake_ip;
+        || old.core_runtime.store_fake_ip != new.core_runtime.store_fake_ip
+        || old.core_runtime.compile_all_nodes != new.core_runtime.compile_all_nodes;
 
     if requires_l2 {
         return ReloadLevel::L2HotReload;
@@ -403,9 +404,20 @@ impl HotReloadCoordinator {
         };
 
         let snapshot_unchanged = prev_snapshot_fp.as_deref() == Some(current_snapshot_fp.as_str());
+        let requires_global_node_expansion = !new_cfg.core_runtime.compile_all_nodes
+            && snapshot.nodes.len() > 32
+            && prev_cfg.as_ref().is_some_and(|old| {
+                old.proxy_mode != new_cfg.proxy_mode
+                    && (old.proxy_mode == crate::models::ProxyMode::Global
+                        || new_cfg.proxy_mode == crate::models::ProxyMode::Global)
+            });
 
         // Fast L1 path when only `proxy_mode` changed, snapshot is identical, and not forced.
-        if !options.force && level == ReloadLevel::L1Rest && snapshot_unchanged {
+        if !options.force
+            && !requires_global_node_expansion
+            && level == ReloadLevel::L1Rest
+            && snapshot_unchanged
+        {
             if let Some(ref old) = prev_cfg {
                 if old.proxy_mode != new_cfg.proxy_mode
                     && self.adapter.has_live_controller().await
@@ -438,7 +450,9 @@ impl HotReloadCoordinator {
             }
         }
 
-        if (options.force || !snapshot_unchanged) && level == ReloadLevel::L1Rest {
+        if (options.force || !snapshot_unchanged || requires_global_node_expansion)
+            && level == ReloadLevel::L1Rest
+        {
             level = ReloadLevel::L2HotReload;
         }
 
@@ -1458,6 +1472,14 @@ mod tests {
             ReloadLevel::L2HotReload
         );
         assert!(has_core_config_changes(&base, &l2_single_node));
+
+        let mut l2_compile_all = base.clone();
+        l2_compile_all.core_runtime.compile_all_nodes = true;
+        assert_eq!(
+            classify_config_diff(&base, &l2_compile_all),
+            ReloadLevel::L2HotReload
+        );
+        assert!(has_core_config_changes(&base, &l2_compile_all));
 
         // L3: ports / TUN stack / binary path / memory tier
         let mut l3_port = base.clone();

@@ -1,3 +1,4 @@
+pub mod app_log;
 pub mod commands;
 pub mod lifecycle;
 pub mod shortcuts;
@@ -125,6 +126,20 @@ pub fn run_with_paths(paths: AppPaths) {
     let tray_click = commands::map_tray_click(&cfg.behavior.tray_click_action);
 
     let app_state = AppState::new(paths.clone(), cfg, storage, Arc::clone(&job_guard));
+    app_state.log_app_event(
+        "info",
+        "应用",
+        &format!(
+            "猫猫云梯桌面端已启动（v{}，便携模式：{}，权限：{}）",
+            env!("CARGO_PKG_VERSION"),
+            if paths.is_portable { "是" } else { "否" },
+            if default_platform().capabilities().is_elevated {
+                "管理员"
+            } else {
+                "普通用户"
+            }
+        ),
+    );
 
     let mut context = tauri::generate_context!();
     lifecycle::apply_portable_overrides(&mut context, &paths);
@@ -453,8 +468,10 @@ pub fn run_with_paths(paths: AppPaths) {
                         if enable_tun_flag && default_platform().capabilities().is_elevated {
                             let has_enabled = commands::has_enabled_nodes(&st).unwrap_or(false);
                             if !has_enabled {
-                                tracing::warn!(
-                                    "--enable-tun 启动跳过：暂无可用节点，请先导入订阅"
+                                st.log_app_event(
+                                    "warning",
+                                    "虚拟网卡",
+                                    "--enable-tun 启动跳过：暂无可用节点，请先导入订阅",
                                 );
                                 return;
                             }
@@ -462,7 +479,11 @@ pub fn run_with_paths(paths: AppPaths) {
                             let mut next_cfg = old_cfg.clone();
                             next_cfg.tun.enabled = true;
                             if let Err(err) = config::save(&st.paths, &next_cfg) {
-                                tracing::warn!("--enable-tun 保存配置失败：{err}");
+                                st.log_app_event(
+                                    "error",
+                                    "虚拟网卡",
+                                    &format!("--enable-tun 保存配置失败：{err}"),
+                                );
                                 return;
                             }
                             if let Ok(mut guard) = st.config.write() {
@@ -470,12 +491,22 @@ pub fn run_with_paths(paths: AppPaths) {
                             }
                             commands::sync_app_side_effects(&auto_handle, &st, &next_cfg);
                             if let Err(err) = commands::start_core_internal(&auto_handle, &st).await {
-                                tracing::warn!("--enable-tun 启动核心失败，已回滚 TUN 开关：{err}");
+                                st.log_app_event(
+                                    "error",
+                                    "虚拟网卡",
+                                    &format!("--enable-tun 提权启动核心失败，已回滚 TUN 开关：{err}"),
+                                );
                                 let _ = config::save(&st.paths, &old_cfg);
                                 if let Ok(mut guard) = st.config.write() {
                                     *guard = old_cfg.clone();
                                 }
                                 commands::sync_app_side_effects(&auto_handle, &st, &old_cfg);
+                            } else {
+                                st.log_app_event(
+                                    "info",
+                                    "虚拟网卡",
+                                    "已通过管理员提权自动开启虚拟网卡（TUN）并启动核心",
+                                );
                             }
                             return;
                         }
@@ -582,8 +613,23 @@ fn spawn_proxy_guard(app: &tauri::AppHandle) {
                     };
                     let expected = latest_cfg.system_proxy.to_platform_spec("127.0.0.1", port);
                     let plat = catcloud_core::platform::windows::WindowsPlatform::new();
-                    if let Err(err) = plat.proxy_guard_tick(&expected) {
-                        tracing::debug!("proxy_guard_tick failed: {err}");
+                    match plat.proxy_guard_tick(&expected) {
+                        Ok(report) if report.drifted => {
+                            let reason = report
+                                .reason
+                                .unwrap_or_else(|| "检测到外部程序篡改系统代理".to_string());
+                            st.log_app_event(
+                                "warning",
+                                "代理守护",
+                                &format!(
+                                    "ProxyGuard 检测到系统代理偏离（{reason}），已自动恢复至 127.0.0.1:{port}"
+                                ),
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::debug!("proxy_guard_tick failed: {err}");
+                        }
                     }
                 })
                 .await;
@@ -828,12 +874,13 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                         let reason = format!(
                             "原节点连续 {fail_count} 次健康探活失败，已自动切换至最优备用节点"
                         );
-                        tracing::info!(
-                            group = %gname,
-                            from = %active_node.name,
-                            to = %next_name,
-                            fail_count,
-                            "group strategy watchdog auto-switched unhealthy active node"
+                        st.log_app_event(
+                            "warning",
+                            "自动切优",
+                            &format!(
+                                "分组「{gname}」后台健康守护自动切换：{} -> {}（{reason}）",
+                                active_node.name, next_name
+                            ),
                         );
                         let _ = app_h.emit(
                             commands::EVENT_STRATEGY_SWITCH,
@@ -846,11 +893,13 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                         );
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            group = %gname,
-                            from = %active_node.name,
-                            to = %next_name,
-                            "group strategy watchdog failover failed: {err}"
+                        st.log_app_event(
+                            "error",
+                            "自动切优",
+                            &format!(
+                                "分组「{gname}」后台自动切优失败（{} -> {}）：{err}",
+                                active_node.name, next_name
+                            ),
                         );
                     }
                 }
@@ -867,6 +916,7 @@ struct TelemetryForwarderState {
     delta_down_since_snap: u64,
     core_mem_bytes: u64,
     active_connections: usize,
+    tunnel_connections: usize,
     last_traffic_at: Option<Instant>,
 }
 
@@ -880,6 +930,7 @@ impl TelemetryForwarderState {
             delta_down_since_snap: 0,
             core_mem_bytes: 0,
             active_connections: 0,
+            tunnel_connections: 0,
             last_traffic_at: None,
         }
     }
@@ -893,13 +944,16 @@ impl TelemetryForwarderState {
             self.delta_down_since_snap = 0;
             self.core_mem_bytes = 0;
             self.active_connections = 0;
+            self.tunnel_connections = 0;
             self.last_traffic_at = None;
         }
     }
 }
 
 fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
-    // 1. Traffic & memory forwarder -> emits `catcloud://traffic` and updates throttled tray tooltip.
+    // 1. Traffic & memory forwarder -> emits `catcloud://traffic` only while a GUI window is
+    // visible & unminimized, pauses `/connections` polling while hidden/minimized, and updates
+    // throttled tray tooltip.
     {
         let app_h = app.clone();
         let mut rx_traffic = state.telemetry.subscribe_traffic();
@@ -916,13 +970,13 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
             loop {
                 tokio::select! {
                     _ = conn_poll.tick() => {
-                        let win = lifecycle::window_mode_snapshot(&app_h);
+                        let has_visible_window = lifecycle::has_visible_gui_window(&app_h);
                         if let Some(st) = app_h.try_state::<AppState>() {
                             session.reset_if_gen_changed(st.core_session_generation());
                             let traffic_quiet = session
                                 .last_traffic_at
                                 .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
-                            if !win.main_open && !win.capsule_open {
+                            if !has_visible_window {
                                 if traffic_quiet {
                                     let mut cleared_rate = false;
                                     if let Ok(mut m) = st.cached_metrics.write() {
@@ -950,7 +1004,10 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                         continue;
                                     }
                                     session.reset_if_gen_changed(cur_gen);
-                                    session.active_connections = snap.connections.len();
+                                    let conn_summary =
+                                        commands::summarize_connections(&snap.connections);
+                                    session.active_connections = conn_summary.app_connections;
+                                    session.tunnel_connections = conn_summary.tunnel_connections;
                                     if snap.memory > 0 {
                                         session.core_mem_bytes = snap.memory;
                                     }
@@ -968,7 +1025,13 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                         .last_traffic_at
                                         .is_none_or(|t| t.elapsed() >= Duration::from_secs(3));
                                     if let Ok(mut m) = st.cached_metrics.write() {
+                                        m.up_total_bytes = session.auth_up_total;
+                                        m.down_total_bytes = session.auth_down_total;
                                         m.core_mem_bytes = session.core_mem_bytes;
+                                        m.app_connections = conn_summary.app_connections;
+                                        m.tunnel_connections = conn_summary.tunnel_connections;
+                                        m.direct_connections = conn_summary.direct_connections;
+                                        m.proxied_connections = conn_summary.proxied_connections;
                                         if quiet_now {
                                             m.up_bps = 0;
                                             m.down_bps = 0;
@@ -976,13 +1039,14 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                     }
                                     // Only emit a zero-rate heartbeat if `/traffic` WS has been quiet,
                                     // avoiding duplicate points or replaying stale spike rates.
-                                    if quiet_now {
+                                    if quiet_now && lifecycle::has_visible_gui_window(&app_h) {
                                         let payload = TrafficEventPayload {
                                             up_bps: 0,
                                             down_bps: 0,
                                             up_total_bytes: session.auth_up_total,
                                             down_total_bytes: session.auth_down_total,
                                             active_connections: session.active_connections,
+                                            tunnel_connections: session.tunnel_connections,
                                             core_memory_mb: (session.core_mem_bytes as f64) / (1024.0 * 1024.0),
                                             timestamp_ms: chrono::Utc::now().timestamp_millis(),
                                         };
@@ -1029,18 +1093,27 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                                 if let Ok(mut m) = st.cached_metrics.write() {
                                     m.up_bps = tick.up;
                                     m.down_bps = tick.down;
+                                    m.up_total_bytes = session
+                                        .auth_up_total
+                                        .saturating_add(session.delta_up_since_snap);
+                                    m.down_total_bytes = session
+                                        .auth_down_total
+                                        .saturating_add(session.delta_down_since_snap);
                                     m.core_mem_bytes = session.core_mem_bytes;
                                 }
-                                let payload = TrafficEventPayload {
-                                    up_bps: tick.up,
-                                    down_bps: tick.down,
-                                    up_total_bytes: session.auth_up_total.saturating_add(session.delta_up_since_snap),
-                                    down_total_bytes: session.auth_down_total.saturating_add(session.delta_down_since_snap),
-                                    active_connections: session.active_connections,
-                                    core_memory_mb: (session.core_mem_bytes as f64) / (1024.0 * 1024.0),
-                                    timestamp_ms: tick.timestamp_ms,
-                                };
-                                let _ = app_h.emit(commands::EVENT_TRAFFIC, payload);
+                                if lifecycle::has_visible_gui_window(&app_h) {
+                                    let payload = TrafficEventPayload {
+                                        up_bps: tick.up,
+                                        down_bps: tick.down,
+                                        up_total_bytes: session.auth_up_total.saturating_add(session.delta_up_since_snap),
+                                        down_total_bytes: session.auth_down_total.saturating_add(session.delta_down_since_snap),
+                                        active_connections: session.active_connections,
+                                        tunnel_connections: session.tunnel_connections,
+                                        core_memory_mb: (session.core_mem_bytes as f64) / (1024.0 * 1024.0),
+                                        timestamp_ms: tick.timestamp_ms,
+                                    };
+                                    let _ = app_h.emit(commands::EVENT_TRAFFIC, payload);
+                                }
                                 if last_tray_sync.elapsed() >= Duration::from_secs(3) {
                                     last_tray_sync = Instant::now();
                                     let _ = tray::sync_tray_visual(&app_h, &commands::build_tray_visual_state(&st));
@@ -1055,15 +1128,36 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
         });
     }
 
-    // 2. Core log forwarder -> emits `catcloud://core-log` only while main window is open.
+    // 2. Core log forwarder -> persists Mihomo warn/error and throttled info lines to rotating
+    // `catcloud.log`, and emits `catcloud://core-log` only while the main window is visible.
     {
         let app_h = app.clone();
         let mut rx_logs = state.telemetry.subscribe_logs();
         tauri::async_runtime::spawn(async move {
+            let mut last_info_persisted: Option<Instant> = None;
             loop {
                 match rx_logs.recv().await {
                     Ok(line) => {
-                        if lifecycle::window_mode_snapshot(&app_h).main_open {
+                        if let Some(st) = app_h.try_state::<AppState>() {
+                            let now = Instant::now();
+                            if app_log::should_persist_mihomo_log(
+                                &line.level,
+                                &line.payload,
+                                last_info_persisted,
+                                now,
+                            ) {
+                                if app_log::normalize_log_level(&line.level) == "info" {
+                                    last_info_persisted = Some(now);
+                                }
+                                st.app_logger.append_formatted(
+                                    &line.timestamp,
+                                    &line.level,
+                                    "mihomo",
+                                    &line.payload,
+                                );
+                            }
+                        }
+                        if lifecycle::is_main_window_visible(&app_h) {
                             let _ = app_h.emit(commands::EVENT_CORE_LOG, line);
                         }
                     }

@@ -2,51 +2,23 @@ import { X } from "lucide-react";
 import { Suspense, lazy, useEffect, useState } from "react";
 import { type AppConfig, catcloudApi, isTauriEnv } from "./api/tauri";
 import { Sidebar } from "./components/Sidebar";
+import { TitleBar } from "./components/TitleBar";
 import {
-  BUILTIN_WALLPAPER_PRESETS,
   type NavRouteId,
   appActions,
-  appStore,
   useAppSelector,
 } from "./store/appStore";
 
-const SAFE_BITMAP_DATA_URL_RE = /^data:image\/(png|jpe?g|webp|gif|bmp);base64,/i;
-
-function isImmediateWallpaperPath(rawPath: string): boolean {
-  if (!rawPath) return true;
-  if (BUILTIN_WALLPAPER_PRESETS.some((p) => p.id === rawPath)) return true;
-  if (/^https?:\/\//i.test(rawPath)) return true;
-  if (SAFE_BITMAP_DATA_URL_RE.test(rawPath)) return true;
-  return false;
-}
-
-async function syncLocalWallpaperVarsIfNeeded(cfg: AppConfig): Promise<void> {
+function enforceCapsuleNoWallpaper(): void {
   if (typeof document === "undefined") return;
-  const p = cfg.personalization;
-  const rawPath = p.wallpaper_path?.trim() ?? "";
-  if (!rawPath || isImmediateWallpaperPath(rawPath)) return;
-  if (/^data:/i.test(rawPath)) return;
-
-  try {
-    const dataUrl = await catcloudApi.resolveWallpaperDataUrl(rawPath);
-    if ((appStore.getState().config.personalization.wallpaper_path?.trim() ?? "") !== rawPath) {
-      return;
-    }
-    if (!dataUrl || !SAFE_BITMAP_DATA_URL_RE.test(dataUrl)) return;
-    const safeUrl = dataUrl.replace(/["\\\n\r]/g, "");
-    const opacity = Math.max(0.05, Math.min(0.65, p.wallpaper_opacity));
-    const blurPx = Math.max(0, Math.min(24, Math.round(p.glass_blur_px)));
-    const root = document.documentElement;
-    root.setAttribute("data-wallpaper", "on");
-    root.setAttribute("data-glass", blurPx > 0 ? "on" : "off");
-    root.style.setProperty("--wallpaper-image", `url("${safeUrl}")`);
-    root.style.setProperty("--wallpaper-opacity", String(opacity));
-    root.style.setProperty("--surface-alpha", blurPx > 0 ? "0.82" : "0.90");
-    root.style.setProperty("--card-alpha", blurPx > 0 ? "0.78" : "0.88");
-    root.style.setProperty("--glass-blur", `${blurPx}px`);
-  } catch {
-    /* keep base theme tokens intact if local wallpaper file is unreadable */
-  }
+  const root = document.documentElement;
+  root.setAttribute("data-wallpaper", "off");
+  root.setAttribute("data-glass", "off");
+  root.style.setProperty("--wallpaper-image", "none");
+  root.style.setProperty("--wallpaper-opacity", "0");
+  root.style.setProperty("--surface-alpha", "1");
+  root.style.setProperty("--card-alpha", "1");
+  root.style.setProperty("--glass-blur", "0px");
 }
 
 // Code-split every page + floating capsule so initial load and per-window memory stay minimal.
@@ -106,15 +78,35 @@ function renderActivePage(route: NavRouteId) {
 export function App() {
   const windowMode = useAppSelector((s) => s.windowMode);
   const activeNav = useAppSelector((s) => s.activeNav);
+  const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
+  const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
   const toast = useAppSelector((s) => s.toast);
   const [dismissedToastId, setDismissedToastId] = useState<number | null>(null);
 
   const visibleToast = toast && toast.id !== dismissedToastId ? toast : null;
 
-  // Keep the floating capsule window synced with the latest theme, wallpaper & personalization
-  // changes saved from the main window across WebView instances.
+  // Pause all CSS animations/transitions whenever the window is hidden or minimized.
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    const syncPausedState = () => {
+      document.documentElement.setAttribute("data-paused", document.hidden ? "on" : "off");
+    };
+    syncPausedState();
+    document.addEventListener("visibilitychange", syncPausedState);
+    return () => document.removeEventListener("visibilitychange", syncPausedState);
+  }, []);
+
+  // Force wallpaper & glass layers off in capsule mode so the 300x64 floating window never decodes wallpapers.
   useEffect(() => {
     if (windowMode !== "capsule") return;
+    enforceCapsuleNoWallpaper();
+  }, [windowMode, resolvedTheme, wallpaperPath]);
+
+  // Keep the floating capsule window synced with the latest theme & personalization
+  // changes saved from the main window across WebView instances (explicitly skipping wallpapers).
+  useEffect(() => {
+    if (windowMode !== "capsule") return;
+    enforceCapsuleNoWallpaper();
     let disposed = false;
     let inFlight = false;
     let pendingAgain = false;
@@ -131,11 +123,19 @@ export function App() {
       try {
         const latestCfg = await catcloudApi.getConfig();
         if (disposed) return;
-        const sig = JSON.stringify(latestCfg.personalization);
+        const sanitizedPersonalization: AppConfig["personalization"] = {
+          ...latestCfg.personalization,
+          wallpaper_path: null,
+          glass_blur_px: 0,
+        };
+        const sig = JSON.stringify(sanitizedPersonalization);
         if (force || sig !== lastPersonalizationSig) {
           lastPersonalizationSig = sig;
-          appActions.syncConfig(latestCfg);
-          await syncLocalWallpaperVarsIfNeeded(latestCfg);
+          appActions.syncConfig({
+            ...latestCfg,
+            personalization: sanitizedPersonalization,
+          });
+          enforceCapsuleNoWallpaper();
         }
       } catch {
         /* ignore transient IPC sync failures */
@@ -165,7 +165,12 @@ export function App() {
           try {
             const parsed = JSON.parse(ev.newValue) as Partial<AppConfig["personalization"]>;
             if (parsed && typeof parsed === "object") {
-              appActions.previewPersonalization(parsed);
+              appActions.previewPersonalization({
+                ...parsed,
+                wallpaper_path: null,
+                glass_blur_px: 0,
+              });
+              enforceCapsuleNoWallpaper();
             }
           } catch {
             /* fallback to backend sync below */
@@ -190,7 +195,7 @@ export function App() {
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onVisibility);
 
-    // Backend broadcasts `catcloud://runtime` whenever config or wallpaper is saved.
+    // Backend broadcasts `catcloud://runtime` whenever config or theme is saved.
     const unsubRuntime = isTauriEnv()
       ? catcloudApi.subscribeRuntimeUpdate(() => {
           scheduleSync();
@@ -223,7 +228,7 @@ export function App() {
               role="status"
               title={visibleToast.text}
               onClick={() => setDismissedToastId(visibleToast.id)}
-              className="pointer-events-auto flex max-w-[288px] cursor-pointer items-center gap-1.5 rounded-full border border-[var(--line-strong)] bg-[var(--surface)]/95 px-2.5 py-0.5 text-[10px] leading-tight text-[var(--text)] shadow-md"
+              className="pointer-events-auto flex max-w-[288px] cursor-pointer items-center gap-1.5 rounded-full border border-[var(--line-strong)] bg-[var(--surface)]/95 px-2.5 py-0.5 text-[10px] leading-tight text-[var(--text)]"
             >
               <span
                 className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
@@ -246,22 +251,26 @@ export function App() {
   }
 
   return (
-    <div className="relative flex h-full w-full overflow-hidden bg-[var(--bg)] text-[var(--text)]">
-      {/* Wallpaper underlay (zero GPU layer when disabled via CSS variables) */}
-      <div className="cc-wallpaper-layer" aria-hidden="true" />
+    <div className="relative flex h-screen w-full flex-col overflow-hidden bg-[var(--bg)] text-[var(--text)]">
+      {/* Wallpaper underlay (blurred once on underlay layer when enabled; 0 GPU layer when off) */}
+      <div className="cc-wallpaper-layer pointer-events-none z-0" aria-hidden="true" />
 
-      <Sidebar />
+      <TitleBar />
 
-      <main className="relative z-10 flex min-w-0 flex-1 flex-col overflow-hidden">
-        <div className="flex-1 overflow-y-auto px-5 py-4">
-          <Suspense fallback={<PageLoadingFallback />}>
-            {renderActivePage(activeNav)}
-          </Suspense>
-        </div>
-      </main>
+      <div className="relative flex min-h-0 flex-1 overflow-hidden">
+        <Sidebar />
+
+        <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+          <div className="flex-1 overflow-y-auto px-5 py-4">
+            <Suspense fallback={<PageLoadingFallback />}>
+              {renderActivePage(activeNav)}
+            </Suspense>
+          </div>
+        </main>
+      </div>
 
       {visibleToast && (
-        <div className="pointer-events-none fixed inset-x-4 top-4 z-50 flex justify-center">
+        <div className="pointer-events-none fixed inset-x-4 top-12 z-50 flex justify-center">
           <div
             role="status"
             className="pointer-events-auto flex max-w-lg items-start gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2.5 text-xs leading-relaxed text-[var(--text)] shadow-lg"

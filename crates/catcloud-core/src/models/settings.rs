@@ -492,11 +492,11 @@ pub enum CoreKind {
     Xray,
 }
 
-/// Adaptive three-tier `GOMEMLIMIT` budget for Mihomo (`48|64|96MiB`).
+/// Adaptive `GOMEMLIMIT` budget for Mihomo (`Auto` -> `40|56|88MiB`; explicit `48|64|96MiB`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryLimitTier {
-    /// Auto-select 48 / 64 / 96 MiB based on active node and rule counts.
+    /// Auto-select 40 / 56 / 88 MiB based on compiled proxy and rule counts.
     #[default]
     Auto,
     #[serde(rename = "48MiB", alias = "mb48")]
@@ -515,23 +515,26 @@ impl MemoryLimitTier {
             Self::Mb64 => 64,
             Self::Mb96 => 96,
             Self::Auto => {
-                if node_count >= 600 || rule_count >= 5000 {
-                    96
-                } else if node_count >= 200 || rule_count >= 1500 {
-                    64
+                if node_count >= 350 || rule_count >= 5000 {
+                    88
+                } else if node_count >= 100 || rule_count >= 1500 {
+                    56
                 } else {
-                    48
+                    40
                 }
             }
         }
     }
 
-    /// Format concrete `GOMEMLIMIT` environment string (e.g. `"48MiB"`).
+    /// Format concrete `GOMEMLIMIT` environment string (e.g. `"40MiB"`).
     pub fn resolve_env_value(&self, node_count: usize, rule_count: usize) -> &'static str {
         match self.resolve_mib(node_count, rule_count) {
             96 => "96MiB",
+            88 => "88MiB",
             64 => "64MiB",
-            _ => "48MiB",
+            56 => "56MiB",
+            48 => "48MiB",
+            _ => "40MiB",
         }
     }
 }
@@ -567,6 +570,8 @@ pub struct CoreRuntimeConfig {
     pub gogc: u32,
     pub store_selected: bool,
     pub store_fake_ip: bool,
+    #[serde(default)]
+    pub compile_all_nodes: bool,
     pub startup_script_path: Option<String>,
     pub quick_check_sites: Vec<QuickCheckSite>,
 }
@@ -577,9 +582,10 @@ impl Default for CoreRuntimeConfig {
             kernel_kind: CoreKind::Mihomo,
             custom_binary_path: None,
             memory_tier: MemoryLimitTier::Auto,
-            gogc: 35,
+            gogc: 25,
             store_selected: false,
             store_fake_ip: false,
+            compile_all_nodes: false,
             startup_script_path: None,
             quick_check_sites: vec![
                 QuickCheckSite {
@@ -980,6 +986,13 @@ mod tests {
 
         assert!(cfg.rules_override.block_quic_udp_443);
         assert!(cfg.rules_override.domestic_direct_enabled);
+        assert_eq!(cfg.core_runtime.gogc, 25);
+        assert!(!cfg.core_runtime.compile_all_nodes);
+        assert_eq!(cfg.resolve_gomemlimit(20, 100), "40MiB");
+        assert_eq!(cfg.resolve_gomemlimit(99, 1499), "40MiB");
+        assert_eq!(cfg.resolve_gomemlimit(100, 100), "56MiB");
+        assert_eq!(cfg.resolve_gomemlimit(349, 100), "56MiB");
+        assert_eq!(cfg.resolve_gomemlimit(350, 100), "88MiB");
 
         let openai_site = cfg
             .core_runtime
@@ -991,12 +1004,15 @@ mod tests {
         assert_eq!(openai_site.expected_status, Some(200));
 
         // Legacy JSON missing newly added fields must populate defaults via serde attributes.
-        let legacy: AppConfig = serde_json::from_str(r#"{"dns":{},"rules_override":{}}"#).unwrap();
+        let legacy: AppConfig =
+            serde_json::from_str(r#"{"dns":{},"rules_override":{},"core_runtime":{}}"#).unwrap();
         assert_eq!(
             legacy.dns.direct_nameserver,
             vec!["223.5.5.5", "119.29.29.29"]
         );
         assert!(legacy.rules_override.block_quic_udp_443);
         assert!(legacy.rules_override.domestic_direct_enabled);
+        assert_eq!(legacy.core_runtime.gogc, 25);
+        assert!(!legacy.core_runtime.compile_all_nodes);
     }
 }

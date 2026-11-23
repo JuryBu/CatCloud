@@ -32,6 +32,7 @@ import {
   Zap,
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   type MigrationPreviewDto,
   type MultiGroup,
@@ -45,6 +46,7 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { AppSelect } from "../components/AppSelect";
 import {
   ContinentRegionFilter,
   PaginationBar,
@@ -1225,7 +1227,9 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
     onClose();
   };
 
-  return (
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
     <div
       className="fixed inset-0 z-50 flex justify-end bg-black/45"
       role="dialog"
@@ -1569,7 +1573,8 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -1832,7 +1837,9 @@ function ProcessAttachDrawer({
     onClose();
   };
 
-  return (
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
     <div
       className="fixed inset-0 z-50 flex justify-end bg-black/45"
       role="dialog"
@@ -2245,7 +2252,8 @@ function ProcessAttachDrawer({
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }
 
@@ -2341,6 +2349,7 @@ export function NodesSubsPage({
 
   // Prune stale selected node IDs whenever the backing node list shrinks
   useEffect(() => {
+    if (embeddedSubsOnly) return;
     setSelectedNodeIds((prev) => {
       if (prev.size === 0) return prev;
       const validIds = new Set(nodes.map((n) => n.id));
@@ -2355,12 +2364,14 @@ export function NodesSubsPage({
       }
       return changed ? next : prev;
     });
-  }, [nodes]);
+  }, [nodes, embeddedSubsOnly]);
 
   // Reset pagination to page 1 when filters or page size change
   useEffect(() => {
+    if (embeddedSubsOnly) return;
     setCurrentPage(1);
   }, [
+    embeddedSubsOnly,
     keyword,
     filterSubId,
     filterContinent,
@@ -2389,6 +2400,7 @@ export function NodesSubsPage({
   }, [nodes]);
 
   const nodeGroupMembership = useMemo(() => {
+    if (embeddedSubsOnly) return new Map<string, MultiGroup[]>();
     const map = new Map<string, MultiGroup[]>();
     for (const g of groups) {
       for (const nid of g.member_node_ids) {
@@ -2398,14 +2410,16 @@ export function NodesSubsPage({
       }
     }
     return map;
-  }, [groups]);
+  }, [groups, embeddedSubsOnly]);
 
   const nodesForRegionStats = useMemo(
     () =>
-      filterSubId === "all"
-        ? nodes
-        : nodes.filter((n) => n.sub_id === filterSubId),
-    [nodes, filterSubId]
+      embeddedSubsOnly
+        ? []
+        : filterSubId === "all"
+          ? nodes
+          : nodes.filter((n) => n.sub_id === filterSubId),
+    [nodes, filterSubId, embeddedSubsOnly]
   );
 
   const continentRegionStats = useMemo(
@@ -2415,7 +2429,7 @@ export function NodesSubsPage({
 
   // Clear stale continent/region filter if switching source leaves zero nodes in that bucket
   useEffect(() => {
-    if (nodesForRegionStats.length === 0) return;
+    if (embeddedSubsOnly || nodesForRegionStats.length === 0) return;
     if (
       filterContinent !== "all" &&
       continentRegionStats.continentCounts[filterContinent] === 0
@@ -2431,6 +2445,7 @@ export function NodesSubsPage({
       setFilterRegion("all");
     }
   }, [
+    embeddedSubsOnly,
     nodesForRegionStats.length,
     continentRegionStats,
     filterContinent,
@@ -2438,20 +2453,22 @@ export function NodesSubsPage({
   ]);
 
   const protocolStats = useMemo(() => {
+    if (embeddedSubsOnly) return [] as Array<[string, number]>;
     const counts = new Map<string, number>();
     for (const n of nodes) {
       const proto = n.protocol.toLowerCase();
       counts.set(proto, (counts.get(proto) ?? 0) + 1);
     }
     return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
-  }, [nodes]);
+  }, [nodes, embeddedSubsOnly]);
 
   const native443Count = useMemo(
-    () => nodes.filter((n) => n.is_443_native).length,
-    [nodes]
+    () => (embeddedSubsOnly ? 0 : nodes.filter((n) => n.is_443_native).length),
+    [nodes, embeddedSubsOnly]
   );
 
   const filteredNodes = useMemo(() => {
+    if (embeddedSubsOnly) return [] as ProxyNode[];
     const kw = keyword.trim().toLowerCase();
     const matched = nodes.filter((node) => {
       if (filterSubId !== "all" && node.sub_id !== filterSubId) return false;
@@ -2543,24 +2560,26 @@ export function NodesSubsPage({
     sortBy,
     storeProbes,
     subNameMap,
+    embeddedSubsOnly,
   ]);
 
   const selectedCrossSubCount = useMemo(() => {
+    if (embeddedSubsOnly || selectedNodeIds.size === 0) return 0;
     const subSet = new Set<string>();
     for (const n of nodes) {
       if (selectedNodeIds.has(n.id)) subSet.add(n.sub_id);
     }
     return subSet.size;
-  }, [nodes, selectedNodeIds]);
+  }, [nodes, selectedNodeIds, embeddedSubsOnly]);
 
   const targetGroup = useMemo(
-    () => groups.find((g) => g.id === targetGroupId) ?? null,
-    [groups, targetGroupId]
+    () => (embeddedSubsOnly ? null : groups.find((g) => g.id === targetGroupId) ?? null),
+    [groups, targetGroupId, embeddedSubsOnly]
   );
 
   const targetGroupMemberSet = useMemo(
-    () => new Set(targetGroup?.member_node_ids ?? []),
-    [targetGroup]
+    () => new Set(embeddedSubsOnly ? [] : (targetGroup?.member_node_ids ?? [])),
+    [targetGroup, embeddedSubsOnly]
   );
 
   const advancedFilterCount =
@@ -2583,11 +2602,15 @@ export function NodesSubsPage({
   const safePage = Math.min(currentPage, totalPages);
   const pageStartIndex = (safePage - 1) * pageSize;
   const pagedNodes = useMemo(
-    () => filteredNodes.slice(pageStartIndex, pageStartIndex + pageSize),
-    [filteredNodes, pageStartIndex, pageSize]
+    () =>
+      embeddedSubsOnly
+        ? []
+        : filteredNodes.slice(pageStartIndex, pageStartIndex + pageSize),
+    [embeddedSubsOnly, filteredNodes, pageStartIndex, pageSize]
   );
 
   const allFilteredSelected =
+    !embeddedSubsOnly &&
     filteredNodes.length > 0 &&
     filteredNodes.every((n) => selectedNodeIds.has(n.id));
 
@@ -3522,19 +3545,22 @@ export function NodesSubsPage({
               />
             </label>
 
-            <label className="text-[11px] text-[var(--muted)] md:col-span-3">
-              自动刷新周期
-              <select
-                value={newSubIntervalSec}
-                onChange={(e) => setNewSubIntervalSec(Number(e.target.value))}
-                className="mt-1 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-              >
-                <option value={21600}>每 6 小时</option>
-                <option value={43200}>每 12 小时</option>
-                <option value={86400}>每 24 小时</option>
-                <option value={0}>仅手动刷新</option>
-              </select>
-            </label>
+            <div className="text-[11px] text-[var(--muted)] md:col-span-3">
+              <span className="block">自动刷新周期</span>
+              <AppSelect
+                aria-label="自动刷新周期"
+                size="sm"
+                value={String(newSubIntervalSec)}
+                onChange={(v) => setNewSubIntervalSec(Number(v))}
+                options={[
+                  { value: "21600", label: "每 6 小时" },
+                  { value: "43200", label: "每 12 小时" },
+                  { value: "86400", label: "每 24 小时" },
+                  { value: "0", label: "仅手动刷新" },
+                ]}
+                className="mt-1 w-full"
+              />
+            </div>
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px] text-[var(--muted)]">
@@ -3842,19 +3868,21 @@ export function NodesSubsPage({
               <span>仅看 AI 可用</span>
             </button>
 
-            <div className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5">
+            <div className="inline-flex items-center gap-1.5">
               <ArrowUpDown className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-              <select
+              <AppSelect
                 aria-label="节点排序方式"
+                size="sm"
                 value={sortBy}
-                onChange={(e) => setSortBy(e.target.value as NodeSortBy)}
-                className="bg-transparent text-xs text-[var(--text)] outline-none"
-              >
-                <option value="default">排序：默认</option>
-                <option value="latency">排序：延迟最低</option>
-                <option value="up">排序：上传最快</option>
-                <option value="down">排序：下载最快</option>
-              </select>
+                onChange={(v) => setSortBy(v as NodeSortBy)}
+                options={[
+                  { value: "default", label: "排序：默认" },
+                  { value: "latency", label: "排序：延迟最低" },
+                  { value: "up", label: "排序：上传最快" },
+                  { value: "down", label: "排序：下载最快" },
+                ]}
+                className="min-w-[132px]"
+              />
             </div>
 
             <button
@@ -4087,19 +4115,20 @@ export function NodesSubsPage({
 
         <div className="flex flex-wrap items-center gap-2">
           <div className="flex items-center gap-1.5 text-xs">
-            <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
-            <select
+            <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+            <AppSelect
               aria-label="目标智能多选组"
+              size="sm"
               value={targetGroupId}
-              onChange={(e) => setTargetGroupId(e.target.value)}
-              className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-            >
-              {groups.map((g) => (
-                <option key={g.id} value={g.id}>
-                  {g.name}（{g.member_node_ids.length} 节点）
-                </option>
-              ))}
-            </select>
+              onChange={setTargetGroupId}
+              options={groups.map((g) => ({
+                value: g.id,
+                label: `${g.name}（${g.member_node_ids.length} 节点）`,
+              }))}
+              placeholder="暂无多选组"
+              disabled={groups.length === 0}
+              className="min-w-[160px]"
+            />
           </div>
 
           <button
@@ -4602,75 +4631,78 @@ export function NodesSubsPage({
       />
 
       {/* Delete Subscription Two-Step Confirmation Modal */}
-      {pendingDeleteSub && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-          onClick={() => {
-            if (!deletingSub) setPendingDeleteSub(null);
-          }}
-        >
+      {pendingDeleteSub &&
+        typeof document !== "undefined" &&
+        createPortal(
           <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="确认删除订阅"
-            onClick={(e) => e.stopPropagation()}
-            className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => {
+              if (!deletingSub) setPendingDeleteSub(null);
+            }}
           >
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-start gap-3">
-                <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--red-soft)] text-[var(--red)]">
-                  <AlertTriangle className="h-4 w-4" />
-                </span>
-                <div className="min-w-0">
-                  <h3 className="text-sm font-semibold text-[var(--text)]">
-                    确认删除整条订阅？
-                  </h3>
-                  <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                    即将删除订阅「
-                    <span className="font-semibold text-[var(--text)]">
-                      {pendingDeleteSub.name}
-                    </span>
-                    」，并同时移除该订阅下的{" "}
-                    <strong className="cc-mono text-[var(--red)]">
-                      {subNodeCountMap.get(pendingDeleteSub.id) ?? 0} 个节点
-                    </strong>
-                    。此操作无法撤销，请确认后再继续。
-                  </p>
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="确认删除订阅"
+              onClick={(e) => e.stopPropagation()}
+              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--red-soft)] text-[var(--red)]">
+                    <AlertTriangle className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                      确认删除整条订阅？
+                    </h3>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                      即将删除订阅「
+                      <span className="font-semibold text-[var(--text)]">
+                        {pendingDeleteSub.name}
+                      </span>
+                      」，并同时移除该订阅下的{" "}
+                      <strong className="cc-mono text-[var(--red)]">
+                        {subNodeCountMap.get(pendingDeleteSub.id) ?? 0} 个节点
+                      </strong>
+                      。此操作无法撤销，请确认后再继续。
+                    </p>
+                  </div>
                 </div>
+                <button
+                  type="button"
+                  disabled={deletingSub}
+                  onClick={() => setPendingDeleteSub(null)}
+                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+                  aria-label="关闭弹窗"
+                >
+                  <X className="h-4 w-4" />
+                </button>
               </div>
-              <button
-                type="button"
-                disabled={deletingSub}
-                onClick={() => setPendingDeleteSub(null)}
-                className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
-                aria-label="关闭弹窗"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
 
-            <div className="mt-5 flex justify-end gap-2">
-              <button
-                type="button"
-                disabled={deletingSub}
-                onClick={() => setPendingDeleteSub(null)}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                disabled={deletingSub}
-                onClick={() => void handleConfirmRemoveSubscription()}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--red)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-                <span>{deletingSub ? "删除中…" : "确认删除"}</span>
-              </button>
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={deletingSub}
+                  onClick={() => setPendingDeleteSub(null)}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={deletingSub}
+                  onClick={() => void handleConfirmRemoveSubscription()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--red)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                  <span>{deletingSub ? "删除中…" : "确认删除"}</span>
+                </button>
+              </div>
             </div>
-          </div>
-        </div>
-      )}
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

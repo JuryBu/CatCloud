@@ -3,6 +3,8 @@ import {
   ArrowDown,
   ArrowRight,
   ArrowUp,
+  BookOpen,
+  Check,
   CheckCircle2,
   ChevronDown,
   Clock,
@@ -19,6 +21,7 @@ import {
   Power,
   RefreshCw,
   RotateCcw,
+  ScrollText,
   Search,
   Server,
   ShieldAlert,
@@ -29,7 +32,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   type ExitIpInfo,
   type MultiGroupMode,
@@ -151,6 +154,153 @@ function getLatencyColor(latencyMs: number | null, ok: boolean | null): string {
   return "var(--red)";
 }
 
+const HomeLiveKpiGrid = memo(function HomeLiveKpiGrid({
+  connectionSubLabel,
+  memSubLabel,
+}: {
+  connectionSubLabel: string;
+  memSubLabel: string;
+}) {
+  const traffic = useLatestTraffic();
+  const tunnelCount = traffic.tunnel_connections ?? 0;
+  const compactConnBase = connectionSubLabel.replace("已接管", "");
+  const connSub =
+    tunnelCount > 0 ? `${compactConnBase} · 含 ${tunnelCount} 隧道` : connectionSubLabel;
+
+  const kpiCards = [
+    {
+      label: "上传速度",
+      value: formatRate(traffic.up_bps),
+      sub: "实时上传",
+      title: undefined as string | undefined,
+      accent: "var(--coral)",
+      icon: ArrowUp,
+    },
+    {
+      label: "下载速度",
+      value: formatRate(traffic.down_bps),
+      sub: "实时下载",
+      title: undefined as string | undefined,
+      accent: "var(--sky)",
+      icon: ArrowDown,
+    },
+    {
+      label: "当前连接",
+      value: `${traffic.connections}`,
+      sub: connSub,
+      title:
+        tunnelCount > 0
+          ? `真实应用连接 ${traffic.connections} 条（另含 ${tunnelCount} 条国内底层提速隧道，未重复计入）`
+          : `真实应用连接 ${traffic.connections} 条`,
+      accent: "var(--text)",
+      icon: Activity,
+    },
+    {
+      label: "累计上传",
+      value: formatBytes(traffic.up_total_bytes),
+      sub: "本次启动",
+      title: undefined as string | undefined,
+      accent: "var(--accent)",
+      icon: HardDriveUpload,
+    },
+    {
+      label: "累计下载",
+      value: formatBytes(traffic.down_total_bytes),
+      sub: "本次启动",
+      title: undefined as string | undefined,
+      accent: "var(--accent)",
+      icon: HardDriveDownload,
+    },
+    {
+      label: "内核内存",
+      value: `${traffic.memory_mb.toFixed(1)} MB`,
+      sub: memSubLabel,
+      title: undefined as string | undefined,
+      accent: "var(--green)",
+      icon: Cpu,
+    },
+  ];
+
+  return (
+    <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+      {kpiCards.map((card) => {
+        const Icon = card.icon;
+        return (
+          <div
+            key={card.label}
+            title={card.title}
+            className="cc-card cc-glass rounded-2xl px-3.5 py-3"
+          >
+            <div className="flex items-center justify-between text-[11px] text-[var(--muted)]">
+              <span>{card.label}</span>
+              <Icon className="h-3.5 w-3.5 shrink-0" style={{ color: card.accent }} />
+            </div>
+            <div
+              className="mt-1.5 cc-mono cc-tabular text-base font-semibold tracking-tight"
+              style={{ color: card.accent }}
+            >
+              {card.value}
+            </div>
+            <div className="mt-0.5 truncate text-[10px] text-[var(--muted)]">{card.sub}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+});
+
+const HomeLiveUptime = memo(function HomeLiveUptime({
+  running,
+  uptimeSec,
+}: {
+  running: boolean;
+  uptimeSec: number;
+}) {
+  const anchorRef = useRef<{ anchorSeconds: number; anchorNowMs: number }>({
+    anchorSeconds: running ? Math.max(0, Math.floor(uptimeSec)) : 0,
+    anchorNowMs: Date.now(),
+  });
+  const [liveUptimeSec, setLiveUptimeSec] = useState<number>(() =>
+    running ? Math.max(0, Math.floor(uptimeSec)) : 0
+  );
+
+  useEffect(() => {
+    const baseSeconds = running ? Math.max(0, Math.floor(uptimeSec)) : 0;
+    anchorRef.current = {
+      anchorSeconds: baseSeconds,
+      anchorNowMs: Date.now(),
+    };
+    setLiveUptimeSec(baseSeconds);
+    if (!running) return;
+
+    const syncFromAnchor = () => {
+      const { anchorSeconds, anchorNowMs } = anchorRef.current;
+      setLiveUptimeSec(
+        anchorSeconds + Math.max(0, Math.floor((Date.now() - anchorNowMs) / 1000))
+      );
+    };
+
+    const tickId = window.setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+      syncFromAnchor();
+    }, 1000);
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        syncFromAnchor();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearInterval(tickId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [running, uptimeSec]);
+
+  return <>{running ? `核心运行中 · ${formatUptime(liveUptimeSec)}` : "核心未启动"}</>;
+});
+
 export function HomePage() {
   const runtime = useAppSelector((s) => s.runtime);
   const config = useAppSelector((s) => s.config);
@@ -162,7 +312,6 @@ export function HomePage() {
   const storeQuickSites = useAppSelector((s) => s.quickSites);
   const mascotState = useAppSelector((s) => s.mascotState);
   const initialized = useAppSelector((s) => s.initialized);
-  const traffic = useLatestTraffic();
 
   const [togglingProxy, setTogglingProxy] = useState(false);
   const [nodeMenuOpen, setNodeMenuOpen] = useState(false);
@@ -179,9 +328,8 @@ export function HomePage() {
   const [exitIp, setExitIp] = useState<ExitIpInfo>(storeExitIp);
   const [ipMasked, setIpMasked] = useState(true);
   const [refreshingIp, setRefreshingIp] = useState(false);
-  const [liveUptimeSec, setLiveUptimeSec] = useState<number>(() =>
-    runtime.running ? Math.max(0, Math.floor(runtime.uptime_sec)) : 0
-  );
+  const [copyingAiDiag, setCopyingAiDiag] = useState(false);
+  const [copiedAiDiag, setCopiedAiDiag] = useState(false);
 
   const syncedSitesRef = useRef(false);
   const timerIdsRef = useRef<number[]>([]);
@@ -207,15 +355,6 @@ export function HomePage() {
       mainEl.scrollTo({ top: 0, behavior: "auto" });
     }
   }, []);
-
-  useEffect(() => {
-    setLiveUptimeSec(runtime.running ? Math.max(0, Math.floor(runtime.uptime_sec)) : 0);
-    if (!runtime.running) return;
-    const tickId = window.setInterval(() => {
-      setLiveUptimeSec((prev) => prev + 1);
-    }, 1000);
-    return () => window.clearInterval(tickId);
-  }, [runtime.running, runtime.uptime_sec]);
 
   useEffect(() => {
     return () => {
@@ -663,6 +802,20 @@ export function HomePage() {
     }
   };
 
+  const handleCopyAiDiag = async () => {
+    if (copyingAiDiag) return;
+    setCopyingAiDiag(true);
+    try {
+      const ok = await appActions.copySanitizedDiagnosticsForAi();
+      if (ok) {
+        setCopiedAiDiag(true);
+        scheduleTimeout(() => setCopiedAiDiag(false), 2200);
+      }
+    } finally {
+      setCopyingAiDiag(false);
+    }
+  };
+
   const connectionSubLabel = runtime.tun_enabled
     ? "虚拟网卡已接管"
     : runtime.system_proxy_enabled
@@ -673,51 +826,6 @@ export function HomePage() {
     config.gomemlimit_mb === 0
       ? "自动省内存"
       : `上限 ${config.gomemlimit_mb} MB`;
-
-  const kpiCards = [
-    {
-      label: "上传速度",
-      value: formatRate(traffic.up_bps),
-      sub: "实时上传",
-      accent: "var(--coral)",
-      icon: ArrowUp,
-    },
-    {
-      label: "下载速度",
-      value: formatRate(traffic.down_bps),
-      sub: "实时下载",
-      accent: "var(--sky)",
-      icon: ArrowDown,
-    },
-    {
-      label: "当前连接",
-      value: `${traffic.connections}`,
-      sub: connectionSubLabel,
-      accent: "var(--text)",
-      icon: Activity,
-    },
-    {
-      label: "累计上传",
-      value: formatBytes(traffic.up_total_bytes),
-      sub: "本次启动",
-      accent: "var(--accent)",
-      icon: HardDriveUpload,
-    },
-    {
-      label: "累计下载",
-      value: formatBytes(traffic.down_total_bytes),
-      sub: "本次启动",
-      accent: "var(--accent)",
-      icon: HardDriveDownload,
-    },
-    {
-      label: "内核内存",
-      value: `${traffic.memory_mb.toFixed(1)} MB`,
-      sub: memSubLabel,
-      accent: "var(--green)",
-      icon: Cpu,
-    },
-  ];
 
   // Determine whether exit IP has actually been probed
   const hasExitIpData = hasRealExitIp(exitIp);
@@ -1515,35 +1623,13 @@ export function HomePage() {
         </div>
       </section>
 
-      {/* Middle Traffic Section: 10-Minute Sparkline + 6 Clean Metric Cards */}
+      {/* Middle Traffic Section: 10-Minute Sparkline + Isolated 1Hz 6-Card KPI Grid */}
       <section className="space-y-3">
         <TrafficSparkline variant="full" />
-
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
-          {kpiCards.map((card) => {
-            const Icon = card.icon;
-            return (
-              <div
-                key={card.label}
-                className="cc-card cc-glass rounded-2xl px-3.5 py-3"
-              >
-                <div className="flex items-center justify-between text-[11px] text-[var(--muted)]">
-                  <span>{card.label}</span>
-                  <Icon className="h-3.5 w-3.5 shrink-0" style={{ color: card.accent }} />
-                </div>
-                <div
-                  className="mt-1.5 cc-mono cc-tabular text-base font-semibold tracking-tight"
-                  style={{ color: card.accent }}
-                >
-                  {card.value}
-                </div>
-                <div className="mt-0.5 truncate text-[10px] text-[var(--muted)]">
-                  {card.sub}
-                </div>
-              </div>
-            );
-          })}
-        </div>
+        <HomeLiveKpiGrid
+          connectionSubLabel={connectionSubLabel}
+          memSubLabel={memSubLabel}
+        />
       </section>
 
       {/* Lower Detection Section: Site Connectivity Check + Exit Information */}
@@ -1767,6 +1853,63 @@ export function HomePage() {
         </div>
       </section>
 
+      {/* Compact Agent-Friendly Troubleshooting Strip */}
+      <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl border-[var(--accent)]/30 px-4 py-3">
+        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
+            <Sparkles className="h-4 w-4" />
+          </span>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-1.5">
+              <h2 className="text-xs font-semibold text-[var(--text)]">AI 助手排查</h2>
+              <span className="rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                自动隐私脱敏
+              </span>
+            </div>
+            <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+              连不上、变慢或想让 AI 帮你调分流规则？一键复制状态与脱敏日志直接发给 AI 助手
+            </p>
+          </div>
+        </div>
+
+        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+          <button
+            type="button"
+            disabled={copyingAiDiag}
+            onClick={() => void handleCopyAiDiag()}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+            title="一键复制脱敏后的运行状态、最近日志与只读 CLI 指引，直接粘贴给 AI 助手排查"
+          >
+            {copiedAiDiag ? (
+              <>
+                <Check className="h-3.5 w-3.5 shrink-0" />
+                <span>已复制诊断包</span>
+              </>
+            ) : (
+              <span>{copyingAiDiag ? "正在打包…" : "🤖 复制诊断给 AI"}</span>
+            )}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => appActions.setNav("logs")}
+            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+          >
+            <ScrollText className="h-3.5 w-3.5 text-[var(--muted)]" />
+            <span>查看运行日志 →</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => appActions.openSettingsAgentDocs()}
+            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+          >
+            <BookOpen className="h-3.5 w-3.5 text-[var(--accent)]" />
+            <span>AI 协作指南 →</span>
+          </button>
+        </div>
+      </section>
+
       {/* Compact Elegant Bottom Status Bar */}
       <footer className="cc-card cc-glass mb-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-2xl px-4 py-2.5 text-xs text-[var(--muted)]">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -1777,7 +1920,7 @@ export function HomePage() {
                 backgroundColor: runtime.running ? "var(--green)" : "var(--amber)",
               }}
             />
-            {runtime.running ? `核心运行中 · ${formatUptime(liveUptimeSec)}` : "核心未启动"}
+            <HomeLiveUptime running={runtime.running} uptimeSec={runtime.uptime_sec} />
           </span>
           <span className="text-[var(--line-strong)]" aria-hidden="true">
             |

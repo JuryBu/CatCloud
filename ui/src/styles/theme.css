@@ -185,12 +185,37 @@ body,
   user-select: none;
 }
 
-/* Floating capsule transparent window mode */
+/* Floating capsule transparent window mode + theme-aware day/night palettes */
 [data-window="capsule"],
 [data-window="capsule"] body,
 [data-window="capsule"] #root {
   background: transparent !important;
   overflow: hidden;
+}
+
+:root,
+[data-theme="warm-dark"] {
+  --capsule-bg: linear-gradient(135deg, rgba(28, 33, 32, 0.98) 0%, rgba(41, 35, 27, 0.98) 100%);
+  --capsule-border: rgba(223, 183, 130, 0.34);
+  --capsule-highlight: inset 0 1px 0 rgba(236, 204, 160, 0.14);
+}
+
+[data-theme="light"] {
+  --capsule-bg: linear-gradient(135deg, rgba(255, 252, 246, 0.98) 0%, rgba(244, 236, 222, 0.98) 100%);
+  --capsule-border: rgba(196, 132, 61, 0.36);
+  --capsule-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.9);
+}
+
+[data-theme="midnight-blue"] {
+  --capsule-bg: linear-gradient(135deg, rgba(20, 31, 56, 0.98) 0%, rgba(29, 44, 78, 0.98) 100%);
+  --capsule-border: rgba(96, 165, 250, 0.34);
+  --capsule-highlight: inset 0 1px 0 rgba(196, 209, 234, 0.12);
+}
+
+.cc-capsule-shell {
+  background-image: var(--capsule-bg);
+  border-color: var(--capsule-border);
+  box-shadow: var(--capsule-highlight);
 }
 
 .cc-selectable {
@@ -212,6 +237,17 @@ body,
 }
 
 /* ============================================================================
+ * Native Select Dark-Theme Fallback (prevents white-on-white in WebView2)
+ * ============================================================================ */
+
+select,
+select option,
+select optgroup {
+  background-color: var(--surface);
+  color: var(--text);
+}
+
+/* ============================================================================
  * Wallpaper & Controlled Local Glassmorphism Surfaces
  * ============================================================================ */
 
@@ -225,6 +261,12 @@ body,
   background-position: center;
   background-repeat: no-repeat;
   opacity: var(--wallpaper-opacity);
+}
+
+/* Blur the static wallpaper once on its single underlay layer (0 per-frame GPU cost) */
+[data-wallpaper="on"][data-glass="on"] .cc-wallpaper-layer {
+  filter: blur(calc(var(--glass-blur) * 0.65)) saturate(1.08);
+  transform: scale(1.04);
 }
 
 .cc-surface {
@@ -244,32 +286,44 @@ body,
   background-color: var(--card-hover);
 }
 
-/* Only allocate GPU backdrop layers when wallpaper + glass are explicitly enabled */
+/* Velvet translucent finish for regular cards/sidebars without 50x GPU backdrop-filter passes */
 [data-wallpaper="on"][data-glass="on"] .cc-glass {
-  backdrop-filter: blur(var(--glass-blur)) saturate(1.12);
-  -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.12);
+  background-image: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.045) 0%,
+    rgba(255, 255, 255, 0.01) 100%
+  );
 }
 
-/* Status pulse dot (automatically disabled when animations are off) */
-@keyframes cc-pulse-soft {
-  0%,
-  100% {
-    opacity: 1;
-    transform: scale(1);
-  }
-  50% {
-    opacity: 0.55;
-    transform: scale(0.92);
-  }
+[data-theme="light"][data-wallpaper="on"][data-glass="on"] .cc-glass {
+  background-image: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.34) 0%,
+    rgba(255, 255, 255, 0.12) 100%
+  );
 }
 
+/* Keep lightweight backdrop blur exclusively for explicit floating popovers */
+[data-wallpaper="on"][data-glass="on"] .cc-glass-popover {
+  backdrop-filter: blur(8px) saturate(1.1);
+  -webkit-backdrop-filter: blur(8px) saturate(1.1);
+}
+
+/* Static luminous status indicator dot (zero 60fps compositor repaints) */
 .cc-pulse-dot {
-  animation: cc-pulse-soft 2.4s ease-in-out infinite;
+  box-shadow: 0 0 0 2px rgba(var(--surface-rgb), 0.72);
 }
 
 /* ============================================================================
- * Zero-Animation Accessibility & Low-Power Mode
+ * Zero-Animation Accessibility, Hidden-Window Pause & Low-Power Mode
  * ============================================================================ */
+
+[data-paused="on"] *,
+[data-paused="on"] *::before,
+[data-paused="on"] *::after {
+  animation-play-state: paused !important;
+  transition-duration: 0.001ms !important;
+}
 
 [data-animations="off"] *,
 [data-animations="off"] *::before,

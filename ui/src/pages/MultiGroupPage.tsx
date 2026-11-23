@@ -41,6 +41,7 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { AppSelect } from "../components/AppSelect";
 import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
 import {
@@ -2277,7 +2278,7 @@ export function MultiGroupPage() {
     let md = buildMultiGroupAgentMarkdown(selectedGroup, currentTriggerMeta);
     if (inTauri) {
       try {
-        const exported = await catcloudApi.exportAgentDocs("multi_group", false);
+        const exported = await catcloudApi.exportAgentDocs("multigroup", false);
         if (exported && exported.trim()) {
           md = exported;
         }
@@ -2794,21 +2795,22 @@ export function MultiGroupPage() {
               </div>
 
               {/* Source (Subscription) dropdown */}
-              <div className="relative shrink-0">
-                <Filter className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-                <select
-                  value={selectedSubId}
-                  onChange={(e) => setSelectedSubId(e.target.value)}
+              <div className="inline-flex shrink-0 items-center gap-1.5">
+                <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+                <AppSelect
                   aria-label="按来源筛选"
-                  className="h-9 max-w-[175px] rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                >
-                  <option value="all">全部来源 ({enabledNodes.length})</option>
-                  {providerTabs.map((sub) => (
-                    <option key={sub.id} value={sub.id}>
-                      {sub.name} ({sub.count})
-                    </option>
-                  ))}
-                </select>
+                  size="md"
+                  value={selectedSubId}
+                  onChange={setSelectedSubId}
+                  options={[
+                    { value: "all", label: `全部来源 (${enabledNodes.length})` },
+                    ...providerTabs.map((sub) => ({
+                      value: sub.id,
+                      label: `${sub.name} (${sub.count})`,
+                    })),
+                  ]}
+                  className="w-[168px]"
+                />
               </div>
 
               {/* TAG-style two-tier Continent -> Country/Region filter */}
@@ -2828,28 +2830,28 @@ export function MultiGroupPage() {
               />
 
               {/* Metric Sort Dropdown */}
-              <div className="relative shrink-0">
+              <div className="inline-flex shrink-0 items-center gap-1.5">
                 <ArrowUpDown
-                  className={`pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 ${
+                  className={`h-3.5 w-3.5 shrink-0 ${
                     sortMode !== "default" ? "text-[var(--accent)]" : "text-[var(--muted)]"
                   }`}
                 />
-                <select
-                  value={sortMode}
-                  onChange={(e) => setSortMode(e.target.value as NodeSortMode)}
+                <AppSelect
                   aria-label="节点排序方式"
-                  className={`h-9 max-w-[200px] cursor-pointer appearance-none rounded-xl border bg-[var(--bg-elevated)] pl-8 pr-7 text-xs font-medium text-[var(--text)] outline-none transition-colors hover:border-[var(--line-strong)] focus:border-[var(--accent)] ${
-                    sortMode !== "default"
-                      ? "border-[var(--accent)]/60"
-                      : "border-[var(--line)]"
+                  size="md"
+                  value={sortMode}
+                  onChange={(v) => setSortMode(v as NodeSortMode)}
+                  options={[
+                    { value: "default", label: "排序：默认（在用优先）" },
+                    { value: "up_desc", label: "排序：上传最快" },
+                    { value: "down_desc", label: "排序：下载最快" },
+                    { value: "latency_asc", label: "排序：延迟最低" },
+                  ]}
+                  className="w-[184px]"
+                  buttonClassName={`font-medium ${
+                    sortMode !== "default" ? "border-[var(--accent)]/60" : ""
                   }`}
-                >
-                  <option value="default">排序：默认（在用优先）</option>
-                  <option value="up_desc">排序：上传最快</option>
-                  <option value="down_desc">排序：下载最快</option>
-                  <option value="latency_asc">排序：延迟最低</option>
-                </select>
-                <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+                />
               </div>
             </div>
 
@@ -3695,26 +3697,29 @@ export function MultiGroupPage() {
 
                 {selectedGroup.fallback_policy === "cross_pool_escalate" && (
                   <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5 text-xs">
-                    <label className="block">
-                      <span className="text-[11px] text-[var(--muted)]">选择备用组</span>
-                      <select
+                    <div className="block">
+                      <span className="block text-[11px] text-[var(--muted)]">选择备用组</span>
+                      <AppSelect
+                        aria-label="选择备用组"
+                        size="sm"
                         value={selectedGroup.fallback_pool_id ?? ""}
-                        onChange={(e) =>
+                        onChange={(v) =>
                           updateSelectedGroup((g) => ({
                             ...g,
-                            fallback_pool_id: e.target.value || null,
+                            fallback_pool_id: v || null,
                           }))
                         }
-                        className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                      >
-                        <option value="">请选择一个备用多选组</option>
-                        {otherGroups.map((og) => (
-                          <option key={og.id} value={og.id}>
-                            {formatGroupDisplayName(og.name)}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                        options={[
+                          { value: "", label: "请选择一个备用多选组" },
+                          ...otherGroups.map((og) => ({
+                            value: og.id,
+                            label: formatGroupDisplayName(og.name),
+                          })),
+                        ]}
+                        className="mt-1 w-full"
+                        buttonClassName="rounded-lg bg-[var(--card)]"
+                      />
+                    </div>
                     <label className="block">
                       <span className="text-[11px] text-[var(--muted)]">
                         每隔多久探测主组恢复（秒）

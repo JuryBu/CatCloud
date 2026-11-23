@@ -27,6 +27,12 @@ const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(80);
 /// Hard upper limit (64 KiB) for captured stdout/stderr during `mihomo -t` config verification.
 const MAX_VERIFY_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// Maximum trailing stderr bytes attached to startup failure diagnostics.
+const MAX_STARTUP_STDERR_TAIL_BYTES: usize = 4 * 1024;
+
+/// Filename under `working_dir` capturing Mihomo stderr without blocking pipes.
+const MIHOMO_STDERR_LOG_FILENAME: &str = "mihomo-stderr.log";
+
 /// Generate a cryptographically secure 32-byte controller secret encoded as 64 lowercase hex chars.
 pub fn generate_controller_secret() -> String {
     let mut bytes = [0u8; 32];
@@ -203,6 +209,8 @@ impl MihomoAdapter {
         let norm_bin = crate::paths::normalize_os_path(&req.binary_path);
         let norm_work = crate::paths::normalize_os_path(&req.working_dir);
         let norm_cfg = crate::paths::normalize_os_path(&req.config_path);
+        let stderr_log_path = req.working_dir.join(MIHOMO_STDERR_LOG_FILENAME);
+        let (stderr_stdio, stderr_captured) = open_mihomo_stderr_stdio(&stderr_log_path);
 
         let mut cmd = Command::new(&norm_bin);
         cmd.arg("-d")
@@ -211,9 +219,10 @@ impl MihomoAdapter {
             .arg(&norm_cfg)
             .env("GOMEMLIMIT", gomemlimit)
             .env("GOGC", &gogc)
+            .env("GODEBUG", "madvdontneed=1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(stderr_stdio)
             .kill_on_drop(true);
         JobGuard::configure_tokio_command(&mut cmd);
 
@@ -289,9 +298,20 @@ impl MihomoAdapter {
                         if let Some(p) = exited_pid {
                             self.job_guard.unregister_pid(p);
                         }
-                        let msg = format!(
-                            "Mihomo exited prematurely during startup with status {exit_status}"
+                        let stderr_tail = read_captured_stderr_tail(
+                            &stderr_log_path,
+                            stderr_captured,
+                            MAX_STARTUP_STDERR_TAIL_BYTES,
                         );
+                        let msg = if stderr_tail.is_empty() {
+                            format!(
+                                "Mihomo exited prematurely during startup with status {exit_status}"
+                            )
+                        } else {
+                            format!(
+                                "Mihomo exited prematurely during startup with status {exit_status}: {stderr_tail}"
+                            )
+                        };
                         guard.last_error = Some(msg.clone());
                         return Err(CatError::Core(msg));
                     }
@@ -313,10 +333,22 @@ impl MihomoAdapter {
         let Some(version) = ready_version else {
             let _ = self.stop_process_unlocked().await;
             let detail = last_probe_err.unwrap_or_else(|| "controller timeout".to_string());
-            let msg = format!(
-                "Mihomo controller did not become ready within {:.1}s: {detail}",
-                STARTUP_READY_TIMEOUT.as_secs_f32()
+            let stderr_tail = read_captured_stderr_tail(
+                &stderr_log_path,
+                stderr_captured,
+                MAX_STARTUP_STDERR_TAIL_BYTES,
             );
+            let msg = if stderr_tail.is_empty() {
+                format!(
+                    "Mihomo controller did not become ready within {:.1}s: {detail}",
+                    STARTUP_READY_TIMEOUT.as_secs_f32()
+                )
+            } else {
+                format!(
+                    "Mihomo controller did not become ready within {:.1}s: {detail} (stderr: {stderr_tail})",
+                    STARTUP_READY_TIMEOUT.as_secs_f32()
+                )
+            };
             let mut guard = self.state.lock().await;
             guard.last_error = Some(msg.clone());
             return Err(CatError::Core(msg));
@@ -1015,6 +1047,63 @@ fn build_controller_http_client() -> CatResult<reqwest::Client> {
         .map_err(CatError::Http)
 }
 
+/// Open and truncate `mihomo-stderr.log` for the child process, returning `(stdio, captured)`.
+/// When opening or truncating fails (e.g. file locked or permission denied), degrades to
+/// `Stdio::null()` with `captured == false` so startup failure diagnostics skip reading stale logs.
+fn open_mihomo_stderr_stdio(log_path: &Path) -> (Stdio, bool) {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(log_path)
+    {
+        Ok(file) => (Stdio::from(file), true),
+        Err(_) => (Stdio::null(), false),
+    }
+}
+
+fn read_captured_stderr_tail(log_path: &Path, stderr_captured: bool, max_bytes: usize) -> String {
+    if !stderr_captured {
+        return String::new();
+    }
+    read_stderr_tail(log_path, max_bytes)
+}
+
+fn read_stderr_tail(log_path: &Path, max_bytes: usize) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(log_path) else {
+        return String::new();
+    };
+    let Ok(meta) = file.metadata() else {
+        return String::new();
+    };
+    let len = meta.len();
+    if len == 0 || max_bytes == 0 {
+        return String::new();
+    }
+    let start = len.saturating_sub(max_bytes as u64);
+    if start > 0 && file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut buf = Vec::with_capacity((len - start).min(max_bytes as u64) as usize);
+    if file.read_to_end(&mut buf).is_err() {
+        return String::new();
+    }
+    let raw = String::from_utf8_lossy(&buf);
+    let compact = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if start > 0 && !compact.is_empty() {
+        format!("...{compact}")
+    } else {
+        compact
+    }
+}
+
 fn strip_windows_verbatim(path: &Path) -> String {
     let raw = path.to_string_lossy();
     #[cfg(target_os = "windows")]
@@ -1311,5 +1400,65 @@ mod tests {
         assert_eq!(parsed["tun"]["enable"], serde_json::Value::Bool(false));
 
         server.abort();
+    }
+
+    #[test]
+    fn stderr_log_helper_truncates_on_reopen_and_reads_bounded_tail() {
+        let path = std::env::temp_dir().join(format!(
+            "catcloud-mihomo-stderr-test-{}.log",
+            uuid::Uuid::new_v4()
+        ));
+
+        // 1. Opening truncates any pre-existing content so stale errors do not bleed across restarts.
+        std::fs::write(&path, "stale old error\n").unwrap();
+        let (stdio, captured) = open_mihomo_stderr_stdio(&path);
+        assert!(captured);
+        drop(stdio);
+        assert_eq!(read_stderr_tail(&path, MAX_STARTUP_STDERR_TAIL_BYTES), "");
+
+        // 2. Small multiline stderr is compacted cleanly without truncation prefix.
+        std::fs::write(&path, "line one\n\n  fatal: bad yaml  \n").unwrap();
+        assert_eq!(
+            read_stderr_tail(&path, MAX_STARTUP_STDERR_TAIL_BYTES),
+            "line one | fatal: bad yaml"
+        );
+
+        // 3. Oversized stderr returns only the bounded trailing bytes with `...` prefix.
+        let big = format!("{}TAIL_MARKER_END\n", "x".repeat(MAX_STARTUP_STDERR_TAIL_BYTES + 256));
+        std::fs::write(&path, big).unwrap();
+        let tail = read_stderr_tail(&path, MAX_STARTUP_STDERR_TAIL_BYTES);
+        assert!(tail.starts_with("..."));
+        assert!(tail.ends_with("TAIL_MARKER_END"));
+        assert!(tail.len() <= MAX_STARTUP_STDERR_TAIL_BYTES + 16);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stderr_log_open_failure_skips_stale_tail_reading() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-mihomo-stderr-fail-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Opening an existing directory as a truncated file always fails and degrades to
+        // `Stdio::null()` with `captured == false`.
+        let (_stdio, captured) = open_mihomo_stderr_stdio(&dir);
+        assert!(!captured);
+
+        // When `stderr_captured == false`, stale log content from an earlier run must be skipped.
+        let stale_path = dir.join(MIHOMO_STDERR_LOG_FILENAME);
+        std::fs::write(&stale_path, "stale previous crash reason\n").unwrap();
+        assert_eq!(
+            read_captured_stderr_tail(&stale_path, false, MAX_STARTUP_STDERR_TAIL_BYTES),
+            ""
+        );
+        assert_eq!(
+            read_captured_stderr_tail(&stale_path, true, MAX_STARTUP_STDERR_TAIL_BYTES),
+            "stale previous crash reason"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

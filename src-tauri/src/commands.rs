@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -59,8 +59,10 @@ use catcloud_core::AppPaths;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::app_log::{self, APP_EVENT_PREFIX, RotatingAppLogger};
 use crate::lifecycle;
 use crate::shortcuts::{self, ShortcutAction, ShortcutBindings};
 use crate::tray::{
@@ -75,6 +77,7 @@ pub const EVENT_CORE_LOG: &str = "catcloud://core-log";
 pub const EVENT_PROBE_PROGRESS: &str = "catcloud://probe-progress";
 pub const EVENT_TUN_NEEDS_ADMIN: &str = "catcloud://tun-needs-admin";
 pub const EVENT_STRATEGY_SWITCH: &str = "catcloud://strategy-switch";
+pub const EVENT_CONFIG_UPDATED: &str = "catcloud://config-updated";
 
 /// Shared backend state managed by Tauri across commands, tray callbacks, streams, and shortcuts.
 pub struct AppState {
@@ -99,7 +102,10 @@ pub struct AppState {
     pub core_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub system_proxy_lock: Arc<std::sync::Mutex<()>>,
     pub node_proxy_name_map: RwLock<HashMap<String, String>>,
+    pub compiled_group_ids: RwLock<Option<HashSet<String>>>,
     pub last_log_level: RwLock<CoreLogLevel>,
+    pub app_logger: Arc<RotatingAppLogger>,
+    pub last_app_error: RwLock<Option<String>>,
     pub started_at: Instant,
 }
 
@@ -107,7 +113,55 @@ pub struct AppState {
 pub struct CachedRealtimeMetrics {
     pub up_bps: u64,
     pub down_bps: u64,
+    pub up_total_bytes: u64,
+    pub down_total_bytes: u64,
     pub core_mem_bytes: u64,
+    pub app_connections: usize,
+    pub tunnel_connections: usize,
+    pub direct_connections: usize,
+    pub proxied_connections: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectionSummaryCounts {
+    pub app_connections: usize,
+    pub tunnel_connections: usize,
+    pub direct_connections: usize,
+    pub proxied_connections: usize,
+}
+
+/// Split Mihomo `/connections` snapshot into real application connections vs internal
+/// pre-acceleration `Inner` tunnels, and classify application connections into direct vs proxied
+/// (excluding `REJECT` / `REJECT-DROP` blocked connections from proxied counts).
+pub fn summarize_connections(
+    conns: &[catcloud_core::core_adapter::ActiveConnection],
+) -> ConnectionSummaryCounts {
+    let mut out = ConnectionSummaryCounts::default();
+    for conn in conns {
+        if conn.conn_type.eq_ignore_ascii_case("Inner") {
+            out.tunnel_connections += 1;
+            continue;
+        }
+        out.app_connections += 1;
+        let is_reject = conn.chains.iter().any(|c| {
+            c.eq_ignore_ascii_case("REJECT") || c.eq_ignore_ascii_case("REJECT-DROP")
+        }) || conn.rule.eq_ignore_ascii_case("REJECT")
+            || conn.rule.eq_ignore_ascii_case("REJECT-DROP");
+        if is_reject {
+            continue;
+        }
+        let is_direct = conn
+            .chains
+            .iter()
+            .any(|c| c.eq_ignore_ascii_case("DIRECT"))
+            || conn.rule.eq_ignore_ascii_case("DIRECT");
+        if is_direct {
+            out.direct_connections += 1;
+        } else {
+            out.proxied_connections += 1;
+        }
+    }
+    out
 }
 
 impl AppState {
@@ -123,6 +177,7 @@ impl AppState {
         );
         let hot_reload = Arc::new(HotReloadCoordinator::new(paths.clone(), Arc::clone(&adapter)));
         let telemetry = Arc::new(CoreTelemetryStore::default());
+        let app_logger = Arc::new(RotatingAppLogger::new(paths.logs_dir.clone()));
         let initial_log_level = cfg.log_level.clone();
         Self {
             paths,
@@ -146,9 +201,72 @@ impl AppState {
             core_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             system_proxy_lock: Arc::new(std::sync::Mutex::new(())),
             node_proxy_name_map: RwLock::new(HashMap::new()),
+            compiled_group_ids: RwLock::new(None),
             last_log_level: RwLock::new(initial_log_level),
+            app_logger,
+            last_app_error: RwLock::new(None),
             started_at: Instant::now(),
         }
+    }
+
+    /// Persist a sanitized application-level event into `catcloud.log` and push it into
+    /// `CoreTelemetryStore` (which automatically emits `catcloud://core-log` when the main window
+    /// is visible via the log forwarder).
+    pub fn log_app_event(&self, level: &str, category: &str, message: &str) {
+        let lvl = app_log::normalize_log_level(level);
+        let sanitized = app_log::sanitize_log_line(message)
+            .replace(['\r', '\n'], " ")
+            .trim()
+            .to_string();
+        if sanitized.is_empty() {
+            return;
+        }
+        let cat = category.trim();
+        let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.app_logger
+            .append_formatted(&ts, lvl, cat, &sanitized);
+
+        if lvl == "error" {
+            let err_summary = if cat.is_empty() {
+                sanitized.clone()
+            } else {
+                format!("[{cat}] {sanitized}")
+            };
+            if let Ok(mut guard) = self.last_app_error.write() {
+                *guard = Some(err_summary);
+            }
+        }
+
+        let payload = if cat.is_empty() {
+            format!("{APP_EVENT_PREFIX}通用] {sanitized}")
+        } else {
+            format!("{APP_EVENT_PREFIX}{cat}] {sanitized}")
+        };
+        self.telemetry.push_log(CoreLogLine {
+            level: lvl.to_string(),
+            payload,
+            timestamp: ts,
+        });
+
+        match lvl {
+            "error" => tracing::error!(category = %cat, "{sanitized}"),
+            "warning" => tracing::warn!(category = %cat, "{sanitized}"),
+            "debug" => tracing::debug!(category = %cat, "{sanitized}"),
+            _ => tracing::info!(category = %cat, "{sanitized}"),
+        }
+    }
+
+    pub fn clear_app_error(&self) {
+        if let Ok(mut guard) = self.last_app_error.write() {
+            *guard = None;
+        }
+    }
+
+    pub fn last_app_error_snapshot(&self) -> Option<String> {
+        self.last_app_error
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     pub fn core_session_generation(&self) -> u64 {
@@ -167,15 +285,33 @@ impl AppState {
         }
     }
 
-    pub fn resolve_compiled_proxy_name(&self, node_id: &str, fallback_name: &str) -> String {
-        if let Ok(guard) = self.node_proxy_name_map.read() {
-            if let Some(mapped) = guard.get(node_id) {
-                if !mapped.trim().is_empty() {
-                    return mapped.clone();
-                }
-            }
+    pub fn lookup_compiled_proxy_name(&self, node_id: &str) -> Option<String> {
+        let guard = self.node_proxy_name_map.read().ok()?;
+        let mapped = guard.get(node_id)?;
+        let trimmed = mapped.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
         }
-        fallback_name.to_string()
+    }
+
+    pub fn resolve_compiled_proxy_name(&self, node_id: &str, fallback_name: &str) -> String {
+        self.lookup_compiled_proxy_name(node_id)
+            .unwrap_or_else(|| fallback_name.to_string())
+    }
+
+    pub fn set_compiled_group_ids(&self, ids: Option<HashSet<String>>) {
+        if let Ok(mut guard) = self.compiled_group_ids.write() {
+            *guard = ids;
+        }
+    }
+
+    pub fn snapshot_compiled_group_ids(&self) -> Option<HashSet<String>> {
+        self.compiled_group_ids
+            .read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     pub fn attach_streams(
@@ -496,6 +632,8 @@ pub struct TrafficEventPayload {
     pub up_total_bytes: u64,
     pub down_total_bytes: u64,
     pub active_connections: usize,
+    #[serde(default)]
+    pub tunnel_connections: usize,
     pub core_memory_mb: f64,
     pub timestamp_ms: i64,
 }
@@ -1880,6 +2018,13 @@ fn refresh_node_proxy_name_map(state: &AppState) {
         compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir))
     {
         state.set_node_proxy_name_map(compiled.node_id_to_proxy_name);
+        state.set_compiled_group_ids(Some(
+            compiled
+                .group_mappings
+                .iter()
+                .map(|g| g.group_id.clone())
+                .collect(),
+        ));
     }
 }
 
@@ -1892,9 +2037,15 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
     let cfg = state.snapshot_config();
     let extra_candidates = state.extra_binary_candidates();
     let resolution = resolve_mihomo_binary(&cfg, &state.paths, &extra_candidates, false)
-        .map_err(|e| format!("查找代理核心失败：{e}"))?;
+        .map_err(|e| {
+            let msg = format!("查找代理核心失败：{e}");
+            state.log_app_event("error", "核心", &msg);
+            msg
+        })?;
     let binary_path = resolution.path.ok_or_else(|| {
-        "未找到 Mihomo 代理核心文件，请将内核放入 bin 目录或在设置中指定内核路径".to_string()
+        let msg = "未找到 Mihomo 代理核心文件，请将内核放入 bin 目录或在设置中指定内核路径".to_string();
+        state.log_app_event("error", "核心", &msg);
+        msg
     })?;
 
     let (nodes, groups, relays) = {
@@ -1991,7 +2142,11 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         group_filtered_members: &empty_filter,
     };
     let compiled = compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir))
-        .map_err(|e| format_mihomo_error_for_user(&format!("生成代理配置失败：{e}")))?;
+        .map_err(|e| {
+            let msg = format_mihomo_error_for_user(&format!("生成代理配置失败：{e}"));
+            state.log_app_event("error", "核心", &msg);
+            msg
+        })?;
     if !compiled.validation.ok {
         let summary = compiled
             .validation
@@ -2000,7 +2155,9 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
             .map(|i| i.message.as_str())
             .collect::<Vec<_>>()
             .join("；");
-        return Err(format!("代理配置静态预检未通过：{summary}"));
+        let msg = format!("代理配置静态预检未通过：{summary}");
+        state.log_app_event("error", "核心", &msg);
+        return Err(msg);
     }
 
     let runtime_yaml = state.hot_reload.runtime_yaml_path();
@@ -2022,7 +2179,9 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
     .await
     .map_err(|e| {
         let _ = std::fs::remove_file(&tmp_yaml);
-        format_mihomo_error_for_user(&e.to_string())
+        let msg = format_mihomo_error_for_user(&e.to_string());
+        state.log_app_event("error", "核心", &format!("内核配置预检失败：{msg}"));
+        msg
     })?;
     AppPaths::atomic_write(&runtime_yaml, compiled.yaml.as_bytes()).map_err(|e| {
         let _ = std::fs::remove_file(&tmp_yaml);
@@ -2043,19 +2202,40 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         active_selections: compiled.active_selections.clone(),
     };
 
-    let status = state
-        .adapter
-        .start(start_req)
-        .await
-        .map_err(|e| format_mihomo_error_for_user(&format!("启动代理核心失败：{e}")))?;
+    let status = state.adapter.start(start_req).await.map_err(|e| {
+        let msg = format_mihomo_error_for_user(&format!("启动代理核心失败：{e}"));
+        state.log_app_event("error", "核心", &msg);
+        msg
+    })?;
 
     state.set_node_proxy_name_map(compiled.node_id_to_proxy_name);
+    state.set_compiled_group_ids(Some(
+        compiled
+            .group_mappings
+            .iter()
+            .map(|g| g.group_id.clone())
+            .collect(),
+    ));
     state
         .hot_reload
         .seed_active_state(cfg.clone(), compiled.sha256, allocated.clone(), secret.clone())
         .await;
     state.bump_core_session_generation();
     state.update_cached_runtime(status.clone());
+    state.clear_app_error();
+    state.log_app_event(
+        "info",
+        "核心",
+        &format!(
+            "代理核心已启动（模式 {}，混合端口 {}，节点 {} 个，规则 {} 条，虚拟网卡 {}，国内提速 {}）",
+            cfg.proxy_mode.as_str(),
+            status.mixed_port,
+            status.node_count,
+            status.rule_count,
+            if cfg.tun.enabled { "开启" } else { "关闭" },
+            if cfg.preaccel.enabled { "开启" } else { "关闭" }
+        ),
+    );
 
     // Attach bounded background telemetry streams (`/traffic`, `/memory`, `/logs`).
     state.attach_streams(
@@ -2101,6 +2281,8 @@ async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
         .map_err(|e| format!("停止旧代理核心失败：{e}"))?;
     state.bump_core_session_generation();
     state.telemetry.clear_traffic();
+    state.set_node_proxy_name_map(HashMap::new());
+    state.set_compiled_group_ids(None);
     let status = state.adapter.status().await;
     state.update_cached_runtime(status);
     if let Ok(mut m) = state.cached_metrics.write() {
@@ -2149,13 +2331,15 @@ async fn stop_core_locked(
     }
 
     state.stop_streams();
-    state
-        .adapter
-        .stop()
-        .await
-        .map_err(|e| format!("停止代理核心失败：{e}"))?;
+    state.adapter.stop().await.map_err(|e| {
+        let msg = format!("停止代理核心失败：{e}");
+        state.log_app_event("error", "核心", &msg);
+        msg
+    })?;
     state.bump_core_session_generation();
     state.telemetry.clear_traffic();
+    state.set_node_proxy_name_map(HashMap::new());
+    state.set_compiled_group_ids(None);
     let status = state.adapter.status().await;
     state.update_cached_runtime(status);
     if let Ok(mut m) = state.cached_metrics.write() {
@@ -2169,10 +2353,12 @@ async fn stop_core_locked(
             up_total_bytes: 0,
             down_total_bytes: 0,
             active_connections: 0,
+            tunnel_connections: 0,
             core_memory_mb: 0.0,
             timestamp_ms: Utc::now().timestamp_millis(),
         },
     );
+    state.log_app_event("info", "核心", "代理核心已停止，系统代理与虚拟网卡状态已复位");
     sync_app_side_effects(app, state, &cfg);
     if let Some(err) = save_err {
         return Err(format!("保存配置失败：{err}"));
@@ -2240,6 +2426,26 @@ pub async fn trigger_reload_if_running(
 
     if outcome.applied {
         refresh_node_proxy_name_map(state);
+        state.clear_app_error();
+        state.log_app_event(
+            "info",
+            "热重载",
+            &format!(
+                "配置热重载成功（级别 {}，回放分组 {} 个）",
+                outcome.level, outcome.replayed_groups
+            ),
+        );
+    } else if outcome.rejected {
+        let detail = outcome
+            .error
+            .as_deref()
+            .map(format_mihomo_error_for_user)
+            .unwrap_or_else(|| "未知原因".to_string());
+        state.log_app_event(
+            "error",
+            "热重载",
+            &format!("配置热重载被拒绝，已保留原运行配置：{detail}"),
+        );
     }
 
     let endpoint_changed = prev_status.controller_host != status.controller_host
@@ -2299,6 +2505,7 @@ pub async fn apply_system_proxy_internal(
             return Err(err);
         }
         config::save(&state.paths, &cfg).map_err(|e| format!("保存系统代理状态失败：{e}"))?;
+        state.log_app_event("info", "系统代理", "已关闭系统代理");
         sync_app_side_effects(app, state, &cfg);
         return Ok(false);
     }
@@ -2371,11 +2578,21 @@ pub async fn apply_system_proxy_internal(
             if let Ok(mut guard) = state.config.write() {
                 *guard = old_cfg.clone();
             }
+            state.log_app_event(
+                "error",
+                "系统代理",
+                &format!("写入操作系统代理失败，已回滚配置：{err}"),
+            );
             sync_app_side_effects(app, state, &old_cfg);
             return Err(err);
         }
     }
 
+    state.log_app_event(
+        "info",
+        "系统代理",
+        &format!("已开启系统代理（127.0.0.1:{effective_port}）"),
+    );
     sync_app_side_effects(app, state, &cfg);
     Ok(true)
 }
@@ -2638,13 +2855,19 @@ async fn select_single_node_with_closed(
     if state.adapter.has_live_controller().await {
         let mut needs_reload = !was_single;
         if was_single {
-            let proxy_name = state.resolve_compiled_proxy_name(&node.id, &node.name);
-            if state
-                .adapter
-                .select_group_proxy(SINGLE_NODE_GROUP_NAME, &proxy_name)
-                .await
-                .is_err()
-            {
+            if let Some(proxy_name) = state.lookup_compiled_proxy_name(&node.id) {
+                if state
+                    .adapter
+                    .select_group_proxy(SINGLE_NODE_GROUP_NAME, &proxy_name)
+                    .await
+                    .is_err()
+                {
+                    needs_reload = true;
+                }
+            } else {
+                // Target node is not present in the currently compiled (possibly pruned) config:
+                // force an L2 reload instead of falling back to raw `node.name`, which would either
+                // trigger an avoidable HTTP 400 or silently switch to a same-named node from another sub.
                 needs_reload = true;
             }
         }
@@ -2684,6 +2907,14 @@ async fn select_single_node_with_closed(
         }
     }
 
+    state.log_app_event(
+        "info",
+        "节点切换",
+        &format!(
+            "单节点直选切换至「{}」（地区 {}，断开旧连接 {} 条）",
+            node.name, node.region_code, closed_connections
+        ),
+    );
     sync_app_side_effects(app, state, &cfg);
     Ok((build_runtime_info_dto(state)?, closed_connections))
 }
@@ -2809,6 +3040,17 @@ async fn select_group_node_core(
     }
 
     let cfg = state.snapshot_config();
+    if activate_group {
+        let from_label = prev_node_name.as_deref().unwrap_or("未选");
+        state.log_app_event(
+            "info",
+            "节点切换",
+            &format!(
+                "分组「{}」切换节点：{} -> {}（断开旧连接 {} 条）",
+                group.name, from_label, target_node.name, closed_connections
+            ),
+        );
+    }
     sync_app_side_effects(app, state, &cfg);
 
     Ok(SwitchResultDto {
@@ -2865,6 +3107,49 @@ pub async fn select_group_node_in_place_internal(
     .await
 }
 
+/// Select group IDs eligible for post-probe auto-reconciliation and switch toast emission.
+/// - Never selects any group while `cfg.route_mode != RouteTargetMode::Group` (Single-node mode).
+/// - When `compiled_group_ids` is provided (running core), filters out groups that were pruned
+///   from the active compiled Mihomo configuration.
+fn select_reconcilable_active_group_ids(
+    cfg: &AppConfig,
+    groups: &[MultiGroup],
+    compiled_group_ids: Option<&HashSet<String>>,
+) -> Vec<String> {
+    if cfg.route_mode != RouteTargetMode::Group || groups.is_empty() {
+        return Vec::new();
+    }
+
+    let active_gid = cfg
+        .active_group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|aid| groups.iter().find(|g| g.id == aid).map(|g| g.id.clone()))
+        .or_else(|| groups.first().map(|g| g.id.clone()));
+
+    let mut ids = Vec::new();
+    for g in groups {
+        let is_primary = active_gid.as_deref() == Some(g.id.as_str());
+        let is_strategy_mode = matches!(
+            g.mode,
+            MultiGroupMode::StickyBest | MultiGroupMode::ConditionalPool
+        );
+        if !(is_primary || (g.independent_routing && is_strategy_mode)) {
+            continue;
+        }
+        if let Some(compiled) = compiled_group_ids {
+            if !compiled.contains(g.id.trim()) {
+                continue;
+            }
+        }
+        if !ids.iter().any(|existing| existing == &g.id) {
+            ids.push(g.id.clone());
+        }
+    }
+    ids
+}
+
 /// Reconcile a single multi-group against current membership, hard gates, and probe snapshots.
 /// Persists any `active_node_id` update to SQLite, optionally hot-switches Mihomo & closes stale
 /// connections when `sync_live_core` is true, and optionally emits `catcloud://strategy-switch`.
@@ -2908,6 +3193,7 @@ pub async fn reconcile_group_best_node_internal(
     };
 
     let mut closed_connections = 0usize;
+    let mut live_switch_ok = true;
     if sync_live_core && state.adapter.has_live_controller().await {
         let target_proxy_name =
             state.resolve_compiled_proxy_name(&decision.to_node_id, &decision.to_node_name);
@@ -2916,6 +3202,7 @@ pub async fn reconcile_group_best_node_internal(
             .select_group_proxy(&group_name, &target_proxy_name)
             .await
         {
+            live_switch_ok = false;
             tracing::debug!(
                 group = %group_name,
                 proxy = %target_proxy_name,
@@ -2939,7 +3226,20 @@ pub async fn reconcile_group_best_node_internal(
         }
     }
 
-    if emit_notification {
+    state.log_app_event(
+        "info",
+        "策略择优",
+        &format!(
+            "分组「{}」自动择优切换：{} -> {}（{}，断开旧连接 {} 条）",
+            group_name,
+            decision.from_node_name,
+            decision.to_node_name,
+            decision.reason,
+            closed_connections
+        ),
+    );
+
+    if emit_notification && live_switch_ok {
         let _ = app.emit(
             EVENT_STRATEGY_SWITCH,
             serde_json::json!({
@@ -3135,6 +3435,7 @@ async fn apply_and_save_config_transition(
 
     sync_autostart_if_changed(old, next);
     sync_app_side_effects(app, state, next);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(next));
     Ok(())
 }
 
@@ -3270,6 +3571,11 @@ pub async fn restart_core(
                 let _ = config::save(&state.paths, &cfg);
             }
             sync_app_side_effects(&app, &state, &cfg);
+            state.log_app_event(
+                "error",
+                "核心",
+                &format!("重启代理核心失败，已自动回滚代理开关：{err}"),
+            );
             Err(err)
         }
     }
@@ -3306,7 +3612,9 @@ pub async fn reload_core_config(
         .await;
     if outcome.rejected {
         if let Some(err) = outcome.error.take() {
-            outcome.error = Some(format_mihomo_error_for_user(&err));
+            let formatted = format_mihomo_error_for_user(&err);
+            state.log_app_event("warning", "热重载", &format!("离线配置预检未通过：{formatted}"));
+            outcome.error = Some(formatted);
         }
     }
     sync_app_side_effects(&app, &state, &disk_cfg);
@@ -3319,21 +3627,36 @@ pub async fn set_proxy_mode(
     state: State<'_, AppState>,
     mode: ProxyMode,
 ) -> Result<ProxyMode, String> {
-    let mut cfg = state.snapshot_config();
+    let prev_cfg = state.snapshot_config();
+    let prev_mode = prev_cfg.proxy_mode.clone();
+    let mut cfg = prev_cfg;
     cfg.proxy_mode = mode.clone();
     config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
     if let Ok(mut guard) = state.config.write() {
         *guard = cfg.clone();
     }
-    if state.adapter.has_live_controller().await {
-        state
-            .adapter
-            .set_proxy_mode(mode.clone())
-            .await
-            .map_err(|e| format!("切换代理模式失败：{e}"))?;
-        let live = state.adapter.status().await;
-        state.update_cached_runtime(live);
+    if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+        if outcome.rejected {
+            let mut rollback_cfg = state.snapshot_config();
+            rollback_cfg.proxy_mode = prev_mode;
+            let _ = config::save(&state.paths, &rollback_cfg);
+            if let Ok(mut guard) = state.config.write() {
+                *guard = rollback_cfg.clone();
+            }
+            sync_app_side_effects(&app, &state, &rollback_cfg);
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            return Err(format!("切换代理模式为 {} 失败：{detail}", mode.as_str()));
+        }
     }
+    state.log_app_event(
+        "info",
+        "模式",
+        &format!("代理模式已切换为 {}", mode.as_str()),
+    );
     sync_app_side_effects(&app, &state, &cfg);
     Ok(mode)
 }
@@ -3360,6 +3683,11 @@ pub async fn set_tun_enabled_internal(
 
     if enabled {
         if !default_platform().capabilities().is_elevated {
+            state.log_app_event(
+                "warning",
+                "虚拟网卡",
+                "尝试开启虚拟网卡（TUN）但当前非管理员权限，需提权重启",
+            );
             return Err(
                 "NEEDS_ADMIN:开启虚拟网卡（TUN）需要管理员权限，请点击「以管理员身份重启」一键开启"
                     .to_string(),
@@ -3383,6 +3711,11 @@ pub async fn set_tun_enabled_internal(
                 if let Ok(mut guard) = state.config.write() {
                     *guard = old_cfg.clone();
                 }
+                state.log_app_event(
+                    "error",
+                    "虚拟网卡",
+                    &format!("开启虚拟网卡并启动核心失败，已回滚：{err}"),
+                );
                 sync_app_side_effects(app, state, &old_cfg);
                 return Err(format!("开启虚拟网卡并启动代理核心失败：{err}"));
             }
@@ -3410,11 +3743,21 @@ pub async fn set_tun_enabled_internal(
                 if let Ok(mut guard) = state.config.write() {
                     *guard = old_cfg.clone();
                 }
+                state.log_app_event(
+                    "error",
+                    "虚拟网卡",
+                    &format!("开启虚拟网卡失败，已回滚配置：{detail}"),
+                );
                 sync_app_side_effects(app, state, &old_cfg);
                 return Err(detail);
             }
         }
 
+        state.log_app_event(
+            "info",
+            "虚拟网卡",
+            &format!("已开启虚拟网卡（TUN 协议栈：{}）", cfg.tun.stack_mode.as_str()),
+        );
         sync_app_side_effects(app, state, &cfg);
         return Ok(true);
     }
@@ -3438,10 +3781,12 @@ pub async fn set_tun_enabled_internal(
                 .as_deref()
                 .map(format_mihomo_error_for_user)
                 .unwrap_or_else(|| "关闭虚拟网卡时重载核心失败".to_string());
+            state.log_app_event("error", "虚拟网卡", &format!("关闭虚拟网卡重载失败：{detail}"));
             return Err(detail);
         }
     }
 
+    state.log_app_event("info", "虚拟网卡", "已关闭虚拟网卡（TUN）");
     sync_app_side_effects(app, state, &cfg);
     Ok(false)
 }
@@ -3529,8 +3874,15 @@ pub async fn relaunch_as_admin(
 
     if !launched {
         // User cancelled the UAC elevation prompt: keep current process running untouched.
+        state.log_app_event("warning", "提权", "用户取消了管理员权限提权重启");
         return Ok(false);
     }
+
+    state.log_app_event(
+        "info",
+        "提权",
+        "已以管理员身份拉起新实例，当前进程准备优雅退出并交接",
+    );
 
     // Elevated replacement instance spawned successfully: release TUN, owned proxy, WebView
     // window handles, and single-instance lock before exiting cleanly.
@@ -3641,6 +3993,13 @@ pub async fn set_active_group(
                 .await;
         }
     }
+    if changed {
+        state.log_app_event(
+            "info",
+            "路线组",
+            &format!("已切换活跃路线分组至「{group_name}」"),
+        );
+    }
     sync_app_side_effects(&app, &state, &cfg);
     build_runtime_info_dto(&state)
 }
@@ -3706,13 +4065,12 @@ pub async fn upsert_multi_group(
     }
     catcloud_core::strategy::formula::validate_formula(&group.formula_expr)
         .map_err(|e| format!("分组排序公式无效：{e}"))?;
-    let (prev_active_id, prev_active_name, next_active_name) = {
+    let (prev_group, prev_active_id, prev_active_name, next_active_name) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        let existing_prev = db
-            .get_multi_group(&group.id)
-            .ok()
-            .flatten()
-            .and_then(|g| g.active_node_id)
+        let existing_group = db.get_multi_group(&group.id).map_err(|e| e.to_string())?;
+        let existing_prev = existing_group
+            .as_ref()
+            .and_then(|g| g.active_node_id.clone())
             .or_else(|| group.active_node_id.clone());
         let nodes = db.list_nodes().map_err(|e| e.to_string())?;
         let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
@@ -3735,9 +4093,33 @@ pub async fn upsert_multi_group(
             .and_then(|id| nodes.iter().find(|n| n.id == id))
             .map(|n| n.name.clone());
         db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
-        (existing_prev, prev_name, next_name)
+        (existing_group, existing_prev, prev_name, next_name)
     };
-    let _ = trigger_reload_if_running(&app, &state, false).await;
+    if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+        if outcome.rejected {
+            if let Ok(db) = state.storage.lock() {
+                match prev_group {
+                    Some(ref old_group) => {
+                        let _ = db.upsert_multi_group(old_group);
+                    }
+                    None => {
+                        let _ = db.delete_multi_group(&group.id);
+                    }
+                }
+            }
+            let cfg = state.snapshot_config();
+            sync_app_side_effects(&app, &state, &cfg);
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            return Err(format!(
+                "保存路线分组「{}」失败，核心配置重载未通过：{detail}",
+                group.name
+            ));
+        }
+    }
     if group.active_node_id != prev_active_id && state.adapter.has_live_controller().await {
         if let Some(ref next_id) = group.active_node_id {
             let fallback = next_active_name.as_deref().unwrap_or(next_id.as_str());
@@ -3813,12 +4195,13 @@ pub async fn update_multi_group_members(
     group_id: String,
     member_node_ids: Vec<String>,
 ) -> Result<MultiGroup, String> {
-    let (updated, prev_active_id, prev_active_name, next_active_name) = {
+    let (updated, prev_group, prev_active_id, prev_active_name, next_active_name) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let mut group = db
             .get_multi_group(&group_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("未找到指定路线分组（{group_id}）"))?;
+        let prev_group = group.clone();
         let prev_active = group.active_node_id.clone();
         let nodes = db.list_nodes().map_err(|e| e.to_string())?;
         let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
@@ -3840,9 +4223,26 @@ pub async fn update_multi_group_members(
             .and_then(|id| nodes.iter().find(|n| n.id == id))
             .map(|n| n.name.clone());
         db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
-        (group, prev_active, prev_name, next_name)
+        (group, prev_group, prev_active, prev_name, next_name)
     };
-    let _ = trigger_reload_if_running(&app, &state, false).await;
+    if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+        if outcome.rejected {
+            if let Ok(db) = state.storage.lock() {
+                let _ = db.upsert_multi_group(&prev_group);
+            }
+            let cfg = state.snapshot_config();
+            sync_app_side_effects(&app, &state, &cfg);
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            return Err(format!(
+                "更新路线分组「{}」成员失败，核心配置重载未通过：{detail}",
+                updated.name
+            ));
+        }
+    }
     if updated.active_node_id != prev_active_id && state.adapter.has_live_controller().await {
         if let Some(ref next_id) = updated.active_node_id {
             let fallback = next_active_name.as_deref().unwrap_or(next_id.as_str());
@@ -4093,6 +4493,20 @@ pub async fn run_isolated_probes(
     let mut cancelled = false;
     let mut snapshots: HashMap<String, ProbeSnapshot> = HashMap::new();
     let mut errors: Vec<String> = Vec::new();
+    state.log_app_event(
+        "info",
+        "隔离测速",
+        &format!(
+            "开始隔离测速：目标节点 {} 个，档位 {}，国内提速 {}",
+            total_count,
+            max_tier.as_deref().unwrap_or("full"),
+            if used_preaccel {
+                preaccel_relay_name.as_deref().unwrap_or("已开启")
+            } else {
+                "关闭"
+            }
+        ),
+    );
 
     const BATCH_SIZE: usize = 12;
     const CONCURRENCY: usize = 4;
@@ -4287,47 +4701,57 @@ pub async fn run_isolated_probes(
     );
 
     // Engage strategy engine immediately after fresh probe snapshots are persisted:
-    // reconcile the active multi-group and all independent-routing StickyBest/ConditionalPool groups.
+    // only reconcile when in Group route mode and the target group is in the active compiled set,
+    // so Single-node mode or pruned inactive groups never emit phantom switch toasts.
     let latest_cfg = state.snapshot_config();
-    if !snapshots.is_empty() {
+    if !snapshots.is_empty() && latest_cfg.route_mode == RouteTargetMode::Group {
+        let core_running = state.snapshot_runtime().running;
+        let compiled_group_ids = if core_running {
+            let existing = state.snapshot_compiled_group_ids();
+            if existing.is_some() {
+                existing
+            } else {
+                refresh_node_proxy_name_map(&state);
+                state.snapshot_compiled_group_ids()
+            }
+        } else {
+            None
+        };
         let target_group_ids: Vec<String> = state
             .storage
             .lock()
             .ok()
             .and_then(|db| db.list_multi_groups().ok())
             .map(|groups| {
-                let active_gid = latest_cfg
-                    .active_group_id
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .and_then(|aid| groups.iter().find(|g| g.id == aid).map(|g| g.id.clone()))
-                    .or_else(|| groups.first().map(|g| g.id.clone()));
-
-                let mut ids = Vec::new();
-                for g in &groups {
-                    let is_primary = active_gid.as_deref() == Some(g.id.as_str());
-                    let is_strategy_mode = matches!(
-                        g.mode,
-                        MultiGroupMode::StickyBest | MultiGroupMode::ConditionalPool
-                    );
-                    if (is_primary || (g.independent_routing && is_strategy_mode))
-                        && !ids.iter().any(|existing| existing == &g.id)
-                    {
-                        ids.push(g.id.clone());
-                    }
-                }
-                ids
+                select_reconcilable_active_group_ids(
+                    &latest_cfg,
+                    &groups,
+                    compiled_group_ids.as_ref(),
+                )
             })
             .unwrap_or_default();
 
         for gid in target_group_ids {
-            let _ = reconcile_group_best_node_internal(&app, &state, &gid, true, true).await;
+            let _ =
+                reconcile_group_best_node_internal(&app, &state, &gid, core_running, core_running)
+                    .await;
         }
     }
 
     let latest_cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &latest_cfg);
+
+    let ok_count = snapshots.values().filter(|s| s.ok).count();
+    let status_text = if cancelled { "已手动取消" } else { "已完成" };
+    let summary_level = if errors.is_empty() { "info" } else { "warning" };
+    state.log_app_event(
+        summary_level,
+        "隔离测速",
+        &format!(
+            "隔离测速{status_text}：完成 {completed_count}/{total_count}，可用 {ok_count} 个，异常 {} 条",
+            errors.len()
+        ),
+    );
 
     Ok(serde_json::json!({
         "probed_count": snapshots.len(),
@@ -4962,6 +5386,15 @@ pub async fn toggle_preaccel(
     if let Ok(mut guard) = state.config.write() {
         *guard = cfg.clone();
     }
+    state.log_app_event(
+        "info",
+        "国内提速",
+        if enabled {
+            "已开启国内 443 预加速"
+        } else {
+            "已关闭国内 443 预加速"
+        },
+    );
     let _ = trigger_reload_if_running(&app, &state, false).await;
     sync_app_side_effects(&app, &state, &cfg);
     Ok(enabled)
@@ -4994,6 +5427,11 @@ pub async fn select_preaccel_relay(
             )
             .await;
     }
+    state.log_app_event(
+        "info",
+        "国内提速",
+        &format!("已切换国内提速中转至「{}」", relay.name),
+    );
     sync_app_side_effects(&app, &state, &cfg);
     Ok(relay.id)
 }
@@ -5031,11 +5469,354 @@ fn format_tcp_host_port(host: &str, port: u16) -> String {
     }
 }
 
+#[derive(Debug)]
+struct RelayProbeNoCertVerify;
+
+impl rustls::client::danger::ServerCertVerifier for RelayProbeNoCertVerify {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
+fn relay_probe_tls_config() -> Arc<rustls::ClientConfig> {
+    static TLS_CFG: std::sync::OnceLock<Arc<rustls::ClientConfig>> = std::sync::OnceLock::new();
+    TLS_CFG
+        .get_or_init(|| {
+            catcloud_core::init_crypto_provider();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            let cfg = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("valid ring TLS protocol versions")
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(RelayProbeNoCertVerify))
+                .with_no_client_auth();
+            Arc::new(cfg)
+        })
+        .clone()
+}
+
+fn relay_is_udp_quic_protocol(relay: &PreAccelRelay) -> bool {
+    matches!(
+        relay.protocol.trim().to_ascii_lowercase().as_str(),
+        "tuic" | "hysteria2" | "hy2" | "hysteria"
+    )
+}
+
+fn relay_uses_tls_probe(relay: &PreAccelRelay) -> bool {
+    if relay_is_udp_quic_protocol(relay) {
+        return false;
+    }
+    if relay.port == 443 {
+        return true;
+    }
+    matches!(
+        relay.protocol.trim().to_ascii_lowercase().as_str(),
+        "trojan" | "anytls" | "vless" | "vmess"
+    )
+}
+
+fn relay_allows_plain_fallback(relay: &PreAccelRelay) -> bool {
+    !matches!(
+        relay.protocol.trim().to_ascii_lowercase().as_str(),
+        "trojan" | "anytls"
+    )
+}
+
+/// Align relay TLS probe SNI with `preaccel/generator.rs` compilation rules:
+/// domestic `:443` relays always strip `relay.sni` and probe with bare host/IP (`relay.server`),
+/// while non-443 relays prefer configured `relay.sni` when present.
+fn resolve_relay_probe_sni_or_host(relay: &PreAccelRelay) -> String {
+    let bare_host = relay
+        .server
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if relay.port == 443 {
+        return bare_host.to_string();
+    }
+    relay
+        .sni
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(bare_host)
+        .to_string()
+}
+
+fn is_local_or_private_host(host: &str) -> bool {
+    let bare = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match bare.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] & 0xffc0) == 0xfe80
+        }
+        Err(_) => false,
+    }
+}
+
+async fn measure_relay_tls_handshake_ms(
+    addr: &str,
+    sni_or_host: &str,
+    timeout: Duration,
+) -> Result<f64, String> {
+    let server_name = rustls::pki_types::ServerName::try_from(sni_or_host.to_string())
+        .or_else(|_| rustls::pki_types::ServerName::try_from("localhost".to_string()))
+        .map_err(|e| format!("解析中转主机名失败：{e}"))?;
+    let tls_cfg = relay_probe_tls_config();
+
+    let handshake_fut = async move {
+        let mut stream = TcpStream::connect(addr)
+            .await
+            .map_err(|e| format!("连接国内中转失败：{e}"))?;
+        let _ = stream.set_nodelay(true);
+
+        // Start timing right before TLS ClientHello: even when Wintun/TUN proxies TCP SYN-ACK
+        // locally in <1ms, the TLS ServerHello MUST arrive from the remote relay server.
+        let tls_started = Instant::now();
+        let mut conn = rustls::ClientConnection::new(tls_cfg, server_name)
+            .map_err(|e| format!("初始化 TLS 探测失败：{e}"))?;
+        let mut write_buf = Vec::with_capacity(2048);
+        let mut read_buf = [0u8; 4096];
+
+        while conn.is_handshaking() {
+            while conn.wants_write() {
+                write_buf.clear();
+                conn.write_tls(&mut write_buf)
+                    .map_err(|e| format!("构造 TLS 握手包失败：{e}"))?;
+                if !write_buf.is_empty() {
+                    stream
+                        .write_all(&write_buf)
+                        .await
+                        .map_err(|e| format!("发送 TLS 握手包失败：{e}"))?;
+                }
+            }
+            if !conn.is_handshaking() {
+                break;
+            }
+            if conn.wants_read() {
+                let n = stream
+                    .read(&mut read_buf)
+                    .await
+                    .map_err(|e| format!("读取远端 TLS 响应失败：{e}"))?;
+                if n == 0 {
+                    return Err("远端在 TLS 握手完成前关闭了连接".to_string());
+                }
+                let mut slice = &read_buf[..n];
+                while !slice.is_empty() {
+                    let read_in = conn
+                        .read_tls(&mut slice)
+                        .map_err(|e| format!("解析远端 TLS 响应失败：{e}"))?;
+                    if read_in == 0 {
+                        break;
+                    }
+                    conn.process_new_packets()
+                        .map_err(|e| format!("TLS 握手未通过：{e}"))?;
+                }
+            } else if !conn.wants_write() {
+                break;
+            }
+        }
+
+        let ms = (tls_started.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+        Ok(ms.max(0.1))
+    };
+
+    match tokio::time::timeout(timeout, handshake_fut).await {
+        Ok(res) => res,
+        Err(_) => Err("中转 TLS 握手超时（4 秒）".to_string()),
+    }
+}
+
+async fn measure_relay_plain_rtt_ms(relay: &PreAccelRelay) -> Result<f64, String> {
+    let addr = format_tcp_host_port(&relay.server, relay.port);
+    let started = Instant::now();
+    match tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&addr)).await {
+        Ok(Ok(_stream)) => {
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if !is_local_or_private_host(&relay.server) && ms < 2.0 {
+                // Likely synthetic local SYN-ACK from Wintun TUN; try an end-to-end HTTP probe.
+                if let Ok(client) = reqwest::Client::builder()
+                    .no_proxy()
+                    .danger_accept_invalid_certs(true)
+                    .connect_timeout(Duration::from_secs(3))
+                    .timeout(Duration::from_secs(3))
+                    .build()
+                {
+                    let http_url = format!("http://{addr}/");
+                    let http_started = Instant::now();
+                    match client.get(&http_url).send().await {
+                        Ok(_resp) => {
+                            let h_ms = http_started.elapsed().as_secs_f64() * 1000.0;
+                            if h_ms >= 2.0 {
+                                return Ok(((h_ms * 10.0).round() / 10.0).max(0.1));
+                            }
+                        }
+                        Err(err) if !err.is_timeout() && !err.is_connect() => {
+                            let h_ms = http_started.elapsed().as_secs_f64() * 1000.0;
+                            if h_ms >= 2.0 {
+                                return Ok(((h_ms * 10.0).round() / 10.0).max(0.1));
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                return Err(
+                    "虚拟网卡接管了明文 TCP 握手，无法测得真实延迟（建议改用 443/TLS 中转或关闭虚拟网卡后重试）"
+                        .to_string(),
+                );
+            }
+            Ok(((ms * 10.0).round() / 10.0).max(0.1))
+        }
+        Ok(Err(err)) => Err(format!("TCP 连接中转失败：{err}")),
+        Err(_) => Err("TCP 连接超时（4 秒）".to_string()),
+    }
+}
+
+/// Native UDP/QUIC end-to-end RTT probe for pure UDP/QUIC relays (`tuic`, `hysteria2`, `hy2`,
+/// `hysteria`), avoiding meaningless 4s TCP TLS handshake failures against UDP-only endpoints.
+/// Sends an RFC 9000 QUIC Version Negotiation trigger (1200-byte Long Header with GREASE version)
+/// so compliant QUIC servers reply statelessly in 1 RTT without credentials.
+async fn measure_relay_udp_quic_rtt_ms(relay: &PreAccelRelay) -> Result<f64, String> {
+    let addr = format_tcp_host_port(relay.server.trim(), relay.port);
+    let target = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::net::lookup_host(addr.as_str()),
+    )
+    .await
+    .map_err(|_| "解析 UDP/QUIC 中转地址超时（2 秒）".to_string())?
+    .map_err(|e| format!("解析 UDP/QUIC 中转地址失败：{e}"))?
+    .next()
+    .ok_or_else(|| "未能解析到有效的 UDP/QUIC 中转 IP 地址".to_string())?;
+
+    let bind_addr = if target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .map_err(|e| format!("创建本地 UDP 探测套接字失败：{e}"))?;
+    socket
+        .connect(target)
+        .await
+        .map_err(|e| format!("绑定 UDP/QUIC 中转目标失败：{e}"))?;
+
+    let mut probe_pkt = vec![0u8; 1200];
+    probe_pkt[0] = 0xc0; // QUIC Long Header | Fixed Bit
+    probe_pkt[1..5].copy_from_slice(&[0x0a, 0x0a, 0x0a, 0x0a]); // GREASE version
+    probe_pkt[5] = 8; // DCID len
+    probe_pkt[6..14].copy_from_slice(b"CATCLOUD");
+    probe_pkt[14] = 8; // SCID len
+    probe_pkt[15..23].copy_from_slice(b"PROBE001");
+
+    let started = Instant::now();
+    socket
+        .send(&probe_pkt)
+        .await
+        .map_err(|e| format!("发送 UDP/QUIC 探测包失败：{e}"))?;
+
+    let mut recv_buf = [0u8; 2048];
+    match tokio::time::timeout(Duration::from_millis(2500), socket.recv(&mut recv_buf)).await {
+        Ok(Ok(n)) if n > 0 => {
+            let ms = (started.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0;
+            Ok(ms.max(0.1))
+        }
+        Ok(Ok(_)) => Err("UDP/QUIC 中转返回了空响应".to_string()),
+        Ok(Err(err)) => Err(format!("UDP/QUIC 中转端口不可达或被拒绝：{err}")),
+        Err(_) => Err(
+            "UDP/QUIC 中转探测超时（2.5 秒，服务端可能未开放 UDP 端口或启用了静默防探测）"
+                .to_string(),
+        ),
+    }
+}
+
+/// Measure real end-to-end RTT to a domestic pre-acceleration relay without falling prey to
+/// Wintun/TUN synthetic `<1ms` local TCP SYN-ACK responses.
+async fn measure_relay_real_rtt_ms(relay: &PreAccelRelay) -> Result<f64, String> {
+    let host = relay.server.trim();
+    if host.is_empty() || relay.port == 0 {
+        return Err("中转服务器地址或端口无效".to_string());
+    }
+    if relay_is_udp_quic_protocol(relay) {
+        return measure_relay_udp_quic_rtt_ms(relay).await;
+    }
+    let addr = format_tcp_host_port(host, relay.port);
+    if relay_uses_tls_probe(relay) {
+        let sni_or_host = resolve_relay_probe_sni_or_host(relay);
+        match measure_relay_tls_handshake_ms(&addr, &sni_or_host, Duration::from_secs(4)).await {
+            Ok(ms) => Ok(ms),
+            Err(tls_err) => {
+                if relay_allows_plain_fallback(relay) {
+                    measure_relay_plain_rtt_ms(relay).await.or(Err(tls_err))
+                } else {
+                    Err(tls_err)
+                }
+            }
+        }
+    } else {
+        measure_relay_plain_rtt_ms(relay).await
+    }
+}
+
 #[tauri::command]
 pub async fn test_preaccel_relays(
     state: State<'_, AppState>,
     relay_ids: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
+    const MAX_RELAY_PROBE_CONCURRENCY: usize = 4;
+
     let relays = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let all = db.list_preaccel_relays(false).map_err(|e| e.to_string())?;
@@ -5046,42 +5827,74 @@ pub async fn test_preaccel_relays(
         }
     };
 
-    let mut results = Vec::new();
-    for relay in relays {
-        let addr = format_tcp_host_port(&relay.server, relay.port);
-        let started = Instant::now();
-        let probe_res = tokio::time::timeout(Duration::from_secs(4), TcpStream::connect(&addr)).await;
+    let total_count = relays.len();
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_RELAY_PROBE_CONCURRENCY));
+    let mut join_set = tokio::task::JoinSet::new();
+
+    for (idx, relay) in relays.into_iter().enumerate() {
+        let sem = Arc::clone(&semaphore);
+        join_set.spawn(async move {
+            let _permit = sem.acquire_owned().await.ok();
+            let probe_res = measure_relay_real_rtt_ms(&relay).await;
+            (idx, relay, probe_res)
+        });
+    }
+
+    let mut ordered_outcomes: Vec<(usize, PreAccelRelay, Result<f64, String>)> =
+        Vec::with_capacity(total_count);
+    while let Some(joined) = join_set.join_next().await {
+        if let Ok(item) = joined {
+            ordered_outcomes.push(item);
+        }
+    }
+    ordered_outcomes.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut results = Vec::with_capacity(total_count);
+    let mut ok_count = 0usize;
+    let mut metrics_updates: Vec<(String, f64, Option<f64>)> = Vec::new();
+    for (_idx, relay, probe_res) in ordered_outcomes {
         match probe_res {
-            Ok(Ok(_stream)) => {
-                let ms = started.elapsed().as_secs_f64() * 1000.0;
-                if let Ok(db) = state.storage.lock() {
-                    let _ = db.update_preaccel_probe_metrics(&relay.id, Some(ms), relay.last_mbps);
-                }
+            Ok(ms) if ms.is_finite() && ms > 0.0 => {
+                ok_count += 1;
+                let rounded = ((ms * 10.0).round() / 10.0).max(0.1);
+                metrics_updates.push((relay.id.clone(), rounded, relay.last_mbps));
                 results.push(serde_json::json!({
                     "relay_id": relay.id,
                     "ok": true,
-                    "latency_ms": (ms * 10.0).round() / 10.0,
+                    "latency_ms": rounded,
                     "error": null
                 }));
             }
-            Ok(Err(err)) => {
+            Ok(_) => {
                 results.push(serde_json::json!({
                     "relay_id": relay.id,
                     "ok": false,
                     "latency_ms": null,
-                    "error": err.to_string()
+                    "error": "未测得有效的端到端延迟"
                 }));
             }
-            Err(_) => {
+            Err(err) => {
                 results.push(serde_json::json!({
                     "relay_id": relay.id,
                     "ok": false,
                     "latency_ms": null,
-                    "error": "TCP 连接超时（4 秒）"
+                    "error": err
                 }));
             }
         }
     }
+    if !metrics_updates.is_empty() {
+        if let Ok(db) = state.storage.lock() {
+            for (relay_id, rounded, last_mbps) in metrics_updates {
+                let _ = db.update_preaccel_probe_metrics(&relay_id, Some(rounded), last_mbps);
+            }
+        }
+    }
+    state.log_app_event(
+        if ok_count == total_count { "info" } else { "warning" },
+        "国内提速",
+        &format!("国内中转真实 RTT 测速完成：可用 {ok_count}/{total_count}"),
+    );
     Ok(serde_json::Value::Array(results))
 }
 
@@ -5254,13 +6067,68 @@ fn calc_boost_ratio(accel: Option<f64>, direct: Option<f64>) -> Option<f64> {
     Some(((a / d) * 100.0).round() / 100.0)
 }
 
+fn summarize_throughput_probe_error(direction: &str, detail: Option<&str>) -> String {
+    let raw = detail.unwrap_or("").trim();
+    if raw.is_empty() {
+        return format!("{direction}未返回有效速率");
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        format!("{direction}超时")
+    } else if lower.contains("fast_fuse_triggered") {
+        format!("{direction}速率过低触发保护熔断（<0.2 Mbps）")
+    } else if lower.contains("unexpected upload http status")
+        || lower.contains("unexpected download http status")
+    {
+        format!("{direction}测速节点返回异常状态码（{raw}）")
+    } else if lower.contains("connection reset")
+        || lower.contains("broken pipe")
+        || lower.contains("unexpected eof")
+        || lower.contains("closed")
+    {
+        format!("{direction}连接被远端中途断开")
+    } else if lower.contains("error sending request") || lower.contains("connect") {
+        format!("{direction}建连失败（线路握手超时或受阻）")
+    } else {
+        format!("{direction}失败（{raw}）")
+    }
+}
+
+fn format_side_log_summary(side: &PreAccelSideSpeedDto) -> String {
+    let lat = side
+        .latency_ms
+        .map(|v| format!("{v:.1}ms"))
+        .unwrap_or_else(|| "--".to_string());
+    let up = side
+        .up_mbps
+        .map(|v| format!("{v:.2}Mbps"))
+        .unwrap_or_else(|| "--".to_string());
+    let down = side
+        .down_mbps
+        .map(|v| format!("{v:.2}Mbps"))
+        .unwrap_or_else(|| "--".to_string());
+    match side.error.as_deref() {
+        Some(err) if !err.trim().is_empty() => {
+            format!("ok={} 延迟={} 上行={} 下行={} 备注={}", side.ok, lat, up, down, err)
+        }
+        _ => format!("ok={} 延迟={} 上行={} 下行={}", side.ok, lat, up, down),
+    }
+}
+
 async fn run_preaccel_comparison_side(
     proxy_port: u16,
     node_id: &str,
     label: &str,
 ) -> PreAccelSideSpeedDto {
-    let side_fut = async {
-        let client = match build_isolated_http_client(proxy_port, Duration::from_secs(6)) {
+    let measured_latency: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let measured_up: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let measured_down: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let measured_latency_ref = Arc::clone(&measured_latency);
+    let measured_up_ref = Arc::clone(&measured_up);
+    let measured_down_ref = Arc::clone(&measured_down);
+
+    let side_fut = async move {
+        let client = match build_isolated_http_client(proxy_port, Duration::from_secs(12)) {
             Ok(c) => c,
             Err(e) => {
                 return PreAccelSideSpeedDto {
@@ -5282,11 +6150,11 @@ async fn run_preaccel_comparison_side(
             expected_status: Some(204),
             body_regex: None,
             payload_bytes: None,
-            timeout_ms: 2500,
+            timeout_ms: 3500,
             builtin: false,
         };
         let lat_rec = match tokio::time::timeout(
-            Duration::from_secs(4),
+            Duration::from_secs(6),
             run_latency_probe(&client, node_id, &latency_def, 2),
         )
         .await
@@ -5298,19 +6166,45 @@ async fn run_preaccel_comparison_side(
                     latency_ms: None,
                     up_mbps: None,
                     down_mbps: None,
-                    error: Some(format!("{label}延迟探测超时")),
+                    error: Some(format!("{label}延迟探测超时（6 秒）")),
                 };
             }
         };
+        if let Some(lat_ms) = lat_rec.latency_ms.filter(|v| v.is_finite() && *v > 0.0) {
+            if let Ok(mut guard) = measured_latency_ref.lock() {
+                *guard = Some(lat_ms);
+            }
+        }
         if !lat_rec.ok {
+            let reason = lat_rec
+                .detail
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|d| format!("{label}连通测试失败：{d}"))
+                .unwrap_or_else(|| format!("{label}连通测试失败，请检查中转或海外节点是否可用"));
             return PreAccelSideSpeedDto {
                 ok: false,
                 latency_ms: lat_rec.latency_ms,
                 up_mbps: None,
                 down_mbps: None,
-                error: Some(format!("{label}连通测试失败，请检查中转或海外节点是否可用")),
+                error: Some(reason),
             };
         }
+
+        // Lightweight Keep-Alive warmup against speed.cloudflare.com so dual-hop cold TLS
+        // handshake does not burn upload/download timeout budget on fresh proxy start.
+        let _ = tokio::time::timeout(Duration::from_secs(4), async {
+            if let Ok(resp) = client
+                .get("https://speed.cloudflare.com/__down?bytes=1")
+                .timeout(Duration::from_secs(4))
+                .send()
+                .await
+            {
+                let _ = resp.bytes().await;
+            }
+        })
+        .await;
 
         let tp_cfg = ThroughputProbeConfig {
             fuse_bytes: 512 * 1024,
@@ -5327,24 +6221,36 @@ async fn run_preaccel_comparison_side(
             expected_status: Some(200),
             body_regex: None,
             payload_bytes: Some(2 * 1024 * 1024),
-            timeout_ms: 4000,
+            timeout_ms: 9000,
             builtin: false,
         };
-        let up_mbps = match tokio::time::timeout(
-            Duration::from_millis(9000),
+        let (up_mbps, up_err): (Option<f64>, Option<String>) = match tokio::time::timeout(
+            Duration::from_secs(20),
             run_upload_probe_with_config(&client, node_id, &upload_def, &tp_cfg),
         )
         .await
         {
             Ok(rec) => {
-                if rec.ok {
-                    rec.up_mbps
+                let speed = rec.up_mbps.filter(|&v| v.is_finite() && v > 0.0);
+                if speed.is_some() {
+                    (speed, None)
                 } else {
-                    rec.up_mbps.filter(|&v| v > 0.0)
+                    (
+                        None,
+                        Some(summarize_throughput_probe_error(
+                            "上行测速",
+                            rec.detail.as_deref(),
+                        )),
+                    )
                 }
             }
-            Err(_) => None,
+            Err(_) => (None, Some("上行测速超时（20 秒）".to_string())),
         };
+        if let Some(speed) = up_mbps {
+            if let Ok(mut guard) = measured_up_ref.lock() {
+                *guard = Some(speed);
+            }
+        }
 
         let download_def = ProbeDefinition {
             id: "preaccel_cmp_download".to_string(),
@@ -5355,30 +6261,53 @@ async fn run_preaccel_comparison_side(
             expected_status: Some(200),
             body_regex: None,
             payload_bytes: Some(2 * 1024 * 1024),
-            timeout_ms: 3500,
+            timeout_ms: 8000,
             builtin: false,
         };
-        let down_mbps = match tokio::time::timeout(
-            Duration::from_secs(8),
+        let (down_mbps, down_err): (Option<f64>, Option<String>) = match tokio::time::timeout(
+            Duration::from_secs(18),
             run_download_probe_with_config(&client, node_id, &download_def, &tp_cfg),
         )
         .await
         {
             Ok(rec) => {
-                if rec.ok {
-                    rec.down_mbps
+                let speed = rec.down_mbps.filter(|&v| v.is_finite() && v > 0.0);
+                if speed.is_some() {
+                    (speed, None)
                 } else {
-                    rec.down_mbps.filter(|&v| v > 0.0)
+                    (
+                        None,
+                        Some(summarize_throughput_probe_error(
+                            "下行测速",
+                            rec.detail.as_deref(),
+                        )),
+                    )
                 }
             }
-            Err(_) => None,
+            Err(_) => (None, Some("下行测速超时（18 秒）".to_string())),
         };
+        if let Some(speed) = down_mbps {
+            if let Ok(mut guard) = measured_down_ref.lock() {
+                *guard = Some(speed);
+            }
+        }
 
         let ok = up_mbps.is_some() || down_mbps.is_some();
-        let error = if ok {
-            None
-        } else {
-            Some(format!("{label}上下行测速均超时，线路可能限速较严"))
+        let error = match (up_mbps.is_some(), down_mbps.is_some()) {
+            (true, true) => None,
+            (true, false) => Some(format!(
+                "{}（上行正常）",
+                down_err.unwrap_or_else(|| "下行测速超时".to_string())
+            )),
+            (false, true) => Some(format!(
+                "{}（下行正常）",
+                up_err.unwrap_or_else(|| "上行测速超时".to_string())
+            )),
+            (false, false) => Some(format!(
+                "{label}上下行测速均未通过（{}；{}）",
+                up_err.unwrap_or_else(|| "上行超时".to_string()),
+                down_err.unwrap_or_else(|| "下行超时".to_string())
+            )),
         };
 
         PreAccelSideSpeedDto {
@@ -5390,15 +6319,21 @@ async fn run_preaccel_comparison_side(
         }
     };
 
-    match tokio::time::timeout(Duration::from_secs(20), side_fut).await {
+    match tokio::time::timeout(Duration::from_secs(44), side_fut).await {
         Ok(res) => res,
-        Err(_) => PreAccelSideSpeedDto {
-            ok: false,
-            latency_ms: None,
-            up_mbps: None,
-            down_mbps: None,
-            error: Some(format!("{label}测速超过 20 秒已自动中止")),
-        },
+        Err(_) => {
+            let preserved_latency = measured_latency.lock().ok().and_then(|g| *g);
+            let preserved_up = measured_up.lock().ok().and_then(|g| *g);
+            let preserved_down = measured_down.lock().ok().and_then(|g| *g);
+            let ok = preserved_up.is_some() || preserved_down.is_some();
+            PreAccelSideSpeedDto {
+                ok,
+                latency_ms: preserved_latency,
+                up_mbps: preserved_up,
+                down_mbps: preserved_down,
+                error: Some(format!("{label}测速超过 44 秒已自动中止")),
+            }
+        }
     }
 }
 
@@ -5466,20 +6401,20 @@ pub async fn benchmark_preaccel_comparison(
         (relay, target_node, fallback_reason)
     };
 
-    // Best-effort direct TCP handshake latency to the domestic relay itself.
-    let relay_tcp_ms = {
-        let host = relay.server.trim();
-        let addr = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]:{}", relay.port)
-        } else {
-            format!("{host}:{}", relay.port)
-        };
-        let started = Instant::now();
-        match tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(&addr)).await {
-            Ok(Ok(_)) => Some((started.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0),
-            _ => None,
-        }
-    };
+    state.log_app_event(
+        "info",
+        "对比测速",
+        &format!(
+            "开始国内提速对比测速：中转「{}」+ 海外节点「{}」",
+            relay.name, target_node.name
+        ),
+    );
+
+    // Measure true end-to-end RTT to the domestic relay (immune to Wintun synthetic 0~1ms TCP ACK).
+    let relay_real_rtt_ms = measure_relay_real_rtt_ms(&relay)
+        .await
+        .ok()
+        .filter(|&v| v.is_finite() && v > 0.0);
 
     let temp_root = state.paths.runtime_dir.join("probe_sandbox");
     std::fs::create_dir_all(&temp_root).map_err(|e| format!("创建隔离测速目录失败：{e}"))?;
@@ -5494,7 +6429,11 @@ pub async fn benchmark_preaccel_comparison(
         DEFAULT_READY_TIMEOUT,
     )
     .await
-    .map_err(|e| format_mihomo_error_for_user(&format!("启动隔离对比测速核心失败：{e}")))?;
+    .map_err(|e| {
+        let msg = format_mihomo_error_for_user(&format!("启动隔离对比测速核心失败：{e}"));
+        state.log_app_event("error", "对比测速", &msg);
+        msg
+    })?;
 
     // Run sequentially so accelerated and direct sides do not compete for local uplink bandwidth.
     let accelerated =
@@ -5503,10 +6442,13 @@ pub async fn benchmark_preaccel_comparison(
 
     let _ = probe_core.shutdown().await;
 
-    let recorded_relay_ms = relay_tcp_ms
-        .or(accelerated.latency_ms)
-        .or(relay.last_probe_ms);
-    let recorded_up_mbps = accelerated.up_mbps.or(relay.last_mbps);
+    let recorded_relay_ms = relay_real_rtt_ms
+        .or(accelerated.latency_ms.filter(|&v| v.is_finite() && v > 0.0))
+        .or(relay.last_probe_ms.filter(|&v| v.is_finite() && v > 0.0));
+    let recorded_up_mbps = accelerated
+        .up_mbps
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .or(relay.last_mbps);
     if recorded_relay_ms.is_some() || recorded_up_mbps.is_some() {
         if let Ok(db) = state.storage.lock() {
             let _ = db.update_preaccel_probe_metrics(
@@ -5520,8 +6462,31 @@ pub async fn benchmark_preaccel_comparison(
     let up_boost_ratio = calc_boost_ratio(accelerated.up_mbps, direct.up_mbps);
     let down_boost_ratio = calc_boost_ratio(accelerated.down_mbps, direct.down_mbps);
 
+    let overall_ok = accelerated.ok || direct.ok;
+    let log_level = if accelerated.ok && direct.ok && accelerated.error.is_none() && direct.error.is_none() {
+        "info"
+    } else {
+        "warning"
+    };
+    let relay_rtt_text = relay_real_rtt_ms
+        .map(|v| format!("{v:.1}ms"))
+        .unwrap_or_else(|| "--".to_string());
+    state.log_app_event(
+        log_level,
+        "对比测速",
+        &format!(
+            "对比测速完成：中转「{}」(真实RTT={relay_rtt_text}) / 节点「{}」| 提速边[{}] | 直连边[{}] | 上行倍率={:?} 下行倍率={:?}",
+            relay.name,
+            target_node.name,
+            format_side_log_summary(&accelerated),
+            format_side_log_summary(&direct),
+            up_boost_ratio,
+            down_boost_ratio
+        ),
+    );
+
     Ok(serde_json::json!({
-        "ok": accelerated.ok || direct.ok,
+        "ok": overall_ok,
         "relay_id": relay.id,
         "relay_name": relay.name,
         "node_id": target_node.id,
@@ -6083,7 +7048,7 @@ pub async fn close_all_connections(state: State<'_, AppState>) -> Result<usize, 
         .adapter
         .list_connections()
         .await
-        .map(|s| s.connections.len())
+        .map(|s| summarize_connections(&s.connections).app_connections)
         .unwrap_or(0);
     state
         .adapter
@@ -6112,13 +7077,13 @@ fn build_traffic_history(state: &AppState) -> Vec<TrafficEventPayload> {
     if ticks.is_empty() {
         return Vec::new();
     }
-    let core_mem_bytes = state
+    let metrics = state
         .cached_metrics
         .read()
-        .map(|m| m.core_mem_bytes)
-        .unwrap_or(0);
-    let core_memory_mb = (core_mem_bytes as f64) / (1024.0 * 1024.0);
-    ticks
+        .map(|m| *m)
+        .unwrap_or_default();
+    let core_memory_mb = (metrics.core_mem_bytes as f64) / (1024.0 * 1024.0);
+    let mut points: Vec<TrafficEventPayload> = ticks
         .into_iter()
         .map(|t| TrafficEventPayload {
             up_bps: t.up,
@@ -6126,10 +7091,18 @@ fn build_traffic_history(state: &AppState) -> Vec<TrafficEventPayload> {
             up_total_bytes: 0,
             down_total_bytes: 0,
             active_connections: 0,
+            tunnel_connections: 0,
             core_memory_mb,
             timestamp_ms: t.timestamp_ms,
         })
-        .collect()
+        .collect();
+    if let Some(last) = points.last_mut() {
+        last.up_total_bytes = metrics.up_total_bytes;
+        last.down_total_bytes = metrics.down_total_bytes;
+        last.active_connections = metrics.app_connections;
+        last.tunnel_connections = metrics.tunnel_connections;
+    }
+    points
 }
 
 #[tauri::command]
@@ -6334,12 +7307,292 @@ pub fn export_shell_env(state: State<'_, AppState>, shell: String) -> String {
     plat.export_shell_env_snippet(&shell, "127.0.0.1", port, port)
 }
 
-#[tauri::command]
-pub fn export_sanitized_diagnostics(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+fn format_memory_tier_label(tier: &MemoryLimitTier) -> &'static str {
+    match tier {
+        MemoryLimitTier::Auto => "auto",
+        MemoryLimitTier::Mb48 => "48MiB",
+        MemoryLimitTier::Mb64 => "64MiB",
+        MemoryLimitTier::Mb96 => "96MiB",
+    }
+}
+
+fn log_dedupe_key(timestamp: &str, body: &str) -> String {
+    let ts_sec = timestamp.get(..19).unwrap_or(timestamp);
+    format!("{ts_sec}|{}", body.trim())
+}
+
+fn extract_disk_log_dedupe_key(line: &str) -> String {
+    let trimmed = line.trim();
+    let (ts_sec, mut rest) = match trimmed.split_once(' ') {
+        Some((ts, r)) => (ts, r.trim_start()),
+        None => ("", trimmed),
+    };
+    let ts_key = ts_sec.get(..19).unwrap_or(ts_sec);
+    // Strip `[level] ` and optional `[category] ` strictly from the left so brackets inside the
+    // message body never break deduplication against `CoreTelemetryStore`.
+    for _ in 0..2 {
+        if rest.starts_with('[') {
+            if let Some((_, after)) = rest.split_once("] ") {
+                rest = after.trim_start();
+                continue;
+            }
+        }
+        break;
+    }
+    format!("{ts_key}|{rest}")
+}
+
+fn merge_sanitized_recent_logs(
+    disk_lines: Vec<String>,
+    mem_logs: Vec<CoreLogLine>,
+    limit: usize,
+) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let mut merged: Vec<String> = Vec::with_capacity(limit.saturating_mul(2));
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for disk_line in disk_lines {
+        let clean = app_log::sanitize_log_line(&disk_line);
+        let key = extract_disk_log_dedupe_key(&clean);
+        if seen.insert(key) {
+            merged.push(clean);
+        }
+    }
+
+    let start_idx = mem_logs.len().saturating_sub(limit);
+    for entry in &mem_logs[start_idx..] {
+        let clean_payload = app_log::sanitize_log_line(&entry.payload)
+            .replace(['\r', '\n'], " ")
+            .trim()
+            .to_string();
+        if clean_payload.is_empty() {
+            continue;
+        }
+        let body_for_key = clean_payload
+            .strip_prefix(APP_EVENT_PREFIX)
+            .and_then(|rest| rest.split_once("] ").map(|(_, msg)| msg))
+            .unwrap_or(clean_payload.as_str());
+        let key = log_dedupe_key(&entry.timestamp, body_for_key);
+        if seen.insert(key) {
+            let lvl = app_log::normalize_log_level(&entry.level);
+            merged.push(format!("{} [{lvl}] {clean_payload}", entry.timestamp));
+        }
+    }
+
+    if merged.len() > limit {
+        merged.split_off(merged.len() - limit)
+    } else {
+        merged
+    }
+}
+
+fn collect_sanitized_recent_logs(state: &AppState, limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let disk_lines = state.app_logger.read_recent_lines(limit);
+    let mem_logs = state.telemetry.logs_snapshot();
+    merge_sanitized_recent_logs(disk_lines, mem_logs, limit)
+}
+
+fn format_geodata_brief(geodata: &serde_json::Value) -> String {
+    let item = |key: &str, label: &str| -> String {
+        let exists = geodata
+            .get(key)
+            .and_then(|v| v.get("exists"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let size = geodata
+            .get(key)
+            .and_then(|v| v.get("size_bytes"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if exists {
+            format!("{label}: 已就绪 ({})", format_bytes_human(size))
+        } else {
+            format!("{label}: 缺失")
+        }
+    };
+    [
+        item("country_mmdb", "Country.mmdb"),
+        item("geoip_dat", "geoip.dat"),
+        item("geosite_dat", "geosite.dat"),
+        item("asn_mmdb", "ASN.mmdb"),
+    ]
+    .join(" / ")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ai_diagnostics_markdown(
+    app_version: &str,
+    os_label: &str,
+    is_elevated: bool,
+    is_portable: bool,
+    cfg: &AppConfig,
+    rt: &CoreRuntimeStatus,
+    runtime_dto: Option<&CoreRuntimeInfoDto>,
+    counts: (usize, usize, usize, usize),
+    conn_summary: ConnectionSummaryCounts,
+    core_mem_bytes: u64,
+    geodata_status: &serde_json::Value,
+    last_error: Option<&str>,
+    recent_logs: &[String],
+) -> String {
+    let (sub_count, node_count, group_count, relay_count) = counts;
+    let route_mode = runtime_dto
+        .map(|d| d.route_mode.as_str())
+        .unwrap_or_else(|| cfg.route_mode.as_str());
+    let active_group_name = runtime_dto
+        .map(|d| d.active_group_name.as_str())
+        .unwrap_or("默认路线");
+    let active_node_name = runtime_dto
+        .map(|d| d.active_node_name.as_str())
+        .unwrap_or("未选择");
+    let active_node_region = runtime_dto
+        .map(|d| d.active_node_region.as_str())
+        .unwrap_or("--");
+    let preaccel_relay_name = runtime_dto
+        .and_then(|d| d.preaccel_relay_name.as_deref())
+        .unwrap_or("未配置");
+    let mixed_port = if rt.running { rt.mixed_port } else { cfg.mixed_port };
+    let controller_port = if rt.running {
+        rt.controller_port
+    } else {
+        cfg.controller_port
+    };
+    let dns_port = if rt.running {
+        rt.dns_listen_port
+    } else {
+        cfg.dns_listen_port
+    };
+    let core_version = rt.version.as_deref().unwrap_or("未知");
+    let core_mem_text = if core_mem_bytes > 0 {
+        format!("{:.1} MiB", (core_mem_bytes as f64) / (1024.0 * 1024.0))
+    } else {
+        "--".to_string()
+    };
+    let last_err_text = last_error.unwrap_or("无");
+
+    let logs_block = if recent_logs.is_empty() {
+        "（暂无运行日志记录）".to_string()
+    } else {
+        recent_logs.join("\n")
+    };
+
+    format!(
+        "请帮我排查猫猫云梯（CatCloud）当前问题。\n\
+\n\
+> 以下诊断包已自动完成隐私脱敏（订阅凭据、密码、Token、Secret 与公网 IP 末段均已隐藏），请先基于状态与日志定位根因并给出清晰步骤。\n\
+\n\
+## 1. 运行状态摘要\n\
+\n\
+| 项目 | 当前状态 |\n\
+| --- | --- |\n\
+| 应用版本 / 环境 | CatCloud v{app_version} · {os_label} · 管理员权限：{} · 便携模式：{} |\n\
+| 代理核心 | {}（Mihomo {core_version}，内核内存：{core_mem_text}） |\n\
+| 代理模式 / 路由方式 | `{}` / `{route_mode}` |\n\
+| 当前路线组 / 节点 | 分组「{active_group_name}」 → 节点「{active_node_name}」（地区：{active_node_region}） |\n\
+| 本地端口 | 混合端口 `{mixed_port}` / 控制端口 `{controller_port}` / DNS `{dns_port}` |\n\
+| 流量接管 | 系统代理：{} · 虚拟网卡（TUN）：{}（协议栈 `{}`） |\n\
+| 内存档位 | `{}`（GOGC={}） |\n\
+| 最近异常 | {last_err_text} |\n\
+\n\
+## 2. 分流与加速配置要点\n\
+\n\
+- 国内直连规则：{} ｜ 阻断 QUIC（UDP/443）：{}\n\
+- 国内 443 预加速：{}（当前中转：{preaccel_relay_name}，跳过 443 原生节点：{}）\n\
+- IPv6 开关：核心数据面 {} ｜ DNS 解析 {}\n\
+- GeoData 状态：{}\n\
+- 本地资产统计：订阅 {sub_count} 个 · 节点 {node_count} 个 · 智能多选组 {group_count} 个 · 国内中转 {relay_count} 个\n\
+\n\
+## 3. 当前连接分布\n\
+\n\
+- 真实应用连接：{} 条（直连 {} 条 · 代理 {} 条）\n\
+- 底层提速隧道（`Inner`）：{} 条（已从应用连接数中排除）\n\
+\n\
+## 4. 最近脱敏运行日志（最近 {} 条）\n\
+\n\
+```text\n\
+{logs_block}\n\
+```\n\
+\n\
+## 5. 本机只读 `catcloud` CLI 进一步排查指引\n\
+\n\
+如果你可以直接在本机终端执行命令，请**优先使用以下只读命令**补充信息（修改配置前请先征得我同意）：\n\
+\n\
+```powershell\n\
+catcloud status --json\n\
+catcloud config diag --json\n\
+catcloud config validate --json\n\
+catcloud group list --json\n\
+catcloud node list --json\n\
+catcloud preaccel pool --json\n\
+catcloud docs export network_reload --format json\n\
+```\n",
+        if is_elevated { "是" } else { "否" },
+        if is_portable { "是" } else { "否" },
+        if rt.running { "运行中" } else { "已停止" },
+        cfg.proxy_mode.as_str(),
+        if cfg.system_proxy.enabled {
+            "已开启"
+        } else {
+            "关闭"
+        },
+        if cfg.tun.enabled { "已开启" } else { "关闭" },
+        cfg.tun.stack_mode.as_str(),
+        format_memory_tier_label(&cfg.core_runtime.memory_tier),
+        cfg.core_runtime.gogc,
+        if cfg.rules_override.domestic_direct_enabled {
+            "开启"
+        } else {
+            "关闭"
+        },
+        if cfg.rules_override.block_quic_udp_443 {
+            "开启"
+        } else {
+            "关闭"
+        },
+        if cfg.preaccel.enabled {
+            "已开启"
+        } else {
+            "关闭"
+        },
+        if cfg.preaccel.skip_443_native {
+            "是"
+        } else {
+            "否"
+        },
+        if cfg.core_ipv6 { "开启" } else { "关闭" },
+        if cfg.dns.ipv6 { "开启" } else { "关闭" },
+        format_geodata_brief(geodata_status),
+        conn_summary.app_connections,
+        conn_summary.direct_connections,
+        conn_summary.proxied_connections,
+        conn_summary.tunnel_connections,
+        recent_logs.len(),
+    )
+}
+
+#[cfg(test)]
+fn build_sanitized_diagnostics_report(
+    state: &AppState,
+    live_conns: Option<&ConnectionsSnapshot>,
+) -> Result<serde_json::Value, String> {
+    build_sanitized_diagnostics_report_with_disk_logs(state, live_conns, None)
+}
+
+fn build_sanitized_diagnostics_report_with_disk_logs(
+    state: &AppState,
+    live_conns: Option<&ConnectionsSnapshot>,
+    preloaded_disk_logs: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
     let cfg = state.snapshot_config();
     let rt = state.snapshot_runtime();
     let plat = default_platform();
     let caps = plat.capabilities();
+    let runtime_dto = build_runtime_info_dto(state).ok();
     let (sub_count, node_count, group_count, relay_count) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         (
@@ -6349,6 +7602,86 @@ pub fn export_sanitized_diagnostics(state: State<'_, AppState>) -> Result<serde_
             db.list_preaccel_relays(false).map(|v| v.len()).unwrap_or(0),
         )
     };
+
+    let (conn_summary, core_mem_bytes) = if let Some(snap) = live_conns {
+        let summary = summarize_connections(&snap.connections);
+        let mem = if snap.memory > 0 {
+            snap.memory
+        } else {
+            state
+                .cached_metrics
+                .read()
+                .map(|m| m.core_mem_bytes)
+                .unwrap_or(0)
+        };
+        (summary, mem)
+    } else if let Ok(m) = state.cached_metrics.read() {
+        (
+            ConnectionSummaryCounts {
+                app_connections: m.app_connections,
+                tunnel_connections: m.tunnel_connections,
+                direct_connections: m.direct_connections,
+                proxied_connections: m.proxied_connections,
+            },
+            m.core_mem_bytes,
+        )
+    } else {
+        (ConnectionSummaryCounts::default(), 0)
+    };
+
+    let geodata_status = collect_geodata_status(&state.paths.runtime_dir);
+    let last_error = rt
+        .last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(app_log::sanitize_log_line)
+        .or_else(|| state.last_app_error_snapshot());
+    let recent_logs = match preloaded_disk_logs {
+        Some(disk_lines) => {
+            let mem_logs = state.telemetry.logs_snapshot();
+            merge_sanitized_recent_logs(disk_lines, mem_logs, 60)
+        }
+        None => collect_sanitized_recent_logs(state, 60),
+    };
+
+    let route_mode = runtime_dto
+        .as_ref()
+        .map(|d| d.route_mode.clone())
+        .unwrap_or_else(|| cfg.route_mode.as_str().to_string());
+    let active_group_name = runtime_dto
+        .as_ref()
+        .map(|d| d.active_group_name.clone())
+        .unwrap_or_else(|| "默认路线".to_string());
+    let active_node_name = runtime_dto
+        .as_ref()
+        .map(|d| d.active_node_name.clone())
+        .unwrap_or_else(|| "待导入节点".to_string());
+    let active_node_region = runtime_dto
+        .as_ref()
+        .map(|d| d.active_node_region.clone())
+        .unwrap_or_else(|| "--".to_string());
+    let preaccel_relay_name = runtime_dto
+        .as_ref()
+        .and_then(|d| d.preaccel_relay_name.clone());
+
+    let os_label = format!("{} {}", caps.os, caps.arch);
+    let ai_prompt_markdown = build_ai_diagnostics_markdown(
+        env!("CARGO_PKG_VERSION"),
+        &os_label,
+        caps.is_elevated,
+        state.paths.is_portable,
+        &cfg,
+        &rt,
+        runtime_dto.as_ref(),
+        (sub_count, node_count, group_count, relay_count),
+        conn_summary,
+        core_mem_bytes,
+        &geodata_status,
+        last_error.as_deref(),
+        &recent_logs,
+    );
+
     Ok(serde_json::json!({
         "app_version": env!("CARGO_PKG_VERSION"),
         "os": caps.os,
@@ -6374,8 +7707,72 @@ pub fn export_sanitized_diagnostics(state: State<'_, AppState>) -> Result<serde_
             "multi_groups": group_count,
             "preaccel_relays": relay_count,
         },
+        "route_summary": {
+            "route_mode": route_mode,
+            "active_group_name": active_group_name,
+            "active_node_name": active_node_name,
+            "active_node_region": active_node_region,
+            "system_proxy_enabled": cfg.system_proxy.enabled,
+            "tun_enabled": cfg.tun.enabled,
+            "preaccel_active": cfg.preaccel.enabled,
+            "preaccel_relay_name": preaccel_relay_name,
+            "domestic_direct_enabled": cfg.rules_override.domestic_direct_enabled,
+            "block_quic_udp_443": cfg.rules_override.block_quic_udp_443,
+            "memory_tier": cfg.core_runtime.memory_tier,
+        },
+        "geodata_status": geodata_status,
+        "connection_summary": {
+            "app_connections": conn_summary.app_connections,
+            "tunnel_connections": conn_summary.tunnel_connections,
+            "direct_connections": conn_summary.direct_connections,
+            "proxied_connections": conn_summary.proxied_connections,
+        },
+        "last_error": last_error,
+        "recent_logs": recent_logs,
+        "ai_prompt_markdown": ai_prompt_markdown,
         "sanitized": true
     }))
+}
+
+#[tauri::command]
+pub async fn export_sanitized_diagnostics(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let live_snap = if state.snapshot_runtime().running && state.adapter.has_live_controller().await
+    {
+        tokio::time::timeout(Duration::from_millis(600), state.adapter.list_connections())
+            .await
+            .ok()
+            .and_then(|res| res.ok())
+    } else {
+        None
+    };
+
+    if let Some(ref snap) = live_snap {
+        let summary = summarize_connections(&snap.connections);
+        if let Ok(mut m) = state.cached_metrics.write() {
+            m.app_connections = summary.app_connections;
+            m.tunnel_connections = summary.tunnel_connections;
+            m.direct_connections = summary.direct_connections;
+            m.proxied_connections = summary.proxied_connections;
+            if snap.upload_total > m.up_total_bytes {
+                m.up_total_bytes = snap.upload_total;
+            }
+            if snap.download_total > m.down_total_bytes {
+                m.down_total_bytes = snap.download_total;
+            }
+            if snap.memory > 0 {
+                m.core_mem_bytes = snap.memory;
+            }
+        }
+    }
+
+    let logger = Arc::clone(&state.app_logger);
+    let disk_logs = tokio::task::spawn_blocking(move || logger.read_recent_lines(60))
+        .await
+        .unwrap_or_default();
+
+    build_sanitized_diagnostics_report_with_disk_logs(&state, live_snap.as_ref(), Some(disk_logs))
 }
 
 fn inspect_geodata_file(runtime_dir: &std::path::Path, candidates: &[&str]) -> serde_json::Value {
@@ -7909,6 +9306,10 @@ mod tests {
 
         if let Ok(mut m) = state.cached_metrics.write() {
             m.core_mem_bytes = 32 * 1024 * 1024;
+            m.up_total_bytes = 123_456;
+            m.down_total_bytes = 987_654;
+            m.app_connections = 7;
+            m.tunnel_connections = 2;
         }
         state.telemetry.push_traffic(catcloud_core::core_adapter::TrafficTick {
             up: 1024,
@@ -7928,11 +9329,443 @@ mod tests {
         assert_eq!(history[0].up_total_bytes, 0);
         assert_eq!(history[0].down_total_bytes, 0);
         assert_eq!(history[0].active_connections, 0);
+        assert_eq!(history[0].tunnel_connections, 0);
         assert!((history[0].core_memory_mb - 32.0).abs() < 1e-6);
         assert_eq!(history[0].timestamp_ms, 1_700_000_001_000);
         assert_eq!(history[1].up_bps, 2048);
         assert_eq!(history[1].down_bps, 8192);
+        assert_eq!(history[1].up_total_bytes, 123_456);
+        assert_eq!(history[1].down_total_bytes, 987_654);
+        assert_eq!(history[1].active_connections, 7);
+        assert_eq!(history[1].tunnel_connections, 2);
         assert_eq!(history[1].timestamp_ms, 1_700_000_002_000);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn summarize_connections_excludes_inner_tunnels_and_splits_direct_vs_proxied() {
+        use catcloud_core::core_adapter::ActiveConnection;
+
+        let conns = vec![
+            ActiveConnection {
+                id: "c1".to_string(),
+                conn_type: "Inner".to_string(),
+                chains: vec!["PreAccel-Relay".to_string()],
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "c2".to_string(),
+                conn_type: "inner".to_string(),
+                chains: vec!["PreAccel-Relay".to_string()],
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "c3".to_string(),
+                conn_type: "HTTP".to_string(),
+                chains: vec!["DIRECT".to_string()],
+                rule: "GEOIP".to_string(),
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "c4".to_string(),
+                conn_type: "TUN".to_string(),
+                chains: vec!["Proxy".to_string(), "JP-01".to_string()],
+                rule: "MATCH".to_string(),
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "c5".to_string(),
+                conn_type: "SOCKS5".to_string(),
+                chains: vec!["AI".to_string(), "US-01".to_string()],
+                rule: "DOMAIN-SUFFIX".to_string(),
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "c6".to_string(),
+                conn_type: "TUN".to_string(),
+                chains: vec!["REJECT".to_string()],
+                rule: "AND".to_string(),
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "c7".to_string(),
+                conn_type: "TUN".to_string(),
+                chains: vec!["REJECT-DROP".to_string()],
+                rule: "REJECT-DROP".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let summary = summarize_connections(&conns);
+        assert_eq!(summary.tunnel_connections, 2);
+        assert_eq!(summary.app_connections, 5);
+        assert_eq!(summary.direct_connections, 1);
+        assert_eq!(summary.proxied_connections, 2);
+    }
+
+    #[tokio::test]
+    async fn relay_real_rtt_probe_detects_tls_protocols_and_never_returns_zero() {
+        let tls_443 = PreAccelRelay {
+            protocol: "anytls".to_string(),
+            server: "198.51.100.1".to_string(),
+            port: 443,
+            sni: Some("ignored-on-443.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(relay_uses_tls_probe(&tls_443));
+        assert!(!relay_is_udp_quic_protocol(&tls_443));
+        assert!(!relay_allows_plain_fallback(&tls_443));
+        assert_eq!(resolve_relay_probe_sni_or_host(&tls_443), "198.51.100.1");
+
+        let trojan_non443 = PreAccelRelay {
+            protocol: "trojan".to_string(),
+            server: "198.51.100.1".to_string(),
+            port: 8443,
+            sni: Some("relay.example.com".to_string()),
+            ..Default::default()
+        };
+        assert!(relay_uses_tls_probe(&trojan_non443));
+        assert!(!relay_allows_plain_fallback(&trojan_non443));
+        assert_eq!(
+            resolve_relay_probe_sni_or_host(&trojan_non443),
+            "relay.example.com"
+        );
+
+        let ss_443 = PreAccelRelay {
+            protocol: "ss".to_string(),
+            server: "198.51.100.1".to_string(),
+            port: 443,
+            ..Default::default()
+        };
+        assert!(relay_uses_tls_probe(&ss_443));
+        assert!(relay_allows_plain_fallback(&ss_443));
+
+        let plain_ss = PreAccelRelay {
+            protocol: "ss".to_string(),
+            server: "198.51.100.1".to_string(),
+            port: 8388,
+            ..Default::default()
+        };
+        assert!(!relay_uses_tls_probe(&plain_ss));
+
+        for udp_proto in ["tuic", "hysteria2", "hy2", "hysteria"] {
+            let udp_relay = PreAccelRelay {
+                protocol: udp_proto.to_string(),
+                server: "198.51.100.1".to_string(),
+                port: 443,
+                ..Default::default()
+            };
+            assert!(
+                relay_is_udp_quic_protocol(&udp_relay),
+                "{udp_proto} must be classified as UDP/QUIC"
+            );
+            assert!(
+                !relay_uses_tls_probe(&udp_relay),
+                "{udp_proto} must never use TCP TLS probe even on port 443"
+            );
+        }
+
+        let invalid = PreAccelRelay {
+            protocol: "anytls".to_string(),
+            server: "".to_string(),
+            port: 443,
+            ..Default::default()
+        };
+        assert!(measure_relay_real_rtt_ms(&invalid).await.is_err());
+
+        // Local plain TCP listener should succeed and clamp to >= 0.1ms (never 0ms).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback test listener");
+        let port = listener.local_addr().expect("listener addr").port();
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+
+        let local_plain = PreAccelRelay {
+            protocol: "ss".to_string(),
+            server: "127.0.0.1".to_string(),
+            port,
+            ..Default::default()
+        };
+        let rtt = measure_relay_real_rtt_ms(&local_plain)
+            .await
+            .expect("local plain tcp probe should succeed");
+        assert!(rtt >= 0.1, "measured RTT must never be 0ms, got {rtt}");
+        let _ = accept_task.await;
+
+        // Local UDP listener simulates a QUIC Version Negotiation reply for Hysteria2/TUIC.
+        let udp_server = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback udp listener");
+        let udp_port = udp_server.local_addr().expect("udp addr").port();
+        let udp_task = tokio::spawn(async move {
+            let mut buf = [0u8; 2048];
+            if let Ok((_, peer)) = udp_server.recv_from(&mut buf).await {
+                let _ = udp_server.send_to(b"\x80\x00\x00\x00\x00", peer).await;
+            }
+        });
+        let local_hy2 = PreAccelRelay {
+            protocol: "hysteria2".to_string(),
+            server: "127.0.0.1".to_string(),
+            port: udp_port,
+            ..Default::default()
+        };
+        let udp_rtt = measure_relay_real_rtt_ms(&local_hy2)
+            .await
+            .expect("local udp/quic probe should succeed");
+        assert!(udp_rtt >= 0.1, "measured UDP RTT must be >= 0.1ms, got {udp_rtt}");
+        let _ = udp_task.await;
+    }
+
+    #[test]
+    fn select_reconcilable_active_group_ids_respects_route_mode_and_compiled_set() {
+        let g_active = MultiGroup {
+            id: "g-active".to_string(),
+            name: "主力组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            independent_routing: false,
+            ..Default::default()
+        };
+        let g_indep = MultiGroup {
+            id: "g-indep".to_string(),
+            name: "独立AI组".to_string(),
+            mode: MultiGroupMode::ConditionalPool,
+            independent_routing: true,
+            ..Default::default()
+        };
+        let g_inactive = MultiGroup {
+            id: "g-inactive".to_string(),
+            name: "未选中组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            independent_routing: false,
+            ..Default::default()
+        };
+        let groups = vec![g_active, g_indep, g_inactive];
+
+        // 1. Single-node route mode must never select any multi-group for post-probe reconciliation.
+        let mut single_cfg = AppConfig::default();
+        single_cfg.route_mode = RouteTargetMode::Single;
+        single_cfg.active_group_id = Some("g-active".to_string());
+        assert!(select_reconcilable_active_group_ids(&single_cfg, &groups, None).is_empty());
+
+        // 2. Group route mode with no compiled filter includes primary + independent strategy groups only.
+        let mut group_cfg = AppConfig::default();
+        group_cfg.route_mode = RouteTargetMode::Group;
+        group_cfg.active_group_id = Some("g-active".to_string());
+        assert_eq!(
+            select_reconcilable_active_group_ids(&group_cfg, &groups, None),
+            vec!["g-active".to_string(), "g-indep".to_string()]
+        );
+
+        // 3. When running with a pruned compiled set, groups outside the compiled set are excluded.
+        let compiled_only_active: HashSet<String> = ["g-active".to_string()].into_iter().collect();
+        assert_eq!(
+            select_reconcilable_active_group_ids(&group_cfg, &groups, Some(&compiled_only_active)),
+            vec!["g-active".to_string()]
+        );
+    }
+
+    #[test]
+    fn lookup_compiled_proxy_name_prevents_uncompiled_same_name_fallback() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_compiled_map_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, AppConfig::default(), storage, job_guard);
+
+        let mut compiled_map = HashMap::new();
+        compiled_map.insert("node-sub-a".to_string(), "香港 01".to_string());
+        state.set_node_proxy_name_map(compiled_map);
+
+        assert_eq!(
+            state.lookup_compiled_proxy_name("node-sub-a").as_deref(),
+            Some("香港 01")
+        );
+        assert_eq!(state.lookup_compiled_proxy_name("node-sub-b"), None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn summarize_throughput_probe_error_maps_causes_to_chinese() {
+        assert_eq!(
+            summarize_throughput_probe_error("上行测速", Some("operation timed out")),
+            "上行测速超时"
+        );
+        assert!(
+            summarize_throughput_probe_error(
+                "下行测速",
+                Some("fast_fuse_triggered: down_mbps=0.10 < 0.20")
+            )
+            .contains("保护熔断")
+        );
+        assert!(
+            summarize_throughput_probe_error("上行测速", Some("unexpected upload HTTP status 502"))
+                .contains("异常状态码")
+        );
+    }
+
+    #[test]
+    fn build_sanitized_diagnostics_report_emits_rich_schema_redacted_logs_and_markdown() {
+        use catcloud_core::core_adapter::ActiveConnection;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_diag_rich_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        std::fs::write(paths.runtime_dir.join("Country.mmdb"), b"mock-country-db")
+            .expect("write mock mmdb");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+
+        let sub = SubscriptionRecord {
+            id: "sub-1".to_string(),
+            name: "主力订阅".to_string(),
+            kind: SubscriptionKind::Url,
+            url_or_cmd: "https://user:pass@sub.example.com/api?token=secret_sub_tok".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_subscription(&sub).expect("upsert sub");
+        let node = ProxyNode {
+            id: "n-jp".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "日本东京 01".to_string(),
+            region_code: "JP".to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.88".to_string(),
+            port: 443,
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_node(&node).expect("upsert node");
+        let group = MultiGroup {
+            id: "g-main".to_string(),
+            name: "AI主力组".to_string(),
+            member_node_ids: vec!["n-jp".to_string()],
+            active_node_id: Some("n-jp".to_string()),
+            ..Default::default()
+        };
+        storage.upsert_multi_group(&group).expect("upsert group");
+        let relay = PreAccelRelay {
+            id: "r-hz".to_string(),
+            name: "杭州443中转".to_string(),
+            server: "203.0.113.66".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "relay_super_secret".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_preaccel_relay(&relay).expect("upsert relay");
+
+        let mut cfg = AppConfig::default();
+        cfg.active_group_id = Some("g-main".to_string());
+        cfg.system_proxy.enabled = true;
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.active_relay_id = Some("r-hz".to_string());
+
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, cfg, storage, job_guard);
+
+        for i in 0..70 {
+            state.log_app_event(
+                "info",
+                "测试",
+                &format!(
+                    "事件#{i:02} https://sub.example.com/get?token=tok_{i}&secret=sec_{i} 远端 203.0.113.66 [240e:390:abcd::99]:443"
+                ),
+            );
+        }
+        state.log_app_event(
+            "error",
+            "核心",
+            "连接失败 trojan://test_secret_pw@203.0.113.45:443?key=k123",
+        );
+
+        let live_conns = ConnectionsSnapshot {
+            memory: 42 * 1024 * 1024,
+            connections: vec![
+                ActiveConnection {
+                    id: "t1".to_string(),
+                    conn_type: "Inner".to_string(),
+                    ..Default::default()
+                },
+                ActiveConnection {
+                    id: "a1".to_string(),
+                    conn_type: "HTTP".to_string(),
+                    chains: vec!["DIRECT".to_string()],
+                    ..Default::default()
+                },
+                ActiveConnection {
+                    id: "a2".to_string(),
+                    conn_type: "TUN".to_string(),
+                    chains: vec!["AI主力组".to_string(), "日本东京 01".to_string()],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let report = build_sanitized_diagnostics_report(&state, Some(&live_conns))
+            .expect("build diagnostics report");
+
+        // Backward-compatible legacy fields
+        assert_eq!(report["sanitized"], true);
+        assert_eq!(report["counts"]["subscriptions"], 1);
+        assert_eq!(report["counts"]["nodes"], 1);
+        assert_eq!(report["counts"]["multi_groups"], 1);
+        assert_eq!(report["counts"]["preaccel_relays"], 1);
+
+        // Rich new fields
+        assert_eq!(report["route_summary"]["route_mode"], "group");
+        assert_eq!(report["route_summary"]["active_group_name"], "AI主力组");
+        assert_eq!(report["route_summary"]["active_node_name"], "日本东京 01");
+        assert_eq!(report["route_summary"]["active_node_region"], "JP");
+        assert_eq!(report["route_summary"]["system_proxy_enabled"], true);
+        assert_eq!(report["route_summary"]["preaccel_active"], true);
+        assert_eq!(report["route_summary"]["preaccel_relay_name"], "杭州443中转");
+        assert_eq!(report["route_summary"]["domestic_direct_enabled"], true);
+        assert_eq!(report["route_summary"]["block_quic_udp_443"], true);
+        assert_eq!(report["geodata_status"]["country_mmdb"]["exists"], true);
+        assert_eq!(report["connection_summary"]["app_connections"], 2);
+        assert_eq!(report["connection_summary"]["tunnel_connections"], 1);
+        assert_eq!(report["connection_summary"]["direct_connections"], 1);
+        assert_eq!(report["connection_summary"]["proxied_connections"], 1);
+
+        let last_err = report["last_error"].as_str().expect("last_error string");
+        assert!(!last_err.contains("test_secret_pw"));
+        assert!(!last_err.contains("k123"));
+        assert!(!last_err.contains("203.0.113.45"));
+        assert!(last_err.contains("203.0.113.*"));
+
+        let recent_logs = report["recent_logs"].as_array().expect("recent_logs array");
+        assert_eq!(recent_logs.len(), 60);
+        let serialized_logs = serde_json::to_string(recent_logs).unwrap();
+        assert!(!serialized_logs.contains("tok_69"));
+        assert!(!serialized_logs.contains("sec_69"));
+        assert!(!serialized_logs.contains("203.0.113.66"));
+        assert!(!serialized_logs.contains("abcd::99"));
+        assert!(serialized_logs.contains("203.0.113.*"));
+        assert!(serialized_logs.contains("[240e:390::*]:443"));
+
+        let md = report["ai_prompt_markdown"]
+            .as_str()
+            .expect("ai_prompt_markdown string");
+        assert!(md.starts_with("请帮我排查猫猫云梯（CatCloud）当前问题"));
+        assert!(md.contains("AI主力组"));
+        assert!(md.contains("日本东京 01"));
+        assert!(md.contains("杭州443中转"));
+        assert!(md.contains("catcloud status --json"));
+        assert!(md.contains("catcloud config diag --json"));
+        assert!(!md.contains("test_secret_pw"));
+        assert!(!md.contains("tok_69"));
+        assert!(!md.contains("203.0.113.66"));
 
         let _ = std::fs::remove_dir_all(&tmp);
     }

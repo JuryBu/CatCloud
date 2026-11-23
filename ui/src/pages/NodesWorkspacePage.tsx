@@ -130,20 +130,20 @@ export function NodesWorkspacePage() {
         </div>
       </div>
 
-      {/* Keep both tabs mounted once opened so filters, selections & live speed tests survive tab switches */}
-      <div className={tab === "nodes" ? undefined : "hidden"}>
+      {/* Keep SpeedTestPage mounted with CSS `hidden` so selections, search, region filters, and pagination survive tab switches */}
+      <div className={tab === "nodes" ? "contents" : "hidden"}>
         <SpeedTestPage
           embedded
           initialSubId={activeSubFilter}
           onOpenSubs={handleOpenSubs}
         />
       </div>
-      <div className={tab === "subs" ? undefined : "hidden"}>
+      {tab === "subs" && (
         <NodesSubsPage
           embeddedSubsOnly
           onViewSubNodes={handleViewSubNodes}
         />
-      </div>
+      )}
     </div>
   );
 }

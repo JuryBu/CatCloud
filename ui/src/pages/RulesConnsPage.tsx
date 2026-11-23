@@ -32,6 +32,7 @@ import {
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
+import { AppSelect, type AppSelectOption } from "../components/AppSelect";
 import { formatBytes, formatRate } from "../components/TrafficSparkline";
 import { appActions, useAppSelector } from "../store/appStore";
 
@@ -78,6 +79,8 @@ interface LiveConnection {
   groupName: string;
   nodeName: string;
   viaPreAccel: boolean;
+  isInnerTunnel: boolean;
+  isLoopback: boolean;
   uploadBytes: number;
   downloadBytes: number;
   upBps: number;
@@ -306,8 +309,16 @@ function formatRuleTargetLabel(target: string): string {
   return target;
 }
 
-function formatConnectionRuleLabel(rawRule: string): string {
+function formatConnectionRuleLabel(
+  rawRule: string,
+  isInnerTunnel = false,
+  preaccelEnabled = false
+): string {
+  if (isInnerTunnel) {
+    return preaccelEnabled ? "国内提速拨号" : "内核内部连接";
+  }
   const trimmed = rawRule.trim();
+  if (trimmed === "国内提速拨号" || trimmed === "内核内部连接") return trimmed;
   if (!trimmed) return "默认走代理";
   const commaIdx = trimmed.indexOf(",");
   const rawType = (commaIdx >= 0 ? trimmed.slice(0, commaIdx) : trimmed).trim();
@@ -371,7 +382,7 @@ function matchesPreAccelChain(chains: string[], relays: PreAccelRelay[]): boolea
   });
 }
 
-function buildPreviewConnections(): LiveConnection[] {
+function buildPreviewConnections(preaccelEnabled = true): LiveConnection[] {
   const now = Date.now();
   return [
     {
@@ -387,6 +398,8 @@ function buildPreviewConnections(): LiveConnection[] {
       groupName: "AI 专线粘性组",
       nodeName: "JP-Tokyo-01 · 1x",
       viaPreAccel: false,
+      isInnerTunnel: false,
+      isLoopback: false,
       uploadBytes: 18_420_000,
       downloadBytes: 94_180_000,
       upBps: 5_800,
@@ -406,6 +419,8 @@ function buildPreviewConnections(): LiveConnection[] {
       groupName: "AI 专线粘性组",
       nodeName: "JP-Tokyo-01 · 1x",
       viaPreAccel: false,
+      isInnerTunnel: false,
+      isLoopback: false,
       uploadBytes: 6_240_000,
       downloadBytes: 24_860_000,
       upBps: 11_600,
@@ -425,6 +440,50 @@ function buildPreviewConnections(): LiveConnection[] {
       groupName: "流媒体与下载受控均衡",
       nodeName: "SG-Edge-02 · 1x",
       viaPreAccel: true,
+      isInnerTunnel: false,
+      isLoopback: false,
+      uploadBytes: 2_890_000,
+      downloadBytes: 286_400_000,
+      upBps: 17_400,
+      downBps: 92_800,
+      startedAtMs: now - 690_000,
+    },
+    {
+      id: "conn-105-loopback",
+      process: "CatCloud.exe",
+      host: "127.0.0.1",
+      dstIp: "127.0.0.1",
+      port: 19090,
+      network: "tcp",
+      rule: "IP-CIDR,127.0.0.0/8",
+      chains: ["DIRECT"],
+      groupId: "DIRECT",
+      groupName: "DIRECT",
+      nodeName: "DIRECT",
+      viaPreAccel: false,
+      isInnerTunnel: false,
+      isLoopback: true,
+      uploadBytes: 420_000,
+      downloadBytes: 1_280_000,
+      upBps: 640,
+      downBps: 1_920,
+      startedAtMs: now - 820_000,
+    },
+    {
+      id: "conn-106-inner",
+      process: preaccelEnabled ? "底层提速隧道 (Inner)" : "内核内部连接 (Inner)",
+      host: preaccelEnabled ? "198.51.100.10" : "223.5.5.5",
+      dstIp: preaccelEnabled ? "198.51.100.10" : "223.5.5.5",
+      port: 443,
+      network: "tcp",
+      rule: preaccelEnabled ? "国内提速拨号" : "内核内部连接",
+      chains: preaccelEnabled ? ["CN-East-443 Primary", "⚡ 国内预加速入口"] : ["DIRECT"],
+      groupId: preaccelEnabled ? "⚡ 国内预加速入口" : "DIRECT",
+      groupName: preaccelEnabled ? "⚡ 国内预加速入口" : "DIRECT",
+      nodeName: preaccelEnabled ? "CN-East-443 Primary" : "DIRECT",
+      viaPreAccel: preaccelEnabled,
+      isInnerTunnel: true,
+      isLoopback: false,
       uploadBytes: 2_890_000,
       downloadBytes: 286_400_000,
       upBps: 17_400,
@@ -437,7 +496,8 @@ function buildPreviewConnections(): LiveConnection[] {
 function mapDtoConnection(
   dto: ActiveConnectionDto,
   groups: MultiGroup[],
-  relays: PreAccelRelay[]
+  relays: PreAccelRelay[],
+  preaccelEnabled = false
 ): LiveConnection {
   const chains = Array.isArray(dto.chains) ? dto.chains : [];
   const matchedGroup = groups.find((g) => chains.includes(g.name) || chains.includes(g.id));
@@ -446,20 +506,44 @@ function mapDtoConnection(
   const nodeName = chains[0] ?? groupName;
   const viaPreAccel = matchesPreAccelChain(chains, relays);
   const parsedStart = Date.parse(dto.start);
+  const connTypeLower = (dto.conn_type || "").trim().toLowerCase();
+  const isInnerTunnel = connTypeLower === "inner";
+  const isPreAccelInner = isInnerTunnel && (preaccelEnabled || viaPreAccel);
+  const rawHost = (dto.host || "").trim();
+  const rawHostLower = rawHost.toLowerCase();
+  const rawDstIp = (dto.destination_ip || "").trim();
+  const isLoopback =
+    rawHostLower === "127.0.0.1" ||
+    rawHostLower === "localhost" ||
+    rawHostLower === "::1" ||
+    rawDstIp.startsWith("127.") ||
+    rawDstIp === "::1";
 
   return {
     id: dto.id,
-    process: dto.process || dto.conn_type || "unknown",
-    host: dto.host || dto.destination_ip || "--",
-    dstIp: dto.destination_ip || "--",
+    process: isInnerTunnel
+      ? isPreAccelInner
+        ? "底层提速隧道 (Inner)"
+        : "内核内部连接 (Inner)"
+      : dto.process || dto.conn_type || "unknown",
+    host: rawHost || rawDstIp || "--",
+    dstIp: rawDstIp || "--",
     port: Number(dto.destination_port) || 0,
     network: dto.network.toLowerCase() === "udp" ? "udp" : "tcp",
-    rule: dto.rule_payload ? `${dto.rule},${dto.rule_payload}` : dto.rule || "MATCH",
+    rule: isInnerTunnel
+      ? isPreAccelInner
+        ? "国内提速拨号"
+        : "内核内部连接"
+      : dto.rule_payload
+        ? `${dto.rule},${dto.rule_payload}`
+        : dto.rule || "MATCH",
     chains,
     groupId,
     groupName,
     nodeName,
     viaPreAccel,
+    isInnerTunnel,
+    isLoopback,
     uploadBytes: dto.upload ?? 0,
     downloadBytes: dto.download ?? 0,
     upBps: 0,
@@ -525,6 +609,9 @@ export function RulesConnsPage() {
   const groups = useAppSelector((s) => s.groups);
   const preAccelRelays = useAppSelector((s) => s.preAccelRelays);
   const runtime = useAppSelector((s) => s.runtime);
+  const preAccelEnabled = useAppSelector(
+    (s) => s.runtime.preaccel_active || s.config.preaccel.enabled
+  );
   const inTauri = isTauriEnv();
 
   const defaultGroupTarget = groups[0]?.name || "DIRECT";
@@ -559,11 +646,13 @@ export function RulesConnsPage() {
 
   // --- Tab B: Connections State ---
   const [connections, setConnections] = useState<LiveConnection[]>(() =>
-    inTauri ? [] : buildPreviewConnections()
+    inTauri ? [] : buildPreviewConnections(preAccelEnabled)
   );
   const [connSearch, setConnSearch] = useState<string>("");
   const [connGroupFilter, setConnGroupFilter] = useState<string>("all");
   const [connSort, setConnSort] = useState<"down" | "up" | "rate" | "age" | "process">("down");
+  const [showInnerTunnels, setShowInnerTunnels] = useState<boolean>(false);
+  const [hideLoopback, setHideLoopback] = useState<boolean>(false);
   const [connPage, setConnPage] = useState<number>(1);
   const [pageJumpInput, setPageJumpInput] = useState<string>("");
   const [connPaused, setConnPaused] = useState<boolean>(false);
@@ -579,6 +668,8 @@ export function RulesConnsPage() {
   relaysRef.current = preAccelRelays;
   const runtimeRunningRef = useRef<boolean>(runtime.running);
   runtimeRunningRef.current = runtime.running;
+  const preAccelEnabledRef = useRef<boolean>(preAccelEnabled);
+  preAccelEnabledRef.current = preAccelEnabled;
   const aiPresetsRef = useRef<AiPresetBundle[]>(aiPresets);
   aiPresetsRef.current = aiPresets;
   const userRulesRef = useRef<ManagedRuleItem[]>(userRules);
@@ -736,7 +827,7 @@ export function RulesConnsPage() {
     async (manual = false, notifyOnError = false): Promise<boolean> => {
       if (inFlightRef.current) return false;
       if (!inTauri) {
-        setConnections(buildPreviewConnections());
+        setConnections(buildPreviewConnections(preAccelEnabledRef.current));
         setNowTick(Date.now());
         return true;
       }
@@ -760,7 +851,12 @@ export function RulesConnsPage() {
         const nextMap = new Map<string, ConnTrafficSnap>();
 
         const mapped = snap.connections.map((dto) => {
-          const item = mapDtoConnection(dto, groupsRef.current, relaysRef.current);
+          const item = mapDtoConnection(
+            dto,
+            groupsRef.current,
+            relaysRef.current,
+            preAccelEnabledRef.current
+          );
           const prev = prevMap.get(item.id);
           if (prev && nowMs > prev.atMs) {
             const dtSec = Math.max(0.2, (nowMs - prev.atMs) / 1000);
@@ -1012,10 +1108,29 @@ export function RulesConnsPage() {
     }
   };
 
-  // --- Connections filtering, pagination & teardown ---
+  // --- Connections classification, filtering, pagination & teardown ---
+  const connectionBreakdown = useMemo(() => {
+    let innerTunnelCount = 0;
+    let loopbackCount = 0;
+    for (const c of connections) {
+      if (c.isInnerTunnel) {
+        innerTunnelCount += 1;
+      } else if (c.isLoopback) {
+        loopbackCount += 1;
+      }
+    }
+    return {
+      appCount: connections.length - innerTunnelCount,
+      innerTunnelCount,
+      loopbackCount,
+    };
+  }, [connections]);
+
   const filteredConnections = useMemo(() => {
     const kw = connSearch.trim().toLowerCase();
     const list = connections.filter((c) => {
+      if (!showInnerTunnels && c.isInnerTunnel) return false;
+      if (hideLoopback && !c.isInnerTunnel && c.isLoopback) return false;
       if (connGroupFilter !== "all") {
         if (connGroupFilter === "DIRECT") {
           const isDirect =
@@ -1028,15 +1143,33 @@ export function RulesConnsPage() {
         }
       }
       if (!kw) return true;
-      const friendlyRule = formatConnectionRuleLabel(c.rule).toLowerCase();
+      const isPreAccelInner = c.isInnerTunnel && (preAccelEnabled || c.viaPreAccel);
+      const friendlyRule = formatConnectionRuleLabel(
+        c.rule,
+        c.isInnerTunnel,
+        isPreAccelInner
+      ).toLowerCase();
+      const displayProcess = c.isInnerTunnel
+        ? isPreAccelInner
+          ? "底层提速隧道 (Inner)"
+          : "内核内部连接 (Inner)"
+        : c.process;
+      const extraTag = c.isInnerTunnel
+        ? isPreAccelInner
+          ? "底层提速隧道 inner 国内提速拨号"
+          : "内核内部连接 inner dns 加密dns 规则探测"
+        : c.isLoopback
+          ? "本机内部通信 loopback 回环"
+          : "";
       return (
-        c.process.toLowerCase().includes(kw) ||
+        displayProcess.toLowerCase().includes(kw) ||
         c.host.toLowerCase().includes(kw) ||
         c.dstIp.includes(kw) ||
         c.rule.toLowerCase().includes(kw) ||
         friendlyRule.includes(kw) ||
         c.nodeName.toLowerCase().includes(kw) ||
-        c.groupName.toLowerCase().includes(kw)
+        c.groupName.toLowerCase().includes(kw) ||
+        extraTag.includes(kw)
       );
     });
 
@@ -1048,7 +1181,15 @@ export function RulesConnsPage() {
       return a.process.localeCompare(b.process);
     });
     return list;
-  }, [connGroupFilter, connSearch, connSort, connections]);
+  }, [
+    connGroupFilter,
+    connSearch,
+    connSort,
+    connections,
+    hideLoopback,
+    preAccelEnabled,
+    showInnerTunnels,
+  ]);
 
   const totalConnPages = Math.max(
     1,
@@ -1058,7 +1199,7 @@ export function RulesConnsPage() {
 
   useEffect(() => {
     setConnPage(1);
-  }, [connGroupFilter, connSearch, connSort]);
+  }, [connGroupFilter, connSearch, connSort, hideLoopback, showInnerTunnels]);
 
   useEffect(() => {
     if (connPage > totalConnPages) {
@@ -1082,21 +1223,72 @@ export function RulesConnsPage() {
     setPageJumpInput("");
   };
 
+  // Strictly exclude `isInnerTunnel` connections from aggregate bytes & rates to avoid double-counting
+  const filteredAppConnCount = useMemo(
+    () => filteredConnections.reduce((acc, c) => (c.isInnerTunnel ? acc : acc + 1), 0),
+    [filteredConnections]
+  );
   const totalConnUpload = useMemo(
-    () => filteredConnections.reduce((acc, c) => acc + c.uploadBytes, 0),
+    () => filteredConnections.reduce((acc, c) => (c.isInnerTunnel ? acc : acc + c.uploadBytes), 0),
     [filteredConnections]
   );
   const totalConnDownload = useMemo(
-    () => filteredConnections.reduce((acc, c) => acc + c.downloadBytes, 0),
+    () => filteredConnections.reduce((acc, c) => (c.isInnerTunnel ? acc : acc + c.downloadBytes), 0),
     [filteredConnections]
   );
   const totalConnUpBps = useMemo(
-    () => filteredConnections.reduce((acc, c) => acc + c.upBps, 0),
+    () => filteredConnections.reduce((acc, c) => (c.isInnerTunnel ? acc : acc + c.upBps), 0),
     [filteredConnections]
   );
   const totalConnDownBps = useMemo(
-    () => filteredConnections.reduce((acc, c) => acc + c.downBps, 0),
+    () => filteredConnections.reduce((acc, c) => (c.isInnerTunnel ? acc : acc + c.downBps), 0),
     [filteredConnections]
+  );
+
+  const ruleLayerOptions = useMemo<AppSelectOption[]>(
+    () => [
+      { value: "prepend", label: "优先匹配（最先判断）" },
+      { value: "append", label: "兜底匹配（最后判断）" },
+    ],
+    []
+  );
+
+  const ruleTypeOptions = useMemo<AppSelectOption[]>(
+    () =>
+      (Object.keys(RULE_TYPE_LABELS) as RuleMatchType[]).map((key) => ({
+        value: key,
+        label: RULE_TYPE_LABELS[key],
+      })),
+    []
+  );
+
+  const ruleTargetOptions = useMemo<AppSelectOption[]>(
+    () =>
+      targetChoices.map((t) => ({
+        value: t,
+        label: formatRuleTargetLabel(t),
+      })),
+    [targetChoices]
+  );
+
+  const connGroupFilterOptions = useMemo<AppSelectOption[]>(
+    () => [
+      { value: "all", label: "全部分组" },
+      { value: "DIRECT", label: "直接连接" },
+      ...groups.map((g) => ({ value: g.id, label: g.name })),
+    ],
+    [groups]
+  );
+
+  const connSortOptions = useMemo<AppSelectOption[]>(
+    () => [
+      { value: "down", label: "按下载量排序" },
+      { value: "up", label: "按上传量排序" },
+      { value: "rate", label: "按实时速率排序" },
+      { value: "age", label: "按连接时长排序" },
+      { value: "process", label: "按软件名排序" },
+    ],
+    []
   );
 
   const handleCloseSingleConn = async (conn: LiveConnection) => {
@@ -1176,6 +1368,7 @@ export function RulesConnsPage() {
   const enabledAiDomainCount = aiPresets
     .filter((p) => p.enabled)
     .reduce((acc, p) => acc + p.domains.length, 0);
+  const innerCountShortLabel = preAccelEnabled ? "提速隧道" : "内核内部连接";
 
   return (
     <div className="space-y-4">
@@ -1212,6 +1405,11 @@ export function RulesConnsPage() {
           <button
             type="button"
             onClick={() => setActiveTab("connections")}
+            title={
+              connectionBreakdown.innerTunnelCount > 0 || connectionBreakdown.loopbackCount > 0
+                ? `真实应用连接 ${connectionBreakdown.appCount} 条（另含 ${connectionBreakdown.innerTunnelCount} 条${innerCountShortLabel} · ${connectionBreakdown.loopbackCount} 条本机回环）`
+                : `真实应用连接 ${connectionBreakdown.appCount} 条`
+            }
             className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium transition-colors ${
               activeTab === "connections"
                 ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
@@ -1221,7 +1419,7 @@ export function RulesConnsPage() {
             <Activity className="h-3.5 w-3.5" />
             当前连接
             <span className="cc-mono rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px]">
-              {connections.length}
+              {connectionBreakdown.appCount}
             </span>
           </button>
         </div>
@@ -1309,20 +1507,18 @@ export function RulesConnsPage() {
 
                     <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-[var(--line)] pt-2 text-[11px]">
                       <span className="text-[var(--muted)]">走哪个分组</span>
-                      <select
+                      <AppSelect
+                        size="xs"
+                        aria-label={`${preset.name} 目标分组`}
                         value={preset.targetGroup}
                         disabled={savingRules || loadingRules}
-                        onChange={(e) =>
-                          void handleChangeAiPresetTarget(preset.id, e.target.value)
-                        }
-                        className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-50"
-                      >
-                        {presetOptions.map((t) => (
-                          <option key={t} value={t}>
-                            {formatRuleTargetLabel(t)}
-                          </option>
-                        ))}
-                      </select>
+                        onChange={(val) => void handleChangeAiPresetTarget(preset.id, val)}
+                        options={presetOptions.map((t) => ({
+                          value: t,
+                          label: formatRuleTargetLabel(t),
+                        }))}
+                        className="min-w-[132px] max-w-[200px]"
+                      />
                     </div>
                   </div>
                 );
@@ -1440,27 +1636,26 @@ export function RulesConnsPage() {
                 系统已自动保护本机直连与防绕路死循环，添加规则后立即保存生效
               </span>
             </div>
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-12">
-              <select
+            <div className="grid grid-cols-1 items-center gap-2 sm:grid-cols-2 lg:grid-cols-12">
+              <AppSelect
+                size="md"
+                aria-label="规则优先级层级"
                 value={newLayer}
-                onChange={(e) => setNewLayer(e.target.value as "prepend" | "append")}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none lg:col-span-2"
-              >
-                <option value="prepend">优先匹配（最先判断）</option>
-                <option value="append">兜底匹配（最后判断）</option>
-              </select>
+                onChange={(v) => setNewLayer(v as "prepend" | "append")}
+                options={ruleLayerOptions}
+                className="w-full lg:col-span-2"
+                buttonClassName="w-full rounded-xl"
+              />
 
-              <select
+              <AppSelect
+                size="md"
+                aria-label="规则匹配类型"
                 value={newType}
-                onChange={(e) => setNewType(e.target.value as RuleMatchType)}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none lg:col-span-2"
-              >
-                {(Object.keys(RULE_TYPE_LABELS) as RuleMatchType[]).map((key) => (
-                  <option key={key} value={key}>
-                    {RULE_TYPE_LABELS[key]}
-                  </option>
-                ))}
-              </select>
+                onChange={(v) => setNewType(v as RuleMatchType)}
+                options={ruleTypeOptions}
+                className="w-full lg:col-span-2"
+                buttonClassName="w-full rounded-xl"
+              />
 
               <input
                 type="text"
@@ -1470,29 +1665,27 @@ export function RulesConnsPage() {
                   if (e.key === "Enter") void handleAddRule();
                 }}
                 placeholder="填写网址或内容，例如 github.com、cn 或 chrome.exe"
-                className="cc-mono rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none lg:col-span-4"
+                className="cc-mono h-9 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none lg:col-span-4"
               />
 
-              <select
+              <AppSelect
+                size="md"
+                aria-label="规则目标分组"
                 value={newTarget}
-                onChange={(e) => {
+                onChange={(v) => {
                   userPickedNewTargetRef.current = true;
-                  setNewTarget(e.target.value);
+                  setNewTarget(v);
                 }}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none lg:col-span-2"
-              >
-                {targetChoices.map((t) => (
-                  <option key={t} value={t}>
-                    {formatRuleTargetLabel(t)}
-                  </option>
-                ))}
-              </select>
+                options={ruleTargetOptions}
+                className="w-full lg:col-span-2"
+                buttonClassName="w-full rounded-xl"
+              />
 
               <button
                 type="button"
                 disabled={savingRules || loadingRules}
                 onClick={() => void handleAddRule()}
-                className="inline-flex items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50 lg:col-span-2"
+                className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50 lg:col-span-2"
               >
                 <Plus className="h-3.5 w-3.5" />
                 添加并保存
@@ -1653,16 +1846,33 @@ export function RulesConnsPage() {
           <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
             <div className="flex flex-wrap items-center gap-4 text-xs">
               <div>
-                <span className="text-[var(--muted)]">当前连接数</span>
+                <span className="text-[var(--muted)]">真实应用连接</span>
                 <div className="cc-mono mt-0.5 text-base font-semibold text-[var(--text)]">
-                  {filteredConnections.length}
+                  {filteredAppConnCount}
                   <span className="ml-1 text-[11px] font-normal text-[var(--muted)]">
-                    / {connections.length}
+                    / {connectionBreakdown.appCount}
                   </span>
                 </div>
+                {(connectionBreakdown.innerTunnelCount > 0 ||
+                  connectionBreakdown.loopbackCount > 0) && (
+                  <div className="mt-0.5 text-[10.5px] text-[var(--muted)]">
+                    {connectionBreakdown.innerTunnelCount > 0 &&
+                    connectionBreakdown.loopbackCount > 0
+                      ? `另含 ${connectionBreakdown.innerTunnelCount} 条${innerCountShortLabel} · ${connectionBreakdown.loopbackCount} 条本机回环`
+                      : connectionBreakdown.innerTunnelCount > 0
+                        ? `另含 ${connectionBreakdown.innerTunnelCount} 条${innerCountShortLabel}`
+                        : `含 ${connectionBreakdown.loopbackCount} 条本机回环`}
+                  </div>
+                )}
               </div>
               <div className="h-7 w-px bg-[var(--line)]" />
-              <div>
+              <div
+                title={
+                  preAccelEnabled
+                    ? "已自动排除底层提速隧道，避免应用层与隧道层重复累计"
+                    : "已自动排除内核内部连接（如加密 DNS、规则探测），仅统计真实应用流量"
+                }
+              >
                 <span className="text-[var(--muted)]">实时上传 / 累计</span>
                 <div className="cc-mono mt-0.5 text-sm font-semibold text-[var(--coral)]">
                   ↑ {formatRate(totalConnUpBps)}
@@ -1671,7 +1881,13 @@ export function RulesConnsPage() {
                   </span>
                 </div>
               </div>
-              <div>
+              <div
+                title={
+                  preAccelEnabled
+                    ? "已自动排除底层提速隧道，避免应用层与隧道层重复累计"
+                    : "已自动排除内核内部连接（如加密 DNS、规则探测），仅统计真实应用流量"
+                }
+              >
                 <span className="text-[var(--muted)]">实时下载 / 累计</span>
                 <div className="cc-mono mt-0.5 text-sm font-semibold text-[var(--sky)]">
                   ↓ {formatRate(totalConnDownBps)}
@@ -1730,7 +1946,7 @@ export function RulesConnsPage() {
                 value={connSearch}
                 onChange={(e) => setConnSearch(e.target.value)}
                 placeholder="按软件名、目标网址/IP、规则或节点搜索..."
-                className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+                className="h-8 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
               {connSearch && (
                 <button
@@ -1743,45 +1959,91 @@ export function RulesConnsPage() {
               )}
             </div>
 
-            <div className="flex items-center gap-1.5 text-xs">
-              <Filter className="h-3.5 w-3.5 text-[var(--muted)]" />
-              <select
-                value={connGroupFilter}
-                onChange={(e) => setConnGroupFilter(e.target.value)}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-              >
-                <option value="all">全部分组</option>
-                <option value="DIRECT">直接连接</option>
-                {groups.map((g) => (
-                  <option key={g.id} value={g.id}>
-                    {g.name}
-                  </option>
-                ))}
-              </select>
-
-              <select
-                value={connSort}
-                onChange={(e) =>
-                  setConnSort(e.target.value as "down" | "up" | "rate" | "age" | "process")
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <label
+                className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-xl border px-2.5 text-[11px] font-medium transition-colors ${
+                  showInnerTunnels
+                    ? "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)]"
+                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                }`}
+                title={
+                  preAccelEnabled
+                    ? "默认隐藏 Mihomo 底层国内提速拨号隧道（Inner），勾选后可展开排查中转连接"
+                    : "默认隐藏 Mihomo 内核内部连接（如加密 DNS、规则探测），勾选后可展开排查"
                 }
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
               >
-                <option value="down">按下载量排序</option>
-                <option value="up">按上传量排序</option>
-                <option value="rate">按实时速率排序</option>
-                <option value="age">按连接时长排序</option>
-                <option value="process">按软件名排序</option>
-              </select>
+                <input
+                  type="checkbox"
+                  checked={showInnerTunnels}
+                  onChange={(e) => setShowInnerTunnels(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-[var(--accent)]"
+                />
+                <span>
+                  {preAccelEnabled ? "显示底层提速隧道 (Inner)" : "显示内核内部连接 (Inner)"}
+                </span>
+                {connectionBreakdown.innerTunnelCount > 0 && (
+                  <span className="cc-mono rounded-full bg-[var(--card)] px-1.5 py-0.2 text-[10px]">
+                    {connectionBreakdown.innerTunnelCount}
+                  </span>
+                )}
+              </label>
 
-              <button
-                type="button"
-                disabled={refreshingConns}
-                onClick={() => void handleRefreshConns()}
-                className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
-                title="刷新当前连接"
+              <label
+                className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-xl border px-2.5 text-[11px] font-medium transition-colors ${
+                  hideLoopback
+                    ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
+                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                }`}
+                title="隐藏发往 127.0.0.1 / localhost / ::1 的本机内部通信"
               >
-                <RefreshCw className={`h-3.5 w-3.5 ${refreshingConns ? "animate-spin" : ""}`} />
-              </button>
+                <input
+                  type="checkbox"
+                  checked={hideLoopback}
+                  onChange={(e) => setHideLoopback(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-[var(--accent)]"
+                />
+                <span>隐藏本机回环 (127.0.0.1)</span>
+                {connectionBreakdown.loopbackCount > 0 && (
+                  <span className="cc-mono rounded-full bg-[var(--card)] px-1.5 py-0.2 text-[10px]">
+                    {connectionBreakdown.loopbackCount}
+                  </span>
+                )}
+              </label>
+
+              <div className="flex items-center gap-1.5">
+                <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+                <AppSelect
+                  size="sm"
+                  aria-label="按分组筛选连接"
+                  value={connGroupFilter}
+                  onChange={setConnGroupFilter}
+                  options={connGroupFilterOptions}
+                  className="min-w-[128px]"
+                  buttonClassName="rounded-xl"
+                />
+
+                <AppSelect
+                  size="sm"
+                  aria-label="连接排序方式"
+                  value={connSort}
+                  onChange={(v) =>
+                    setConnSort(v as "down" | "up" | "rate" | "age" | "process")
+                  }
+                  options={connSortOptions}
+                  className="min-w-[132px]"
+                  buttonClassName="rounded-xl"
+                />
+
+                <button
+                  type="button"
+                  disabled={refreshingConns}
+                  onClick={() => void handleRefreshConns()}
+                  className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
+                  title="刷新当前连接"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${refreshingConns ? "animate-spin" : ""}`} />
+                </button>
+              </div>
             </div>
           </section>
 
@@ -1791,13 +2053,13 @@ export function RulesConnsPage() {
               <table className="w-full min-w-[860px] border-collapse text-left text-xs">
                 <thead>
                   <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[11px] text-[var(--muted)]">
-                    <th className="px-4 py-2.5 font-medium">软件 / 协议</th>
-                    <th className="px-3 py-2.5 font-medium">访问地址与端口</th>
-                    <th className="px-3 py-2.5 font-medium">命中规则</th>
-                    <th className="px-3 py-2.5 font-medium">分组与当前节点</th>
-                    <th className="px-3 py-2.5 text-right font-medium">实时速率 / 累计流量</th>
-                    <th className="px-3 py-2.5 text-right font-medium">时长</th>
-                    <th className="px-4 py-2.5 text-right font-medium">操作</th>
+                    <th className="whitespace-nowrap px-3 py-2.5 font-medium">软件 / 协议</th>
+                    <th className="whitespace-nowrap px-2.5 py-2.5 font-medium">访问地址与端口</th>
+                    <th className="whitespace-nowrap px-2.5 py-2.5 font-medium">命中规则</th>
+                    <th className="min-w-[136px] whitespace-nowrap px-2.5 py-2.5 font-medium">分组与当前节点</th>
+                    <th className="whitespace-nowrap px-2.5 py-2.5 text-right font-medium">实时速率 / 累计流量</th>
+                    <th className="whitespace-nowrap px-2.5 py-2.5 text-right font-medium">时长</th>
+                    <th className="whitespace-nowrap px-3 py-2.5 text-right font-medium">操作</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[var(--line)]">
@@ -1815,52 +2077,108 @@ export function RulesConnsPage() {
                       </td>
                     </tr>
                   ) : (
-                    pagedConnections.map((conn) => (
-                      <tr key={conn.id} className="hover:bg-[var(--card-hover)]">
-                        <td className="px-4 py-2.5">
-                          <div className="cc-mono font-semibold text-[var(--text)]">
-                            {conn.process}
+                    pagedConnections.map((conn) => {
+                      const isPreAccelInner =
+                        conn.isInnerTunnel && (preAccelEnabled || conn.viaPreAccel);
+                      const displayProcess = conn.isInnerTunnel
+                        ? isPreAccelInner
+                          ? "底层提速隧道 (Inner)"
+                          : "内核内部连接 (Inner)"
+                        : conn.process;
+                      return (
+                      <tr
+                        key={conn.id}
+                        className={`hover:bg-[var(--card-hover)] ${
+                          conn.isInnerTunnel ? "bg-[var(--amber-soft)]/15" : ""
+                        }`}
+                      >
+                        <td className="max-w-[140px] px-3 py-2.5">
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span
+                              title={displayProcess}
+                              className={`cc-mono max-w-[126px] truncate font-semibold ${
+                                conn.isInnerTunnel
+                                  ? "text-[var(--amber)]"
+                                  : "text-[var(--text)]"
+                              }`}
+                            >
+                              {displayProcess}
+                            </span>
+                            {conn.isInnerTunnel && (
+                              <span className="rounded bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                                {isPreAccelInner ? "底层隧道" : "内核内部"}
+                              </span>
+                            )}
+                            {!conn.isInnerTunnel && conn.isLoopback && (
+                              <span className="rounded bg-[var(--sky-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--sky)]">
+                                本机内部通信
+                              </span>
+                            )}
                           </div>
                           <span className="cc-mono mt-0.5 inline-block rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] uppercase text-[var(--muted)]">
                             {conn.network}
                           </span>
                         </td>
 
-                        <td className="px-3 py-2.5">
-                          <div className="cc-mono cc-selectable font-medium text-[var(--text)]">
+                        <td className="max-w-[185px] px-2.5 py-2.5">
+                          <div
+                            title={`${conn.host}:${conn.port}`}
+                            className="cc-mono cc-selectable truncate font-medium text-[var(--text)]"
+                          >
                             {conn.host}:{conn.port}
                           </div>
-                          <div className="cc-mono text-[10px] text-[var(--muted)]">
+                          <div className="cc-mono truncate text-[10px] text-[var(--muted)]">
                             {conn.dstIp}
+                            {!conn.isInnerTunnel && conn.isLoopback ? " · 本机内部通信" : ""}
                           </div>
                         </td>
 
-                        <td className="px-3 py-2.5">
+                        <td className="px-2.5 py-2.5">
                           <span
-                            title={conn.rule}
-                            className="inline-block max-w-[220px] truncate rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]"
+                            title={
+                              conn.isInnerTunnel
+                                ? isPreAccelInner
+                                  ? "国内提速拨号（Inner 底层隧道）"
+                                  : "内核内部连接（如加密 DNS、规则探测）"
+                                : conn.rule
+                            }
+                            className={`inline-block max-w-[132px] truncate rounded-lg border px-2 py-0.5 text-[11px] ${
+                              conn.isInnerTunnel
+                                ? "border-[var(--amber)]/40 bg-[var(--amber-soft)]/70 font-medium text-[var(--amber)]"
+                                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)]"
+                            }`}
                           >
-                            {formatConnectionRuleLabel(conn.rule)}
+                            {formatConnectionRuleLabel(
+                              conn.rule,
+                              conn.isInnerTunnel,
+                              isPreAccelInner
+                            )}
                           </span>
                         </td>
 
-                        <td className="px-3 py-2.5">
-                          <div className="flex items-center gap-1.5">
-                            <span className="text-[11px] font-medium text-[var(--accent)]">
+                        <td className="min-w-[136px] max-w-[165px] px-2.5 py-2.5">
+                          <div className="flex flex-wrap items-center gap-1">
+                            <span
+                              title={formatRuleTargetLabel(conn.groupName)}
+                              className="max-w-[125px] truncate text-[11px] font-medium text-[var(--accent)]"
+                            >
                               {formatRuleTargetLabel(conn.groupName)}
                             </span>
                             {conn.viaPreAccel && (
-                              <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] text-[var(--green)]">
+                              <span className="shrink-0 whitespace-nowrap rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] text-[var(--green)]">
                                 走国内提速
                               </span>
                             )}
                           </div>
-                          <div className="cc-mono mt-0.5 text-[11px] text-[var(--text-secondary)]">
+                          <div
+                            title={formatRuleTargetLabel(conn.nodeName)}
+                            className="cc-mono mt-0.5 max-w-[155px] truncate text-[11px] text-[var(--text-secondary)]"
+                          >
                             {formatRuleTargetLabel(conn.nodeName)}
                           </div>
                         </td>
 
-                        <td className="cc-mono px-3 py-2.5 text-right whitespace-nowrap">
+                        <td className="cc-mono px-2.5 py-2.5 text-right whitespace-nowrap">
                           <div className="text-[11px] font-medium">
                             <span className="text-[var(--coral)]">↑ {formatRate(conn.upBps)}</span>
                             <span className="mx-1 text-[var(--muted)]">·</span>
@@ -1871,22 +2189,23 @@ export function RulesConnsPage() {
                           </div>
                         </td>
 
-                        <td className="cc-mono px-3 py-2.5 text-right text-[11px] text-[var(--muted)]">
+                        <td className="cc-mono whitespace-nowrap px-2.5 py-2.5 text-right text-[11px] text-[var(--muted)]">
                           {formatDuration(conn.startedAtMs, nowTick)}
                         </td>
 
-                        <td className="px-4 py-2.5 text-right">
+                        <td className="whitespace-nowrap px-3 py-2.5 text-right">
                           <button
                             type="button"
                             onClick={() => void handleCloseSingleConn(conn)}
-                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--red)] hover:bg-[var(--red-soft)] hover:text-[var(--red)]"
+                            className="inline-flex shrink-0 whitespace-nowrap items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] font-medium text-[var(--muted)] hover:border-[var(--red)] hover:bg-[var(--red-soft)] hover:text-[var(--red)]"
                           >
-                            <X className="h-3 w-3" />
+                            <X className="h-3 w-3 shrink-0" />
                             断开
                           </button>
                         </td>
                       </tr>
-                    ))
+                      );
+                    })
                   )}
                 </tbody>
               </table>
