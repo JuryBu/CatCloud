@@ -3,41 +3,62 @@ import { Copy, Minus, Square, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { isTauriEnv } from "../api/tauri";
 import { useAppSelector } from "../store/appStore";
+import { resolvePlatformOs } from "../utils/platform";
 
 function resolveModeBadge(
-  running: boolean,
+  proxyActive: boolean,
   status: string,
   proxyMode: string,
-  preaccelActive: boolean
+  proxyPreaccelActive: boolean,
+  globalPreaccelActive: boolean
 ): { label: string; dotColor: string } {
   const dotColor =
     status === "error"
       ? "var(--red)"
       : status === "warn"
         ? "var(--amber)"
-        : status === "preaccel"
+        : proxyPreaccelActive || globalPreaccelActive
           ? "var(--accent)"
-          : running
+          : proxyActive
             ? "var(--green)"
             : "var(--muted)";
 
-  if (!running && status === "idle") {
+  if (!proxyActive) {
+    if (status === "error") {
+      return { label: "核心异常", dotColor };
+    }
+    if (globalPreaccelActive) {
+      return {
+        label: "底层提速中",
+        dotColor: status === "warn" ? "var(--amber)" : "var(--accent)",
+      };
+    }
+    if (status === "warn") {
+      return { label: "待认证", dotColor };
+    }
     return { label: "待命", dotColor };
   }
 
   const modeLabel =
     proxyMode === "global" ? "全局" : proxyMode === "direct" ? "直连" : "规则";
-  const label = preaccelActive ? `${modeLabel} · 提速` : modeLabel;
+  const label = proxyPreaccelActive
+    ? `${modeLabel} · 提速`
+    : globalPreaccelActive
+      ? `${modeLabel} · 底层提速`
+      : modeLabel;
   return { label, dotColor };
 }
 
 export function TitleBar() {
   const runtime = useAppSelector((s) => s.runtime);
+  const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
+  const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
   const minimizeToTrayOnClose = useAppSelector(
     (s) => s.config?.behavior?.minimize_to_tray_on_close ?? true
   );
   const [maximized, setMaximized] = useState(false);
   const inTauri = isTauriEnv();
+  const isMac = resolvePlatformOs(runtime.os_label) === "macos";
 
   useEffect(() => {
     if (!isTauriEnv()) return;
@@ -117,11 +138,20 @@ export function TitleBar() {
     }
   };
 
+  const proxyActive =
+    runtime.running && (runtime.system_proxy_enabled || runtime.tun_enabled);
+  const isPreAccelEnabled = Boolean(runtime.preaccel_enabled ?? preAccelEnabledConfig);
+  const isProxyPreAccelActive = proxyActive && isPreAccelEnabled;
+  const isGlobalPreAccelRunning = Boolean(
+    globalPreAccel.running || runtime.global_preaccel_active
+  );
+
   const badge = resolveModeBadge(
-    runtime.running,
+    proxyActive,
     runtime.status,
     runtime.proxy_mode,
-    runtime.preaccel_active
+    isProxyPreAccelActive,
+    isGlobalPreAccelRunning
   );
 
   const closeButtonLabel = minimizeToTrayOnClose
@@ -130,11 +160,13 @@ export function TitleBar() {
 
   return (
     <header className="cc-surface relative z-30 flex h-9 shrink-0 select-none items-center justify-between border-b border-[var(--line)]/60">
-      {/* Left brand + compact mode badge + center drag region */}
+      {/* Left brand + compact mode badge + center drag region (macOS reserves 76px for native traffic lights) */}
       <div
         data-tauri-drag-region
         onDoubleClick={inTauri ? undefined : () => void handleToggleMaximize()}
-        className="flex h-full min-w-0 flex-1 items-center gap-2 pl-3 pr-2"
+        className={`flex h-full min-w-0 flex-1 items-center gap-2 pr-2 ${
+          isMac ? "pl-[76px]" : "pl-3"
+        }`}
       >
         <img
           src="./icons/icon_a_cream_cat.png"
@@ -158,38 +190,40 @@ export function TitleBar() {
         </span>
       </div>
 
-      {/* Right native-style window controls (never marked as drag region) */}
-      <div className="flex h-full shrink-0 items-center">
-        <button
-          type="button"
-          onClick={() => void handleMinimize()}
-          className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[var(--card-hover)] hover:text-[var(--text)]"
-          aria-label="最小化窗口"
-          title="最小化"
-        >
-          <Minus className="h-3.5 w-3.5" />
-        </button>
+      {/* Right native-style window controls (Windows / Linux only; macOS uses native left traffic lights) */}
+      {!isMac && (
+        <div className="flex h-full shrink-0 items-center">
+          <button
+            type="button"
+            onClick={() => void handleMinimize()}
+            className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[var(--card-hover)] hover:text-[var(--text)]"
+            aria-label="最小化窗口"
+            title="最小化"
+          >
+            <Minus className="h-3.5 w-3.5" />
+          </button>
 
-        <button
-          type="button"
-          onClick={() => void handleToggleMaximize()}
-          className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[var(--card-hover)] hover:text-[var(--text)]"
-          aria-label={maximized ? "还原窗口" : "最大化窗口"}
-          title={maximized ? "还原" : "最大化"}
-        >
-          {maximized ? <Copy className="h-3 w-3" /> : <Square className="h-3 w-3" />}
-        </button>
+          <button
+            type="button"
+            onClick={() => void handleToggleMaximize()}
+            className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[var(--card-hover)] hover:text-[var(--text)]"
+            aria-label={maximized ? "还原窗口" : "最大化窗口"}
+            title={maximized ? "还原" : "最大化"}
+          >
+            {maximized ? <Copy className="h-3 w-3" /> : <Square className="h-3 w-3" />}
+          </button>
 
-        <button
-          type="button"
-          onClick={() => void handleClose()}
-          className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[#e5534b]/90 hover:text-white"
-          aria-label={closeButtonLabel}
-          title={closeButtonLabel}
-        >
-          <X className="h-3.5 w-3.5" />
-        </button>
-      </div>
+          <button
+            type="button"
+            onClick={() => void handleClose()}
+            className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[#e5534b]/90 hover:text-white"
+            aria-label={closeButtonLabel}
+            title={closeButtonLabel}
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      )}
     </header>
   );
 }

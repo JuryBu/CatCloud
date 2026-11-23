@@ -2,12 +2,25 @@ use crate::error::CatResult;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub mod common;
 #[cfg(target_os = "windows")]
 pub mod windows;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod linux;
+
+pub use common::{
+    DEFAULT_LINUX_PROXY_BYPASS, DEFAULT_MACOS_PROXY_BYPASS, DEFAULT_WINDOWS_PROXY_BYPASS,
+    LinuxDesktopHint, classify_linux_desktop, format_gsettings_bypass_list,
+    format_kde_no_proxy_for, format_kde_proxy_url, format_shell_env_snippet,
+    is_macos_ignored_network_service, is_pkexec_user_cancelled, macos_bypass_command_args,
+    parse_getcap_has_net_admin, parse_kde_proxy_endpoint, parse_macos_network_services,
+    render_linux_desktop_entry, render_linux_desktop_entry_with_env,
+    render_macos_launch_agent_plist, resolve_persistent_linux_exe_path,
+    resolve_persistent_linux_exe_path_with_env, sanitize_linux_bypass_list,
+    sanitize_macos_bypass_list, sanitize_shell_host, sanitize_windows_bypass_list,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemProxySpec {

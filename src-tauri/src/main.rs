@@ -107,10 +107,11 @@ fn main() {
     // 2. Resolve portable/sandbox/standard data layout while strictly single-threaded.
     let paths = resolve_startup_paths();
 
-    // 3. Redirect WebView2 user data folder before Tauri Builder or WebView2 initializes.
+    // 3. On Windows, redirect WebView2 user data folder before Tauri Builder or WebView2 initializes.
     //    Elevated instances always use a separate `webview2_elevated` directory to prevent
     //    cross-IL lock/ACL blank screens on Windows 11.
     // SAFETY: Called at the very start of `main()` before any threads or Tokio runtimes spawn.
+    #[cfg(target_os = "windows")]
     unsafe {
         catcloud_desktop_lib::lifecycle::set_webview2_user_data_env(&paths);
     }

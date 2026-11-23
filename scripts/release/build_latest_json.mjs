@@ -89,22 +89,46 @@ function parseArgs(argv) {
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--version" && argv[i + 1]) {
-      opts.version = argv[++i];
-    } else if (arg === "--repo" && argv[i + 1]) {
-      opts.repo = argv[++i];
-    } else if (arg === "--assets-dir" && argv[i + 1]) {
-      opts.assetsDir = path.resolve(argv[++i]);
-    } else if (arg === "--checksums" && argv[i + 1]) {
-      opts.checksums = path.resolve(argv[++i]);
-    } else if (arg === "--notes-file" && argv[i + 1]) {
-      opts.notesFile = path.resolve(argv[++i]);
-    } else if (arg === "--changelog" && argv[i + 1]) {
-      opts.changelog = path.resolve(argv[++i]);
-    } else if (arg === "--output" && argv[i + 1]) {
-      opts.output = path.resolve(argv[++i]);
-    } else if (arg === "--pub-date" && argv[i + 1]) {
-      opts.pubDate = argv[++i];
+    if (arg === "--version") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.version = val;
+      }
+    } else if (arg === "--repo") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.repo = val;
+      }
+    } else if (arg === "--assets-dir") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.assetsDir = path.resolve(val);
+      }
+    } else if (arg === "--checksums") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.checksums = path.resolve(val);
+      }
+    } else if (arg === "--notes-file") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        opts.notesFile = val ? path.resolve(val) : null;
+      }
+    } else if (arg === "--changelog") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.changelog = path.resolve(val);
+      }
+    } else if (arg === "--output") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.output = path.resolve(val);
+      }
+    } else if (arg === "--pub-date") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.pubDate = val;
+      }
     } else if (arg === "--require-signatures") {
       opts.requireSignatures = true;
     } else if (arg === "--help" || arg === "-h") {

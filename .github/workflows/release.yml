@@ -68,7 +68,7 @@ jobs:
           CONF_VER="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("src-tauri/tauri.conf.json","utf8")).version)')"
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             TAG="${GITHUB_REF_NAME}"
-            VER="${TAG#v}"
+            VER="${TAG#[vV]}"
             DRY_RUN="false"
             MIHOMO_VER="v1.19.16"
             if [[ "$VER" != "$CONF_VER" ]]; then
@@ -80,10 +80,13 @@ jobs:
             if [[ -z "$VER" ]]; then
               VER="$CONF_VER"
             fi
-            VER="${VER#v}"
+            VER="${VER#[vV]}"
             TAG="v${VER}"
             DRY_RUN="${{ inputs.dry_run }}"
             MIHOMO_VER="${{ inputs.mihomo_version }}"
+            if [[ -z "$MIHOMO_VER" ]]; then
+              MIHOMO_VER="v1.19.16"
+            fi
           fi
           if [[ "$VER" == "0.0.0" ]]; then
             echo "ERROR: Version 0.0.0 is forbidden." >&2
@@ -124,6 +127,9 @@ jobs:
   build-windows:
     name: Build Windows (${{ matrix.arch }})
     needs: [preflight]
+    defaults:
+      run:
+        shell: pwsh
     strategy:
       fail-fast: false
       matrix:
@@ -155,6 +161,7 @@ jobs:
           cache: pnpm
 
       - name: Install workspace CLI devDependencies (for tauri CLI)
+        shell: pwsh
         run: pnpm install --frozen-lockfile
 
       - name: Setup Rust toolchain
@@ -168,6 +175,7 @@ jobs:
           shared-key: release-windows-${{ matrix.arch }}
 
       - name: Fetch and verify official Mihomo binary
+        shell: pwsh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -180,12 +188,17 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
+          RELEASE_REPO: ${{ github.repository }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $isDryRun = "${{ needs.preflight.outputs.dry_run }}" -eq "true"
-          $hasKey = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)
-          $enableUpdater = (-not $isDryRun) -and $hasKey
+          $hasPrivateKey = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PRIVATE_KEY)
+          $hasPublicKey = -not [string]::IsNullOrWhiteSpace($env:TAURI_SIGNING_PUBLIC_KEY)
+          $enableUpdater = (-not $isDryRun) -and $hasPrivateKey -and $hasPublicKey
           $overridePath = Join-Path $env:RUNNER_TEMP "tauri-release-override.json"
           $overrideObj = @{
+            version = "${{ needs.preflight.outputs.version }}"
             bundle = @{
               createUpdaterArtifacts = $enableUpdater
               resources = @{
@@ -193,18 +206,35 @@ jobs:
               }
             }
           }
-          $overrideObj | ConvertTo-Json -Depth 6 | Set-Content -Path $overridePath -Encoding UTF8
-          Write-Host "createUpdaterArtifacts=$enableUpdater (dry_run=$isDryRun, signing_key_configured=$hasKey)"
+          if ($enableUpdater) {
+            $overrideObj["plugins"] = @{
+              updater = @{
+                pubkey = $env:TAURI_SIGNING_PUBLIC_KEY.Trim()
+                endpoints = @(
+                  "https://github.com/$($env:RELEASE_REPO)/releases/latest/download/latest.json"
+                )
+              }
+            }
+          } else {
+            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY -ErrorAction SilentlyContinue
+            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD -ErrorAction SilentlyContinue
+          }
+          $json = $overrideObj | ConvertTo-Json -Depth 6
+          [System.IO.File]::WriteAllText($overridePath, $json, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "createUpdaterArtifacts=$enableUpdater (dry_run=$isDryRun, private_key=$hasPrivateKey, public_key=$hasPublicKey)"
           pnpm exec tauri build `
             --target "${{ matrix.target }}" `
             --bundles msi,nsis `
             --config src-tauri/tauri.prebuilt-frontend.conf.json `
-            --config $overridePath
+            --config $overridePath `
+            '--' --locked
 
       - name: Build headless catcloud CLI
+        shell: pwsh
         run: cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
 
       - name: Stage Windows artifacts (MSI, NSIS, Portable ZIP, CLI ZIP)
+        shell: pwsh
         run: |
           node scripts/release/stage_windows.mjs `
             --target "${{ matrix.target }}" `
@@ -274,29 +304,57 @@ jobs:
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
+          RELEASE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          HAS_PRIV="false"
+          HAS_PUB="false"
+          if [[ -n "$(printf '%s' "${TAURI_SIGNING_PRIVATE_KEY:-}" | tr -d '[:space:]')" ]]; then
+            HAS_PRIV="true"
+          fi
+          if [[ -n "$(printf '%s' "${TAURI_SIGNING_PUBLIC_KEY:-}" | tr -d '[:space:]')" ]]; then
+            HAS_PUB="true"
+          fi
           ENABLE_UPDATER="false"
-          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && "$HAS_PRIV" == "true" && "$HAS_PUB" == "true" ]]; then
             ENABLE_UPDATER="true"
           fi
           OVERRIDE_PATH="${RUNNER_TEMP}/tauri-release-override.json"
-          cat > "$OVERRIDE_PATH" <<EOF
-          {
-            "bundle": {
-              "createUpdaterArtifacts": ${ENABLE_UPDATER},
-              "resources": {
-                "resources/bin/mihomo": "resources/bin/mihomo"
-              }
+          RELEASE_VERSION="${{ needs.preflight.outputs.version }}" ENABLE_UPDATER="$ENABLE_UPDATER" OVERRIDE_PATH="$OVERRIDE_PATH" node -e '
+            const fs = require("node:fs");
+            const enable = process.env.ENABLE_UPDATER === "true";
+            const cfg = {
+              version: process.env.RELEASE_VERSION,
+              bundle: {
+                createUpdaterArtifacts: enable,
+                resources: {
+                  "resources/bin/mihomo": "resources/bin/mihomo",
+                },
+              },
+            };
+            if (enable) {
+              cfg.plugins = {
+                updater: {
+                  pubkey: process.env.TAURI_SIGNING_PUBLIC_KEY.trim(),
+                  endpoints: [
+                    `https://github.com/${process.env.RELEASE_REPO}/releases/latest/download/latest.json`,
+                  ],
+                },
+              };
             }
-          }
-          EOF
-          echo "createUpdaterArtifacts=${ENABLE_UPDATER}"
+            fs.writeFileSync(process.env.OVERRIDE_PATH, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+          '
+          if [[ "$ENABLE_UPDATER" != "true" ]]; then
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          fi
+          echo "createUpdaterArtifacts=${ENABLE_UPDATER} (dry_run=${{ needs.preflight.outputs.dry_run }}, private_key=${HAS_PRIV}, public_key=${HAS_PUB})"
           pnpm exec tauri build \
             --target "${{ matrix.target }}" \
             --bundles app,dmg \
             --config src-tauri/tauri.prebuilt-frontend.conf.json \
-            --config "$OVERRIDE_PATH"
+            --config "$OVERRIDE_PATH" \
+            -- --locked
 
       - name: Build headless catcloud CLI
         run: cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
@@ -343,6 +401,7 @@ jobs:
             rpm \
             squashfs-tools \
             file
+          sudo apt-get install -y --no-install-recommends libfuse2 || sudo apt-get install -y --no-install-recommends libfuse2t64 || true
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -379,29 +438,57 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: "1"
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
+          RELEASE_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          HAS_PRIV="false"
+          HAS_PUB="false"
+          if [[ -n "$(printf '%s' "${TAURI_SIGNING_PRIVATE_KEY:-}" | tr -d '[:space:]')" ]]; then
+            HAS_PRIV="true"
+          fi
+          if [[ -n "$(printf '%s' "${TAURI_SIGNING_PUBLIC_KEY:-}" | tr -d '[:space:]')" ]]; then
+            HAS_PUB="true"
+          fi
           ENABLE_UPDATER="false"
-          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && "$HAS_PRIV" == "true" && "$HAS_PUB" == "true" ]]; then
             ENABLE_UPDATER="true"
           fi
           OVERRIDE_PATH="${RUNNER_TEMP}/tauri-release-override.json"
-          cat > "$OVERRIDE_PATH" <<EOF
-          {
-            "bundle": {
-              "createUpdaterArtifacts": ${ENABLE_UPDATER},
-              "resources": {
-                "resources/bin/mihomo": "resources/bin/mihomo"
-              }
+          RELEASE_VERSION="${{ needs.preflight.outputs.version }}" ENABLE_UPDATER="$ENABLE_UPDATER" OVERRIDE_PATH="$OVERRIDE_PATH" node -e '
+            const fs = require("node:fs");
+            const enable = process.env.ENABLE_UPDATER === "true";
+            const cfg = {
+              version: process.env.RELEASE_VERSION,
+              bundle: {
+                createUpdaterArtifacts: enable,
+                resources: {
+                  "resources/bin/mihomo": "resources/bin/mihomo",
+                },
+              },
+            };
+            if (enable) {
+              cfg.plugins = {
+                updater: {
+                  pubkey: process.env.TAURI_SIGNING_PUBLIC_KEY.trim(),
+                  endpoints: [
+                    `https://github.com/${process.env.RELEASE_REPO}/releases/latest/download/latest.json`,
+                  ],
+                },
+              };
             }
-          }
-          EOF
-          echo "createUpdaterArtifacts=${ENABLE_UPDATER}"
+            fs.writeFileSync(process.env.OVERRIDE_PATH, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
+          '
+          if [[ "$ENABLE_UPDATER" != "true" ]]; then
+            unset TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          fi
+          echo "createUpdaterArtifacts=${ENABLE_UPDATER} (dry_run=${{ needs.preflight.outputs.dry_run }}, private_key=${HAS_PRIV}, public_key=${HAS_PUB})"
           pnpm exec tauri build \
             --target x86_64-unknown-linux-gnu \
             --bundles appimage,deb,rpm \
             --config src-tauri/tauri.prebuilt-frontend.conf.json \
-            --config "$OVERRIDE_PATH"
+            --config "$OVERRIDE_PATH" \
+            -- --locked
 
       - name: Build headless catcloud CLI
         run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p catcloud-cli --bin catcloud
@@ -470,10 +557,13 @@ jobs:
       - name: Build latest.json updater manifest
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PUBLIC_KEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           EXTRA_ARGS=()
-          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" && -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
+          if [[ "${{ needs.preflight.outputs.dry_run }}" != "true" \
+             && -n "$(printf '%s' "${TAURI_SIGNING_PRIVATE_KEY:-}" | tr -d '[:space:]')" \
+             && -n "$(printf '%s' "${TAURI_SIGNING_PUBLIC_KEY:-}" | tr -d '[:space:]')" ]]; then
             EXTRA_ARGS+=(--require-signatures)
           fi
           node scripts/release/build_latest_json.mjs \

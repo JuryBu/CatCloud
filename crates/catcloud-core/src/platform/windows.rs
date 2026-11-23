@@ -28,8 +28,7 @@ use windows_sys::Win32::System::Threading::{
 const INTERNET_SETTINGS_SUBKEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
 const STARTUP_SHORTCUT_NAME: &str = "CatCloud.lnk";
-const DEFAULT_PROXY_BYPASS: &str =
-    "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
+const DEFAULT_PROXY_BYPASS: &str = super::common::DEFAULT_WINDOWS_PROXY_BYPASS;
 
 /// Outcome of a Proxy Guard reconciliation tick.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,12 +298,7 @@ impl PlatformAdapter for WindowsPlatform {
             let override_val = if spec.bypass.is_empty() {
                 DEFAULT_PROXY_BYPASS.to_string()
             } else {
-                spec.bypass
-                    .iter()
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(";")
+                super::common::sanitize_windows_bypass_list(&spec.bypass).join(";")
             };
             key.set_sz("ProxyServer", &server)?;
             key.set_sz("ProxyOverride", &override_val)?;
@@ -384,49 +378,18 @@ impl PlatformAdapter for WindowsPlatform {
     }
 }
 
-/// Shared multi-shell proxy environment snippet formatter (PowerShell / CMD / Bash / Fish).
+/// Shared multi-shell proxy environment snippet formatter (PowerShell / CMD / Bash / Zsh / Fish).
 pub fn export_env_snippet_common(
     shell: &str,
     host: &str,
     http_port: u16,
     socks_port: u16,
 ) -> String {
-    let clean_host = sanitize_host(host);
-    let http_url = format!("http://{clean_host}:{http_port}");
-    let socks_url = format!("socks5h://{clean_host}:{socks_port}");
-    let no_proxy = "localhost,127.0.0.1,::1";
-
-    match shell.trim().to_ascii_lowercase().as_str() {
-        "cmd" | "bat" | "commandprompt" => format!(
-            "set HTTP_PROXY={http_url}\r\nset HTTPS_PROXY={http_url}\r\nset ALL_PROXY={socks_url}\r\nset NO_PROXY={no_proxy}"
-        ),
-        "bash" | "zsh" | "sh" | "gitbash" => format!(
-            "export HTTP_PROXY=\"{http_url}\"\nexport HTTPS_PROXY=\"{http_url}\"\nexport ALL_PROXY=\"{socks_url}\"\nexport NO_PROXY=\"{no_proxy}\""
-        ),
-        "fish" => format!(
-            "set -gx HTTP_PROXY \"{http_url}\"\nset -gx HTTPS_PROXY \"{http_url}\"\nset -gx ALL_PROXY \"{socks_url}\"\nset -gx NO_PROXY \"{no_proxy}\""
-        ),
-        // Default on Windows: PowerShell (`powershell`, `pwsh`, `ps`)
-        _ => format!(
-            "$env:HTTP_PROXY=\"{http_url}\"\n$env:HTTPS_PROXY=\"{http_url}\"\n$env:ALL_PROXY=\"{socks_url}\"\n$env:NO_PROXY=\"{no_proxy}\""
-        ),
-    }
+    super::common::format_shell_env_snippet(shell, host, http_port, socks_port, false)
 }
 
 fn sanitize_host(host: &str) -> String {
-    let trimmed = host.trim();
-    if trimmed.is_empty()
-        || trimmed
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '"' | '\'' | ';' | '\n' | '\r' | ' ' | '$'))
-    {
-        return "127.0.0.1".into();
-    }
-    if trimmed.contains(':') && !trimmed.starts_with('[') {
-        format!("[{trimmed}]")
-    } else {
-        trimmed.to_string()
-    }
+    super::common::sanitize_shell_host(host)
 }
 
 fn format_proxy_server(host: &str, port: u16) -> String {
@@ -540,17 +503,24 @@ pub fn detect_proxy_drift(
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
-        let mut exp_norm: Vec<String> = expected
+        let mut exp_raw_norm: Vec<String> = expected
             .bypass
             .iter()
             .map(|s| s.trim().to_ascii_lowercase())
             .filter(|s| !s.is_empty())
             .collect();
+        let mut exp_sanitized_norm: Vec<String> =
+            super::common::sanitize_windows_bypass_list(&expected.bypass)
+                .into_iter()
+                .map(|s| s.to_ascii_lowercase())
+                .collect();
         obs_norm.sort();
         obs_norm.dedup();
-        exp_norm.sort();
-        exp_norm.dedup();
-        if obs_norm != exp_norm {
+        exp_raw_norm.sort();
+        exp_raw_norm.dedup();
+        exp_sanitized_norm.sort();
+        exp_sanitized_norm.dedup();
+        if obs_norm != exp_raw_norm && obs_norm != exp_sanitized_norm {
             return Some("proxy bypass list modified externally".into());
         }
     }
@@ -991,14 +961,28 @@ mod tests {
         let ps = p.export_shell_env_snippet("powershell", "127.0.0.1", 7890, 7891);
         assert!(ps.contains("$env:HTTP_PROXY=\"http://127.0.0.1:7890\""));
         assert!(ps.contains("$env:ALL_PROXY=\"socks5h://127.0.0.1:7891\""));
+        assert!(ps.contains("$env:NO_PROXY=\"localhost,127.0.0.1,::1\""));
+        assert!(ps.contains("$env:no_proxy=\"localhost,127.0.0.1,::1\""));
 
         let cmd = p.export_shell_env_snippet("cmd", "127.0.0.1", 7890, 7891);
         assert!(cmd.contains("set HTTP_PROXY=http://127.0.0.1:7890"));
         assert!(cmd.contains("set ALL_PROXY=socks5h://127.0.0.1:7891"));
+        assert!(cmd.contains("set NO_PROXY=localhost,127.0.0.1,::1"));
+        assert!(cmd.contains("set no_proxy=localhost,127.0.0.1,::1"));
 
         let bash = p.export_shell_env_snippet("bash", "127.0.0.1", 7890, 7891);
         assert!(bash.contains("export HTTP_PROXY=\"http://127.0.0.1:7890\""));
         assert!(bash.contains("export ALL_PROXY=\"socks5h://127.0.0.1:7891\""));
+        assert!(bash.contains("export NO_PROXY=\"localhost,127.0.0.1,::1\""));
+        assert!(bash.contains("export no_proxy=\"localhost,127.0.0.1,::1\""));
+
+        let zsh = p.export_shell_env_snippet("zsh", "127.0.0.1", 7890, 7891);
+        assert!(zsh.contains("export NO_PROXY=\"localhost,127.0.0.1,::1\""));
+        assert!(zsh.contains("export no_proxy=\"localhost,127.0.0.1,::1\""));
+
+        let fish = p.export_shell_env_snippet("fish", "127.0.0.1", 7890, 7891);
+        assert!(fish.contains("set -gx NO_PROXY \"localhost,127.0.0.1,::1\""));
+        assert!(fish.contains("set -gx no_proxy \"localhost,127.0.0.1,::1\""));
     }
 
     #[test]

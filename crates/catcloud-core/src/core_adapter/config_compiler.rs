@@ -1240,9 +1240,11 @@ pub fn compile_mihomo_config_with_runtime_dir(
     // Conservative red line: never include broad overseas/hybrid root domains such as
     // `microsoft.com`, `apple.com`, `steampowered.com`, `steamcommunity.com`, `github.com`, etc.
     const ALWAYS_DOMESTIC_AND_SYSTEM_CDN_DOMAINS: &[&str] = &[
-        // Microsoft connectivity checks & Windows Update download CDNs
+        // Microsoft connectivity checks, Windows push notifications & Windows Update download CDNs
         "msftconnecttest.com",
         "msftncsi.com",
+        "wns.windows.com",
+        "notify.windows.com",
         "time.windows.com",
         "windowsupdate.com",
         "update.microsoft.com",
@@ -2399,12 +2401,33 @@ fn is_domestic_default_nameserver(entry: &str) -> bool {
     )
 }
 
+/// Decide whether `tun.device` should be emitted into Mihomo YAML for the given target OS.
+///
+/// On macOS, kernel utun interfaces strictly require `utun[0-9]*` naming (e.g. `utun9`).
+/// Emitting non-utun names such as `"CatCloud"` causes Mihomo to fail loading the config on
+/// macOS; omitting `device` lets Mihomo auto-allocate a valid `utun[0-9]*` device.
+pub fn should_emit_tun_device_name(target_os: &str, device_name: &str) -> bool {
+    let trimmed = device_name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if target_os.eq_ignore_ascii_case("macos") {
+        trimmed
+            .strip_prefix("utun")
+            .is_some_and(|rest| rest.bytes().all(|b| b.is_ascii_digit()))
+    } else {
+        true
+    }
+}
+
 fn build_tun_section(cfg: &AppConfig) -> Mapping {
     let tun = &cfg.tun;
     let mut map = Mapping::new();
     insert_bool(&mut map, "enable", tun.enabled);
     insert_str(&mut map, "stack", tun.stack_mode.as_str());
-    insert_str(&mut map, "device", &tun.device_name);
+    if should_emit_tun_device_name(std::env::consts::OS, &tun.device_name) {
+        insert_str(&mut map, "device", tun.device_name.trim());
+    }
     insert_bool(&mut map, "auto-route", tun.auto_route);
     insert_bool(&mut map, "auto-detect-interface", tun.auto_detect_interface);
     insert_bool(&mut map, "strict-route", tun.strict_route);
@@ -5077,6 +5100,103 @@ rules:
             .filter_map(Value::as_str)
             .collect();
         assert!(rules_upper.contains(&"GEOIP,CN,DIRECT,no-resolve"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn should_emit_tun_device_name_enforces_macos_utun_naming_and_allows_windows_linux() {
+        assert!(!should_emit_tun_device_name("macos", "CatCloud"));
+        assert!(!should_emit_tun_device_name("macos", "utun_bad"));
+        assert!(!should_emit_tun_device_name("macos", "   "));
+        assert!(should_emit_tun_device_name("macos", "utun9"));
+        assert!(should_emit_tun_device_name("macos", "utun"));
+        assert!(should_emit_tun_device_name("macos", "utun12"));
+
+        assert!(should_emit_tun_device_name("windows", "CatCloud"));
+        assert!(should_emit_tun_device_name("windows", "utun9"));
+        assert!(should_emit_tun_device_name("linux", "CatCloud"));
+        assert!(should_emit_tun_device_name("linux", "catcloud0"));
+        assert!(!should_emit_tun_device_name("windows", ""));
+        assert!(!should_emit_tun_device_name("linux", "  "));
+
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = true;
+        cfg.tun.device_name = "CatCloud".to_string();
+        let tun_map = build_tun_section(&cfg);
+        if cfg!(target_os = "macos") {
+            assert!(tun_map.get("device").is_none());
+        } else {
+            assert_eq!(tun_map.get("device").and_then(Value::as_str), Some("CatCloud"));
+        }
+
+        cfg.tun.device_name = "utun9".to_string();
+        let tun_utun = build_tun_section(&cfg);
+        assert_eq!(tun_utun.get("device").and_then(Value::as_str), Some("utun9"));
+    }
+
+    #[test]
+    fn conservative_domestic_direct_includes_system_push_notification_domains() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-compiler-push-direct-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = AppConfig::default();
+        let ports = sample_ports();
+        let nodes = vec![sample_node("n1", "Node-JP-01", 443, true)];
+        let empty = HashMap::new();
+        let input = CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        };
+
+        // Always emitted even without geosite.dat.
+        let without_geosite = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(without_geosite.validation.ok);
+        let rules_no_geo: Vec<&str> = without_geosite.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for domain in ["wns.windows.com", "notify.windows.com", "push.apple.com"] {
+            let expected = format!("DOMAIN-SUFFIX,{domain},DIRECT");
+            assert!(
+                rules_no_geo.contains(&expected.as_str()),
+                "missing conservative system push direct rule `{expected}`"
+            );
+        }
+
+        // Still emitted ahead of GEOSITE,cn,DIRECT when geosite.dat is present.
+        std::fs::write(dir.join("geosite.dat"), b"stub").unwrap();
+        let with_geosite = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        let rules_with_geo: Vec<&str> = with_geosite.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let idx_geosite = rules_with_geo
+            .iter()
+            .position(|r| *r == "GEOSITE,cn,DIRECT")
+            .expect("GEOSITE,cn,DIRECT must exist");
+        for domain in ["wns.windows.com", "notify.windows.com", "push.apple.com"] {
+            let expected = format!("DOMAIN-SUFFIX,{domain},DIRECT");
+            let idx = rules_with_geo
+                .iter()
+                .position(|r| *r == expected)
+                .unwrap_or_else(|| panic!("missing `{expected}` with geosite.dat"));
+            assert!(idx < idx_geosite);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

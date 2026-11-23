@@ -1,9 +1,12 @@
+use super::common::{
+    format_shell_env_snippet, macos_bypass_command_args, parse_macos_network_services,
+    render_macos_launch_agent_plist,
+};
 use super::{PlatformAdapter, PlatformCapabilities, SystemProxySpec};
 use crate::error::{CatError, CatResult};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const LAUNCH_AGENT_LABEL: &str = "io.catcloud.app";
 const LAUNCH_AGENT_FILENAME: &str = "io.catcloud.app.plist";
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -83,89 +86,62 @@ impl PlatformAdapter for MacosPlatform {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
+        let mut applied_count = 0usize;
+        let mut last_err: Option<CatError> = None;
+
         for service in &services {
-            if !spec.enabled {
-                run_networksetup(&["-setwebproxystate", service, "off"])?;
-                run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
-                run_networksetup(&["-setautoproxystate", service, "off"])?;
-            } else if let Some(pac_url) = pac {
-                run_networksetup(&["-setwebproxystate", service, "off"])?;
-                run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
-                run_networksetup(&["-setautoproxyurl", service, pac_url])?;
-                run_networksetup(&["-setautoproxystate", service, "on"])?;
-            } else {
-                let port_str = spec.port.to_string();
-                run_networksetup(&["-setautoproxystate", service, "off"])?;
-                run_networksetup(&["-setwebproxy", service, &spec.host, &port_str])?;
-                run_networksetup(&["-setsecurewebproxy", service, &spec.host, &port_str])?;
-                run_networksetup(&["-setwebproxystate", service, "on"])?;
-                run_networksetup(&["-setsecurewebproxystate", service, "on"])?;
-                if !spec.bypass.is_empty() {
-                    let mut cmd_args: Vec<&str> = Vec::with_capacity(spec.bypass.len() + 2);
-                    cmd_args.push("-setproxybypassdomains");
-                    cmd_args.push(service);
-                    for domain in &spec.bypass {
-                        if !domain.trim().is_empty() {
-                            cmd_args.push(domain.trim());
-                        }
-                    }
-                    run_networksetup(&cmd_args)?;
+            match apply_proxy_to_service(service, spec, pac) {
+                Ok(()) => applied_count += 1,
+                Err(err) => {
+                    tracing::warn!(
+                        service = %service,
+                        error = %err,
+                        "failed to update macOS system proxy on network service; continuing to next interface"
+                    );
+                    last_err = Some(err);
                 }
             }
         }
-        Ok(())
+
+        if applied_count > 0 {
+            return Ok(());
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            CatError::Process(
+                "failed to apply macOS system proxy to any active network service".into(),
+            )
+        }))
     }
 
     fn read_system_proxy(&self) -> CatResult<SystemProxySpec> {
         let services = list_active_network_services()?;
-        let Some(primary) = services.first() else {
-            return Ok(SystemProxySpec {
-                enabled: false,
-                host: "127.0.0.1".into(),
-                port: 7890,
-                bypass: Vec::new(),
-                pac_url: None,
-            });
-        };
+        if services.is_empty() {
+            return Ok(default_disabled_proxy_spec());
+        }
 
-        let web_out = run_networksetup(&["-getwebproxy", primary])?;
-        let auto_out = run_networksetup(&["-getautoproxyurl", primary]).unwrap_or_default();
-        let bypass_out = run_networksetup(&["-getproxybypassdomains", primary]).unwrap_or_default();
+        let mut first_ok: Option<SystemProxySpec> = None;
+        for service in &services {
+            match read_service_system_proxy(service) {
+                Ok(spec) => {
+                    if spec.enabled {
+                        return Ok(spec);
+                    }
+                    if first_ok.is_none() {
+                        first_ok = Some(spec);
+                    }
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        service = %service,
+                        error = %err,
+                        "skipping unreadable macOS network service during read_system_proxy"
+                    );
+                }
+            }
+        }
 
-        let web_enabled = parse_kv_field(&web_out, "Enabled")
-            .map(|v| v.eq_ignore_ascii_case("yes"))
-            .unwrap_or(false);
-        let host = parse_kv_field(&web_out, "Server")
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| "127.0.0.1".into());
-        let port = parse_kv_field(&web_out, "Port")
-            .and_then(|v| v.parse::<u16>().ok())
-            .filter(|&p| p > 0)
-            .unwrap_or(7890);
-
-        let auto_enabled = parse_kv_field(&auto_out, "Enabled")
-            .map(|v| v.eq_ignore_ascii_case("yes"))
-            .unwrap_or(false);
-        let pac_url = if auto_enabled {
-            parse_kv_field(&auto_out, "URL").filter(|v| !v.is_empty() && v != "(null)")
-        } else {
-            None
-        };
-
-        let bypass = bypass_out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty() && !l.starts_with("There aren't any"))
-            .map(ToString::to_string)
-            .collect();
-
-        Ok(SystemProxySpec {
-            enabled: web_enabled || pac_url.is_some(),
-            host,
-            port,
-            bypass,
-            pac_url,
-        })
+        Ok(first_ok.unwrap_or_else(default_disabled_proxy_spec))
     }
 
     fn set_autostart(&self, enabled: bool, exe_path: &Path, args: &[String]) -> CatResult<()> {
@@ -202,24 +178,112 @@ impl PlatformAdapter for MacosPlatform {
         http_port: u16,
         socks_port: u16,
     ) -> String {
-        let http_url = format!("http://{host}:{http_port}");
-        let socks_url = format!("socks5h://{host}:{socks_port}");
-        let no_proxy = "localhost,127.0.0.1,::1";
-        match shell.trim().to_ascii_lowercase().as_str() {
-            "fish" => format!(
-                "set -gx HTTP_PROXY \"{http_url}\"\nset -gx HTTPS_PROXY \"{http_url}\"\nset -gx ALL_PROXY \"{socks_url}\"\nset -gx NO_PROXY \"{no_proxy}\""
-            ),
-            "powershell" | "pwsh" | "ps" => format!(
-                "$env:HTTP_PROXY=\"{http_url}\"\n$env:HTTPS_PROXY=\"{http_url}\"\n$env:ALL_PROXY=\"{socks_url}\"\n$env:NO_PROXY=\"{no_proxy}\""
-            ),
-            "cmd" | "bat" => format!(
-                "set HTTP_PROXY={http_url}\nset HTTPS_PROXY={http_url}\nset ALL_PROXY={socks_url}\nset NO_PROXY={no_proxy}"
-            ),
-            _ => format!(
-                "export HTTP_PROXY=\"{http_url}\"\nexport HTTPS_PROXY=\"{http_url}\"\nexport ALL_PROXY=\"{socks_url}\"\nexport NO_PROXY=\"{no_proxy}\""
-            ),
-        }
+        format_shell_env_snippet(shell, host, http_port, socks_port, true)
     }
+}
+
+fn default_disabled_proxy_spec() -> SystemProxySpec {
+    SystemProxySpec {
+        enabled: false,
+        host: "127.0.0.1".into(),
+        port: 7890,
+        bypass: Vec::new(),
+        pac_url: None,
+    }
+}
+
+fn apply_proxy_to_service(
+    service: &str,
+    spec: &SystemProxySpec,
+    pac: Option<&str>,
+) -> CatResult<()> {
+    if !spec.enabled {
+        run_networksetup(&["-setwebproxystate", service, "off"])?;
+        run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
+        run_networksetup(&["-setsocksfirewallproxystate", service, "off"])?;
+        run_networksetup(&["-setautoproxystate", service, "off"])?;
+        return Ok(());
+    }
+
+    if let Some(pac_url) = pac {
+        run_networksetup(&["-setwebproxystate", service, "off"])?;
+        run_networksetup(&["-setsecurewebproxystate", service, "off"])?;
+        run_networksetup(&["-setsocksfirewallproxystate", service, "off"])?;
+        run_networksetup(&["-setautoproxyurl", service, pac_url])?;
+        run_networksetup(&["-setautoproxystate", service, "on"])?;
+        return Ok(());
+    }
+
+    let port_str = spec.port.to_string();
+    run_networksetup(&["-setautoproxystate", service, "off"])?;
+    run_networksetup(&["-setwebproxy", service, &spec.host, &port_str])?;
+    run_networksetup(&["-setsecurewebproxy", service, &spec.host, &port_str])?;
+    run_networksetup(&["-setsocksfirewallproxy", service, &spec.host, &port_str])?;
+    run_networksetup(&["-setwebproxystate", service, "on"])?;
+    run_networksetup(&["-setsecurewebproxystate", service, "on"])?;
+    run_networksetup(&["-setsocksfirewallproxystate", service, "on"])?;
+
+    let bypass_args = macos_bypass_command_args(&spec.bypass);
+    let mut cmd_args: Vec<&str> = Vec::with_capacity(bypass_args.len() + 2);
+    cmd_args.push("-setproxybypassdomains");
+    cmd_args.push(service);
+    for domain in &bypass_args {
+        cmd_args.push(domain.as_str());
+    }
+    run_networksetup(&cmd_args)?;
+    Ok(())
+}
+
+fn read_service_system_proxy(service: &str) -> CatResult<SystemProxySpec> {
+    let web_out = run_networksetup(&["-getwebproxy", service])?;
+    let socks_out = run_networksetup(&["-getsocksfirewallproxy", service]).unwrap_or_default();
+    let auto_out = run_networksetup(&["-getautoproxyurl", service]).unwrap_or_default();
+    let bypass_out = run_networksetup(&["-getproxybypassdomains", service]).unwrap_or_default();
+
+    let web_enabled = parse_kv_field(&web_out, "Enabled")
+        .map(|v| v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    let socks_enabled = parse_kv_field(&socks_out, "Enabled")
+        .map(|v| v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+
+    let endpoint_source = if web_enabled || !socks_enabled {
+        &web_out
+    } else {
+        &socks_out
+    };
+
+    let host = parse_kv_field(endpoint_source, "Server")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".into());
+    let port = parse_kv_field(endpoint_source, "Port")
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&p| p > 0)
+        .unwrap_or(7890);
+
+    let auto_enabled = parse_kv_field(&auto_out, "Enabled")
+        .map(|v| v.eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    let pac_url = if auto_enabled {
+        parse_kv_field(&auto_out, "URL").filter(|v| !v.is_empty() && v != "(null)")
+    } else {
+        None
+    };
+
+    let bypass = bypass_out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with("There aren't any"))
+        .map(ToString::to_string)
+        .collect();
+
+    Ok(SystemProxySpec {
+        enabled: web_enabled || socks_enabled || pac_url.is_some(),
+        host,
+        port,
+        bypass,
+        pac_url,
+    })
 }
 
 fn launch_agents_dir() -> CatResult<PathBuf> {
@@ -245,24 +309,7 @@ fn run_networksetup(args: &[&str]) -> CatResult<String> {
 
 fn list_active_network_services() -> CatResult<Vec<String>> {
     let raw = run_networksetup(&["-listallnetworkservices"])?;
-    let mut services: Vec<String> = raw
-        .lines()
-        .skip(1)
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('*'))
-        .map(ToString::to_string)
-        .collect();
-    // Prioritize Wi-Fi / Ethernet at front so read_system_proxy inspects the primary interface.
-    services.sort_by_key(|name| {
-        if name.eq_ignore_ascii_case("Wi-Fi") {
-            0
-        } else if name.contains("Ethernet") || name.contains("LAN") {
-            1
-        } else {
-            2
-        }
-    });
-    Ok(services)
+    Ok(parse_macos_network_services(&raw))
 }
 
 fn parse_kv_field(output: &str, key: &str) -> Option<String> {
@@ -276,41 +323,6 @@ fn parse_kv_field(output: &str, key: &str) -> Option<String> {
     None
 }
 
-fn xml_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 fn render_launch_agent_plist(exe_path: &Path, args: &[String]) -> String {
-    let mut prog_args = String::new();
-    prog_args.push_str(&format!(
-        "        <string>{}</string>\n",
-        xml_escape(&exe_path.to_string_lossy())
-    ));
-    for arg in args {
-        prog_args.push_str(&format!("        <string>{}</string>\n", xml_escape(arg)));
-    }
-
-    format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-         <plist version=\"1.0\">\n\
-         <dict>\n\
-             <key>Label</key>\n\
-             <string>{LAUNCH_AGENT_LABEL}</string>\n\
-             <key>ProgramArguments</key>\n\
-             <array>\n\
-         {prog_args}\
-             </array>\n\
-             <key>RunAtLoad</key>\n\
-             <true/>\n\
-             <key>KeepAlive</key>\n\
-             <false/>\n\
-         </dict>\n\
-         </plist>\n"
-    )
+    render_macos_launch_agent_plist(exe_path, args)
 }

@@ -16,6 +16,7 @@ use catcloud_core::models::{
 use catcloud_core::platform::default_platform;
 use catcloud_core::preaccel::campus::{CampusBypassTracker, probe_campus_portal};
 use catcloud_core::preaccel::generator::{build_preaccel_compile_plan, validate_domestic_probe_url};
+use catcloud_core::preaccel::global_tunnel::locate_windivert_files;
 use catcloud_core::preaccel::schema::{
     evaluate_expiry, parse_mmrelay_clipboard, validate_relay_strict,
 };
@@ -247,6 +248,13 @@ pub struct GroupPolicyArgs {
     pub hard_gate: Vec<String>,
 }
 
+/// Platform-appropriate default shell for `config export-env`.
+const DEFAULT_EXPORT_SHELL: &str = if cfg!(target_os = "windows") {
+    "powershell"
+} else {
+    "bash"
+};
+
 #[derive(Subcommand, Debug)]
 pub enum PreaccelCommand {
     /// Import domestic :443 relays from an mmrelay/v1 JSON file or mmrelay://v1 URI
@@ -272,6 +280,8 @@ pub enum PreaccelCommand {
         #[arg(long)]
         campus: bool,
     },
+    /// Inspect standalone global domestic :443 pre-acceleration config and WinDivert readiness
+    GlobalStatus,
 }
 
 #[derive(Subcommand, Debug)]
@@ -290,7 +300,7 @@ pub enum ConfigCommand {
     },
     /// Output shell proxy environment variable commands
     ExportEnv {
-        #[arg(long, default_value = "powershell")]
+        #[arg(long, default_value = DEFAULT_EXPORT_SHELL)]
         shell: String,
     },
     /// Output 100% sanitized diagnostic summary
@@ -381,6 +391,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             let db = open_storage(paths)?;
             let plat = default_platform();
             let caps = plat.capabilities();
+            let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
             let out = json!({
                 "ok": true,
                 "version": env!("CARGO_PKG_VERSION"),
@@ -393,6 +404,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 "controller_addr": cfg.controller_addr(),
                 "dns_listen_addr": cfg.dns_listen_addr(),
                 "preaccel_enabled": cfg.preaccel.enabled,
+                "global_preaccel": {
+                    "enabled": cfg.preaccel.global_bypass_enabled,
+                    "scope": cfg.preaccel.global_scope,
+                    "windivert_available": wd_files.is_some(),
+                    "windivert_path": wd_files.as_ref().map(|(dll, _)| dll.to_string_lossy().to_string()),
+                    "is_elevated": caps.is_elevated,
+                },
                 "counts": {
                     "subscriptions": db.list_subscriptions()?.len(),
                     "nodes": db.list_nodes()?.len(),
@@ -402,13 +420,15 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 }
             });
             let human = format!(
-                "CatCloud CLI v{} | portable={} | mode={} | port={} | nodes={} | groups={}",
+                "CatCloud CLI v{} | portable={} | mode={} | port={} | nodes={} | groups={} | global_preaccel={} (windivert={})",
                 env!("CARGO_PKG_VERSION"),
                 paths.is_portable,
                 cfg.proxy_mode.as_str(),
                 cfg.mixed_port,
                 db.list_nodes()?.len(),
-                db.list_multi_groups()?.len()
+                db.list_multi_groups()?.len(),
+                cfg.preaccel.global_bypass_enabled,
+                wd_files.is_some()
             );
             emit_output(as_json, &out, &human)
         }
@@ -1095,6 +1115,11 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     ),
                 )
             }
+
+            PreaccelCommand::GlobalStatus => {
+                let (out, human) = build_global_preaccel_status_payload(paths)?;
+                emit_output(as_json, &out, &human)
+            }
         },
 
         Commands::Config { action } => match action {
@@ -1667,12 +1692,69 @@ fn collect_geodata_status(runtime_dir: &std::path::Path) -> Value {
     })
 }
 
+fn build_global_preaccel_status_payload(paths: &AppPaths) -> Result<(Value, String)> {
+    let cfg = config::load_or_init(paths)?;
+    let db = open_storage(paths)?;
+    let plat = default_platform();
+    let caps = plat.capabilities();
+    let enabled_relays = db.list_preaccel_relays(true)?;
+    let active_relay_names: Vec<String> = enabled_relays
+        .iter()
+        .map(|r| {
+            if !r.name.trim().is_empty() {
+                r.name.trim().to_string()
+            } else {
+                r.id.trim().to_string()
+            }
+        })
+        .collect();
+    let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
+    let windivert_available = wd_files.is_some();
+    let bin_res = resolve_mihomo_binary(&cfg, paths, &[], false)?;
+    let recommended_mode = if cfg!(target_os = "windows") && caps.is_elevated && windivert_available {
+        "windivert"
+    } else {
+        "local_socks5"
+    };
+
+    let out = json!({
+        "ok": true,
+        "os": caps.os,
+        "arch": caps.arch,
+        "is_elevated": caps.is_elevated,
+        "global_bypass_enabled": cfg.preaccel.global_bypass_enabled,
+        "global_scope": cfg.preaccel.global_scope,
+        "global_target_processes": cfg.preaccel.global_target_processes,
+        "windivert_dir": cfg.preaccel.windivert_dir,
+        "windivert_available": windivert_available,
+        "windivert_dll": wd_files.as_ref().map(|(dll, _)| dll.to_string_lossy().to_string()),
+        "windivert_sys": wd_files.as_ref().map(|(_, sys)| sys.to_string_lossy().to_string()),
+        "mihomo_available": bin_res.found,
+        "enabled_relay_count": active_relay_names.len(),
+        "active_relays": active_relay_names,
+        "recommended_mode": recommended_mode,
+    });
+
+    let human = format!(
+        "Global Pre-Accel: enabled={} | scope={} | relays={} | windivert_ready={} | elevated={} | recommended_mode={}",
+        cfg.preaccel.global_bypass_enabled,
+        cfg.preaccel.global_scope.as_str(),
+        enabled_relays.len(),
+        windivert_available,
+        caps.is_elevated,
+        recommended_mode
+    );
+
+    Ok((out, human))
+}
+
 fn build_diag_payload(paths: &AppPaths) -> Result<Value> {
     let cfg = config::load_or_init(paths)?;
     let db = open_storage(paths)?;
     let plat = default_platform();
     let caps = plat.capabilities();
     let geodata_status = collect_geodata_status(&paths.runtime_dir);
+    let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
     let recent_logs =
         read_sanitized_log_tail(&paths.logs_dir.join("catcloud.log"), MAX_DIAG_LOG_LINES);
     Ok(json!({
@@ -1700,6 +1782,9 @@ fn build_diag_payload(paths: &AppPaths) -> Result<Value> {
         "block_quic_udp_443": cfg.rules_override.block_quic_udp_443,
         "preaccel_enabled": cfg.preaccel.enabled,
         "skip_443_native": cfg.preaccel.skip_443_native,
+        "global_preaccel_enabled": cfg.preaccel.global_bypass_enabled,
+        "global_preaccel_scope": cfg.preaccel.global_scope,
+        "windivert_available": wd_files.is_some(),
         "compile_all_nodes": cfg.core_runtime.compile_all_nodes,
         "geodata_status": geodata_status,
         "recent_logs": recent_logs,
@@ -2136,6 +2221,39 @@ mod tests {
             assert!(s.contains("token=<REDACTED>"));
             assert!(s.contains("ip=<REDACTED_IPV6>"));
         }
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn global_preaccel_status_payload_reports_config_and_windivert_readiness() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-global-preaccel-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        let mut cfg = config::load_or_init(&paths).expect("init config");
+        cfg.preaccel.global_bypass_enabled = true;
+        config::save(&paths, &cfg).expect("save config");
+
+        let (payload_before, human_before) =
+            build_global_preaccel_status_payload(&paths).expect("status before windivert");
+        assert_eq!(payload_before["ok"], json!(true));
+        assert_eq!(payload_before["global_bypass_enabled"], json!(true));
+        assert_eq!(payload_before["global_scope"], json!("proxy_apps_only"));
+        assert_eq!(payload_before["windivert_available"], json!(false));
+        assert!(human_before.contains("enabled=true"));
+
+        std::fs::write(paths.bin_dir.join("WinDivert64.dll"), b"stub-dll").unwrap();
+        std::fs::write(paths.bin_dir.join("WinDivert64.sys"), b"stub-sys").unwrap();
+
+        let (payload_after, _) =
+            build_global_preaccel_status_payload(&paths).expect("status after windivert");
+        assert_eq!(payload_after["windivert_available"], json!(true));
+        assert!(payload_after["windivert_dll"].as_str().is_some());
+        assert!(payload_after["windivert_sys"].as_str().is_some());
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

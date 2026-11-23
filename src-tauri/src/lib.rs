@@ -4,7 +4,7 @@ pub mod lifecycle;
 pub mod shortcuts;
 pub mod tray;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -30,6 +30,7 @@ pub fn run() {
     let paths =
         AppPaths::resolve(cli_data_dir).expect("failed to resolve CatCloud runtime paths");
     // SAFETY: Fallback entrypoint before Tauri threads spawn.
+    #[cfg(target_os = "windows")]
     unsafe {
         lifecycle::set_webview2_user_data_env(&paths);
     }
@@ -88,6 +89,7 @@ pub fn run_with_paths(paths: AppPaths) {
     let silent_flag = has_cli_flag("--silent");
     let post_update_cleanup = has_cli_flag("--post-update-cleanup");
     let enable_tun_flag = has_cli_flag("--enable-tun");
+    let enable_global_preaccel_flag = has_cli_flag("--enable-global-preaccel");
 
     if post_update_cleanup {
         let _ = catcloud_core::updater::run_post_update_cleanup(&paths.backup_dir);
@@ -116,7 +118,10 @@ pub fn run_with_paths(paths: AppPaths) {
         return;
     }
 
-    let job_guard = Arc::new(JobGuard::new().expect("failed to initialize process JobGuard"));
+    let job_guard = Arc::new(
+        JobGuard::with_pid_file(Some(paths.runtime_dir.join("core.pid")))
+            .expect("failed to initialize process JobGuard"),
+    );
     let cfg = config::load_or_init(&paths).unwrap_or_default();
     let mut storage = Storage::open(&paths.db_path).expect("failed to open CatCloud SQLite store");
     let _ = storage.seed_builtin_probes();
@@ -143,6 +148,16 @@ pub fn run_with_paths(paths: AppPaths) {
 
     let mut context = tauri::generate_context!();
     lifecycle::apply_portable_overrides(&mut context, &paths);
+    #[cfg(target_os = "macos")]
+    {
+        for win_cfg in &mut context.config_mut().app.windows {
+            if win_cfg.label == lifecycle::MAIN_WINDOW_LABEL {
+                win_cfg.decorations = true;
+                win_cfg.title_bar_style = tauri::TitleBarStyle::Overlay;
+                win_cfg.hidden_title = true;
+            }
+        }
+    }
 
     let instance_guard_slot = Arc::new(Mutex::new(instance_guard));
     let wake_guard_ref = Arc::clone(&instance_guard_slot);
@@ -165,10 +180,6 @@ pub fn run_with_paths(paths: AppPaths) {
     let mut builder = tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_autostart::init(
-            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-            Some(vec!["--silent"]),
-        ))
         .plugin(shortcuts::build_plugin());
 
     if has_updater_plugin_cfg {
@@ -223,6 +234,11 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::upsert_preaccel_relay,
             commands::delete_preaccel_relay,
             commands::toggle_preaccel,
+            commands::get_global_preaccel_status,
+            commands::toggle_global_preaccel,
+            commands::update_global_preaccel_settings,
+            commands::install_windivert_driver,
+            commands::relaunch_as_admin_for_global_preaccel,
             commands::select_preaccel_relay,
             commands::failover_preaccel,
             commands::test_preaccel_relays,
@@ -263,6 +279,11 @@ pub fn run_with_paths(paths: AppPaths) {
         .setup(move |app| {
             let handle = app.handle().clone();
 
+            #[cfg(target_os = "macos")]
+            if let Err(err) = install_macos_native_menu(&handle) {
+                tracing::warn!("failed to install macOS native application menu: {err}");
+            }
+
             // Inject Tauri bundle resource_dir into AppState for cross-platform bundled Mihomo lookup.
             let state = handle.state::<AppState>();
             state.set_resource_dir(app.path().resource_dir().ok());
@@ -280,7 +301,7 @@ pub fn run_with_paths(paths: AppPaths) {
 
             // Spawn background telemetry event forwarders feeding frontend sparklines, logs, and tray tooltip.
             spawn_telemetry_forwarders(&handle, &state);
-            // Spawn background Windows ProxyGuard watchdog preventing third-party proxy hijacking.
+            // Spawn background cross-platform ProxyGuard watchdog preventing third-party proxy hijacking.
             spawn_proxy_guard(&handle);
             // Spawn background multi-group health watchdog driving automatic failover for StickyBest/ConditionalPool.
             spawn_group_strategy_watchdog(&handle);
@@ -377,7 +398,21 @@ pub fn run_with_paths(paths: AppPaths) {
                         tauri::async_runtime::spawn(async move {
                             if let Some(st) = app_async.try_state::<AppState>() {
                                 let next = !st.snapshot_config().preaccel.enabled;
-                                let _ = commands::toggle_preaccel(app_async.clone(), st, next).await;
+                                let _ = commands::toggle_preaccel_internal(&app_async, &st, next).await;
+                            }
+                        });
+                    }
+                    TrayAction::ToggleGlobalPreAccel => {
+                        tauri::async_runtime::spawn(async move {
+                            if let Some(st) = app_async.try_state::<AppState>() {
+                                let currently_on = st.snapshot_global_preaccel().running
+                                    || st.snapshot_config().preaccel.global_bypass_enabled;
+                                let _ = commands::toggle_global_preaccel_internal(
+                                    &app_async,
+                                    &st,
+                                    !currently_on,
+                                )
+                                .await;
                             }
                         });
                     }
@@ -411,8 +446,12 @@ pub fn run_with_paths(paths: AppPaths) {
                     }
                     TrayAction::CopyShellEnv => {
                         if let Some(st) = app_h.try_state::<AppState>() {
+                            #[cfg(target_os = "windows")]
+                            let default_shell = "powershell";
+                            #[cfg(not(target_os = "windows"))]
+                            let default_shell = "bash";
                             let snippet =
-                                commands::export_shell_env(st, "powershell".to_string());
+                                commands::export_shell_env(st, default_shell.to_string());
                             let _ = commands::copy_text_to_clipboard(&snippet);
                         }
                     }
@@ -511,11 +550,64 @@ pub fn run_with_paths(paths: AppPaths) {
                             return;
                         }
 
+                        if enable_global_preaccel_flag {
+                            match commands::toggle_global_preaccel_internal(&auto_handle, &st, true)
+                                .await
+                            {
+                                Ok(global_st) => {
+                                    st.log_app_event(
+                                        "info",
+                                        "国内提速",
+                                        &format!(
+                                            "已通过提权启动参数自动启用独立底层全局国内提速（模式：{}）",
+                                            global_st.mode
+                                        ),
+                                    );
+                                }
+                                Err(err) => {
+                                    st.log_app_event(
+                                        "error",
+                                        "国内提速",
+                                        &format!("--enable-global-preaccel 启动底层全局提速失败：{err}"),
+                                    );
+                                }
+                            }
+                        }
+
                         let cfg = st.snapshot_config();
                         if !(cfg.system_proxy.enabled || cfg.tun.enabled) {
                             tracing::info!(
                                 "auto-start core skipped: system_proxy and tun are both disabled"
                             );
+                            if !enable_global_preaccel_flag
+                                && cfg.preaccel.enabled
+                                && cfg.preaccel.global_bypass_enabled
+                                && !st.global_preaccel.status().running
+                            {
+                                match commands::toggle_global_preaccel_internal(
+                                    &auto_handle,
+                                    &st,
+                                    true,
+                                )
+                                .await
+                                {
+                                    Ok(global_st) => {
+                                        st.log_app_event(
+                                            "info",
+                                            "国内提速",
+                                            &format!(
+                                                "启动时自动恢复独立底层全局国内提速（模式：{}）",
+                                                global_st.mode
+                                            ),
+                                        );
+                                    }
+                                    Err(err) => {
+                                        tracing::info!(
+                                            "auto-start standalone global preaccel skipped: {err}"
+                                        );
+                                    }
+                                }
+                            }
                             return;
                         }
                         let has_nodes = commands::has_enabled_nodes(&st).unwrap_or(false);
@@ -549,6 +641,59 @@ pub fn run_with_paths(paths: AppPaths) {
     app.run(move |app_handle, event| {
         lifecycle::handle_run_event(app_handle, event, &mut cleanup);
     });
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_native_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, PredefinedMenuItem, Submenu};
+
+    let app_menu = Submenu::with_items(
+        app,
+        "CatCloud",
+        true,
+        &[
+            &PredefinedMenuItem::about(app, Some("关于 猫猫云梯"), None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::services(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::hide(app, None)?,
+            &PredefinedMenuItem::hide_others(app, None)?,
+            &PredefinedMenuItem::show_all(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::quit(app, None)?,
+        ],
+    )?;
+
+    let edit_menu = Submenu::with_items(
+        app,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(app, None)?,
+            &PredefinedMenuItem::redo(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::cut(app, None)?,
+            &PredefinedMenuItem::copy(app, None)?,
+            &PredefinedMenuItem::paste(app, None)?,
+            &PredefinedMenuItem::select_all(app, None)?,
+        ],
+    )?;
+
+    let window_menu = Submenu::with_items(
+        app,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(app, None)?,
+            &PredefinedMenuItem::maximize(app, None)?,
+            &PredefinedMenuItem::separator(app)?,
+            &PredefinedMenuItem::close_window(app, None)?,
+        ],
+    )?;
+
+    let menu = Menu::with_items(app, &[&app_menu, &edit_menu, &window_menu])?;
+    let _ = app.set_menu(menu)?;
+    Ok(())
 }
 
 fn spawn_proxy_guard(app: &tauri::AppHandle) {
@@ -585,33 +730,34 @@ fn spawn_proxy_guard(app: &tauri::AppHandle) {
                 continue;
             }
 
-            #[cfg(target_os = "windows")]
-            {
-                let app_blocking = app_h.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let Some(st) = app_blocking.try_state::<AppState>() else {
-                        return;
-                    };
-                    let _proxy_guard = st
-                        .system_proxy_lock
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if st.shutting_down.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    let latest_cfg = st.snapshot_config();
-                    if !(latest_cfg.system_proxy.enabled
-                        && latest_cfg.system_proxy.proxy_guard.enabled)
-                    {
-                        return;
-                    }
-                    let rt = st.snapshot_runtime();
-                    let port = if rt.running {
-                        rt.mixed_port
-                    } else {
-                        latest_cfg.mixed_port
-                    };
-                    let expected = latest_cfg.system_proxy.to_platform_spec("127.0.0.1", port);
+            let app_blocking = app_h.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let Some(st) = app_blocking.try_state::<AppState>() else {
+                    return;
+                };
+                let _proxy_guard = st
+                    .system_proxy_lock
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if st.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                let latest_cfg = st.snapshot_config();
+                if !(latest_cfg.system_proxy.enabled
+                    && latest_cfg.system_proxy.proxy_guard.enabled)
+                {
+                    return;
+                }
+                let rt = st.snapshot_runtime();
+                let port = if rt.running {
+                    rt.mixed_port
+                } else {
+                    latest_cfg.mixed_port
+                };
+                let expected = latest_cfg.system_proxy.to_platform_spec("127.0.0.1", port);
+
+                #[cfg(target_os = "windows")]
+                {
                     let plat = catcloud_core::platform::windows::WindowsPlatform::new();
                     match plat.proxy_guard_tick(&expected) {
                         Ok(report) if report.drifted => {
@@ -631,11 +777,86 @@ fn spawn_proxy_guard(app: &tauri::AppHandle) {
                             tracing::debug!("proxy_guard_tick failed: {err}");
                         }
                     }
-                })
-                .await;
-            }
+                }
+
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let plat = default_platform();
+                    match plat.read_system_proxy() {
+                        Ok(observed) => {
+                            let drifted = observed.enabled != expected.enabled
+                                || (expected.enabled
+                                    && (observed.pac_url != expected.pac_url
+                                        || (expected.pac_url.is_none()
+                                            && (observed.host != expected.host
+                                                || observed.port != expected.port))));
+                            if drifted {
+                                if let Err(err) = plat.apply_system_proxy(&expected) {
+                                    tracing::debug!("proxy_guard_tick repair failed: {err}");
+                                } else {
+                                    st.log_app_event(
+                                        "warning",
+                                        "代理守护",
+                                        &format!(
+                                            "ProxyGuard 检测到系统代理偏离，已自动恢复至 127.0.0.1:{port}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!("proxy_guard_tick read failed: {err}");
+                        }
+                    }
+                }
+            })
+            .await;
         }
     });
+}
+
+async fn probe_compiled_proxy_delay(
+    http_client: &reqwest::Client,
+    ctrl_host: &str,
+    port: u16,
+    secret: &str,
+    compiled_proxy: &str,
+    timeout_ms: u64,
+) -> Option<u64> {
+    let encoded_proxy = commands::percent_encode_path_segment(compiled_proxy);
+    let delay_url = format!(
+        "http://{ctrl_host}:{port}/proxies/{encoded_proxy}/delay?url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout={timeout_ms}"
+    );
+    let mut req = http_client.get(&delay_url);
+    if !secret.trim().is_empty() {
+        req = req.bearer_auth(secret);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("delay").and_then(|d| d.as_u64()))
+            .filter(|&delay| delay > 0),
+        _ => None,
+    }
+}
+
+fn is_watchdog_high_throughput(st: &AppState) -> bool {
+    let cached = st
+        .cached_metrics
+        .read()
+        .map(|m| *m)
+        .unwrap_or_default();
+    let recent_ticks = st.telemetry.traffic_snapshot();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    commands::is_high_throughput_active(
+        &cached,
+        &recent_ticks,
+        now_ms,
+        commands::WATCHDOG_HIGH_THROUGHPUT_WINDOW_MS,
+        commands::WATCHDOG_HIGH_THROUGHPUT_THRESHOLD_BPS,
+    )
 }
 
 fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
@@ -651,12 +872,22 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
             return;
         };
 
+        const FAILED_NODE_COOLDOWN: Duration = Duration::from_secs(300);
+        const ALL_CANDIDATES_FAILED_BACKOFF: Duration = Duration::from_secs(180);
+        const MAX_FAILOVER_CANDIDATES: usize = 3;
+        const CANDIDATE_PROBE_TIMEOUT_MS: u64 = 3500;
+
         let mut consecutive_fail_counts: HashMap<String, u32> = HashMap::new();
         let mut last_auto_switch_at: HashMap<String, Instant> = HashMap::new();
+        let mut failed_group_backoff_until: HashMap<String, Instant> = HashMap::new();
         let mut last_checked_node: HashMap<String, String> = HashMap::new();
+        let mut failed_node_cooldowns: HashMap<String, Instant> = HashMap::new();
 
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
+
+            // Purge expired 5-minute bounce-back cooldowns at the start of every cycle.
+            failed_node_cooldowns.retain(|_, t| t.elapsed() < FAILED_NODE_COOLDOWN);
 
             let Some(st) = app_h.try_state::<AppState>() else {
                 break;
@@ -684,6 +915,18 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                 consecutive_fail_counts.clear();
                 continue;
             }
+
+            // Guard #1: suppress probing & reset failure counters whenever sustained high-throughput
+            // traffic (>= 256 KiB/s within the 10s sliding window) is active, protecting large
+            // uploads/downloads from spurious mid-transfer failover even while minimized.
+            if is_watchdog_high_throughput(&st) {
+                consecutive_fail_counts.clear();
+                tracing::debug!(
+                    "group strategy watchdog skipped round: active high-throughput transfer detected"
+                );
+                continue;
+            }
+
             let secret = st.adapter.controller_secret().await;
 
             // Snapshot groups & nodes under a brief sync lock; NEVER hold across `.await`.
@@ -731,6 +974,8 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
             consecutive_fail_counts
                 .retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
             last_auto_switch_at.retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
+            failed_group_backoff_until
+                .retain(|gid, until| Instant::now() < *until && target_groups.iter().any(|(g, _)| &g.id == gid));
             last_checked_node.retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
 
             if target_groups.is_empty() {
@@ -747,6 +992,10 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                 if st.shutting_down.load(Ordering::SeqCst) {
                     break;
                 }
+                if is_watchdog_high_throughput(&st) {
+                    consecutive_fail_counts.clear();
+                    break;
+                }
                 let Some(active_node) = commands::resolve_valid_group_active_node(&group, &nodes)
                 else {
                     continue;
@@ -755,31 +1004,29 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     != Some(active_node.id.as_str())
                 {
                     consecutive_fail_counts.remove(&group.id);
+                    failed_group_backoff_until.remove(&group.id);
                     last_checked_node.insert(group.id.clone(), active_node.id.clone());
+                }
+
+                if failed_group_backoff_until
+                    .get(&group.id)
+                    .is_some_and(|until| Instant::now() < *until)
+                {
+                    continue;
                 }
 
                 let compiled_proxy =
                     st.resolve_compiled_proxy_name(&active_node.id, &active_node.name);
-                let encoded_proxy = commands::percent_encode_path_segment(&compiled_proxy);
-                let delay_url = format!(
-                    "http://{ctrl_host}:{}/proxies/{encoded_proxy}/delay?url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout=4500",
-                    rt.controller_port
-                );
-
-                let mut req = http_client.get(&delay_url);
-                if !secret.trim().is_empty() {
-                    req = req.bearer_auth(&secret);
-                }
-
-                let healthy = match req.send().await {
-                    Ok(resp) if resp.status().is_success() => resp
-                        .json::<serde_json::Value>()
-                        .await
-                        .ok()
-                        .and_then(|v| v.get("delay").and_then(|d| d.as_u64()))
-                        .is_some_and(|delay| delay > 0),
-                    _ => false,
-                };
+                let healthy = probe_compiled_proxy_delay(
+                    &http_client,
+                    &ctrl_host,
+                    rt.controller_port,
+                    &secret,
+                    &compiled_proxy,
+                    4500,
+                )
+                .await
+                .is_some();
 
                 if healthy {
                     // Healthy active node: reset failure counter and stay sticky (zero IP drift).
@@ -810,8 +1057,25 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     continue;
                 }
 
-                // Re-read latest group, nodes, and probe snapshots under a brief sync lock before switching.
-                let switch_plan = st.storage.lock().ok().and_then(|db| {
+                // Guard #1 (re-check): abort failover if high-throughput transfer started during probe.
+                if is_watchdog_high_throughput(&st) {
+                    consecutive_fail_counts.clear();
+                    tracing::debug!(
+                        group = %group.name,
+                        "group strategy watchdog aborted failover: high-throughput transfer active"
+                    );
+                    continue;
+                }
+
+                // Guard #2: record the just-failed active node into 5-minute bounce-back cooldown.
+                failed_node_cooldowns.retain(|_, t| t.elapsed() < FAILED_NODE_COOLDOWN);
+                failed_node_cooldowns.insert(active_node.id.clone(), Instant::now());
+                let cooldown_ids: HashSet<String> =
+                    failed_node_cooldowns.keys().cloned().collect();
+
+                // Re-read latest group, nodes, and probe snapshots under a brief sync lock before
+                // ranking up to 3 backup candidates (excluding active & 5-minute cooldown nodes).
+                let candidate_plan = st.storage.lock().ok().and_then(|db| {
                     let latest_group = db.get_multi_group(&group.id).ok().flatten()?;
                     let latest_nodes = db.list_nodes().ok()?;
                     let latest_active =
@@ -827,32 +1091,116 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                             latest_group.primary_probe_id.as_deref(),
                         )
                         .unwrap_or_default();
-                    let next_id = commands::pick_best_group_candidate(
+                    let candidate_ids = commands::pick_group_candidates_with_cooldown(
                         &latest_group,
                         &latest_nodes,
                         &snaps,
                         Some(&active_node.id),
-                    )?;
-                    let next_name = latest_nodes
-                        .iter()
-                        .find(|n| n.id == next_id)
-                        .map(|n| n.name.clone())
-                        .unwrap_or_else(|| next_id.clone());
-                    Some((latest_group.id, latest_group.name, next_id, next_name))
+                        &cooldown_ids,
+                        MAX_FAILOVER_CANDIDATES,
+                    );
+                    if candidate_ids.is_empty() {
+                        return None;
+                    }
+                    let candidates: Vec<(String, String, String)> = candidate_ids
+                        .into_iter()
+                        .map(|cid| {
+                            let cname = latest_nodes
+                                .iter()
+                                .find(|n| n.id == cid)
+                                .map(|n| n.name.clone())
+                                .unwrap_or_else(|| cid.clone());
+                            let compiled = st.resolve_compiled_proxy_name(&cid, &cname);
+                            (cid, cname, compiled)
+                        })
+                        .collect();
+                    Some((latest_group.id, latest_group.name, candidates))
                 });
 
-                let Some((gid, gname, next_id, next_name)) = switch_plan else {
+                let Some((gid, gname, candidates)) = candidate_plan else {
                     continue;
                 };
 
-                // Re-check latest user config right before failover: if user switched to Single
-                // node mode or Direct mode during the 4.5s probe window, abort silently.
-                // Always switch in-place (`activate_group = false`) so background failover never
-                // hijacks the user's selected route mode or primary active group.
+                // Guard #3: sequentially live-probe top 3 candidates outside sync locks (`timeout=3500ms`),
+                // placing any failed candidate immediately into 5-minute cooldown and refusing blind switches.
+                let mut verified_candidate: Option<(String, String, u64)> = None;
+                let probed_total = candidates.len();
+                for (cand_id, cand_name, cand_compiled) in candidates {
+                    if st.shutting_down.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Some(delay_ms) = probe_compiled_proxy_delay(
+                        &http_client,
+                        &ctrl_host,
+                        rt.controller_port,
+                        &secret,
+                        &cand_compiled,
+                        CANDIDATE_PROBE_TIMEOUT_MS,
+                    )
+                    .await
+                    {
+                        verified_candidate = Some((cand_id, cand_name, delay_ms));
+                        break;
+                    }
+                    failed_node_cooldowns.insert(cand_id, Instant::now());
+                }
+
+                let Some((next_id, next_name, verified_delay_ms)) = verified_candidate else {
+                    consecutive_fail_counts.remove(&gid);
+                    let now = Instant::now();
+                    last_auto_switch_at.insert(gid.clone(), now);
+                    failed_group_backoff_until
+                        .insert(gid.clone(), now + ALL_CANDIDATES_FAILED_BACKOFF);
+                    st.log_app_event(
+                        "warning",
+                        "自动切优",
+                        &format!(
+                            "分组「{gname}」原节点「{}」连续 {fail_count} 次健康探活失败，但顺位前 {probed_total} 个备用候选实测探活均未通过，已记入 5 分钟冷却并进入 180 秒分组退避，放弃盲切",
+                            active_node.name
+                        ),
+                    );
+                    continue;
+                };
+
+                // Re-check latest user config and high-throughput state right before failover: if
+                // user switched to Single/Direct mode or started a large transfer during probing,
+                // abort cleanly without interrupting active connections.
                 let latest_cfg = st.snapshot_config();
                 if latest_cfg.route_mode != RouteTargetMode::Group
                     || latest_cfg.proxy_mode == ProxyMode::Direct
                 {
+                    continue;
+                }
+                if is_watchdog_high_throughput(&st) {
+                    consecutive_fail_counts.clear();
+                    continue;
+                }
+                // Guard #4: briefly re-verify DB `active_node_id` right before switching so we
+                // never overwrite a manual node selection made while backup candidates were probed.
+                let still_same_active = st
+                    .storage
+                    .lock()
+                    .ok()
+                    .and_then(|db| db.get_multi_group(&gid).ok().flatten())
+                    .map(|latest_group| {
+                        let unchanged_explicit = latest_group.active_node_id.as_deref()
+                            == Some(active_node.id.as_str());
+                        let unchanged_implicit = group.active_node_id.is_none()
+                            && latest_group.active_node_id.is_none();
+                        unchanged_explicit || unchanged_implicit
+                    })
+                    .unwrap_or(false);
+                if !still_same_active {
+                    consecutive_fail_counts.remove(&gid);
+                    failed_group_backoff_until.remove(&gid);
+                    st.log_app_event(
+                        "info",
+                        "自动切优",
+                        &format!(
+                            "分组「{gname}」在备用候选探活期间已被手动切换节点，后台守护已放弃本次自动覆盖（原探测节点：{}）",
+                            active_node.name
+                        ),
+                    );
                     continue;
                 }
                 let _ = is_primary;
@@ -872,7 +1220,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                         last_auto_switch_at.insert(gid.clone(), Instant::now());
                         last_checked_node.insert(gid.clone(), next_id.clone());
                         let reason = format!(
-                            "原节点连续 {fail_count} 次健康探活失败，已自动切换至最优备用节点"
+                            "原节点连续 {fail_count} 次健康探活失败，已验证并自动切换至可用备用节点（{verified_delay_ms} ms）"
                         );
                         st.log_app_event(
                             "warning",

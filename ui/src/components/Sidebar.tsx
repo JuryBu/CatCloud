@@ -32,6 +32,7 @@ import {
 } from "../store/appStore";
 import { MascotSprite } from "./MascotSprite";
 import { TrafficSparkline } from "./TrafficSparkline";
+import { resolvePlatformOs } from "../utils/platform";
 
 export interface NavItemSpec {
   id: NavRouteId;
@@ -101,28 +102,31 @@ const PROXY_MODES: ReadonlyArray<{ id: ProxyMode; label: string; hint: string }>
   { id: "direct", label: "直连", hint: "全部流量直接连接" },
 ];
 
-function resolveStatusLabel(status: string, running: boolean): string {
-  if (!running && status === "idle") return "待命状态";
-  switch (status) {
-    case "error":
-      return "核心异常";
-    case "warn":
-      return "路线存在波动";
-    case "preaccel":
-      return "国内提速运行中";
-    case "ok":
-      return "运行正常";
-    default:
-      return "待命状态";
+function resolveStatusLabel(
+  status: string,
+  proxyActive: boolean,
+  proxyPreAccelActive: boolean,
+  globalPreAccelRunning: boolean
+): string {
+  if (status === "error") return "核心异常";
+  if (status === "warn") return "路线存在波动";
+  if (proxyPreAccelActive && globalPreAccelRunning) return "全局 + 代理提速中";
+  if (proxyPreAccelActive) return "代理提速运行中";
+  if (!proxyActive) {
+    return globalPreAccelRunning ? "底层提速中" : "待命状态";
   }
+  if (globalPreAccelRunning) return "代理与底层提速中";
+  return "代理运行中";
 }
 
 export function Sidebar() {
   const activeNav = useAppSelector((s) => s.activeNav);
   const themeMode = useAppSelector((s) => s.config.personalization.theme_mode);
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
+  const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const runtime = useAppSelector((s) => s.runtime);
+  const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const isProbeRunning = useAppSelector((s) => s.probeProgress.running);
   const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
   const tunAdminPromptBusy = useAppSelector((s) => s.tunAdminPromptBusy);
@@ -130,6 +134,16 @@ export function Sidebar() {
 
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
+  const platformOs = resolvePlatformOs(runtime.os_label);
+  const proxyActive =
+    runtime.running && (runtime.system_proxy_enabled || runtime.tun_enabled);
+  const isGlobalPreAccelRunning = Boolean(
+    globalPreAccel.running || runtime.global_preaccel_active
+  );
+  const isPreAccelEnabled = Boolean(runtime.preaccel_enabled ?? preAccelEnabledConfig);
+  const isProxyPreAccelActive = proxyActive && isPreAccelEnabled;
+  const isPreAccelActive = isProxyPreAccelActive || isGlobalPreAccelRunning;
+  const isStandaloneGlobalOnly = !isProxyPreAccelActive && isGlobalPreAccelRunning;
 
   useEffect(() => {
     if (!tunAdminPromptOpen) return;
@@ -167,13 +181,46 @@ export function Sidebar() {
       ? "var(--red)"
       : runtime.status === "warn"
         ? "var(--amber)"
-        : runtime.status === "preaccel"
+        : isProxyPreAccelActive || isGlobalPreAccelRunning
           ? "var(--accent)"
-          : runtime.running
+          : proxyActive
             ? "var(--green)"
             : "var(--muted)";
 
-  const statusLabel = resolveStatusLabel(runtime.status, runtime.running);
+  const statusLabel = resolveStatusLabel(
+    runtime.status,
+    proxyActive,
+    isProxyPreAccelActive,
+    isGlobalPreAccelRunning
+  );
+
+  const tunElevationCopy =
+    platformOs === "linux"
+      ? {
+          ariaLabel: "为代理核心授予网络权限开启虚拟网卡",
+          title: "为代理核心授予网络权限并开启虚拟网卡",
+          desc: "虚拟网卡可接管终端、浏览器与桌面软件的全部流量。点击确认后，将通过系统授权仅给代理核心授予网络权限（cap_net_admin），界面继续以普通用户运行，不会污染个人配置目录。",
+          actionLabel: "一键授予核心网络权限",
+          busyLabel: "正在请求系统授权…",
+          buttonHint: "开启虚拟网卡需要给代理核心授予网络权限，点击可一键授权",
+        }
+      : platformOs === "macos"
+        ? {
+            ariaLabel: "安全授权开启虚拟网卡",
+            title: "安全授权开启虚拟网卡（macOS）",
+            desc: "虚拟网卡可接管终端与桌面软件的全部流量，在 macOS 下创建系统虚拟网卡（utun）需要管理员安全授权。确认后将弹出系统授权指引，完成验证后即可自动开启虚拟网卡。",
+            actionLabel: "前往系统授权并开启",
+            busyLabel: "正在请求系统授权…",
+            buttonHint: "开启虚拟网卡需要 macOS 系统安全授权，点击查看并一键授权",
+          }
+        : {
+            ariaLabel: "需要管理员权限开启虚拟网卡",
+            title: "以管理员身份重启并开启虚拟网卡",
+            desc: "虚拟网卡可接管终端、游戏与桌面软件的全部流量，需要 Windows 管理员权限。确认后将弹出系统授权框（UAC），自动以管理员身份重启猫猫云梯并开启虚拟网卡。",
+            actionLabel: "以管理员身份重启并开启",
+            busyLabel: "正在请求授权…",
+            buttonHint: "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启",
+          };
 
   const handleSelectTheme = (mode: ThemeMode) => {
     void appActions.setThemeMode(mode);
@@ -398,9 +445,15 @@ export function Sidebar() {
                   测速中
                 </span>
               )}
-              {item.id === "preaccel" && runtime.preaccel_active && (
-                <span className="ml-auto shrink-0 rounded-full bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]">
-                  提速中
+              {item.id === "preaccel" && isPreAccelActive && (
+                <span
+                  className={`ml-auto shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
+                    isStandaloneGlobalOnly
+                      ? "bg-[var(--amber-soft)] text-[var(--amber)]"
+                      : "bg-[var(--accent-soft)] text-[var(--accent)]"
+                  }`}
+                >
+                  {isStandaloneGlobalOnly ? "底层提速中" : "提速中"}
                 </span>
               )}
               {item.id === "overview" && runtime.captive_portal_required && (
@@ -475,7 +528,7 @@ export function Sidebar() {
               title={
                 runtime.tun_admin_ready
                   ? "点击开关虚拟网卡（接管电脑全部软件）"
-                  : "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启"
+                  : tunElevationCopy.buttonHint
               }
             >
               <span className="inline-flex items-center gap-1 truncate">
@@ -542,7 +595,7 @@ export function Sidebar() {
             <div
               role="dialog"
               aria-modal="true"
-              aria-label="需要管理员权限开启虚拟网卡"
+              aria-label={tunElevationCopy.ariaLabel}
               onClick={(e) => e.stopPropagation()}
               className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
             >
@@ -553,10 +606,10 @@ export function Sidebar() {
                   </span>
                   <div>
                     <h3 className="text-sm font-semibold text-[var(--text)]">
-                      以管理员身份重启并开启虚拟网卡
+                      {tunElevationCopy.title}
                     </h3>
                     <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                      虚拟网卡可接管终端、游戏与桌面软件的全部流量，需要 Windows 管理员权限。确认后将弹出系统授权框（UAC），自动以管理员身份重启猫猫云梯并开启虚拟网卡。
+                      {tunElevationCopy.desc}
                     </p>
                   </div>
                 </div>
@@ -598,7 +651,9 @@ export function Sidebar() {
                     <ShieldCheck className="h-3.5 w-3.5" />
                   )}
                   <span>
-                    {tunAdminPromptBusy ? "正在请求授权…" : "以管理员身份重启并开启"}
+                    {tunAdminPromptBusy
+                      ? tunElevationCopy.busyLabel
+                      : tunElevationCopy.actionLabel}
                   </span>
                 </button>
               </div>

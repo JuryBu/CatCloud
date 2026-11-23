@@ -34,6 +34,29 @@ const MAX_REDIRECT_HOPS = 5;
 const MAX_ARCHIVE_BYTES = 64 * 1024 * 1024;
 const MAX_EXTRACTED_BYTES = 128 * 1024 * 1024;
 const MAX_CHECKSUMS_BYTES = 512 * 1024;
+const MAX_RELEASE_META_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Official verified SHA-256 digests for pinned MetaCubeX/mihomo releases
+ * (sourced from GitHub Releases API `assets[].digest`, because MetaCubeX/mihomo
+ * does not ship a `checksums.txt` asset).
+ */
+export const PINNED_MIHOMO_SHA256 = {
+  "v1.19.16": {
+    "mihomo-windows-amd64-compatible-v1.19.16.zip":
+      "dba602f921c9b39cc7ee24ccc0191a4806b03ceb1644b1c5c2a31408687fdaa2",
+    "mihomo-windows-arm64-v1.19.16.zip":
+      "0cfb5d5ffd37fe54e1741b533d247703aa389610fa0b57675c6d42d7944176fa",
+    "mihomo-darwin-arm64-v1.19.16.gz":
+      "3cf103abd22495520979b51b9f09b8087ae56eb03722c93b9a2bbb6296f21038",
+    "mihomo-darwin-amd64-compatible-v1.19.16.gz":
+      "e9a125d8d164b68953e3d95bc91d42cbab47cabaabd82ccadee49241ed9224ea",
+    "mihomo-linux-amd64-compatible-v1.19.16.gz":
+      "3393345527c6628f47c295e2f1dfd182454800f964f3211f606d3aab0fdfc5a9",
+    "mihomo-linux-arm64-v1.19.16.gz":
+      "6d3763071003188dd2262b1220789996e56bd63ea4ad5564b31a486e880b7aa8",
+  },
+};
 
 /**
  * Target triple -> official MetaCubeX/mihomo asset candidate naming order.
@@ -111,14 +134,26 @@ function parseArgs(argv) {
 
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--target" && argv[i + 1]) {
-      opts.target = argv[++i];
-    } else if (arg === "--version" && argv[i + 1]) {
-      opts.version = argv[++i];
-    } else if (arg === "--out-dir" && argv[i + 1]) {
-      opts.outDir = path.resolve(argv[++i]);
-    } else if (arg === "--sha256" && argv[i + 1]) {
-      opts.sha256 = argv[++i].trim().toLowerCase();
+    if (arg === "--target") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.target = val;
+      }
+    } else if (arg === "--version") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.version = val;
+      }
+    } else if (arg === "--out-dir") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.outDir = path.resolve(val);
+      }
+    } else if (arg === "--sha256") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim().toLowerCase();
+        opts.sha256 = val || null;
+      }
     } else if (arg === "--dry-run") {
       opts.dryRun = true;
     } else if (arg === "--verify-local") {
@@ -182,11 +217,11 @@ function validateAllowedHttpsUrl(rawUrl) {
   return parsed;
 }
 
-async function fetchAllowlistedBuffer(startUrl, maxBytes) {
+async function fetchAllowlistedBuffer(startUrl, maxBytes, acceptHeader = "*/*") {
   let currentUrl = startUrl;
   const baseHeaders = {
     "User-Agent": "CatCloud-Release-CI/0.1.0",
-    Accept: "*/*",
+    Accept: acceptHeader,
   };
   if (process.env.GITHUB_TOKEN) {
     baseHeaders.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
@@ -437,6 +472,50 @@ function verifyLocalBinary(outDir, spec, opts) {
   return true;
 }
 
+/**
+ * Fetch official asset SHA-256 checksums for a MetaCubeX/mihomo release tag via
+ * GitHub Releases API `assets[].digest` (plus `checksums.txt` if present).
+ */
+async function fetchOfficialReleaseChecksums(version, baseDownloadUrl) {
+  const apiUrl = `https://api.github.com/repos/${MIHOMO_REPO}/releases/tags/${encodeURIComponent(version)}`;
+  console.log(`[fetch_mihomo] Querying GitHub release metadata from ${apiUrl}`);
+  const rawBuf = await fetchAllowlistedBuffer(
+    apiUrl,
+    MAX_RELEASE_META_BYTES,
+    "application/vnd.github+json"
+  );
+  const release = JSON.parse(rawBuf.toString("utf8"));
+  const assets = Array.isArray(release?.assets) ? release.assets : [];
+  const checksumMap = new Map();
+  let hasChecksumsTxt = false;
+
+  for (const asset of assets) {
+    const name = typeof asset?.name === "string" ? asset.name.trim() : "";
+    if (!name) continue;
+    if (name === "checksums.txt") {
+      hasChecksumsTxt = true;
+    }
+    const digest = typeof asset?.digest === "string" ? asset.digest.trim() : "";
+    const match = digest.match(/^sha256:([a-fA-F0-9]{64})$/);
+    if (match) {
+      checksumMap.set(name, match[1].toLowerCase());
+    }
+  }
+
+  if (hasChecksumsTxt) {
+    const checksumsUrl = `${baseDownloadUrl}/checksums.txt`;
+    console.log(`[fetch_mihomo] Supplementing checksums from ${checksumsUrl}`);
+    const checksumsBuf = await fetchAllowlistedBuffer(checksumsUrl, MAX_CHECKSUMS_BYTES);
+    for (const [name, hash] of parseChecksumsTxt(checksumsBuf.toString("utf8"))) {
+      if (!checksumMap.has(name)) {
+        checksumMap.set(name, hash);
+      }
+    }
+  }
+
+  return { checksumMap, apiUrl };
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const spec = TARGET_SPECS[opts.target];
@@ -444,7 +523,8 @@ async function main() {
   const destMetaPath = path.join(opts.outDir, "mihomo.meta.json");
   const candidates = spec.candidates(opts.version);
   const baseDownloadUrl = `https://github.com/${MIHOMO_REPO}/releases/download/${opts.version}`;
-  const checksumsUrl = `${baseDownloadUrl}/checksums.txt`;
+  const releaseApiUrl = `https://api.github.com/repos/${MIHOMO_REPO}/releases/tags/${encodeURIComponent(opts.version)}`;
+  const pinnedForVersion = PINNED_MIHOMO_SHA256[opts.version] || null;
 
   if (opts.verifyLocal) {
     verifyLocalBinary(opts.outDir, spec, opts);
@@ -452,6 +532,9 @@ async function main() {
   }
 
   if (opts.dryRun) {
+    const pinnedCandidate = pinnedForVersion
+      ? candidates.find((c) => Object.prototype.hasOwnProperty.call(pinnedForVersion, c)) || null
+      : null;
     console.log(
       JSON.stringify(
         {
@@ -460,7 +543,9 @@ async function main() {
           version: opts.version,
           target: opts.target,
           output_binary: destBinPath,
-          checksums_url: checksumsUrl,
+          release_api_url: releaseApiUrl,
+          pinned_asset: pinnedCandidate,
+          pinned_sha256: pinnedCandidate ? pinnedForVersion[pinnedCandidate] : null,
           candidate_assets: candidates.map((c) => `${baseDownloadUrl}/${c}`),
           explicit_sha256: opts.sha256,
         },
@@ -490,31 +575,57 @@ async function main() {
     }
   }
 
-  console.log(`[fetch_mihomo] Fetching official checksums from ${checksumsUrl}`);
-  const checksumsBuf = await fetchAllowlistedBuffer(checksumsUrl, MAX_CHECKSUMS_BYTES);
-  const checksumMap = parseChecksumsTxt(checksumsBuf.toString("utf8"));
-
   let selectedAsset = null;
   let expectedArchiveSha256 = opts.sha256;
-  for (const candidate of candidates) {
-    if (checksumMap.has(candidate)) {
-      selectedAsset = candidate;
-      const officialHash = checksumMap.get(candidate);
-      if (expectedArchiveSha256 && expectedArchiveSha256 !== officialHash) {
-        throw new Error(
-          `Explicit --sha256 (${expectedArchiveSha256}) conflicts with official checksums.txt (${officialHash}) for ${candidate}`
-        );
+  let checksumSource = "explicit";
+
+  if (pinnedForVersion) {
+    for (const candidate of candidates) {
+      if (Object.prototype.hasOwnProperty.call(pinnedForVersion, candidate)) {
+        const pinnedHash = pinnedForVersion[candidate].toLowerCase();
+        if (expectedArchiveSha256 && expectedArchiveSha256 !== pinnedHash) {
+          throw new Error(
+            `Explicit --sha256 (${expectedArchiveSha256}) conflicts with pinned official SHA-256 (${pinnedHash}) for ${candidate}`
+          );
+        }
+        selectedAsset = candidate;
+        expectedArchiveSha256 = pinnedHash;
+        checksumSource = "pinned_table";
+        break;
       }
-      expectedArchiveSha256 = officialHash;
-      break;
     }
   }
 
   if (!selectedAsset || !expectedArchiveSha256) {
-    throw new Error(
-      `Could not find any expected asset (${candidates.join(", ")}) in ${checksumsUrl}`
+    const { checksumMap, apiUrl } = await fetchOfficialReleaseChecksums(
+      opts.version,
+      baseDownloadUrl
     );
+    for (const candidate of candidates) {
+      if (checksumMap.has(candidate)) {
+        selectedAsset = candidate;
+        const officialHash = checksumMap.get(candidate);
+        if (expectedArchiveSha256 && expectedArchiveSha256 !== officialHash) {
+          throw new Error(
+            `Explicit --sha256 (${expectedArchiveSha256}) conflicts with official GitHub release digest (${officialHash}) for ${candidate}`
+          );
+        }
+        expectedArchiveSha256 = officialHash;
+        checksumSource = "github_release_api";
+        break;
+      }
+    }
+
+    if (!selectedAsset || !expectedArchiveSha256) {
+      throw new Error(
+        `Could not verify an official SHA-256 digest for any expected asset (${candidates.join(", ")}) from ${apiUrl}`
+      );
+    }
   }
+
+  console.log(
+    `[fetch_mihomo] Selected ${selectedAsset} (checksum source: ${checksumSource})`
+  );
 
   const assetUrl = `${baseDownloadUrl}/${selectedAsset}`;
   console.log(`[fetch_mihomo] Downloading ${assetUrl}`);

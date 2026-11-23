@@ -1,7 +1,10 @@
 pub mod benchmark;
 pub mod campus;
 pub mod generator;
+pub mod global_tunnel;
 pub mod schema;
+#[cfg(target_os = "windows")]
+mod windivert_win;
 
 pub use benchmark::{
     BandwidthThrottleReport, PortSpeedSample, ThrottleConfidence, analyze_443_throttle,
@@ -17,6 +20,17 @@ pub use generator::{
     PREACCEL_SELECT_GROUP, PreAccelCompilePlan, build_preaccel_compile_plan,
     compile_relay_to_mihomo_yaml, host_to_direct_rule, host_to_fake_ip_filter,
     is_disallowed_domestic_probe_host, validate_domestic_probe_url,
+};
+pub use global_tunnel::{
+    GlobalPreAccelManager, GlobalPreAccelMetrics, GlobalPreAccelStatus, Ipv4TcpMeta,
+    MAX_NAT_ENTRIES, NAT_IDLE_TIMEOUT, NatEntry, NatKey, NatTable, STANDALONE_TUNNEL_GOGC,
+    STANDALONE_TUNNEL_GOMEMLIMIT, StandalonePreAccelTunnel, WINDIVERT_DOWNLOAD_URL,
+    WINDIVERT_ZIP_SHA256, WinDivertAddress, WinDivertPaths, build_windivert_filter,
+    collect_enabled_relay_ipv4s, compile_standalone_preaccel_yaml, download_and_install_windivert,
+    is_physical_nic_descriptor, locate_windivert_files, locate_windivert_files_with_exe_dir,
+    locate_windivert_paths, normalize_process_basename, parse_ipv4_tcp_packet,
+    rewrite_ipv4_tcp_dst, rewrite_ipv4_tcp_src, should_intercept_process,
+    socks5_noauth_connect_ipv4, verify_and_extract_windivert_zip,
 };
 pub use schema::{
     EXPIRY_SOON_THRESHOLD_DAYS, MMRELAY_URI_PREFIX, RelayExpiryStatus, RelayProtocol,

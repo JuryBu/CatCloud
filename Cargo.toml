@@ -13,6 +13,7 @@ license = "MIT"
 rust-version = "1.92"
 repository = "https://github.com/JuryBu/CatCloud"
 authors = ["CatCloud Contributors"]
+description = "CatCloud - Lightweight cross-platform proxy manager with smart multi-select groups and domestic 443 pre-acceleration"
 
 [workspace.dependencies]
 tauri = { version = "2.10", features = ["tray-icon", "image-png"] }
@@ -51,6 +52,9 @@ windows-sys = { version = "0.59", features = [
   "Win32_Security",
   "Win32_System_JobObjects",
   "Win32_System_Threading",
+  "Win32_System_LibraryLoader",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
   "Win32_Networking_WinInet",
   "Win32_System_Registry",
   "Win32_System_Diagnostics_ToolHelp",

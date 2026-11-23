@@ -182,28 +182,37 @@ pub fn resolve_webview2_browser_args(existing: Option<&str>) -> Option<&'static 
 }
 
 /// Helper for single-threaded bootstrap paths to set `WEBVIEW2_USER_DATA_FOLDER` and lightweight
-/// WebView2 browser arguments before Tauri initializes. Elevated processes always receive an
-/// isolated `webview2_elevated` directory so High IL and Medium IL WebView2 instances never
-/// contend on `EBWebView` locks or ACLs.
+/// WebView2 browser arguments before Tauri initializes on Windows. Elevated processes always receive
+/// an isolated `webview2_elevated` directory so High IL and Medium IL WebView2 instances never
+/// contend on `EBWebView` locks or ACLs. No-op on non-Windows platforms so macOS/Linux never create
+/// unused `webview2/` directories or set `WEBVIEW2_*` environment variables.
 ///
 /// # Safety
 /// Must only be invoked while the process is single-threaded prior to spawning threads.
 pub unsafe fn set_webview2_user_data_env(paths: &AppPaths) {
-    let is_elevated = catcloud_core::platform::default_platform()
-        .capabilities()
-        .is_elevated;
-    let webview_dir = paths.effective_webview_dir(is_elevated);
-    let _ = std::fs::create_dir_all(&webview_dir);
-    if is_elevated || paths.is_portable || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none() {
-        unsafe {
-            std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_dir);
+    #[cfg(target_os = "windows")]
+    {
+        let is_elevated = catcloud_core::platform::default_platform()
+            .capabilities()
+            .is_elevated;
+        let webview_dir = paths.effective_webview_dir(is_elevated);
+        let _ = std::fs::create_dir_all(&webview_dir);
+        if is_elevated || paths.is_portable || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none()
+        {
+            unsafe {
+                std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_dir);
+            }
+        }
+        let existing_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok();
+        if let Some(default_args) = resolve_webview2_browser_args(existing_args.as_deref()) {
+            unsafe {
+                std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", default_args);
+            }
         }
     }
-    let existing_args = std::env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").ok();
-    if let Some(default_args) = resolve_webview2_browser_args(existing_args.as_deref()) {
-        unsafe {
-            std::env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", default_args);
-        }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = paths;
     }
 }
 
@@ -377,7 +386,16 @@ pub fn show_or_rebuild_main_window<R: Runtime>(app: &AppHandle<R>) {
         #[cfg(target_os = "macos")]
         let _ = app_handle.set_activation_policy(tauri::ActivationPolicy::Regular);
 
-        match WebviewWindowBuilder::from_config(&app_handle, &cfg).and_then(|b| b.build()) {
+        let build_res = WebviewWindowBuilder::from_config(&app_handle, &cfg).and_then(|builder| {
+            #[cfg(target_os = "macos")]
+            let builder = builder
+                .decorations(true)
+                .title_bar_style(tauri::TitleBarStyle::Overlay)
+                .hidden_title(true);
+            builder.build()
+        });
+
+        match build_res {
             Ok(win) => {
                 let _ = win.show();
                 let _ = win.set_focus();
@@ -451,12 +469,49 @@ pub fn destroy_capsule_window<R: Runtime>(app: &AppHandle<R>) {
     emit_window_mode_changed(app);
 }
 
+/// Ensure the floating capsule window restores its default expanded size and min/max bounds
+/// when re-shown or rebuilt so it never stays stuck in an edge-collapsed slim strip state.
+fn restore_capsule_default_bounds<R: Runtime>(
+    app: &AppHandle<R>,
+    win: &tauri::WebviewWindow<R>,
+) {
+    let Some(cfg) = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == CAPSULE_WINDOW_LABEL)
+    else {
+        return;
+    };
+    let min_w = cfg.min_width.unwrap_or(280.0);
+    let min_h = cfg.min_height.unwrap_or(56.0);
+    let _ = win.set_min_size(Some(tauri::LogicalSize::new(min_w, min_h)));
+    if let (Some(max_w), Some(max_h)) = (cfg.max_width, cfg.max_height) {
+        let _ = win.set_max_size(Some(tauri::LogicalSize::new(max_w, max_h)));
+    }
+    let scale = win.scale_factor().unwrap_or(1.0).max(0.5);
+    let collapsed = win
+        .inner_size()
+        .ok()
+        .map(|sz| {
+            let logical_w = (sz.width as f64) / scale;
+            let logical_h = (sz.height as f64) / scale;
+            logical_w + 1.0 < min_w || logical_h + 1.0 < min_h
+        })
+        .unwrap_or(true);
+    if collapsed {
+        let _ = win.set_size(tauri::LogicalSize::new(cfg.width, cfg.height));
+    }
+}
+
 /// Ensure the floating capsule window is created and visible.
 pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         if !DESTROYING_CAPSULE.load(Ordering::SeqCst) {
             if let Some(win) = app_handle.get_webview_window(CAPSULE_WINDOW_LABEL) {
+                restore_capsule_default_bounds(&app_handle, &win);
                 let _ = win.show();
                 let _ = win.set_focus();
                 return;
@@ -476,6 +531,7 @@ pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
         .await;
 
         if let Some(win) = app_handle.get_webview_window(CAPSULE_WINDOW_LABEL) {
+            restore_capsule_default_bounds(&app_handle, &win);
             let _ = win.show();
             return;
         }
@@ -494,6 +550,7 @@ pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
 
         match WebviewWindowBuilder::from_config(&app_handle, &cfg).and_then(|b| b.build()) {
             Ok(win) => {
+                restore_capsule_default_bounds(&app_handle, &win);
                 let _ = win.show();
                 emit_window_mode_changed(&app_handle);
             }
@@ -549,6 +606,7 @@ pub fn toggle_capsule_window<R: Runtime>(app: &AppHandle<R>) {
 
         match WebviewWindowBuilder::from_config(&app_handle, &cfg).and_then(|b| b.build()) {
             Ok(win) => {
+                restore_capsule_default_bounds(&app_handle, &win);
                 let _ = win.show();
                 emit_window_mode_changed(&app_handle);
             }

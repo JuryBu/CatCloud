@@ -46,6 +46,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "CatCloud Contributors",
+    "shortDescription": "Lightweight cross-platform proxy manager with smart multi-select groups and domestic 443 pre-acceleration",
+    "longDescription": "CatCloud is a lightweight, low-memory cross-platform proxy desktop client featuring smart multi-select node groups, sticky failover protection, and domestic 443 pre-acceleration.",
     "createUpdaterArtifacts": false,
     "windows": {
       "nsis": {

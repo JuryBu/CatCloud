@@ -41,11 +41,18 @@ jobs:
             node --check "$f"
           done
 
-      - name: Smoke-test Mihomo fetcher dry-run
+      - name: Smoke-test release fetcher & staging scripts dry-run (all 5 targets)
         run: |
-          node scripts/release/fetch_mihomo.mjs --dry-run --target x86_64-unknown-linux-gnu
           node scripts/release/fetch_mihomo.mjs --dry-run --target x86_64-pc-windows-msvc
+          node scripts/release/fetch_mihomo.mjs --dry-run --target aarch64-pc-windows-msvc
           node scripts/release/fetch_mihomo.mjs --dry-run --target aarch64-apple-darwin
+          node scripts/release/fetch_mihomo.mjs --dry-run --target x86_64-apple-darwin
+          node scripts/release/fetch_mihomo.mjs --dry-run --target x86_64-unknown-linux-gnu
+          node scripts/release/stage_windows.mjs --dry-run --target x86_64-pc-windows-msvc
+          node scripts/release/stage_windows.mjs --dry-run --target aarch64-pc-windows-msvc
+          node scripts/release/stage_macos.mjs --dry-run --target aarch64-apple-darwin
+          node scripts/release/stage_macos.mjs --dry-run --target x86_64-apple-darwin
+          node scripts/release/stage_linux.mjs --dry-run --target x86_64-unknown-linux-gnu
 
   frontend-build:
     name: Frontend Typecheck & Production Build
@@ -82,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest]
+        os: [ubuntu-22.04, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository

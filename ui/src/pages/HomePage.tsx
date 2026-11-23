@@ -47,6 +47,7 @@ import {
 import { MASCOT_STATE_LABELS, type MascotState, MascotSprite } from "../components/MascotSprite";
 import { TrafficSparkline, formatBytes, formatRate } from "../components/TrafficSparkline";
 import { appActions, useAppSelector, useLatestTraffic } from "../store/appStore";
+import { resolvePlatformOs } from "../utils/platform";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
 
 const PROXY_MODE_OPTIONS: ReadonlyArray<{ id: ProxyMode; label: string; hint: string }> = [
@@ -304,6 +305,7 @@ const HomeLiveUptime = memo(function HomeLiveUptime({
 export function HomePage() {
   const runtime = useAppSelector((s) => s.runtime);
   const config = useAppSelector((s) => s.config);
+  const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const groups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
@@ -314,6 +316,7 @@ export function HomePage() {
   const initialized = useAppSelector((s) => s.initialized);
 
   const [togglingProxy, setTogglingProxy] = useState(false);
+  const [togglingPreAccel, setTogglingPreAccel] = useState(false);
   const [nodeMenuOpen, setNodeMenuOpen] = useState(false);
   const [nodeSearch, setNodeSearch] = useState("");
   const [switchingNode, setSwitchingNode] = useState(false);
@@ -557,11 +560,27 @@ export function HomePage() {
   const activeAiBadges = getProbeAiBadges(activeNodeProbe);
 
   // Main power switch state & human-friendly traffic status
+  const platformOs = resolvePlatformOs(runtime.os_label);
   const isProxyEnabled =
     runtime.running && (runtime.system_proxy_enabled || runtime.tun_enabled);
+  const isGlobalPreAccelRunning = Boolean(
+    runtime.global_preaccel_active || globalPreAccel.running
+  );
+  const effectiveGlobalMode = runtime.global_preaccel_mode ?? globalPreAccel.mode ?? "off";
+  const effectiveGlobalPort =
+    runtime.global_preaccel_socks_port ?? globalPreAccel.socks_port ?? null;
+  const isPreAccelConfigOn = Boolean(runtime.preaccel_enabled ?? config.preaccel.enabled);
+  const isProxyPreAccelRunning = Boolean(
+    isProxyEnabled && (runtime.preaccel_active || isPreAccelConfigOn)
+  );
+  const isStandaloneGlobalOnly = !isProxyEnabled && isGlobalPreAccelRunning;
+  const isAnyPreAccelActive = isProxyPreAccelRunning || isGlobalPreAccelRunning;
 
   const trafficStatusSentence = (() => {
     if (!isProxyEnabled) {
+      if (isGlobalPreAccelRunning) {
+        return "未开启猫猫代理 · 底层全局国内提速运行中（正在加速其它软件）";
+      }
       return runtime.running
         ? "未开启代理，仅本地待命，不走流量"
         : "未开启代理，电脑流量全部直连";
@@ -578,10 +597,46 @@ export function HomePage() {
     return "已接管电脑网络流量";
   })();
 
+  const preAccelPillTitle = (() => {
+    if (isStandaloneGlobalOnly) {
+      if (effectiveGlobalMode === "windivert") {
+        return "底层全局国内提速运行中（WinDivert 正在自动加速电脑上其它梯子与工具）· 点击关闭";
+      }
+      const portText = effectiveGlobalPort ? `127.0.0.1:${effectiveGlobalPort}` : "本地端口";
+      return `独立本地 443 通道运行中（${portText}）· 点击关闭`;
+    }
+    if (isProxyPreAccelRunning) {
+      const relayLabel = runtime.preaccel_relay_name || "主力国内中转";
+      return `国内提速运行中（正通过「${relayLabel}」加速代理上传）· 点击关闭`;
+    }
+    if (isPreAccelConfigOn) {
+      return "国内提速已开启就绪（开启代理或底层全局提速后自动生效）· 点击关闭";
+    }
+    return "一键开启国内提速（开代理时加速猫猫流量，关代理时可独立给电脑上其它软件加速）";
+  })();
+
+  const tunPillTitle = runtime.tun_admin_ready
+    ? "接管电脑全部软件和命令行流量"
+    : platformOs === "linux"
+      ? "开启虚拟网卡需要给代理核心授予网络权限，点击可一键授权"
+      : platformOs === "macos"
+        ? "开启虚拟网卡需要系统安全授权，点击查看并一键授权"
+        : "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启";
+
+  const handleTogglePreAccelQuick = async () => {
+    if (togglingPreAccel) return;
+    setTogglingPreAccel(true);
+    try {
+      await appActions.togglePreAccel();
+    } finally {
+      setTogglingPreAccel(false);
+    }
+  };
+
   // Dual-form mascot: cream cat idle by default, working sprite during probing/switching/toggling
   const effectiveMascotState: MascotState = checkingSites
     ? "searching"
-    : switchingNode || togglingProxy
+    : switchingNode || togglingProxy || togglingPreAccel
       ? "thinking"
       : mascotState;
 
@@ -820,7 +875,9 @@ export function HomePage() {
     ? "虚拟网卡已接管"
     : runtime.system_proxy_enabled
       ? "系统代理已接管"
-      : "本地待命";
+      : isGlobalPreAccelRunning
+        ? "底层提速运行中"
+        : "本地待命";
 
   const memSubLabel =
     config.gomemlimit_mb === 0
@@ -959,7 +1016,14 @@ export function HomePage() {
                           : "点击开启代理"}
                     </span>
                   </div>
-                  <p className="mt-0.5 truncate text-xs text-[var(--text-secondary)]">
+                  <p
+                    title={trafficStatusSentence}
+                    className={`mt-0.5 truncate text-xs ${
+                      isStandaloneGlobalOnly
+                        ? "font-medium text-[var(--accent)]"
+                        : "text-[var(--text-secondary)]"
+                    }`}
+                  >
                     {trafficStatusSentence}
                   </p>
                 </div>
@@ -995,7 +1059,7 @@ export function HomePage() {
               </div>
 
               {/* Takeover Method Pills */}
-              <div className="flex items-center gap-1.5">
+              <div className="flex flex-wrap items-center gap-1.5">
                 <button
                   type="button"
                   onClick={() => void appActions.toggleSystemProxy()}
@@ -1018,14 +1082,32 @@ export function HomePage() {
                       ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
                       : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
                   }`}
-                  title={
-                    runtime.tun_admin_ready
-                      ? "接管电脑全部软件和命令行流量"
-                      : "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启"
-                  }
+                  title={tunPillTitle}
                 >
                   <ShieldCheck className="h-3.5 w-3.5" />
                   <span>虚拟网卡</span>
+                </button>
+
+                <button
+                  type="button"
+                  disabled={togglingPreAccel}
+                  aria-pressed={isAnyPreAccelActive || isPreAccelConfigOn}
+                  onClick={() => void handleTogglePreAccelQuick()}
+                  className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:opacity-65 ${
+                    isStandaloneGlobalOnly
+                      ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)]"
+                      : isProxyPreAccelRunning
+                        ? "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
+                        : isPreAccelConfigOn
+                          ? "border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 text-[var(--accent)]"
+                          : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+                  }`}
+                  title={preAccelPillTitle}
+                >
+                  <Zap
+                    className={`h-3.5 w-3.5 ${togglingPreAccel ? "animate-pulse" : ""}`}
+                  />
+                  <span>{isStandaloneGlobalOnly ? "底层提速中" : "国内提速"}</span>
                 </button>
               </div>
             </div>
@@ -1062,16 +1144,38 @@ export function HomePage() {
                     </span>
 
                     {/* Domestic Pre-Acceleration Status Tag */}
-                    {runtime.preaccel_active && (
+                    {(isAnyPreAccelActive || isPreAccelConfigOn) && (
                       <button
                         type="button"
                         onClick={() => appActions.setNav("preaccel")}
-                        className="inline-flex items-center gap-1 rounded-full border border-[var(--green)]/50 bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-semibold transition-opacity hover:opacity-90"
-                        style={{ color: "color-mix(in srgb, var(--green) 78%, var(--text))" }}
-                        title="点击查看国内提速设置"
+                        className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold transition-opacity hover:opacity-90 ${
+                          isStandaloneGlobalOnly
+                            ? "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)]"
+                            : isProxyPreAccelRunning
+                              ? "border-[var(--green)]/50 bg-[var(--green-soft)]"
+                              : "border-[var(--accent)]/45 bg-[var(--accent-soft)]/70 text-[var(--accent)]"
+                        }`}
+                        style={
+                          isProxyPreAccelRunning
+                            ? { color: "color-mix(in srgb, var(--green) 78%, var(--text))" }
+                            : undefined
+                        }
+                        title={
+                          isStandaloneGlobalOnly
+                            ? "独立底层全局提速运行中，点击前往国内提速页查看详情"
+                            : isProxyPreAccelRunning
+                              ? "国内提速运行中，点击查看国内提速设置"
+                              : "国内提速已开启就绪，点击前往国内提速页配置"
+                        }
                       >
                         <Zap className="h-3 w-3" />
-                        <span>国内提速中</span>
+                        <span>
+                          {isStandaloneGlobalOnly
+                            ? "底层提速中"
+                            : isProxyPreAccelRunning
+                              ? "国内提速中"
+                              : "提速已就绪"}
+                        </span>
                       </button>
                     )}
 

@@ -38,6 +38,7 @@
 
 ### 国内预加速技术（Domestic Pre-Acceleration）
 - 针对非 `:443` 端口跨境单流上行受限场景，通过前端国内纯 IP 无 SNI `:443` 中继链（`dialer-proxy`）显著改善长连接与大体积上传吞吐。
+- **底层全局国内预代理（免开代理/免开 TUN）**：支持在不启动 CatCloud 自身代理与虚拟网卡的情况下，通过独立轻量 `:443` 双活隧道与 Windows 按需加载官方签名 WinDivert 透明重定向（macOS / Linux 提供独立本地 `socks5h://` 入口），直接为其他代理软件与 SSH/SCP 工具提供底层 `:443` 提速，并实现首页、悬浮胶囊、国内提速页与系统托盘四端实时联动。
 - 内置 `mmrelay/v1` JSON 与单行 `mmrelay://v1/<base64url>` 剪贴板格式导入、分协议无 SNI 强校验（Trojan/AnyTLS `sni` 与 VLESS `servername`）、原生 443 节点智能跳过、国内 204 双活秒切、自动防环规则生成与高校校园网 Captive Portal 防假连。
 - 详见 [docs/DOMESTIC_PREACCEL.md](./docs/DOMESTIC_PREACCEL.md)。
 

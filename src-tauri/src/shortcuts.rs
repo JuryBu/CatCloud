@@ -7,10 +7,12 @@ use tauri::plugin::TauriPlugin;
 use tauri::{AppHandle, Manager, Runtime};
 use tauri_plugin_global_shortcut::{GlobalShortcut, Shortcut, ShortcutState};
 
-/// Default global accelerator for one-click switch to the next best node.
-pub const DEFAULT_SWITCH_NEXT_BEST_SHORTCUT: &str = "CommandOrControl+Alt+N";
-/// Default global accelerator for toggling the floating capsule window.
-pub const DEFAULT_TOGGLE_CAPSULE_SHORTCUT: &str = "CommandOrControl+Alt+C";
+/// Default global accelerator for one-click switch to the next best node (aligned with `settings.rs`;
+/// maps to `Option+Shift+N` on macOS).
+pub const DEFAULT_SWITCH_NEXT_BEST_SHORTCUT: &str = "Alt+Shift+N";
+/// Default global accelerator for toggling the floating capsule window (aligned with `settings.rs`;
+/// maps to `Option+Shift+C` on macOS).
+pub const DEFAULT_TOGGLE_CAPSULE_SHORTCUT: &str = "Alt+Shift+C";
 
 /// Actions that can be bound to system-wide hotkeys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -3,7 +3,10 @@ import {
   type AppConfig,
   type CoreRuntimeInfo,
   DEFAULT_APP_CONFIG,
+  DEFAULT_GLOBAL_PREACCEL_STATUS,
   type ExitIpInfo,
+  type GlobalPreAccelScope,
+  type GlobalPreAccelStatus,
   type MultiGroup,
   type PreAccelRelay,
   type ProbeSnapshot,
@@ -20,10 +23,14 @@ import {
   generateSeedTrafficSamples,
   isTauriEnv,
 } from "../api/tauri";
+import { detectNavigatorOs, resolvePlatformOs } from "../utils/platform";
 
 export type {
   AppConfig,
   CoreRuntimeInfo,
+  GlobalPreAccelMode,
+  GlobalPreAccelScope,
+  GlobalPreAccelStatus,
   ProxyMode,
   ResolvedTheme,
   RouteTargetMode,
@@ -463,6 +470,7 @@ export interface AppState {
   probeProgress: ProbeRunProgressState;
   subscriptions: SubscriptionRecord[];
   preAccelRelays: PreAccelRelay[];
+  globalPreAccel: GlobalPreAccelStatus;
   exitIp: ExitIpInfo;
   quickSites: SiteCheckItem[];
   latestTraffic: TrafficSample;
@@ -528,6 +536,14 @@ if (!runningInTauri) {
   initialTrafficVersion = seedSamples.length;
 }
 
+const initialDetectedOs = detectNavigatorOs();
+const initialOsLabel =
+  initialDetectedOs === "macos"
+    ? "macos"
+    : initialDetectedOs === "linux"
+      ? "linux"
+      : "windows";
+
 const initialRuntime: CoreRuntimeInfo = runningInTauri
   ? {
       running: false,
@@ -548,13 +564,18 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       active_node_latency_ms: null,
       active_node_up_mbps: null,
       preaccel_active: false,
+      preaccel_enabled: false,
       preaccel_relay_name: null,
+      global_preaccel_active: false,
+      global_preaccel_mode: "off",
+      global_preaccel_socks_port: null,
+      global_preaccel_connections: 0,
       captive_portal_required: false,
       system_proxy_enabled: false,
       tun_enabled: false,
       tun_admin_ready: false,
       app_version: "0.1.0",
-      os_label: "Windows",
+      os_label: initialOsLabel,
       autostart_enabled: false,
       portable_mode: false,
       last_update_check: null,
@@ -578,7 +599,12 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       active_node_latency_ms: 68,
       active_node_up_mbps: 14.8,
       preaccel_active: true,
+      preaccel_enabled: initialConfig.preaccel.enabled,
       preaccel_relay_name: "CN-East-443 Primary",
+      global_preaccel_active: false,
+      global_preaccel_mode: "off",
+      global_preaccel_socks_port: null,
+      global_preaccel_connections: 0,
       captive_portal_required: false,
       system_proxy_enabled: initialConfig.system_proxy_enabled,
       tun_enabled: initialConfig.tun_enabled,
@@ -691,6 +717,7 @@ let state: AppState = {
   },
   subscriptions: [],
   preAccelRelays: [],
+  globalPreAccel: { ...DEFAULT_GLOBAL_PREACCEL_STATUS },
   exitIp: initialExitIp,
   quickSites: [],
   latestTraffic: initialTraffic,
@@ -752,6 +779,7 @@ let disposeConfigUpdate: (() => void) | null = null;
 let disposeTunNeedsAdmin: (() => void) | null = null;
 let themeClockTimer: number | null = null;
 let trafficBackfillInFlight = false;
+let globalPreAccelRefreshInFlight = false;
 
 function syncResolvedThemeFromClock(): void {
   const p = state.config.personalization;
@@ -901,6 +929,7 @@ async function hydrateFromBackend(): Promise<void> {
     catcloudApi.listSubscriptions(),
     catcloudApi.listPreAccelRelays(),
     catcloudApi.getFullConfig(),
+    catcloudApi.getGlobalPreAccelStatus(),
     inDesktop ? Promise.resolve(null) : catcloudApi.getExitIpInfo(),
     inDesktop ? Promise.resolve(null) : catcloudApi.checkQuickSites(),
   ]);
@@ -914,6 +943,7 @@ async function hydrateFromBackend(): Promise<void> {
     subsRes,
     relaysRes,
     fullCfgRes,
+    globalPreAccelRes,
     exitIpRes,
     quickSitesRes,
   ] = results;
@@ -1020,6 +1050,10 @@ async function hydrateFromBackend(): Promise<void> {
     probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
     subscriptions: subsRes.status === "fulfilled" ? subsRes.value : prev.subscriptions,
     preAccelRelays: relaysRes.status === "fulfilled" ? relaysRes.value : prev.preAccelRelays,
+    globalPreAccel:
+      globalPreAccelRes.status === "fulfilled"
+        ? globalPreAccelRes.value
+        : prev.globalPreAccel,
     exitIp:
       !inDesktop && exitIpRes.status === "fulfilled" && exitIpRes.value
         ? exitIpRes.value
@@ -1120,7 +1154,34 @@ export const appStore = {
         };
         emitTraffic();
       }
-      setState((prev) => ({ ...prev, runtime: info }));
+      const globalStateChanged =
+        info.global_preaccel_active !== state.runtime.global_preaccel_active ||
+        info.global_preaccel_mode !== state.runtime.global_preaccel_mode ||
+        info.global_preaccel_socks_port !== state.runtime.global_preaccel_socks_port;
+      setState((prev) => ({
+        ...prev,
+        runtime: info,
+        globalPreAccel:
+          info.global_preaccel_active !== undefined ||
+          info.global_preaccel_mode !== undefined ||
+          info.global_preaccel_socks_port !== undefined ||
+          info.global_preaccel_connections !== undefined
+            ? {
+                ...prev.globalPreAccel,
+                running: info.global_preaccel_active ?? prev.globalPreAccel.running,
+                mode: info.global_preaccel_mode ?? prev.globalPreAccel.mode,
+                socks_port:
+                  info.global_preaccel_socks_port !== undefined
+                    ? info.global_preaccel_socks_port
+                    : prev.globalPreAccel.socks_port,
+                active_connections:
+                  info.global_preaccel_connections ?? prev.globalPreAccel.active_connections,
+              }
+            : prev.globalPreAccel,
+      }));
+      if (globalStateChanged && isTauriEnv() && state.windowMode === "main") {
+        void appActions.refreshGlobalPreAccelStatus();
+      }
     });
 
     disposeProbeProgress = catcloudApi.subscribeProbeProgress((ev) => {
@@ -1205,11 +1266,19 @@ export const appStore = {
           state.windowMode
         );
       }
+      const prevPreAccel = state.config.preaccel;
+      const preAccelChanged =
+        mergedConfig.preaccel.enabled !== prevPreAccel.enabled ||
+        mergedConfig.preaccel.global_bypass_enabled !== prevPreAccel.global_bypass_enabled ||
+        mergedConfig.preaccel.global_scope !== prevPreAccel.global_scope;
       setState((prev) => ({
         ...prev,
         config: mergedConfig,
         resolvedTheme: resolved,
       }));
+      if (preAccelChanged && isTauriEnv() && state.windowMode === "main") {
+        void appActions.refreshGlobalPreAccelStatus();
+      }
     });
 
     if (isTauriEnv()) {
@@ -1486,6 +1555,355 @@ export const appActions = {
 
   syncPreAccelRelays(preAccelRelays: PreAccelRelay[]): void {
     setState((prev) => ({ ...prev, preAccelRelays }));
+  },
+
+  syncGlobalPreAccel(globalPreAccel: GlobalPreAccelStatus): void {
+    setState((prev) => ({ ...prev, globalPreAccel }));
+  },
+
+  async refreshGlobalPreAccelStatus(): Promise<GlobalPreAccelStatus> {
+    if (globalPreAccelRefreshInFlight) {
+      return state.globalPreAccel;
+    }
+    globalPreAccelRefreshInFlight = true;
+    try {
+      const status = await catcloudApi.getGlobalPreAccelStatus();
+      setState((prev) => ({ ...prev, globalPreAccel: status }));
+      return status;
+    } catch {
+      return state.globalPreAccel;
+    } finally {
+      globalPreAccelRefreshInFlight = false;
+    }
+  },
+
+  async togglePreAccel(next?: boolean): Promise<boolean> {
+    const currentlyOn = Boolean(
+      state.runtime.preaccel_active ||
+        state.runtime.global_preaccel_active ||
+        state.globalPreAccel.running ||
+        state.config.preaccel.enabled
+    );
+    const target = next ?? !currentlyOn;
+
+    if (target) {
+      let relays = state.preAccelRelays;
+      if (!relays.some((r) => r.enabled) && isTauriEnv()) {
+        try {
+          relays = await catcloudApi.listPreAccelRelays();
+          setState((prev) => ({ ...prev, preAccelRelays: relays }));
+        } catch {
+          /* fall through to empty relay guard */
+        }
+      }
+      const hasEnabledRelay = relays.some((r) => r.enabled);
+      if (!hasEnabledRelay) {
+        pushToast(
+          "还没有可用的国内中转线路，请先在「国内提速」页添加并启用至少一条中转",
+          "warn",
+          4200
+        );
+        if (state.windowMode === "main" && state.activeNav !== "preaccel") {
+          appActions.setNav("preaccel");
+        }
+        return false;
+      }
+    }
+
+    try {
+      const applied = await catcloudApi.togglePreAccel(target);
+      const [cfgRes, rtRes, globalRes] = await Promise.allSettled([
+        catcloudApi.getConfig(),
+        catcloudApi.getRuntimeInfo(),
+        catcloudApi.getGlobalPreAccelStatus(),
+      ]);
+
+      const nextCfg: AppConfig =
+        cfgRes.status === "fulfilled"
+          ? {
+              ...cfgRes.value,
+              behavior: cfgRes.value.behavior ?? state.config.behavior,
+            }
+          : {
+              ...state.config,
+              preaccel: {
+                ...state.config.preaccel,
+                enabled: applied,
+              },
+            };
+
+      const nextRt: CoreRuntimeInfo =
+        rtRes.status === "fulfilled"
+          ? rtRes.value
+          : {
+              ...state.runtime,
+              preaccel_enabled: applied,
+              preaccel_active:
+                applied && (state.runtime.running || state.globalPreAccel.running),
+            };
+
+      const nextGlobal: GlobalPreAccelStatus =
+        globalRes.status === "fulfilled"
+          ? globalRes.value
+          : applied
+            ? state.globalPreAccel
+            : {
+                ...state.globalPreAccel,
+                running: false,
+                mode: "off",
+                socks_port: null,
+                active_connections: 0,
+              };
+
+      setState((prev) => ({
+        ...prev,
+        config: nextCfg,
+        runtime: nextRt,
+        globalPreAccel: nextGlobal,
+      }));
+
+      if (!applied) {
+        pushToast("已关闭国内提速", "info");
+        return false;
+      }
+
+      const os = resolvePlatformOs(nextRt.os_label);
+      const proxyActive =
+        nextRt.running && (nextRt.system_proxy_enabled || nextRt.tun_enabled);
+
+      if (!proxyActive && nextGlobal.running) {
+        if (nextGlobal.mode === "windivert") {
+          pushToast("已开启底层全局国内提速，正在为本机其它软件加速", "ok", 4000);
+        } else if (os === "windows") {
+          pushToast(
+            "已开启国内提速（已启动本地 443 通道，可一键提权接管其它梯子）",
+            "ok",
+            4600
+          );
+        } else {
+          const portLabel = nextGlobal.socks_port
+            ? `127.0.0.1:${nextGlobal.socks_port}`
+            : "本地 443 通道";
+          pushToast(`已开启国内提速（独立入口 ${portLabel} 已就绪）`, "ok", 4200);
+        }
+      } else if (nextRt.running) {
+        if (nextGlobal.running && nextGlobal.mode === "windivert") {
+          pushToast("已开启国内提速，代理与底层全局加速已同时运行", "ok", 4000);
+        } else {
+          const relayHint = nextRt.preaccel_relay_name
+            ? `（当前主力：${nextRt.preaccel_relay_name}）`
+            : "";
+          pushToast(`已开启国内提速${relayHint}`, "ok");
+        }
+      } else {
+        pushToast("已开启国内提速，启动代理或底层全局提速后即刻生效", "ok");
+      }
+
+      return true;
+    } catch (err) {
+      pushToast(`切换国内提速失败：${formatErrorMessage(err)}`, "warn", 4200);
+      return false;
+    }
+  },
+
+  async toggleGlobalPreAccel(next?: boolean): Promise<boolean> {
+    const currentlyRunning = Boolean(
+      state.globalPreAccel.running || state.runtime.global_preaccel_active
+    );
+    const target = next ?? !currentlyRunning;
+
+    if (target) {
+      let relays = state.preAccelRelays;
+      if (!relays.some((r) => r.enabled) && isTauriEnv()) {
+        try {
+          relays = await catcloudApi.listPreAccelRelays();
+          setState((prev) => ({ ...prev, preAccelRelays: relays }));
+        } catch {
+          /* fall through */
+        }
+      }
+      if (!relays.some((r) => r.enabled)) {
+        pushToast(
+          "还没有可用的国内中转线路，请先添加并启用至少一条中转后再开启底层提速",
+          "warn",
+          4200
+        );
+        return false;
+      }
+    }
+
+    try {
+      const nextGlobal = await catcloudApi.toggleGlobalPreAccel(target);
+      const [cfgRes, rtRes] = await Promise.allSettled([
+        catcloudApi.getConfig(),
+        catcloudApi.getRuntimeInfo(),
+      ]);
+
+      const nextCfg: AppConfig =
+        cfgRes.status === "fulfilled"
+          ? {
+              ...cfgRes.value,
+              behavior: cfgRes.value.behavior ?? state.config.behavior,
+            }
+          : {
+              ...state.config,
+              preaccel: {
+                ...state.config.preaccel,
+                global_bypass_enabled: target,
+                enabled: target ? true : state.config.preaccel.enabled,
+              },
+            };
+
+      const nextRt: CoreRuntimeInfo =
+        rtRes.status === "fulfilled"
+          ? rtRes.value
+          : {
+              ...state.runtime,
+              global_preaccel_active: nextGlobal.running,
+              global_preaccel_mode: nextGlobal.mode,
+              global_preaccel_socks_port: nextGlobal.socks_port,
+              global_preaccel_connections: nextGlobal.active_connections,
+              preaccel_active:
+                nextGlobal.running || (state.runtime.running && nextCfg.preaccel.enabled),
+            };
+
+      setState((prev) => ({
+        ...prev,
+        config: nextCfg,
+        runtime: nextRt,
+        globalPreAccel: nextGlobal,
+      }));
+
+      if (!target || !nextGlobal.running) {
+        if (target && nextGlobal.last_error) {
+          pushToast(`底层全局提速启动受阻：${nextGlobal.last_error}`, "warn", 4600);
+          return false;
+        }
+        pushToast("已关闭底层全局国内提速", "info");
+        return false;
+      }
+
+      const os = resolvePlatformOs(nextRt.os_label);
+      if (nextGlobal.mode === "windivert") {
+        pushToast("已开启底层全局国内提速，正在为本机其它软件加速", "ok", 4000);
+      } else if (os === "windows") {
+        pushToast(
+          "已启动本地独立 443 通道，完成驱动与管理员授权后即可自动接管其它梯子",
+          "ok",
+          4600
+        );
+      } else {
+        const portHint = nextGlobal.socks_port ? `127.0.0.1:${nextGlobal.socks_port}` : "本地入口";
+        pushToast(`已启动本地独立 443 通道（${portHint}），可供终端与其它软件使用`, "ok", 4200);
+      }
+      return true;
+    } catch (err) {
+      pushToast(`切换底层全局提速失败：${formatErrorMessage(err)}`, "warn", 4200);
+      return false;
+    }
+  },
+
+  async updateGlobalPreAccelSettings(
+    scope: GlobalPreAccelScope,
+    targetProcesses: string[],
+    windivertDir: string | null = state.config.preaccel.windivert_dir ?? null
+  ): Promise<boolean> {
+    try {
+      const nextGlobal = await catcloudApi.updateGlobalPreAccelSettings(
+        scope,
+        targetProcesses,
+        windivertDir
+      );
+      const [cfgRes, rtRes] = await Promise.allSettled([
+        catcloudApi.getConfig(),
+        catcloudApi.getRuntimeInfo(),
+      ]);
+      setState((prev) => ({
+        ...prev,
+        config:
+          cfgRes.status === "fulfilled"
+            ? {
+                ...cfgRes.value,
+                behavior: cfgRes.value.behavior ?? prev.config.behavior,
+              }
+            : {
+                ...prev.config,
+                preaccel: {
+                  ...prev.config.preaccel,
+                  global_scope: scope,
+                  global_target_processes: targetProcesses,
+                  windivert_dir: windivertDir,
+                },
+              },
+        runtime: rtRes.status === "fulfilled" ? rtRes.value : prev.runtime,
+        globalPreAccel: nextGlobal,
+      }));
+      return true;
+    } catch (err) {
+      pushToast(`保存底层提速范围失败：${formatErrorMessage(err)}`, "warn", 4000);
+      return false;
+    }
+  },
+
+  async installWinDivertDriver(): Promise<boolean> {
+    try {
+      const nextGlobal = await catcloudApi.installWinDivertDriver();
+      const rt = await catcloudApi.getRuntimeInfo().catch(() => null);
+      setState((prev) => ({
+        ...prev,
+        globalPreAccel: nextGlobal,
+        runtime: rt ?? prev.runtime,
+      }));
+      if (nextGlobal.windivert_available) {
+        pushToast(
+          nextGlobal.is_elevated
+            ? "官方驱动（WinDivert v2.2.2）已校验安装就绪，可以启用最底层透明加速"
+            : "官方驱动已校验安装，点击下方以管理员身份启动即可接管其它梯子",
+          "ok",
+          4600
+        );
+        return true;
+      }
+      pushToast(
+        nextGlobal.last_error || "驱动下载未完成，如被安全软件拦截请放行后重试",
+        "warn",
+        4600
+      );
+      return false;
+    } catch (err) {
+      pushToast(`下载校验 WinDivert 驱动失败：${formatErrorMessage(err)}`, "warn", 5000);
+      return false;
+    }
+  },
+
+  async relaunchAsAdminForGlobalPreAccel(): Promise<boolean> {
+    try {
+      const launched = await catcloudApi.relaunchAsAdminForGlobalPreAccel();
+      if (launched) {
+        if (!isTauriEnv()) {
+          const [cfg, rt, globalStatus] = await Promise.all([
+            catcloudApi.getConfig(),
+            catcloudApi.getRuntimeInfo(),
+            catcloudApi.getGlobalPreAccelStatus(),
+          ]);
+          setState((prev) => ({
+            ...prev,
+            config: cfg,
+            runtime: rt,
+            globalPreAccel: globalStatus,
+          }));
+          pushToast("演示模式：已模拟管理员提权并开启最底层透明加速", "ok");
+        } else {
+          pushToast("已拉起管理员实例，正在启用最底层透明加速…", "ok", 4200);
+        }
+        return true;
+      }
+      pushToast("已取消管理员授权，当前继续保持本地独立 443 通道", "info");
+      return false;
+    } catch (err) {
+      pushToast(`以管理员身份启动失败：${formatErrorMessage(err)}`, "warn", 4600);
+      return false;
+    }
   },
 
   syncQuickSites(quickSites: SiteCheckItem[]): void {
@@ -1809,6 +2227,7 @@ export const appActions = {
 
   async relaunchAsAdminForTun(): Promise<boolean> {
     if (state.tunAdminPromptBusy) return false;
+    const os = resolvePlatformOs(state.runtime.os_label);
     setState((prev) => ({ ...prev, tunAdminPromptBusy: true }));
     try {
       const launched = await catcloudApi.relaunchAsAdmin(true);
@@ -1826,7 +2245,24 @@ export const appActions = {
             tunAdminPromptBusy: false,
             tunAdminPromptReason: null,
           }));
-          pushToast("演示模式：已模拟管理员提权并开启虚拟网卡", "ok");
+          pushToast("演示模式：已模拟完成提权并开启虚拟网卡", "ok");
+        } else if (os === "linux") {
+          const [cfgRes, rtRes] = await Promise.allSettled([
+            catcloudApi.getConfig(),
+            catcloudApi.getRuntimeInfo(),
+          ]);
+          setState((prev) => ({
+            ...prev,
+            config:
+              cfgRes.status === "fulfilled"
+                ? { ...cfgRes.value, behavior: cfgRes.value.behavior ?? prev.config.behavior }
+                : prev.config,
+            runtime: rtRes.status === "fulfilled" ? rtRes.value : prev.runtime,
+            tunAdminPromptOpen: false,
+            tunAdminPromptBusy: false,
+            tunAdminPromptReason: null,
+          }));
+          pushToast("已为代理核心授予网络权限，虚拟网卡已就绪", "ok", 4000);
         } else {
           setState((prev) => ({
             ...prev,
@@ -1834,7 +2270,12 @@ export const appActions = {
             tunAdminPromptBusy: false,
             tunAdminPromptReason: null,
           }));
-          pushToast("已拉起管理员实例，正在接管并开启虚拟网卡…", "ok");
+          pushToast(
+            os === "macos"
+              ? "已发起系统安全授权，正在开启虚拟网卡…"
+              : "已拉起管理员实例，正在接管并开启虚拟网卡…",
+            "ok"
+          );
         }
         return true;
       }
@@ -1844,11 +2285,16 @@ export const appActions = {
         tunAdminPromptBusy: false,
         tunAdminPromptReason: null,
       }));
-      pushToast("已取消管理员授权，虚拟网卡未开启", "info");
+      pushToast("已取消系统授权，虚拟网卡未开启", "info");
       return false;
     } catch (err) {
       setState((prev) => ({ ...prev, tunAdminPromptBusy: false }));
-      pushToast(`管理员重启失败：${formatErrorMessage(err)}`, "warn");
+      pushToast(
+        os === "linux"
+          ? `授予核心网络权限失败：${formatErrorMessage(err)}`
+          : `系统授权启动失败：${formatErrorMessage(err)}`,
+        "warn"
+      );
       return false;
     }
   },

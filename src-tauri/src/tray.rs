@@ -22,6 +22,8 @@ pub mod menu_id {
     pub const QUICK_SWITCH_NEXT_BEST_PREFIX: &str = "tray:group_next:";
     pub const GROUP_SELECT_PREFIX: &str = "tray:group_select:";
     pub const PREACCEL_TOGGLE: &str = "tray:preaccel:toggle";
+    pub const TOGGLE_GLOBAL_PREACCEL: &str = "tray:preaccel:toggle_global";
+    pub const PREACCEL_TOGGLE_GLOBAL_SUB: &str = "tray:preaccel:toggle_global_sub";
     pub const PREACCEL_FAILOVER_NEXT: &str = "tray:preaccel:failover";
     pub const PREACCEL_RELAY_PREFIX: &str = "tray:preaccel:relay:";
     pub const SUBS_REFRESH_ALL: &str = "tray:subs:refresh_all";
@@ -211,6 +213,12 @@ pub struct TrayPreAccelSummary {
     pub enabled: bool,
     pub active_label: Option<String>,
     pub relays: Vec<TrayPreAccelRelayItem>,
+    #[serde(default)]
+    pub global_enabled: bool,
+    #[serde(default)]
+    pub global_running: bool,
+    #[serde(default)]
+    pub global_mode_label: Option<String>,
 }
 
 /// Read-only subscription entry shown under the subscription pool submenu.
@@ -376,6 +384,7 @@ pub enum TrayAction {
     QuickSwitchNextBest { group_id: String },
     SelectGroupNode { group_id: String, node_id: String },
     TogglePreAccel,
+    ToggleGlobalPreAccel,
     FailoverPreAccel,
     SelectPreAccelRelay { relay_id: String },
     RefreshSubscriptions,
@@ -398,6 +407,9 @@ pub fn parse_menu_action(id: &str) -> Option<TrayAction> {
         menu_id::MODE_GLOBAL => Some(TrayAction::SetProxyMode(TrayProxyMode::Global)),
         menu_id::MODE_DIRECT => Some(TrayAction::SetProxyMode(TrayProxyMode::Direct)),
         menu_id::PREACCEL_TOGGLE => Some(TrayAction::TogglePreAccel),
+        menu_id::TOGGLE_GLOBAL_PREACCEL | menu_id::PREACCEL_TOGGLE_GLOBAL_SUB => {
+            Some(TrayAction::ToggleGlobalPreAccel)
+        }
         menu_id::PREACCEL_FAILOVER_NEXT => Some(TrayAction::FailoverPreAccel),
         menu_id::SUBS_REFRESH_ALL => Some(TrayAction::RefreshSubscriptions),
         menu_id::TOGGLE_SYSTEM_PROXY => Some(TrayAction::ToggleSystemProxy),
@@ -629,6 +641,40 @@ fn build_group_submenu<R: Runtime>(
     Ok(submenu)
 }
 
+fn format_preaccel_submenu_title(preaccel: &TrayPreAccelSummary) -> String {
+    let active_suffix = preaccel
+        .active_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let status_tag = if preaccel.global_running {
+        match preaccel.global_mode_label.as_deref().map(str::trim) {
+            Some("dual") => "已开启·全局+代理",
+            Some("local_socks5") | Some("本地443通道") => "本地443通道就绪",
+            Some("windivert") | Some("底层全局提速") => "底层全局提速中",
+            Some(custom) if !custom.is_empty() => custom,
+            _ if preaccel.enabled => "已开启·全局+代理",
+            _ => "底层全局提速中",
+        }
+    } else if preaccel.enabled {
+        match preaccel.global_mode_label.as_deref().map(str::trim) {
+            Some("standby") => "已开启·待启动",
+            _ => "已开启·代理提速",
+        }
+    } else if preaccel.global_enabled {
+        "底层全局提速·待启动"
+    } else {
+        "已关闭"
+    };
+
+    match active_suffix {
+        Some(label) if preaccel.enabled || preaccel.global_running || preaccel.global_enabled => {
+            format!("国内加速入口 ({status_tag} · {label})")
+        }
+        _ => format!("国内加速入口 ({status_tag})"),
+    }
+}
+
 /// Build the complete Fig. 9 context menu from a discrete `TrayMenuState`.
 pub fn build_tray_menu<R: Runtime>(
     app: &AppHandle<R>,
@@ -754,20 +800,22 @@ pub fn build_tray_menu<R: Runtime>(
     };
 
     // Domestic Pre-Acceleration submenu
-    let preaccel_title = match (&state.preaccel.enabled, &state.preaccel.active_label) {
-        (true, Some(label)) if !label.trim().is_empty() => {
-            format!("国内加速入口 (已开启 · {})", label.trim())
-        }
-        (true, _) => "国内加速入口 (已开启)".to_string(),
-        (false, _) => "国内加速入口 (已关闭)".to_string(),
-    };
+    let preaccel_title = format_preaccel_submenu_title(&state.preaccel);
     let preaccel_submenu = Submenu::new(app, preaccel_title, true)?;
     let preaccel_toggle = CheckMenuItem::with_id(
         app,
         menu_id::PREACCEL_TOGGLE,
-        "启用国内加速入口",
+        "启用代理内国内加速入口",
         true,
         state.preaccel.enabled,
+        None::<&str>,
+    )?;
+    let preaccel_global_sub_toggle = CheckMenuItem::with_id(
+        app,
+        menu_id::PREACCEL_TOGGLE_GLOBAL_SUB,
+        "启用底层全局国内提速（免开代理/给其它软件）",
+        true,
+        state.preaccel.global_enabled || state.preaccel.global_running,
         None::<&str>,
     )?;
     let preaccel_failover = MenuItem::with_id(
@@ -778,6 +826,7 @@ pub fn build_tray_menu<R: Runtime>(
         None::<&str>,
     )?;
     preaccel_submenu.append(&preaccel_toggle)?;
+    preaccel_submenu.append(&preaccel_global_sub_toggle)?;
     preaccel_submenu.append(&preaccel_failover)?;
     preaccel_submenu.append(&PredefinedMenuItem::separator(app)?)?;
     if state.preaccel.relays.is_empty() {
@@ -838,6 +887,14 @@ pub fn build_tray_menu<R: Runtime>(
         "TUN 虚拟网卡模式",
         true,
         state.tun_enabled,
+        None::<&str>,
+    )?;
+    let global_preaccel = CheckMenuItem::with_id(
+        app,
+        menu_id::TOGGLE_GLOBAL_PREACCEL,
+        "底层全局国内提速（免开代理）",
+        true,
+        state.preaccel.global_enabled || state.preaccel.global_running,
         None::<&str>,
     )?;
     let windowless = CheckMenuItem::with_id(
@@ -917,7 +974,7 @@ pub fn build_tray_menu<R: Runtime>(
     let sep4 = PredefinedMenuItem::separator(app)?;
     let sep5 = PredefinedMenuItem::separator(app)?;
 
-    let items: [&dyn IsMenuItem<R>; 21] = [
+    let items: [&dyn IsMenuItem<R>; 22] = [
         &open_main,
         &toggle_capsule,
         &sep1,
@@ -931,6 +988,7 @@ pub fn build_tray_menu<R: Runtime>(
         &sep3,
         &sys_proxy,
         &tun_mode,
+        &global_preaccel,
         &windowless,
         &sep4,
         &copy_env,
@@ -1321,5 +1379,121 @@ mod tests {
         let mut single_menu = initial;
         single_menu.active_single_node_label = Some("🇯🇵 Tokyo 01".into());
         assert!(runtime.should_rebuild_menu(&single_menu));
+    }
+
+    #[test]
+    fn toggle_global_preaccel_menu_id_parsing_and_diff() {
+        assert_eq!(
+            parse_menu_action(menu_id::TOGGLE_GLOBAL_PREACCEL),
+            Some(TrayAction::ToggleGlobalPreAccel)
+        );
+        assert_eq!(
+            parse_menu_action(menu_id::PREACCEL_TOGGLE_GLOBAL_SUB),
+            Some(TrayAction::ToggleGlobalPreAccel)
+        );
+
+        let initial = TrayMenuState::default();
+        let runtime = TrayRuntimeState::new(
+            initial.clone(),
+            (TrayIconPack::A, TrayHealthState::Idle),
+            "CatCloud".into(),
+            TrayClickAction::ToggleMain,
+        );
+        assert!(!runtime.should_rebuild_menu(&initial));
+
+        let mut global_on = initial.clone();
+        global_on.preaccel.global_enabled = true;
+        global_on.preaccel.global_running = true;
+        global_on.preaccel.global_mode_label = Some("windivert".into());
+        assert!(runtime.should_rebuild_menu(&global_on));
+        runtime.commit_menu(global_on.clone());
+        assert!(!runtime.should_rebuild_menu(&global_on));
+
+        let mut local_mode = global_on;
+        local_mode.preaccel.global_mode_label = Some("local_socks5".into());
+        assert!(runtime.should_rebuild_menu(&local_mode));
+    }
+
+    #[test]
+    fn preaccel_submenu_title_and_global_tooltip_clamp_utf16() {
+        let closed = TrayPreAccelSummary::default();
+        assert_eq!(format_preaccel_submenu_title(&closed), "国内加速入口 (已关闭)");
+
+        let proxy_only = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&proxy_only),
+            "国内加速入口 (已开启·代理提速 · 杭州443)"
+        );
+
+        let standby = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            global_mode_label: Some("standby".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&standby),
+            "国内加速入口 (已开启·待启动 · 杭州443)"
+        );
+
+        let windivert = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            global_enabled: true,
+            global_running: true,
+            global_mode_label: Some("windivert".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&windivert),
+            "国内加速入口 (底层全局提速中 · 杭州443)"
+        );
+
+        let local_socks = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            global_enabled: true,
+            global_running: true,
+            global_mode_label: Some("local_socks5".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&local_socks),
+            "国内加速入口 (本地443通道就绪 · 杭州443)"
+        );
+
+        let dual = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            global_enabled: true,
+            global_running: true,
+            global_mode_label: Some("dual".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&dual),
+            "国内加速入口 (已开启·全局+代理 · 杭州443)"
+        );
+
+        let info = TrayTooltipInfo {
+            version: "0.1.0".into(),
+            runtime_mode_label: "便携模式".into(),
+            proxy_mode: TrayProxyMode::Rule,
+            tun_enabled: false,
+            system_proxy_enabled: false,
+            preaccel_summary: Some(
+                "底层全局提速中 · 杭州阿里云443高带宽中转节点超长名称测试测试测试 (127.0.0.1:17895)"
+                    .into(),
+            ),
+            primary_group_summary: Some("主力路线组 -> 🇯🇵 Tokyo 01 超长节点名测试测试测试".into()),
+            realtime_speed: None,
+        };
+        let formatted = info.format_tooltip();
+        assert!(formatted.contains("预加速: 底层全局提速中"));
+        assert!(formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
     }
 }

@@ -25,26 +25,31 @@ use catcloud_core::core_adapter::stream_client::{
 };
 use catcloud_core::core_adapter::{
     ConnectionsSnapshot, CoreAdapter, CoreLogLine, CoreRuntimeStatus, CoreStartRequest,
-    ReloadLevel, ReloadOutcome, SINGLE_NODE_GROUP_NAME,
+    ReloadLevel, ReloadOutcome, SINGLE_NODE_GROUP_NAME, TrafficTick,
 };
 use catcloud_core::models::{
-    AppConfig, CoreLogLevel, MemoryLimitTier, MultiGroup, MultiGroupMode, OverrideMode,
-    PersonalizationConfig, PreAccelConfig, PreAccelRelay, ProbeDefinition, ProbeSnapshot,
-    ProxyMode, ProxyNode, RouteTargetMode, SubscriptionKind, SubscriptionRecord, SwitchMode,
-    ThemeDaySchedule, ThemeMode, TrayClickAction as CoreTrayClickAction, TrayIconMode,
+    AppConfig, CoreLogLevel, GlobalPreAccelScope, MemoryLimitTier, MultiGroup, MultiGroupMode,
+    OverrideMode, PersonalizationConfig, PreAccelConfig, PreAccelRelay, ProbeDefinition,
+    ProbeSnapshot, ProxyMode, ProxyNode, RouteTargetMode, SubscriptionKind, SubscriptionRecord,
+    SwitchMode, ThemeDaySchedule, ThemeMode, TrayClickAction as CoreTrayClickAction, TrayIconMode,
     TunStackMode, UpdateApplyMode, UpdateConfig,
 };
 use catcloud_core::platform::{SystemProxySpec, default_platform};
 use catcloud_core::preaccel::campus::{
     CampusBypassTracker, CampusPortalState, probe_campus_portal_with_fallback,
 };
+use catcloud_core::preaccel::global_tunnel::{GlobalPreAccelManager, GlobalPreAccelStatus};
+#[cfg(target_os = "windows")]
+use catcloud_core::preaccel::global_tunnel::download_and_install_windivert;
 use catcloud_core::probe::{
     DEFAULT_READY_TIMEOUT, FunnelOptions, FunnelTier, IsolatedProbeCore, ProbeRegistry,
     ThroughputProbeConfig, build_isolated_http_client, probe_live_google_cleanliness,
     run_download_probe_with_config, run_funnel_for_node, run_latency_probe,
     run_upload_probe_with_config,
 };
-use catcloud_core::process_guard::{JobGuard, relaunch_self_as_admin};
+use catcloud_core::process_guard::JobGuard;
+#[cfg(target_os = "windows")]
+use catcloud_core::process_guard::relaunch_self_as_admin;
 use catcloud_core::storage::Storage;
 use catcloud_core::strategy::evaluator::evaluate_group_candidates;
 use catcloud_core::subscription::{
@@ -85,6 +90,7 @@ pub struct AppState {
     pub config: RwLock<AppConfig>,
     pub storage: Mutex<Storage>,
     pub job_guard: Arc<JobGuard>,
+    pub global_preaccel: Arc<GlobalPreAccelManager>,
     pub adapter: Arc<MihomoAdapter>,
     pub hot_reload: Arc<HotReloadCoordinator>,
     pub telemetry: Arc<CoreTelemetryStore>,
@@ -175,6 +181,10 @@ impl AppState {
             MihomoAdapter::new(Arc::clone(&job_guard))
                 .expect("failed to initialize MihomoAdapter"),
         );
+        let global_preaccel = Arc::new(GlobalPreAccelManager::new(
+            paths.clone(),
+            Arc::clone(&job_guard),
+        ));
         let hot_reload = Arc::new(HotReloadCoordinator::new(paths.clone(), Arc::clone(&adapter)));
         let telemetry = Arc::new(CoreTelemetryStore::default());
         let app_logger = Arc::new(RotatingAppLogger::new(paths.logs_dir.clone()));
@@ -184,6 +194,7 @@ impl AppState {
             config: RwLock::new(cfg),
             storage: Mutex::new(storage),
             job_guard,
+            global_preaccel,
             adapter,
             hot_reload,
             telemetry,
@@ -260,6 +271,12 @@ impl AppState {
         if let Ok(mut guard) = self.last_app_error.write() {
             *guard = None;
         }
+    }
+
+    pub fn snapshot_global_preaccel(&self) -> GlobalPreAccelStatus {
+        let custom_dir = self.snapshot_config().preaccel.windivert_dir;
+        self.global_preaccel
+            .status_with_custom_dir(custom_dir.as_deref())
     }
 
     pub fn last_app_error_snapshot(&self) -> Option<String> {
@@ -418,6 +435,16 @@ pub struct UiPreAccelDto {
     pub skip_443_native: bool,
     pub probe_url: String,
     pub fallback_probe_url: String,
+    #[serde(default)]
+    pub campus_portal_guard: Option<bool>,
+    #[serde(default)]
+    pub global_bypass_enabled: Option<bool>,
+    #[serde(default)]
+    pub global_scope: Option<GlobalPreAccelScope>,
+    #[serde(default)]
+    pub global_target_processes: Option<Vec<String>>,
+    #[serde(default)]
+    pub windivert_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -478,6 +505,11 @@ impl From<&AppConfig> for UiAppConfigDto {
                 skip_443_native: cfg.preaccel.skip_443_native,
                 probe_url: cfg.preaccel.probe_url.clone(),
                 fallback_probe_url: cfg.preaccel.fallback_probe_url.clone(),
+                campus_portal_guard: Some(cfg.preaccel.campus_portal_guard),
+                global_bypass_enabled: Some(cfg.preaccel.global_bypass_enabled),
+                global_scope: Some(cfg.preaccel.global_scope),
+                global_target_processes: Some(cfg.preaccel.global_target_processes.clone()),
+                windivert_dir: cfg.preaccel.windivert_dir.clone(),
             },
             personalization: UiPersonalizationDto {
                 theme_mode: cfg.personalization.theme_mode.clone(),
@@ -534,6 +566,34 @@ fn apply_ui_dto(cfg: &mut AppConfig, dto: &UiAppConfigDto) {
         skip_443_native: dto.preaccel.skip_443_native,
         probe_url: dto.preaccel.probe_url.clone(),
         fallback_probe_url: dto.preaccel.fallback_probe_url.clone(),
+        campus_portal_guard: dto
+            .preaccel
+            .campus_portal_guard
+            .unwrap_or(cfg.preaccel.campus_portal_guard),
+        global_bypass_enabled: dto
+            .preaccel
+            .global_bypass_enabled
+            .unwrap_or(cfg.preaccel.global_bypass_enabled),
+        global_scope: dto
+            .preaccel
+            .global_scope
+            .unwrap_or(cfg.preaccel.global_scope),
+        global_target_processes: dto
+            .preaccel
+            .global_target_processes
+            .clone()
+            .unwrap_or_else(|| cfg.preaccel.global_target_processes.clone()),
+        windivert_dir: match dto.preaccel.windivert_dir.as_deref() {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            None => cfg.preaccel.windivert_dir.clone(),
+        },
         ..cfg.preaccel.clone()
     };
     cfg.personalization = PersonalizationConfig {
@@ -581,6 +641,16 @@ pub struct CoreRuntimeInfoDto {
     pub active_node_latency_ms: Option<f64>,
     pub active_node_up_mbps: Option<f64>,
     pub preaccel_active: bool,
+    #[serde(default)]
+    pub preaccel_enabled: bool,
+    #[serde(default)]
+    pub global_preaccel_active: bool,
+    #[serde(default)]
+    pub global_preaccel_mode: String,
+    #[serde(default)]
+    pub global_preaccel_socks_port: Option<u16>,
+    #[serde(default)]
+    pub global_preaccel_connections: u64,
     pub preaccel_relay_name: Option<String>,
     pub captive_portal_required: bool,
     pub system_proxy_enabled: bool,
@@ -876,6 +946,184 @@ pub fn pick_best_group_candidate(
         .map(str::to_string)
 }
 
+/// Default sliding window (10 s) for high-throughput failover suppression.
+pub(crate) const WATCHDOG_HIGH_THROUGHPUT_WINDOW_MS: i64 = 10_000;
+/// Default throughput guard threshold (256 KiB/s) protecting active uploads/downloads.
+pub(crate) const WATCHDOG_HIGH_THROUGHPUT_THRESHOLD_BPS: u64 = 256 * 1024;
+
+/// Return `true` when active transfer throughput meets or exceeds `threshold_bps`, checking both
+/// the cached real-time rate and the peak rate within `window_ms` of `now_ms` inside
+/// `recent_ticks` (so minimizing/hiding the GUI window, which zeroes `cached` on quiet ticks,
+/// never disables active transfer protection).
+pub(crate) fn is_high_throughput_active(
+    cached: &CachedRealtimeMetrics,
+    recent_ticks: &[TrafficTick],
+    now_ms: i64,
+    window_ms: i64,
+    threshold_bps: u64,
+) -> bool {
+    if cached.up_bps.max(cached.down_bps) >= threshold_bps {
+        return true;
+    }
+    let cutoff_ms = now_ms.saturating_sub(window_ms.max(0));
+    let upper_ms = now_ms.saturating_add(5_000);
+    for tick in recent_ticks {
+        if tick.timestamp_ms >= cutoff_ms && tick.timestamp_ms <= upper_ms {
+            if tick.up.max(tick.down) >= threshold_bps {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn collect_ranked_group_candidates(
+    group: &MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    active_node_id: Option<&str>,
+    cooldown_node_ids: &HashSet<String>,
+    max_candidates: usize,
+) -> Vec<String> {
+    if max_candidates == 0 {
+        return Vec::new();
+    }
+    let active_trimmed = active_node_id.map(str::trim).filter(|s| !s.is_empty());
+    let allowed = |id: &str| {
+        active_trimmed != Some(id)
+            && !cooldown_node_ids.contains(id)
+            && is_valid_group_member(group, id, nodes)
+    };
+
+    let mut out: Vec<String> = Vec::with_capacity(max_candidates);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut push_if_allowed = |id: &str| -> bool {
+        if out.len() >= max_candidates {
+            return true;
+        }
+        if allowed(id) && seen.insert(id.to_string()) {
+            out.push(id.to_string());
+        }
+        out.len() >= max_candidates
+    };
+
+    if let Ok(report) = evaluate_group_candidates(group, nodes, snaps) {
+        // Tier 1: highest-scoring healthy candidates.
+        for c in &report.healthy_candidates {
+            if push_if_allowed(&c.node_id) {
+                return out;
+            }
+        }
+        // Tier 2: highest-scoring ok gate-passing candidates.
+        for c in report.gate_passed.iter().filter(|c| c.ok) {
+            if push_if_allowed(&c.node_id) {
+                return out;
+            }
+        }
+        // Tier 3: remaining gate-passing candidates when static hard gates are configured.
+        if !group.hard_gates.is_empty() {
+            for c in &report.gate_passed {
+                if push_if_allowed(&c.node_id) {
+                    return out;
+                }
+            }
+        }
+        // Tier 4: gate-rejected candidates preserving ok -> probed finite score -> distinct score order.
+        for c in report.gate_rejected.iter().filter(|c| c.ok) {
+            if push_if_allowed(&c.node_id) {
+                return out;
+            }
+        }
+        let allowed_rejected: Vec<_> = report
+            .gate_rejected
+            .iter()
+            .filter(|c| allowed(&c.node_id))
+            .collect();
+        for c in allowed_rejected
+            .iter()
+            .filter(|c| snaps.contains_key(&c.node_id) && c.score.is_finite())
+        {
+            if push_if_allowed(&c.node_id) {
+                return out;
+            }
+        }
+        if let (Some(first), Some(last)) = (allowed_rejected.first(), allowed_rejected.last()) {
+            if first.score.is_finite()
+                && (!last.score.is_finite() || (first.score - last.score).abs() > 1e-9)
+            {
+                for c in &allowed_rejected {
+                    if c.score.is_finite() && push_if_allowed(&c.node_id) {
+                        return out;
+                    }
+                }
+            }
+        }
+    }
+
+    // Tier 5: fall back to enabled member order starting right after `active_node_id`.
+    let mut enabled_members: Vec<&str> = Vec::new();
+    let mut member_seen: HashSet<&str> = HashSet::new();
+    if !group.member_node_ids.is_empty() {
+        for mid in &group.member_node_ids {
+            if let Some(n) = nodes.iter().find(|n| &n.id == mid && n.enabled) {
+                if member_seen.insert(n.id.as_str()) {
+                    enabled_members.push(n.id.as_str());
+                }
+            }
+        }
+    } else {
+        for n in nodes.iter().filter(|n| n.enabled) {
+            if member_seen.insert(n.id.as_str()) {
+                enabled_members.push(n.id.as_str());
+            }
+        }
+    }
+
+    if enabled_members.is_empty() {
+        return out;
+    }
+
+    let start_idx = active_trimmed
+        .and_then(|aid| enabled_members.iter().position(|&id| id == aid))
+        .map(|idx| (idx + 1) % enabled_members.len())
+        .unwrap_or(0);
+    for offset in 0..enabled_members.len() {
+        let id = enabled_members[(start_idx + offset) % enabled_members.len()];
+        if push_if_allowed(id) {
+            break;
+        }
+    }
+
+    out
+}
+
+/// Rank up to `max_candidates` backup nodes for watchdog failover using the same 5-tier priority
+/// order as `pick_best_group_candidate`, excluding both `active_node_id` and nodes currently in
+/// `cooldown_node_ids`. If every non-active member is in cooldown, relaxes the cooldown filter as a
+/// last resort while still excluding `active_node_id`.
+pub(crate) fn pick_group_candidates_with_cooldown(
+    group: &MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    active_node_id: Option<&str>,
+    cooldown_node_ids: &HashSet<String>,
+    max_candidates: usize,
+) -> Vec<String> {
+    let ranked = collect_ranked_group_candidates(
+        group,
+        nodes,
+        snaps,
+        active_node_id,
+        cooldown_node_ids,
+        max_candidates,
+    );
+    if !ranked.is_empty() || cooldown_node_ids.is_empty() {
+        return ranked;
+    }
+    let empty = HashSet::new();
+    collect_ranked_group_candidates(group, nodes, snaps, active_node_id, &empty, max_candidates)
+}
+
 /// Sanitize a group's `active_node_id`: when `!group.member_node_ids.is_empty()` and
 /// `group.active_node_id` is missing, removed from `member_node_ids`, or disabled, replace it
 /// with the highest-scoring gate-passing candidate via `evaluate_group_candidates` (falling back
@@ -1067,6 +1315,12 @@ fn select_tray_group_candidates<'a>(
     ordered
 }
 
+/// Return `true` only when the main proxy core is genuinely taking over host traffic
+/// (core process is running AND either OS system proxy or TUN virtual NIC is enabled).
+pub(crate) fn is_proxy_takeover_active(core_running: bool, cfg: &AppConfig) -> bool {
+    core_running && (cfg.system_proxy.enabled || cfg.tun.enabled)
+}
+
 pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState {
     let cfg = state.snapshot_config();
     let win = lifecycle::window_mode_snapshot(app);
@@ -1200,6 +1454,21 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
         })
         .collect();
 
+    let rt = state.snapshot_runtime();
+    let global_status = state.snapshot_global_preaccel();
+    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
+    let global_mode_label = if global_status.running {
+        if proxy_active && cfg.preaccel.enabled {
+            Some("dual".to_string())
+        } else {
+            Some(global_status.mode.clone())
+        }
+    } else if cfg.preaccel.enabled && !proxy_active {
+        Some("standby".to_string())
+    } else {
+        None
+    };
+
     TrayMenuState {
         proxy_mode: match cfg.proxy_mode {
             ProxyMode::Rule => TrayProxyMode::Rule,
@@ -1218,6 +1487,9 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
             enabled: cfg.preaccel.enabled,
             active_label: active_relay_label,
             relays: tray_relays,
+            global_enabled: cfg.preaccel.global_bypass_enabled,
+            global_running: global_status.running,
+            global_mode_label,
         },
         subscriptions: TraySubscriptionSummary {
             total_remaining_label: if total_remaining > 0 {
@@ -1233,6 +1505,7 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
 pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
     let cfg = state.snapshot_config();
     let rt = state.snapshot_runtime();
+    let global_status = state.snapshot_global_preaccel();
     let metrics = state
         .cached_metrics
         .read()
@@ -1250,42 +1523,94 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         TrayIconMode::AlwaysC => tray::TrayIconMode::AlwaysC,
         TrayIconMode::AlwaysPixel => tray::TrayIconMode::AlwaysPixel,
     };
+    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
+    let preaccel_active = (proxy_active && cfg.preaccel.enabled) || global_status.running;
     let health = if rt.last_error.is_some() {
         TrayHealthState::Error
     } else if portal_required {
         TrayHealthState::Warn
-    } else if cfg.preaccel.enabled && rt.running {
+    } else if preaccel_active {
         TrayHealthState::PreAccel
-    } else if rt.running || cfg.system_proxy.enabled || cfg.tun.enabled {
+    } else if proxy_active {
         TrayHealthState::Ok
     } else {
         TrayHealthState::Idle
     };
 
-    let primary_group_summary = state.storage.lock().ok().and_then(|db| {
-        if cfg.route_mode == RouteTargetMode::Single {
-            if let Some(node) = cfg
-                .active_single_node_id
+    let (primary_group_summary, configured_relay_name) = state
+        .storage
+        .lock()
+        .ok()
+        .map(|db| {
+            let relays = db.list_preaccel_relays(true).unwrap_or_default();
+            let relay_name = cfg
+                .preaccel
+                .active_relay_id
                 .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .and_then(|id| db.get_node(id).ok().flatten())
-            {
-                return Some(format!("单节点 · {}", node.name));
+                .and_then(|id| relays.iter().find(|r| r.id == id))
+                .or_else(|| relays.first())
+                .map(|r| r.name.clone());
+
+            let group_summary = (|| {
+                if cfg.route_mode == RouteTargetMode::Single {
+                    if let Some(node) = cfg
+                        .active_single_node_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .and_then(|id| db.get_node(id).ok().flatten())
+                    {
+                        return Some(format!("单节点 · {}", node.name));
+                    }
+                }
+                let groups = db.list_multi_groups().ok()?;
+                let nodes = db.list_nodes().unwrap_or_default();
+                let g = cfg
+                    .active_group_id
+                    .as_deref()
+                    .and_then(|gid| groups.iter().find(|g| g.id == gid))
+                    .or_else(|| groups.first())?;
+                let node_name = resolve_valid_group_active_node(g, &nodes)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_else(|| "自动择优".to_string());
+                Some(format!("{} -> {}", g.name, node_name))
+            })();
+            (group_summary, relay_name)
+        })
+        .unwrap_or((None, None));
+
+    let active_relay_name = global_status
+        .active_relays
+        .first()
+        .cloned()
+        .or(configured_relay_name);
+
+    let preaccel_summary = if global_status.running {
+        if global_status.mode == "windivert" {
+            let prefix = if proxy_active && cfg.preaccel.enabled {
+                "全局+代理提速中"
+            } else {
+                "底层全局提速中"
+            };
+            match active_relay_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(relay) => Some(format!("{prefix} · {relay}")),
+                None => Some(prefix.to_string()),
             }
+        } else if let Some(port) = global_status.socks_port {
+            Some(format!("本地443通道 (127.0.0.1:{port})"))
+        } else {
+            Some("本地443通道就绪".to_string())
         }
-        let groups = db.list_multi_groups().ok()?;
-        let nodes = db.list_nodes().unwrap_or_default();
-        let g = cfg
-            .active_group_id
-            .as_deref()
-            .and_then(|gid| groups.iter().find(|g| g.id == gid))
-            .or_else(|| groups.first())?;
-        let node_name = resolve_valid_group_active_node(g, &nodes)
-            .map(|n| n.name.clone())
-            .unwrap_or_else(|| "自动择优".to_string());
-        Some(format!("{} -> {}", g.name, node_name))
-    });
+    } else if proxy_active && cfg.preaccel.enabled {
+        match active_relay_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(relay) => Some(format!("国内加速中 · {relay}")),
+            None => Some("国内加速入口运行中".to_string()),
+        }
+    } else if cfg.preaccel.enabled {
+        Some("国内加速已开启（待启动）".to_string())
+    } else {
+        None
+    };
 
     let realtime_speed = if rt.running {
         Some(format!(
@@ -1311,11 +1636,7 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         },
         tun_enabled: cfg.tun.enabled,
         system_proxy_enabled: cfg.system_proxy.enabled,
-        preaccel_summary: if cfg.preaccel.enabled {
-            Some("国内加速入口已开启".to_string())
-        } else {
-            None
-        },
+        preaccel_summary,
         primary_group_summary,
         realtime_speed,
     };
@@ -1323,6 +1644,51 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         icon_mode,
         health,
         tooltip: info.format_tooltip(),
+    }
+}
+
+/// Return `true` when TUN virtual NIC privileges are satisfied on the current OS:
+/// - Windows/macOS: current process is elevated (`is_elevated`).
+/// - Linux: process is root OR the resolved Mihomo core binary carries `cap_net_admin` file
+///   capabilities so TUN works without running the desktop GUI as root.
+pub fn is_tun_privilege_ready(state: &AppState) -> bool {
+    let _ = state;
+    if default_platform().capabilities().is_elevated {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cfg = state.snapshot_config();
+        let extra = state.extra_binary_candidates();
+        if let Ok(res) = resolve_mihomo_binary(&cfg, &state.paths, &extra, false) {
+            if let Some(bin_path) = res.path {
+                return catcloud_core::platform::linux::has_mihomo_tun_capability(&bin_path);
+            }
+        }
+    }
+    false
+}
+
+fn tun_needs_admin_error_message() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        "NEEDS_ADMIN:开启虚拟网卡（TUN）需要为代理核心授予 Linux 网络权限（setcap），请点击「立即授权」一键启用"
+            .to_string()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "NEEDS_ADMIN:macOS 开启虚拟网卡（TUN）需要管理员权限，请通过管理员终端启动应用或在后续系统授权后启用 TUN"
+            .to_string()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "NEEDS_ADMIN:开启虚拟网卡（TUN）需要管理员权限，请点击「以管理员身份重启」一键开启"
+            .to_string()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        "NEEDS_ADMIN:开启虚拟网卡（TUN）需要管理员权限，请使用具备网络管理权限的账户启动应用"
+            .to_string()
     }
 }
 
@@ -1401,21 +1767,30 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         )
     };
 
-    let active_relay_name = cfg
-        .preaccel
-        .active_relay_id
-        .as_deref()
-        .and_then(|id| relays.iter().find(|r| r.id == id))
-        .or_else(|| relays.first())
-        .map(|r| r.name.clone());
+    let global_status = state.snapshot_global_preaccel();
+    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
+    let preaccel_active = (proxy_active && cfg.preaccel.enabled) || global_status.running;
+
+    let active_relay_name = global_status
+        .active_relays
+        .first()
+        .cloned()
+        .or_else(|| {
+            cfg.preaccel
+                .active_relay_id
+                .as_deref()
+                .and_then(|id| relays.iter().find(|r| r.id == id))
+                .or_else(|| relays.first())
+                .map(|r| r.name.clone())
+        });
 
     let status_label = if rt.last_error.is_some() {
         "error".to_string()
     } else if portal_required {
         "warn".to_string()
-    } else if rt.running && cfg.preaccel.enabled {
+    } else if preaccel_active {
         "preaccel".to_string()
-    } else if rt.running {
+    } else if proxy_active {
         "ok".to_string()
     } else {
         "idle".to_string()
@@ -1459,12 +1834,17 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         active_node_region,
         active_node_latency_ms: active_snap.as_ref().and_then(|s| s.latency_ms),
         active_node_up_mbps: active_snap.as_ref().and_then(|s| s.up_mbps),
-        preaccel_active: cfg.preaccel.enabled,
+        preaccel_active,
+        preaccel_enabled: cfg.preaccel.enabled,
+        global_preaccel_active: global_status.running,
+        global_preaccel_mode: global_status.mode,
+        global_preaccel_socks_port: global_status.socks_port,
+        global_preaccel_connections: global_status.active_connections,
         preaccel_relay_name: active_relay_name,
         captive_portal_required: portal_required,
         system_proxy_enabled: cfg.system_proxy.enabled,
         tun_enabled: cfg.tun.enabled,
-        tun_admin_ready: caps.is_elevated,
+        tun_admin_ready: is_tun_privilege_ready(state),
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         os_label: format!("{} {}", caps.os, caps.arch),
         autostart_enabled: cfg.behavior.autostart,
@@ -1932,27 +2312,39 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
     let cfg = state.snapshot_config();
     let may_have_tun =
         cfg.tun.enabled || cfg.rules_override.override_mode != OverrideMode::Disabled;
-    if may_have_tun {
+    let global_running = state.global_preaccel.status().running;
+
+    if may_have_tun || global_running {
         let adapter = Arc::clone(&state.adapter);
-        let run_disable = move || {
+        let global_preaccel = Arc::clone(&state.global_preaccel);
+        let run_teardown = move || {
             tauri::async_runtime::block_on(async move {
-                let _ = tokio::time::timeout(Duration::from_millis(1500), async {
-                    if adapter.has_live_controller().await {
-                        let _ = adapter.disable_tun_gracefully().await;
-                    }
-                })
-                .await;
+                if global_running {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(1500),
+                        global_preaccel.stop(),
+                    )
+                    .await;
+                }
+                if may_have_tun {
+                    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+                        if adapter.has_live_controller().await {
+                            let _ = adapter.disable_tun_gracefully().await;
+                        }
+                    })
+                    .await;
+                }
             });
         };
         if tokio::runtime::Handle::try_current().is_ok() {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                run_disable();
+                run_teardown();
                 let _ = tx.send(());
             });
-            let _ = rx.recv_timeout(Duration::from_millis(1700));
+            let _ = rx.recv_timeout(Duration::from_millis(2000));
         } else {
-            run_disable();
+            run_teardown();
         }
     }
 
@@ -2250,7 +2642,27 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         tracing::warn!("核心启动后同步系统代理端口失败：{err}");
     }
 
+    // Coordinate with standalone global pre-acceleration: when CatCloud's primary core takes over
+    // host traffic via system proxy or TUN, suspend the standalone 443 tunnel by default so we do
+    // not run two redundant 443 Mihomo tunnels (preserving `global_bypass_enabled` for clean
+    // hand-back if the primary core is stopped later). Otherwise, if the standalone global engine
+    // remains running alongside an idle/mixed-port-only primary core, synchronize the new main
+    // core PID so WinDivert excludes CatCloud's own `mihomo` process.
     let latest_cfg = state.snapshot_config();
+    if is_proxy_takeover_active(status.running, &latest_cfg)
+        && state.global_preaccel.status().running
+    {
+        let _ = state.global_preaccel.stop().await;
+        state.log_app_event(
+            "info",
+            "国内提速",
+            "主代理核心已启动接管流量，已暂挂独立底层 443 隧道以避免重复占用内存，改由主核心统一提供国内提速",
+        );
+    } else if state.global_preaccel.status().running {
+        let main_pid = status.pid.filter(|&p| p > 0);
+        state.global_preaccel.sync_main_core_pid(main_pid);
+    }
+
     sync_app_side_effects(app, state, &latest_cfg);
     build_runtime_info_dto(state)
 }
@@ -2279,6 +2691,7 @@ async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
         .stop()
         .await
         .map_err(|e| format!("停止旧代理核心失败：{e}"))?;
+    state.global_preaccel.sync_main_core_pid(None);
     state.bump_core_session_generation();
     state.telemetry.clear_traffic();
     state.set_node_proxy_name_map(HashMap::new());
@@ -2336,6 +2749,7 @@ async fn stop_core_locked(
         state.log_app_event("error", "核心", &msg);
         msg
     })?;
+    state.global_preaccel.sync_main_core_pid(None);
     state.bump_core_session_generation();
     state.telemetry.clear_traffic();
     state.set_node_proxy_name_map(HashMap::new());
@@ -2359,7 +2773,37 @@ async fn stop_core_locked(
         },
     );
     state.log_app_event("info", "核心", "代理核心已停止，系统代理与虚拟网卡状态已复位");
+
+    // If the user kept standalone global pre-acceleration enabled while stopping CatCloud's own
+    // proxy core, seamlessly resume the lightweight standalone 443 tunnel.
+    if !state.shutting_down.load(Ordering::SeqCst)
+        && cfg.preaccel.enabled
+        && cfg.preaccel.global_bypass_enabled
+        && !state.global_preaccel.status().running
+    {
+        match start_global_preaccel_engine(state, &cfg).await {
+            Ok(global_st) => {
+                state.log_app_event(
+                    "info",
+                    "国内提速",
+                    &format!(
+                        "主代理核心已停止，已自动切回独立底层全局国内提速（模式：{}）",
+                        global_st.mode
+                    ),
+                );
+            }
+            Err(err) => {
+                state.log_app_event(
+                    "warning",
+                    "国内提速",
+                    &format!("主核心停止后自动切回独立底层国内提速失败：{err}"),
+                );
+            }
+        }
+    }
+
     sync_app_side_effects(app, state, &cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
     if let Some(err) = save_err {
         return Err(format!("保存配置失败：{err}"));
     }
@@ -2476,8 +2920,73 @@ pub async fn trigger_reload_if_running(
         }
     }
 
+    // Keep WinDivert main-core PID exclusion in sync across L3 restarts or unexpected exits.
+    if (is_l3_restart || !status.running) && state.global_preaccel.status().running {
+        let main_pid = if status.running {
+            status.pid.filter(|&p| p > 0)
+        } else {
+            None
+        };
+        state.global_preaccel.sync_main_core_pid(main_pid);
+    }
+
     sync_app_side_effects(app, state, &cfg);
     Some(outcome)
+}
+
+/// Coordinate standalone global pre-acceleration whenever host traffic takeover (`proxy_active`)
+/// transitions between inactive and active:
+/// - `false -> true`: suspend a running standalone 443 tunnel to prevent running two 443 tunnels
+///   concurrently while preserving `global_bypass_enabled` for later hand-back.
+/// - `true -> false`: seamlessly resume the standalone global pre-acceleration engine when
+///   `cfg.preaccel.global_bypass_enabled` is true and enabled relays exist.
+async fn coordinate_global_preaccel_on_proxy_transition(
+    state: &AppState,
+    cfg: &AppConfig,
+    was_proxy_active: bool,
+    now_proxy_active: bool,
+    trigger_label: &str,
+) {
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return;
+    }
+    if !was_proxy_active && now_proxy_active {
+        if state.global_preaccel.status().running {
+            let _ = state.global_preaccel.stop().await;
+            state.log_app_event(
+                "info",
+                "国内提速",
+                &format!(
+                    "{trigger_label}已生效接管流量，已暂挂独立底层 443 隧道以避免双跑 443，改由主核心统一提供国内提速"
+                ),
+            );
+        }
+    } else if was_proxy_active && !now_proxy_active {
+        if cfg.preaccel.global_bypass_enabled
+            && !state.global_preaccel.status().running
+            && load_enabled_preaccel_relays(state).is_ok_and(|relays| !relays.is_empty())
+        {
+            match start_global_preaccel_engine(state, cfg).await {
+                Ok(global_st) => {
+                    state.log_app_event(
+                        "info",
+                        "国内提速",
+                        &format!(
+                            "{trigger_label}已关闭且主代理不再接管流量，已自动切回独立底层全局国内提速（模式：{}）",
+                            global_st.mode
+                        ),
+                    );
+                }
+                Err(err) => {
+                    state.log_app_event(
+                        "warning",
+                        "国内提速",
+                        &format!("{trigger_label}关闭后自动切回独立底层全局国内提速失败：{err}"),
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Apply system proxy state safely:
@@ -2490,6 +2999,9 @@ pub async fn apply_system_proxy_internal(
     enabled: bool,
 ) -> Result<bool, String> {
     let old_cfg = state.snapshot_config();
+    let was_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let was_proxy_active = is_proxy_takeover_active(was_core_running, &old_cfg);
 
     if !enabled {
         let was_enabled = old_cfg.system_proxy.enabled;
@@ -2505,8 +3017,21 @@ pub async fn apply_system_proxy_internal(
             return Err(err);
         }
         config::save(&state.paths, &cfg).map_err(|e| format!("保存系统代理状态失败：{e}"))?;
+        let now_core_running =
+            state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+        let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
+        coordinate_global_preaccel_on_proxy_transition(
+            state,
+            &cfg,
+            was_proxy_active,
+            now_proxy_active,
+            "系统代理",
+        )
+        .await;
         state.log_app_event("info", "系统代理", "已关闭系统代理");
-        sync_app_side_effects(app, state, &cfg);
+        let latest_cfg = state.snapshot_config();
+        sync_app_side_effects(app, state, &latest_cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
         return Ok(false);
     }
 
@@ -2571,6 +3096,7 @@ pub async fn apply_system_proxy_internal(
             // Concurrent stop_core or shutdown disabled system proxy while we were enabling.
             let latest = state.snapshot_config();
             sync_app_side_effects(app, state, &latest);
+            let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest));
             return Ok(false);
         }
         Err(err) => {
@@ -2588,12 +3114,26 @@ pub async fn apply_system_proxy_internal(
         }
     }
 
+    let now_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
+    coordinate_global_preaccel_on_proxy_transition(
+        state,
+        &cfg,
+        was_proxy_active,
+        now_proxy_active,
+        "系统代理",
+    )
+    .await;
+
     state.log_app_event(
         "info",
         "系统代理",
         &format!("已开启系统代理（127.0.0.1:{effective_port}）"),
     );
-    sync_app_side_effects(app, state, &cfg);
+    let latest_cfg = state.snapshot_config();
+    sync_app_side_effects(app, state, &latest_cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
     Ok(true)
 }
 
@@ -3297,18 +3837,58 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
         use std::os::windows::process::CommandExt;
         use std::process::{Command, Stdio};
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let mut child = Command::new("cmd")
-            .args(["/C", "clip"])
+
+        // `clip.exe` natively decodes UTF-16LE with BOM (0xFF 0xFE) as CF_UNICODETEXT without
+        // passing through legacy OEM code pages, eliminating Chinese mojibake on Windows.
+        let mut utf16_bytes = Vec::with_capacity(2 + text.len().saturating_mul(2));
+        utf16_bytes.extend_from_slice(&[0xFF, 0xFE]);
+        for unit in text.encode_utf16() {
+            utf16_bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let clip_ok = Command::new("clip")
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| e.to_string())?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            .and_then(|mut child| {
+                if let Some(mut stdin) = child.stdin.take() {
+                    stdin.write_all(&utf16_bytes)?;
+                }
+                child.wait()
+            })
+            .is_ok_and(|status| status.success());
+
+        if clip_ok {
+            return Ok(());
         }
-        let _ = child.wait();
+
+        // Fallback to PowerShell `Set-Clipboard` with explicit UTF-8 stdin decoding.
+        let mut child = Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "[Console]::InputEncoding = [System.Text.Encoding]::UTF8; Set-Clipboard -Value ([Console]::In.ReadToEnd())",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("无法写入 Windows 剪贴板：{e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("写入剪贴板数据失败：{e}"))?;
+        }
+        let status = child
+            .wait()
+            .map_err(|e| format!("等待剪贴板写入完成失败：{e}"))?;
+        if !status.success() {
+            return Err(format!("写入 Windows 剪贴板失败（退出码：{status}）"));
+        }
         Ok(())
     }
     #[cfg(target_os = "macos")]
@@ -3317,28 +3897,86 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
         use std::process::{Command, Stdio};
         let mut child = Command::new("pbcopy")
             .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("无法调用 pbcopy 写入剪贴板：{e}"))?;
         if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+            stdin
+                .write_all(text.as_bytes())
+                .map_err(|e| format!("写入 pbcopy 失败：{e}"))?;
         }
-        let _ = child.wait();
+        let status = child
+            .wait()
+            .map_err(|e| format!("等待 pbcopy 完成失败：{e}"))?;
+        if !status.success() {
+            return Err(format!("pbcopy 返回失败状态：{status}"));
+        }
         Ok(())
     }
     #[cfg(target_os = "linux")]
     {
         use std::io::Write;
         use std::process::{Command, Stdio};
-        let mut child = Command::new("xclip")
-            .args(["-selection", "clipboard"])
-            .stdin(Stdio::piped())
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+
+        let is_wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+        let candidates: &[(&str, &[&str])] = if is_wayland {
+            &[
+                ("wl-copy", &[]),
+                ("xclip", &["-selection", "clipboard"]),
+                ("xsel", &["--clipboard", "--input"]),
+            ]
+        } else {
+            &[
+                ("xclip", &["-selection", "clipboard"]),
+                ("xsel", &["--clipboard", "--input"]),
+                ("wl-copy", &[]),
+            ]
+        };
+
+        let mut last_err: Option<String> = None;
+        for (bin, args) in candidates {
+            // Always redirect stdout/stderr to null so backgrounded clipboard daemons (`xclip`,
+            // `wl-copy`) never inherit parent pipes and hang callers.
+            let spawn_res = Command::new(bin)
+                .args(*args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            match spawn_res {
+                Ok(mut child) => {
+                    let write_res = if let Some(mut stdin) = child.stdin.take() {
+                        stdin.write_all(text.as_bytes())
+                    } else {
+                        Ok(())
+                    };
+                    if let Err(err) = write_res {
+                        last_err = Some(format!("{bin} 写入失败：{err}"));
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        continue;
+                    }
+                    match child.wait() {
+                        Ok(status) if status.success() => return Ok(()),
+                        Ok(status) => {
+                            last_err = Some(format!("{bin} 退出状态异常：{status}"));
+                        }
+                        Err(err) => {
+                            last_err = Some(format!("等待 {bin} 结束失败：{err}"));
+                        }
+                    }
+                }
+                Err(err) => {
+                    last_err = Some(format!("{bin} 不可用：{err}"));
+                }
+            }
         }
-        let _ = child.wait();
-        Ok(())
+
+        Err(format!(
+            "Linux 剪贴板写入失败，请安装 wl-clipboard（Wayland）或 xclip / xsel（X11）：{}",
+            last_err.unwrap_or_else(|| "未找到可用剪贴板工具".to_string())
+        ))
     }
 }
 
@@ -3358,11 +3996,12 @@ async fn apply_and_save_config_transition(
     old: &AppConfig,
     next: &AppConfig,
 ) -> Result<(), String> {
-    if !old.tun.enabled && next.tun.enabled && !default_platform().capabilities().is_elevated {
-        return Err(
-            "NEEDS_ADMIN:开启虚拟网卡（TUN）需要管理员权限，请点击「以管理员身份重启」一键开启"
-                .to_string(),
-        );
+    let was_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let was_proxy_active = is_proxy_takeover_active(was_core_running, old);
+
+    if !old.tun.enabled && next.tun.enabled && !is_tun_privilege_ready(state) {
+        return Err(tun_needs_admin_error_message());
     }
 
     if (!old.system_proxy.enabled && next.system_proxy.enabled)
@@ -3431,6 +4070,20 @@ async fn apply_and_save_config_transition(
             sync_app_side_effects(app, state, old);
             return Err(err);
         }
+    }
+
+    let now_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let now_proxy_active = is_proxy_takeover_active(now_core_running, next);
+    if was_proxy_active != now_proxy_active {
+        coordinate_global_preaccel_on_proxy_transition(
+            state,
+            next,
+            was_proxy_active,
+            now_proxy_active,
+            "代理配置",
+        )
+        .await;
     }
 
     sync_autostart_if_changed(old, next);
@@ -3644,6 +4297,7 @@ pub async fn set_proxy_mode(
                 *guard = rollback_cfg.clone();
             }
             sync_app_side_effects(&app, &state, &rollback_cfg);
+            let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&rollback_cfg));
             let detail = outcome
                 .error
                 .as_deref()
@@ -3657,7 +4311,9 @@ pub async fn set_proxy_mode(
         "模式",
         &format!("代理模式已切换为 {}", mode.as_str()),
     );
-    sync_app_side_effects(&app, &state, &cfg);
+    let latest_cfg = state.snapshot_config();
+    sync_app_side_effects(&app, &state, &latest_cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
     Ok(mode)
 }
 
@@ -3680,18 +4336,24 @@ pub async fn set_tun_enabled_internal(
     enabled: bool,
 ) -> Result<bool, String> {
     let old_cfg = state.snapshot_config();
+    let was_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let was_proxy_active = is_proxy_takeover_active(was_core_running, &old_cfg);
 
     if enabled {
-        if !default_platform().capabilities().is_elevated {
+        if !is_tun_privilege_ready(state) {
             state.log_app_event(
                 "warning",
                 "虚拟网卡",
-                "尝试开启虚拟网卡（TUN）但当前非管理员权限，需提权重启",
+                if cfg!(target_os = "linux") {
+                    "尝试开启虚拟网卡（TUN）但 Mihomo 内核尚未授予 cap_net_admin 权限，需执行 setcap 授权"
+                } else if cfg!(target_os = "macos") {
+                    "尝试开启虚拟网卡（TUN）但当前非管理员权限，请通过管理员终端启动应用或完成系统授权后再启用"
+                } else {
+                    "尝试开启虚拟网卡（TUN）但当前非管理员权限，需提权重启"
+                },
             );
-            return Err(
-                "NEEDS_ADMIN:开启虚拟网卡（TUN）需要管理员权限，请点击「以管理员身份重启」一键开启"
-                    .to_string(),
-            );
+            return Err(tun_needs_admin_error_message());
         }
 
         if !has_enabled_nodes(state)? {
@@ -3753,12 +4415,26 @@ pub async fn set_tun_enabled_internal(
             }
         }
 
+        let now_core_running =
+            state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+        let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
+        coordinate_global_preaccel_on_proxy_transition(
+            state,
+            &cfg,
+            was_proxy_active,
+            now_proxy_active,
+            "虚拟网卡（TUN）",
+        )
+        .await;
+
         state.log_app_event(
             "info",
             "虚拟网卡",
             &format!("已开启虚拟网卡（TUN 协议栈：{}）", cfg.tun.stack_mode.as_str()),
         );
-        sync_app_side_effects(app, state, &cfg);
+        let latest_cfg = state.snapshot_config();
+        sync_app_side_effects(app, state, &latest_cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
         return Ok(true);
     }
 
@@ -3786,8 +4462,22 @@ pub async fn set_tun_enabled_internal(
         }
     }
 
+    let now_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
+    coordinate_global_preaccel_on_proxy_transition(
+        state,
+        &cfg,
+        was_proxy_active,
+        now_proxy_active,
+        "虚拟网卡（TUN）",
+    )
+    .await;
+
     state.log_app_event("info", "虚拟网卡", "已关闭虚拟网卡（TUN）");
-    sync_app_side_effects(app, state, &cfg);
+    let latest_cfg = state.snapshot_config();
+    sync_app_side_effects(app, state, &latest_cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
     Ok(false)
 }
 
@@ -3800,10 +4490,12 @@ pub async fn set_tun_enabled(
     set_tun_enabled_internal(&app, &state, enabled).await
 }
 
-fn collect_relaunch_admin_args(
+#[cfg(any(target_os = "windows", test))]
+fn collect_relaunch_admin_args_with_flags(
     raw_args: &[std::ffi::OsString],
     fallback_data_dir: Option<&std::path::Path>,
     enable_tun: bool,
+    enable_global_preaccel: bool,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut has_data_dir = false;
@@ -3842,7 +4534,19 @@ fn collect_relaunch_admin_args(
     if enable_tun {
         out.push("--enable-tun".to_string());
     }
+    if enable_global_preaccel {
+        out.push("--enable-global-preaccel".to_string());
+    }
     out
+}
+
+#[cfg(test)]
+fn collect_relaunch_admin_args(
+    raw_args: &[std::ffi::OsString],
+    fallback_data_dir: Option<&std::path::Path>,
+    enable_tun: bool,
+) -> Vec<String> {
+    collect_relaunch_admin_args_with_flags(raw_args, fallback_data_dir, enable_tun, false)
 }
 
 #[tauri::command]
@@ -3851,16 +4555,100 @@ pub async fn relaunch_as_admin(
     state: State<'_, AppState>,
     enable_tun: Option<bool>,
 ) -> Result<bool, String> {
+    let want_tun = enable_tun.unwrap_or(true);
+
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, grant minimal `cap_net_admin,cap_net_bind_service` strictly to the Mihomo
+        // binary via `pkexec setcap` instead of running the entire GUI process as root.
+        let cfg = state.snapshot_config();
+        let extra = state.extra_binary_candidates();
+        let resolution = resolve_mihomo_binary(&cfg, &state.paths, &extra, false)
+            .map_err(|e| format!("查找代理核心失败：{e}"))?;
+        let binary_path = resolution.path.ok_or_else(|| {
+            "未找到 Mihomo 代理核心文件，请先将内核放入 bin 目录或在设置中指定路径".to_string()
+        })?;
+        let bin_for_cap = binary_path.clone();
+        let granted = tokio::task::spawn_blocking(move || {
+            catcloud_core::platform::linux::grant_mihomo_tun_capability(&bin_for_cap)
+        })
+        .await
+        .map_err(|e| format!("Linux TUN 授权任务异常中止：{e}"))?
+        .map_err(|e| format!("为代理核心授予 Linux TUN 网络权限失败：{e}"))?;
+
+        if !granted {
+            state.log_app_event("warning", "提权", "用户取消了 Linux TUN 核心网络权限授权");
+            return Ok(false);
+        }
+
+        state.log_app_event(
+            "info",
+            "提权",
+            &format!(
+                "已为代理核心授予 Linux TUN 网络权限（{}），桌面界面保持普通用户运行",
+                binary_path.display()
+            ),
+        );
+
+        if want_tun && has_enabled_nodes(&state).unwrap_or(false) {
+            if let Err(err) = set_tun_enabled_internal(&app, &state, true).await {
+                state.log_app_event(
+                    "warning",
+                    "虚拟网卡",
+                    &format!("Linux 核心已获授权，但自动开启虚拟网卡失败：{err}"),
+                );
+                let latest_cfg = state.snapshot_config();
+                sync_app_side_effects(&app, &state, &latest_cfg);
+                let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
+                return Err(err);
+            }
+        }
+
+        let latest_cfg = state.snapshot_config();
+        sync_app_side_effects(&app, &state, &latest_cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
+        Ok(true)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (&app, &state, want_tun);
+        Err(
+            "macOS 暂不支持一键弹窗提权重启，请通过管理员终端启动猫猫云梯或在完成后续系统授权后启用虚拟网卡（TUN）"
+                .to_string(),
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        relaunch_self_with_elevation_flags(&app, &state, want_tun, false).await
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (&app, &state, want_tun);
+        Err("当前系统暂不支持一键管理员提权重启，请以具备网络管理权限的账户启动应用".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn relaunch_self_with_elevation_flags(
+    app: &AppHandle,
+    state: &AppState,
+    enable_tun: bool,
+    enable_global_preaccel: bool,
+) -> Result<bool, String> {
     let exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径：{e}"))?;
     let workdir = exe
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| state.paths.root_data_dir.clone());
     let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    let args = collect_relaunch_admin_args(
+    let args = collect_relaunch_admin_args_with_flags(
         &raw_args,
         Some(&state.paths.root_data_dir),
-        enable_tun.unwrap_or(true),
+        enable_tun,
+        enable_global_preaccel,
     );
 
     let exe_clone = exe.clone();
@@ -3891,6 +4679,13 @@ pub async fn relaunch_as_admin(
         if let Some(st) = app_exit.try_state::<AppState>() {
             st.shutting_down.store(true, Ordering::SeqCst);
             st.stop_streams();
+            if st.global_preaccel.status().running {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(1200),
+                    st.global_preaccel.stop(),
+                )
+                .await;
+            }
             let cfg = st.snapshot_config();
             let may_have_tun =
                 cfg.tun.enabled || cfg.rules_override.override_mode != OverrideMode::Disabled;
@@ -5335,6 +6130,94 @@ pub fn list_preaccel_relays(state: State<'_, AppState>) -> Result<Vec<PreAccelRe
     db.list_preaccel_relays(false).map_err(|e| e.to_string())
 }
 
+fn collect_excluded_pids_for_global_preaccel(state: &AppState) -> Vec<u32> {
+    let mut pids = Vec::with_capacity(2);
+    let rt = state.snapshot_runtime();
+    if rt.running {
+        if let Some(pid) = rt.pid.filter(|&p| p > 0) {
+            pids.push(pid);
+        }
+    }
+    pids
+}
+
+fn load_enabled_preaccel_relays(state: &AppState) -> Result<Vec<PreAccelRelay>, String> {
+    let db = state.storage.lock().map_err(|e| e.to_string())?;
+    db.list_preaccel_relays(true).map_err(|e| e.to_string())
+}
+
+async fn start_global_preaccel_engine(
+    state: &AppState,
+    cfg: &AppConfig,
+) -> Result<GlobalPreAccelStatus, String> {
+    let relays = load_enabled_preaccel_relays(state)?;
+    if relays.is_empty() {
+        return Err("尚未配置已启用的国内 443 中转线路，请先添加并启用至少一条中转".to_string());
+    }
+    let excluded_pids = collect_excluded_pids_for_global_preaccel(state);
+    state
+        .global_preaccel
+        .start(cfg, &relays, &excluded_pids)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn sync_running_global_preaccel_if_active(state: &AppState, cfg: &AppConfig) {
+    if !state.global_preaccel.status().running {
+        return;
+    }
+    match load_enabled_preaccel_relays(state) {
+        Ok(relays) if !relays.is_empty() => {
+            let excluded_pids = collect_excluded_pids_for_global_preaccel(state);
+            if let Err(err) = state
+                .global_preaccel
+                .start(cfg, &relays, &excluded_pids)
+                .await
+            {
+                state.log_app_event(
+                    "warning",
+                    "国内提速",
+                    &format!("中转配置变更后重建独立底层 443 隧道失败：{err}"),
+                );
+            }
+        }
+        _ => {
+            let _ = state.global_preaccel.stop().await;
+            state.log_app_event(
+                "info",
+                "国内提速",
+                "已无可用的国内中转线路，独立底层 443 隧道已自动停止",
+            );
+        }
+    }
+}
+
+fn parse_global_preaccel_scope(raw: &str) -> Result<GlobalPreAccelScope, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "proxy_apps_only" => Ok(GlobalPreAccelScope::ProxyAppsOnly),
+        "all_non_443_tcp" | "all_non443_tcp" => Ok(GlobalPreAccelScope::AllNon443Tcp),
+        other => Err(format!(
+            "未知的全局底层预代理范围 `{other}`，仅支持 `proxy_apps_only` 或 `all_non_443_tcp`"
+        )),
+    }
+}
+
+fn normalize_global_target_processes(processes: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(processes.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for raw in processes {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if seen.insert(lower) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
 #[tauri::command]
 pub async fn upsert_preaccel_relay(
     app: AppHandle,
@@ -5351,7 +6234,9 @@ pub async fn upsert_preaccel_relay(
     }
     let _ = trigger_reload_if_running(&app, &state, false).await;
     let cfg = state.snapshot_config();
+    sync_running_global_preaccel_if_active(&state, &cfg).await;
     sync_app_side_effects(&app, &state, &cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
     Ok(relay)
 }
 
@@ -5369,9 +6254,102 @@ pub async fn delete_preaccel_relay(
     if deleted {
         let _ = trigger_reload_if_running(&app, &state, false).await;
         let cfg = state.snapshot_config();
+        sync_running_global_preaccel_if_active(&state, &cfg).await;
         sync_app_side_effects(&app, &state, &cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
     }
     Ok(deleted)
+}
+
+pub async fn toggle_preaccel_internal(
+    app: &AppHandle,
+    state: &AppState,
+    enabled: bool,
+) -> Result<bool, String> {
+    let old_cfg = state.snapshot_config();
+    let mut cfg = old_cfg.clone();
+    let core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let proxy_active = is_proxy_takeover_active(core_running, &cfg);
+
+    if enabled {
+        cfg.preaccel.enabled = true;
+        if proxy_active {
+            config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+            if let Ok(mut guard) = state.config.write() {
+                *guard = cfg.clone();
+            }
+            state.log_app_event("info", "国内提速", "已开启国内 443 预加速（主代理核心生效）");
+            let _ = trigger_reload_if_running(app, state, false).await;
+        } else {
+            let enabled_relays = load_enabled_preaccel_relays(state)?;
+            if !enabled_relays.is_empty() {
+                cfg.preaccel.global_bypass_enabled = true;
+                config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = cfg.clone();
+                }
+                match start_global_preaccel_engine(state, &cfg).await {
+                    Ok(global_st) => {
+                        let detail = match global_st.mode.as_str() {
+                            "windivert" => "已开启独立底层全局国内提速（WinDivert 透明接管运行中）"
+                                .to_string(),
+                            _ => match global_st.socks_port {
+                                Some(port) => format!(
+                                    "已开启国内提速并启动本地独立 443 通道（127.0.0.1:{port}）"
+                                ),
+                                None => "已开启国内提速并启动本地独立 443 通道".to_string(),
+                            },
+                        };
+                        state.log_app_event("info", "国内提速", &detail);
+                    }
+                    Err(err) => {
+                        cfg.preaccel.global_bypass_enabled = old_cfg.preaccel.global_bypass_enabled;
+                        let _ = config::save(&state.paths, &cfg);
+                        if let Ok(mut guard) = state.config.write() {
+                            *guard = cfg.clone();
+                        }
+                        state.log_app_event(
+                            "error",
+                            "国内提速",
+                            &format!("主代理未接管流量时启动独立底层国内提速失败：{err}"),
+                        );
+                        sync_app_side_effects(app, state, &cfg);
+                        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+                        return Err(err);
+                    }
+                }
+            } else {
+                config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = cfg.clone();
+                }
+                state.log_app_event(
+                    "warning",
+                    "国内提速",
+                    "已打开国内提速开关，但尚未配置可用的国内 443 中转线路",
+                );
+            }
+        }
+    } else {
+        cfg.preaccel.enabled = false;
+        cfg.preaccel.global_bypass_enabled = false;
+        config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = cfg.clone();
+        }
+        if state.global_preaccel.status().running {
+            let _ = state.global_preaccel.stop().await;
+        }
+        if core_running {
+            let _ = trigger_reload_if_running(app, state, false).await;
+        }
+        state.log_app_event("info", "国内提速", "已关闭国内 443 预加速（含独立底层全局提速）");
+    }
+
+    sync_app_side_effects(app, state, &cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+    Ok(enabled)
 }
 
 #[tauri::command]
@@ -5380,24 +6358,254 @@ pub async fn toggle_preaccel(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<bool, String> {
+    toggle_preaccel_internal(&app, &state, enabled).await
+}
+
+#[tauri::command]
+pub fn get_global_preaccel_status(
+    state: State<'_, AppState>,
+) -> Result<GlobalPreAccelStatus, String> {
+    Ok(state.snapshot_global_preaccel())
+}
+
+pub async fn toggle_global_preaccel_internal(
+    app: &AppHandle,
+    state: &AppState,
+    enabled: bool,
+) -> Result<GlobalPreAccelStatus, String> {
+    let old_cfg = state.snapshot_config();
+    let mut cfg = old_cfg.clone();
+
+    if enabled {
+        let relays = load_enabled_preaccel_relays(state)?;
+        if relays.is_empty() {
+            return Err("尚未配置已启用的国内 443 中转线路，请先添加并启用至少一条中转".to_string());
+        }
+        cfg.preaccel.global_bypass_enabled = true;
+        cfg.preaccel.enabled = true;
+
+        let excluded_pids = collect_excluded_pids_for_global_preaccel(state);
+        match state
+            .global_preaccel
+            .start(&cfg, &relays, &excluded_pids)
+            .await
+        {
+            Ok(status) => {
+                if let Err(err) = config::save(&state.paths, &cfg) {
+                    let _ = state.global_preaccel.stop().await;
+                    let msg = format!("保存底层全局提速配置失败：{err}");
+                    state.log_app_event("error", "国内提速", &msg);
+                    sync_app_side_effects(app, state, &old_cfg);
+                    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&old_cfg));
+                    return Err(msg);
+                }
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = cfg.clone();
+                }
+                let msg = match status.mode.as_str() {
+                    "windivert" => "已开启独立底层全局国内提速（WinDivert 透明接管运行中）".to_string(),
+                    _ => match status.socks_port {
+                        Some(port) => format!(
+                            "已开启独立底层国内提速（本地 443 SOCKS5 通道 127.0.0.1:{port}）"
+                        ),
+                        None => "已开启独立底层国内提速（本地 443 通道就绪）".to_string(),
+                    },
+                };
+                state.log_app_event("info", "国内提速", &msg);
+                sync_app_side_effects(app, state, &cfg);
+                let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+                Ok(status)
+            }
+            Err(err) => {
+                let detail = err.to_string();
+                state.log_app_event(
+                    "error",
+                    "国内提速",
+                    &format!("开启独立底层全局国内提速失败：{detail}"),
+                );
+                sync_app_side_effects(app, state, &old_cfg);
+                let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&old_cfg));
+                Err(detail)
+            }
+        }
+    } else {
+        cfg.preaccel.global_bypass_enabled = false;
+        config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = cfg.clone();
+        }
+        let status = state
+            .global_preaccel
+            .stop()
+            .await
+            .map_err(|e| e.to_string())?;
+        state.log_app_event("info", "国内提速", "已停止独立底层全局国内提速");
+        sync_app_side_effects(app, state, &cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+        Ok(status)
+    }
+}
+
+#[tauri::command]
+pub async fn toggle_global_preaccel(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<GlobalPreAccelStatus, String> {
+    toggle_global_preaccel_internal(&app, &state, enabled).await
+}
+
+#[tauri::command]
+pub async fn update_global_preaccel_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    scope: String,
+    target_processes: Vec<String>,
+    windivert_dir: Option<String>,
+) -> Result<GlobalPreAccelStatus, String> {
+    let parsed_scope = parse_global_preaccel_scope(&scope)?;
+    let normalized_processes = normalize_global_target_processes(target_processes);
+    let normalized_dir = windivert_dir
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     let mut cfg = state.snapshot_config();
-    cfg.preaccel.enabled = enabled;
-    config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+    cfg.preaccel.global_scope = parsed_scope;
+    cfg.preaccel.global_target_processes = normalized_processes;
+    cfg.preaccel.windivert_dir = normalized_dir;
+
+    config::save(&state.paths, &cfg).map_err(|e| format!("保存底层全局提速设置失败：{e}"))?;
     if let Ok(mut guard) = state.config.write() {
         *guard = cfg.clone();
     }
+
+    let was_running = state.global_preaccel.status().running;
+    let status = if was_running {
+        match start_global_preaccel_engine(&state, &cfg).await {
+            Ok(st) => st,
+            Err(err) => {
+                state.log_app_event(
+                    "warning",
+                    "国内提速",
+                    &format!("更新底层全局提速设置后重启引擎失败：{err}"),
+                );
+                sync_app_side_effects(&app, &state, &cfg);
+                let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+                return Err(err);
+            }
+        }
+    } else {
+        state.snapshot_global_preaccel()
+    };
+
     state.log_app_event(
         "info",
         "国内提速",
-        if enabled {
-            "已开启国内 443 预加速"
-        } else {
-            "已关闭国内 443 预加速"
-        },
+        &format!(
+            "已更新底层全局提速设置（范围：{}，目标进程 {} 个）",
+            cfg.preaccel.global_scope.as_str(),
+            cfg.preaccel.global_target_processes.len()
+        ),
     );
-    let _ = trigger_reload_if_running(&app, &state, false).await;
     sync_app_side_effects(&app, &state, &cfg);
-    Ok(enabled)
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn install_windivert_driver(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<GlobalPreAccelStatus, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&app, &state);
+        return Err(
+            "WinDivert 驱动仅适用于 Windows 平台，当前系统请直接使用内置的本地独立 443 SOCKS5 通道"
+                .to_string(),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let rt = state.snapshot_runtime();
+        let proxy_url = if rt.running && rt.mixed_port > 0 {
+            Some(format!("http://127.0.0.1:{}", rt.mixed_port))
+        } else {
+            None
+        };
+
+        let install_res = match proxy_url.as_deref() {
+            Some(proxy) => match download_and_install_windivert(&state.paths, Some(proxy)).await {
+                Ok(dir) => Ok(dir),
+                Err(_) => download_and_install_windivert(&state.paths, None).await,
+            },
+            None => download_and_install_windivert(&state.paths, None).await,
+        };
+
+        let installed_dir = install_res.map_err(|e| {
+            let msg = e.to_string();
+            state.log_app_event("error", "国内提速", &format!("安装 WinDivert 驱动失败：{msg}"));
+            msg
+        })?;
+
+        state.log_app_event(
+            "info",
+            "国内提速",
+            &format!(
+                "已下载并通过 SHA-256 校验安装官方 WinDivert v2.2.2 驱动至 {}",
+                installed_dir.display()
+            ),
+        );
+
+        let cfg = state.snapshot_config();
+        let current = state.snapshot_global_preaccel();
+        if current.running
+            && current.mode != "windivert"
+            && default_platform().capabilities().is_elevated
+        {
+            if let Err(err) = start_global_preaccel_engine(&state, &cfg).await {
+                state.log_app_event(
+                    "warning",
+                    "国内提速",
+                    &format!("驱动就绪后自动升级 WinDivert 透明模式失败：{err}"),
+                );
+            } else {
+                state.log_app_event(
+                    "info",
+                    "国内提速",
+                    "驱动安装完成，已自动升级为 WinDivert 最底层透明接管模式",
+                );
+            }
+        }
+
+        sync_app_side_effects(&app, &state, &cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+        Ok(state.snapshot_global_preaccel())
+    }
+}
+
+#[tauri::command]
+pub async fn relaunch_as_admin_for_global_preaccel(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&app, &state);
+        Err(
+            "当前系统无需 Windows 管理员提权，可直接使用内置「本地独立 443 通道」为其它软件提速"
+                .to_string(),
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Never dirty-write `preaccel.enabled` / `global_bypass_enabled` to disk before UAC
+        // succeeds. The elevated replacement instance receives `--enable-global-preaccel` and
+        // persists config only after `toggle_global_preaccel_internal(..., true)` starts cleanly.
+        relaunch_self_with_elevation_flags(&app, &state, false, true).await
+    }
 }
 
 #[tauri::command]
@@ -5427,12 +6635,14 @@ pub async fn select_preaccel_relay(
             )
             .await;
     }
+    sync_running_global_preaccel_if_active(&state, &cfg).await;
     state.log_app_event(
         "info",
         "国内提速",
         &format!("已切换国内提速中转至「{}」", relay.name),
     );
     sync_app_side_effects(&app, &state, &cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
     Ok(relay.id)
 }
 
@@ -7215,8 +8425,10 @@ pub async fn import_mmrelay_input(
         }
     }
     let _ = trigger_reload_if_running(&app, &state, false).await;
-    let cfg = state.snapshot_config();
-    sync_app_side_effects(&app, &state, &cfg);
+    let latest_cfg = state.snapshot_config();
+    sync_running_global_preaccel_if_active(&state, &latest_cfg).await;
+    sync_app_side_effects(&app, &state, &latest_cfg);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
     Ok(bundle.relays)
 }
 
@@ -7480,6 +8692,11 @@ fn build_ai_diagnostics_markdown(
     } else {
         recent_logs.join("\n")
     };
+    let cli_fence_lang = if cfg!(target_os = "windows") || os_label.starts_with("windows") {
+        "powershell"
+    } else {
+        "bash"
+    };
 
     format!(
         "请帮我排查猫猫云梯（CatCloud）当前问题。\n\
@@ -7522,7 +8739,7 @@ fn build_ai_diagnostics_markdown(
 \n\
 如果你可以直接在本机终端执行命令，请**优先使用以下只读命令**补充信息（修改配置前请先征得我同意）：\n\
 \n\
-```powershell\n\
+```{cli_fence_lang}\n\
 catcloud status --json\n\
 catcloud config diag --json\n\
 catcloud config validate --json\n\
@@ -9768,5 +10985,362 @@ mod tests {
         assert!(!md.contains("203.0.113.66"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn high_throughput_guard_protects_minimized_window_via_recent_ticks() {
+        let threshold = WATCHDOG_HIGH_THROUGHPUT_THRESHOLD_BPS;
+        let window_ms = WATCHDOG_HIGH_THROUGHPUT_WINDOW_MS;
+        let now_ms: i64 = 1_700_000_050_000;
+
+        // 1. Live cached metrics above threshold immediately protect.
+        let active_cached = CachedRealtimeMetrics {
+            up_bps: threshold,
+            down_bps: 0,
+            ..Default::default()
+        };
+        assert!(is_high_throughput_active(
+            &active_cached,
+            &[],
+            now_ms,
+            window_ms,
+            threshold
+        ));
+
+        // 2. Window minimized -> cached metrics zeroed, but recent tick within 10s window was
+        //    uploading at 4 MiB/s -> MUST still protect active upload.
+        let zeroed_cached = CachedRealtimeMetrics::default();
+        let recent_ticks = vec![
+            TrafficTick {
+                up: 16 * 1024,
+                down: 32 * 1024,
+                timestamp_ms: now_ms - 8_000,
+            },
+            TrafficTick {
+                up: 4 * 1024 * 1024,
+                down: 64 * 1024,
+                timestamp_ms: now_ms - 4_000,
+            },
+        ];
+        assert!(is_high_throughput_active(
+            &zeroed_cached,
+            &recent_ticks,
+            now_ms,
+            window_ms,
+            threshold
+        ));
+
+        // 3. Stale high-throughput tick older than the 10s window does NOT block failover.
+        let stale_ticks = vec![TrafficTick {
+            up: 10 * 1024 * 1024,
+            down: 10 * 1024 * 1024,
+            timestamp_ms: now_ms - window_ms - 500,
+        }];
+        assert!(!is_high_throughput_active(
+            &zeroed_cached,
+            &stale_ticks,
+            now_ms,
+            window_ms,
+            threshold
+        ));
+
+        // 4. Low idle heartbeat traffic inside window does NOT block failover.
+        let idle_ticks = vec![TrafficTick {
+            up: 12 * 1024,
+            down: 48 * 1024,
+            timestamp_ms: now_ms - 1_000,
+        }];
+        assert!(!is_high_throughput_active(
+            &zeroed_cached,
+            &idle_ticks,
+            now_ms,
+            window_ms,
+            threshold
+        ));
+    }
+
+    #[test]
+    fn pick_group_candidates_with_cooldown_excludes_and_falls_back_when_all_cooled() {
+        let make_node = |id: &str, name: &str| ProxyNode {
+            id: id.to_string(),
+            sub_id: "sub-1".to_string(),
+            name: name.to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let nodes = vec![
+            make_node("n-a", "节点A"),
+            make_node("n-b", "节点B"),
+            make_node("n-c", "节点C"),
+            make_node("n-d", "节点D"),
+        ];
+
+        let mut snaps = HashMap::new();
+        for (id, latency, up) in [
+            ("n-a", 30.0, 120.0),
+            ("n-b", 40.0, 100.0),
+            ("n-c", 55.0, 80.0),
+            ("n-d", 80.0, 50.0),
+        ] {
+            snaps.insert(
+                id.to_string(),
+                ProbeSnapshot {
+                    node_id: id.to_string(),
+                    ok: true,
+                    latency_ms: Some(latency),
+                    up_mbps: Some(up),
+                    down_mbps: Some(up * 2.0),
+                    ..Default::default()
+                },
+            );
+        }
+
+        let group = MultiGroup {
+            id: "g-watch".to_string(),
+            name: "主力组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec![
+                "n-a".to_string(),
+                "n-b".to_string(),
+                "n-c".to_string(),
+                "n-d".to_string(),
+            ],
+            active_node_id: Some("n-a".to_string()),
+            ..Default::default()
+        };
+
+        // Active is n-a, n-b is in 5-minute cooldown -> returns [n-c, n-d] in priority order.
+        let mut cooldowns = HashSet::new();
+        cooldowns.insert("n-b".to_string());
+        let ranked = pick_group_candidates_with_cooldown(
+            &group,
+            &nodes,
+            &snaps,
+            Some("n-a"),
+            &cooldowns,
+            3,
+        );
+        assert_eq!(ranked, vec!["n-c".to_string(), "n-d".to_string()]);
+
+        // All backup nodes (n-b, n-c, n-d) are in cooldown -> relaxes cooldowns as last resort
+        // while still excluding active node `n-a`.
+        cooldowns.insert("n-c".to_string());
+        cooldowns.insert("n-d".to_string());
+        let fallback = pick_group_candidates_with_cooldown(
+            &group,
+            &nodes,
+            &snaps,
+            Some("n-a"),
+            &cooldowns,
+            3,
+        );
+        assert_eq!(
+            fallback,
+            vec!["n-b".to_string(), "n-c".to_string(), "n-d".to_string()]
+        );
+        assert!(!fallback.contains(&"n-a".to_string()));
+    }
+
+    #[test]
+    fn is_proxy_takeover_active_requires_running_core_and_system_proxy_or_tun() {
+        let mut cfg = AppConfig::default();
+        cfg.system_proxy.enabled = false;
+        cfg.tun.enabled = false;
+
+        // Idle core (running without system proxy or TUN) must NOT count as active proxy takeover.
+        assert!(!is_proxy_takeover_active(false, &cfg));
+        assert!(!is_proxy_takeover_active(true, &cfg));
+
+        // System proxy enabled -> active only while core is running.
+        cfg.system_proxy.enabled = true;
+        assert!(!is_proxy_takeover_active(false, &cfg));
+        assert!(is_proxy_takeover_active(true, &cfg));
+
+        // TUN enabled -> active only while core is running.
+        cfg.system_proxy.enabled = false;
+        cfg.tun.enabled = true;
+        assert!(!is_proxy_takeover_active(false, &cfg));
+        assert!(is_proxy_takeover_active(true, &cfg));
+
+        // Both enabled -> active while core is running.
+        cfg.system_proxy.enabled = true;
+        assert!(is_proxy_takeover_active(true, &cfg));
+    }
+
+    #[test]
+    fn runtime_info_preaccel_active_requires_running_core_or_global_engine() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_preaccel_status_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+
+        let state = AppState::new(paths, cfg, storage, job_guard);
+
+        // 1. Core stopped & standalone global engine off -> must NOT falsely report preaccel_active.
+        let dto_idle = build_runtime_info_dto(&state).expect("build idle runtime dto");
+        assert!(!dto_idle.running);
+        assert!(dto_idle.preaccel_enabled);
+        assert!(!dto_idle.preaccel_active);
+        assert!(!dto_idle.global_preaccel_active);
+        assert_eq!(dto_idle.global_preaccel_mode, "off");
+        assert_eq!(dto_idle.global_preaccel_socks_port, None);
+        assert_eq!(dto_idle.global_preaccel_connections, 0);
+        assert_eq!(dto_idle.status, "idle");
+        assert_eq!(build_tray_visual_state(&state).health, TrayHealthState::Idle);
+
+        // 2. Core running in idle/mixed-port-only mode (system_proxy=false, tun=false) ->
+        //    proxy_active is false, so preaccel_active stays false and tray remains Idle.
+        state.update_cached_runtime(CoreRuntimeStatus {
+            running: true,
+            ..Default::default()
+        });
+        let dto_idle_core = build_runtime_info_dto(&state).expect("build idle-core runtime dto");
+        assert!(dto_idle_core.running);
+        assert!(dto_idle_core.preaccel_enabled);
+        assert!(!dto_idle_core.preaccel_active);
+        assert_eq!(dto_idle_core.status, "idle");
+        assert_eq!(build_tray_visual_state(&state).health, TrayHealthState::Idle);
+
+        // 3. Core running with system proxy enabled & preaccel.enabled == true ->
+        //    proxy_active is true, preaccel_active is true, status == "preaccel", tray == PreAccel.
+        if let Ok(mut guard) = state.config.write() {
+            guard.system_proxy.enabled = true;
+        }
+        let dto_running = build_runtime_info_dto(&state).expect("build running runtime dto");
+        assert!(dto_running.running);
+        assert!(dto_running.preaccel_enabled);
+        assert!(dto_running.preaccel_active);
+        assert_eq!(dto_running.status, "preaccel");
+        assert_eq!(
+            build_tray_visual_state(&state).health,
+            TrayHealthState::PreAccel
+        );
+
+        // 4. Core running with system proxy enabled & preaccel.enabled == false -> status == "ok".
+        if let Ok(mut guard) = state.config.write() {
+            guard.preaccel.enabled = false;
+        }
+        let dto_ok = build_runtime_info_dto(&state).expect("build ok runtime dto");
+        assert!(!dto_ok.preaccel_active);
+        assert_eq!(dto_ok.status, "ok");
+        assert_eq!(build_tray_visual_state(&state).health, TrayHealthState::Ok);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn relaunch_admin_args_supports_enable_global_preaccel_flag() {
+        let raw = vec![
+            std::ffi::OsString::from("--data-dir"),
+            std::ffi::OsString::from("C:/CatCloud/data"),
+        ];
+        let args = collect_relaunch_admin_args_with_flags(&raw, None, false, true);
+        assert!(args.iter().any(|a| a == "--restarting"));
+        assert!(args.iter().any(|a| a == "--enable-global-preaccel"));
+        assert!(!args.iter().any(|a| a == "--enable-tun"));
+        assert!(args.iter().any(|a| a == "C:/CatCloud/data"));
+    }
+
+    #[test]
+    fn global_preaccel_settings_helpers_and_ui_dto_roundtrip() {
+        assert_eq!(
+            parse_global_preaccel_scope("proxy_apps_only").unwrap(),
+            GlobalPreAccelScope::ProxyAppsOnly
+        );
+        assert_eq!(
+            parse_global_preaccel_scope("all_non_443_tcp").unwrap(),
+            GlobalPreAccelScope::AllNon443Tcp
+        );
+        assert_eq!(
+            parse_global_preaccel_scope("ALL_NON_443_TCP").unwrap(),
+            GlobalPreAccelScope::AllNon443Tcp
+        );
+        assert_eq!(
+            parse_global_preaccel_scope("all_non443_tcp").unwrap(),
+            GlobalPreAccelScope::AllNon443Tcp
+        );
+        assert_eq!(
+            parse_global_preaccel_scope("ALL_NON443_TCP").unwrap(),
+            GlobalPreAccelScope::AllNon443Tcp
+        );
+        assert!(parse_global_preaccel_scope("invalid_scope").is_err());
+
+        let deduped = normalize_global_target_processes(vec![
+            "  mihomo.exe ".to_string(),
+            "".to_string(),
+            "MIHOMO.EXE".to_string(),
+            "scp.exe".to_string(),
+        ]);
+        assert_eq!(deduped, vec!["mihomo.exe".to_string(), "scp.exe".to_string()]);
+
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.campus_portal_guard = false;
+        cfg.preaccel.global_bypass_enabled = true;
+        cfg.preaccel.global_scope = GlobalPreAccelScope::AllNon443Tcp;
+        cfg.preaccel.global_target_processes = vec!["FlClashCore.exe".to_string()];
+        cfg.preaccel.windivert_dir = Some("C:/Custom/WinDivert".to_string());
+
+        let dto = UiAppConfigDto::from(&cfg);
+        assert_eq!(dto.preaccel.campus_portal_guard, Some(false));
+        assert_eq!(dto.preaccel.global_bypass_enabled, Some(true));
+        assert_eq!(
+            dto.preaccel.global_scope,
+            Some(GlobalPreAccelScope::AllNon443Tcp)
+        );
+        assert_eq!(
+            dto.preaccel.global_target_processes,
+            Some(vec!["FlClashCore.exe".to_string()])
+        );
+        assert_eq!(
+            dto.preaccel.windivert_dir.as_deref(),
+            Some("C:/Custom/WinDivert")
+        );
+
+        // Round-trip explicit `campus_portal_guard = Some(false)` onto a default config (which starts `true`).
+        let mut roundtrip_cfg = AppConfig::default();
+        assert!(roundtrip_cfg.preaccel.campus_portal_guard);
+        apply_ui_dto(&mut roundtrip_cfg, &dto);
+        assert!(!roundtrip_cfg.preaccel.campus_portal_guard);
+
+        // Explicit empty `windivert_dir = Some("")` clears the configured path to `None`.
+        let mut clear_dir_dto = dto.clone();
+        clear_dir_dto.preaccel.windivert_dir = Some("".to_string());
+        clear_dir_dto.preaccel.campus_portal_guard = Some(true);
+        apply_ui_dto(&mut roundtrip_cfg, &clear_dir_dto);
+        assert_eq!(roundtrip_cfg.preaccel.windivert_dir, None);
+        assert!(roundtrip_cfg.preaccel.campus_portal_guard);
+
+        // Legacy UI payload omitting the optional fields must preserve existing config values.
+        let mut legacy_dto = dto;
+        legacy_dto.preaccel.campus_portal_guard = None;
+        legacy_dto.preaccel.global_bypass_enabled = None;
+        legacy_dto.preaccel.global_scope = None;
+        legacy_dto.preaccel.global_target_processes = None;
+        legacy_dto.preaccel.windivert_dir = None;
+
+        let mut target_cfg = cfg.clone();
+        apply_ui_dto(&mut target_cfg, &legacy_dto);
+        assert!(!target_cfg.preaccel.campus_portal_guard);
+        assert!(target_cfg.preaccel.global_bypass_enabled);
+        assert_eq!(
+            target_cfg.preaccel.global_scope,
+            GlobalPreAccelScope::AllNon443Tcp
+        );
+        assert_eq!(
+            target_cfg.preaccel.global_target_processes,
+            vec!["FlClashCore.exe".to_string()]
+        );
+        assert_eq!(
+            target_cfg.preaccel.windivert_dir.as_deref(),
+            Some("C:/Custom/WinDivert")
+        );
     }
 }

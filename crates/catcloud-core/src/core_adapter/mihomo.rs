@@ -207,6 +207,7 @@ impl MihomoAdapter {
         let gogc = req.config.core_runtime.gogc.to_string();
 
         let norm_bin = crate::paths::normalize_os_path(&req.binary_path);
+        crate::core_adapter::binary_resolver::ensure_unix_executable(&norm_bin);
         let norm_work = crate::paths::normalize_os_path(&req.working_dir);
         let norm_cfg = crate::paths::normalize_os_path(&req.config_path);
         let stderr_log_path = req.working_dir.join(MIHOMO_STDERR_LOG_FILENAME);
@@ -922,6 +923,7 @@ pub async fn verify_config_with_binary(
     }
 
     let norm_bin = crate::paths::normalize_os_path(binary_path);
+    crate::core_adapter::binary_resolver::ensure_unix_executable(&norm_bin);
     let norm_work = crate::paths::normalize_os_path(working_dir);
     let norm_cfg = crate::paths::normalize_os_path(config_path);
 

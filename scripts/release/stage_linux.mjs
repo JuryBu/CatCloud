@@ -59,16 +59,31 @@ function parseArgs(argv) {
   };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--target" && argv[i + 1]) {
-      opts.target = argv[++i];
-    } else if (arg === "--version" && argv[i + 1]) {
-      opts.version = argv[++i].replace(/^[vV]/, "");
-    } else if (arg === "--target-dir" && argv[i + 1]) {
-      opts.targetDir = path.resolve(argv[++i]);
-    } else if (arg === "--out-dir" && argv[i + 1]) {
-      opts.outDir = path.resolve(argv[++i]);
-    } else if (arg === "--mihomo-bin" && argv[i + 1]) {
-      opts.mihomoBin = path.resolve(argv[++i]);
+    if (arg === "--target") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.target = val;
+      }
+    } else if (arg === "--version") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim().replace(/^[vV]/, "");
+        if (val) opts.version = val;
+      }
+    } else if (arg === "--target-dir") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.targetDir = path.resolve(val);
+      }
+    } else if (arg === "--out-dir") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.outDir = path.resolve(val);
+      }
+    } else if (arg === "--mihomo-bin") {
+      if (i + 1 < argv.length && !argv[i + 1].startsWith("--")) {
+        const val = argv[++i].trim();
+        if (val) opts.mihomoBin = path.resolve(val);
+      }
     } else if (arg === "--dry-run") {
       opts.dryRun = true;
     } else if (arg === "--help" || arg === "-h") {

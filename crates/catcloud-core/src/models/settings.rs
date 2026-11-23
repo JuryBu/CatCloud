@@ -16,6 +16,34 @@ pub const DEFAULT_PREACCEL_FALLBACK_PROBE_URL: &str =
 /// Default public GitHub repository for automatic updates.
 pub const DEFAULT_UPDATE_REPO: &str = "JuryBu/CatCloud";
 
+/// Default global shortcut for switching to the next best node.
+/// Cross-platform semantics: `Alt+Shift+N` on Windows/Linux (`Option+Shift+N` on macOS).
+pub const DEFAULT_HOTKEY_SWITCH_NEXT_BEST: &str = "Alt+Shift+N";
+
+/// Default global shortcut for toggling the floating capsule window.
+/// Cross-platform semantics: `Alt+Shift+C` on Windows/Linux (`Option+Shift+C` on macOS).
+pub const DEFAULT_HOTKEY_TOGGLE_CAPSULE: &str = "Alt+Shift+C";
+
+/// Default target executable names intercepted by the standalone global domestic :443
+/// pre-acceleration engine when `global_scope == GlobalPreAccelScope::ProxyAppsOnly`.
+pub const DEFAULT_GLOBAL_PREACCEL_PROCESSES: &[&str] = &[
+    "mihomotag-serv.exe",
+    "FlClashCore.exe",
+    "ShaYuCore.exe",
+    "yeshayunCore.exe",
+    "verge-mihomo.exe",
+    "clash-meta.exe",
+    "mihomo.exe",
+    "xray.exe",
+    "sing-box.exe",
+    "v2ray.exe",
+    "v2rayN.exe",
+    "scp.exe",
+    "ssh.exe",
+    "sftp.exe",
+    "rsync.exe",
+];
+
 /// Core routing mode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -170,6 +198,8 @@ impl Default for SystemProxyConfig {
             proxy_guard: ProxyGuardConfig::default(),
             bypass: vec![
                 "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "::1".to_string(),
                 "127.*".to_string(),
                 "10.*".to_string(),
                 "172.16.*".to_string(),
@@ -617,6 +647,37 @@ impl Default for CoreRuntimeConfig {
     }
 }
 
+/// Scope controlling which outbound non-443 TCP connections are intercepted by the
+/// standalone global domestic :443 pre-acceleration engine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum GlobalPreAccelScope {
+    /// Intercept only third-party proxy cores and configured transfer tools
+    /// (`global_target_processes`), leaving unrelated applications untouched.
+    #[default]
+    ProxyAppsOnly,
+    /// Intercept all public non-443/non-53 TCP connections on physical interfaces
+    /// (always excluding core OS services, CatCloud itself, and the standalone 443 tunnel).
+    #[serde(rename = "all_non_443_tcp", alias = "all_non443_tcp")]
+    AllNon443Tcp,
+}
+
+impl GlobalPreAccelScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProxyAppsOnly => "proxy_apps_only",
+            Self::AllNon443Tcp => "all_non_443_tcp",
+        }
+    }
+}
+
+fn default_global_target_processes() -> Vec<String> {
+    DEFAULT_GLOBAL_PREACCEL_PROCESSES
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect()
+}
+
 /// Domestic pre-acceleration configuration.
 /// Probe URLs must point to domestic endpoints (`hicloud` / `miui`), never overseas `gstatic`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -631,6 +692,19 @@ pub struct PreAccelConfig {
     pub auto_failover: bool,
     pub campus_portal_guard: bool,
     pub campus_direct_domains: Vec<String>,
+    /// Allow standalone lowest-level domestic :443 pre-acceleration even when CatCloud's own
+    /// main proxy is disabled, transparently accelerating third-party proxy cores or CLI tools.
+    #[serde(default)]
+    pub global_bypass_enabled: bool,
+    /// Traffic scope for the standalone global :443 pre-acceleration engine.
+    #[serde(default)]
+    pub global_scope: GlobalPreAccelScope,
+    /// Executable filenames accelerated when `global_scope == GlobalPreAccelScope::ProxyAppsOnly`.
+    #[serde(default = "default_global_target_processes")]
+    pub global_target_processes: Vec<String>,
+    /// Optional custom directory containing `WinDivert64.dll` (or `WinDivert.dll`) and `WinDivert64.sys`.
+    #[serde(default)]
+    pub windivert_dir: Option<String>,
 }
 
 impl Default for PreAccelConfig {
@@ -645,6 +719,10 @@ impl Default for PreAccelConfig {
             auto_failover: true,
             campus_portal_guard: true,
             campus_direct_domains: Vec::new(),
+            global_bypass_enabled: false,
+            global_scope: GlobalPreAccelScope::ProxyAppsOnly,
+            global_target_processes: default_global_target_processes(),
+            windivert_dir: None,
         }
     }
 }
@@ -663,6 +741,9 @@ pub enum TrayClickAction {
 }
 
 /// Global keyboard shortcuts.
+///
+/// Default accelerators use `Alt+Shift+N` / `Alt+Shift+C` (`Option+Shift+N` / `Option+Shift+C`
+/// on macOS), matching `src-tauri/src/shortcuts.rs` across Windows, macOS, and Linux.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct HotkeyConfig {
@@ -681,8 +762,8 @@ impl Default for HotkeyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            switch_next_best: Some("Alt+Shift+N".to_string()),
-            toggle_capsule: Some("Alt+Shift+C".to_string()),
+            switch_next_best: Some(DEFAULT_HOTKEY_SWITCH_NEXT_BEST.to_string()),
+            toggle_capsule: Some(DEFAULT_HOTKEY_TOGGLE_CAPSULE.to_string()),
             toggle_system_proxy: None,
             toggle_tun: None,
             show_main_window: None,
@@ -1005,7 +1086,7 @@ mod tests {
 
         // Legacy JSON missing newly added fields must populate defaults via serde attributes.
         let legacy: AppConfig =
-            serde_json::from_str(r#"{"dns":{},"rules_override":{},"core_runtime":{}}"#).unwrap();
+            serde_json::from_str(r#"{"dns":{},"rules_override":{},"core_runtime":{},"preaccel":{},"behavior":{"hotkeys":{}}}"#).unwrap();
         assert_eq!(
             legacy.dns.direct_nameserver,
             vec!["223.5.5.5", "119.29.29.29"]
@@ -1014,5 +1095,52 @@ mod tests {
         assert!(legacy.rules_override.domestic_direct_enabled);
         assert_eq!(legacy.core_runtime.gogc, 25);
         assert!(!legacy.core_runtime.compile_all_nodes);
+
+        // Stage 10 global pre-acceleration defaults & backward-compatible deserialization.
+        assert!(!cfg.preaccel.global_bypass_enabled);
+        assert_eq!(cfg.preaccel.global_scope, GlobalPreAccelScope::ProxyAppsOnly);
+        assert!(cfg.preaccel.windivert_dir.is_none());
+        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "mihomotag-serv.exe"));
+        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "FlClashCore.exe"));
+        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "rsync.exe"));
+        assert!(!legacy.preaccel.global_bypass_enabled);
+        assert_eq!(legacy.preaccel.global_scope, GlobalPreAccelScope::ProxyAppsOnly);
+        assert_eq!(
+            legacy.preaccel.global_target_processes.len(),
+            DEFAULT_GLOBAL_PREACCEL_PROCESSES.len()
+        );
+        assert!(legacy.preaccel.windivert_dir.is_none());
+        assert_eq!(
+            serde_json::to_string(&GlobalPreAccelScope::AllNon443Tcp).unwrap(),
+            "\"all_non_443_tcp\""
+        );
+        assert_eq!(
+            serde_json::from_str::<GlobalPreAccelScope>("\"all_non_443_tcp\"").unwrap(),
+            GlobalPreAccelScope::AllNon443Tcp
+        );
+        assert_eq!(
+            serde_json::from_str::<GlobalPreAccelScope>("\"all_non443_tcp\"").unwrap(),
+            GlobalPreAccelScope::AllNon443Tcp
+        );
+        assert_eq!(GlobalPreAccelScope::AllNon443Tcp.as_str(), "all_non_443_tcp");
+        assert_eq!(&cfg.system_proxy.bypass[..3], &["localhost", "127.0.0.1", "::1"]);
+
+        // Cross-platform unified hotkey defaults & legacy deserialization.
+        assert_eq!(
+            cfg.behavior.hotkeys.switch_next_best.as_deref(),
+            Some("Alt+Shift+N")
+        );
+        assert_eq!(
+            cfg.behavior.hotkeys.toggle_capsule.as_deref(),
+            Some("Alt+Shift+C")
+        );
+        assert_eq!(
+            legacy.behavior.hotkeys.switch_next_best.as_deref(),
+            Some("Alt+Shift+N")
+        );
+        assert_eq!(
+            legacy.behavior.hotkeys.toggle_capsule.as_deref(),
+            Some("Alt+Shift+C")
+        );
     }
 }

@@ -531,20 +531,122 @@ fn is_unix_pgid_alive(pgid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// Check whether a running process matches CatCloud's managed core or application binaries
+/// (`mihomo` or `catcloud` in process name, executable path, or command-line arguments).
+/// Used on Unix before terminating a stale PGID recorded in `core.pid` so OS PID/PGID reuse
+/// can never terminate an unrelated system process.
+pub fn is_managed_stale_process(
+    name: &str,
+    exe_path: Option<&Path>,
+    cmdline: &[String],
+) -> bool {
+    let matches_token = |text: &str| {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("mihomo") || lower.contains("catcloud")
+    };
+    if matches_token(name) {
+        return true;
+    }
+    if let Some(exe) = exe_path {
+        if matches_token(&exe.to_string_lossy()) {
+            return true;
+        }
+    }
+    cmdline.iter().any(|arg| matches_token(arg))
+}
+
 /// Clean up stale child process groups recorded in a Unix/macOS PID file from a crashed prior run.
+/// Verifies via `sysinfo::System` that the live process(es) belong to `mihomo` or `catcloud`
+/// before delivering `SIGTERM`/`SIGKILL` so PID/PGID reuse never harms unrelated system processes.
 #[cfg(unix)]
 pub fn cleanup_stale_pid_file(pid_file: &Path) {
+    use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System, UpdateKind};
+
     let Ok(content) = std::fs::read_to_string(pid_file) else {
         return;
     };
-    for line in content.lines() {
-        if let Ok(pgid) = line.trim().parse::<i32>() {
-            if pgid > 1 {
-                // SAFETY: Terminating stale managed process group recorded by prior instance.
+
+    let my_pid = std::process::id() as i32;
+    let candidate_pgids: Vec<i32> = content
+        .lines()
+        .filter_map(|line| line.trim().parse::<i32>().ok())
+        .filter(|&pgid| pgid > 1 && pgid != my_pid)
+        .collect();
+
+    if !candidate_pgids.is_empty() {
+        let refresh = RefreshKind::nothing().with_processes(
+            ProcessRefreshKind::nothing()
+                .with_cmd(UpdateKind::Always)
+                .with_exe(UpdateKind::Always),
+        );
+        let system = System::new_with_specifics(refresh);
+
+        for pgid in candidate_pgids {
+            if !is_unix_pgid_alive(pgid) {
+                continue;
+            }
+
+            let verified_managed = if let Some(proc_info) = system.process(Pid::from_u32(pgid as u32)) {
+                let name = proc_info.name().to_string_lossy();
+                let cmdline: Vec<String> = proc_info
+                    .cmd()
+                    .iter()
+                    .map(|arg| arg.to_string_lossy().into_owned())
+                    .collect();
+                let matched = is_managed_stale_process(&name, proc_info.exe(), &cmdline);
+                if !matched {
+                    tracing::warn!(
+                        pgid,
+                        process = %name,
+                        "skipping stale pid cleanup: PID appears reused by unrelated process"
+                    );
+                }
+                matched
+            } else {
+                // Leader exited; check whether any surviving member of `-pgid` is a managed process
+                // and no unrelated process occupies the group.
+                let mut found_managed = false;
+                let mut found_unrelated = false;
+                for (pid, proc_info) in system.processes() {
+                    let raw_pid = pid.as_u32() as i32;
+                    if raw_pid <= 1 || raw_pid == my_pid {
+                        continue;
+                    }
+                    // SAFETY: `getpgid` is a read-only POSIX query for the target process's PGID.
+                    let member_pgid = unsafe { libc::getpgid(raw_pid) };
+                    if member_pgid == pgid {
+                        let name = proc_info.name().to_string_lossy();
+                        let cmdline: Vec<String> = proc_info
+                            .cmd()
+                            .iter()
+                            .map(|arg| arg.to_string_lossy().into_owned())
+                            .collect();
+                        if is_managed_stale_process(&name, proc_info.exe(), &cmdline) {
+                            found_managed = true;
+                        } else {
+                            found_unrelated = true;
+                            tracing::warn!(
+                                pgid,
+                                member_pid = raw_pid,
+                                process = %name,
+                                "skipping stale pgid cleanup: unrelated process found in process group"
+                            );
+                            break;
+                        }
+                    }
+                }
+                found_managed && !found_unrelated
+            };
+
+            if verified_managed {
+                // SAFETY: Terminating verified stale managed process group recorded by prior instance.
                 unsafe {
-                    if libc::kill(-pgid, 0) == 0 {
-                        let _ = libc::kill(-pgid, libc::SIGTERM);
-                        std::thread::sleep(Duration::from_millis(80));
+                    let _ = libc::kill(-pgid, libc::SIGTERM);
+                }
+                std::thread::sleep(Duration::from_millis(80));
+                if is_unix_pgid_alive(pgid) {
+                    // SAFETY: Escalating to SIGKILL for verified managed process group still alive.
+                    unsafe {
                         let _ = libc::kill(-pgid, libc::SIGKILL);
                     }
                 }
@@ -742,11 +844,31 @@ pub fn spawn_detached_self(
     }
 }
 
+/// Resolve the executable path to relaunch during self-restart.
+/// On Linux AppImage launches, prefers a validated existing `$APPIMAGE` path over `/tmp/.mount_*`.
+pub fn resolve_restarted_self_exe_path(
+    current_exe: &Path,
+    is_linux: bool,
+    appimage_env: Option<&std::ffi::OsStr>,
+) -> PathBuf {
+    if is_linux {
+        crate::platform::resolve_persistent_linux_exe_path_with_env(current_exe, appimage_env)
+    } else {
+        current_exe.to_path_buf()
+    }
+}
+
 /// Convenience helper that relaunches the current executable with `--restarting` prepended
 /// (if not already present) using `spawn_detached_self`.
 pub fn spawn_restarted_self(extra_args: &[String]) -> CatResult<DetachedSpawnResult> {
-    let exe = std::env::current_exe()
+    let current_exe = std::env::current_exe()
         .map_err(|e| CatError::Process(format!("cannot determine current_exe: {e}")))?;
+    let appimage_env = std::env::var_os("APPIMAGE");
+    let exe = resolve_restarted_self_exe_path(
+        &current_exe,
+        cfg!(target_os = "linux"),
+        appimage_env.as_deref(),
+    );
     let cwd = exe
         .parent()
         .map(Path::to_path_buf)
@@ -1869,5 +1991,69 @@ mod tests {
             OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_DACL_ONLY).is_some(),
             "DACL-only cross-IL SDDL must parse on Windows"
         );
+    }
+
+    #[test]
+    fn stale_pid_process_identity_guard_matches_only_mihomo_or_catcloud() {
+        assert!(is_managed_stale_process("mihomo", None, &[]));
+        assert!(is_managed_stale_process(
+            "CatCloud-Desktop",
+            Some(Path::new("/usr/bin/catcloud-desktop")),
+            &[]
+        ));
+        assert!(is_managed_stale_process(
+            "core-runner",
+            Some(Path::new("/home/catcloud/.local/share/catcloud/bin/mihomo")),
+            &[]
+        ));
+        assert!(is_managed_stale_process(
+            "proxy-core",
+            None,
+            &[
+                "/opt/bin/core".to_string(),
+                "-f".to_string(),
+                "/home/catcloud/catcloud/runtime.yaml".to_string(),
+            ]
+        ));
+
+        // Unrelated system or user processes must NEVER be matched on PID/PGID reuse.
+        assert!(!is_managed_stale_process(
+            "sshd",
+            Some(Path::new("/usr/sbin/sshd")),
+            &["sshd: root@pts/0".to_string()]
+        ));
+        assert!(!is_managed_stale_process(
+            "systemd",
+            Some(Path::new("/lib/systemd/systemd")),
+            &["--user".to_string()]
+        ));
+        assert!(!is_managed_stale_process(
+            "bash",
+            Some(Path::new("/bin/bash")),
+            &["-l".to_string()]
+        ));
+        assert!(!is_managed_stale_process("", None, &[]));
+    }
+
+    #[test]
+    fn restarted_self_exe_path_prefers_validated_appimage_on_linux() {
+        let mount_exe = Path::new("/tmp/.mount_CatClo9999/usr/bin/catcloud-desktop");
+        let tmp_appimage = std::env::temp_dir().join(format!(
+            "catcloud-restart-test-{}.AppImage",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&tmp_appimage, b"stub-appimage").unwrap();
+
+        assert_eq!(
+            resolve_restarted_self_exe_path(mount_exe, true, Some(tmp_appimage.as_os_str())),
+            tmp_appimage
+        );
+        // Non-Linux platforms must ignore $APPIMAGE and preserve current_exe.
+        assert_eq!(
+            resolve_restarted_self_exe_path(mount_exe, false, Some(tmp_appimage.as_os_str())),
+            mount_exe
+        );
+
+        let _ = std::fs::remove_file(&tmp_appimage);
     }
 }

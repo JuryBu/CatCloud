@@ -7,6 +7,13 @@
  *   RFC 5737 documentation IP ranges and placeholder provider labels only.
  */
 
+import {
+  DEFAULT_GLOBAL_TARGET_PROCESSES,
+  buildShellEnvFallback,
+  detectNavigatorOs,
+  type ShellEnvKind,
+} from "../utils/platform";
+
 export type ThemeMode = "auto_time" | "light" | "warm_dark" | "midnight_blue";
 export type ResolvedTheme = "light" | "warm-dark" | "midnight-blue";
 export type TrayIconMode = "auto_ac" | "always_a" | "always_c" | "always_pixel";
@@ -16,6 +23,8 @@ export type CoreHealthStatus = "idle" | "ok" | "preaccel" | "warn" | "error";
 export type MemoryTier = "auto" | "mb48" | "mb64" | "mb96" | "48MiB" | "64MiB" | "96MiB";
 export type PreAccelOverrideMode = "inherit" | "force_on" | "force_off";
 export type RouteTargetMode = "single" | "group";
+export type GlobalPreAccelScope = "proxy_apps_only" | "all_non_443_tcp";
+export type GlobalPreAccelMode = "off" | "windivert" | "local_socks5";
 
 export type MultiGroupMode =
   | "sticky_best"
@@ -63,7 +72,43 @@ export interface PreAccelConfig {
   probe_url: string;
   fallback_probe_url: string;
   campus_portal_guard?: boolean;
+  global_bypass_enabled?: boolean;
+  global_scope?: GlobalPreAccelScope;
+  global_target_processes?: string[];
+  windivert_dir?: string | null;
 }
+
+export interface GlobalPreAccelStatus {
+  running: boolean;
+  mode: GlobalPreAccelMode;
+  socks_port: number | null;
+  windivert_available: boolean;
+  windivert_path: string | null;
+  is_elevated: boolean;
+  active_connections: number;
+  total_connections: number;
+  up_bytes: number;
+  down_bytes: number;
+  accelerated_processes: string[];
+  active_relays: string[];
+  last_error: string | null;
+}
+
+export const DEFAULT_GLOBAL_PREACCEL_STATUS: GlobalPreAccelStatus = {
+  running: false,
+  mode: "off",
+  socks_port: null,
+  windivert_available: false,
+  windivert_path: null,
+  is_elevated: false,
+  active_connections: 0,
+  total_connections: 0,
+  up_bytes: 0,
+  down_bytes: 0,
+  accelerated_processes: [],
+  active_relays: [],
+  last_error: null,
+};
 
 export interface UpdateConfig {
   repo: string;
@@ -372,7 +417,12 @@ export interface CoreRuntimeInfo {
   active_node_latency_ms: number | null;
   active_node_up_mbps: number | null;
   preaccel_active: boolean;
+  preaccel_enabled?: boolean;
   preaccel_relay_name: string | null;
+  global_preaccel_active?: boolean;
+  global_preaccel_mode?: GlobalPreAccelMode;
+  global_preaccel_socks_port?: number | null;
+  global_preaccel_connections?: number;
   captive_portal_required: boolean;
   system_proxy_enabled: boolean;
   tun_enabled: boolean;
@@ -805,6 +855,10 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     probe_url: "http://connectivitycheck.platform.hicloud.com/generate_204",
     fallback_probe_url: "http://connect.rom.miui.com/generate_204",
     campus_portal_guard: true,
+    global_bypass_enabled: false,
+    global_scope: "proxy_apps_only",
+    global_target_processes: [...DEFAULT_GLOBAL_TARGET_PROCESSES],
+    windivert_dir: null,
   },
   personalization: {
     theme_mode: "auto_time",
@@ -1258,6 +1312,59 @@ let mockQuickSites: SiteCheckItem[] = structuredClone(MOCK_QUICK_SITES);
 let mockActiveNodeIdx = 0;
 let mockUpTotal = 186 * 1024 * 1024;
 let mockDownTotal = 1.42 * 1024 * 1024 * 1024;
+function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
+  if (!raw || typeof raw !== "object") {
+    return { ...DEFAULT_GLOBAL_PREACCEL_STATUS };
+  }
+  const r = raw as Partial<GlobalPreAccelStatus>;
+  const mode: GlobalPreAccelMode =
+    r.mode === "windivert" || r.mode === "local_socks5" || r.mode === "off"
+      ? r.mode
+      : r.running
+        ? "local_socks5"
+        : "off";
+  const safeNum = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+  return {
+    running: Boolean(r.running),
+    mode,
+    socks_port:
+      typeof r.socks_port === "number" && Number.isFinite(r.socks_port) && r.socks_port > 0
+        ? r.socks_port
+        : null,
+    windivert_available: Boolean(r.windivert_available),
+    windivert_path: typeof r.windivert_path === "string" ? r.windivert_path : null,
+    is_elevated: Boolean(r.is_elevated),
+    active_connections: safeNum(r.active_connections),
+    total_connections: safeNum(r.total_connections),
+    up_bytes: safeNum(r.up_bytes),
+    down_bytes: safeNum(r.down_bytes),
+    accelerated_processes: Array.isArray(r.accelerated_processes)
+      ? r.accelerated_processes.filter((x): x is string => typeof x === "string")
+      : [],
+    active_relays: Array.isArray(r.active_relays)
+      ? r.active_relays.filter((x): x is string => typeof x === "string")
+      : [],
+    last_error: typeof r.last_error === "string" && r.last_error.trim() ? r.last_error : null,
+  };
+}
+
+let mockGlobalPreAccel: GlobalPreAccelStatus = {
+  running: false,
+  mode: "off",
+  socks_port: null,
+  windivert_available: detectNavigatorOs() === "windows",
+  windivert_path: detectNavigatorOs() === "windows" ? "bin/WinDivert64.dll" : null,
+  is_elevated: true,
+  active_connections: 0,
+  total_connections: 0,
+  up_bytes: 0,
+  down_bytes: 0,
+  accelerated_processes: [],
+  active_relays: MOCK_PREACCEL_RELAYS.filter((r) => r.enabled).map((r) => r.name),
+  last_error: null,
+};
+
 let mockRuntime: CoreRuntimeInfo = {
   running: true,
   status: "preaccel",
@@ -1277,7 +1384,12 @@ let mockRuntime: CoreRuntimeInfo = {
   active_node_latency_ms: 68,
   active_node_up_mbps: 14.8,
   preaccel_active: true,
+  preaccel_enabled: mockConfig.preaccel.enabled,
   preaccel_relay_name: "CN-East-443 Primary",
+  global_preaccel_active: false,
+  global_preaccel_mode: "off",
+  global_preaccel_socks_port: null,
+  global_preaccel_connections: 0,
   captive_portal_required: false,
   system_proxy_enabled: mockConfig.system_proxy_enabled,
   tun_enabled: mockConfig.tun_enabled,
@@ -1288,6 +1400,77 @@ let mockRuntime: CoreRuntimeInfo = {
   portable_mode: true,
   last_update_check: "2026-11-23 04:30",
 };
+
+function syncMockPreAccelRuntime(): void {
+  const proxyActive =
+    mockRuntime.running && (mockRuntime.system_proxy_enabled || mockRuntime.tun_enabled);
+  const proxyPreAccelActive = mockRuntime.running && mockConfig.preaccel.enabled;
+  const globalActive = mockGlobalPreAccel.running;
+  const preaccelActive = proxyPreAccelActive || globalActive;
+  const nextStatus: CoreHealthStatus =
+    (proxyActive && mockConfig.preaccel.enabled) || globalActive || proxyPreAccelActive
+      ? "preaccel"
+      : mockRuntime.running
+        ? "ok"
+        : "idle";
+
+  const activeRelays = mockRelays.filter((r) => r.enabled).map((r) => r.name);
+  mockGlobalPreAccel = {
+    ...mockGlobalPreAccel,
+    active_relays: activeRelays,
+  };
+  mockRuntime = {
+    ...mockRuntime,
+    preaccel_enabled: mockConfig.preaccel.enabled,
+    preaccel_active: preaccelActive,
+    preaccel_relay_name: activeRelays[0] ?? null,
+    global_preaccel_active: globalActive,
+    global_preaccel_mode: mockGlobalPreAccel.mode,
+    global_preaccel_socks_port: mockGlobalPreAccel.socks_port,
+    global_preaccel_connections: mockGlobalPreAccel.active_connections,
+    status: nextStatus,
+  };
+}
+
+function startMockGlobalPreAccel(): void {
+  const enabledRelays = mockRelays.filter((r) => r.enabled);
+  if (enabledRelays.length === 0) {
+    throw new Error("请先添加并启用至少一条国内中转线路");
+  }
+  const os = detectNavigatorOs();
+  const useWinDivert =
+    os === "windows" && mockGlobalPreAccel.windivert_available && mockGlobalPreAccel.is_elevated;
+  const targetSample = (mockConfig.preaccel.global_target_processes ?? [])
+    .slice(0, 2);
+  mockGlobalPreAccel = {
+    ...mockGlobalPreAccel,
+    running: true,
+    mode: useWinDivert ? "windivert" : "local_socks5",
+    socks_port: 17895,
+    active_connections: useWinDivert ? 3 : 0,
+    total_connections: Math.max(mockGlobalPreAccel.total_connections, useWinDivert ? 14 : 2),
+    up_bytes: Math.max(mockGlobalPreAccel.up_bytes, useWinDivert ? 48 * 1024 * 1024 : 0),
+    down_bytes: Math.max(mockGlobalPreAccel.down_bytes, useWinDivert ? 12 * 1024 * 1024 : 0),
+    accelerated_processes: useWinDivert
+      ? targetSample.length > 0
+        ? targetSample
+        : ["mihomotag-serv.exe", "FlClashCore.exe"]
+      : [],
+    active_relays: enabledRelays.map((r) => r.name),
+    last_error: null,
+  };
+}
+
+function stopMockGlobalPreAccel(): void {
+  mockGlobalPreAccel = {
+    ...mockGlobalPreAccel,
+    running: false,
+    mode: "off",
+    socks_port: null,
+    active_connections: 0,
+    last_error: null,
+  };
+}
 
 /** Generate deterministic-looking smooth mock traffic history for browser preview */
 export function generateSeedTrafficSamples(count = 75, intervalMs = 2000): TrafficSample[] {
@@ -1333,15 +1516,17 @@ export const catcloudApi = {
       return tauriInvokeOrThrow<AppConfig>("save_app_config", { config: wireConfig });
     }
     mockConfig = structuredClone(next);
+    if (!next.preaccel.enabled) {
+      stopMockGlobalPreAccel();
+    }
     mockRuntime = {
       ...mockRuntime,
       proxy_mode: next.proxy_mode,
       system_proxy_enabled: next.system_proxy_enabled,
       tun_enabled: next.tun_enabled,
       mixed_port: next.mixed_port,
-      preaccel_active: next.preaccel.enabled,
-      status: next.preaccel.enabled ? "preaccel" : "ok",
     };
+    syncMockPreAccelRuntime();
     return structuredClone(mockConfig);
   },
 
@@ -1430,7 +1615,8 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<CoreRuntimeInfo>("start_core");
     }
-    mockRuntime = { ...mockRuntime, running: true, status: mockConfig.preaccel.enabled ? "preaccel" : "ok" };
+    mockRuntime = { ...mockRuntime, running: true };
+    syncMockPreAccelRuntime();
     return { ...mockRuntime };
   },
 
@@ -1438,7 +1624,8 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<CoreRuntimeInfo>("stop_core");
     }
-    mockRuntime = { ...mockRuntime, running: false, status: "idle" };
+    mockRuntime = { ...mockRuntime, running: false };
+    syncMockPreAccelRuntime();
     return { ...mockRuntime };
   },
 
@@ -1483,6 +1670,7 @@ export const catcloudApi = {
     }
     mockConfig.system_proxy_enabled = enabled;
     mockRuntime.system_proxy_enabled = enabled;
+    syncMockPreAccelRuntime();
     return enabled;
   },
 
@@ -1492,6 +1680,7 @@ export const catcloudApi = {
     }
     mockConfig.tun_enabled = enabled;
     mockRuntime.tun_enabled = enabled;
+    syncMockPreAccelRuntime();
     return enabled;
   },
 
@@ -1982,9 +2171,126 @@ export const catcloudApi = {
       return tauriInvokeOrThrow<boolean>("toggle_preaccel", { enabled });
     }
     mockConfig.preaccel.enabled = enabled;
-    mockRuntime.preaccel_active = enabled;
-    mockRuntime.status = enabled ? "preaccel" : "ok";
+    if (!enabled) {
+      stopMockGlobalPreAccel();
+    } else {
+      const proxyRunning =
+        mockRuntime.running && (mockRuntime.system_proxy_enabled || mockRuntime.tun_enabled);
+      if (!proxyRunning) {
+        mockConfig.preaccel.global_bypass_enabled = true;
+        startMockGlobalPreAccel();
+      }
+    }
+    syncMockPreAccelRuntime();
     return enabled;
+  },
+
+  async getGlobalPreAccelStatus(): Promise<GlobalPreAccelStatus> {
+    if (isTauriEnv()) {
+      const raw = await tauriInvokeOrThrow<unknown>("get_global_preaccel_status");
+      return normalizeGlobalPreAccelStatus(raw);
+    }
+    syncMockPreAccelRuntime();
+    return structuredClone(mockGlobalPreAccel);
+  },
+
+  async toggleGlobalPreAccel(enabled: boolean): Promise<GlobalPreAccelStatus> {
+    if (isTauriEnv()) {
+      const raw = await tauriInvokeOrThrow<unknown>("toggle_global_preaccel", { enabled });
+      if (raw && typeof raw === "object" && "running" in raw) {
+        return normalizeGlobalPreAccelStatus(raw);
+      }
+      return catcloudApi.getGlobalPreAccelStatus();
+    }
+    mockConfig.preaccel.global_bypass_enabled = enabled;
+    if (enabled) {
+      mockConfig.preaccel.enabled = true;
+      startMockGlobalPreAccel();
+    } else {
+      stopMockGlobalPreAccel();
+    }
+    syncMockPreAccelRuntime();
+    return structuredClone(mockGlobalPreAccel);
+  },
+
+  async updateGlobalPreAccelSettings(
+    scope: GlobalPreAccelScope,
+    targetProcesses: string[],
+    windivertDir: string | null = null
+  ): Promise<GlobalPreAccelStatus> {
+    if (isTauriEnv()) {
+      const raw = await tauriInvokeOrThrow<unknown>("update_global_preaccel_settings", {
+        scope,
+        targetProcesses,
+        windivertDir,
+      });
+      if (raw && typeof raw === "object" && "running" in raw) {
+        return normalizeGlobalPreAccelStatus(raw);
+      }
+      return catcloudApi.getGlobalPreAccelStatus();
+    }
+    const cleanedProcesses = Array.from(
+      new Set(targetProcesses.map((s) => s.trim()).filter(Boolean))
+    );
+    mockConfig.preaccel.global_scope = scope;
+    mockConfig.preaccel.global_target_processes = cleanedProcesses;
+    mockConfig.preaccel.windivert_dir = windivertDir?.trim() || null;
+    if (mockFullConfig.preaccel) {
+      mockFullConfig.preaccel.global_scope = scope;
+      mockFullConfig.preaccel.global_target_processes = cleanedProcesses;
+      mockFullConfig.preaccel.windivert_dir = windivertDir?.trim() || null;
+    }
+    if (mockGlobalPreAccel.running && mockGlobalPreAccel.mode === "windivert") {
+      mockGlobalPreAccel = {
+        ...mockGlobalPreAccel,
+        accelerated_processes: cleanedProcesses.slice(0, 2),
+      };
+    }
+    syncMockPreAccelRuntime();
+    return structuredClone(mockGlobalPreAccel);
+  },
+
+  async installWinDivertDriver(): Promise<GlobalPreAccelStatus> {
+    if (isTauriEnv()) {
+      const raw = await tauriInvokeOrThrow<unknown>("install_windivert_driver");
+      if (raw && typeof raw === "object" && "running" in raw) {
+        return normalizeGlobalPreAccelStatus(raw);
+      }
+      const latest = await catcloudApi.getGlobalPreAccelStatus();
+      if (typeof raw === "string" && raw.trim() && !latest.windivert_path) {
+        return { ...latest, windivert_available: true, windivert_path: raw.trim() };
+      }
+      return latest;
+    }
+    mockGlobalPreAccel = {
+      ...mockGlobalPreAccel,
+      windivert_available: true,
+      windivert_path: "bin/WinDivert64.dll",
+      last_error: null,
+    };
+    if (mockGlobalPreAccel.running && mockGlobalPreAccel.is_elevated) {
+      startMockGlobalPreAccel();
+    }
+    syncMockPreAccelRuntime();
+    return structuredClone(mockGlobalPreAccel);
+  },
+
+  async relaunchAsAdminForGlobalPreAccel(): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("relaunch_as_admin_for_global_preaccel");
+    }
+    mockRuntime.tun_admin_ready = true;
+    mockGlobalPreAccel = {
+      ...mockGlobalPreAccel,
+      is_elevated: true,
+      windivert_available: true,
+      windivert_path: mockGlobalPreAccel.windivert_path ?? "bin/WinDivert64.dll",
+    };
+    mockConfig.preaccel.enabled = true;
+    mockConfig.preaccel.global_bypass_enabled = true;
+    startMockGlobalPreAccel();
+    syncMockPreAccelRuntime();
+    return true;
   },
 
   async failoverPreAccel(): Promise<string | null> {
@@ -2274,7 +2580,16 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<string>("export_shell_env", { shell });
     }
-    return `export http_proxy="http://127.0.0.1:${mockConfig.mixed_port}"`;
+    const normalized = shell.trim().toLowerCase();
+    const kind: ShellEnvKind =
+      normalized === "powershell" ||
+      normalized === "cmd" ||
+      normalized === "bash" ||
+      normalized === "zsh" ||
+      normalized === "fish"
+        ? normalized
+        : "bash";
+    return buildShellEnvFallback(kind, mockConfig.mixed_port);
   },
 
   async exportSanitizedDiagnostics(): Promise<SanitizedDiagnosticsDto> {

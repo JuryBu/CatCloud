@@ -55,6 +55,13 @@ import {
   getBeijingTimeLabel,
   useAppSelector,
 } from "../store/appStore";
+import {
+  type PlatformOs,
+  type ShellEnvKind,
+  buildShellEnvFallback,
+  defaultShellForOs,
+  resolvePlatformOs,
+} from "../utils/platform";
 
 type SettingsTabId = "system" | "appearance" | "dns" | "core" | "updates";
 type LogLevel = "silent" | "error" | "warning" | "info" | "debug";
@@ -112,7 +119,7 @@ const DEFAULT_WEBUI_ENTRIES: WebUiEntry[] = [
 ];
 
 const DEFAULT_EXTENDED: ExtendedSettings = {
-  bypassDomains: "localhost, 127.*, 10.*, 172.16.*, 192.168.*, *.local, <local>",
+  bypassDomains: "localhost, 127.0.0.1, ::1, 127.*, 10.*, 172.16.*, 192.168.*, *.local, <local>",
   domesticDirectEnabled: true,
   blockQuicUdp443: true,
   allowLan: false,
@@ -146,13 +153,32 @@ const DEFAULT_EXTENDED: ExtendedSettings = {
   trayClickAction: "toggle_main_window",
   closeToWindowless: true,
   hotkeys: {
-    toggleProxy: "Alt+Shift+P",
+    toggleProxy: "",
     switchNextBest: "Alt+Shift+N",
-    toggleMainWindow: "Alt+Shift+M",
+    toggleMainWindow: "",
     toggleCapsule: "Alt+Shift+C",
-    toggleTun: "Alt+Shift+T",
+    toggleTun: "",
   },
 };
+
+function getShellEnvOptionsForOs(
+  os: PlatformOs
+): ReadonlyArray<{ value: ShellEnvKind; label: string }> {
+  const all: Record<ShellEnvKind, { value: ShellEnvKind; label: string }> = {
+    powershell: { value: "powershell", label: "PowerShell (Windows)" },
+    cmd: { value: "cmd", label: "命令提示符 CMD (Windows)" },
+    bash: { value: "bash", label: "Bash" },
+    zsh: { value: "zsh", label: "Zsh (macOS / Linux)" },
+    fish: { value: "fish", label: "Fish" },
+  };
+  if (os === "macos") {
+    return [all.zsh, all.bash, all.fish, all.powershell, all.cmd];
+  }
+  if (os === "linux") {
+    return [all.bash, all.zsh, all.fish, all.powershell, all.cmd];
+  }
+  return [all.powershell, all.cmd, all.bash, all.zsh, all.fish];
+}
 
 const RESOLVED_THEME_LABELS: Record<ResolvedTheme, string> = {
   light: "浅色暖纸",
@@ -336,7 +362,7 @@ const AGENT_DOCS = [
     goal: "管理系统代理、防篡改守护、虚拟网卡 TUN、独立 IPv6/Fake-IP 策略与三级热重载。",
     keys: "mixed_port, controller_port, dns_listen_port, ipv6_core_enabled, ipv6_dns_enabled, tun_stack_mode, append_rules",
     workflow: "改动规则或 DNS 后先预览最终编译 YAML，确认无误再触发内核热重载。",
-    guardrails: "Windows 启用 TUN 需管理员权限；遇到 IPv6 异常时先关闭 DNS 返回 IPv6 再排查。",
+    guardrails: "启用 TUN 虚拟网卡需系统网络权限（Windows 为 UAC 管理员，Linux 仅给核心授予 cap_net_admin，macOS 需系统安全授权）；遇到 IPv6 异常时先关闭 DNS 返回 IPv6 再排查。",
   },
   {
     id: "updater_lifecycle",
@@ -500,9 +526,9 @@ function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
     closeToWindowless: beh?.minimize_to_tray_on_close ?? true,
     hotkeys: {
       toggleProxy: hk?.toggle_system_proxy ?? "",
-      switchNextBest: hk?.switch_next_best ?? "Alt+Shift+N",
+      switchNextBest: hk !== undefined ? (hk.switch_next_best ?? "") : "Alt+Shift+N",
       toggleMainWindow: hk?.show_main_window ?? "",
-      toggleCapsule: hk?.toggle_capsule ?? "Alt+Shift+C",
+      toggleCapsule: hk !== undefined ? (hk.toggle_capsule ?? "") : "Alt+Shift+C",
       toggleTun: hk?.toggle_tun ?? "",
     },
   };
@@ -825,6 +851,20 @@ export function SettingsPage() {
   const settingsTabHint = useAppSelector((s) => s.settingsTabHint);
   const settingsOpenAgentDocs = useAppSelector((s) => s.settingsOpenAgentDocs);
   const inTauri = isTauriEnv();
+  const platformOs = resolvePlatformOs(runtime.os_label);
+  const isWindows = platformOs === "windows";
+  const shellEnvOptions = useMemo(() => getShellEnvOptionsForOs(platformOs), [platformOs]);
+
+  const [selectedShell, setSelectedShell] = useState<ShellEnvKind>(() =>
+    defaultShellForOs(platformOs)
+  );
+  const userPickedShellRef = useRef(false);
+
+  useEffect(() => {
+    if (!userPickedShellRef.current) {
+      setSelectedShell(defaultShellForOs(platformOs));
+    }
+  }, [platformOs]);
 
   const [tab, setTab] = useState<SettingsTabId>(() =>
     settingsOpenAgentDocs ? "updates" : (settingsTabHint ?? "system")
@@ -1348,12 +1388,15 @@ export function SettingsPage() {
     }
   };
 
-  const handleCopyShellEnv = async (sh: "powershell" | "cmd" | "bash") => {
-    const fallback = {
-      powershell: `$env:HTTP_PROXY="http://127.0.0.1:${draft.mixed_port}"; $env:HTTPS_PROXY="http://127.0.0.1:${draft.mixed_port}"; $env:ALL_PROXY="socks5://127.0.0.1:${draft.mixed_port}"`,
-      cmd: `set HTTP_PROXY=http://127.0.0.1:${draft.mixed_port} && set HTTPS_PROXY=http://127.0.0.1:${draft.mixed_port}`,
-      bash: `export http_proxy="http://127.0.0.1:${draft.mixed_port}" https_proxy="http://127.0.0.1:${draft.mixed_port}" all_proxy="socks5://127.0.0.1:${draft.mixed_port}"`,
-    }[sh];
+  const handleCopyShellEnv = async (sh: ShellEnvKind) => {
+    const labelMap: Record<ShellEnvKind, string> = {
+      powershell: "PowerShell",
+      cmd: "CMD",
+      bash: "Bash",
+      zsh: "Zsh",
+      fish: "Fish",
+    };
+    const fallback = buildShellEnvFallback(sh, draft.mixed_port);
     let text = fallback;
     if (inTauri) {
       try {
@@ -1363,7 +1406,7 @@ export function SettingsPage() {
         /* fallback */
       }
     }
-    await copyText(text, `${sh.toUpperCase()} 代理命令`);
+    await copyText(text, `${labelMap[sh]} 代理命令`);
   };
 
   const handleCopyDiagnostics = async () => {
@@ -1531,8 +1574,12 @@ export function SettingsPage() {
                 title="虚拟网卡接管"
                 desc={
                   runtime.tun_admin_ready
-                    ? "已具备管理员权限，可接管游戏和终端等全部软件"
-                    : "需要管理员权限，开启时将弹出系统授权提示"
+                    ? "已具备虚拟网卡网络权限，可接管终端和桌面软件等全部流量"
+                    : platformOs === "linux"
+                      ? "需要为代理核心授予网络权限，开启时将弹出系统授权提示（界面保持普通用户）"
+                      : platformOs === "macos"
+                        ? "需要 macOS 系统安全授权，开启时将弹出授权指引"
+                        : "需要管理员权限，开启时将弹出系统授权提示（UAC）"
                 }
                 checked={runtime.tun_enabled}
                 onChange={(v) => void appActions.toggleTun(v)}
@@ -1546,7 +1593,11 @@ export function SettingsPage() {
                       color: runtime.tun_admin_ready ? "var(--green)" : "var(--amber)",
                     }}
                   >
-                    {runtime.tun_admin_ready ? "权限就绪" : "需管理员"}
+                    {runtime.tun_admin_ready
+                      ? "权限就绪"
+                      : platformOs === "linux"
+                        ? "需授核心权限"
+                        : "需授权"}
                   </span>
                 }
               />
@@ -1648,10 +1699,12 @@ export function SettingsPage() {
                     buttonClassName="rounded-lg"
                   />
                 </div>
-                <button type="button" onClick={() => void handleLaunchUwp()} className={BTN_CLS}>
-                  <Shield className="h-3.5 w-3.5" />
-                  <span>查看本机应用网络放行状态</span>
-                </button>
+                {isWindows && (
+                  <button type="button" onClick={() => void handleLaunchUwp()} className={BTN_CLS}>
+                    <Shield className="h-3.5 w-3.5" />
+                    <span>查看本机应用网络放行状态</span>
+                  </button>
+                )}
               </div>
             </Card>
           </div>
@@ -2596,7 +2649,11 @@ export function SettingsPage() {
                   <input
                     value={coreBinaryPath}
                     onChange={(e) => setCoreBinaryPath(e.target.value)}
-                    placeholder="填写本地内核程序路径（如 C:\path\to\mihomo.exe）"
+                    placeholder={
+                      isWindows
+                        ? "填写本地内核程序路径（如 C:\\path\\to\\mihomo.exe）"
+                        : "填写本地内核程序路径（如 /usr/local/bin/mihomo）"
+                    }
                     className={`${INPUT_CLS} flex-1 cc-mono`}
                   />
                   <button
@@ -2695,17 +2752,29 @@ export function SettingsPage() {
 
             <div className="flex flex-wrap items-center gap-2 border-t border-[var(--line)] pt-2.5">
               <span className="text-xs text-[var(--muted)]">终端代理命令：</span>
-              {(["powershell", "cmd", "bash"] as const).map((sh) => (
-                <button
-                  key={sh}
-                  type="button"
-                  onClick={() => void handleCopyShellEnv(sh)}
-                  className={BTN_CLS}
-                >
-                  <Terminal className="h-3.5 w-3.5" />
-                  <span>{sh.toUpperCase()}</span>
-                </button>
-              ))}
+              <AppSelect
+                aria-label="选择终端类型"
+                size="sm"
+                value={selectedShell}
+                onChange={(v) => {
+                  userPickedShellRef.current = true;
+                  setSelectedShell(v as ShellEnvKind);
+                }}
+                options={shellEnvOptions.map((opt) => ({
+                  value: opt.value,
+                  label: opt.label,
+                }))}
+                className="min-w-[180px]"
+                buttonClassName="rounded-lg"
+              />
+              <button
+                type="button"
+                onClick={() => void handleCopyShellEnv(selectedShell)}
+                className={BTN_CLS}
+              >
+                <Terminal className="h-3.5 w-3.5" />
+                <span>复制代理命令</span>
+              </button>
               <button
                 type="button"
                 onClick={() => void handleCopyDiagnostics()}

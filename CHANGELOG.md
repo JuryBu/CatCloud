@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-- Maintenance and upcoming enhancements.
+### Global Domestic Pre-Acceleration & Four-Way Sync
+- Added standalone system-level **Global Domestic Pre-Acceleration** (usable without enabling CatCloud's own system proxy or TUN): launches an independent lightweight `:443` active-standby relay tunnel (~18 MB, zero TUN/DNS conflict) paired on Windows with dynamically loaded officially signed WinDivert transparent TCP redirection (`IfIdx` physical NIC pinning, per-process filtering for third-party proxy cores / SSH / SCP or global non-443 TCP fallback, RAII instant driver teardown on exit) and cross-platform standalone `socks5h://` entry.
+- Unified four-way real-time toggle sync across Overview, Floating Capsule, Domestic Pre-Acceleration page, and System Tray (icon state + tooltip + context menu).
+
+### Smart Watchdog, Routing & Performance
+- Hardened smart multi-group background watchdog against false failovers under heavy uploads: reads 10s rolling throughput window unaffected by window minimization, enforces 5-minute anti-flapping cooldown on failed nodes, and live-probes top-3 replacement candidates before switching.
+- Expanded conservative domestic direct routing (including Windows/Apple push notification endpoints and domestic CDNs) while keeping overseas & hybrid services strictly proxied.
+- Applied active-node YAML pruning (`>90%` config size reduction in rule mode), `geodata-loader: memconservative`, rolling sanitized file logging, AI diagnostic quick-copy entry, custom frameless titlebar + Portal dropdowns/modals, resizable day/night-synced floating capsule, and ~48% steady-state Mihomo memory reduction.
+
+### Cross-Platform Support (Windows / macOS / Linux)
+- macOS: fixed TUN auto-interface naming (`utun*`), added native App Menu restoring `Cmd+C/V/A`, frameless titlebar traffic-light safe inset, resilient `networksetup` SOCKS & `Empty` bypass handling, LaunchAgent `Aqua` session, and PID-file orphan core cleanup.
+- Linux: added dual KDE (`kwriteconfig5`/`kwriteconfig6`) + GNOME system proxy support, `$APPIMAGE` path resolution, least-privilege `pkexec setcap` for TUN (never elevating GUI as root), Wayland/X11 clipboard fallback (`wl-copy` -> `xclip` -> `xsel`), and automatic `+x` execution bits.
+- Windows: fixed UTF-16LE clipboard Chinese encoding; expanded CI test matrix to Ubuntu + macOS 14 + Windows and hardened multi-arch Release workflow.
 
 ## [0.1.0] - 2026-11-23
 

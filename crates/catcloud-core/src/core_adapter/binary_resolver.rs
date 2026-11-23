@@ -57,6 +57,50 @@ pub fn mihomo_binary_name() -> &'static str {
     }
 }
 
+/// On Unix, ensure a located Mihomo binary has at least one execute permission bit (`mode & 0o111`).
+/// When missing (e.g. a user-copied or hot-swapped binary in `paths.bin_dir`), performs a
+/// best-effort `chmod 0o755` repair and returns `true` if permissions were updated.
+pub fn ensure_unix_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(meta) = std::fs::metadata(path) else {
+            return false;
+        };
+        let mode = meta.permissions().mode();
+        if mode & 0o111 != 0 {
+            return false;
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(0o755);
+        match std::fs::set_permissions(path, perms) {
+            Ok(()) => {
+                let old_mode = format!("{:o}", mode & 0o7777);
+                tracing::info!(
+                    path = %path.display(),
+                    old_mode = %old_mode,
+                    "repaired missing Unix execute permission bit on Mihomo binary (0o755)"
+                );
+                true
+            }
+            Err(err) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "failed to repair Unix execute permission bit on Mihomo binary"
+                );
+                false
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// Compute lowercase hex SHA-256 of a file using a bounded streaming buffer.
 pub fn compute_file_sha256(path: &Path) -> CatResult<String> {
     let mut file = File::open(path)?;
@@ -237,6 +281,7 @@ pub fn resolve_mihomo_binary_with_exe_dir(
             let resolved_path = crate::paths::normalize_os_path(
                 &std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone()),
             );
+            ensure_unix_executable(&resolved_path);
             let sha256 = if compute_sha256 {
                 Some(compute_file_sha256(&resolved_path)?)
             } else {
@@ -476,6 +521,42 @@ mod tests {
             r_extra_dir.path.unwrap(),
             crate::paths::normalize_os_path(&std::fs::canonicalize(&tauri_res_bin).unwrap())
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ensure_unix_executable_returns_false_for_missing_file() {
+        let missing = std::env::temp_dir().join(format!(
+            "catcloud-missing-bin-{}",
+            Uuid::new_v4()
+        ));
+        assert!(!ensure_unix_executable(&missing));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolves_user_data_bin_and_repairs_missing_unix_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, paths, exe_dir) = make_temp_env("unix-chmod");
+        let data_bin = paths.bin_dir.join(mihomo_binary_name());
+        std::fs::write(&data_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&data_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&data_bin).unwrap().permissions().mode() & 0o111,
+            0
+        );
+
+        let cfg = AppConfig::default();
+        let res = resolve_mihomo_binary_with_exe_dir(&cfg, &paths, Some(&exe_dir), &[], false)
+            .unwrap();
+        assert!(res.found);
+        assert_eq!(res.source, BinarySource::UserDataBin);
+
+        let repaired_mode = std::fs::metadata(&data_bin).unwrap().permissions().mode();
+        assert_ne!(repaired_mode & 0o111, 0, "execute bit must be restored");
+        assert_eq!(repaired_mode & 0o777, 0o755);
 
         let _ = std::fs::remove_dir_all(&root);
     }
