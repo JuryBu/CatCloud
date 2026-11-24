@@ -57,6 +57,13 @@ import {
   nodeMatchesContinentAndRegion,
   resolveNodeRegionCode,
 } from "../utils/regions";
+import {
+  isBoolPref,
+  oneOfPref,
+  readUiPref,
+  usePersistedState,
+  writeUiPref,
+} from "../utils/uiPrefs";
 
 type SpeedTestTier = "latency" | "unlock" | "full";
 
@@ -567,20 +574,12 @@ export function SpeedTestPage({
     [preAccelRelays]
   );
   const defaultUsePreaccel = config.preaccel.enabled && hasEnabledPreAccelRelay;
-  const [usePreaccelForProbe, setUsePreaccelForProbe] = useState<boolean>(
-    () => defaultUsePreaccel
+  const [manualUsePreaccel, setManualUsePreaccel] = useState<boolean | null>(() =>
+    readUiPref<boolean | null>("speedtest.usePreaccel", null, isBoolPref)
   );
-  const userToggledPreaccelRef = useRef(false);
-
-  useEffect(() => {
-    if (!hasEnabledPreAccelRelay) {
-      setUsePreaccelForProbe(false);
-      return;
-    }
-    if (initialized && !userToggledPreaccelRef.current) {
-      setUsePreaccelForProbe(defaultUsePreaccel);
-    }
-  }, [initialized, defaultUsePreaccel, hasEnabledPreAccelRelay]);
+  const usePreaccelForProbe = hasEnabledPreAccelRelay
+    ? (manualUsePreaccel ?? defaultUsePreaccel)
+    : false;
 
   // Persisted keepalive (single source of truth) & probe enabled states
   const [includeKeepalive, setIncludeKeepalive] = useState<boolean>(() => {
@@ -616,7 +615,11 @@ export function SpeedTestPage({
             : p.enabled,
     }));
   });
-  const [showProbeSettings, setShowProbeSettings] = useState(false);
+  const [showProbeSettings, setShowProbeSettings] = usePersistedState<boolean>(
+    "speedtest.showProbeSettings",
+    false,
+    isBoolPref
+  );
   const [showAddProbe, setShowAddProbe] = useState(false);
   const [newProbeId, setNewProbeId] = useState("");
   const [newProbeName, setNewProbeName] = useState("");
@@ -646,10 +649,22 @@ export function SpeedTestPage({
   const [onlyTested, setOnlyTested] = useState(false);
   const [onlyGoogleClean, setOnlyGoogleClean] = useState(false);
   const [onlyAiUnlocked, setOnlyAiUnlocked] = useState(false);
-  const [sortKey, setSortKey] = useState<SortKey>("latency");
-  const [sortDir, setSortDir] = useState<SortDir>("asc");
+  const [sortKey, setSortKey] = usePersistedState<SortKey>(
+    "speedtest.sortKey",
+    "latency",
+    oneOfPref(["name", "source", "latency", "up", "down", "google", "unlocks"] as const)
+  );
+  const [sortDir, setSortDir] = usePersistedState<SortDir>(
+    "speedtest.sortDir",
+    "asc",
+    oneOfPref(["asc", "desc"] as const)
+  );
   const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState<number>(50);
+  const [pageSize, setPageSize] = usePersistedState<number>(
+    "speedtest.pageSize",
+    50,
+    oneOfPref(PAGE_SIZE_OPTIONS)
+  );
 
   // Multi-selection & Ctrl+left-button drag selection
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
@@ -2097,8 +2112,9 @@ export function SpeedTestPage({
             aria-checked={usePreaccelForProbe && hasEnabledPreAccelRelay}
             disabled={isRunning || !hasEnabledPreAccelRelay}
             onClick={() => {
-              userToggledPreaccelRef.current = true;
-              setUsePreaccelForProbe((v) => !v);
+              const next = !(usePreaccelForProbe && hasEnabledPreAccelRelay);
+              setManualUsePreaccel(next);
+              writeUiPref("speedtest.usePreaccel", next);
             }}
             title={
               hasEnabledPreAccelRelay

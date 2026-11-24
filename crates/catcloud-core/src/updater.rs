@@ -333,6 +333,29 @@ pub fn is_newer_version(remote: &str, local: &str) -> CatResult<bool> {
     Ok(rem > loc)
 }
 
+/// Evaluate whether `latest` is an available update over `current` for the chosen release channel.
+///
+/// When `include_prerelease` is `false`, any prerelease version (containing a SemVer prerelease
+/// identifier after `-`) returns `Ok(false)` while still validating SemVer syntax and rejecting
+/// `0.0.0`.
+pub fn is_update_available_for_channel(
+    latest: &str,
+    current: &str,
+    include_prerelease: bool,
+) -> CatResult<bool> {
+    let rem = parse_semver(latest)?;
+    if rem.is_zero_core() {
+        return Err(CatError::Validation(format!(
+            "remote release version 0.0.0 is rejected: '{latest}'"
+        )));
+    }
+    let loc = parse_semver(current)?;
+    if !include_prerelease && !rem.prerelease.is_empty() {
+        return Ok(false);
+    }
+    Ok(rem > loc)
+}
+
 // ============================================================================
 // GitHub Releases `latest.json` + `SHA256SUMS.txt` parsing & verification
 // ============================================================================
@@ -370,6 +393,51 @@ pub struct UpdateCheckResult {
     pub notes: String,
     pub pub_date: Option<String>,
     pub manifest: LatestManifest,
+}
+
+/// Map an explicit `(os, arch, is_portable)` target description to the `latest.json`
+/// platform key emitted by `scripts/release/build_latest_json.mjs`.
+///
+/// Returns `Some(...)` strictly for the 7 official desktop release combinations and `None`
+/// for unsupported `(os, arch)` pairs.
+pub fn update_platform_key_for_opt(os: &str, arch: &str, is_portable: bool) -> Option<&'static str> {
+    match (os, arch) {
+        ("windows", "x86_64") => Some(if is_portable {
+            "windows-x86_64-portable"
+        } else {
+            "windows-x86_64"
+        }),
+        ("windows", "aarch64") => Some(if is_portable {
+            "windows-aarch64-portable"
+        } else {
+            "windows-aarch64"
+        }),
+        ("macos", "aarch64") => Some("darwin-aarch64"),
+        ("macos", "x86_64") => Some("darwin-x86_64"),
+        ("linux", "x86_64") => Some("linux-x86_64"),
+        _ => None,
+    }
+}
+
+/// Return the `latest.json` platform key for the current compile target and packaging mode,
+/// or `None` if the current `(OS, ARCH)` is not among the 7 official desktop targets.
+pub fn current_update_platform_key_opt(is_portable: bool) -> Option<&'static str> {
+    update_platform_key_for_opt(std::env::consts::OS, std::env::consts::ARCH, is_portable)
+}
+
+/// Map an explicit `(os, arch, is_portable)` target description to the `latest.json`
+/// platform key emitted by `scripts/release/build_latest_json.mjs`.
+///
+/// Compatibility wrapper over `update_platform_key_for_opt` falling back to `"linux-x86_64"`.
+pub fn update_platform_key_for(os: &str, arch: &str, is_portable: bool) -> &'static str {
+    update_platform_key_for_opt(os, arch, is_portable).unwrap_or("linux-x86_64")
+}
+
+/// Return the `latest.json` platform key for the current compile target and packaging mode.
+///
+/// Compatibility wrapper over `current_update_platform_key_opt` falling back to `"linux-x86_64"`.
+pub fn current_update_platform_key(is_portable: bool) -> &'static str {
+    current_update_platform_key_opt(is_portable).unwrap_or("linux-x86_64")
 }
 
 /// Parse and validate `latest.json` (verifies SemVer != `0.0.0` and validates every URL against allowlist).
@@ -918,6 +986,20 @@ pub struct PortableApplyOutcome {
     pub old_exe_backup_path: Option<PathBuf>,
 }
 
+impl PortableApplyOutcome {
+    pub fn no_pending() -> Self {
+        Self {
+            applied: false,
+            from_version: String::new(),
+            to_version: String::new(),
+            files_updated: 0,
+            needs_post_update_cleanup_relaunch: false,
+            relaunch_args: Vec::new(),
+            old_exe_backup_path: None,
+        }
+    }
+}
+
 /// Verify an update ZIP archive's SHA256, validate SemVer, safely extract it into
 /// `staging_dir/payload/`, strip any preserved user data paths, and atomically write
 /// `staging_dir/pending_apply.json` for next-launch application.
@@ -987,8 +1069,121 @@ pub fn stage_verified_archive(
     Ok(metadata)
 }
 
+fn read_metadata_file_bounded(path: &Path) -> CatResult<Vec<u8>> {
+    let file = File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CatError::NotFound(format!("update metadata file not found: {}", path.display()))
+        } else {
+            CatError::Io(e)
+        }
+    })?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(CatError::Validation(format!(
+            "update metadata path is not a file: {}",
+            path.display()
+        )));
+    }
+    if meta.len() > MAX_METADATA_BYTES as u64 {
+        return Err(CatError::Security(format!(
+            "update metadata file `{}` exceeds {MAX_METADATA_BYTES} byte limit",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+    let mut limited = file.take(MAX_METADATA_BYTES as u64 + 1);
+    limited.read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_METADATA_BYTES {
+        return Err(CatError::Security(format!(
+            "update metadata file `{}` exceeded {MAX_METADATA_BYTES} byte limit",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+/// Strictly verify the integrity of a staged portable update inside `staging_dir`.
+///
+/// Validates:
+/// - `pending_apply.json` exists, is within `MAX_METADATA_BYTES`, and parses cleanly
+/// - `target_version` is a valid non-zero SemVer and `files` is non-empty
+/// - `staging_dir/payload/` exists as a directory
+/// - Every declared relative path is safe, non-preserved, non-duplicate, non-symlink,
+///   exists under `payload/`, and matches its recorded SHA-256 digest.
+pub fn verify_staged_payload_integrity(staging_dir: &Path) -> CatResult<PendingUpdateMetadata> {
+    let manifest_path = staging_dir.join(PENDING_APPLY_MANIFEST);
+    let manifest_bytes = read_metadata_file_bounded(&manifest_path)?;
+    let pending: PendingUpdateMetadata = serde_json::from_slice(&manifest_bytes)?;
+    let parsed_ver = parse_semver(&pending.target_version)?;
+    if parsed_ver.is_zero_core() {
+        return Err(CatError::Validation(format!(
+            "staged target version 0.0.0 is rejected: '{}'",
+            pending.target_version
+        )));
+    }
+    if pending.files.is_empty() {
+        return Err(CatError::Validation(
+            "pending_apply.json contains no files to apply".into(),
+        ));
+    }
+
+    let payload_dir = staging_dir.join(STAGING_PAYLOAD_DIR);
+    if !payload_dir.is_dir() {
+        return Err(CatError::Validation(format!(
+            "staged update payload directory missing: {}",
+            payload_dir.display()
+        )));
+    }
+    let canonical_payload =
+        std::fs::canonicalize(&payload_dir).unwrap_or_else(|_| payload_dir.clone());
+
+    let mut seen_rel: HashSet<String> = HashSet::with_capacity(pending.files.len());
+    for entry in &pending.files {
+        let clean_rel = sanitize_and_validate_zip_path(&entry.rel_path)?;
+        if is_preserved_relpath(&clean_rel) {
+            return Err(CatError::Security(format!(
+                "staged update manifest references preserved user path: '{clean_rel}'"
+            )));
+        }
+        if !seen_rel.insert(clean_rel.to_ascii_lowercase()) {
+            return Err(CatError::Security(format!(
+                "duplicate file entry in staged update manifest: '{clean_rel}'"
+            )));
+        }
+
+        let staged_file = canonical_payload.join(rel_posix_to_path(&clean_rel));
+        ensure_within_root(&staged_file, &canonical_payload)?;
+        let sym_meta = std::fs::symlink_metadata(&staged_file).map_err(|_| {
+            CatError::Validation(format!("staged update file missing: '{clean_rel}'"))
+        })?;
+        if sym_meta.file_type().is_symlink() {
+            return Err(CatError::Security(format!(
+                "symlink blocked in staged update payload: '{clean_rel}'"
+            )));
+        }
+        if !sym_meta.is_file() {
+            return Err(CatError::Validation(format!(
+                "staged update file missing: '{clean_rel}'"
+            )));
+        }
+        verify_file_sha256(&staged_file, &entry.sha256)?;
+    }
+
+    Ok(pending)
+}
+
+/// Read-only check for a verified staged portable update inside `staging_dir`.
+///
+/// Returns `Some(PendingUpdateMetadata)` only when `verify_staged_payload_integrity` succeeds
+/// completely; returns `None` if no update is staged or if the staged payload is corrupt.
+pub fn read_pending_staged_update(staging_dir: &Path) -> Option<PendingUpdateMetadata> {
+    verify_staged_payload_integrity(staging_dir).ok()
+}
+
 /// Apply a previously verified & staged portable update at next startup:
-/// 1. Re-verifies every staged file's SHA256 and user-data allowlist before touching `app_root`.
+/// 1. Checks anti-downgrade (`is_newer_version(target, current_version)`) and full staged
+///    SHA256 integrity before touching `app_root`; automatically purges stale or corrupt
+///    `staging_dir` directories to prevent deadlocked "ready" loops.
 /// 2. If the running executable (`current_exe_path`) is among the updated files, performs a
 ///    same-volume rename of the live `.exe` to `backup_dir/<exe>.<old_ver>.old`, then atomically
 ///    renames the staged replacement into place and requests a `--post-update-cleanup` relaunch.
@@ -1006,6 +1201,25 @@ pub fn apply_staged_portable_update(
         current_exe_path,
         staging_dir,
         backup_dir,
+        env!("CARGO_PKG_VERSION"),
+        None,
+    )
+}
+
+/// Apply a staged portable update evaluated against an explicit `current_version`.
+pub fn apply_staged_portable_update_for_version(
+    app_root: &Path,
+    current_exe_path: &Path,
+    staging_dir: &Path,
+    backup_dir: &Path,
+    current_version: &str,
+) -> CatResult<PortableApplyOutcome> {
+    apply_staged_portable_update_internal(
+        app_root,
+        current_exe_path,
+        staging_dir,
+        backup_dir,
+        current_version,
         None,
     )
 }
@@ -1062,31 +1276,78 @@ fn apply_staged_portable_update_internal(
     current_exe_path: &Path,
     staging_dir: &Path,
     backup_dir: &Path,
+    current_version: &str,
     fault_hook: Option<FaultHook<'_>>,
 ) -> CatResult<PortableApplyOutcome> {
     let manifest_path = staging_dir.join(PENDING_APPLY_MANIFEST);
     if !manifest_path.is_file() {
-        return Ok(PortableApplyOutcome {
-            applied: false,
-            from_version: String::new(),
-            to_version: String::new(),
-            files_updated: 0,
-            needs_post_update_cleanup_relaunch: false,
-            relaunch_args: Vec::new(),
-            old_exe_backup_path: None,
-        });
+        return Ok(PortableApplyOutcome::no_pending());
     }
 
-    let manifest_bytes = std::fs::read(&manifest_path)?;
-    let pending: PendingUpdateMetadata = serde_json::from_slice(&manifest_bytes)?;
+    let manifest_bytes = match read_metadata_file_bounded(&manifest_path) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!(
+                staging_dir = %staging_dir.display(),
+                "removing unreadable staged update directory: {err}"
+            );
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return Err(err);
+        }
+    };
+    let parsed_pending: PendingUpdateMetadata = match serde_json::from_slice(&manifest_bytes) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(
+                staging_dir = %staging_dir.display(),
+                "removing corrupt staged update manifest: {err}"
+            );
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return Err(CatError::Json(err));
+        }
+    };
+
+    // Pre-flight step 1: enforce anti-downgrade before touching any payload or app file.
+    match is_newer_version(&parsed_pending.target_version, current_version) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(
+                current_version = %current_version,
+                staged_version = %parsed_pending.target_version,
+                staging_dir = %staging_dir.display(),
+                "staged portable update is not newer than current version; cleaning up stale staging dir"
+            );
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return Ok(PortableApplyOutcome::no_pending());
+        }
+        Err(err) => {
+            tracing::warn!(
+                current_version = %current_version,
+                staged_version = %parsed_pending.target_version,
+                staging_dir = %staging_dir.display(),
+                "staged portable update has invalid version; cleaning up staging dir: {err}"
+            );
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return Err(err);
+        }
+    }
+
+    // Pre-flight step 2: verify full staged payload existence, paths, and SHA-256 digests.
+    // On any missing file or checksum mismatch, remove `staging_dir` so startup/UI never
+    // deadlocks in a false "ready" state.
+    let pending = match verify_staged_payload_integrity(staging_dir) {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(
+                staging_dir = %staging_dir.display(),
+                "staged portable update integrity check failed; removing corrupt staging dir: {err}"
+            );
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return Err(err);
+        }
+    };
+
     let payload_dir = staging_dir.join(STAGING_PAYLOAD_DIR);
-
-    if pending.files.is_empty() {
-        return Err(CatError::Validation(
-            "pending_apply.json contains no files to apply".into(),
-        ));
-    }
-
     std::fs::create_dir_all(app_root)?;
     let canonical_root = std::fs::canonicalize(app_root).unwrap_or_else(|_| app_root.to_path_buf());
     let canonical_payload =
@@ -1094,22 +1355,13 @@ fn apply_staged_portable_update_internal(
     let canonical_exe = std::fs::canonicalize(current_exe_path)
         .unwrap_or_else(|_| current_exe_path.to_path_buf());
 
-    // Pre-flight verification: validate every staged file's path, allowlist, SHA256, and target collision.
+    // Pre-flight step 3: verify target destinations inside `app_root` for directory collisions.
     let mut applicable: Vec<&StagedFileEntry> = Vec::with_capacity(pending.files.len());
     for entry in &pending.files {
         let clean_rel = sanitize_and_validate_zip_path(&entry.rel_path)?;
         if is_preserved_relpath(&clean_rel) {
             continue;
         }
-        let staged_file = canonical_payload.join(rel_posix_to_path(&clean_rel));
-        ensure_within_root(&staged_file, &canonical_payload)?;
-        if !staged_file.is_file() {
-            return Err(CatError::Validation(format!(
-                "staged update file missing: '{clean_rel}'"
-            )));
-        }
-        verify_file_sha256(&staged_file, &entry.sha256)?;
-
         let dst_file = canonical_root.join(rel_posix_to_path(&clean_rel));
         ensure_within_root(&dst_file, &canonical_root)?;
         if dst_file.is_dir() {
@@ -1121,6 +1373,7 @@ fn apply_staged_portable_update_internal(
     }
 
     if applicable.is_empty() {
+        let _ = std::fs::remove_dir_all(staging_dir);
         return Err(CatError::Validation(
             "no applicable files remain after safety verification".into(),
         ));
@@ -1452,6 +1705,69 @@ fn copy_atomic_replace(src: &Path, dst: &Path) -> CatResult<()> {
 // High-level async Updater facade (GitHub Releases latest.json + SHA256SUMS)
 // ============================================================================
 
+/// Validate that `raw` is a clean GitHub repository slug in strict `owner/repo` format
+/// with two non-empty segments, zero whitespace/control characters, and no path traversal.
+pub fn validate_github_repo_slug(raw: &str) -> CatResult<String> {
+    if raw.chars().any(|c| c.is_control()) {
+        return Err(CatError::Validation(
+            "GitHub repository slug contains control characters".into(),
+        ));
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace()) {
+        return Err(CatError::Validation(format!(
+            "invalid GitHub repository slug '{raw}': expected `owner/repo` without whitespace"
+        )));
+    }
+    if trimmed.starts_with('/') || trimmed.ends_with('/') || trimmed.contains('\\') {
+        return Err(CatError::Validation(format!(
+            "invalid GitHub repository slug '{raw}': expected `owner/repo`"
+        )));
+    }
+    let mut parts = trimmed.split('/');
+    let Some(owner) = parts.next() else {
+        return Err(CatError::Validation(format!(
+            "invalid GitHub repository slug '{raw}': missing owner"
+        )));
+    };
+    let Some(repo) = parts.next() else {
+        return Err(CatError::Validation(format!(
+            "invalid GitHub repository slug '{raw}': expected `owner/repo`"
+        )));
+    };
+    if parts.next().is_some() {
+        return Err(CatError::Validation(format!(
+            "invalid GitHub repository slug '{raw}': too many path segments"
+        )));
+    }
+    if owner.is_empty()
+        || owner.len() > 39
+        || owner.starts_with('-')
+        || owner.ends_with('-')
+        || !owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(CatError::Validation(format!(
+            "invalid GitHub repository owner '{owner}' in '{raw}'"
+        )));
+    }
+    if repo.is_empty()
+        || repo.len() > 100
+        || repo == "."
+        || repo == ".."
+        || repo.contains("..")
+        || !repo
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        return Err(CatError::Validation(format!(
+            "invalid GitHub repository name '{repo}' in '{raw}'"
+        )));
+    }
+    Ok(format!("{owner}/{repo}"))
+}
+
 #[derive(Debug, Clone)]
 pub struct Updater {
     repo: String,
@@ -1462,13 +1778,15 @@ pub struct Updater {
 
 impl Updater {
     pub fn new(repo: impl Into<String>, current_version: impl Into<String>) -> CatResult<Self> {
+        let raw_repo = repo.into();
+        let validated_repo = validate_github_repo_slug(&raw_repo)?;
         let client = build_safe_http_client(METADATA_REQUEST_TIMEOUT)?;
         let download_client = build_safe_http_client_with_timeouts(
             PACKAGE_CONNECT_TIMEOUT,
             PACKAGE_DOWNLOAD_TIMEOUT,
         )?;
         Ok(Self {
-            repo: repo.into(),
+            repo: validated_repo,
             current_version: current_version.into(),
             client,
             download_client,
@@ -1880,6 +2198,7 @@ mod tests {
             &exe_path,
             &staging_dir,
             &backup_dir,
+            "0.1.0",
             Some(&hook),
         );
         assert!(res.is_err(), "I/O failure must trigger rollback");
@@ -1959,6 +2278,10 @@ mod tests {
         let err = apply_staged_portable_update(&app_root, &exe_path, &staging_dir, &backup_dir);
         assert!(err.is_err());
         assert_eq!(std::fs::read(&exe_path).unwrap(), b"ORIGINAL_EXE");
+        assert!(
+            !staging_dir.exists(),
+            "corrupt staging_dir must be automatically removed to break false-ready deadlock"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -2018,5 +2341,320 @@ mod tests {
         assert!(!leftover_swap, "swap_bak file must be removed after replace");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn platform_keys_pending_staging_and_full_12_platform_manifest_verification() {
+        // 1. Platform key mapping aligns strictly with scripts/release/build_latest_json.mjs.
+        assert_eq!(
+            update_platform_key_for("windows", "x86_64", true),
+            "windows-x86_64-portable"
+        );
+        assert_eq!(
+            update_platform_key_for("windows", "x86_64", false),
+            "windows-x86_64"
+        );
+        assert_eq!(
+            update_platform_key_for("windows", "aarch64", true),
+            "windows-aarch64-portable"
+        );
+        assert_eq!(
+            update_platform_key_for("windows", "aarch64", false),
+            "windows-aarch64"
+        );
+        assert_eq!(
+            update_platform_key_for("macos", "aarch64", false),
+            "darwin-aarch64"
+        );
+        assert_eq!(
+            update_platform_key_for("macos", "x86_64", false),
+            "darwin-x86_64"
+        );
+        assert_eq!(
+            update_platform_key_for("linux", "x86_64", false),
+            "linux-x86_64"
+        );
+
+        // 2. Realistic 12-platform latest.json + 18-line SHA256SUMS.txt cross-verification.
+        let version = "0.2.0";
+        let base_url = format!("https://github.com/JuryBu/CatCloud/releases/download/v{version}");
+        let platform_assets: [(&str, &str); 12] = [
+            (
+                "windows-x86_64-portable",
+                "CatCloud-0.2.0-windows-x64-portable.zip",
+            ),
+            (
+                "windows-aarch64-portable",
+                "CatCloud-0.2.0-windows-arm64-portable.zip",
+            ),
+            ("windows-x86_64", "CatCloud-0.2.0-windows-x64-setup.exe"),
+            ("windows-aarch64", "CatCloud-0.2.0-windows-arm64-setup.exe"),
+            ("darwin-aarch64", "CatCloud-0.2.0-macos-aarch64.app.tar.gz"),
+            ("darwin-x86_64", "CatCloud-0.2.0-macos-x64.app.tar.gz"),
+            (
+                "linux-x86_64",
+                "CatCloud-0.2.0-linux-x86_64.AppImage.tar.gz",
+            ),
+            ("windows-x86_64-cli", "catcloud-windows-x86_64.zip"),
+            ("windows-aarch64-cli", "catcloud-windows-aarch64.zip"),
+            ("darwin-aarch64-cli", "catcloud-macos-aarch64.tar.gz"),
+            ("darwin-x86_64-cli", "catcloud-macos-x86_64.tar.gz"),
+            ("linux-x86_64-cli", "catcloud-linux-x86_64.tar.gz"),
+        ];
+        let extra_release_assets: [&str; 6] = [
+            "CatCloud-0.2.0-windows-x64.msi",
+            "CatCloud-0.2.0-windows-arm64.msi",
+            "CatCloud-0.2.0-macos-aarch64.dmg",
+            "CatCloud-0.2.0-macos-x64.dmg",
+            "CatCloud-0.2.0-linux-x86_64.AppImage",
+            "CatCloud-0.2.0-linux-x86_64.deb",
+        ];
+
+        let mut platforms_json = serde_json::Map::new();
+        let mut sums_lines: Vec<String> = Vec::with_capacity(18);
+        let mut expected_by_platform: HashMap<&str, String> = HashMap::new();
+
+        for (idx, (plat_key, filename)) in platform_assets.iter().enumerate() {
+            let sha = compute_sha256_hex(format!("artifact:{plat_key}:{filename}").as_bytes());
+            expected_by_platform.insert(*plat_key, sha.clone());
+            if idx % 2 == 0 {
+                sums_lines.push(format!("{sha}  {filename}"));
+            } else {
+                sums_lines.push(format!("{sha}  release-assets/{filename}"));
+            }
+            platforms_json.insert(
+                (*plat_key).to_string(),
+                serde_json::json!({
+                    "url": format!("{base_url}/{filename}"),
+                    "sha256": sha,
+                    "filename": filename,
+                }),
+            );
+        }
+        for extra in extra_release_assets {
+            let sha = compute_sha256_hex(format!("extra:{extra}").as_bytes());
+            sums_lines.push(format!("{sha}  {extra}"));
+        }
+        assert_eq!(sums_lines.len(), 18);
+
+        let latest_json = serde_json::json!({
+            "version": version,
+            "notes": "CatCloud v0.2.0 multi-platform release",
+            "pub_date": "2026-11-24T00:00:00Z",
+            "sha256sums_url": format!("{base_url}/SHA256SUMS.txt"),
+            "platforms": serde_json::Value::Object(platforms_json),
+        });
+        let latest_bytes = serde_json::to_vec_pretty(&latest_json).unwrap();
+        let sums_txt = sums_lines.join("\n");
+
+        let manifest = parse_latest_manifest(&latest_bytes).expect("parse 12-platform latest.json");
+        assert_eq!(manifest.version, version);
+        assert_eq!(manifest.platforms.len(), 12);
+
+        let sums_map = parse_sha256sums(&sums_txt).expect("parse 18-line SHA256SUMS.txt");
+        assert_eq!(sums_map.len(), 18);
+
+        for (plat_key, _) in &platform_assets {
+            let asset = manifest
+                .platforms
+                .get(*plat_key)
+                .unwrap_or_else(|| panic!("missing platform key {plat_key}"));
+            let resolved = resolve_asset_sha256(asset, Some(&sums_map))
+                .unwrap_or_else(|e| panic!("resolve sha256 failed for {plat_key}: {e}"));
+            assert_eq!(resolved, expected_by_platform[*plat_key]);
+        }
+
+        // Current target platform keys must be covered by the 12-platform manifest.
+        assert!(
+            manifest
+                .platforms
+                .contains_key(current_update_platform_key(true))
+        );
+        assert!(
+            manifest
+                .platforms
+                .contains_key(current_update_platform_key(false))
+        );
+
+        // 3. `read_pending_staged_update` validates pending_apply.json + payload/ existence.
+        let tmp = make_temp_dir("read-pending");
+        let staging_dir = tmp.join(".update_staging");
+        assert!(read_pending_staged_update(&staging_dir).is_none());
+
+        let zip_bytes = build_zip(&[
+            ("CatCloud-0.2.0/CatCloud.exe", b"NEW_EXE_V020", None),
+            ("CatCloud-0.2.0/version.json", br#"{"version":"0.2.0"}"#, None),
+        ]);
+        let zip_hash = compute_sha256_hex(&zip_bytes);
+        stage_verified_archive(&zip_bytes, &zip_hash, "0.1.0", "0.2.0", &staging_dir)
+            .expect("stage archive");
+
+        let pending = read_pending_staged_update(&staging_dir)
+            .expect("pending staged update should be detected");
+        assert_eq!(pending.target_version, "0.2.0");
+        assert_eq!(pending.archive_sha256, zip_hash);
+        assert_eq!(pending.files.len(), 2);
+
+        std::fs::remove_dir_all(staging_dir.join(STAGING_PAYLOAD_DIR)).unwrap();
+        assert!(read_pending_staged_update(&staging_dir).is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn platform_key_opt_only_accepts_seven_official_desktop_targets() {
+        assert_eq!(
+            update_platform_key_for_opt("windows", "x86_64", true),
+            Some("windows-x86_64-portable")
+        );
+        assert_eq!(
+            update_platform_key_for_opt("windows", "x86_64", false),
+            Some("windows-x86_64")
+        );
+        assert_eq!(
+            update_platform_key_for_opt("windows", "aarch64", true),
+            Some("windows-aarch64-portable")
+        );
+        assert_eq!(
+            update_platform_key_for_opt("windows", "aarch64", false),
+            Some("windows-aarch64")
+        );
+        assert_eq!(
+            update_platform_key_for_opt("macos", "aarch64", false),
+            Some("darwin-aarch64")
+        );
+        assert_eq!(
+            update_platform_key_for_opt("macos", "x86_64", false),
+            Some("darwin-x86_64")
+        );
+        assert_eq!(
+            update_platform_key_for_opt("linux", "x86_64", false),
+            Some("linux-x86_64")
+        );
+
+        // Unsupported OS/arch combinations must return None (never silently misroute).
+        assert_eq!(update_platform_key_for_opt("linux", "aarch64", false), None);
+        assert_eq!(update_platform_key_for_opt("windows", "x86", true), None);
+        assert_eq!(update_platform_key_for_opt("freebsd", "x86_64", false), None);
+    }
+
+    #[test]
+    fn channel_update_availability_filters_prereleases_unless_opted_in() {
+        // Stable-only channel skips prereleases even when core version is higher.
+        assert!(!is_update_available_for_channel("0.2.0-rc.1", "0.1.0", false).unwrap());
+        assert!(!is_update_available_for_channel("v1.0.0-beta.2", "0.9.0", false).unwrap());
+        assert!(is_update_available_for_channel("0.2.0", "0.1.0", false).unwrap());
+        assert!(is_update_available_for_channel("0.2.0+build-1", "0.1.0", false).unwrap());
+
+        // Prerelease opt-in channel allows newer prereleases while still rejecting downgrades.
+        assert!(is_update_available_for_channel("0.2.0-rc.1", "0.1.0", true).unwrap());
+        assert!(!is_update_available_for_channel("0.1.0-rc.1", "0.1.0", true).unwrap());
+
+        // Invalid or 0.0.0 versions are still strictly rejected.
+        assert!(is_update_available_for_channel("0.0.0-alpha.1", "0.1.0", false).is_err());
+        assert!(is_update_available_for_channel("not-semver", "0.1.0", false).is_err());
+    }
+
+    #[test]
+    fn updater_new_strictly_validates_github_repo_slug() {
+        assert!(Updater::new("JuryBu/CatCloud", "0.1.0").is_ok());
+        assert!(Updater::new("org-1/cat_cloud.rs", "0.1.0").is_ok());
+
+        for bad in [
+            "",
+            "   ",
+            "JuryBu",
+            "JuryBu/",
+            "/CatCloud",
+            "a/b/c",
+            "../evil/repo",
+            "JuryBu/..",
+            "JuryBu/.",
+            "JuryBu/CatCloud?x=1",
+            "JuryBu/CatCloud#frag",
+            "JuryBu/Cat Cloud",
+            "JuryBu/Cat\nCloud",
+            "-bad/repo",
+            "bad-/repo",
+            "https://github.com/JuryBu/CatCloud",
+        ] {
+            assert!(
+                Updater::new(bad, "0.1.0").is_err(),
+                "expected invalid repo slug '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn verify_staged_integrity_and_apply_auto_clean_downgrade_or_missing_payload() {
+        let root = make_temp_dir("integrity-and-downgrade");
+        let app_root = root.join("app");
+        let staging_dir = app_root.join(".update_staging");
+        let backup_dir = app_root.join(".update_backup");
+        std::fs::create_dir_all(&app_root).unwrap();
+
+        let exe_path = app_root.join("CatCloud.exe");
+        std::fs::write(&exe_path, b"CURRENT_V030_EXE").unwrap();
+
+        let zip_bytes = build_zip(&[
+            ("CatCloud.exe", b"STAGED_V020_EXE", None),
+            ("version.json", br#"{"version":"0.2.0"}"#, None),
+        ]);
+        let zip_hash = compute_sha256_hex(&zip_bytes);
+
+        // 1. Healthy staging passes `verify_staged_payload_integrity` and `read_pending_staged_update`.
+        stage_verified_archive(&zip_bytes, &zip_hash, "0.1.0", "0.2.0", &staging_dir).unwrap();
+        assert!(verify_staged_payload_integrity(&staging_dir).is_ok());
+        assert!(read_pending_staged_update(&staging_dir).is_some());
+
+        // 2. Downgrade / same-version staged update (current 0.3.0 vs staged 0.2.0) returns
+        //    NoPending (`applied == false`), leaves current exe untouched, and removes `staging_dir`.
+        let downgrade_outcome = apply_staged_portable_update_for_version(
+            &app_root,
+            &exe_path,
+            &staging_dir,
+            &backup_dir,
+            "0.3.0",
+        )
+        .expect("downgrade staging must safely no-op and clean up");
+        assert!(!downgrade_outcome.applied);
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"CURRENT_V030_EXE");
+        assert!(
+            !staging_dir.exists(),
+            "stale/downgrade staging_dir must be deleted automatically"
+        );
+
+        // Same version (0.2.0 vs 0.2.0) also cleans up safely.
+        stage_verified_archive(&zip_bytes, &zip_hash, "0.1.0", "0.2.0", &staging_dir).unwrap();
+        let same_ver_outcome = apply_staged_portable_update_for_version(
+            &app_root,
+            &exe_path,
+            &staging_dir,
+            &backup_dir,
+            "0.2.0",
+        )
+        .expect("same-version staging must safely no-op and clean up");
+        assert!(!same_ver_outcome.applied);
+        assert!(!staging_dir.exists());
+
+        // 3. Missing payload file fails `verify_staged_payload_integrity`, makes
+        //    `read_pending_staged_update` return `None`, and causes apply to remove `staging_dir`.
+        stage_verified_archive(&zip_bytes, &zip_hash, "0.1.0", "0.2.0", &staging_dir).unwrap();
+        std::fs::remove_file(staging_dir.join(STAGING_PAYLOAD_DIR).join("version.json")).unwrap();
+        assert!(verify_staged_payload_integrity(&staging_dir).is_err());
+        assert!(read_pending_staged_update(&staging_dir).is_none());
+
+        let missing_err = apply_staged_portable_update_for_version(
+            &app_root,
+            &exe_path,
+            &staging_dir,
+            &backup_dir,
+            "0.1.0",
+        );
+        assert!(missing_err.is_err());
+        assert!(!staging_dir.exists());
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"CURRENT_V030_EXE");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

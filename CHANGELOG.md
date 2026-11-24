@@ -16,10 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded conservative domestic direct routing (including Windows/Apple push notification endpoints and domestic CDNs) while keeping overseas & hybrid services strictly proxied.
 - Applied active-node YAML pruning (`>90%` config size reduction in rule mode), `geodata-loader: memconservative`, rolling sanitized file logging, AI diagnostic quick-copy entry, custom frameless titlebar + Portal dropdowns/modals, resizable day/night-synced floating capsule, and ~48% steady-state Mihomo memory reduction.
 
-### Cross-Platform Support (Windows / macOS / Linux)
-- macOS: fixed TUN auto-interface naming (`utun*`), added native App Menu restoring `Cmd+C/V/A`, frameless titlebar traffic-light safe inset, resilient `networksetup` SOCKS & `Empty` bypass handling, LaunchAgent `Aqua` session, and PID-file orphan core cleanup.
+### Cross-Platform Support, Readonly Migration & Auto-Update
+- macOS: fixed TUN auto-interface naming (`utun*`), added native App Menu restoring `Cmd+C/V/A`, frameless titlebar traffic-light safe inset, resilient `networksetup` SOCKS & `Empty` bypass handling, LaunchAgent `Aqua` session, single-context `_EMBED_INFO_PLIST` guard, and PID-file orphan core cleanup.
 - Linux: added dual KDE (`kwriteconfig5`/`kwriteconfig6`) + GNOME system proxy support, `$APPIMAGE` path resolution, least-privilege `pkexec setcap` for TUN (never elevating GUI as root), Wayland/X11 clipboard fallback (`wl-copy` -> `xclip` -> `xsel`), and automatic `+x` execution bits.
-- Windows: fixed UTF-16LE clipboard Chinese encoding; expanded CI test matrix to Ubuntu + macOS 14 + Windows and hardened multi-arch Release workflow.
+- Windows: fixed UTF-16LE clipboard Chinese encoding; expanded CI test matrix to Ubuntu + macOS (`macos-latest`) + Windows and hardened 5-architecture multi-platform Release workflow; added floating capsule four-edge magnetic dock/expand with multi-DPI physical coordinates.
+- Readonly Config Migration: sorted candidate configs by file size descending (capped at 64 files with `16 MiB` bounded reads) so large real subscriptions in busy `profiles/` folders are never truncated by tiny templates; parsed `profiles.yaml` / `profile.yaml` for human-readable `display_name`; expanded open-source client path discovery (`mihomo-party`, `clash-party`, `clash-nyanpasu`, `FlClash`) and added custom directory/file readonly picker with collision-free node ID rebinding.
+- Background Auto-Update Loop: wired end-to-end GitHub Releases `latest.json` + `SHA256SUMS.txt` auto-check and portable ZIP background staging (`next_launch` default) with startup cold-boot delay, mutex serialization, downgrade & corrupt-staging auto-recovery, strict portable-install detection decoupled from `--data-dir`, and secret-free external HTTPS URL launcher.
 
 ## [0.1.0] - 2026-11-23
 

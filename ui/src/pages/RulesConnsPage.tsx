@@ -35,8 +35,12 @@ import {
 import { AppSelect, type AppSelectOption } from "../components/AppSelect";
 import { formatBytes, formatRate } from "../components/TrafficSparkline";
 import { appActions, useAppSelector } from "../store/appStore";
+import { isBoolPref, oneOfPref, usePersistedState } from "../utils/uiPrefs";
 
 type ActiveTab = "rules" | "connections";
+type ConnSortKey = "down" | "up" | "rate" | "age" | "process";
+const ACTIVE_TAB_VALIDATOR = oneOfPref(["rules", "connections"] as const);
+const CONN_SORT_VALIDATOR = oneOfPref(["down", "up", "rate", "age", "process"] as const);
 type RuleLayer = "prepend" | "group" | "append";
 type RuleMatchType =
   | "DOMAIN-SUFFIX"
@@ -616,7 +620,11 @@ export function RulesConnsPage() {
 
   const defaultGroupTarget = groups[0]?.name || "DIRECT";
 
-  const [activeTab, setActiveTab] = useState<ActiveTab>("rules");
+  const [activeTab, setActiveTab] = usePersistedState<ActiveTab>(
+    "rulesconns.activeTab",
+    "rules",
+    ACTIVE_TAB_VALIDATOR
+  );
 
   // --- Tab A: Rules State (hydrated from catcloudApi.getFullConfig) ---
   const [aiPresets, setAiPresets] = useState<AiPresetBundle[]>(() =>
@@ -631,7 +639,11 @@ export function RulesConnsPage() {
   const [savingRules, setSavingRules] = useState<boolean>(false);
   const [ruleSearch, setRuleSearch] = useState<string>("");
   const [ruleLayerFilter, setRuleLayerFilter] = useState<"all" | RuleLayer>("all");
-  const [showYamlPreview, setShowYamlPreview] = useState<boolean>(false);
+  const [showYamlPreview, setShowYamlPreview] = usePersistedState<boolean>(
+    "rulesconns.showYamlPreview",
+    false,
+    isBoolPref
+  );
   const [compiledPreview, setCompiledPreview] = useState<CompiledYamlPreview | null>(null);
   const [loadingPreview, setLoadingPreview] = useState<boolean>(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
@@ -650,9 +662,21 @@ export function RulesConnsPage() {
   );
   const [connSearch, setConnSearch] = useState<string>("");
   const [connGroupFilter, setConnGroupFilter] = useState<string>("all");
-  const [connSort, setConnSort] = useState<"down" | "up" | "rate" | "age" | "process">("down");
-  const [showInnerTunnels, setShowInnerTunnels] = useState<boolean>(false);
-  const [hideLoopback, setHideLoopback] = useState<boolean>(false);
+  const [connSort, setConnSort] = usePersistedState<ConnSortKey>(
+    "rulesconns.connSort",
+    "down",
+    CONN_SORT_VALIDATOR
+  );
+  const [showInnerTunnels, setShowInnerTunnels] = usePersistedState<boolean>(
+    "rulesconns.showInnerTunnels",
+    false,
+    isBoolPref
+  );
+  const [hideLoopback, setHideLoopback] = usePersistedState<boolean>(
+    "rulesconns.hideLoopback",
+    false,
+    isBoolPref
+  );
   const [connPage, setConnPage] = useState<number>(1);
   const [pageJumpInput, setPageJumpInput] = useState<string>("");
   const [connPaused, setConnPaused] = useState<boolean>(false);
@@ -1004,10 +1028,25 @@ export function RulesConnsPage() {
     [compiledPreview]
   );
 
+  const autoLoadedPreviewRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    if (
+      activeTab === "rules" &&
+      showYamlPreview &&
+      !autoLoadedPreviewRef.current &&
+      !compiledPreview
+    ) {
+      autoLoadedPreviewRef.current = true;
+      void loadCompiledPreview();
+    }
+  }, [activeTab, compiledPreview, loadCompiledPreview, showYamlPreview]);
+
   const handleToggleYamlPreview = () => {
     const next = !showYamlPreview;
     setShowYamlPreview(next);
     if (next) {
+      autoLoadedPreviewRef.current = true;
       void loadCompiledPreview();
     }
   };

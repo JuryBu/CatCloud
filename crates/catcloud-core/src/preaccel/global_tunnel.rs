@@ -2551,7 +2551,7 @@ mod tests {
         assert!(!is_physical_nic_descriptor(24, 5, "Software Loopback Interface 1"));
 
         // Process interception scope & anti-loop exclusions
-        let targets: HashSet<String> = ["mihomotag-serv.exe", "ssh.exe"]
+        let targets: HashSet<String> = ["verge-mihomo.exe", "ssh.exe"]
             .into_iter()
             .map(String::from)
             .collect();
@@ -2559,14 +2559,14 @@ mod tests {
 
         assert!(should_intercept_process(
             2000,
-            Some(r"C:\Program Files\Proxy\mihomotag-serv.exe"),
+            Some(r"C:\Program Files\Clash Verge\verge-mihomo.exe"),
             GlobalPreAccelScope::ProxyAppsOnly,
             &targets,
             &excluded
         ));
         assert!(!should_intercept_process(
             1002,
-            Some("mihomotag-serv.exe"),
+            Some("verge-mihomo.exe"),
             GlobalPreAccelScope::AllNon443Tcp,
             &targets,
             &excluded

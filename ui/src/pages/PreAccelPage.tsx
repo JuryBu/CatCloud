@@ -1836,7 +1836,7 @@ export function PreAccelPage() {
               </span>
             </div>
             <p className="mt-1 text-xs leading-relaxed text-[var(--muted)]">
-              不用打开猫猫云梯自己的代理或虚拟网卡，也能从系统底层自动把落云、鲨鱼、夜煞云、TAG、Clash、v2rayN、SSH/SCP 等软件的上传流量送进国内 443 通道。
+              不用打开猫猫云梯自己的代理或虚拟网卡，也能从系统底层自动把 Clash Verge、FlClash、v2rayN、SSH/SCP 等其他代理与终端软件的上传流量送进国内 443 通道。
             </p>
           </div>
 
@@ -2211,7 +2211,7 @@ export function PreAccelPage() {
                     type="text"
                     value={newProcessInput}
                     onChange={(e) => setNewProcessInput(e.target.value)}
-                    placeholder="添加其它梯子或工具进程名（如 mihomotag-serv.exe、scp.exe）"
+                    placeholder="添加其它代理或终端进程名（如 verge-mihomo.exe, xray.exe）"
                     className="cc-mono min-w-[220px] flex-1 rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                   />
                   <button

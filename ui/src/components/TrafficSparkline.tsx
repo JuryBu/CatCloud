@@ -7,6 +7,7 @@ import {
   useLatestTraffic,
   useTrafficVersion,
 } from "../store/appStore";
+import { oneOfPref, usePersistedState } from "../utils/uiPrefs";
 
 export { TrafficRingBuffer };
 
@@ -305,8 +306,16 @@ export function TrafficSparkline({
   const [isVisible, setIsVisible] = useState<boolean>(() =>
     typeof document === "undefined" ? true : document.visibilityState === "visible"
   );
-  const [windowSec, setWindowSec] = useState<TimeWindowSec>(600);
-  const [scaleMode, setScaleMode] = useState<ScaleMode>("linear");
+  const [windowSec, setWindowSec] = usePersistedState<TimeWindowSec>(
+    "home.sparkline.windowSec",
+    600,
+    oneOfPref([120, 600] as const)
+  );
+  const [scaleMode, setScaleMode] = usePersistedState<ScaleMode>(
+    "home.sparkline.scaleMode",
+    "linear",
+    oneOfPref(["linear", "sqrt"] as const)
+  );
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const scratchRef = useRef<SparklineScratch | null>(null);

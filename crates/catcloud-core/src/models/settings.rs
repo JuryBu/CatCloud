@@ -27,19 +27,19 @@ pub const DEFAULT_HOTKEY_TOGGLE_CAPSULE: &str = "Alt+Shift+C";
 /// Default target executable names intercepted by the standalone global domestic :443
 /// pre-acceleration engine when `global_scope == GlobalPreAccelScope::ProxyAppsOnly`.
 pub const DEFAULT_GLOBAL_PREACCEL_PROCESSES: &[&str] = &[
-    "mihomotag-serv.exe",
-    "FlClashCore.exe",
-    "ShaYuCore.exe",
-    "yeshayunCore.exe",
     "verge-mihomo.exe",
-    "clash-meta.exe",
     "mihomo.exe",
+    "FlClashCore.exe",
+    "clash-meta.exe",
+    "clash.exe",
     "xray.exe",
     "sing-box.exe",
     "v2ray.exe",
     "v2rayN.exe",
-    "scp.exe",
+    "hysteria.exe",
+    "tuic-client.exe",
     "ssh.exe",
+    "scp.exe",
     "sftp.exe",
     "rsync.exe",
 ];
@@ -1100,8 +1100,11 @@ mod tests {
         assert!(!cfg.preaccel.global_bypass_enabled);
         assert_eq!(cfg.preaccel.global_scope, GlobalPreAccelScope::ProxyAppsOnly);
         assert!(cfg.preaccel.windivert_dir.is_none());
-        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "mihomotag-serv.exe"));
+        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "verge-mihomo.exe"));
         assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "FlClashCore.exe"));
+        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "clash.exe"));
+        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "hysteria.exe"));
+        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "tuic-client.exe"));
         assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "rsync.exe"));
         assert!(!legacy.preaccel.global_bypass_enabled);
         assert_eq!(legacy.preaccel.global_scope, GlobalPreAccelScope::ProxyAppsOnly);

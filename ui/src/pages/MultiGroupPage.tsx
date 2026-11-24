@@ -51,6 +51,7 @@ import {
   nodeMatchesContinentAndRegion,
   resolveNodeRegionCode,
 } from "../utils/regions";
+import { isBoolPref, oneOfPref, usePersistedState } from "../utils/uiPrefs";
 
 /* ============================================================================
  * Constants & Human-Friendly Presets
@@ -1283,20 +1284,40 @@ export function MultiGroupPage() {
   const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
   const [filterRegion, setFilterRegion] = useState<string>("all");
   const [searchQuery, setSearchQuery] = useState("");
-  const [viewMode, setViewMode] = useState<NodeViewMode>("all");
-  const [sortMode, setSortMode] = useState<NodeSortMode>("default");
+  const [viewMode, setViewMode] = usePersistedState<NodeViewMode>(
+    "multigroup.viewMode",
+    "all",
+    oneOfPref(["all", "members"] as const)
+  );
+  const [sortMode, setSortMode] = usePersistedState<NodeSortMode>(
+    "multigroup.sortMode",
+    "default",
+    oneOfPref(["default", "up_desc", "down_desc", "latency_asc"] as const)
+  );
   const [filterGoogleClean, setFilterGoogleClean] = useState(false);
   const [filterAiReady, setFilterAiReady] = useState(false);
   const [nodePage, setNodePage] = useState(1);
-  const [nodePageSize, setNodePageSize] = useState(24);
+  const [nodePageSize, setNodePageSize] = usePersistedState<number>(
+    "multigroup.pageSize",
+    24,
+    oneOfPref(NODE_PAGE_SIZE_OPTIONS)
+  );
   const [confirmClearMembers, setConfirmClearMembers] = useState(false);
   const [switchingNext, setSwitchingNext] = useState(false);
   const [selectingNodeId, setSelectingNodeId] = useState<string | null>(null);
   const [probingNodeIds, setProbingNodeIds] = useState<Record<string, boolean>>({});
 
   // Right strategy drawer: collapsed by default so node grid gets huge breathing room
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = usePersistedState<boolean>(
+    "multigroup.drawerOpen",
+    false,
+    isBoolPref
+  );
+  const [advancedOpen, setAdvancedOpen] = usePersistedState<boolean>(
+    "multigroup.advancedOpen",
+    false,
+    isBoolPref
+  );
   const [savingGroup, setSavingGroup] = useState(false);
   const [evaluating, setEvaluating] = useState(false);
   const [evalReport, setEvalReport] = useState<GroupEvaluationReport | null>(null);

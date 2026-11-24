@@ -115,6 +115,7 @@ export interface UpdateConfig {
   mode: "next_launch" | "manual" | "auto_restart";
   check_interval_min: number;
   include_prerelease: boolean;
+  auto_download?: boolean;
 }
 
 export interface AppConfig {
@@ -245,6 +246,9 @@ export interface FullAppConfig {
       proxy_mode_global?: string | null;
       proxy_mode_direct?: string | null;
     };
+  };
+  update?: Partial<UpdateConfig> & {
+    last_checked_at?: string | null;
   };
   [key: string]: unknown;
 }
@@ -655,6 +659,7 @@ export interface CompiledYamlPreview {
 export interface MigrationPreviewDto {
   source_kind: string;
   source_path: string | null;
+  display_name?: string | null;
   nodes: ProxyNode[];
   prepend_rules: string[];
   append_rules: string[];
@@ -748,7 +753,22 @@ export interface AppUpdateCheckResult {
   release_url: string;
   notes: string;
   checked_at: string;
+  staged_version?: string | null;
+  platform_key?: string;
+  can_auto_stage?: boolean;
+  download_url?: string | null;
   error?: string | null;
+}
+
+export interface DownloadAndStageUpdateResult {
+  staged: boolean;
+  already_latest?: boolean;
+  can_auto_stage?: boolean;
+  target_version?: string | null;
+  archive_sha256?: string | null;
+  release_url?: string | null;
+  download_url?: string | null;
+  message?: string;
 }
 
 export interface ExportBackupResult {
@@ -809,6 +829,24 @@ async function tauriInvokeOrThrow<T>(
   } catch (err) {
     throw new Error(formatErrorMessage(err));
   }
+}
+
+function extractDialogSinglePath(raw: unknown): string | null {
+  if (typeof raw === "string") {
+    return raw.trim() || null;
+  }
+  if (Array.isArray(raw)) {
+    const first = raw[0];
+    if (typeof first === "string") return first.trim() || null;
+    if (first && typeof first === "object" && "path" in first && typeof first.path === "string") {
+      return first.path.trim() || null;
+    }
+    return null;
+  }
+  if (raw && typeof raw === "object" && "path" in raw && typeof raw.path === "string") {
+    return raw.path.trim() || null;
+  }
+  return null;
 }
 
 async function tauriListen<T>(
@@ -880,6 +918,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     mode: "next_launch",
     check_interval_min: 360,
     include_prerelease: false,
+    auto_download: true,
   },
 };
 
@@ -1301,6 +1340,10 @@ let mockFullConfig: FullAppConfig = {
     block_quic_udp_443: true,
     domestic_direct_enabled: true,
   },
+  update: {
+    ...DEFAULT_APP_CONFIG.update,
+    last_checked_at: null,
+  },
 };
 let mockGroups: MultiGroup[] = structuredClone(MOCK_GROUPS);
 let mockNodes: ProxyNode[] = structuredClone(MOCK_NODES);
@@ -1454,7 +1497,7 @@ function startMockGlobalPreAccel(): void {
     accelerated_processes: useWinDivert
       ? targetSample.length > 0
         ? targetSample
-        : ["mihomotag-serv.exe", "FlClashCore.exe"]
+        : ["verge-mihomo.exe", "FlClashCore.exe"]
       : [],
     active_relays: enabledRelays.map((r) => r.name),
     last_error: null,
@@ -1511,7 +1554,13 @@ export const catcloudApi = {
 
   async saveConfig(next: AppConfig): Promise<AppConfig> {
     if (isTauriEnv()) {
-      const wireConfig: AppConfig = { ...next };
+      const wireConfig: AppConfig = {
+        ...next,
+        update: {
+          ...next.update,
+          auto_download: next.update.auto_download ?? true,
+        },
+      };
       delete wireConfig.behavior;
       return tauriInvokeOrThrow<AppConfig>("save_app_config", { config: wireConfig });
     }
@@ -1574,6 +1623,13 @@ export const catcloudApi = {
               ...(patch.rules_override as RulesOverrideConfig),
             }
           : mockFullConfig.rules_override,
+      update:
+        patch.update && typeof patch.update === "object"
+          ? {
+              ...mockFullConfig.update,
+              ...(patch.update as FullAppConfig["update"]),
+            }
+          : mockFullConfig.update,
     };
     if (patch.preaccel && typeof patch.preaccel === "object") {
       const prePatch = patch.preaccel as Partial<PreAccelConfig>;
@@ -1582,6 +1638,16 @@ export const catcloudApi = {
         preaccel: {
           ...mockConfig.preaccel,
           ...prePatch,
+        },
+      };
+    }
+    if (patch.update && typeof patch.update === "object") {
+      const updPatch = patch.update as Partial<UpdateConfig>;
+      mockConfig = {
+        ...mockConfig,
+        update: {
+          ...mockConfig.update,
+          ...updPatch,
         },
       };
     }
@@ -2533,6 +2599,93 @@ export const catcloudApi = {
     return [];
   },
 
+  async pickMigrationDirectory(
+    title = "选择已有代理软件配置目录（只读，不改动原软件）"
+  ): Promise<string | null> {
+    if (!isTauriEnv()) {
+      return null;
+    }
+    const raw = await tauriInvokeOrThrow<unknown>("plugin:dialog|open", {
+      options: {
+        directory: true,
+        multiple: false,
+        title,
+      },
+    });
+    return extractDialogSinglePath(raw);
+  },
+
+  async pickMigrationFile(
+    title = "选择代理配置文件（只读，不改动原文件）"
+  ): Promise<string | null> {
+    if (!isTauriEnv()) {
+      return null;
+    }
+    const raw = await tauriInvokeOrThrow<unknown>("plugin:dialog|open", {
+      options: {
+        directory: false,
+        multiple: false,
+        title,
+        filters: [
+          {
+            name: "代理配置文件",
+            extensions: ["yaml", "yml", "json", "txt"],
+          },
+        ],
+      },
+    });
+    return extractDialogSinglePath(raw);
+  },
+
+  async scanMigrationPath(path: string): Promise<MigrationPreviewDto[]> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<MigrationPreviewDto[]>("scan_migration_path", { path });
+    }
+    const cleanPath = path.trim() || "C:\\Users\\<USER>\\Desktop\\demo-profiles\\custom.yaml";
+    const segs = cleanPath.split(/[/\\]/).filter(Boolean);
+    const folderLabel = segs[segs.length - 1] || "自定义配置";
+    return [
+      {
+        source_kind: "local_file",
+        source_path: cleanPath,
+        display_name: `自定义目录 · ${folderLabel}`,
+        nodes: [
+          {
+            id: "mig-custom-jp-01",
+            sub_id: "sub-mig-custom",
+            name: "JP-Tokyo-Custom · 1x",
+            protocol: "vless",
+            server: "203.0.113.91",
+            port: 443,
+            region_code: "JP",
+            multiplier: 1.0,
+            is_443_native: true,
+            preaccel_override: null,
+            tags: ["migrated", "native-443"],
+            enabled: true,
+          },
+          {
+            id: "mig-custom-sg-02",
+            sub_id: "sub-mig-custom",
+            name: "SG-Edge-Custom · 1.5x",
+            protocol: "trojan",
+            server: "198.51.100.92",
+            port: 8443,
+            region_code: "SG",
+            multiplier: 1.5,
+            is_443_native: false,
+            preaccel_override: null,
+            tags: ["migrated"],
+            enabled: true,
+          },
+        ],
+        prepend_rules: ["DOMAIN-SUFFIX,campus.example.invalid,DIRECT"],
+        append_rules: [],
+        warnings: ["浏览器预览模式：展示自定义目录只读扫描的模拟结果"],
+      },
+    ];
+  },
+
   async previewMigrationFromText(
     name: string,
     rawYaml: string
@@ -2678,6 +2831,14 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<AppUpdateCheckResult>("check_app_update");
     }
+    const os = detectNavigatorOs();
+    const platformKey =
+      os === "macos"
+        ? "darwin-aarch64"
+        : os === "linux"
+          ? "linux-x86_64"
+          : "windows-x86_64-portable";
+    const canAutoStage = os === "windows" && mockRuntime.portable_mode;
     return {
       has_update: false,
       current_version: mockRuntime.app_version,
@@ -2685,6 +2846,41 @@ export const catcloudApi = {
       release_url: `https://github.com/${mockConfig.update.repo}/releases`,
       notes: "",
       checked_at: new Date().toISOString(),
+      staged_version: null,
+      platform_key: platformKey,
+      can_auto_stage: canAutoStage,
+      download_url: null,
+    };
+  },
+
+  async downloadAndStageUpdate(): Promise<DownloadAndStageUpdateResult> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<DownloadAndStageUpdateResult>("download_and_stage_update");
+    }
+    const os = detectNavigatorOs();
+    const canAutoStage = os === "windows" && mockRuntime.portable_mode;
+    const releaseUrl = `https://github.com/${mockConfig.update.repo}/releases`;
+    if (!canAutoStage) {
+      return {
+        staged: false,
+        already_latest: false,
+        can_auto_stage: false,
+        target_version: mockRuntime.app_version,
+        archive_sha256: null,
+        release_url: releaseUrl,
+        download_url: releaseUrl,
+        message: "浏览器预览模式：当前平台为安装包形态，请前往官方下载页获取对应系统安装包",
+      };
+    }
+    return {
+      staged: true,
+      already_latest: false,
+      can_auto_stage: true,
+      target_version: mockRuntime.app_version,
+      archive_sha256: "preview-sha256-verified",
+      release_url: releaseUrl,
+      download_url: `${releaseUrl}/latest`,
+      message: `浏览器预览模式：已模拟下载并校验 v${mockRuntime.app_version}（下次重启自动应用）`,
     };
   },
 
@@ -2748,6 +2944,20 @@ export const catcloudApi = {
       return tauriInvokeOrThrow<string>("open_web_ui", { url });
     }
     return url ?? `http://127.0.0.1:${mockConfig.controller_port}/ui`;
+  },
+
+  async openExternalUrl(url: string): Promise<string> {
+    const trimmed = url.trim();
+    if (!trimmed) {
+      throw new Error("外部链接不能为空");
+    }
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<string>("open_external_url", { url: trimmed });
+    }
+    if (typeof window !== "undefined") {
+      window.open(trimmed, "_blank", "noopener,noreferrer");
+    }
+    return trimmed;
   },
 
   async getTrafficHistory(): Promise<TrafficSample[]> {

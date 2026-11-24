@@ -114,7 +114,7 @@ export function ContinentRegionFilter({
     );
   }
 
-  // variant === "pills": TAGv2-inspired two-tier continent -> country pills
+  // variant === "pills": 通用分洲分组标准两级「大洲 -> 国家/地区」筛选胶囊
   const countryPills = continent === "all" ? [] : stats.regionsByContinent[continent] ?? [];
 
   return (

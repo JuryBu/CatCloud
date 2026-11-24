@@ -916,6 +916,27 @@ function handleStorageSync(ev: StorageEvent): void {
   }
 }
 
+function mergeIncomingAppConfig(
+  incoming: AppConfig,
+  prev: AppConfig,
+  fallbackAutoDownload?: boolean
+): AppConfig {
+  const autoDownload =
+    typeof incoming.update?.auto_download === "boolean"
+      ? incoming.update.auto_download
+      : typeof fallbackAutoDownload === "boolean"
+        ? fallbackAutoDownload
+        : (prev.update.auto_download ?? true);
+  return {
+    ...incoming,
+    behavior: incoming.behavior ?? prev.behavior,
+    update: {
+      ...incoming.update,
+      auto_download: autoDownload,
+    },
+  };
+}
+
 async function hydrateFromBackend(): Promise<void> {
   const inDesktop = isTauriEnv();
   // Never fire outbound network requests (exit IP / site checks) on startup in desktop mode
@@ -949,6 +970,13 @@ async function hydrateFromBackend(): Promise<void> {
   ] = results;
 
   const cfg = cfgRes.status === "fulfilled" ? cfgRes.value : state.config;
+  const hydratedAutoDownload =
+    typeof cfg.update?.auto_download === "boolean"
+      ? cfg.update.auto_download
+      : fullCfgRes.status === "fulfilled" &&
+          typeof fullCfgRes.value?.update?.auto_download === "boolean"
+        ? fullCfgRes.value.update.auto_download
+        : (state.config.update.auto_download ?? true);
   const hydratedMinimizeToTray =
     fullCfgRes.status === "fulfilled" &&
     fullCfgRes.value?.behavior?.minimize_to_tray_on_close !== undefined
@@ -963,12 +991,20 @@ async function hydrateFromBackend(): Promise<void> {
           ...cfg.behavior,
           minimize_to_tray_on_close: hydratedMinimizeToTray,
         },
+        update: {
+          ...cfg.update,
+          auto_download: hydratedAutoDownload,
+        },
       }
     : {
         ...cfg,
         behavior: {
           ...cfg.behavior,
           minimize_to_tray_on_close: hydratedMinimizeToTray,
+        },
+        update: {
+          ...cfg.update,
+          auto_download: hydratedAutoDownload,
         },
         personalization: {
           ...cfg.personalization,
@@ -1248,10 +1284,7 @@ export const appStore = {
     });
 
     disposeConfigUpdate = catcloudApi.subscribeConfigUpdate((incomingCfg) => {
-      const mergedConfig: AppConfig = {
-        ...incomingCfg,
-        behavior: incomingCfg.behavior ?? state.config.behavior,
-      };
+      const mergedConfig = mergeIncomingAppConfig(incomingCfg, state.config);
       const resolved = resolveThemeBySchedule(
         mergedConfig.personalization.theme_mode,
         mergedConfig.personalization.theme_schedule
@@ -1523,12 +1556,7 @@ export const appActions = {
     applyPersonalizationToDom(resolved, nextConfig.personalization, state.windowMode);
     setState((prev) => ({
       ...prev,
-      config:
-        nextConfig.behavior !== undefined
-          ? nextConfig
-          : prev.config.behavior !== undefined
-            ? { ...nextConfig, behavior: prev.config.behavior }
-            : nextConfig,
+      config: mergeIncomingAppConfig(nextConfig, prev.config),
       resolvedTheme: resolved,
     }));
   },
@@ -1620,10 +1648,7 @@ export const appActions = {
 
       const nextCfg: AppConfig =
         cfgRes.status === "fulfilled"
-          ? {
-              ...cfgRes.value,
-              behavior: cfgRes.value.behavior ?? state.config.behavior,
-            }
+          ? mergeIncomingAppConfig(cfgRes.value, state.config)
           : {
               ...state.config,
               preaccel: {
@@ -1741,10 +1766,7 @@ export const appActions = {
 
       const nextCfg: AppConfig =
         cfgRes.status === "fulfilled"
-          ? {
-              ...cfgRes.value,
-              behavior: cfgRes.value.behavior ?? state.config.behavior,
-            }
+          ? mergeIncomingAppConfig(cfgRes.value, state.config)
           : {
               ...state.config,
               preaccel: {
@@ -1822,10 +1844,7 @@ export const appActions = {
         ...prev,
         config:
           cfgRes.status === "fulfilled"
-            ? {
-                ...cfgRes.value,
-                behavior: cfgRes.value.behavior ?? prev.config.behavior,
-              }
+            ? mergeIncomingAppConfig(cfgRes.value, prev.config)
             : {
                 ...prev.config,
                 preaccel: {
@@ -1977,12 +1996,7 @@ export const appActions = {
       applyPersonalizationToDom(savedResolved, saved.personalization, state.windowMode);
       setState((prev) => ({
         ...prev,
-        config:
-          saved.behavior !== undefined
-            ? saved
-            : prev.config.behavior !== undefined
-              ? { ...saved, behavior: prev.config.behavior }
-              : saved,
+        config: mergeIncomingAppConfig(saved, prev.config),
         resolvedTheme: savedResolved,
       }));
       if (notice) pushToast(notice, "info");
@@ -2255,7 +2269,7 @@ export const appActions = {
             ...prev,
             config:
               cfgRes.status === "fulfilled"
-                ? { ...cfgRes.value, behavior: cfgRes.value.behavior ?? prev.config.behavior }
+                ? mergeIncomingAppConfig(cfgRes.value, prev.config)
                 : prev.config,
             runtime: rtRes.status === "fulfilled" ? rtRes.value : prev.runtime,
             tunAdminPromptOpen: false,

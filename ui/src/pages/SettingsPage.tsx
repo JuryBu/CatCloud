@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import {
   type AppConfig,
+  type AppUpdateCheckResult,
   type FullAppConfig,
   type GeoDataFileStatus,
   type GeoDataStatusDto,
@@ -62,6 +63,13 @@ import {
   defaultShellForOs,
   resolvePlatformOs,
 } from "../utils/platform";
+import {
+  isBoolPref,
+  oneOfPref,
+  readUiPref,
+  usePersistedState,
+  writeUiPref,
+} from "../utils/uiPrefs";
 
 type SettingsTabId = "system" | "appearance" | "dns" | "core" | "updates";
 type LogLevel = "silent" | "error" | "warning" | "info" | "debug";
@@ -374,6 +382,12 @@ const AGENT_DOCS = [
   },
 ] as const;
 
+type AgentDocId = (typeof AGENT_DOCS)[number]["id"];
+const SHELL_ENV_VALIDATOR = oneOfPref(["powershell", "cmd", "bash", "zsh", "fish"] as const);
+const WEB_UI_IDX_VALIDATOR = (raw: unknown): number | undefined =>
+  typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : undefined;
+const AGENT_DOC_ID_VALIDATOR = oneOfPref(AGENT_DOCS.map((d) => d.id) as readonly AgentDocId[]);
+
 const CLI_SNIPPETS = [
   { cmd: "catcloud status --json", desc: "查看核心运行状态、当前节点与端口" },
   { cmd: "catcloud config reload --json", desc: "校验并热重载当前配置" },
@@ -612,6 +626,15 @@ function fullMemoryTierFromMb(mb: 0 | 48 | 64 | 96): string {
   return "auto";
 }
 
+function normalizeUpdateRepo(raw: string | null | undefined): string {
+  const cleaned = (raw ?? "").trim().replace(/^\/+|\/+$/g, "");
+  return cleaned || "JuryBu/CatCloud";
+}
+
+function buildReleasesFallbackUrl(repo: string | null | undefined): string {
+  return `https://github.com/${normalizeUpdateRepo(repo)}/releases`;
+}
+
 function buildMergedSettingsPatch(
   draft: AppConfig,
   ext: ExtendedSettings
@@ -654,10 +677,11 @@ function buildMergedSettingsPatch(
       silent_start: draft.silent_start,
     },
     update: {
-      repo: draft.update.repo,
+      repo: normalizeUpdateRepo(draft.update.repo),
       mode: draft.update.mode,
       check_interval_min: draft.update.check_interval_min,
       include_prerelease: draft.update.include_prerelease,
+      auto_download: draft.update.auto_download ?? true,
     },
   };
 }
@@ -842,6 +866,8 @@ function SegButtons<T extends string | number>({
   );
 }
 
+let lastCheckedUpdateInfo: AppUpdateCheckResult | null = null;
+
 export function SettingsPage() {
   const storeConfig = useAppSelector((s) => s.config);
   const runtime = useAppSelector((s) => s.runtime);
@@ -855,16 +881,25 @@ export function SettingsPage() {
   const isWindows = platformOs === "windows";
   const shellEnvOptions = useMemo(() => getShellEnvOptionsForOs(platformOs), [platformOs]);
 
-  const [selectedShell, setSelectedShell] = useState<ShellEnvKind>(() =>
-    defaultShellForOs(platformOs)
+  const [selectedShell, setSelectedShell] = usePersistedState<ShellEnvKind>(
+    "settings.selectedShell",
+    defaultShellForOs(platformOs),
+    SHELL_ENV_VALIDATOR
   );
-  const userPickedShellRef = useRef(false);
+  const userPickedShellRef = useRef<boolean | null>(null);
+  if (userPickedShellRef.current === null) {
+    userPickedShellRef.current =
+      readUiPref<ShellEnvKind | null>("settings.selectedShell", null, SHELL_ENV_VALIDATOR) !== null;
+  }
+  const prevPlatformOsRef = useRef<PlatformOs>(platformOs);
 
   useEffect(() => {
+    if (prevPlatformOsRef.current === platformOs) return;
+    prevPlatformOsRef.current = platformOs;
     if (!userPickedShellRef.current) {
       setSelectedShell(defaultShellForOs(platformOs));
     }
-  }, [platformOs]);
+  }, [platformOs, setSelectedShell]);
 
   const [tab, setTab] = useState<SettingsTabId>(() =>
     settingsOpenAgentDocs ? "updates" : (settingsTabHint ?? "system")
@@ -879,8 +914,14 @@ export function SettingsPage() {
   }, [settingsTabHint]);
   const [draft, setDraft] = useState<AppConfig>(() => structuredClone(storeConfig));
   const [ext, setExt] = useState<ExtendedSettings>(DEFAULT_EXTENDED);
+  const [extLoaded, setExtLoaded] = useState(false);
+  const [extLoadError, setExtLoadError] = useState<string | null>(null);
   const [showSecret, setShowSecret] = useState(false);
-  const [selectedWebUiIdx, setSelectedWebUiIdx] = useState(0);
+  const [selectedWebUiIdx, setSelectedWebUiIdx] = usePersistedState<number>(
+    "settings.selectedWebUiIdx",
+    0,
+    WEB_UI_IDX_VALIDATOR
+  );
   const [newWebUiName, setNewWebUiName] = useState("");
   const [newWebUiTpl, setNewWebUiTpl] = useState("");
   const [coreBinaryPath, setCoreBinaryPath] = useState("");
@@ -892,8 +933,14 @@ export function SettingsPage() {
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [wallpaperUrlInput, setWallpaperUrlInput] = useState("");
   const [imgLoadFailed, setImgLoadFailed] = useState(false);
-  const [showAdvancedDns, setShowAdvancedDns] = useState(false);
-  const [showDevTools, setShowDevTools] = useState(() => settingsOpenAgentDocs);
+  const [showAdvancedDns, setShowAdvancedDns] = usePersistedState<boolean>(
+    "settings.showAdvancedDns",
+    false,
+    isBoolPref
+  );
+  const [showDevTools, setShowDevTools] = useState(
+    () => settingsOpenAgentDocs || readUiPref("settings.showDevTools", false, isBoolPref)
+  );
   const [pendingScrollToDevTools, setPendingScrollToDevTools] = useState(
     () => settingsOpenAgentDocs
   );
@@ -925,8 +972,29 @@ export function SettingsPage() {
   const [geoStatusLoading, setGeoStatusLoading] = useState(true);
   const [confirmImportBackupOpen, setConfirmImportBackupOpen] = useState(false);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [downloadingUpdate, setDownloadingUpdate] = useState(false);
+  const [updateInfo, setUpdateInfoState] = useState<AppUpdateCheckResult | null>(
+    () => lastCheckedUpdateInfo
+  );
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
-  const [activeDocId, setActiveDocId] = useState<string>(AGENT_DOCS[0].id);
+  const [activeDocId, setActiveDocId] = usePersistedState<AgentDocId>(
+    "settings.activeDocId",
+    AGENT_DOCS[0].id,
+    AGENT_DOC_ID_VALIDATOR
+  );
+
+  const setUpdateInfo = (
+    next:
+      | AppUpdateCheckResult
+      | null
+      | ((prev: AppUpdateCheckResult | null) => AppUpdateCheckResult | null)
+  ) => {
+    setUpdateInfoState((prev) => {
+      const resolved = typeof next === "function" ? next(prev) : next;
+      lastCheckedUpdateInfo = resolved;
+      return resolved;
+    });
+  };
 
   const dirty = draftDirty || extDirty;
   const dirtyRef = useRef(dirty);
@@ -960,7 +1028,13 @@ export function SettingsPage() {
       }));
       return;
     }
-    setDraft(structuredClone(storeConfig));
+    setDraft((prev) => {
+      const next = structuredClone(storeConfig);
+      if (next.update.auto_download === undefined && prev.update.auto_download !== undefined) {
+        next.update.auto_download = prev.update.auto_download;
+      }
+      return next;
+    });
   }, [storeConfig]);
 
   useEffect(() => {
@@ -973,20 +1047,35 @@ export function SettingsPage() {
     }
   }, [storeConfig.personalization.wallpaper_path]);
 
+  const loadExtendedConfig = async (isActive?: () => boolean) => {
+    try {
+      const full = await catcloudApi.getFullConfig();
+      if (isActive && !isActive()) return;
+      setExt(hydrateExtendedFromFullConfig(full));
+      setExtLoaded(true);
+      setExtLoadError(null);
+      if (full.core_runtime?.custom_binary_path) {
+        setCoreBinaryPath(full.core_runtime.custom_binary_path);
+      }
+      if (typeof full.update?.auto_download === "boolean" && !dirtyRef.current) {
+        setDraft((prev) => ({
+          ...prev,
+          update: {
+            ...prev.update,
+            auto_download: full.update?.auto_download,
+          },
+        }));
+      }
+    } catch (err) {
+      if (isActive && !isActive()) return;
+      setExtLoaded(false);
+      setExtLoadError(formatErrorMessage(err) || "读取高级配置失败");
+    }
+  };
+
   useEffect(() => {
     let active = true;
-    void catcloudApi
-      .getFullConfig()
-      .then((full) => {
-        if (!active) return;
-        setExt(hydrateExtendedFromFullConfig(full));
-        if (full.core_runtime?.custom_binary_path) {
-          setCoreBinaryPath(full.core_runtime.custom_binary_path);
-        }
-      })
-      .catch(() => {
-        /* keep default extended fields if backend config read fails */
-      });
+    void loadExtendedConfig(() => active);
 
     setGeoStatusLoading(true);
     void catcloudApi
@@ -1023,19 +1112,34 @@ export function SettingsPage() {
   };
 
   const patchExt = <K extends keyof ExtendedSettings>(k: K, v: ExtendedSettings[K]) => {
+    if (!extLoaded) {
+      appActions.showToast(
+        extLoadError
+          ? `高级配置加载失败（${extLoadError}），请先重新加载后再修改`
+          : "高级配置正在加载，请稍候片刻再修改",
+        "warn"
+      );
+      return;
+    }
     setExt((prev) => ({ ...prev, [k]: v }));
     setExtDirty(true);
   };
 
   const handleDnsPortChange = (nextPort: number) => {
     patchDraft({ dns_listen_port: nextPort });
-    setExt((prev) => {
-      const host = prev.dnsListen.split(":")[0]?.trim() || "127.0.0.1";
-      return { ...prev, dnsListen: `${host}:${nextPort}` };
-    });
+    if (extLoaded) {
+      setExt((prev) => {
+        const host = prev.dnsListen.split(":")[0]?.trim() || "127.0.0.1";
+        return { ...prev, dnsListen: `${host}:${nextPort}` };
+      });
+    }
   };
 
   const handleDnsListenChange = (nextAddr: string) => {
+    if (!extLoaded) {
+      appActions.showToast("高级配置正在加载，请稍候片刻再修改", "warn");
+      return;
+    }
     patchExt("dnsListen", nextAddr);
     const portPart = Number(nextAddr.split(":")[1]);
     if (Number.isFinite(portPart) && portPart > 0 && portPart <= 65535) {
@@ -1073,12 +1177,27 @@ export function SettingsPage() {
       appActions.showToast("当前没有待保存的更改", "info");
       return;
     }
+    if (extDirty && !extLoaded) {
+      appActions.showToast(
+        extLoadError
+          ? `高级配置加载失败（${extLoadError}），已阻止保存以防止覆写原配置`
+          : "高级配置尚未加载完成，已阻止保存以防止覆写原配置",
+        "warn"
+      );
+      return;
+    }
     setSaving(true);
     try {
+      const normalizedRepo = normalizeUpdateRepo(draft.update.repo);
       const payload: AppConfig = {
         ...draft,
         memory_tier: tierFromMb(draft.gomemlimit_mb),
         personalization: storeConfig.personalization,
+        update: {
+          ...draft.update,
+          repo: normalizedRepo,
+          auto_download: draft.update.auto_download ?? true,
+        },
       };
       let savedBasic: AppConfig;
       if (draftDirty && !extDirty) {
@@ -1094,15 +1213,24 @@ export function SettingsPage() {
         savedBasic = await catcloudApi.saveConfig(payload);
         await catcloudApi.saveExtendedSettings(buildExtendedPatch(ext));
       }
+      const syncedUpdate = {
+        ...savedBasic.update,
+        auto_download:
+          savedBasic.update.auto_download ?? payload.update.auto_download ?? true,
+      };
       const syncedConfig: AppConfig = extDirty
         ? {
             ...savedBasic,
+            update: syncedUpdate,
             behavior: {
               ...savedBasic.behavior,
               minimize_to_tray_on_close: ext.closeToWindowless,
             },
           }
-        : savedBasic;
+        : {
+            ...savedBasic,
+            update: syncedUpdate,
+          };
       dirtyRef.current = false;
       setDraftDirty(false);
       setExtDirty(false);
@@ -1241,12 +1369,30 @@ export function SettingsPage() {
     setCheckingUpdate(true);
     try {
       const res = await catcloudApi.checkAppUpdate();
+      setUpdateInfo(res);
       if (res.error) {
         setUpdateMsg(`检查失败：${res.error}`);
         appActions.showToast(`检查更新失败：${res.error}`, "warn");
+      } else if (res.staged_version) {
+        setUpdateMsg(`已下载并校验完成 v${res.staged_version}，下次重启自动生效`);
+        appActions.showToast(
+          `v${res.staged_version} 已准备就绪，下次重启猫猫云梯时自动生效`,
+          "ok"
+        );
       } else if (res.has_update) {
-        setUpdateMsg(`发现新版本 v${res.latest_version}（当前 v${res.current_version}）`);
-        appActions.showToast(`发现新版本 v${res.latest_version}`, "ok");
+        const autoDownloadOn = draft.update.auto_download ?? true;
+        if (res.can_auto_stage && autoDownloadOn && draft.update.mode !== "manual") {
+          setUpdateMsg(
+            `发现新版本 v${res.latest_version}（当前 v${res.current_version}），点击下方即可一键下载预置`
+          );
+          appActions.showToast(
+            `发现新版本 v${res.latest_version}，可一键下载并在下次启动自动应用`,
+            "ok"
+          );
+        } else {
+          setUpdateMsg(`发现新版本 v${res.latest_version}（当前 v${res.current_version}）`);
+          appActions.showToast(`发现新版本 v${res.latest_version}`, "ok");
+        }
       } else {
         setUpdateMsg(`当前 v${res.current_version} 已是最新版本`);
         appActions.showToast("当前已是最新版本", "info");
@@ -1258,6 +1404,88 @@ export function SettingsPage() {
     } finally {
       setCheckingUpdate(false);
     }
+  };
+
+  const handleDownloadAndStageUpdate = async () => {
+    if (downloadingUpdate) return;
+    setDownloadingUpdate(true);
+    try {
+      const res = await catcloudApi.downloadAndStageUpdate();
+      if (res.staged) {
+        const targetVersion =
+          res.target_version || updateInfo?.latest_version || runtime.app_version;
+        setUpdateInfo((prev) => ({
+          has_update: true,
+          current_version: prev?.current_version ?? runtime.app_version,
+          latest_version: targetVersion,
+          release_url:
+            res.release_url ||
+            prev?.release_url ||
+            buildReleasesFallbackUrl(draft.update.repo),
+          download_url: res.download_url ?? prev?.download_url ?? null,
+          notes: prev?.notes ?? "",
+          checked_at: prev?.checked_at ?? new Date().toISOString(),
+          platform_key: prev?.platform_key,
+          can_auto_stage: true,
+          staged_version: targetVersion,
+          error: null,
+        }));
+        setUpdateMsg(`已下载并校验完成 v${targetVersion}，下次重启时自动生效`);
+        appActions.showToast(
+          res.message || `已下载并校验完成 v${targetVersion}，下次重启猫猫云梯时自动生效`,
+          "ok"
+        );
+      } else if (res.already_latest) {
+        setUpdateInfo((prev) => (prev ? { ...prev, has_update: false } : prev));
+        setUpdateMsg(res.message || `当前 v${runtime.app_version} 已是最新版本`);
+        appActions.showToast(res.message || "当前已是最新版本", "info");
+      } else {
+        const releaseUrl =
+          res.release_url ||
+          updateInfo?.release_url ||
+          buildReleasesFallbackUrl(draft.update.repo);
+        setUpdateInfo((prev) =>
+          prev
+            ? {
+                ...prev,
+                can_auto_stage: res.can_auto_stage ?? prev.can_auto_stage,
+                release_url: releaseUrl,
+                download_url: res.download_url ?? prev.download_url,
+              }
+            : prev
+        );
+        const hint = res.message || "当前版本形态需通过官方下载页获取对应系统安装包";
+        setUpdateMsg(hint);
+        appActions.showToast(hint, "info");
+      }
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      setUpdateMsg(`下载更新失败：${msg}`);
+      appActions.showToast(`下载更新失败：${msg}`, "warn");
+    } finally {
+      setDownloadingUpdate(false);
+    }
+  };
+
+  const handleOpenReleasePage = async () => {
+    const cleanRepo = draft.update.repo.trim().replace(/^\/+|\/+$/g, "");
+    const fallbackUrl = `https://github.com/${cleanRepo || "JuryBu/CatCloud"}/releases`;
+    const targetUrl = updateInfo?.release_url?.trim() || fallbackUrl;
+    try {
+      await catcloudApi.openExternalUrl(targetUrl);
+      if (inTauri) {
+        try {
+          await navigator.clipboard.writeText(targetUrl);
+        } catch {
+          /* clipboard optional when browser opens directly */
+        }
+        appActions.showToast(`已在浏览器打开官方下载页：${targetUrl}`, "ok");
+        return;
+      }
+    } catch {
+      /* fall back to copying link below */
+    }
+    await copyText(targetUrl, "官方下载页链接");
   };
 
   const handleExportBackup = async () => {
@@ -1309,6 +1537,8 @@ export function SettingsPage() {
             await appActions.refreshAllData();
             const full = await catcloudApi.getFullConfig();
             setExt(hydrateExtendedFromFullConfig(full));
+            setExtLoaded(true);
+            setExtLoadError(null);
             appActions.showToast(
               res.message || `已恢复备份（分组 ${res.restored_groups} / 中转 ${res.restored_relays}）`,
               "ok"
@@ -1350,8 +1580,13 @@ export function SettingsPage() {
     }
   };
 
+  const safeWebUiIdx =
+    ext.webuiUrls.length > 0
+      ? Math.max(0, Math.min(selectedWebUiIdx, ext.webuiUrls.length - 1))
+      : 0;
+
   const handleOpenWebUi = async () => {
-    const entry = ext.webuiUrls[selectedWebUiIdx] ?? ext.webuiUrls[0];
+    const entry = ext.webuiUrls[safeWebUiIdx] ?? ext.webuiUrls[0];
     const rawTemplate = entry?.url_template?.trim() || null;
     try {
       await catcloudApi.openWebUi(rawTemplate);
@@ -1486,7 +1721,7 @@ export function SettingsPage() {
         <button
           type="button"
           onClick={() => void handleSave()}
-          disabled={saving}
+          disabled={saving || (extDirty && !extLoaded)}
           className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-60"
           style={{
             backgroundColor: dirty ? "var(--accent)" : "var(--surface)",
@@ -1495,9 +1730,36 @@ export function SettingsPage() {
           }}
         >
           {dirty ? <Save className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
-          <span>{saving ? "保存中..." : dirty ? "保存更改" : "已保存"}</span>
+          <span>
+            {saving
+              ? "保存中..."
+              : extDirty && !extLoaded
+                ? "等待配置加载..."
+                : dirty
+                  ? "保存更改"
+                  : "已保存"}
+          </span>
         </button>
       </div>
+
+      {!extLoaded && extLoadError && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2 text-xs text-[var(--amber)]">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0" />
+            <span>
+              高级配置读取失败（{extLoadError}），已保护磁盘原配置不被默认值覆写。基础开关仍可正常保存。
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void loadExtendedConfig()}
+            className="inline-flex items-center gap-1 rounded-lg border border-[var(--amber)]/50 bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] hover:border-[var(--accent)]"
+          >
+            <RefreshCw className="h-3 w-3" />
+            <span>重试读取</span>
+          </button>
+        </div>
+      )}
 
       {/* Tab 1: 常规与代理 */}
       {tab === "system" && (
@@ -2707,10 +2969,15 @@ export function SettingsPage() {
                   <AppSelect
                     aria-label="外部控制面板"
                     size="sm"
-                    value={String(
-                      Math.min(selectedWebUiIdx, Math.max(0, ext.webuiUrls.length - 1))
-                    )}
-                    onChange={(v) => setSelectedWebUiIdx(Number(v) || 0)}
+                    value={String(safeWebUiIdx)}
+                    onChange={(v) => {
+                      const parsed = Number(v);
+                      const nextIdx =
+                        Number.isInteger(parsed) && parsed >= 0
+                          ? Math.min(parsed, Math.max(0, ext.webuiUrls.length - 1))
+                          : 0;
+                      setSelectedWebUiIdx(nextIdx);
+                    }}
                     options={ext.webuiUrls.map((item, idx) => ({
                       value: String(idx),
                       label: item.name,
@@ -2832,9 +3099,16 @@ export function SettingsPage() {
                     })
                   }
                   options={[
-                    { value: "next_launch", label: "下次启动自动更新（推荐）" },
-                    { value: "manual", label: "仅手动检查提醒" },
-                    { value: "auto_restart", label: "下载后自动重启" },
+                    { value: "next_launch", label: "下次启动自动生效（默认）" },
+                    { value: "manual", label: "仅手动检查" },
+                    ...(draft.update.mode === "auto_restart"
+                      ? [
+                          {
+                            value: "auto_restart",
+                            label: "自动重启（暂未实现，等同下次启动生效）",
+                          },
+                        ]
+                      : []),
                   ]}
                   className="mt-1 w-full"
                 />
@@ -2857,20 +3131,146 @@ export function SettingsPage() {
                 />
               </label>
             </div>
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-[var(--muted)]">
-              <label className="inline-flex items-center gap-2">
-                <Toggle
-                  checked={draft.update.include_prerelease}
-                  onChange={(v) =>
-                    patchDraft({ update: { ...draft.update, include_prerelease: v } })
-                  }
-                  label="接收测试版更新"
-                />
-                <span>接收测试版更新</span>
-              </label>
-              <span className="text-[11px]">
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <SwitchRow
+                title="自动下载新版本（下次启动自动生效）"
+                desc="发现新版后自动校验预置，下次重启猫猫云梯无缝更新，不打断当前上网"
+                checked={draft.update.auto_download ?? true}
+                onChange={(v) =>
+                  patchDraft({ update: { ...draft.update, auto_download: v } })
+                }
+              />
+              <SwitchRow
+                title="接收测试版更新"
+                desc="提前体验新功能预览版，日常稳定使用建议保持关闭"
+                checked={draft.update.include_prerelease}
+                onChange={(v) =>
+                  patchDraft({ update: { ...draft.update, include_prerelease: v } })
+                }
+              />
+            </div>
+
+            {updateInfo?.staged_version && (
+              <div className="flex items-start gap-2.5 rounded-xl border border-[var(--green)]/45 bg-[var(--green-soft)] px-3.5 py-2.5 text-xs text-[var(--green)]">
+                <Shield className="mt-0.5 h-4 w-4 shrink-0" />
+                <div className="min-w-0 leading-relaxed font-medium">
+                  已下载并校验完成 v{updateInfo.staged_version}，下次重启猫猫云梯时自动生效（保留全部配置与订阅）
+                </div>
+              </div>
+            )}
+
+            {updateInfo?.has_update && !updateInfo.staged_version && (
+              <div className="space-y-2.5 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)]/45 px-3.5 py-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0 space-y-0.5">
+                    <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-[var(--text)]">
+                      <span>发现新版本 v{updateInfo.latest_version}</span>
+                      <span className="rounded-md bg-[var(--surface)] px-1.5 py-0.5 cc-mono text-[10px] font-normal text-[var(--muted)]">
+                        当前 v{updateInfo.current_version}
+                      </span>
+                    </div>
+                    <p className="text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                      {updateInfo.can_auto_stage
+                        ? (draft.update.auto_download ?? true) &&
+                          draft.update.mode !== "manual"
+                          ? "你已开启下次启动自动更新，点击右侧按钮即可立即下载并校验更新包，下次重启自动生效（保留全部配置与订阅）。"
+                          : "当前便携版支持一键下载并校验更新包，下次重启猫猫云梯时自动应用（保留全部配置与订阅）。"
+                        : platformOs === "macos"
+                          ? "当前为 macOS 版本，请打开官方下载页获取对应芯片（Apple Silicon / Intel）的 .dmg 安装包替换应用，配置与订阅会自动保留。"
+                          : platformOs === "linux"
+                            ? "当前为 Linux 版本，请打开官方下载页获取最新的 AppImage / .deb / .rpm 安装包完成更新，配置与订阅会自动保留。"
+                            : "当前为系统安装版，请打开官方下载页下载最新 .exe / .msi 安装包覆盖安装，原有配置与订阅会自动保留。"}
+                    </p>
+                  </div>
+
+                  <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                    {updateInfo.can_auto_stage ? (
+                      <button
+                        type="button"
+                        disabled={downloadingUpdate}
+                        onClick={() => void handleDownloadAndStageUpdate()}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {downloadingUpdate ? (
+                          <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Download className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {downloadingUpdate
+                            ? "正在下载并校验..."
+                            : "一键下载更新（下次启动自动应用）"}
+                        </span>
+                      </button>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => void handleOpenReleasePage()}
+                          className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                        >
+                          <ExternalLink className="h-3.5 w-3.5" />
+                          <span>打开官方下载页</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            void copyText(
+                              updateInfo.release_url ||
+                                buildReleasesFallbackUrl(draft.update.repo),
+                              "官方下载页链接"
+                            )
+                          }
+                          className={BTN_CLS}
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                          <span>复制链接</span>
+                        </button>
+                        {updateInfo.download_url &&
+                          updateInfo.download_url !== updateInfo.release_url && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                void copyText(updateInfo.download_url ?? "", "安装包直链")
+                              }
+                              className={BTN_CLS}
+                            >
+                              <Download className="h-3.5 w-3.5" />
+                              <span>复制安装包直链</span>
+                            </button>
+                          )}
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {updateInfo.notes?.trim() && (
+                  <div className="rounded-lg border border-[var(--line)] bg-[var(--surface)]/80 px-3 py-2">
+                    <div className="mb-1 text-[10px] font-medium text-[var(--muted)]">
+                      更新说明
+                    </div>
+                    <div className="cc-selectable max-h-24 overflow-y-auto whitespace-pre-wrap text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                      {updateInfo.notes.trim()}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--muted)]">
+              <span>
                 {updateMsg ?? `上次检查：${runtime.last_update_check ?? "尚未检查"}`}
               </span>
+              {updateInfo?.release_url && (
+                <button
+                  type="button"
+                  onClick={() => void handleOpenReleasePage()}
+                  className="inline-flex items-center gap-1 text-[var(--accent)] hover:underline"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  <span>查看发布说明</span>
+                </button>
+              )}
             </div>
           </Card>
 
@@ -2881,7 +3281,13 @@ export function SettingsPage() {
           >
             <button
               type="button"
-              onClick={() => setShowDevTools((open) => !open)}
+              onClick={() =>
+                setShowDevTools((open) => {
+                  const next = !open;
+                  writeUiPref("settings.showDevTools", next);
+                  return next;
+                })
+              }
               className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left transition-colors hover:bg-[var(--surface)]/60"
             >
               <div>
@@ -2951,7 +3357,7 @@ export function SettingsPage() {
                     </div>
                   }
                 >
-                  <SegButtons<string>
+                  <SegButtons<AgentDocId>
                     value={activeDoc.id}
                     onChange={setActiveDocId}
                     options={AGENT_DOCS.map((d) => [d.id, d.title] as const)}

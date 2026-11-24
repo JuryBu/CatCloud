@@ -30,14 +30,17 @@ use catcloud_core::strategy::arbiter::{ArbiterGroupMemory, decide_group_action};
 use catcloud_core::strategy::evaluator::evaluate_group_candidates;
 use catcloud_core::strategy::formula::validate_formula;
 use catcloud_core::subscription::migrator::{
-    MigrationImportOptions, import_migration_preview, preview_from_file, scan_local_clients,
+    MigrationImportOptions, generate_migration_subscription_id, import_migration_preview,
+    scan_custom_path_readonly, scan_local_clients,
 };
 use catcloud_core::subscription::parser::{
     apply_parsed_subscription, fetch_and_parse_subscription, parse_subscription_payload,
 };
 use catcloud_core::subscription::process_attach::{inspect_process_source, list_process_candidates};
 use catcloud_core::updater::{
-    Updater, parse_latest_manifest, parse_sha256sums, stage_verified_archive,
+    LatestManifest, MAX_METADATA_BYTES, MAX_ZIP_BYTES, PlatformAsset, Updater,
+    current_update_platform_key_opt, is_update_available_for_channel, parse_latest_manifest,
+    parse_sha256sums, read_pending_staged_update, resolve_asset_sha256, stage_verified_archive,
 };
 use catcloud_core::{AppPaths, CatError};
 use chrono::Utc;
@@ -504,7 +507,10 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
 
             NodeCommand::Migrate(args) => {
                 let previews = if let Some(file) = args.file {
-                    vec![preview_from_file(&file, None)?]
+                    if !file.exists() {
+                        anyhow::bail!("migration source path not found: {}", file.display());
+                    }
+                    scan_custom_path_readonly(&file)
                 } else {
                     let _ = args.scan;
                     scan_local_clients()
@@ -512,10 +518,25 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 if args.apply {
                     let mut db = open_storage(paths)?;
                     let mut reports = Vec::new();
-                    for (idx, p) in previews.iter().enumerate() {
+                    for p in &previews {
                         if !p.nodes.is_empty() {
-                            let sub_id = format!("sub-migrated-{idx}");
-                            let sub_name = format!("Migrated {:?}", p.source_kind);
+                            let sub_id = generate_migration_subscription_id();
+                            let sub_name = p
+                                .display_name
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(ToOwned::to_owned)
+                                .or_else(|| {
+                                    p.source_path
+                                        .as_ref()
+                                        .and_then(|sp| sp.file_name())
+                                        .and_then(|n| n.to_str())
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(ToOwned::to_owned)
+                                })
+                                .unwrap_or_else(|| format!("Migrated ({})", p.source_kind.as_str()));
                             reports.push(import_migration_preview(
                                 &mut db,
                                 p,
@@ -1521,6 +1542,10 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let cfg = config::load_or_init(paths)?;
                 let target_repo = repo.unwrap_or_else(|| cfg.update.repo.clone());
                 let current_version = env!("CARGO_PKG_VERSION");
+                let is_self_updatable_portable = paths.is_self_updatable_portable();
+                let platform_key = current_update_platform_key_opt(is_self_updatable_portable);
+                let staged_version =
+                    read_pending_staged_update(&paths.staging_dir).map(|p| p.target_version);
 
                 if offline {
                     let out = json!({
@@ -1530,14 +1555,22 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         "repo": &target_repo,
                         "mode": &cfg.update.mode,
                         "include_prerelease": cfg.update.include_prerelease,
+                        "is_self_updatable_portable": is_self_updatable_portable,
+                        "platform_key": platform_key,
+                        "download_url": Value::Null,
+                        "staged_version": &staged_version,
                         "staging_dir": &paths.staging_dir,
                     });
                     return emit_output(
                         as_json,
                         &out,
                         &format!(
-                            "CatCloud v{current_version} offline update channel: {} ({:?})",
-                            target_repo, cfg.update.mode
+                            "CatCloud v{current_version} offline update channel: {} ({:?}, platform={}, self_updatable_portable={}, staged={})",
+                            target_repo,
+                            cfg.update.mode,
+                            platform_key.unwrap_or("unsupported"),
+                            is_self_updatable_portable,
+                            staged_version.as_deref().unwrap_or("none"),
                         ),
                     );
                 }
@@ -1553,6 +1586,10 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             "repo": &target_repo,
                             "mode": &cfg.update.mode,
                             "include_prerelease": cfg.update.include_prerelease,
+                            "is_self_updatable_portable": is_self_updatable_portable,
+                            "platform_key": platform_key,
+                            "download_url": Value::Null,
+                            "staged_version": &staged_version,
                             "staging_dir": &paths.staging_dir,
                             "error": &msg,
                         });
@@ -1565,32 +1602,52 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let manifest_url = updater.default_latest_json_url();
                 match updater.check_latest(None).await {
                     Ok(check) => {
+                        let update_available = is_update_available_for_channel(
+                            &check.latest_version,
+                            &check.current_version,
+                            cfg.update.include_prerelease,
+                        )?;
+                        let download_url = platform_key
+                            .and_then(|k| check.manifest.platforms.get(k))
+                            .map(|asset| asset.url.clone());
                         let platforms: Vec<&String> = check.manifest.platforms.keys().collect();
                         let out = json!({
                             "ok": true,
                             "offline": false,
                             "current_version": &check.current_version,
                             "latest_version": &check.latest_version,
-                            "update_available": check.update_available,
+                            "update_available": update_available,
                             "pub_date": &check.pub_date,
                             "notes": &check.notes,
                             "repo": &target_repo,
                             "manifest_url": &manifest_url,
                             "mode": &cfg.update.mode,
                             "include_prerelease": cfg.update.include_prerelease,
+                            "is_self_updatable_portable": is_self_updatable_portable,
+                            "platform_key": platform_key,
+                            "download_url": &download_url,
+                            "staged_version": &staged_version,
                             "staging_dir": &paths.staging_dir,
                             "platforms": platforms,
                             "manifest": &check.manifest,
                         });
-                        let human = if check.update_available {
+                        let human = if update_available {
                             format!(
-                                "Update available for CatCloud: v{} -> v{} (repo={}).",
-                                check.current_version, check.latest_version, target_repo
+                                "Update available for CatCloud: v{} -> v{} (repo={}, platform={}, staged={}).",
+                                check.current_version,
+                                check.latest_version,
+                                target_repo,
+                                platform_key.unwrap_or("unsupported"),
+                                staged_version.as_deref().unwrap_or("none"),
                             )
                         } else {
                             format!(
-                                "CatCloud v{} is up to date (latest: v{}, repo={}).",
-                                check.current_version, check.latest_version, target_repo
+                                "CatCloud v{} is up to date (latest: v{}, repo={}, platform={}, staged={}).",
+                                check.current_version,
+                                check.latest_version,
+                                target_repo,
+                                platform_key.unwrap_or("unsupported"),
+                                staged_version.as_deref().unwrap_or("none"),
                             )
                         };
                         emit_output(as_json, &out, &human)
@@ -1605,6 +1662,10 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             "manifest_url": &manifest_url,
                             "mode": &cfg.update.mode,
                             "include_prerelease": cfg.update.include_prerelease,
+                            "is_self_updatable_portable": is_self_updatable_portable,
+                            "platform_key": platform_key,
+                            "download_url": Value::Null,
+                            "staged_version": &staged_version,
                             "staging_dir": &paths.staging_dir,
                             "error": &msg,
                         });
@@ -1622,9 +1683,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 checksums,
                 asset_name,
             } => {
-                let manifest_bytes = std::fs::read(&manifest)?;
+                let manifest_bytes =
+                    read_file_with_limit(&manifest, MAX_METADATA_BYTES, "update manifest")?;
                 let parsed_manifest = parse_latest_manifest(&manifest_bytes)?;
-                let sums_raw = std::fs::read_to_string(&checksums)?;
+                let sums_bytes =
+                    read_file_with_limit(&checksums, MAX_METADATA_BYTES, "SHA256SUMS")?;
+                let sums_raw = String::from_utf8(sums_bytes)
+                    .context("SHA256SUMS file is not valid UTF-8")?;
                 let sums = parse_sha256sums(&sums_raw)?;
                 let fname = asset_name.unwrap_or_else(|| {
                     archive
@@ -1633,11 +1698,17 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         .unwrap_or("update.zip")
                         .to_string()
                 });
-                let expected = sums
-                    .get(&fname)
-                    .cloned()
-                    .with_context(|| format!("asset `{fname}` missing from SHA256SUMS"))?;
-                let zip_bytes = std::fs::read(&archive)?;
+                let fallback_asset = PlatformAsset {
+                    url: String::new(),
+                    signature: None,
+                    sha256: None,
+                    filename: Some(fname.clone()),
+                };
+                let target_asset = find_manifest_asset_for_stage(&parsed_manifest, &fname)
+                    .unwrap_or(&fallback_asset);
+                let expected = resolve_asset_sha256(target_asset, Some(&sums))?;
+                let zip_bytes =
+                    read_file_with_limit(&archive, MAX_ZIP_BYTES, "update archive")?;
                 let staged = stage_verified_archive(
                     &zip_bytes,
                     &expected,
@@ -1658,6 +1729,68 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
 
 const MAX_DIAG_LOG_LINES: usize = 40;
 const MAX_DIAG_LOG_TAIL_READ_BYTES: u64 = 64 * 1024;
+
+fn read_file_with_limit(
+    path: &std::path::Path,
+    max_bytes: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {label} `{}`", path.display()))?;
+    let meta = file
+        .metadata()
+        .with_context(|| format!("failed to inspect {label} `{}`", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("{label} path is not a regular file: {}", path.display());
+    }
+    if meta.len() > max_bytes as u64 {
+        anyhow::bail!(
+            "{label} `{}` ({} bytes) exceeds maximum allowed {} bytes",
+            path.display(),
+            meta.len(),
+            max_bytes
+        );
+    }
+    let mut out = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+    let mut limited = file.take(max_bytes as u64 + 1);
+    limited
+        .read_to_end(&mut out)
+        .with_context(|| format!("failed to read {label} `{}`", path.display()))?;
+    if out.len() > max_bytes {
+        anyhow::bail!(
+            "{label} `{}` exceeded maximum allowed {} bytes while reading",
+            path.display(),
+            max_bytes
+        );
+    }
+    Ok(out)
+}
+
+fn find_manifest_asset_for_stage<'a>(
+    manifest: &'a LatestManifest,
+    target_name: &str,
+) -> Option<&'a PlatformAsset> {
+    if let Some(by_key) = manifest.platforms.get(target_name) {
+        return Some(by_key);
+    }
+    manifest.platforms.values().find(|asset| {
+        if asset
+            .filename
+            .as_deref()
+            .is_some_and(|f| f == target_name)
+        {
+            return true;
+        }
+        asset
+            .url
+            .rsplit('/')
+            .next()
+            .map(|seg| seg.split('?').next().unwrap_or(seg))
+            .is_some_and(|seg| seg == target_name)
+    })
+}
 
 fn inspect_geodata_file(runtime_dir: &std::path::Path, candidates: &[&str]) -> Value {
     for name in candidates {
@@ -2254,6 +2387,119 @@ mod tests {
         assert_eq!(payload_after["windivert_available"], json!(true));
         assert!(payload_after["windivert_dll"].as_str().is_some());
         assert!(payload_after["windivert_sys"].as_str().is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn node_migrate_supports_directory_display_name_and_unique_subscription_ids() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-migrate-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let data_dir = temp_root.join("data");
+        let src_dir = temp_root.join("third_party");
+        let profiles_dir = src_dir.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(
+            profiles_dir.join("sub_a.yaml"),
+            "proxies:\n  - name: \"HK Migrate Test 1x\"\n    type: trojan\n    server: 198.51.100.44\n    port: 443\n    password: \"placeholder-pass\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src_dir.join("profiles.yaml"),
+            "items:\n  - name: \"我的真实订阅\"\n    file: sub_a.yaml\n",
+        )
+        .unwrap();
+
+        let paths = AppPaths::from_data_dir(data_dir, true).expect("init temp paths");
+        for _ in 0..2 {
+            dispatch(
+                &paths,
+                true,
+                Commands::Node {
+                    action: NodeCommand::Migrate(NodeMigrateArgs {
+                        scan: false,
+                        file: Some(src_dir.clone()),
+                        apply: true,
+                    }),
+                },
+            )
+            .await
+            .expect("apply migration from directory");
+        }
+
+        let db = open_storage(&paths).expect("open db");
+        let subs = db.list_subscriptions().expect("list subs");
+        let nodes = db.list_nodes().expect("list nodes");
+        assert_eq!(subs.len(), 2, "repeated --apply must not overwrite previous migrated subscription");
+        assert_eq!(nodes.len(), 2, "nodes from both imports must be preserved");
+        assert_ne!(subs[0].id, subs[1].id);
+        for sub in &subs {
+            assert!(sub.id.starts_with("migrated-"));
+            assert_eq!(sub.name, "我的真实订阅");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn update_stage_helpers_enforce_size_cap_and_cross_check_manifest_sha256() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-stage-helpers-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let oversized = temp_root.join("oversized.zip");
+        let f = std::fs::File::create(&oversized).unwrap();
+        f.set_len(MAX_ZIP_BYTES as u64 + 1).unwrap();
+        assert!(
+            read_file_with_limit(&oversized, MAX_ZIP_BYTES, "update archive").is_err(),
+            "archives larger than MAX_ZIP_BYTES must be rejected before reading"
+        );
+
+        let good_sha = "a".repeat(64);
+        let bad_sha = "b".repeat(64);
+        let manifest_bytes = serde_json::to_vec(&json!({
+            "version": "0.2.0",
+            "platforms": {
+                "windows-x86_64-portable": {
+                    "url": "https://github.com/JuryBu/CatCloud/releases/download/v0.2.0/CatCloud-0.2.0-windows-x64-portable.zip",
+                    "filename": "CatCloud-0.2.0-windows-x64-portable.zip",
+                    "sha256": good_sha
+                }
+            }
+        }))
+        .unwrap();
+        let manifest = parse_latest_manifest(&manifest_bytes).unwrap();
+        let asset = find_manifest_asset_for_stage(
+            &manifest,
+            "CatCloud-0.2.0-windows-x64-portable.zip",
+        )
+        .expect("asset matched by filename");
+
+        let mut matching_sums = HashMap::new();
+        matching_sums.insert(
+            "release-assets/CatCloud-0.2.0-windows-x64-portable.zip".to_string(),
+            good_sha.clone(),
+        );
+        assert_eq!(
+            resolve_asset_sha256(asset, Some(&matching_sums)).unwrap(),
+            good_sha
+        );
+
+        let mut mismatched_sums = HashMap::new();
+        mismatched_sums.insert(
+            "CatCloud-0.2.0-windows-x64-portable.zip".to_string(),
+            bad_sha,
+        );
+        assert!(
+            resolve_asset_sha256(asset, Some(&mismatched_sums)).is_err(),
+            "mismatched manifest sha256 vs SHA256SUMS must fail"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

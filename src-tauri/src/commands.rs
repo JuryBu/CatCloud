@@ -106,6 +106,7 @@ pub struct AppState {
     pub adapter_cooldown: Arc<AdapterCooldownGuard>,
     pub shutting_down: Arc<AtomicBool>,
     pub core_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
+    pub update_staging_lock: Arc<tokio::sync::Mutex<()>>,
     pub system_proxy_lock: Arc<std::sync::Mutex<()>>,
     pub node_proxy_name_map: RwLock<HashMap<String, String>>,
     pub compiled_group_ids: RwLock<Option<HashSet<String>>>,
@@ -210,6 +211,7 @@ impl AppState {
             adapter_cooldown: Arc::new(AdapterCooldownGuard::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             core_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
+            update_staging_lock: Arc::new(tokio::sync::Mutex::new(())),
             system_proxy_lock: Arc::new(std::sync::Mutex::new(())),
             node_proxy_name_map: RwLock::new(HashMap::new()),
             compiled_group_ids: RwLock::new(None),
@@ -473,6 +475,8 @@ pub struct UiUpdateDto {
     pub mode: UpdateApplyMode,
     pub check_interval_min: u64,
     pub include_prerelease: bool,
+    #[serde(default)]
+    pub auto_download: Option<bool>,
 }
 
 impl From<&AppConfig> for UiAppConfigDto {
@@ -531,6 +535,7 @@ impl From<&AppConfig> for UiAppConfigDto {
                 mode: cfg.update.mode.clone(),
                 check_interval_min: cfg.update.check_interval_min,
                 include_prerelease: cfg.update.include_prerelease,
+                auto_download: Some(cfg.update.auto_download),
             },
         }
     }
@@ -617,6 +622,10 @@ fn apply_ui_dto(cfg: &mut AppConfig, dto: &UiAppConfigDto) {
         mode: dto.update.mode.clone(),
         check_interval_min: dto.update.check_interval_min,
         include_prerelease: dto.update.include_prerelease,
+        auto_download: dto
+            .update
+            .auto_download
+            .unwrap_or(cfg.update.auto_download),
         ..cfg.update.clone()
     };
 }
@@ -3977,6 +3986,11 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
             "Linux 剪贴板写入失败，请安装 wl-clipboard（Wayland）或 xclip / xsel（X11）：{}",
             last_err.unwrap_or_else(|| "未找到可用剪贴板工具".to_string())
         ))
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = text;
+        Err("当前操作系统暂不支持内置剪贴板写入，请手动复制内容".to_string())
     }
 }
 
@@ -8433,8 +8447,30 @@ pub async fn import_mmrelay_input(
 }
 
 #[tauri::command]
-pub fn scan_local_migrations() -> Vec<catcloud_core::subscription::migrator::MigrationPreview> {
-    catcloud_core::subscription::migrator::scan_local_clients()
+pub async fn scan_local_migrations(
+) -> Result<Vec<catcloud_core::subscription::migrator::MigrationPreview>, String> {
+    tauri::async_runtime::spawn_blocking(catcloud_core::subscription::migrator::scan_local_clients)
+        .await
+        .map_err(|e| format!("扫描本地客户端配置任务异常中止：{e}"))
+}
+
+#[tauri::command]
+pub async fn scan_migration_path(
+    path: String,
+) -> Result<Vec<catcloud_core::subscription::migrator::MigrationPreview>, String> {
+    let trimmed = path.trim().to_string();
+    if trimmed.is_empty() {
+        return Err("请先选择需要扫描的配置文件或目录路径".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let target = std::path::Path::new(&trimmed);
+        if !target.exists() {
+            return Err(format!("指定路径不存在：{trimmed}"));
+        }
+        Ok(catcloud_core::subscription::migrator::scan_custom_path_readonly(target))
+    })
+    .await
+    .map_err(|e| format!("扫描指定迁移路径任务异常中止：{e}"))?
 }
 
 #[tauri::command]
@@ -8453,20 +8489,16 @@ pub fn preview_migration_from_text(
     }))
 }
 
-#[tauri::command]
-pub async fn apply_migration_nodes(
-    app: AppHandle,
-    state: State<'_, AppState>,
+fn persist_migration_nodes(
+    storage: &mut Storage,
     source_name: String,
     mut nodes: Vec<ProxyNode>,
-) -> Result<usize, String> {
+) -> Result<(String, usize), String> {
     if nodes.is_empty() {
         return Err("未解析到可导入的节点，已取消导入".to_string());
     }
     let sub_id = format!("migrated-{}", uuid::Uuid::new_v4().simple());
-    for n in &mut nodes {
-        n.sub_id = sub_id.clone();
-    }
+    catcloud_core::subscription::migrator::rebind_migration_nodes(&sub_id, &mut nodes);
     let sub = SubscriptionRecord {
         id: sub_id.clone(),
         name: if source_name.trim().is_empty() {
@@ -8480,10 +8512,21 @@ pub async fn apply_migration_nodes(
         enabled: true,
         ..SubscriptionRecord::default()
     };
-    let count = {
+    storage.upsert_subscription(&sub).map_err(|e| e.to_string())?;
+    let count = storage.upsert_nodes_batch(&nodes).map_err(|e| e.to_string())?;
+    Ok((sub_id, count))
+}
+
+#[tauri::command]
+pub async fn apply_migration_nodes(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_name: String,
+    nodes: Vec<ProxyNode>,
+) -> Result<usize, String> {
+    let (_sub_id, count) = {
         let mut db = state.storage.lock().map_err(|e| e.to_string())?;
-        db.upsert_subscription(&sub).map_err(|e| e.to_string())?;
-        db.upsert_nodes_batch(&nodes).map_err(|e| e.to_string())?
+        persist_migration_nodes(&mut db, source_name, nodes)?
     };
     ensure_default_group_if_empty(&state);
     let _ = trigger_reload_if_running(&app, &state, false).await;
@@ -9081,40 +9124,509 @@ pub async fn refresh_geo_db(
     }))
 }
 
-#[tauri::command]
-pub async fn check_app_update(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let mut cfg = state.snapshot_config();
+fn can_auto_stage_portable_update(is_portable_install: bool) -> bool {
+    is_portable_install && cfg!(target_os = "windows")
+}
+
+fn manifest_asset_is_zip(asset: &catcloud_core::updater::PlatformAsset) -> bool {
+    let candidate = asset
+        .filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(asset.url.as_str());
+    let without_query = candidate.split(['?', '#']).next().unwrap_or(candidate);
+    without_query.to_ascii_lowercase().ends_with(".zip")
+}
+
+fn resolve_can_auto_stage_for_manifest(
+    is_portable_install: bool,
+    platform_key: Option<&str>,
+    manifest: Option<&catcloud_core::updater::LatestManifest>,
+) -> bool {
+    if !can_auto_stage_portable_update(is_portable_install) {
+        return false;
+    }
+    let Some(key) = platform_key else {
+        return false;
+    };
+    manifest
+        .and_then(|m| m.platforms.get(key))
+        .is_some_and(manifest_asset_is_zip)
+}
+
+fn resolve_staged_update_version(
+    staging_dir: &std::path::Path,
+    current_version: &str,
+    include_prerelease: bool,
+) -> Option<String> {
+    let pending = catcloud_core::updater::verify_staged_payload_integrity(staging_dir).ok()?;
+    if catcloud_core::updater::is_update_available_for_channel(
+        &pending.target_version,
+        current_version,
+        include_prerelease,
+    )
+    .unwrap_or(false)
+    {
+        Some(pending.target_version)
+    } else {
+        None
+    }
+}
+
+fn persist_last_update_check_time(app: &AppHandle, state: &AppState, checked_at: &str) {
+    let updated_cfg = if let Ok(mut guard) = state.config.write() {
+        guard.update.last_checked_at = Some(checked_at.to_string());
+        guard.clone()
+    } else {
+        let mut fallback = state.snapshot_config();
+        fallback.update.last_checked_at = Some(checked_at.to_string());
+        fallback
+    };
+    let _ = config::save(&state.paths, &updated_cfg);
+    emit_runtime_snapshot(app, state);
+}
+
+async fn resolve_expected_archive_sha256(
+    updater: &Updater,
+    manifest: &catcloud_core::updater::LatestManifest,
+    asset: &catcloud_core::updater::PlatformAsset,
+) -> Option<String> {
+    if let Ok(inline_sha) = catcloud_core::updater::resolve_asset_sha256(asset, None) {
+        return Some(inline_sha);
+    }
+    let sums_url = manifest
+        .sha256sums_url
+        .clone()
+        .unwrap_or_else(|| updater.default_sha256sums_url());
+    if catcloud_core::updater::validate_https_url(&sums_url).is_err() {
+        return None;
+    }
+    let client = catcloud_core::updater::build_safe_http_client(
+        catcloud_core::updater::METADATA_REQUEST_TIMEOUT,
+    )
+    .ok()?;
+    let mut resp = client.get(&sums_url).send().await.ok()?;
+    if catcloud_core::updater::validate_https_url(resp.url().as_str()).is_err()
+        || !resp.status().is_success()
+    {
+        return None;
+    }
+    if resp
+        .content_length()
+        .is_some_and(|cl| cl > catcloud_core::updater::MAX_METADATA_BYTES as u64)
+    {
+        return None;
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if buf.len().saturating_add(chunk.len()) > catcloud_core::updater::MAX_METADATA_BYTES {
+            return None;
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let sums_text = String::from_utf8(buf).ok()?;
+    let sums_map = catcloud_core::updater::parse_sha256sums(&sums_text).ok()?;
+    catcloud_core::updater::resolve_asset_sha256(asset, Some(&sums_map)).ok()
+}
+
+/// Download, SHA256-verify, and stage a portable update archive from an already-fetched manifest.
+/// Caller MUST hold `state.update_staging_lock`.
+#[allow(clippy::too_many_arguments)]
+async fn stage_update_from_manifest_locked(
+    app: &AppHandle,
+    state: &AppState,
+    updater: &Updater,
+    res: &catcloud_core::updater::UpdateCheckResult,
+    update_available: bool,
+    is_portable_install: bool,
+    platform_key: Option<&'static str>,
+    release_url: &str,
+    silent_background: bool,
+) -> Result<serde_json::Value, String> {
+    let can_auto_stage =
+        resolve_can_auto_stage_for_manifest(is_portable_install, platform_key, Some(&res.manifest));
+    let download_url = platform_key
+        .and_then(|key| res.manifest.platforms.get(key))
+        .map(|asset| asset.url.clone());
+
+    if !update_available {
+        return Ok(serde_json::json!({
+            "staged": false,
+            "reused": false,
+            "already_latest": true,
+            "can_auto_stage": can_auto_stage,
+            "current_version": res.current_version,
+            "latest_version": res.latest_version,
+            "target_version": null,
+            "archive_sha256": null,
+            "platform_key": platform_key,
+            "release_url": release_url,
+            "download_url": download_url,
+            "message": format!("当前已是最新版本 v{}", res.current_version),
+        }));
+    }
+
+    let (Some(key), Some(asset)) = (
+        platform_key,
+        platform_key.and_then(|k| res.manifest.platforms.get(k)),
+    ) else {
+        let guide_msg = format!(
+            "当前系统架构暂未提供自动预置更新包，请前往官方 Release 页面下载 v{} 安装包",
+            res.latest_version
+        );
+        if !silent_background {
+            state.log_app_event("info", "软件更新", &guide_msg);
+        }
+        return Ok(serde_json::json!({
+            "staged": false,
+            "reused": false,
+            "already_latest": false,
+            "can_auto_stage": false,
+            "current_version": res.current_version,
+            "latest_version": res.latest_version,
+            "target_version": res.latest_version,
+            "archive_sha256": null,
+            "platform_key": platform_key,
+            "release_url": release_url,
+            "download_url": download_url,
+            "message": guide_msg,
+        }));
+    };
+
+    if !can_auto_stage {
+        let guide_msg = if cfg!(target_os = "windows") {
+            format!(
+                "当前为安装版或未提供便携 ZIP 更新包，请前往官方 Release 页面下载 v{} 安装包",
+                res.latest_version
+            )
+        } else {
+            format!(
+                "当前平台（{key}）请前往官方 Release 页面下载 v{} 安装包完成更新",
+                res.latest_version
+            )
+        };
+        if !silent_background {
+            state.log_app_event("info", "软件更新", &guide_msg);
+        }
+        return Ok(serde_json::json!({
+            "staged": false,
+            "reused": false,
+            "already_latest": false,
+            "can_auto_stage": false,
+            "current_version": res.current_version,
+            "latest_version": res.latest_version,
+            "target_version": res.latest_version,
+            "archive_sha256": null,
+            "platform_key": Some(key),
+            "release_url": release_url,
+            "download_url": download_url,
+            "message": guide_msg,
+        }));
+    }
+
+    let expected_sha = resolve_expected_archive_sha256(updater, &res.manifest, asset).await;
+    if state.paths.staging_dir.exists() {
+        match catcloud_core::updater::verify_staged_payload_integrity(&state.paths.staging_dir) {
+            Ok(existing) => {
+                let version_matches = existing.target_version == res.latest_version;
+                let sha_matches = expected_sha
+                    .as_deref()
+                    .is_some_and(|exp| existing.archive_sha256.eq_ignore_ascii_case(exp));
+                if version_matches && sha_matches {
+                    let msg = format!(
+                        "v{} 更新包已在本地完成校验，下次重启猫猫云梯时自动生效",
+                        existing.target_version
+                    );
+                    if !silent_background {
+                        state.log_app_event("info", "软件更新", &msg);
+                    }
+                    return Ok(serde_json::json!({
+                        "staged": true,
+                        "reused": true,
+                        "already_latest": false,
+                        "can_auto_stage": true,
+                        "current_version": res.current_version,
+                        "latest_version": res.latest_version,
+                        "target_version": existing.target_version,
+                        "archive_sha256": existing.archive_sha256,
+                        "platform_key": Some(key),
+                        "release_url": release_url,
+                        "download_url": download_url,
+                        "message": msg,
+                    }));
+                }
+                if version_matches && expected_sha.is_some() && !sha_matches {
+                    state.log_app_event(
+                        "warning",
+                        "软件更新",
+                        &format!(
+                            "检测到本地预置的 v{} 更新包摘要与最新清单不一致，已清理缓存并重新下载校验",
+                            existing.target_version
+                        ),
+                    );
+                    let _ = std::fs::remove_dir_all(&state.paths.staging_dir);
+                }
+            }
+            Err(err) => {
+                state.log_app_event(
+                    "warning",
+                    "软件更新",
+                    &format!("检测到本地预置更新包损坏或缺失（{err}），已清理并重新下载"),
+                );
+                let _ = std::fs::remove_dir_all(&state.paths.staging_dir);
+            }
+        }
+    }
+
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return Err("应用正在退出，已取消更新包下载".to_string());
+    }
+
+    state.log_app_event(
+        "info",
+        "软件更新",
+        &format!(
+            "{}下载并校验 v{} 便携更新包（平台：{key}）",
+            if silent_background { "后台自动" } else { "开始" },
+            res.latest_version
+        ),
+    );
+
+    let staged = updater
+        .download_and_stage(&res.manifest, key, &state.paths.staging_dir)
+        .await
+        .map_err(|e| {
+            let err_msg = format!("下载或校验 v{} 更新包失败：{e}", res.latest_version);
+            state.log_app_event(
+                if silent_background { "warning" } else { "error" },
+                "软件更新",
+                &err_msg,
+            );
+            err_msg
+        })?;
+
+    let short_sha: String = staged.archive_sha256.chars().take(12).collect();
+    let ok_msg = format!(
+        "已{}下载并完成 SHA256 校验 v{}（{short_sha}），下次重启猫猫云梯时自动替换生效",
+        if silent_background { "在后台自动" } else { "" },
+        staged.target_version
+    );
+    state.log_app_event("info", "软件更新", &ok_msg);
+    emit_runtime_snapshot(app, state);
+
+    Ok(serde_json::json!({
+        "staged": true,
+        "reused": false,
+        "already_latest": false,
+        "can_auto_stage": true,
+        "current_version": res.current_version,
+        "latest_version": res.latest_version,
+        "target_version": staged.target_version,
+        "archive_sha256": staged.archive_sha256,
+        "platform_key": Some(key),
+        "release_url": release_url,
+        "download_url": download_url,
+        "message": ok_msg,
+    }))
+}
+
+pub(crate) async fn check_and_optionally_stage_update_internal(
+    app: &AppHandle,
+    state: &AppState,
+    allow_auto_stage: bool,
+) -> Result<serde_json::Value, String> {
+    let cfg = state.snapshot_config();
     let current = env!("CARGO_PKG_VERSION").to_string();
     let checked_at = Utc::now().to_rfc3339();
+    let repo_clean = cfg.update.repo.trim().trim_matches('/');
+    let release_url = format!("https://github.com/{repo_clean}/releases/latest");
+    let is_portable_install = state.paths.is_self_updatable_portable();
+    let platform_key = catcloud_core::updater::current_update_platform_key_opt(is_portable_install);
+
     let updater = Updater::new(cfg.update.repo.clone(), current.clone())
         .map_err(|e| e.to_string())?;
     match updater.check_latest(None).await {
         Ok(res) => {
-            cfg.update.last_checked_at = Some(checked_at.clone());
-            let _ = config::save(&state.paths, &cfg);
-            if let Ok(mut guard) = state.config.write() {
-                *guard = cfg.clone();
+            persist_last_update_check_time(app, state, &checked_at);
+
+            let latest_cfg = state.snapshot_config();
+            let update_available = catcloud_core::updater::is_update_available_for_channel(
+                &res.latest_version,
+                &current,
+                latest_cfg.update.include_prerelease,
+            )
+            .unwrap_or(false);
+            let can_auto_stage = resolve_can_auto_stage_for_manifest(
+                is_portable_install,
+                platform_key,
+                Some(&res.manifest),
+            );
+            let download_url = platform_key
+                .and_then(|key| res.manifest.platforms.get(key))
+                .map(|asset| asset.url.clone());
+
+            let mut staged_version = if let Ok(_guard) = state.update_staging_lock.try_lock() {
+                resolve_staged_update_version(
+                    &state.paths.staging_dir,
+                    &current,
+                    latest_cfg.update.include_prerelease,
+                )
+            } else {
+                None
+            };
+
+            let mut auto_staged = false;
+            let mut auto_stage_reused = false;
+            if allow_auto_stage && update_available && can_auto_stage {
+                let _staging_guard = state.update_staging_lock.lock().await;
+                if !state.shutting_down.load(Ordering::SeqCst) {
+                    match stage_update_from_manifest_locked(
+                        app,
+                        state,
+                        &updater,
+                        &res,
+                        update_available,
+                        is_portable_install,
+                        platform_key,
+                        &release_url,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(stage_val) => {
+                            if stage_val
+                                .get("staged")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                auto_staged = true;
+                                auto_stage_reused = stage_val
+                                    .get("reused")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                staged_version = stage_val
+                                    .get("target_version")
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                                    .or(staged_version);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!("background auto-stage update failed: {err}");
+                        }
+                    }
+                }
             }
+
             Ok(serde_json::json!({
-                "has_update": res.update_available,
+                "has_update": update_available,
                 "current_version": res.current_version,
                 "latest_version": res.latest_version,
-                "release_url": format!("https://github.com/{}/releases/latest", cfg.update.repo.trim_matches('/')),
+                "release_url": release_url,
                 "notes": res.notes,
                 "checked_at": checked_at,
+                "staged_version": staged_version,
+                "platform_key": platform_key,
+                "can_auto_stage": can_auto_stage,
+                "download_url": download_url,
+                "auto_staged": auto_staged,
+                "auto_stage_reused": auto_stage_reused,
                 "error": null
             }))
         }
-        Err(err) => Ok(serde_json::json!({
-            "has_update": false,
-            "current_version": current,
-            "latest_version": current,
-            "release_url": format!("https://github.com/{}/releases/latest", cfg.update.repo.trim_matches('/')),
-            "notes": "",
-            "checked_at": checked_at,
-            "error": err.to_string()
-        })),
+        Err(err) => {
+            let staged_version = if let Ok(_guard) = state.update_staging_lock.try_lock() {
+                resolve_staged_update_version(
+                    &state.paths.staging_dir,
+                    &current,
+                    cfg.update.include_prerelease,
+                )
+            } else {
+                None
+            };
+            Ok(serde_json::json!({
+                "has_update": false,
+                "current_version": current,
+                "latest_version": current,
+                "release_url": release_url,
+                "notes": "",
+                "checked_at": checked_at,
+                "staged_version": staged_version,
+                "platform_key": platform_key,
+                "can_auto_stage": false,
+                "download_url": null,
+                "auto_staged": false,
+                "auto_stage_reused": false,
+                "error": err.to_string()
+            }))
+        }
     }
+}
+
+pub(crate) async fn download_and_stage_update_internal(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<serde_json::Value, String> {
+    let _staging_guard = state.update_staging_lock.lock().await;
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return Err("应用正在退出，已取消下载更新".to_string());
+    }
+
+    let cfg = state.snapshot_config();
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    let checked_at = Utc::now().to_rfc3339();
+    let repo_clean = cfg.update.repo.trim().trim_matches('/');
+    let release_url = format!("https://github.com/{repo_clean}/releases/latest");
+    let is_portable_install = state.paths.is_self_updatable_portable();
+    let platform_key = catcloud_core::updater::current_update_platform_key_opt(is_portable_install);
+
+    let updater = Updater::new(cfg.update.repo.clone(), current.clone())
+        .map_err(|e| e.to_string())?;
+    let res = updater.check_latest(None).await.map_err(|e| {
+        let msg = format!("检查最新版本失败：{e}");
+        state.log_app_event("warning", "软件更新", &msg);
+        msg
+    })?;
+
+    persist_last_update_check_time(app, state, &checked_at);
+
+    let latest_cfg = state.snapshot_config();
+    let update_available = catcloud_core::updater::is_update_available_for_channel(
+        &res.latest_version,
+        &current,
+        latest_cfg.update.include_prerelease,
+    )
+    .unwrap_or(false);
+
+    stage_update_from_manifest_locked(
+        app,
+        state,
+        &updater,
+        &res,
+        update_available,
+        is_portable_install,
+        platform_key,
+        &release_url,
+        false,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn check_app_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    check_and_optionally_stage_update_internal(&app, &state, false).await
+}
+
+#[tauri::command]
+pub async fn download_and_stage_update(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    download_and_stage_update_internal(&app, &state).await
 }
 
 #[tauri::command]
@@ -9521,6 +10033,72 @@ pub async fn open_web_ui(
             .map_err(|e| e.to_string())?;
     }
     Ok(sanitized_url)
+}
+
+/// Validate an external HTTPS URL for OS browser launch:
+/// strictly trims whitespace, rejects control characters, requires `https://`,
+/// forbids embedded userinfo credentials, and never appends controller host/port/secret.
+fn validate_external_https_url(raw: &str) -> Result<String, String> {
+    if raw.chars().any(|c| c.is_control()) {
+        return Err("外部链接包含非法控制字符，已拒绝打开".to_string());
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("外部链接不能为空".to_string());
+    }
+    if trimmed.len() <= 8 || !trimmed[..8].eq_ignore_ascii_case("https://") {
+        return Err("仅允许打开安全的 https:// 外部链接".to_string());
+    }
+    if matches!(trimmed.as_bytes().get(8), Some(b'/' | b'\\')) {
+        return Err("外部链接缺少有效主机名".to_string());
+    }
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|e| format!("外部链接格式无效：{e}"))?;
+    if parsed.scheme() != "https" {
+        return Err("仅允许打开安全的 https:// 外部链接".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("外部链接不允许包含账号或密码凭据".to_string());
+    }
+    let host = parsed.host_str().map(str::trim).unwrap_or("");
+    if host.is_empty() {
+        return Err("外部链接缺少有效主机名".to_string());
+    }
+    Ok(parsed.to_string())
+}
+
+#[tauri::command]
+pub async fn open_external_url(url: String) -> Result<String, String> {
+    let safe_url = validate_external_https_url(&url)?;
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(&safe_url)
+            .spawn()
+            .map_err(|e| format!("无法打开外部链接：{e}"))?;
+        Ok(safe_url)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&safe_url)
+            .spawn()
+            .map_err(|e| format!("无法打开外部链接：{e}"))?;
+        Ok(safe_url)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&safe_url)
+            .spawn()
+            .map_err(|e| format!("无法打开外部链接：{e}"))?;
+        Ok(safe_url)
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        let _ = safe_url;
+        Err("当前操作系统暂不支持自动打开外部链接，请手动复制链接后在浏览器打开".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -11342,5 +11920,367 @@ mod tests {
             target_cfg.preaccel.windivert_dir.as_deref(),
             Some("C:/Custom/WinDivert")
         );
+    }
+
+    #[test]
+    fn apply_migration_nodes_rebinds_ids_without_primary_key_collision() {
+        let mut storage = Storage::open_in_memory().expect("open in-memory storage");
+
+        let sample_nodes = vec![
+            ProxyNode {
+                id: "node_duplicate_preview_1".to_string(),
+                sub_id: "preview_clash_verge".to_string(),
+                name: "HK 01".to_string(),
+                protocol: "trojan".to_string(),
+                server: "203.0.113.10".to_string(),
+                port: 443,
+                raw_config: serde_json::json!({
+                    "name": "HK 01",
+                    "type": "trojan",
+                    "server": "203.0.113.10",
+                    "port": 443,
+                    "password": "placeholder-password"
+                }),
+                region_code: "HK".to_string(),
+                multiplier: 1.0,
+                is_443_native: true,
+                preaccel_eligible: true,
+                preaccel_override: None,
+                tags: Vec::new(),
+                enabled: true,
+            },
+            ProxyNode {
+                id: "node_duplicate_preview_1".to_string(),
+                sub_id: "preview_clash_verge".to_string(),
+                name: "HK 01".to_string(),
+                protocol: "trojan".to_string(),
+                server: "203.0.113.10".to_string(),
+                port: 443,
+                raw_config: serde_json::json!({
+                    "name": "HK 01",
+                    "type": "trojan",
+                    "server": "203.0.113.10",
+                    "port": 443,
+                    "password": "placeholder-password"
+                }),
+                region_code: "HK".to_string(),
+                multiplier: 1.0,
+                is_443_native: true,
+                preaccel_eligible: true,
+                preaccel_override: None,
+                tags: Vec::new(),
+                enabled: true,
+            },
+            ProxyNode {
+                id: "node_duplicate_preview_2".to_string(),
+                sub_id: "preview_clash_verge".to_string(),
+                name: "JP 01".to_string(),
+                protocol: "vless".to_string(),
+                server: "198.51.100.20".to_string(),
+                port: 443,
+                raw_config: serde_json::json!({
+                    "name": "JP 01",
+                    "type": "vless",
+                    "server": "198.51.100.20",
+                    "port": 443,
+                    "uuid": "00000000-0000-4000-8000-000000000099"
+                }),
+                region_code: "JP".to_string(),
+                multiplier: 1.0,
+                is_443_native: true,
+                preaccel_eligible: true,
+                preaccel_override: None,
+                tags: Vec::new(),
+                enabled: true,
+            },
+        ];
+
+        assert!(persist_migration_nodes(&mut storage, "空导入".to_string(), Vec::new()).is_err());
+
+        let (sub1, count1) =
+            persist_migration_nodes(&mut storage, "迁移批次 A".to_string(), sample_nodes.clone())
+                .expect("first migration import");
+        let (sub2, count2) =
+            persist_migration_nodes(&mut storage, "迁移批次 B".to_string(), sample_nodes)
+                .expect("second migration import");
+
+        assert_eq!(count1, 3);
+        assert_eq!(count2, 3);
+        assert_ne!(sub1, sub2);
+
+        let all_nodes = storage.list_nodes().expect("list persisted nodes");
+        assert_eq!(
+            all_nodes.len(),
+            6,
+            "repeated migrations with identical node names must never collide or overwrite"
+        );
+
+        let unique_ids: HashSet<&str> = all_nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(unique_ids.len(), 6);
+        assert!(all_nodes.iter().all(|n| n.id.starts_with("node_")));
+        assert_eq!(all_nodes.iter().filter(|n| n.sub_id == sub1).count(), 3);
+        assert_eq!(all_nodes.iter().filter(|n| n.sub_id == sub2).count(), 3);
+    }
+
+    #[test]
+    fn update_platform_keys_and_staging_status_helpers_align() {
+        assert_eq!(
+            catcloud_core::updater::update_platform_key_for("windows", "x86_64", true),
+            "windows-x86_64-portable"
+        );
+        assert_eq!(
+            catcloud_core::updater::update_platform_key_for("windows", "x86_64", false),
+            "windows-x86_64"
+        );
+        assert_eq!(
+            catcloud_core::updater::update_platform_key_for("windows", "aarch64", true),
+            "windows-aarch64-portable"
+        );
+        assert_eq!(
+            catcloud_core::updater::update_platform_key_for("windows", "aarch64", false),
+            "windows-aarch64"
+        );
+        assert_eq!(
+            catcloud_core::updater::update_platform_key_for("macos", "aarch64", false),
+            "darwin-aarch64"
+        );
+        assert_eq!(
+            catcloud_core::updater::update_platform_key_for("macos", "x86_64", false),
+            "darwin-x86_64"
+        );
+        assert_eq!(
+            catcloud_core::updater::update_platform_key_for("linux", "x86_64", false),
+            "linux-x86_64"
+        );
+
+        assert_eq!(
+            can_auto_stage_portable_update(true),
+            cfg!(target_os = "windows")
+        );
+        assert!(!can_auto_stage_portable_update(false));
+
+        let current_portable_key = catcloud_core::updater::current_update_platform_key_opt(true);
+        let current_standard_key = catcloud_core::updater::current_update_platform_key_opt(false);
+        if cfg!(target_os = "windows") {
+            assert!(current_portable_key.is_some_and(|k| k.ends_with("-portable")));
+            assert!(current_standard_key.is_some_and(|k| !k.ends_with("-portable")));
+        } else {
+            assert_eq!(current_portable_key, current_standard_key);
+        }
+
+        // Verify unified `can_auto_stage` rules across `check_app_update` and `download_and_stage_update`.
+        let mut platforms = HashMap::new();
+        platforms.insert(
+            "windows-x86_64-portable".to_string(),
+            catcloud_core::updater::PlatformAsset {
+                url: "https://github.com/JuryBu/CatCloud/releases/download/v0.2.0/CatCloud-portable.zip"
+                    .to_string(),
+                signature: None,
+                sha256: Some("a".repeat(64)),
+                filename: Some("CatCloud-portable.zip".to_string()),
+            },
+        );
+        platforms.insert(
+            "windows-x86_64".to_string(),
+            catcloud_core::updater::PlatformAsset {
+                url: "https://github.com/JuryBu/CatCloud/releases/download/v0.2.0/CatCloud-setup.exe"
+                    .to_string(),
+                signature: None,
+                sha256: Some("b".repeat(64)),
+                filename: Some("CatCloud-setup.exe".to_string()),
+            },
+        );
+        let manifest = catcloud_core::updater::LatestManifest {
+            version: "0.2.0".to_string(),
+            notes: String::new(),
+            pub_date: None,
+            sha256sums_url: None,
+            platforms,
+        };
+        assert_eq!(
+            resolve_can_auto_stage_for_manifest(
+                true,
+                Some("windows-x86_64-portable"),
+                Some(&manifest)
+            ),
+            cfg!(target_os = "windows")
+        );
+        assert!(!resolve_can_auto_stage_for_manifest(
+            false,
+            Some("windows-x86_64-portable"),
+            Some(&manifest)
+        ));
+        assert!(!resolve_can_auto_stage_for_manifest(
+            true,
+            Some("windows-x86_64"),
+            Some(&manifest)
+        ));
+        assert!(!resolve_can_auto_stage_for_manifest(
+            true,
+            None,
+            Some(&manifest)
+        ));
+        assert!(!resolve_can_auto_stage_for_manifest(
+            true,
+            Some("windows-x86_64-portable"),
+            None
+        ));
+
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_upd_helper_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let staging_dir = tmp.join(".update_staging");
+        let payload_dir = staging_dir.join(catcloud_core::updater::STAGING_PAYLOAD_DIR);
+        std::fs::create_dir_all(&payload_dir).expect("create staging payload dir");
+
+        assert_eq!(
+            resolve_staged_update_version(&staging_dir, "0.1.0", false),
+            None
+        );
+
+        let version_payload = br#"{"version":"0.2.0"}"#;
+        let version_sha = catcloud_core::updater::compute_sha256_hex(version_payload);
+        std::fs::write(payload_dir.join("version.json"), version_payload)
+            .expect("write staged payload file");
+
+        let pending = catcloud_core::updater::PendingUpdateMetadata {
+            from_version: "0.1.0".to_string(),
+            target_version: "0.2.0".to_string(),
+            archive_sha256: "a".repeat(64),
+            staged_at: Utc::now().to_rfc3339(),
+            files: vec![catcloud_core::updater::StagedFileEntry {
+                rel_path: "version.json".to_string(),
+                sha256: version_sha.clone(),
+                size_bytes: version_payload.len() as u64,
+            }],
+        };
+        let bytes = serde_json::to_vec_pretty(&pending).expect("serialize pending manifest");
+        std::fs::write(
+            staging_dir.join(catcloud_core::updater::PENDING_APPLY_MANIFEST),
+            bytes,
+        )
+        .expect("write pending manifest");
+
+        assert_eq!(
+            resolve_staged_update_version(&staging_dir, "0.1.0", false).as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            resolve_staged_update_version(&staging_dir, "0.2.0", false),
+            None
+        );
+
+        // Prerelease staged target is gated on `include_prerelease`.
+        let pre_pending = catcloud_core::updater::PendingUpdateMetadata {
+            target_version: "0.2.0-rc.1".to_string(),
+            ..pending
+        };
+        std::fs::write(
+            staging_dir.join(catcloud_core::updater::PENDING_APPLY_MANIFEST),
+            serde_json::to_vec_pretty(&pre_pending).expect("serialize prerelease manifest"),
+        )
+        .expect("write prerelease manifest");
+        assert_eq!(
+            resolve_staged_update_version(&staging_dir, "0.1.0", false),
+            None
+        );
+        assert_eq!(
+            resolve_staged_update_version(&staging_dir, "0.1.0", true).as_deref(),
+            Some("0.2.0-rc.1")
+        );
+
+        // Tampering with staged payload must fail integrity verification and return None.
+        std::fs::write(payload_dir.join("version.json"), b"CORRUPTED_BYTES")
+            .expect("corrupt staged payload");
+        assert_eq!(
+            resolve_staged_update_version(&staging_dir, "0.1.0", true),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn validate_external_https_url_accepts_clean_https_and_trims() {
+        let ok = validate_external_https_url(
+            "  https://github.com/JuryBu/CatCloud/releases/latest?tag=v0.2.0#assets  ",
+        )
+        .expect("valid https url should pass");
+        assert_eq!(
+            ok,
+            "https://github.com/JuryBu/CatCloud/releases/latest?tag=v0.2.0#assets"
+        );
+        assert!(!ok.contains("secret="));
+        assert!(!ok.contains("hostname="));
+    }
+
+    #[test]
+    fn validate_external_https_url_rejects_non_https_userinfo_and_control_chars() {
+        for bad in [
+            "",
+            "   ",
+            "http://github.com/JuryBu/CatCloud",
+            "file:///C:/Windows/System32/calc.exe",
+            "javascript:alert(1)",
+            "https:///missing-host",
+            "https://user:pass@github.com/JuryBu/CatCloud",
+            "https://token@github.com/JuryBu/CatCloud",
+            "https://github.com/JuryBu/CatCloud\r\nX-Injected: 1",
+            "https://github.com/JuryBu/CatCloud\x00",
+            "https://github.com/JuryBu/CatCloud\t",
+            "not a url",
+        ] {
+            assert!(
+                validate_external_https_url(bad).is_err(),
+                "expected external URL validator to reject: {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ui_update_dto_roundtrips_auto_download_and_preserves_legacy_none() {
+        let mut cfg = AppConfig::default();
+        cfg.update.auto_download = false;
+        cfg.update.include_prerelease = true;
+        cfg.update.check_interval_min = 120;
+        cfg.update.mode = UpdateApplyMode::Manual;
+
+        let dto = UiAppConfigDto::from(&cfg);
+        assert_eq!(dto.update.auto_download, Some(false));
+        assert!(dto.update.include_prerelease);
+        assert_eq!(dto.update.check_interval_min, 120);
+        assert_eq!(dto.update.mode, UpdateApplyMode::Manual);
+
+        let mut target = AppConfig::default();
+        assert!(target.update.auto_download);
+        apply_ui_dto(&mut target, &dto);
+        assert!(!target.update.auto_download);
+        assert!(target.update.include_prerelease);
+        assert_eq!(target.update.check_interval_min, 120);
+        assert_eq!(target.update.mode, UpdateApplyMode::Manual);
+
+        let mut enable_dto = dto.clone();
+        enable_dto.update.auto_download = Some(true);
+        apply_ui_dto(&mut target, &enable_dto);
+        assert!(target.update.auto_download);
+
+        // Legacy payload omitting `auto_download` deserializes as `None` and preserves current value.
+        let mut raw_val = serde_json::to_value(&dto).expect("serialize dto");
+        raw_val["update"]
+            .as_object_mut()
+            .expect("update object")
+            .remove("auto_download");
+        let legacy_dto: UiAppConfigDto =
+            serde_json::from_value(raw_val).expect("deserialize legacy dto without auto_download");
+        assert_eq!(legacy_dto.update.auto_download, None);
+
+        target.update.auto_download = true;
+        apply_ui_dto(&mut target, &legacy_dto);
+        assert!(target.update.auto_download);
+
+        target.update.auto_download = false;
+        apply_ui_dto(&mut target, &legacy_dto);
+        assert!(!target.update.auto_download);
     }
 }

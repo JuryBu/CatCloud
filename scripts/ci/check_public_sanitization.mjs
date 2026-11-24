@@ -64,6 +64,14 @@ const FORBIDDEN_PATTERNS = [
     name: "private_local_brain",
     re: /plans_agy|\.gemini[\\/]antigravity[\\/]brain/i,
   },
+  {
+    name: "private_vendor_process",
+    re: /mihomotag-serv|ShaYuCore|yeshayunCore/i,
+  },
+  {
+    name: "private_vendor_name",
+    re: /落云|夜煞云|鲨鱼云|TAGv2/i,
+  },
 ];
 
 const IPV4_RE = /\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g;

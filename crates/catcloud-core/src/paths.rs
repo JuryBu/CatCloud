@@ -174,6 +174,44 @@ impl AppPaths {
         }
     }
 
+    /// Return `true` strictly when the running executable belongs to a true self-updatable
+    /// portable layout: `<exe_dir>/portable.flag` or `<exe_dir>/data/` exists AND the resolved
+    /// `root_data_dir` resides inside `<exe_dir>` after path normalization.
+    ///
+    /// Installed builds relaunched with `--data-dir %APPDATA%\CatCloud` (for example after UAC
+    /// elevation) or isolated `--data-dir %TEMP%\...` sandboxes always return `false`, ensuring
+    /// portable ZIP self-updates never overwrite an installed application directory.
+    pub fn is_self_updatable_portable(&self) -> bool {
+        let Some(exe_dir) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+        else {
+            return false;
+        };
+        self.is_self_updatable_portable_for_exe_dir(&exe_dir)
+    }
+
+    /// Deterministic variant of `is_self_updatable_portable` accepting an explicit executable
+    /// directory for unit tests and diagnostics.
+    pub fn is_self_updatable_portable_for_exe_dir(&self, exe_dir: &Path) -> bool {
+        if !self.is_portable {
+            return false;
+        }
+        let flag = exe_dir.join("portable.flag");
+        let sibling_data = exe_dir.join("data");
+        if !flag.is_file() && !sibling_data.is_dir() {
+            return false;
+        }
+        let norm_exe_dir = normalize_os_path(
+            &std::fs::canonicalize(exe_dir).unwrap_or_else(|_| exe_dir.to_path_buf()),
+        );
+        let norm_root = normalize_os_path(
+            &std::fs::canonicalize(&self.root_data_dir)
+                .unwrap_or_else(|_| self.root_data_dir.clone()),
+        );
+        path_is_within_dir(&norm_root, &norm_exe_dir)
+    }
+
     /// Parse `--data-dir <PATH>` from raw process args before Tauri initializes.
     pub fn parse_cli_data_dir_from_args() -> Option<PathBuf> {
         let mut args = std::env::args_os().skip(1);
@@ -294,6 +332,38 @@ impl AppPaths {
             }
             Ok(())
         }
+    }
+}
+
+fn path_is_within_dir(child: &Path, parent: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::Component;
+        let parent_comps: Vec<Component<'_>> = parent.components().collect();
+        if parent_comps.is_empty() {
+            return false;
+        }
+        let child_comps: Vec<Component<'_>> = child.components().collect();
+        if child_comps.len() < parent_comps.len() {
+            return false;
+        }
+        parent_comps
+            .iter()
+            .zip(child_comps.iter())
+            .all(|(p, c)| match (p, c) {
+                (Component::Normal(a), Component::Normal(b)) => {
+                    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+                }
+                (Component::Prefix(a), Component::Prefix(b)) => a
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()),
+                (a, b) => a == b,
+            })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        !parent.as_os_str().is_empty() && child.starts_with(parent)
     }
 }
 
@@ -418,5 +488,58 @@ mod tests {
                 PathBuf::from("/var/lib/catcloud")
             );
         }
+    }
+
+    #[test]
+    fn is_self_updatable_portable_requires_marker_and_data_dir_inside_exe_dir() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-portable-detect-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let portable_exe_dir = root.join("app");
+        let sibling_prefix_dir = root.join("app_external");
+        let installed_exe_dir = root.join("program_files_catcloud");
+        let external_appdata_dir = root.join("appdata_catcloud");
+        let sandbox_temp_dir = root.join("temp_sandbox");
+
+        std::fs::create_dir_all(&portable_exe_dir).unwrap();
+        std::fs::create_dir_all(&installed_exe_dir).unwrap();
+        std::fs::write(portable_exe_dir.join("portable.flag"), b"1").unwrap();
+
+        // 1. True portable deployment: marker present and data dir lives inside exe_dir.
+        let portable_paths =
+            AppPaths::from_data_dir(portable_exe_dir.join("data"), true).expect("portable paths");
+        assert!(portable_paths.is_self_updatable_portable_for_exe_dir(&portable_exe_dir));
+
+        // 2. Sibling `data/` directory alone (without portable.flag) also qualifies.
+        std::fs::remove_file(portable_exe_dir.join("portable.flag")).unwrap();
+        assert!(portable_paths.is_self_updatable_portable_for_exe_dir(&portable_exe_dir));
+
+        // Re-create portable.flag for remaining negative checks.
+        std::fs::write(portable_exe_dir.join("portable.flag"), b"1").unwrap();
+
+        // 3. Explicit `is_portable = false` must never be treated as self-updatable portable.
+        let non_portable_flag_paths =
+            AppPaths::from_data_dir(portable_exe_dir.join("data"), false).expect("non-portable");
+        assert!(!non_portable_flag_paths.is_self_updatable_portable_for_exe_dir(&portable_exe_dir));
+
+        // 4. Sandbox `--data-dir %TEMP%` instance running from a portable folder must return false.
+        let sandbox_paths =
+            AppPaths::from_data_dir(sandbox_temp_dir, true).expect("sandbox paths");
+        assert!(!sandbox_paths.is_self_updatable_portable_for_exe_dir(&portable_exe_dir));
+
+        // 5. Installed build elevated with `--data-dir %APPDATA%\CatCloud` must return false.
+        let elevated_installed_paths =
+            AppPaths::from_data_dir(external_appdata_dir, true).expect("elevated installed paths");
+        assert!(
+            !elevated_installed_paths.is_self_updatable_portable_for_exe_dir(&installed_exe_dir)
+        );
+
+        // 6. Sibling directory sharing a string prefix (`app_external` vs `app`) must return false.
+        let sibling_prefix_paths =
+            AppPaths::from_data_dir(sibling_prefix_dir.join("data"), true).expect("sibling paths");
+        assert!(!sibling_prefix_paths.is_self_updatable_portable_for_exe_dir(&portable_exe_dir));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

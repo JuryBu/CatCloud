@@ -3,19 +3,16 @@ export type PlatformOs = "windows" | "macos" | "linux";
 export type ShellEnvKind = "powershell" | "cmd" | "bash" | "zsh" | "fish";
 
 export const DEFAULT_GLOBAL_TARGET_PROCESSES: readonly string[] = [
-  "mihomotag-serv.exe",
-  "FlClashCore.exe",
-  "ShaYuCore.exe",
-  "yeshayunCore.exe",
   "verge-mihomo.exe",
-  "clash-meta.exe",
   "mihomo.exe",
+  "FlClashCore.exe",
+  "clash-meta.exe",
   "xray.exe",
   "sing-box.exe",
+  "ssh.exe",
+  "scp.exe",
   "v2ray.exe",
   "v2rayN.exe",
-  "scp.exe",
-  "ssh.exe",
   "sftp.exe",
   "rsync.exe",
 ] as const;

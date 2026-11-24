@@ -16,6 +16,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import { catcloudApi, isTauriEnv } from "../api/tauri";
 import { appActions, useAppSelector } from "../store/appStore";
+import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 
 export type LogLevel = "debug" | "info" | "warning" | "error";
 
@@ -63,6 +64,34 @@ const LEVEL_META: Record<
 };
 
 const ALL_LEVELS: readonly LogLevel[] = ["debug", "info", "warning", "error"] as const;
+
+const DEFAULT_ENABLED_LEVELS: Record<LogLevel, boolean> = {
+  debug: true,
+  info: true,
+  warning: true,
+  error: true,
+};
+
+function validateEnabledLevels(raw: unknown): Record<LogLevel, boolean> | undefined {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const rec = raw as Record<string, unknown>;
+  if (
+    typeof rec.debug !== "boolean" ||
+    typeof rec.info !== "boolean" ||
+    typeof rec.warning !== "boolean" ||
+    typeof rec.error !== "boolean"
+  ) {
+    return undefined;
+  }
+  return {
+    debug: rec.debug,
+    info: rec.info,
+    warning: rec.warning,
+    error: rec.error,
+  };
+}
 
 function formatNowClock(date: Date = new Date()): string {
   const hh = String(date.getHours()).padStart(2, "0");
@@ -488,15 +517,18 @@ export function LogsPage() {
   }));
   const [paused, setPaused] = useState<boolean>(false);
   const [bufferedWhilePaused, setBufferedWhilePaused] = useState<number>(0);
-  const [autoScroll, setAutoScroll] = useState<boolean>(true);
+  const [autoScroll, setAutoScroll] = usePersistedState<boolean>(
+    "logs.autoScroll",
+    true,
+    isBoolPref
+  );
   const [keyword, setKeyword] = useState<string>("");
   const [renderLimit, setRenderLimit] = useState<number>(DEFAULT_RENDER_LIMIT);
-  const [enabledLevels, setEnabledLevels] = useState<Record<LogLevel, boolean>>({
-    debug: true,
-    info: true,
-    warning: true,
-    error: true,
-  });
+  const [enabledLevels, setEnabledLevels] = usePersistedState<Record<LogLevel, boolean>>(
+    "logs.enabledLevels",
+    DEFAULT_ENABLED_LEVELS,
+    validateEnabledLevels
+  );
   const [copied, setCopied] = useState<boolean>(false);
   const [copyingAiDiag, setCopyingAiDiag] = useState<boolean>(false);
   const [copiedAiDiag, setCopiedAiDiag] = useState<boolean>(false);

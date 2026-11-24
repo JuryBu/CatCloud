@@ -59,6 +59,7 @@ import {
   nodeMatchesContinentAndRegion,
   resolveNodeRegionCode,
 } from "../utils/regions";
+import { isBoolPref, oneOfPref, usePersistedState } from "../utils/uiPrefs";
 
 /* ============================================================================
  * Domain Types & Demo Presets
@@ -84,6 +85,8 @@ interface MigrationPreviewItem {
   id: string;
   source_kind: MigrationSourceKind;
   client_label: string;
+  source_client_label?: string;
+  display_name?: string | null;
   source_path: string | null;
   nodes: ProxyNode[];
   prepend_rules: string[];
@@ -162,7 +165,7 @@ const KNOWN_CLIENT_SPECS: Array<{
   },
   {
     kind: "flclash",
-    label: "落云 / FlClash",
+    label: "FlClash",
     readonlyPathHint: "%APPDATA%\\com.follow.clash\\profiles",
     desc: "只读提取多份配置里的节点、地区和倍率信息",
   },
@@ -246,7 +249,7 @@ const DEMO_MIGRATION_SCANS: Record<
   flclash: {
     id: "mig-flclash",
     source_kind: "flclash",
-    client_label: "落云 / FlClash",
+    client_label: "FlClash",
     source_path:
       "C:\\Users\\<USER>\\AppData\\Roaming\\com.follow.clash\\profiles\\demo_pool.yaml",
     nodes: [
@@ -453,7 +456,7 @@ function migrationClientLabel(kind: string): string {
     case "clash_verge":
       return "Clash Verge / Rev";
     case "flclash":
-      return "落云 / FlClash";
+      return "FlClash";
     case "v2rayn":
       return "v2rayN";
     case "local_file":
@@ -478,21 +481,159 @@ function normalizeMigrationKind(kind: string): MigrationSourceKind {
   return "local_file";
 }
 
+const KNOWN_MIGRATION_CLIENT_KINDS = new Set<MigrationSourceKind>([
+  "clash_verge",
+  "flclash",
+  "v2rayn",
+]);
+
+function extractPathBasename(path: string | null | undefined): string | null {
+  const trimmed = path?.trim();
+  if (!trimmed) return null;
+  const withoutTrailing = trimmed.replace(/[\\/]+$/, "");
+  if (!withoutTrailing) return null;
+  const segs = withoutTrailing.split(/[\\/]/).filter(Boolean);
+  return segs[segs.length - 1] ?? null;
+}
+
+function normalizeMigrationSourcePath(path: string | null | undefined): string | null {
+  const trimmed = path?.trim();
+  if (!trimmed) return null;
+  let unified = trimmed.replace(/\\/g, "/");
+  if (unified.startsWith("//?/UNC/")) {
+    unified = `//${unified.slice(8)}`;
+  } else if (unified.startsWith("//?/")) {
+    unified = unified.slice(4);
+  }
+  unified = unified.replace(/(^|[^:])\/+/g, "$1/");
+  if (unified.length > 3 && !/^[a-z]:\/$/i.test(unified)) {
+    unified = unified.replace(/\/+$/, "");
+  }
+  const isWindowsLike =
+    /^[a-z]:\//i.test(unified) ||
+    trimmed.includes("\\") ||
+    (typeof navigator !== "undefined" &&
+      /win/i.test(navigator.platform || navigator.userAgent || ""));
+  return isWindowsLike ? unified.toLowerCase() : unified;
+}
+
+function getMigrationDedupeKey(item: MigrationPreviewItem): string {
+  const norm = normalizeMigrationSourcePath(item.source_path);
+  return norm ? `path:${norm}` : `id:${item.id}`;
+}
+
+function isNormalizedPathInDir(candidateNorm: string, dirNorm: string): boolean {
+  if (candidateNorm === dirNorm) return true;
+  const prefix = dirNorm.endsWith("/") ? dirNorm : `${dirNorm}/`;
+  return candidateNorm.startsWith(prefix);
+}
+
+function defaultMigrationSubName(item: MigrationPreviewItem): string {
+  const customDisplay = item.display_name?.trim();
+  if (customDisplay) return customDisplay;
+  const basename = extractPathBasename(item.source_path);
+  if (basename) return basename;
+  return `导入 · ${item.client_label}`;
+}
+
 function mapMigrationDtoToPreview(
   dto: MigrationPreviewDto,
   index: number
 ): MigrationPreviewItem {
   const sourceKind = normalizeMigrationKind(dto.source_kind);
+  const sourceClientLabel = migrationClientLabel(sourceKind);
+  const displayName = dto.display_name?.trim() || null;
+  const normPath = normalizeMigrationSourcePath(dto.source_path);
+  const stableId = normPath ? `mig-path:${normPath}` : `mig-${sourceKind}-inline-${index}`;
   return {
-    id: `mig-${sourceKind}-${index}-${dto.source_path ?? "inline"}`,
+    id: stableId,
     source_kind: sourceKind,
-    client_label: migrationClientLabel(sourceKind),
+    client_label: displayName ?? sourceClientLabel,
+    source_client_label: sourceClientLabel,
+    display_name: displayName,
     source_path: dto.source_path ?? null,
     nodes: Array.isArray(dto.nodes) ? dto.nodes : [],
     prepend_rules: Array.isArray(dto.prepend_rules) ? dto.prepend_rules : [],
     append_rules: Array.isArray(dto.append_rules) ? dto.append_rules : [],
     warnings: Array.isArray(dto.warnings) ? dto.warnings : [],
   };
+}
+
+function mergeSingleMigrationItem(
+  existing: MigrationPreviewItem,
+  incoming: MigrationPreviewItem
+): MigrationPreviewItem {
+  // If an already-detected known client file is re-scanned via generic custom path ("local_file"),
+  // keep the specific client identity while refreshing nodes/rules/warnings from disk.
+  if (
+    KNOWN_MIGRATION_CLIENT_KINDS.has(existing.source_kind) &&
+    incoming.source_kind === "local_file"
+  ) {
+    const resolvedDisplay = incoming.display_name ?? existing.display_name ?? null;
+    return {
+      ...incoming,
+      id: existing.id,
+      source_kind: existing.source_kind,
+      source_client_label: existing.source_client_label ?? migrationClientLabel(existing.source_kind),
+      display_name: resolvedDisplay,
+      client_label:
+        resolvedDisplay ?? existing.source_client_label ?? migrationClientLabel(existing.source_kind),
+    };
+  }
+  return incoming;
+}
+
+function mergeScannedMigrationItems(
+  baseItems: MigrationPreviewItem[],
+  incomingItems: MigrationPreviewItem[],
+  prependIncoming: boolean
+): MigrationPreviewItem[] {
+  // First deduplicate incomingItems themselves by normalized source_path
+  const dedupedIncoming: MigrationPreviewItem[] = [];
+  const incomingIndexByKey = new Map<string, number>();
+  for (const item of incomingItems) {
+    const key = getMigrationDedupeKey(item);
+    const existingIdx = incomingIndexByKey.get(key);
+    if (existingIdx !== undefined) {
+      dedupedIncoming[existingIdx] = mergeSingleMigrationItem(dedupedIncoming[existingIdx], item);
+    } else {
+      incomingIndexByKey.set(key, dedupedIncoming.length);
+      dedupedIncoming.push(item);
+    }
+  }
+
+  const baseByKey = new Map<string, MigrationPreviewItem>();
+  for (const item of baseItems) {
+    const key = getMigrationDedupeKey(item);
+    if (!baseByKey.has(key)) {
+      baseByKey.set(key, item);
+    }
+  }
+
+  const mergedByKey = new Map<string, MigrationPreviewItem>();
+  if (prependIncoming) {
+    for (const next of dedupedIncoming) {
+      const key = getMigrationDedupeKey(next);
+      const prev = baseByKey.get(key);
+      mergedByKey.set(key, prev ? mergeSingleMigrationItem(prev, next) : next);
+    }
+    for (const [key, prev] of baseByKey.entries()) {
+      if (!mergedByKey.has(key)) {
+        mergedByKey.set(key, prev);
+      }
+    }
+  } else {
+    for (const [key, prev] of baseByKey.entries()) {
+      mergedByKey.set(key, prev);
+    }
+    for (const next of dedupedIncoming) {
+      const key = getMigrationDedupeKey(next);
+      const prev = mergedByKey.get(key);
+      mergedByKey.set(key, prev ? mergeSingleMigrationItem(prev, next) : next);
+    }
+  }
+
+  return Array.from(mergedByKey.values());
 }
 
 function mapProcessCandidateDto(dto: ProcessCandidateDto): ProcessCandidateItem {
@@ -1083,21 +1224,29 @@ interface MigrationDrawerProps {
     preview: MigrationPreviewItem,
     customName: string,
     includeRules: boolean
-  ) => void | Promise<void>;
+  ) => Promise<boolean>;
 }
 
 function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
   const [tab, setTab] = useState<"scan" | "paste">("scan");
-  const [scanningKind, setScanningKind] = useState<string | null>(null);
+  const [scanningKind, setScanningKind] = useState<
+    "all" | "clash_verge" | "flclash" | "v2rayn" | "custom_dir" | "custom_file" | null
+  >(null);
   const [scannedItems, setScannedItems] = useState<MigrationPreviewItem[]>([]);
   const [selectedPreviewId, setSelectedPreviewId] = useState<string | null>(null);
   const [pasteText, setPasteText] = useState("");
   const [pastePreview, setPastePreview] = useState<MigrationPreviewItem | null>(
     null
   );
-  const [customSubName, setCustomSubName] = useState("");
+  const [scanSubName, setScanSubName] = useState("");
+  const [pasteSubName, setPasteSubName] = useState("");
   const [includeRules, setIncludeRules] = useState(true);
+  const [importing, setImporting] = useState(false);
   const openSessionRef = useRef(false);
+  const scannedItemsRef = useRef<MigrationPreviewItem[]>(scannedItems);
+  scannedItemsRef.current = scannedItems;
+  const selectedPreviewIdRef = useRef<string | null>(selectedPreviewId);
+  selectedPreviewIdRef.current = selectedPreviewId;
 
   const runScanClient = useCallback(
     async (
@@ -1125,27 +1274,147 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
               : [DEMO_MIGRATION_SCANS[kind]];
         }
 
-        setScannedItems((prev) => {
-          const merged = new Map<string, MigrationPreviewItem>();
-          for (const p of prev) merged.set(p.id, p);
-          for (const next of items) merged.set(next.id, next);
-          return Array.from(merged.values());
-        });
+        // Replace stale entries of the re-scanned source_kind(s) so deleted files are evicted
+        const retained = scannedItemsRef.current.filter((prevItem) =>
+          kind === "all"
+            ? !KNOWN_MIGRATION_CLIENT_KINDS.has(prevItem.source_kind)
+            : prevItem.source_kind !== kind
+        );
+        const nextList = mergeScannedMigrationItems(retained, items, false);
+        setScannedItems(nextList);
+
         if (items.length > 0) {
-          setSelectedPreviewId(items[0].id);
-          setCustomSubName(`导入 · ${items[0].client_label}`);
-          appActions.showToast(
-            `已找到 ${items.reduce((acc, i) => acc + i.nodes.length, 0)} 个可导入节点（不会改动原软件）`,
-            "ok"
+          const firstKey = getMigrationDedupeKey(items[0]);
+          const matchedFirst =
+            nextList.find((it) => getMigrationDedupeKey(it) === firstKey) ?? items[0];
+          setSelectedPreviewId(matchedFirst.id);
+          setScanSubName(defaultMigrationSubName(matchedFirst));
+
+          const totalNodes = items.reduce((acc, i) => acc + i.nodes.length, 0);
+          const totalRules = items.reduce(
+            (acc, i) => acc + i.prepend_rules.length + i.append_rules.length,
+            0
           );
-        } else if (!autoTriggered) {
+          if (totalNodes > 0) {
+            appActions.showToast(
+              `已找到 ${totalNodes} 个可导入节点（不会改动原软件）`,
+              "ok"
+            );
+          } else if (totalRules > 0 && !autoTriggered) {
+            appActions.showToast(
+              `扫描到 ${items.length} 份仅含分流规则的配置（共 ${totalRules} 条规则，无代理节点）`,
+              "info"
+            );
+          }
+        } else {
+          const currentSelected = selectedPreviewIdRef.current;
+          const stillExists = currentSelected
+            ? nextList.some((it) => it.id === currentSelected)
+            : false;
+          if (!stillExists) {
+            const fallback = nextList[0] ?? null;
+            setSelectedPreviewId(fallback ? fallback.id : null);
+            setScanSubName(fallback ? defaultMigrationSubName(fallback) : "");
+          }
+          if (!autoTriggered) {
+            appActions.showToast(
+              "未在常见位置找到已有软件配置，也可以点击「选择目录扫描」「选择配置文件」或切换到「粘贴配置文本」导入",
+              "info"
+            );
+          }
+        }
+      } catch (err) {
+        appActions.showToast(`扫描已有配置失败：${formatErrorMessage(err)}`, "warn");
+      } finally {
+        setScanningKind(null);
+      }
+    },
+    []
+  );
+
+  const handlePickCustomPathScan = useCallback(
+    async (pickMode: "directory" | "file") => {
+      const targetLabel = pickMode === "directory" ? "目录" : "配置文件";
+      if (!isTauriEnv()) {
+        appActions.showToast(
+          `当前为浏览器预览模式，请在桌面端猫猫云梯中使用本地${targetLabel}只读扫描，或先切换到「粘贴配置文本」体验导入`,
+          "info"
+        );
+        return;
+      }
+      setScanningKind(pickMode === "directory" ? "custom_dir" : "custom_file");
+      try {
+        const picked =
+          pickMode === "directory"
+            ? await catcloudApi.pickMigrationDirectory(
+                "选择已有代理软件配置目录（只读，不改动原软件）"
+              )
+            : await catcloudApi.pickMigrationFile(
+                "选择代理配置文件（只读，不改动原文件）"
+              );
+        if (!picked) return;
+
+        const rawList = await catcloudApi.scanMigrationPath(picked);
+        const mapped = rawList.map((dto, idx) => mapMigrationDtoToPreview(dto, idx));
+
+        const pickedNorm = normalizeMigrationSourcePath(picked);
+        // Evict stale local_file entries under the re-scanned path/directory so deleted files disappear
+        const retained = scannedItemsRef.current.filter((prevItem) => {
+          if (prevItem.source_kind !== "local_file" || !pickedNorm) return true;
+          const prevNorm = normalizeMigrationSourcePath(prevItem.source_path);
+          if (!prevNorm) return true;
+          return pickMode === "directory"
+            ? !isNormalizedPathInDir(prevNorm, pickedNorm)
+            : prevNorm !== pickedNorm;
+        });
+
+        const nextList = mergeScannedMigrationItems(retained, mapped, true);
+        setScannedItems(nextList);
+
+        if (mapped.length > 0) {
+          const firstKey = getMigrationDedupeKey(mapped[0]);
+          const matchedFirst =
+            nextList.find((it) => getMigrationDedupeKey(it) === firstKey) ?? mapped[0];
+          setSelectedPreviewId(matchedFirst.id);
+          setScanSubName(defaultMigrationSubName(matchedFirst));
+
+          const totalNodes = mapped.reduce((acc, i) => acc + i.nodes.length, 0);
+          const totalRules = mapped.reduce(
+            (acc, i) => acc + i.prepend_rules.length + i.append_rules.length,
+            0
+          );
+          if (totalNodes > 0) {
+            appActions.showToast(
+              `从所选${targetLabel}找到 ${mapped.length} 份配置、共 ${totalNodes} 个可导入节点（只读，未改动原软件）`,
+              "ok"
+            );
+          } else if (totalRules > 0) {
+            appActions.showToast(
+              `所选${targetLabel}仅包含 ${totalRules} 条分流规则、无代理节点，请查看下方说明或选择含节点的配置文件`,
+              "info"
+            );
+          } else {
+            appActions.showToast(
+              `所选${targetLabel}未解析出可用代理节点，请换选其他配置文件`,
+              "info"
+            );
+          }
+        } else {
+          const currentSelected = selectedPreviewIdRef.current;
+          if (currentSelected && !nextList.some((it) => it.id === currentSelected)) {
+            const fallback = nextList[0] ?? null;
+            setSelectedPreviewId(fallback ? fallback.id : null);
+            setScanSubName(fallback ? defaultMigrationSubName(fallback) : "");
+          }
           appActions.showToast(
-            "未在常见位置找到已有软件配置，也可以切换到「粘贴配置文本」导入",
+            pickMode === "directory"
+              ? "所选目录中未找到可识别的明文代理配置，可尝试选择具体配置文件或切换到「粘贴配置文本」导入"
+              : "所选文件中未识别到有效的代理配置，请确认是明文 YAML / JSON / 节点链接文件",
             "info"
           );
         }
       } catch (err) {
-        appActions.showToast(`扫描已有配置失败：${formatErrorMessage(err)}`, "warn");
+        appActions.showToast(`扫描所选${targetLabel}失败：${formatErrorMessage(err)}`, "warn");
       } finally {
         setScanningKind(null);
       }
@@ -1164,11 +1433,11 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
       void runScanClient("all", true);
     }
     const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") onClose();
+      if (ev.key === "Escape" && !importing) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose, runScanClient]);
+  }, [open, importing, onClose, runScanClient]);
 
   if (!open) return null;
 
@@ -1178,8 +1447,17 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         scannedItems[0] ??
         null
       : pastePreview;
+  const activeSubName = tab === "scan" ? scanSubName : pasteSubName;
+  const setActiveSubName = tab === "scan" ? setScanSubName : setPasteSubName;
+  const activeRuleCount = activePreview
+    ? activePreview.prepend_rules.length + activePreview.append_rules.length
+    : 0;
+  const isRulesOnlyPreview = Boolean(
+    activePreview && activePreview.nodes.length === 0 && activeRuleCount > 0
+  );
 
   const handleParsePaste = async () => {
+    if (importing) return;
     if (!pasteText.trim()) {
       appActions.showToast("请先粘贴配置文件内容或节点链接", "warn");
       return;
@@ -1188,7 +1466,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
       let parsed: MigrationPreviewItem;
       if (isTauriEnv()) {
         const res = await catcloudApi.previewMigrationFromText(
-          customSubName.trim() || "粘贴导入的节点",
+          pasteSubName.trim() || "粘贴导入的节点",
           pasteText
         );
         parsed = {
@@ -1205,11 +1483,17 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         parsed = parsePastedConfigPreview(pasteText);
       }
       setPastePreview(parsed);
-      setCustomSubName(parsed.client_label || "粘贴导入的节点");
+      setPasteSubName((prev) => prev.trim() || parsed.client_label || "粘贴导入的节点");
+      const parsedRuleCount = parsed.prepend_rules.length + parsed.append_rules.length;
       if (parsed.nodes.length > 0) {
         appActions.showToast(
           `解析成功：找到 ${parsed.nodes.length} 个可用节点`,
           "ok"
+        );
+      } else if (parsedRuleCount > 0) {
+        appActions.showToast(
+          `仅识别到 ${parsedRuleCount} 条分流规则、无可用节点，无法直接作为节点订阅导入`,
+          "warn"
         );
       } else {
         appActions.showToast("没有识别出可用节点，请检查粘贴的内容是否完整", "warn");
@@ -1219,11 +1503,25 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
     }
   };
 
-  const handleConfirmImport = () => {
-    if (!activePreview || activePreview.nodes.length === 0) return;
+  const handleConfirmImport = async () => {
+    if (importing || !activePreview || activePreview.nodes.length === 0) return;
     const finalName =
-      customSubName.trim() || `导入 · ${activePreview.client_label}`;
-    onImport(activePreview, finalName, includeRules);
+      activeSubName.trim() || defaultMigrationSubName(activePreview);
+    setImporting(true);
+    try {
+      const ok = await onImport(activePreview, finalName, includeRules);
+      if (ok) {
+        onClose();
+      }
+    } catch {
+      /* onImport 已弹出错误提示，保留抽屉与当前输入状态供直接重试 */
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const safeClose = () => {
+    if (importing) return;
     onClose();
   };
 
@@ -1235,7 +1533,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
       role="dialog"
       aria-modal="true"
       aria-label="从电脑已有梯子导入"
-      onClick={onClose}
+      onClick={safeClose}
     >
       <div
         className="cc-surface flex h-full w-full max-w-[620px] flex-col border-l border-[var(--line-strong)] shadow-2xl"
@@ -1251,13 +1549,14 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
               </h2>
             </div>
             <p className="mt-1 text-xs text-[var(--muted)]">
-              自动查找 Clash Verge / 落云 / v2rayN 的已有配置，也支持直接粘贴配置或节点链接。
+              自动查找 Clash Verge / FlClash / v2rayN 等其他代理客户端的已有配置，也支持直接粘贴配置或节点链接。
             </p>
           </div>
           <button
             type="button"
-            onClick={onClose}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
+            disabled={importing}
+            onClick={safeClose}
+            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
             aria-label="关闭导入窗口"
           >
             <X className="h-4 w-4" />
@@ -1276,8 +1575,9 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         <div className="mx-5 mt-3 flex items-center gap-2 border-b border-[var(--line)] pb-2.5">
           <button
             type="button"
+            disabled={importing}
             onClick={() => setTab("scan")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 ${
               tab === "scan"
                 ? "bg-[var(--accent)] text-[var(--accent-ink)]"
                 : "border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
@@ -1288,8 +1588,9 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
           </button>
           <button
             type="button"
+            disabled={importing}
             onClick={() => setTab("paste")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
+            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 ${
               tab === "paste"
                 ? "bg-[var(--accent)] text-[var(--accent-ink)]"
                 : "border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
@@ -1304,27 +1605,57 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         <div className="flex-1 space-y-4 overflow-y-auto px-5 py-4">
           {tab === "scan" ? (
             <>
-              <div className="flex items-center justify-between">
+              <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-xs font-medium text-[var(--text-secondary)]">
-                  常见梯子软件配置位置
+                  常见代理客户端配置位置
                 </span>
-                <button
-                  type="button"
-                  disabled={scanningKind !== null}
-                  onClick={() => void runScanClient("all", false)}
-                  className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)] bg-[var(--accent-soft)] px-2.5 py-1 text-xs font-medium text-[var(--accent)] hover:opacity-90 disabled:opacity-50"
-                >
-                  <RefreshCw
-                    className={`h-3.5 w-3.5 ${scanningKind === "all" ? "animate-spin" : ""}`}
-                  />
-                  {scanningKind === "all" ? "正在扫描..." : "重新扫描全部"}
-                </button>
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={scanningKind !== null || importing}
+                    onClick={() => void handlePickCustomPathScan("directory")}
+                    title="手动挑选桌面、D 盘或任意配置文件夹进行只读扫描"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2.5 py-1 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                  >
+                    <FolderOpen className="h-3.5 w-3.5" />
+                    {scanningKind === "custom_dir" ? "正在扫描..." : "选择目录扫描"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={scanningKind !== null || importing}
+                    onClick={() => void handlePickCustomPathScan("file")}
+                    title="直接选取单个 .yaml / .yml / .json / .txt 配置文件进行只读解析"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2.5 py-1 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                  >
+                    <FileCode2 className="h-3.5 w-3.5" />
+                    {scanningKind === "custom_file" ? "正在解析..." : "选择配置文件"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={scanningKind !== null || importing}
+                    onClick={() => void runScanClient("all", false)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)] bg-[var(--accent-soft)] px-2.5 py-1 text-xs font-medium text-[var(--accent)] hover:opacity-90 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${scanningKind === "all" ? "animate-spin" : ""}`}
+                    />
+                    {scanningKind === "all" ? "正在扫描..." : "重新扫描全部"}
+                  </button>
+                </div>
               </div>
 
               <div className="space-y-2">
                 {KNOWN_CLIENT_SPECS.map((spec) => {
-                  const found = scannedItems.find(
+                  const foundList = scannedItems.filter(
                     (s) => s.source_kind === spec.kind
+                  );
+                  const found = foundList[0];
+                  const totalNodes = foundList.reduce(
+                    (acc, item) => acc + item.nodes.length,
+                    0
+                  );
+                  const isSpecActive = foundList.some(
+                    (item) => activePreview?.id === item.id
                   );
                   const isBusy =
                     scanningKind === spec.kind || scanningKind === "all";
@@ -1332,23 +1663,25 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                     <div
                       key={spec.kind}
                       className={`rounded-xl border p-3 transition-colors ${
-                        found && activePreview?.id === found.id
+                        isSpecActive
                           ? "border-[var(--accent)] bg-[var(--accent-soft)]"
                           : "border-[var(--line)] bg-[var(--card)]"
                       }`}
                     >
                       <div className="flex items-center justify-between gap-2">
                         <div className="min-w-0">
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
                             <span className="text-xs font-semibold text-[var(--text)]">
                               {spec.label}
                             </span>
                             {found && (
                               <span className="rounded-full bg-[var(--green-soft)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--green)]">
-                                {found.nodes.length} 节点 ·{" "}
-                                {found.prepend_rules.length +
-                                  found.append_rules.length}{" "}
-                                规则
+                                {foundList.length > 1
+                                  ? `${foundList.length} 份配置 · ${totalNodes} 节点`
+                                  : `${found.nodes.length} 节点 · ${
+                                      found.prepend_rules.length +
+                                      found.append_rules.length
+                                    } 规则`}
                               </span>
                             )}
                           </div>
@@ -1363,18 +1696,19 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                           {found && (
                             <button
                               type="button"
+                              disabled={importing}
                               onClick={() => {
                                 setSelectedPreviewId(found.id);
-                                setCustomSubName(`导入 · ${found.client_label}`);
+                                setScanSubName(defaultMigrationSubName(found));
                               }}
-                              className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
+                              className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
                             >
                               查看
                             </button>
                           )}
                           <button
                             type="button"
-                            disabled={isBusy}
+                            disabled={isBusy || importing}
                             onClick={() => void runScanClient(spec.kind, false)}
                             className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
                           >
@@ -1387,6 +1721,80 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                   );
                 })}
               </div>
+
+              {scannedItems.length > 0 && (
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between text-[11px] text-[var(--muted)]">
+                    <span>已扫描到的配置（点击切换预览，悬停路径看完整位置）</span>
+                    <span className="cc-mono">{scannedItems.length} 份</span>
+                  </div>
+                  <div className="max-h-40 space-y-1.5 overflow-y-auto pr-1">
+                    {scannedItems.map((item) => {
+                      const selected = activePreview?.id === item.id;
+                      const showSourceBadge =
+                        Boolean(item.source_client_label) &&
+                        item.source_client_label !== item.client_label;
+                      const itemRuleCount =
+                        item.prepend_rules.length + item.append_rules.length;
+                      const itemBasename =
+                        extractPathBasename(item.source_path) ?? item.source_path;
+                      return (
+                        <button
+                          key={item.id}
+                          type="button"
+                          disabled={importing}
+                          onClick={() => {
+                            setSelectedPreviewId(item.id);
+                            setScanSubName(defaultMigrationSubName(item));
+                          }}
+                          className={`flex w-full items-center justify-between gap-2 rounded-xl border px-3 py-2 text-left transition-colors disabled:opacity-60 ${
+                            selected
+                              ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                              : "border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)]"
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-1.5">
+                              <span className="truncate text-xs font-semibold text-[var(--text)]">
+                                {item.client_label}
+                              </span>
+                              {showSourceBadge && (
+                                <span className="shrink-0 rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                                  {item.source_client_label}
+                                </span>
+                              )}
+                            </div>
+                            {item.source_path && (
+                              <div
+                                title={item.source_path}
+                                className="mt-0.5 truncate cc-mono text-[10px] text-[var(--muted)]"
+                              >
+                                {itemBasename}
+                              </div>
+                            )}
+                          </div>
+                          {item.nodes.length > 0 ? (
+                            <span className="shrink-0 rounded-full bg-[var(--green-soft)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--green)]">
+                              {item.nodes.length} 节点
+                            </span>
+                          ) : itemRuleCount > 0 ? (
+                            <span
+                              title="该条目仅含分流规则，没有可导入的代理节点"
+                              className="shrink-0 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--amber)]"
+                            >
+                              仅规则 · {itemRuleCount} 条
+                            </span>
+                          ) : (
+                            <span className="shrink-0 rounded-full bg-[var(--bg-elevated)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--muted)]">
+                              0 节点
+                            </span>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </>
           ) : (
             <div className="space-y-2.5">
@@ -1395,12 +1803,13 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                   htmlFor="cc-migration-paste"
                   className="text-xs font-medium text-[var(--text-secondary)]"
                 >
-                  支持粘贴其他软件的配置文件内容、编码文本或单条/多条节点分享链接
+                  支持粘贴其他代理客户端的配置文件内容、编码文本或单条/多条节点分享链接
                 </label>
                 <button
                   type="button"
+                  disabled={importing}
                   onClick={() => setPasteText(DEMO_PASTE_SAMPLE)}
-                  className="shrink-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--accent)] hover:border-[var(--accent)]"
+                  className="shrink-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--accent)] hover:border-[var(--accent)] disabled:opacity-50"
                 >
                   填入示例内容
                 </button>
@@ -1408,26 +1817,30 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
               <textarea
                 id="cc-migration-paste"
                 value={pasteText}
+                disabled={importing}
                 onChange={(e) => setPasteText(e.target.value)}
                 rows={8}
                 placeholder="在这里粘贴配置内容，或者粘贴 vless:// / trojan:// / ss:// 等节点链接..."
-                className="cc-selectable w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3 cc-mono text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+                className="cc-selectable w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3 cc-mono text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-60"
               />
               <div className="flex items-center justify-end gap-2">
                 <button
                   type="button"
+                  disabled={importing}
                   onClick={() => {
                     setPasteText("");
                     setPastePreview(null);
+                    setPasteSubName("");
                   }}
-                  className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)]"
+                  className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
                 >
                   清空
                 </button>
                 <button
                   type="button"
+                  disabled={importing}
                   onClick={() => void handleParsePaste()}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50"
                 >
                   <Upload className="h-3.5 w-3.5" />
                   解析并预览节点
@@ -1440,13 +1853,17 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
           {activePreview && (
             <div className="space-y-3 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] p-3.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
+                <div className="min-w-0">
                   <div className="text-xs font-semibold text-[var(--text)]">
                     预览结果 · {activePreview.client_label}
                   </div>
                   {activePreview.source_path && (
-                    <div className="mt-0.5 break-all cc-mono text-[10px] text-[var(--muted)]">
-                      {activePreview.source_path}
+                    <div
+                      title={activePreview.source_path}
+                      className="mt-0.5 truncate cc-mono text-[10px] text-[var(--muted)]"
+                    >
+                      {extractPathBasename(activePreview.source_path) ??
+                        activePreview.source_path}
                     </div>
                   )}
                 </div>
@@ -1454,6 +1871,29 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                   {activePreview.nodes.length} 个节点
                 </span>
               </div>
+
+              {isRulesOnlyPreview && (
+                <div className="flex items-start gap-2 rounded-lg border border-[var(--amber)]/40 bg-[var(--amber-soft)] px-3 py-2 text-[11px] leading-relaxed text-[var(--amber)]">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <div>
+                    <div className="font-semibold">
+                      该配置仅包含 {activeRuleCount} 条分流规则，未包含可导入的代理节点
+                    </div>
+                    <div className="mt-0.5 opacity-90">
+                      此处迁移需至少包含 1 个可用代理节点，因此「确认导入」暂不可用。这通常是纯规则覆写或模板文件，请选择包含节点列表的配置文件，或前往「分流与连接」页面配置分流规则。
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activePreview.nodes.length === 0 && !isRulesOnlyPreview && (
+                <div className="flex items-start gap-2 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--amber)]" />
+                  <span>
+                    当前条目未解析到任何代理节点，因此无法执行导入。请改选包含有效节点的配置文件，或检查粘贴内容是否完整。
+                  </span>
+                </div>
+              )}
 
               {activePreview.warnings.length > 0 && (
                 <div className="space-y-1 rounded-lg bg-[var(--amber-soft)] px-2.5 py-2 text-[11px] text-[var(--amber)]">
@@ -1513,6 +1953,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                     <label className="inline-flex cursor-pointer items-center gap-1.5 text-[var(--text-secondary)]">
                       <input
                         type="checkbox"
+                        disabled={importing}
                         checked={includeRules}
                         onChange={(e) => setIncludeRules(e.target.checked)}
                         className="accent-[var(--accent)]"
@@ -1537,10 +1978,11 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
                   导入后的订阅名称
                   <input
                     type="text"
-                    value={customSubName}
-                    onChange={(e) => setCustomSubName(e.target.value)}
-                    placeholder={`导入 · ${activePreview.client_label}`}
-                    className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
+                    disabled={importing}
+                    value={activeSubName}
+                    onChange={(e) => setActiveSubName(e.target.value)}
+                    placeholder={defaultMigrationSubName(activePreview)}
+                    className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-60"
                   />
                 </label>
               </div>
@@ -1549,26 +1991,44 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between border-t border-[var(--line)] px-5 py-3">
+        <div className="flex items-center justify-between gap-2 border-t border-[var(--line)] px-5 py-3">
           <span className="text-[11px] text-[var(--muted)]">
-            只复制到猫猫云梯本地，不会修改原软件
+            {importing
+              ? "正在导入节点与规则，请稍候..."
+              : isRulesOnlyPreview
+                ? `当前条目仅含 ${activeRuleCount} 条规则、无代理节点，暂不可导入`
+                : activePreview && activePreview.nodes.length === 0
+                  ? "当前条目未包含可用代理节点，暂不可导入"
+                  : "只复制到猫猫云梯本地，不会修改原软件"}
           </span>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             <button
               type="button"
-              onClick={onClose}
-              className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)]"
+              disabled={importing}
+              onClick={safeClose}
+              className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
             >
               取消
             </button>
             <button
               type="button"
-              disabled={!activePreview || activePreview.nodes.length === 0}
-              onClick={handleConfirmImport}
+              disabled={importing || !activePreview || activePreview.nodes.length === 0}
+              title={
+                isRulesOnlyPreview
+                  ? "当前配置仅含分流规则、无代理节点，无法导入"
+                  : !activePreview || activePreview.nodes.length === 0
+                    ? "请先选择包含至少 1 个可用节点的配置"
+                    : undefined
+              }
+              onClick={() => void handleConfirmImport()}
               className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
             >
-              <Check className="h-3.5 w-3.5" />
-              确认导入
+              {importing ? (
+                <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Check className="h-3.5 w-3.5" />
+              )}
+              {importing ? "正在导入..." : "确认导入"}
             </button>
           </div>
         </div>
@@ -2328,9 +2788,21 @@ export function NodesSubsPage({
     keepalive60s: false,
     aiUnlocked: false,
   });
-  const [sortBy, setSortBy] = useState<NodeSortBy>("default");
-  const [showMoreFilters, setShowMoreFilters] = useState(false);
-  const [pageSize, setPageSize] = useState<number>(30);
+  const [sortBy, setSortBy] = usePersistedState<NodeSortBy>(
+    "nodes.sortBy",
+    "default",
+    oneOfPref(["default", "latency", "up", "down"] as const)
+  );
+  const [showMoreFilters, setShowMoreFilters] = usePersistedState<boolean>(
+    "nodes.showMoreFilters",
+    false,
+    isBoolPref
+  );
+  const [pageSize, setPageSize] = usePersistedState<number>(
+    "nodes.pageSize",
+    30,
+    oneOfPref([30, 50, 100] as const)
+  );
   const [currentPage, setCurrentPage] = useState<number>(1);
 
   // Cross-subscription batch selection & target multi-group
@@ -2949,7 +3421,7 @@ export function NodesSubsPage({
     preview: MigrationPreviewItem,
     customName: string,
     includeRules: boolean
-  ) => {
+  ): Promise<boolean> => {
     if (inTauri) {
       try {
         const count = await catcloudApi.applyMigrationNodes(customName, preview.nodes);
@@ -2968,10 +3440,11 @@ export function NodesSubsPage({
             "ok"
           );
         }
+        return true;
       } catch (err) {
         appActions.showToast(`导入节点失败：${formatErrorMessage(err)}`, "warn");
+        return false;
       }
-      return;
     }
 
     const subId = `sub-mig-${Date.now()}`;
@@ -3007,6 +3480,7 @@ export function NodesSubsPage({
       `导入完成：已保存 ${importedNodes.length} 个节点${ruleRes.savedCount > 0 ? `、${ruleRes.savedCount} 条分流规则` : ""}（原软件未改动）`,
       "ok"
     );
+    return true;
   };
 
   const handleProcessAttach = async (payload: {
@@ -3460,7 +3934,7 @@ export function NodesSubsPage({
               </div>
             </div>
             <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-              自动找 Clash Verge / 落云 / v2rayN 已有配置，只读安全复制，不改你原来的软件。
+              自动找 Clash Verge / FlClash / v2rayN 等其他代理客户端已有配置，只读安全复制，不改你原来的软件。
             </p>
           </div>
 

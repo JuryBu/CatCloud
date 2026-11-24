@@ -8,11 +8,31 @@ use crate::subscription::parser::{
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Maximum number of files inspected inside a single third-party profile directory.
-const MAX_SCAN_FILES_PER_DIR: usize = 32;
+const MAX_SCAN_FILES_PER_DIR: usize = 64;
+
+/// Maximum `profiles.yaml` metadata index file size (2 MiB).
+const MAX_PROFILES_YAML_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Maximum recursion depth below a user-selected directory for `scan_custom_path_readonly`.
+const MAX_CUSTOM_SCAN_DEPTH: usize = 2;
+
+/// Maximum total directory entries visited during a recursive custom scan to avoid hangs
+/// when a user accidentally picks a large system/project directory.
+const MAX_CUSTOM_SCAN_ENTRIES: usize = 4096;
+
+/// Directory names skipped during recursive custom migration scans (case-insensitive).
+const IGNORED_SCAN_DIRS: &[&str] = &[
+    "cache",
+    "logs",
+    "ebwebview",
+    "webview2",
+    "node_modules",
+    ".git",
+];
 
 /// Source category for a read-only configuration migration preview.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +62,8 @@ impl MigrationSourceKind {
 pub struct MigrationPreview {
     pub source_kind: MigrationSourceKind,
     pub source_path: Option<PathBuf>,
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub nodes: Vec<ProxyNode>,
     pub prepend_rules: Vec<String>,
     pub append_rules: Vec<String>,
@@ -78,7 +100,8 @@ pub struct MigrationImportReport {
 }
 
 /// Return standard read-only candidate plaintext configuration locations for common
-/// open-source proxy clients (Clash Verge / Clash Verge Rev, FlClash, v2rayN).
+/// open-source proxy clients (Clash Verge / Clash Verge Rev, Mihomo Party, Clash Party,
+/// Clash Nyanpasu, FlClash, v2rayN).
 ///
 /// This function never creates directories or writes to any third-party path.
 pub fn discover_known_client_paths() -> Vec<(MigrationSourceKind, PathBuf)> {
@@ -99,6 +122,18 @@ pub fn discover_known_client_paths() -> Vec<(MigrationSourceKind, PathBuf)> {
             ));
             candidates.push((
                 MigrationSourceKind::ClashVerge,
+                base.join("mihomo-party").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
+                base.join("clash-party").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
+                base.join("clash-nyanpasu").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
                 base.join("io.github.clash-verge-rev.clash-verge-rev")
                     .join("clash-verge.yaml"),
             ));
@@ -108,7 +143,15 @@ pub fn discover_known_client_paths() -> Vec<(MigrationSourceKind, PathBuf)> {
             ));
             candidates.push((
                 MigrationSourceKind::FlClash,
+                base.join("com.follow.clash").join("config.yaml"),
+            ));
+            candidates.push((
+                MigrationSourceKind::FlClash,
                 base.join("FlClash").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::FlClash,
+                base.join("FlClash").join("config.yaml"),
             ));
             candidates.push((
                 MigrationSourceKind::V2rayN,
@@ -141,8 +184,32 @@ pub fn discover_known_client_paths() -> Vec<(MigrationSourceKind, PathBuf)> {
                 app_support.join("clash-verge").join("profiles"),
             ));
             candidates.push((
+                MigrationSourceKind::ClashVerge,
+                app_support.join("mihomo-party").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
+                app_support.join("clash-party").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
+                app_support.join("clash-nyanpasu").join("profiles"),
+            ));
+            candidates.push((
                 MigrationSourceKind::FlClash,
                 app_support.join("com.follow.clash").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::FlClash,
+                app_support.join("com.follow.clash").join("config.yaml"),
+            ));
+            candidates.push((
+                MigrationSourceKind::FlClash,
+                app_support.join("FlClash").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::FlClash,
+                app_support.join("FlClash").join("config.yaml"),
             ));
             candidates.push((
                 MigrationSourceKind::V2rayN,
@@ -180,12 +247,36 @@ pub fn discover_known_client_paths() -> Vec<(MigrationSourceKind, PathBuf)> {
                 cfg_root.join("clash-verge").join("profiles"),
             ));
             candidates.push((
+                MigrationSourceKind::ClashVerge,
+                cfg_root.join("mihomo-party").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
+                cfg_root.join("clash-party").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
+                cfg_root.join("clash-nyanpasu").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::ClashVerge,
+                data_root.join("clash-nyanpasu").join("profiles"),
+            ));
+            candidates.push((
                 MigrationSourceKind::FlClash,
                 data_root.join("com.follow.clash").join("profiles"),
             ));
             candidates.push((
                 MigrationSourceKind::FlClash,
+                data_root.join("com.follow.clash").join("config.yaml"),
+            ));
+            candidates.push((
+                MigrationSourceKind::FlClash,
                 cfg_root.join("FlClash").join("profiles"),
+            ));
+            candidates.push((
+                MigrationSourceKind::FlClash,
+                cfg_root.join("FlClash").join("config.yaml"),
             ));
             candidates.push((
                 MigrationSourceKind::V2rayN,
@@ -198,6 +289,12 @@ pub fn discover_known_client_paths() -> Vec<(MigrationSourceKind, PathBuf)> {
     }
 
     candidates
+}
+
+/// Generate a unique subscription ID for an applied migration so repeated imports never
+/// overwrite previously imported nodes.
+pub fn generate_migration_subscription_id() -> String {
+    format!("migrated-{}", uuid::Uuid::new_v4())
 }
 
 /// Perform a one-click read-only scan across known open-source proxy client paths on this machine.
@@ -213,7 +310,7 @@ pub fn scan_local_clients() -> Vec<MigrationPreview> {
         let found = scan_path_readonly(kind, &candidate);
         for preview in found {
             if let Some(ref p) = preview.source_path {
-                let key = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                let key = normalize_dedup_path(p);
                 if !seen_paths.insert(key) {
                     continue;
                 }
@@ -227,10 +324,18 @@ pub fn scan_local_clients() -> Vec<MigrationPreview> {
 
 /// Read-only scan of a specific directory or config file attributed to `kind`.
 pub fn scan_path_readonly(kind: MigrationSourceKind, path: &Path) -> Vec<MigrationPreview> {
+    let mut profiles_cache: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+
     if path.is_file() {
         return preview_from_file(path, Some(kind))
             .ok()
-            .filter(|p| !p.nodes.is_empty() || !p.prepend_rules.is_empty() || !p.append_rules.is_empty())
+            .filter(|p| {
+                !p.nodes.is_empty() || !p.prepend_rules.is_empty() || !p.append_rules.is_empty()
+            })
+            .map(|mut p| {
+                p.display_name = resolve_display_name_for_file(path, &mut profiles_cache);
+                p
+            })
             .into_iter()
             .collect();
     }
@@ -243,21 +348,39 @@ pub fn scan_path_readonly(kind: MigrationSourceKind, path: &Path) -> Vec<Migrati
         return Vec::new();
     };
 
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.is_file() && is_supported_config_extension(p))
-        .collect();
-    files.sort();
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    let mut seen_candidates: HashSet<PathBuf> = HashSet::new();
+    for entry in entries.filter_map(Result::ok) {
+        let p = entry.path();
+        if !p.is_file() || !is_supported_config_extension(&p) {
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&p) else {
+            continue;
+        };
+        let len = meta.len();
+        if len == 0 || len > MAX_SUBSCRIPTION_BYTES as u64 {
+            continue;
+        }
+        if seen_candidates.insert(normalize_dedup_path(&p)) {
+            files.push((p, len));
+        }
+    }
+    sort_files_by_size_desc(&mut files);
     files.truncate(MAX_SCAN_FILES_PER_DIR);
 
     let mut previews = Vec::new();
-    for file in files {
-        if let Ok(preview) = preview_from_file(&file, Some(kind)) {
+    let mut seen_paths = HashSet::new();
+    for (file, _) in files {
+        if !seen_paths.insert(normalize_dedup_path(&file)) {
+            continue;
+        }
+        if let Ok(mut preview) = preview_from_file(&file, Some(kind)) {
             if !preview.nodes.is_empty()
                 || !preview.prepend_rules.is_empty()
                 || !preview.append_rules.is_empty()
             {
+                preview.display_name = resolve_display_name_for_file(&file, &mut profiles_cache);
                 previews.push(preview);
             }
         }
@@ -265,29 +388,93 @@ pub fn scan_path_readonly(kind: MigrationSourceKind, path: &Path) -> Vec<Migrati
     previews
 }
 
+/// Read-only scan of an arbitrary single plaintext config file or custom directory.
+///
+/// Recurses at most 2 levels below `path` (bounded by `MAX_CUSTOM_SCAN_ENTRIES`), skips
+/// cache/log/webview/VCS subdirectories (`cache`, `logs`, `ebwebview`, `webview2`,
+/// `node_modules`, `.git`), filters out empty or oversized (`> MAX_SUBSCRIPTION_BYTES`) files,
+/// deduplicates canonicalized paths, ranks candidate YAML/JSON/TXT files by descending byte size
+/// (tie-breaking by filename) before applying `MAX_SCAN_FILES_PER_DIR`, and automatically resolves
+/// `profiles.yaml` / `profile.yaml` display names.
+pub fn scan_custom_path_readonly(path: &Path) -> Vec<MigrationPreview> {
+    let mut profiles_cache: HashMap<PathBuf, HashMap<String, String>> = HashMap::new();
+
+    if path.is_file() {
+        return preview_from_file(path, Some(MigrationSourceKind::LocalFile))
+            .ok()
+            .filter(|p| {
+                !p.nodes.is_empty() || !p.prepend_rules.is_empty() || !p.append_rules.is_empty()
+            })
+            .map(|mut p| {
+                p.display_name = resolve_display_name_for_file(path, &mut profiles_cache);
+                p
+            })
+            .into_iter()
+            .collect();
+    }
+
+    if !path.is_dir() {
+        return Vec::new();
+    }
+
+    let mut files: Vec<(PathBuf, u64)> = Vec::new();
+    let mut visited_entries: usize = 0;
+    let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut seen_files: HashSet<PathBuf> = HashSet::new();
+    collect_custom_scan_files(
+        path,
+        0,
+        &mut visited_entries,
+        &mut seen_dirs,
+        &mut seen_files,
+        &mut files,
+    );
+    sort_files_by_size_desc(&mut files);
+    files.truncate(MAX_SCAN_FILES_PER_DIR);
+
+    let mut previews = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for (file, _) in files {
+        let key = normalize_dedup_path(&file);
+        if !seen_paths.insert(key) {
+            continue;
+        }
+        if let Ok(mut preview) = preview_from_file(&file, Some(MigrationSourceKind::LocalFile)) {
+            if !preview.nodes.is_empty()
+                || !preview.prepend_rules.is_empty()
+                || !preview.append_rules.is_empty()
+            {
+                preview.display_name = resolve_display_name_for_file(&file, &mut profiles_cache);
+                previews.push(preview);
+            }
+        }
+    }
+    previews
+}
+
+/// Deterministically re-bind every migrated node to `sub_id` and recompute its collision-free
+/// primary key via `parser::stable_node_id`.
+pub fn rebind_migration_nodes(sub_id: &str, nodes: &mut [ProxyNode]) {
+    let mut used_ids = HashSet::with_capacity(nodes.len());
+    for node in nodes.iter_mut() {
+        node.sub_id = sub_id.to_string();
+        node.id = stable_node_id(
+            sub_id,
+            &node.protocol,
+            &node.server,
+            node.port,
+            &node.name,
+            &mut used_ids,
+        );
+    }
+}
+
 /// Parse a user-selected local plaintext configuration file in read-only mode.
 pub fn preview_from_file(
     path: &Path,
     kind_hint: Option<MigrationSourceKind>,
 ) -> CatResult<MigrationPreview> {
-    if !path.is_file() {
-        return Err(CatError::NotFound(format!(
-            "migration source file not found: {}",
-            path.display()
-        )));
-    }
-
-    let meta = std::fs::metadata(path)?;
-    if meta.len() > MAX_SUBSCRIPTION_BYTES as u64 {
-        return Err(CatError::Validation(format!(
-            "migration file `{}` ({} bytes) exceeds maximum allowed {} bytes",
-            path.display(),
-            meta.len(),
-            MAX_SUBSCRIPTION_BYTES
-        )));
-    }
-
-    let raw = std::fs::read(path)?;
+    let raw = read_file_bounded(path, MAX_SUBSCRIPTION_BYTES as u64)?;
     let text = std::str::from_utf8(&raw).map_err(|e| {
         CatError::Validation(format!(
             "migration file `{}` is not valid UTF-8 plaintext: {e}",
@@ -362,21 +549,8 @@ pub fn import_migration_preview(
         enabled: true,
     };
 
-    let mut used_ids = HashSet::with_capacity(preview.nodes.len());
-    let mut rebound_nodes = Vec::with_capacity(preview.nodes.len());
-    for node in &preview.nodes {
-        let mut cloned = node.clone();
-        cloned.sub_id = sub_id.to_string();
-        cloned.id = stable_node_id(
-            sub_id,
-            &cloned.protocol,
-            &cloned.server,
-            cloned.port,
-            &cloned.name,
-            &mut used_ids,
-        );
-        rebound_nodes.push(cloned);
-    }
+    let mut rebound_nodes = preview.nodes.clone();
+    rebind_migration_nodes(sub_id, &mut rebound_nodes);
 
     storage.upsert_subscription(&sub_record)?;
     let imported_node_count = if options.replace_existing {
@@ -473,6 +647,7 @@ fn parse_migration_text(
     Ok(MigrationPreview {
         source_kind,
         source_path: None,
+        display_name: None,
         nodes: parsed.nodes,
         prepend_rules: Vec::new(),
         append_rules: Vec::new(),
@@ -542,6 +717,7 @@ fn parse_clash_yaml_preview(
     Ok(MigrationPreview {
         source_kind,
         source_path: None,
+        display_name: None,
         nodes,
         prepend_rules,
         append_rules,
@@ -622,6 +798,7 @@ fn parse_v2ray_json_preview(
     Ok(MigrationPreview {
         source_kind,
         source_path: None,
+        display_name: None,
         nodes,
         prepend_rules,
         append_rules,
@@ -1010,4 +1187,596 @@ fn is_supported_config_extension(path: &Path) -> bool {
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
         .is_some_and(|ext| matches!(ext.as_str(), "yaml" | "yml" | "json" | "txt"))
+}
+
+fn sort_files_by_size_desc(files: &mut [(PathBuf, u64)]) {
+    files.sort_by(|(pa, sa), (pb, sb)| {
+        sb.cmp(sa).then_with(|| {
+            let na = pa.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let nb = pb.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            na.cmp(nb).then_with(|| pa.cmp(pb))
+        })
+    });
+}
+
+fn is_ignored_scan_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            IGNORED_SCAN_DIRS
+                .iter()
+                .any(|ignored| name.eq_ignore_ascii_case(ignored))
+        })
+}
+
+fn normalize_dedup_path(path: &Path) -> PathBuf {
+    let canonical = crate::paths::normalize_os_path(
+        &std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()),
+    );
+    #[cfg(target_os = "windows")]
+    {
+        PathBuf::from(canonical.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        canonical
+    }
+}
+
+fn read_file_bounded(path: &Path, max_bytes: u64) -> CatResult<Vec<u8>> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            CatError::NotFound(format!("migration source file not found: {}", path.display()))
+        } else {
+            CatError::Io(e)
+        }
+    })?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(CatError::NotFound(format!(
+            "migration source file not found: {}",
+            path.display()
+        )));
+    }
+    if meta.len() > max_bytes {
+        return Err(CatError::Validation(format!(
+            "migration file `{}` ({} bytes) exceeds maximum allowed {} bytes",
+            path.display(),
+            meta.len(),
+            max_bytes
+        )));
+    }
+
+    let mut raw = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+    let mut limited = file.take(max_bytes.saturating_add(1));
+    limited.read_to_end(&mut raw)?;
+    if raw.len() as u64 > max_bytes {
+        return Err(CatError::Validation(format!(
+            "migration file `{}` exceeded maximum allowed {} bytes during read",
+            path.display(),
+            max_bytes
+        )));
+    }
+    Ok(raw)
+}
+
+fn collect_custom_scan_files(
+    dir: &Path,
+    depth: usize,
+    visited_entries: &mut usize,
+    seen_dirs: &mut HashSet<PathBuf>,
+    seen_files: &mut HashSet<PathBuf>,
+    out: &mut Vec<(PathBuf, u64)>,
+) {
+    if *visited_entries >= MAX_CUSTOM_SCAN_ENTRIES {
+        return;
+    }
+    if !seen_dirs.insert(normalize_dedup_path(dir)) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        if *visited_entries >= MAX_CUSTOM_SCAN_ENTRIES {
+            break;
+        }
+        *visited_entries += 1;
+
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let p = entry.path();
+        if ft.is_dir() {
+            if depth < MAX_CUSTOM_SCAN_DEPTH && !is_ignored_scan_dir(&p) {
+                collect_custom_scan_files(
+                    &p,
+                    depth + 1,
+                    visited_entries,
+                    seen_dirs,
+                    seen_files,
+                    out,
+                );
+            }
+            continue;
+        }
+        if (ft.is_file() || (ft.is_symlink() && p.is_file())) && is_supported_config_extension(&p) {
+            let Ok(meta) = std::fs::metadata(&p) else {
+                continue;
+            };
+            let len = meta.len();
+            if len == 0 || len > MAX_SUBSCRIPTION_BYTES as u64 {
+                continue;
+            }
+            if seen_files.insert(normalize_dedup_path(&p)) {
+                out.push((p, len));
+            }
+        }
+    }
+}
+
+fn is_profiles_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("profiles"))
+}
+
+fn normalize_filename_key(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base = trimmed.rsplit(['/', '\\']).next()?.trim();
+    if base.is_empty() {
+        return None;
+    }
+    Some(base.to_ascii_lowercase())
+}
+
+fn yaml_scalar_to_trimmed_string(v: &serde_yaml_ng::Value) -> Option<String> {
+    match v {
+        serde_yaml_ng::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        serde_yaml_ng::Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                Some(u.to_string())
+            } else if let Some(i) = n.as_i64() {
+                Some(i.to_string())
+            } else {
+                n.as_f64().filter(|f| f.is_finite()).map(|f| f.to_string())
+            }
+        }
+        serde_yaml_ng::Value::Tagged(tagged) => yaml_scalar_to_trimmed_string(&tagged.value),
+        _ => None,
+    }
+}
+
+fn load_profiles_yaml_name_map(profiles_yaml_path: &Path) -> HashMap<String, String> {
+    use std::io::Read as _;
+
+    let mut map = HashMap::new();
+    let Ok(file) = std::fs::File::open(profiles_yaml_path) else {
+        return map;
+    };
+    let Ok(meta) = file.metadata() else {
+        return map;
+    };
+    if !meta.is_file() || meta.len() == 0 || meta.len() > MAX_PROFILES_YAML_BYTES {
+        return map;
+    }
+    let mut raw = Vec::with_capacity((meta.len() as usize).min(64 * 1024));
+    let mut limited = file.take(MAX_PROFILES_YAML_BYTES.saturating_add(1));
+    if limited.read_to_end(&mut raw).is_err() || raw.len() as u64 > MAX_PROFILES_YAML_BYTES {
+        return map;
+    }
+    let Ok(text) = std::str::from_utf8(&raw) else {
+        return map;
+    };
+    let clean = text.strip_prefix('\u{FEFF}').unwrap_or(text);
+    let Ok(mut val) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(clean) else {
+        return map;
+    };
+    let _ = val.apply_merge();
+
+    let Some(items) = val
+        .as_mapping()
+        .and_then(|root| root.get("items"))
+        .and_then(serde_yaml_ng::Value::as_sequence)
+    else {
+        return map;
+    };
+
+    for item in items {
+        let Some(item_map) = item.as_mapping() else {
+            continue;
+        };
+        let Some(name_str) = item_map
+            .get("name")
+            .and_then(yaml_scalar_to_trimmed_string)
+        else {
+            continue;
+        };
+        let file_ref = item_map
+            .get("file")
+            .and_then(yaml_scalar_to_trimmed_string)
+            .or_else(|| {
+                item_map
+                    .get("id")
+                    .and_then(yaml_scalar_to_trimmed_string)
+                    .map(|id| {
+                        let lower = id.to_ascii_lowercase();
+                        if lower.ends_with(".yaml")
+                            || lower.ends_with(".yml")
+                            || lower.ends_with(".json")
+                            || lower.ends_with(".txt")
+                        {
+                            id
+                        } else {
+                            format!("{id}.yaml")
+                        }
+                    })
+            });
+        let Some(file_str) = file_ref else {
+            continue;
+        };
+        if let Some(norm_file) = normalize_filename_key(&file_str) {
+            map.insert(norm_file, name_str);
+        }
+    }
+    map
+}
+
+fn lookup_display_name(map: &HashMap<String, String>, file_path: &Path) -> Option<String> {
+    let key = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(normalize_filename_key)?;
+    map.get(&key).cloned()
+}
+
+fn resolve_display_name_for_file(
+    file_path: &Path,
+    cache: &mut HashMap<PathBuf, HashMap<String, String>>,
+) -> Option<String> {
+    const PROFILE_INDEX_FILENAMES: &[&str] = &["profiles.yaml", "profile.yaml"];
+
+    let parent = file_path.parent()?;
+    let mut candidates = Vec::with_capacity(4);
+    if is_profiles_dir(parent) {
+        if let Some(grandparent) = parent.parent() {
+            for index_name in PROFILE_INDEX_FILENAMES {
+                candidates.push(grandparent.join(index_name));
+            }
+        }
+    }
+    for index_name in PROFILE_INDEX_FILENAMES {
+        candidates.push(parent.join(index_name));
+    }
+
+    for cand in candidates {
+        let map = cache
+            .entry(cand.clone())
+            .or_insert_with(|| load_profiles_yaml_name_map(&cand));
+        if let Some(name) = lookup_display_name(map, file_path) {
+            return Some(name);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn build_large_clash_subscription(sub_idx: usize) -> String {
+        let mut yaml = String::from("proxies:\n");
+        for n in 0..16 {
+            yaml.push_str(&format!(
+                "  - name: \"JP Tokyo Sub{sub_idx:02} Node{n:02} 1x\"\n    type: trojan\n    server: 203.0.113.{}\n    port: {}\n    password: \"placeholder-secret-token-{sub_idx:02}-{n:02}\"\n    sni: edge-{sub_idx:02}-{n:02}.example.invalid\n    udp: true\n",
+                (sub_idx * 16 + n) % 240 + 1,
+                443 + (n % 5)
+            ));
+        }
+        yaml
+    }
+
+    fn build_single_node_yaml(label: &str, octet: u8) -> String {
+        format!(
+            "proxies:\n  - name: \"{label}\"\n    type: trojan\n    server: 198.51.100.{octet}\n    port: 443\n    password: \"placeholder-pass\"\n"
+        )
+    }
+
+    #[test]
+    fn clash_verge_52_files_descending_size_and_profiles_yaml_display_names() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-migrator-52files-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profiles_dir = root.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).expect("create profiles dir");
+
+        // 42 small ~80-byte empty templates with alphabetically earlier filenames.
+        let empty_template =
+            "# Clash Verge empty merge template placeholder\nproxies: []\nrules: []\n# pad_80b!\n";
+        assert_eq!(empty_template.len(), 80);
+        for i in 0..42 {
+            let path = profiles_dir.join(format!("a_{i:02}_empty.yaml"));
+            std::fs::write(path, empty_template).expect("write empty template");
+        }
+
+        // 10 realistic >2KB subscriptions with alphabetically later filenames.
+        let mut profiles_index = String::from("current: z_sub_00\nitems:\n");
+        for i in 0..10 {
+            let filename = format!("z_sub_{i:02}.yaml");
+            let content = build_large_clash_subscription(i);
+            assert!(
+                content.len() >= 2048,
+                "expected >= 2KB subscription fixture, got {} bytes",
+                content.len()
+            );
+            std::fs::write(profiles_dir.join(&filename), content).expect("write real subscription");
+            let file_ref = if i == 9 {
+                format!("profiles/{filename}")
+            } else {
+                filename
+            };
+            profiles_index.push_str(&format!(
+                "  - uid: sub_{i:02}\n    type: remote\n    name: \"真实订阅 {i:02}\"\n    file: {file_ref}\n"
+            ));
+        }
+        std::fs::write(root.join("profiles.yaml"), profiles_index).expect("write profiles.yaml");
+
+        let scanned = scan_path_readonly(MigrationSourceKind::ClashVerge, &profiles_dir);
+        assert_eq!(
+            scanned.len(),
+            10,
+            "all 10 real subscriptions must be discovered without truncation"
+        );
+        let names: HashSet<String> = scanned
+            .iter()
+            .filter_map(|p| p.display_name.clone())
+            .collect();
+        for i in 0..10 {
+            let expected = format!("真实订阅 {i:02}");
+            assert!(
+                names.contains(&expected),
+                "missing display_name `{expected}` in {names:?}"
+            );
+        }
+
+        // Even when total files exceed MAX_SCAN_FILES_PER_DIR (64), descending-size ordering
+        // still keeps all 10 large subscriptions ahead of 67 small empty templates.
+        for i in 42..67 {
+            let path = profiles_dir.join(format!("a_{i:02}_empty.yaml"));
+            std::fs::write(path, empty_template).expect("write extra empty template");
+        }
+        let scanned_over_cap = scan_path_readonly(MigrationSourceKind::ClashVerge, &profiles_dir);
+        assert_eq!(scanned_over_cap.len(), 10);
+        for i in 0..10 {
+            let expected = format!("真实订阅 {i:02}");
+            assert!(
+                scanned_over_cap
+                    .iter()
+                    .any(|p| p.display_name.as_deref() == Some(expected.as_str()))
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn scan_custom_path_readonly_recurses_two_levels_skips_ignored_dirs_and_maps_names() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-migrator-custom-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let level1_dir = root.join("client_a");
+        let level2_profiles = level1_dir.join("profiles");
+        let level3_dir = level1_dir.join("nested").join("too_deep");
+        std::fs::create_dir_all(&level2_profiles).expect("mkdir level2");
+        std::fs::create_dir_all(&level3_dir).expect("mkdir level3");
+
+        let level0_file = root.join("top_level.yaml");
+        let level1_file = level1_dir.join("mid_level.yaml");
+        let level2_file = level2_profiles.join("R406R4CRgJ3h.yaml");
+        let level3_file = level3_dir.join("depth3_ignored.yaml");
+
+        std::fs::write(&level0_file, build_single_node_yaml("HK Depth0 1x", 10)).unwrap();
+        std::fs::write(&level1_file, build_single_node_yaml("SG Depth1 1x", 11)).unwrap();
+        std::fs::write(&level2_file, build_single_node_yaml("JP Depth2 1x", 12)).unwrap();
+        std::fs::write(&level3_file, build_single_node_yaml("US Depth3 1x", 13)).unwrap();
+        std::fs::write(
+            level1_dir.join("profiles.yaml"),
+            "items:\n  - name: \"二层目录真实名称\"\n    file: R406R4CRgJ3h.yaml\n",
+        )
+        .unwrap();
+
+        for (idx, ignored) in [
+            "cache",
+            "logs",
+            "EBWebView",
+            "WebView2",
+            "node_modules",
+            ".git",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let dir = root.join(ignored);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("should_skip.yaml"),
+                build_single_node_yaml("Ignored Node", 50 + idx as u8),
+            )
+            .unwrap();
+        }
+
+        let scanned = scan_custom_path_readonly(&root);
+        let found_names: HashSet<String> = scanned
+            .iter()
+            .filter_map(|p| {
+                p.source_path
+                    .as_ref()
+                    .and_then(|sp| sp.file_name())
+                    .and_then(|n| n.to_str())
+                    .map(ToOwned::to_owned)
+            })
+            .collect();
+
+        assert_eq!(scanned.len(), 3, "expected exactly depth 0/1/2 valid files");
+        assert!(found_names.contains("top_level.yaml"));
+        assert!(found_names.contains("mid_level.yaml"));
+        assert!(found_names.contains("R406R4CRgJ3h.yaml"));
+        assert!(!found_names.contains("depth3_ignored.yaml"));
+        assert!(!found_names.contains("should_skip.yaml"));
+
+        let mapped_preview = scanned
+            .iter()
+            .find(|p| {
+                p.source_path
+                    .as_ref()
+                    .and_then(|sp| sp.file_name())
+                    .and_then(|n| n.to_str())
+                    == Some("R406R4CRgJ3h.yaml")
+            })
+            .expect("level2 profile present");
+        assert_eq!(
+            mapped_preview.display_name.as_deref(),
+            Some("二层目录真实名称")
+        );
+
+        // Single-file custom scan also resolves parent `profiles.yaml` display_name.
+        let single = scan_custom_path_readonly(&level2_file);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].display_name.as_deref(), Some("二层目录真实名称"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrator_filters_empty_and_oversized_files_and_caps_custom_scan_entries() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-migrator-bounds-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profiles_dir = root.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+
+        // Create 64 oversized (>16 MiB) files and 8 empty files; none should consume scan slots.
+        for i in 0..MAX_SCAN_FILES_PER_DIR {
+            let huge = profiles_dir.join(format!("huge_{i:02}.yaml"));
+            let f = std::fs::File::create(&huge).unwrap();
+            f.set_len(MAX_SUBSCRIPTION_BYTES as u64 + 1).unwrap();
+        }
+        for i in 0..8 {
+            std::fs::write(profiles_dir.join(format!("empty_{i:02}.yaml")), b"").unwrap();
+        }
+        let valid_file = profiles_dir.join("real_small.yaml");
+        std::fs::write(&valid_file, build_single_node_yaml("TW Valid 1x", 22)).unwrap();
+
+        // Both scan_path_readonly and scan_custom_path_readonly must still discover `real_small.yaml`.
+        let via_known = scan_path_readonly(MigrationSourceKind::ClashVerge, &profiles_dir);
+        assert_eq!(via_known.len(), 1);
+        assert_eq!(via_known[0].nodes.len(), 1);
+
+        let via_custom = scan_custom_path_readonly(&root);
+        assert_eq!(via_custom.len(), 1);
+        assert_eq!(via_custom[0].nodes.len(), 1);
+
+        // `preview_from_file` must reject oversized files cleanly via bounded read.
+        let huge_err = preview_from_file(&profiles_dir.join("huge_00.yaml"), None)
+            .expect_err("oversized file must be rejected");
+        assert!(matches!(huge_err, CatError::Validation(_)));
+
+        // Entry-visit cap stops collection cleanly when budget is nearly exhausted.
+        let mut out = Vec::new();
+        let mut visited = MAX_CUSTOM_SCAN_ENTRIES - 1;
+        let mut seen_dirs = HashSet::new();
+        let mut seen_files = HashSet::new();
+        collect_custom_scan_files(
+            &profiles_dir,
+            0,
+            &mut visited,
+            &mut seen_dirs,
+            &mut seen_files,
+            &mut out,
+        );
+        assert_eq!(visited, MAX_CUSTOM_SCAN_ENTRIES);
+        assert!(out.len() <= 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn load_profiles_yaml_supports_merge_numeric_names_and_singular_profile_yaml_id_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-migrator-profile-yaml-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let profiles_dir = root.join("profiles");
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+
+        let numeric_sub = profiles_dir.join("num_sub.yaml");
+        let party_sub = profiles_dir.join("party_193a.yaml");
+        let merged_sub = profiles_dir.join("merged_sub.yaml");
+        std::fs::write(&numeric_sub, build_single_node_yaml("HK Num 1x", 31)).unwrap();
+        std::fs::write(&party_sub, build_single_node_yaml("JP Party 1x", 32)).unwrap();
+        std::fs::write(&merged_sub, build_single_node_yaml("SG Merge 1x", 33)).unwrap();
+
+        // Mihomo/Clash Party singular `profile.yaml` using YAML anchor merge, numeric `name`,
+        // and `id` without explicit `file` field.
+        let profile_yaml = "\
+defaults: &base_item
+  name: \"锚点继承订阅\"
+items:
+  - id: party_193a
+    name: \"Clash Party 订阅\"
+  - file: num_sub.yaml
+    name: 202601
+  - <<: *base_item
+    id: merged_sub
+";
+        std::fs::write(root.join("profile.yaml"), profile_yaml).unwrap();
+
+        let scanned = scan_path_readonly(MigrationSourceKind::ClashVerge, &profiles_dir);
+        assert_eq!(scanned.len(), 3);
+
+        let by_file: HashMap<String, Option<String>> = scanned
+            .iter()
+            .filter_map(|p| {
+                let fname = p
+                    .source_path
+                    .as_ref()?
+                    .file_name()?
+                    .to_str()?
+                    .to_string();
+                Some((fname, p.display_name.clone()))
+            })
+            .collect();
+
+        assert_eq!(
+            by_file.get("party_193a.yaml").and_then(|o| o.as_deref()),
+            Some("Clash Party 订阅")
+        );
+        assert_eq!(
+            by_file.get("num_sub.yaml").and_then(|o| o.as_deref()),
+            Some("202601")
+        );
+        assert_eq!(
+            by_file.get("merged_sub.yaml").and_then(|o| o.as_deref()),
+            Some("锚点继承订阅")
+        );
+
+        let id1 = generate_migration_subscription_id();
+        let id2 = generate_migration_subscription_id();
+        assert!(id1.starts_with("migrated-"));
+        assert!(id2.starts_with("migrated-"));
+        assert_ne!(id1, id2);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

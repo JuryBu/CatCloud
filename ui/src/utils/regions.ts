@@ -31,7 +31,7 @@ export const CONTINENT_ORDER: ReadonlyArray<ContinentMeta> = [
 ];
 
 /**
- * TAGv2-inspired "常用" quick-access regions ordered by daily priority.
+ * 通用分洲分组标准：「常用」快捷地区按日常使用优先级排序。
  */
 export const COMMON_REGION_ORDER: readonly string[] = [
   "HK",
@@ -96,7 +96,7 @@ export const REGION_META: Record<string, RegionMeta> = {
   TM: { label: "土库曼斯坦", continent: "asia" },
   KP: { label: "朝鲜", continent: "asia" },
 
-  // Middle East (TAGv2 standalone bucket)
+  // Middle East (通用分洲分组标准独立大区)
   AE: { label: "阿联酋", continent: "middle_east" },
   SA: { label: "沙特阿拉伯", continent: "middle_east" },
   IL: { label: "以色列", continent: "middle_east" },
@@ -448,7 +448,7 @@ export function buildContinentRegionStats(
     }
   }
 
-  // Order "common" by TAGv2 daily priority
+  // 按通用分洲分组标准日常优先级排序 "common"
   regionsByContinent.common.sort((a, b) => {
     const ia = COMMON_REGION_ORDER.indexOf(a.code);
     const ib = COMMON_REGION_ORDER.indexOf(b.code);

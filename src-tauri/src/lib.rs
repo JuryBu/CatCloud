@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use catcloud_core::config;
-use catcloud_core::models::{MultiGroup, MultiGroupMode, ProxyMode, RouteTargetMode};
+use catcloud_core::models::{
+    MultiGroup, MultiGroupMode, ProxyMode, RouteTargetMode, UpdateApplyMode, UpdateConfig,
+};
 use catcloud_core::platform::default_platform;
 use catcloud_core::process_guard::{
     AcquireOutcome, JobGuard, SingleInstanceGuard, spawn_detached_self,
@@ -48,6 +50,9 @@ fn has_cli_flag(flag: &str) -> bool {
 }
 
 fn try_apply_staged_portable_update(paths: &AppPaths) -> bool {
+    if !paths.is_self_updatable_portable() {
+        return false;
+    }
     let Ok(current_exe) = std::env::current_exe() else {
         return false;
     };
@@ -117,7 +122,10 @@ pub fn run_with_paths(paths: AppPaths) {
         };
 
     // Apply any verified staged portable update before starting core or opening SQLite.
-    if !post_update_cleanup && paths.is_portable && try_apply_staged_portable_update(&paths) {
+    if !post_update_cleanup
+        && paths.is_self_updatable_portable()
+        && try_apply_staged_portable_update(&paths)
+    {
         if let Some(mut guard) = instance_guard {
             guard.release();
         }
@@ -265,6 +273,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::compile_preview_yaml,
             commands::import_mmrelay_input,
             commands::scan_local_migrations,
+            commands::scan_migration_path,
             commands::preview_migration_from_text,
             commands::apply_migration_nodes,
             commands::list_running_processes,
@@ -274,12 +283,14 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::get_geodata_status,
             commands::refresh_geo_db,
             commands::check_app_update,
+            commands::download_and_stage_update,
             commands::export_backup_bundle,
             commands::import_backup_bundle,
             commands::launch_uwp_loopback,
             commands::hot_swap_core,
             commands::open_app_dir,
             commands::open_web_ui,
+            commands::open_external_url,
         ])
         .on_window_event(lifecycle::handle_window_event_with_state)
         .setup(move |app| {
@@ -311,6 +322,8 @@ pub fn run_with_paths(paths: AppPaths) {
             spawn_proxy_guard(&handle);
             // Spawn background multi-group health watchdog driving automatic failover for StickyBest/ConditionalPool.
             spawn_group_strategy_watchdog(&handle);
+            // Spawn background auto-update checker & portable staging loop (45s cold-start silence).
+            spawn_auto_update_loop(&handle);
 
             let initial_menu = commands::build_tray_menu_state(&handle, &state);
             let initial_visual = commands::build_tray_visual_state(&state);
@@ -1520,5 +1533,139 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                 }
             }
         });
+    }
+}
+
+/// Decide whether the background auto-update loop should run a remote check at `now`.
+fn should_run_auto_update_check(
+    cfg: &UpdateConfig,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if cfg.mode == UpdateApplyMode::Manual {
+        return false;
+    }
+    let min_interval_min = cfg.check_interval_min.clamp(30, 365 * 24 * 60) as i64;
+    let Some(raw_last) = cfg
+        .last_checked_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return true;
+    };
+    let Ok(parsed_last) = chrono::DateTime::parse_from_rfc3339(raw_last) else {
+        return true;
+    };
+    let elapsed = now.signed_duration_since(parsed_last.with_timezone(&chrono::Utc));
+    elapsed >= chrono::Duration::minutes(min_interval_min)
+}
+
+fn spawn_auto_update_loop(app: &tauri::AppHandle) {
+    let app_h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Strict cold-start zero-traffic guard: stay completely silent for 45 seconds after launch
+        // so 5s idle GUI startup audits observe 0 outbound update requests.
+        const INITIAL_SILENT_DELAY: Duration = Duration::from_secs(45);
+        const WAKE_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+        tokio::time::sleep(INITIAL_SILENT_DELAY).await;
+
+        loop {
+            let Some(st) = app_h.try_state::<AppState>() else {
+                break;
+            };
+            if st.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let cfg = st.snapshot_config();
+            if should_run_auto_update_check(&cfg.update, chrono::Utc::now()) {
+                let allow_auto_stage =
+                    cfg.update.auto_download && cfg.update.mode != UpdateApplyMode::Manual;
+                match commands::check_and_optionally_stage_update_internal(
+                    &app_h,
+                    &st,
+                    allow_auto_stage,
+                )
+                .await
+                {
+                    Ok(res) => {
+                        if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
+                            tracing::debug!("background auto-update check skipped/failed: {err}");
+                        } else if res
+                            .get("has_update")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                        {
+                            let latest = res
+                                .get("latest_version")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let auto_staged = res
+                                .get("auto_staged")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let staged_ver = res.get("staged_version").and_then(|v| v.as_str());
+                            if !auto_staged && staged_ver.is_none() && !latest.is_empty() {
+                                st.log_app_event(
+                                    "info",
+                                    "软件更新",
+                                    &format!(
+                                        "后台自动检查发现新版本 v{latest}（当前 v{}），可在设置页查看并更新",
+                                        env!("CARGO_PKG_VERSION")
+                                    ),
+                                );
+                            }
+                        }
+                        commands::emit_runtime_snapshot(&app_h, &st);
+                    }
+                    Err(err) => {
+                        tracing::debug!("background auto-update loop error: {err}");
+                    }
+                }
+            }
+
+            tokio::time::sleep(WAKE_INTERVAL).await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_run_auto_update_check_respects_manual_mode_and_min_interval() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-11-24T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        let mut cfg = UpdateConfig::default();
+        cfg.mode = UpdateApplyMode::Manual;
+        cfg.last_checked_at = None;
+        assert!(!should_run_auto_update_check(&cfg, now));
+
+        cfg.mode = UpdateApplyMode::NextLaunch;
+        assert!(should_run_auto_update_check(&cfg, now));
+
+        // Check interval enforces a 30-minute minimum floor even if configured smaller.
+        cfg.check_interval_min = 5;
+        cfg.last_checked_at = Some("2026-11-24T11:31:00Z".to_string());
+        assert!(!should_run_auto_update_check(&cfg, now));
+        cfg.last_checked_at = Some("2026-11-24T11:30:00Z".to_string());
+        assert!(should_run_auto_update_check(&cfg, now));
+
+        // Standard 360-minute interval boundary.
+        cfg.check_interval_min = 360;
+        cfg.last_checked_at = Some("2026-11-24T06:01:00Z".to_string());
+        assert!(!should_run_auto_update_check(&cfg, now));
+        cfg.last_checked_at = Some("2026-11-24T06:00:00Z".to_string());
+        assert!(should_run_auto_update_check(&cfg, now));
+
+        // Future timestamp (clock skew) must not storm checks; malformed timestamp falls back to due.
+        cfg.last_checked_at = Some("2026-11-24T13:00:00Z".to_string());
+        assert!(!should_run_auto_update_check(&cfg, now));
+        cfg.last_checked_at = Some("not-a-timestamp".to_string());
+        assert!(should_run_auto_update_check(&cfg, now));
     }
 }

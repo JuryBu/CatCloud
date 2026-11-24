@@ -50,6 +50,70 @@ pub trait PlatformAdapter: Send + Sync {
     fn export_shell_env_snippet(&self, shell: &str, host: &str, http_port: u16, socks_port: u16) -> String;
 }
 
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[derive(Debug, Default, Clone, Copy)]
+struct FallbackPlatform;
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+impl PlatformAdapter for FallbackPlatform {
+    fn capabilities(&self) -> PlatformCapabilities {
+        PlatformCapabilities {
+            os: std::env::consts::OS.to_string(),
+            arch: std::env::consts::ARCH.to_string(),
+            supports_uwp_loopback: false,
+            supports_tun_service: false,
+            is_elevated: false,
+        }
+    }
+
+    fn apply_system_proxy(&self, _spec: &SystemProxySpec) -> CatResult<()> {
+        Err(crate::error::CatError::Process(format!(
+            "system proxy configuration is not supported on target OS `{}`",
+            std::env::consts::OS
+        )))
+    }
+
+    fn read_system_proxy(&self) -> CatResult<SystemProxySpec> {
+        Ok(SystemProxySpec {
+            enabled: false,
+            host: "127.0.0.1".to_string(),
+            port: 7890,
+            bypass: Vec::new(),
+            pac_url: None,
+        })
+    }
+
+    fn set_autostart(
+        &self,
+        _enabled: bool,
+        _exe_path: &Path,
+        _args: &[String],
+    ) -> CatResult<()> {
+        Err(crate::error::CatError::Process(format!(
+            "autostart configuration is not supported on target OS `{}`",
+            std::env::consts::OS
+        )))
+    }
+
+    fn is_autostart_enabled(&self) -> CatResult<bool> {
+        Ok(false)
+    }
+
+    fn flush_dns(&self) -> CatResult<()> {
+        Ok(())
+    }
+
+    fn export_shell_env_snippet(
+        &self,
+        shell: &str,
+        host: &str,
+        http_port: u16,
+        socks_port: u16,
+    ) -> String {
+        format_shell_env_snippet(shell, host, http_port, socks_port, true)
+    }
+}
+
 pub fn default_platform() -> Box<dyn PlatformAdapter> {
     #[cfg(target_os = "windows")]
     {
@@ -62,5 +126,9 @@ pub fn default_platform() -> Box<dyn PlatformAdapter> {
     #[cfg(target_os = "linux")]
     {
         Box::new(linux::LinuxPlatform::new())
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+    {
+        Box::new(FallbackPlatform)
     }
 }
