@@ -253,17 +253,20 @@ pub fn should_persist_mihomo_log(
 /// - Redacts URL userinfo credentials (`scheme://user:pass@host`) and opaque proxy payloads
 ///   (`vmess://<base64>`, `ss://<base64>`, `mmrelay://v1/<payload>`)
 /// - Redacts sensitive query/key-value secrets (`secret`, `password`, `token`, `key`, `auth`, `uuid`, `Bearer`, etc.)
-/// - Redacts local user home directory usernames (`C:\Users\<USER>\`, `/Users/<USER>/`, `/home/<USER>/`)
-/// - Masks the last octet of public IPv4 addresses (`a.b.c.*`) while keeping private/loopback/FakeIP intact
-/// - Masks public IPv6 host bits (`xxxx:yyyy::*`) including unbracketed `:port` and `:failed`/`:error` suffixes
-///   without touching timestamps (`HH:MM:SS`) or loopback/ULA
+/// - Redacts local user home directory usernames (`C:\Users\<USER>\`, `/Users/<USER>/`, `/home/<USER>/`),
+///   including usernames containing spaces (`C:\Users\<USER Name>\...`)
+/// - Redacts non-system drive absolute paths (`D:\SomeFolder\...` -> `<LOCAL_PATH>` / `<LOCAL_PATH>/bin`)
+/// - Masks RFC1918 private, CGNAT, link-local, ULA, and public IPv4/IPv6 addresses, only exempting
+///   `127.0.0.1`, `0.0.0.0`, `198.18.0.0/15`, `::1`, `::`, and public domestic DNS (`223.5.5.5`, `119.29.29.29`)
+///   without touching timestamps (`HH:MM:SS`)
 pub fn sanitize_log_line(raw: &str) -> String {
     let step1 = redact_url_userinfo(raw);
     let step2 = redact_bearer_tokens(&step1);
     let step3 = redact_sensitive_key_values(&step2);
     let step4 = redact_user_home_paths(&step3);
-    let step5 = redact_public_ipv4(&step4);
-    redact_public_ipv6(&step5)
+    let step5 = redact_non_system_drive_paths(&step4);
+    let step6 = redact_public_ipv4(&step5);
+    redact_public_ipv6(&step6)
 }
 
 fn is_opaque_uri_payload_end(c: char) -> bool {
@@ -590,7 +593,10 @@ fn redact_sensitive_key_values(input: &str) -> String {
 }
 
 fn is_home_username_terminator(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '\\' | '/' | '"' | '\'' | ')' | ']' | '}' | '>' | ',' | ';')
+    matches!(
+        c,
+        '\\' | '/' | '"' | '\'' | '`' | '\r' | '\n' | '\t' | ')' | ']' | '}' | '>' | ',' | ';'
+    )
 }
 
 fn match_windows_users_prefix(tail: &str) -> Option<usize> {
@@ -665,9 +671,26 @@ fn redact_user_home_paths(input: &str) -> String {
                 i += consumed;
                 continue;
             }
-            let user_len = after
+            let hard_len = after
                 .find(is_home_username_terminator)
                 .unwrap_or(after.len());
+            let candidate = &after[..hard_len];
+            let next_char = after[hard_len..].chars().next();
+            let bounded_by_path_or_quote = matches!(
+                next_char,
+                Some('\\' | '/' | '"' | '\'' | '`' | '\r' | '\n' | '\t')
+            );
+            let looks_like_spaced_username = bounded_by_path_or_quote
+                && candidate.chars().count() <= 64
+                && !candidate.contains("://")
+                && !candidate.contains('=');
+            let user_len = if looks_like_spaced_username {
+                hard_len
+            } else {
+                after
+                    .find(|c: char| c.is_whitespace() || is_home_username_terminator(c))
+                    .unwrap_or(after.len())
+            };
             if user_len > 0 {
                 out.push_str(&tail[..plen]);
                 out.push_str("<USER>");
@@ -687,18 +710,177 @@ fn redact_user_home_paths(input: &str) -> String {
     out
 }
 
+fn starts_with_windows_drive_path(tail: &str) -> bool {
+    let bytes = tail.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return false;
+    }
+    if bytes[2] == b'\\' {
+        true
+    } else if bytes[2] == b'/' {
+        // Exclude single-letter URI schemes such as `d://...`
+        bytes.get(3) != Some(&b'/')
+    } else {
+        false
+    }
+}
+
+fn is_bare_path_hard_terminator(c: char) -> bool {
+    matches!(
+        c,
+        '\r' | '\n'
+            | '\t'
+            | '"'
+            | '\''
+            | '`'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | ','
+            | ';'
+            | '、'
+            | '，'
+            | '。'
+            | '：'
+            | '；'
+            | '（'
+            | '）'
+            | '「'
+            | '」'
+            | '【'
+            | '】'
+            | '！'
+            | '？'
+    )
+}
+
+fn find_bare_windows_path_end(tail: &str) -> usize {
+    let mut pos = 3usize;
+    while pos < tail.len() {
+        let Some(ch) = tail[pos..].chars().next() else {
+            break;
+        };
+        if is_bare_path_hard_terminator(ch) {
+            break;
+        }
+        if ch == ' ' {
+            let mut next_non_space = pos;
+            while next_non_space < tail.len() && tail.as_bytes()[next_non_space] == b' ' {
+                next_non_space += 1;
+            }
+            if next_non_space >= tail.len() {
+                break;
+            }
+            let rest = &tail[next_non_space..];
+            let seg_len = rest
+                .find(|c: char| c.is_whitespace() || is_bare_path_hard_terminator(c))
+                .unwrap_or(rest.len());
+            let next_seg = &rest[..seg_len];
+            let continues_same_path = !next_seg.is_empty()
+                && !starts_with_windows_drive_path(next_seg)
+                && !next_seg.starts_with('/')
+                && !next_seg.contains("://")
+                && (next_seg.contains('\\') || next_seg.contains('/'));
+            if continues_same_path {
+                pos = next_non_space + seg_len;
+                continue;
+            }
+            break;
+        }
+        pos += ch.len_utf8();
+    }
+    pos
+}
+
+fn format_redacted_non_system_path(raw_path: &str) -> String {
+    let last_seg = raw_path
+        .split(['\\', '/'])
+        .rev()
+        .find(|seg| !seg.is_empty());
+    match last_seg {
+        Some(seg)
+            if matches!(
+                seg.to_ascii_lowercase().as_str(),
+                "bin" | "logs" | "config" | "runtime" | "data" | "cache" | "backup" | "backups"
+            ) =>
+        {
+            format!("<LOCAL_PATH>/{seg}")
+        }
+        _ => "<LOCAL_PATH>".to_string(),
+    }
+}
+
+/// Redact non-system Windows drive absolute paths (e.g. `D:\SomeFolder\CatCloud\bin` ->
+/// `<LOCAL_PATH>/bin`, `E:\Private\sub.yaml` -> `<LOCAL_PATH>`) so portable installation
+/// paths or security allowlist guidance never leak local folder names into logs or AI prompts.
+fn redact_non_system_drive_paths(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let tail = &input[i..];
+        let prev_ok = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || matches!(bytes[i - 1], b'_' | b'-' | b'.' | b'/'));
+
+        if prev_ok
+            && starts_with_windows_drive_path(tail)
+            && !bytes[i].eq_ignore_ascii_case(&b'C')
+        {
+            let closing_delim = out.chars().next_back().and_then(|prev| match prev {
+                '`' => Some('`'),
+                '"' => Some('"'),
+                '\'' => Some('\''),
+                '「' => Some('」'),
+                _ => None,
+            });
+            let path_end = match closing_delim {
+                Some('"') => {
+                    let quote_end = find_unescaped_quote(tail, b'"').unwrap_or(tail.len());
+                    let nl_end = tail[..quote_end]
+                        .find(['\r', '\n'])
+                        .unwrap_or(quote_end);
+                    nl_end
+                }
+                Some(delim) => tail
+                    .find(|c: char| c == delim || matches!(c, '\r' | '\n'))
+                    .unwrap_or(tail.len()),
+                None => find_bare_windows_path_end(tail),
+            };
+            if path_end >= 3 {
+                let raw_path = &tail[..path_end];
+                out.push_str(&format_redacted_non_system_path(raw_path));
+                i += path_end;
+                continue;
+            }
+        }
+
+        if let Some(ch) = tail.chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
 fn is_non_public_ipv4(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
-    ip.is_private()
-        || ip.is_loopback()
-        || ip.is_link_local()
+    ip == Ipv4Addr::LOCALHOST
         || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
         // Mihomo Fake-IP benchmark range 198.18.0.0/15
         || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
-        // CGNAT 100.64.0.0/10
-        || (o[0] == 100 && (64..=127).contains(&o[1]))
+        // Well-known public domestic DNS resolvers safe to retain for diagnostics
+        || ip == Ipv4Addr::new(223, 5, 5, 5)
+        || ip == Ipv4Addr::new(119, 29, 29, 29)
 }
 
 fn redact_public_ipv4(input: &str) -> String {
@@ -747,14 +929,7 @@ fn redact_public_ipv4(input: &str) -> String {
 }
 
 fn is_non_public_ipv6(ip: Ipv6Addr) -> bool {
-    let s = ip.segments();
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        // Unique Local Address fc00::/7
-        || (s[0] & 0xfe00) == 0xfc00
-        // Link-local fe80::/10
-        || (s[0] & 0xffc0) == 0xfe80
+    ip.is_loopback() || ip.is_unspecified()
 }
 
 fn is_ipv6_char(b: u8) -> bool {
@@ -914,7 +1089,8 @@ mod tests {
         assert!(clean.contains("https://<REDACTED>@sub.example.com/api/sub?token=<REDACTED>&secret=<REDACTED>&key=<REDACTED>&password=<REDACTED>"));
         assert!(clean.contains("trojan://<REDACTED>@198.51.100.*:443"));
         assert!(clean.contains("127.0.0.1:7890"));
-        assert!(clean.contains("192.168.1.10"));
+        assert!(!clean.contains("192.168.1.10"));
+        assert!(clean.contains("192.168.1.*"));
         assert!(clean.contains("198.18.0.12"));
         assert!(clean.contains("[240e:390::*]:443"));
         assert!(clean.contains("回环 ::1"));
@@ -1065,7 +1241,8 @@ mod tests {
         assert!(clean.contains("connect 240e:390::*:failed"));
         assert!(clean.contains("handshake 240e:390::*:error"));
         assert!(clean.contains("probe 240e:390::*:timeout"));
-        assert!(clean.contains("local fe80::1:failed"));
+        assert!(!clean.contains("fe80::1"));
+        assert!(clean.contains("local fe80:0::*:failed"));
         assert!(clean.contains("2026-11-24T03:25:00Z"));
         assert!(clean.contains("12:34:56:789"));
         assert_eq!(sanitize_log_line(&clean), clean);
@@ -1073,10 +1250,19 @@ mod tests {
 
     #[test]
     fn sanitize_log_line_handles_escaped_quotes_and_preserves_valid_json() {
-        let raw = r#"{"password":"abc\"def\"ghi","secret":12345,"x-api-key":98765,"private_key":"tail\\","path":"C:\\Users\\张三\\cfg.json","ok":true}"#;
+        let raw = r#"{"password":"abc\"def\"ghi","secret":12345,"x-api-key":98765,"private_key":"tail\\","path":"C:\\Users\\张三\\cfg.json","portable":"D:\\MySecretWork\\CatCloud\\bin","ok":true}"#;
         let clean = sanitize_log_line(raw);
 
-        for leaked in ["abc", "def", "ghi", "12345", "98765", "tail", "张三"] {
+        for leaked in [
+            "abc",
+            "def",
+            "ghi",
+            "12345",
+            "98765",
+            "tail",
+            "张三",
+            "MySecretWork",
+        ] {
             assert!(!clean.contains(leaked), "leaked `{leaked}` in: {clean}");
         }
 
@@ -1087,7 +1273,68 @@ mod tests {
         assert_eq!(parsed["x-api-key"], "<REDACTED>");
         assert_eq!(parsed["private_key"], "<REDACTED>");
         assert_eq!(parsed["path"], r"C:\Users\<USER>\cfg.json");
+        assert_eq!(parsed["portable"], "<LOCAL_PATH>/bin");
         assert_eq!(parsed["ok"], true);
+        assert_eq!(sanitize_log_line(&clean), clean);
+    }
+
+    #[test]
+    fn sanitize_log_line_redacts_private_ips_spaced_usernames_and_non_system_paths() {
+        let raw = concat!(
+            "lan 10.24.8.15 corp 172.16.9.22 home 192.168.50.88 cgnat 100.64.12.34 ",
+            "ula fd12:3456:789a::42 link fe80::abcd:1234 ",
+            "keep 127.0.0.1 0.0.0.0 198.18.0.5 223.5.5.5 119.29.29.29 ::1 :: ",
+            "spaced C:\\", "Users\\John Doe\\AppData\\Local\\CatCloud ",
+            "slash C:/", "Users/Jane Smith/Desktop/sub.yaml ",
+            "escaped C:\\\\Users\\\\John Doe\\\\logs\\\\catcloud.log ",
+            "mac /", "Users/Alex Mercer/Library/Logs ",
+            "guidance 信任区添加目录 `D:\\My Secret Folder\\CatCloudPortable\\bin`（放行） ",
+            "bare 安装至 E:\\Program Files\\CatCloud\\bin 完成 ",
+            "file 读取 F:\\PrivateDocs\\secret.yaml 失败"
+        );
+        let clean = sanitize_log_line(raw);
+
+        for leaked in [
+            "10.24.8.15",
+            "172.16.9.22",
+            "192.168.50.88",
+            "100.64.12.34",
+            "789a::42",
+            "abcd:1234",
+            "John Doe",
+            "Jane Smith",
+            "Alex Mercer",
+            "My Secret Folder",
+            "CatCloudPortable",
+            "Program Files",
+            "PrivateDocs",
+            "secret.yaml",
+        ] {
+            assert!(!clean.contains(leaked), "leaked `{leaked}` in: {clean}");
+        }
+
+        assert!(clean.contains("10.24.8.*"));
+        assert!(clean.contains("172.16.9.*"));
+        assert!(clean.contains("192.168.50.*"));
+        assert!(clean.contains("100.64.12.*"));
+        assert!(clean.contains("fd12:3456::*"));
+        assert!(clean.contains("fe80:0::*"));
+
+        assert!(clean.contains("127.0.0.1"));
+        assert!(clean.contains("0.0.0.0"));
+        assert!(clean.contains("198.18.0.5"));
+        assert!(clean.contains("223.5.5.5"));
+        assert!(clean.contains("119.29.29.29"));
+        assert!(clean.contains("::1"));
+        assert!(clean.contains(" :: "));
+
+        assert!(clean.contains(r"C:\Users\<USER>\AppData\Local\CatCloud"));
+        assert!(clean.contains("C:/Users/<USER>/Desktop/sub.yaml"));
+        assert!(clean.contains(r"C:\\Users\\<USER>\\logs\\catcloud.log"));
+        assert!(clean.contains("/Users/<USER>/Library/Logs"));
+        assert!(clean.contains("`<LOCAL_PATH>/bin`（放行）"));
+        assert!(clean.contains("安装至 <LOCAL_PATH>/bin 完成"));
+        assert!(clean.contains("读取 <LOCAL_PATH> 失败"));
         assert_eq!(sanitize_log_line(&clean), clean);
     }
 }

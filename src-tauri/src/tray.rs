@@ -217,6 +217,10 @@ pub struct TrayPreAccelSummary {
     pub global_running: bool,
     #[serde(default)]
     pub global_mode_label: Option<String>,
+    #[serde(default)]
+    pub global_preaccel_verify_state: String,
+    #[serde(default)]
+    pub global_preaccel_verify_ms: Option<u64>,
 }
 
 /// Read-only subscription entry shown under the subscription pool submenu.
@@ -361,6 +365,10 @@ pub struct TrayVisualState {
     pub icon_mode: TrayIconMode,
     pub health: TrayHealthState,
     pub tooltip: String,
+    #[serde(default)]
+    pub global_preaccel_verify_state: String,
+    #[serde(default)]
+    pub global_preaccel_verify_ms: Option<u64>,
 }
 
 impl Default for TrayVisualState {
@@ -369,6 +377,8 @@ impl Default for TrayVisualState {
             icon_mode: TrayIconMode::AutoAc,
             health: TrayHealthState::Idle,
             tooltip: TrayTooltipInfo::default().format_tooltip(),
+            global_preaccel_verify_state: "idle".to_string(),
+            global_preaccel_verify_ms: None,
         }
     }
 }
@@ -646,23 +656,38 @@ fn format_preaccel_submenu_title(preaccel: &TrayPreAccelSummary) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty());
     let unified_on = preaccel.enabled || preaccel.global_enabled || preaccel.global_running;
+    let verify_state = preaccel.global_preaccel_verify_state.trim();
     let status_tag = if !unified_on {
-        "已关闭"
+        "已关闭".to_string()
+    } else if verify_state == "degraded" {
+        "已保护回退（请查看国内提速环境放行指引）".to_string()
+    } else if verify_state == "probing" {
+        "探测链路中…".to_string()
     } else {
         match preaccel.global_mode_label.as_deref().map(str::trim) {
-            Some("dual") => "已开启·猫云+其它软件",
-            Some("windivert") | Some("底层全局提速") if preaccel.global_running => "全局提速中",
-            Some("downloading") => "准备提速组件中",
-            Some("need_elevation") => "需管理员权限",
-            Some("local_socks5") | Some("本地443通道") => "本地通道待命",
-            Some("standby") => "已开启·待启动",
-            _ if preaccel.enabled => "已开启",
-            _ => "本地通道待命",
+            Some("dual") => match preaccel.global_preaccel_verify_ms {
+                Some(ms) if verify_state == "verified" => {
+                    format!("已开启·猫云+其它软件 · {ms} ms")
+                }
+                _ => "已开启·猫云+其它软件".to_string(),
+            },
+            Some("windivert") | Some("底层全局提速") if preaccel.global_running => {
+                match preaccel.global_preaccel_verify_ms {
+                    Some(ms) if verify_state == "verified" => format!("全局提速中 · {ms} ms"),
+                    _ => "全局提速中".to_string(),
+                }
+            }
+            Some("downloading") => "准备提速组件中".to_string(),
+            Some("need_elevation") => "需管理员权限".to_string(),
+            Some("local_socks5") | Some("本地443通道") => "本地通道待命".to_string(),
+            Some("standby") => "已开启·待启动".to_string(),
+            _ if preaccel.enabled => "已开启".to_string(),
+            _ => "本地通道待命".to_string(),
         }
     };
 
     match active_suffix {
-        Some(label) if unified_on => {
+        Some(label) if unified_on && verify_state != "degraded" => {
             format!("国内提速 ({status_tag} · {label})")
         }
         _ => format!("国内提速 ({status_tag})"),
@@ -814,6 +839,24 @@ pub fn build_tray_menu<R: Runtime>(
         None::<&str>,
     )?;
     preaccel_submenu.append(&preaccel_toggle)?;
+    if preaccel_unified_checked {
+        match state.preaccel.global_preaccel_verify_state.trim() {
+            "degraded" => {
+                let status_hint = MenuItem::new(
+                    app,
+                    "状态: 已保护回退（请查看国内提速环境放行指引）",
+                    false,
+                    None::<&str>,
+                )?;
+                preaccel_submenu.append(&status_hint)?;
+            }
+            "probing" => {
+                let status_hint = MenuItem::new(app, "状态: 探测链路中…", false, None::<&str>)?;
+                preaccel_submenu.append(&status_hint)?;
+            }
+            _ => {}
+        }
+    }
     preaccel_submenu.append(&preaccel_failover)?;
     preaccel_submenu.append(&PredefinedMenuItem::separator(app)?)?;
     if state.preaccel.relays.is_empty() {
@@ -1478,5 +1521,72 @@ mod tests {
         let formatted = info.format_tooltip();
         assert!(formatted.contains("预加速: 全局提速中"));
         assert!(formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
+    }
+
+    #[test]
+    fn preaccel_submenu_and_menu_diff_reflect_probing_and_degraded_verify_states() {
+        let degraded = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            global_enabled: true,
+            global_running: true,
+            global_mode_label: Some("local_socks5".into()),
+            global_preaccel_verify_state: "degraded".into(),
+            global_preaccel_verify_ms: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&degraded),
+            "国内提速 (已保护回退（请查看国内提速环境放行指引）)"
+        );
+
+        let probing = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            global_enabled: true,
+            global_running: true,
+            global_mode_label: Some("windivert".into()),
+            global_preaccel_verify_state: "probing".into(),
+            global_preaccel_verify_ms: None,
+            ..Default::default()
+        };
+        let probing_title = format_preaccel_submenu_title(&probing);
+        assert!(probing_title.contains("探测链路中…"));
+        assert!(!probing_title.contains("全局提速中"));
+
+        let verified = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("杭州443".into()),
+            global_enabled: true,
+            global_running: true,
+            global_mode_label: Some("windivert".into()),
+            global_preaccel_verify_state: "verified".into(),
+            global_preaccel_verify_ms: Some(36),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&verified),
+            "国内提速 (全局提速中 · 36 ms · 杭州443)"
+        );
+
+        let initial_menu = TrayMenuState {
+            preaccel: probing,
+            ..Default::default()
+        };
+        let runtime = TrayRuntimeState::new(
+            initial_menu.clone(),
+            (TrayIconPack::A, TrayHealthState::Idle),
+            "CatCloud".into(),
+            TrayClickAction::ToggleMain,
+        );
+        let next_menu = TrayMenuState {
+            preaccel: degraded,
+            ..Default::default()
+        };
+        assert!(runtime.should_rebuild_menu(&next_menu));
+
+        let default_visual = TrayVisualState::default();
+        assert_eq!(default_visual.global_preaccel_verify_state, "idle");
+        assert_eq!(default_visual.global_preaccel_verify_ms, None);
     }
 }

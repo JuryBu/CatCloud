@@ -97,7 +97,7 @@ export function NodesWorkspacePage() {
         <div
           className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5"
           role="tablist"
-          aria-label="节点与订阅工作台切签"
+          aria-label="节点与测速工作台切签"
         >
           <button
             type="button"

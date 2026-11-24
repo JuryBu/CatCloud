@@ -365,14 +365,42 @@ function resolveStatusAccent(
   }
   if (preaccel.proxyActive) {
     if (preaccel.enabled) {
-      return {
-        color: "var(--accent)",
-        label: preaccel.realWinDivertActive ? "国内提速中（全局）" : "国内提速运行中",
-      };
+      if (preaccel.realWinDivertActive) {
+        if (preaccel.verifyState === "probing") {
+          return { color: "var(--amber)", label: "国内提速（探测中）" };
+        }
+        if (preaccel.verifyState === "verified") {
+          return {
+            color: "var(--green)",
+            label: preaccel.verifyLatencyMs
+              ? `国内提速（已畅通 ${preaccel.verifyLatencyMs}ms）`
+              : "国内提速（已畅通）",
+          };
+        }
+        return { color: "var(--accent)", label: "国内提速中（全局）" };
+      }
+      if (preaccel.verifyState === "probing") {
+        return { color: "var(--amber)", label: "国内提速（探测中）" };
+      }
+      if (preaccel.verifyState === "degraded") {
+        return { color: "var(--amber)", label: "国内提速（其它已回退）" };
+      }
+      return { color: "var(--accent)", label: "国内提速运行中" };
     }
     return { color: "var(--green)", label: "代理运行正常" };
   }
   if (preaccel.realWinDivertActive) {
+    if (preaccel.verifyState === "probing") {
+      return { color: "var(--amber)", label: "正在探测链路…" };
+    }
+    if (preaccel.verifyState === "verified") {
+      return {
+        color: "var(--green)",
+        label: preaccel.verifyLatencyMs
+          ? `已探测畅通 ${preaccel.verifyLatencyMs}ms`
+          : "已探测畅通",
+      };
+    }
     return { color: "var(--accent)", label: "全局提速中" };
   }
   if (preaccel.enabled) {
@@ -381,6 +409,12 @@ function resolveStatusAccent(
     }
     if (preaccel.installState === "need_elevation") {
       return { color: "var(--amber)", label: "提速需管理员" };
+    }
+    if (preaccel.verifyState === "probing") {
+      return { color: "var(--amber)", label: "正在探测链路…" };
+    }
+    if (preaccel.verifyState === "degraded") {
+      return { color: "var(--amber)", label: "已自动保护回退" };
     }
     return { color: "var(--amber)", label: "本地通道待命" };
   }
@@ -1974,7 +2008,8 @@ export function CapsuleWindow() {
         >
           {togglingPreAccel ||
           preaccelSummary.installState === "downloading" ||
-          preaccelSummary.installState === "verifying" ? (
+          preaccelSummary.installState === "verifying" ||
+          preaccelSummary.verifyState === "probing" ? (
             <Loader2 className="h-3 w-3 animate-spin" />
           ) : (
             <Zap
@@ -2057,7 +2092,9 @@ export function CapsuleWindow() {
         : `↑${formatCompactRate(peakUp).replace("/s", "")}`;
     }
     if (preaccelSummary.proxyActive && preaccelSummary.enabled) return "提速中";
-    if (!preaccelSummary.proxyActive && preaccelSummary.realWinDivertActive) return "全局提速";
+    if (!preaccelSummary.proxyActive && preaccelSummary.realWinDivertActive) {
+      return preaccelSummary.verifyState === "probing" ? "探测中" : "全局提速";
+    }
     if (!preaccelSummary.proxyActive && preaccelSummary.enabled) {
       if (
         preaccelSummary.installState === "downloading" ||
@@ -2066,6 +2103,8 @@ export function CapsuleWindow() {
         return "准备中";
       }
       if (preaccelSummary.installState === "need_elevation") return "需提权";
+      if (preaccelSummary.verifyState === "probing") return "探测中";
+      if (preaccelSummary.verifyState === "degraded") return "已回退";
       return "待命中";
     }
     if (runtime.running) return "运行中";

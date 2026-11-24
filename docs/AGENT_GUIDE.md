@@ -6,7 +6,7 @@ CatCloud 从架构层面将 **AI Agent 与自动化脚本** 视为与图形界�
 
 ## 1. 全产品「Agent 辅助友好」设计原则
 
-1. **人机双读四段式内置文档**：CatCloud 在 `catcloud-core` 的 `agent_docs` 注册表中为全部 6 个核心子系统维护结构化指南，界面支持一键复制为 Prompt 交给 AI Agent，CLI 支持 Markdown / JSON 导出：
+1. **人机双读内置文档与小白一键 AI 导师**：CatCloud 在 `catcloud-core` 的 `agent_docs` 注册表中为新手总纲与全部 6 个核心子系统（共 7 大模块）维护结构化指南；桌面端侧栏、首页首屏/空态与导入页均提供一眼可见的「AI 带我上手」一键复制按钮，直接生成纯中文小白向导 Prompt + 当前脱敏进度快照，粘给任意 AI 即可按用户当前画面一步步教学；CLI 同时支持 Markdown / JSON 导出：
    - 第 1 段：**何时使用与量化触发信号**（When to Use & Quantitative Signals）
    - 第 2 段：**外部前置条件与标准 Schema**（External Prerequisites & Standard Schema）
    - 第 3 段：**GUI 路径与无头 CLI 接入验真命令**（GUI & Headless CLI Verification）
@@ -15,14 +15,15 @@ CatCloud 从架构层面将 **AI Agent 与自动化脚本** 视为与图形界�
 3. **验证优先与失败零断流**：任何由外部脚本或 AI Agent 编辑的 `data/config.json` 或覆写文件，均可先通过静态与内核预检；即使直接写入磁盘触发文件监听热载，无效配置也会被原子拒载并输出结构化错误，绝不中断现役连接。
 4. **原生沙箱隔离**：所有命令均支持全局 `--data-dir <PATH>` 参数，AI Agent 可在临时目录中独立演练配置、探针与策略公式，零风险影响用户主力实例。
 
-### 内置 6 大 Agent 文档模块 ID
+### 内置 7 大 Agent 文档模块 ID
 
 | 模块 ID | 覆盖范围 |
 |---|---|
-| `preaccel` | 国内预加速（`mmrelay/v1`、纯 IP 无 SNI、国内 204 双活、校园网防护） |
+| `onboarding` | 全中文小白上手总纲（5 大核心玩法、精确中文界面路径与陌生 AI 渐进式教学守则） |
+| `preaccel` | 国内提速（`mmrelay/v1`、纯 IP 无 SNI、国内 204 双活、WinDivert 底层自动探测与校园网防护） |
 | `multigroup` | 智能多选组（4 种模式、安全 AST 公式、3 选 1 兜底与滞回回切） |
-| `probes` | 零干扰隔离探针引擎（三级省流漏斗、Google 真值、自定义与脚本探针） |
-| `nodes_ingest` | 多维节点库、老配置只读迁移、运行中进程只读探测与 `catcloud-adapter/v1` |
+| `probes` | 零干扰隔离测速引擎（三级省流漏斗、Google 真值、自定义与脚本探针） |
+| `nodes_ingest` | 多维节点库、老配置只读迁移、`1→2→3` 实时捕捉向导与 `catcloud-adapter/v1` |
 | `network_reload` | Proxy Guard、PAC、TUN、进阶 DNS、三级热加载与脱敏诊断 |
 | `updater_lifecycle` | 无窗省内存态、便携隔离与下次启动安全自更新 |
 

@@ -2335,12 +2335,8 @@ fn build_dns_section(
     let mut ff_map = Mapping::new();
     insert_bool(&mut ff_map, "geoip", dns.fallback_filter.geoip && has_geoip);
     insert_str(&mut ff_map, "geoip-code", &dns.fallback_filter.geoip_code);
-    if has_geosite && !dns.fallback_filter.geosite.is_empty() {
-        ff_map.insert(
-            str_val("geosite"),
-            string_seq(dns.fallback_filter.geosite.iter().map(String::as_str)),
-        );
-    }
+    // `fallback-filter.geosite` is deprecated in Mihomo and triggers a warning on every start/reload;
+    // geosite DNS routing is already handled by `nameserver-policy` above.
     ff_map.insert(
         str_val("ipcidr"),
         string_seq(dns.fallback_filter.ipcidr.iter().map(String::as_str)),
@@ -3590,7 +3586,9 @@ rules:
             with_geo.value["dns"]["fallback-filter"]["geoip"],
             Value::Bool(true)
         );
-        assert!(with_geo.value["dns"]["fallback-filter"].get("geosite").is_some());
+        // `fallback-filter.geosite` is intentionally omitted because Mihomo deprecates it
+        // in favor of `nameserver-policy`.
+        assert!(with_geo.value["dns"]["fallback-filter"].get("geosite").is_none());
         assert!(
             with_geo.value["dns"]["nameserver-policy"]
                 .get("geosite:cn,private")

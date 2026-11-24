@@ -23,13 +23,17 @@ pub use generator::{
 };
 pub use global_tunnel::{
     GlobalPreAccelManager, GlobalPreAccelMetrics, GlobalPreAccelStatus, Ipv4TcpMeta,
-    MAX_NAT_ENTRIES, NAT_IDLE_TIMEOUT, NatEntry, NatKey, NatTable, STANDALONE_TUNNEL_GOGC,
-    STANDALONE_TUNNEL_GOMEMLIMIT, StandalonePreAccelTunnel, WINDIVERT_DOWNLOAD_URL,
-    WINDIVERT_ZIP_SHA256, WinDivertAddress, WinDivertPaths, build_windivert_filter,
-    collect_enabled_relay_ipv4s, compile_standalone_preaccel_yaml, download_and_install_windivert,
-    is_physical_nic_descriptor, locate_windivert_files, locate_windivert_files_with_exe_dir,
-    locate_windivert_paths, normalize_process_basename, parse_ipv4_tcp_packet,
-    rewrite_ipv4_tcp_dst, rewrite_ipv4_tcp_src, should_intercept_process,
+    MAX_NAT_ENTRIES, NAT_CLOSING_GRACE, NAT_IDLE_TIMEOUT, NatEntry, NatKey, NatTable,
+    SELF_TEST_DETECTED_BY, STANDALONE_TUNNEL_GOGC, STANDALONE_TUNNEL_GOMEMLIMIT,
+    StandalonePreAccelTunnel, WINDIVERT_DOWNLOAD_URL, WINDIVERT_ZIP_SHA256, WinDivertAddress,
+    WinDivertPaths, build_security_guidance, build_self_test_probe_urls, build_windivert_filter,
+    clamp_tcp_syn_mss, classify_security_products_from_process_names,
+    collect_enabled_relay_ipv4s, compile_standalone_preaccel_yaml,
+    compile_standalone_preaccel_yaml_with_interface, detect_host_security_products,
+    download_and_install_windivert, is_physical_nic_descriptor, locate_windivert_files,
+    locate_windivert_files_with_exe_dir, locate_windivert_paths, normalize_process_basename,
+    parse_ipv4_tcp_packet, rewrite_ipv4_tcp_dst, rewrite_ipv4_tcp_from_loopback,
+    rewrite_ipv4_tcp_src, rewrite_ipv4_tcp_to_loopback, should_intercept_process,
     socks5_noauth_connect_ipv4, verify_and_extract_windivert_zip,
 };
 pub use schema::{

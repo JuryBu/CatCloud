@@ -109,19 +109,43 @@ function resolveStatusLabel(status: string, preaccel: PreAccelSummary): string {
   if (status === "warn") return "路线存在波动";
   if (preaccel.proxyActive) {
     if (preaccel.enabled) {
-      return preaccel.realWinDivertActive
-        ? "国内提速中（猫云 + 其它软件）"
-        : "国内提速运行中";
+      if (preaccel.realWinDivertActive) {
+        if (preaccel.verifyState === "probing") {
+          return "国内提速中（探测其它软件链路…）";
+        }
+        if (preaccel.verifyState === "verified" && preaccel.verifyLatencyMs) {
+          return `国内提速中（猫云 + 其它软件 · ${preaccel.verifyLatencyMs} ms）`;
+        }
+        return "国内提速中（猫云 + 其它软件）";
+      }
+      if (preaccel.verifyState === "degraded") {
+        return "国内提速中（其它软件已保护回退）";
+      }
+      return "国内提速运行中";
     }
     return "代理运行中";
   }
-  if (preaccel.realWinDivertActive) return "全局提速中";
+  if (preaccel.realWinDivertActive) {
+    if (preaccel.verifyState === "probing") return "正在探测链路…";
+    if (preaccel.verifyState === "verified") {
+      return preaccel.verifyLatencyMs
+        ? `已探测畅通（${preaccel.verifyLatencyMs} ms）`
+        : "已探测畅通";
+    }
+    return "全局提速中";
+  }
   if (preaccel.enabled) {
     if (preaccel.installState === "downloading" || preaccel.installState === "verifying") {
       return "正在准备提速组件…";
     }
     if (preaccel.installState === "need_elevation") {
       return "国内提速需管理员权限";
+    }
+    if (preaccel.verifyState === "probing") {
+      return "正在探测链路…";
+    }
+    if (preaccel.verifyState === "degraded") {
+      return "已自动保护回退";
     }
     return "本地通道待命";
   }
@@ -149,7 +173,10 @@ export function Sidebar() {
   const tunAdminPromptReason = useAppSelector((s) => s.tunAdminPromptReason);
 
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
+  const [copyingAiGuide, setCopyingAiGuide] = useState(false);
+  const [copiedAiGuide, setCopiedAiGuide] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
+  const aiGuideTimerRef = useRef<number | null>(null);
   const platformOs = resolvePlatformOs(runtime.os_label);
   const preaccelSummary = resolvePreAccelSummary(
     runtime,
@@ -167,6 +194,18 @@ export function Sidebar() {
       };
     }
     if (preaccelSummary.realWinDivertActive) {
+      if (preaccelSummary.verifyState === "probing") {
+        return {
+          label: "探测中",
+          cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+        };
+      }
+      if (preaccelSummary.verifyState === "verified") {
+        return {
+          label: "已畅通",
+          cls: "bg-[var(--green-soft)] text-[var(--green)]",
+        };
+      }
       return {
         label: "全局提速",
         cls: "bg-[var(--accent-soft)] text-[var(--accent)]",
@@ -184,6 +223,18 @@ export function Sidebar() {
     if (preaccelSummary.installState === "need_elevation") {
       return {
         label: "需提权",
+        cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+      };
+    }
+    if (preaccelSummary.verifyState === "probing") {
+      return {
+        label: "探测中",
+        cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+      };
+    }
+    if (preaccelSummary.verifyState === "degraded") {
+      return {
+        label: "已回退",
         cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
       };
     }
@@ -232,7 +283,11 @@ export function Sidebar() {
         : preaccelSummary.proxyActive && preaccelSummary.enabled
           ? "var(--accent)"
           : preaccelSummary.realWinDivertActive
-            ? "var(--accent)"
+            ? preaccelSummary.verifyState === "probing"
+              ? "var(--amber)"
+              : preaccelSummary.verifyState === "verified"
+                ? "var(--green)"
+                : "var(--accent)"
             : preaccelSummary.enabled
               ? "var(--amber)"
               : preaccelSummary.proxyActive
@@ -283,6 +338,35 @@ export function Sidebar() {
       presetId,
       presetId ? `已更换背景：${label}` : "已恢复纯色背景"
     );
+  };
+
+  useEffect(() => {
+    return () => {
+      if (aiGuideTimerRef.current !== null) {
+        window.clearTimeout(aiGuideTimerRef.current);
+        aiGuideTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopyAiOnboarding = async () => {
+    if (copyingAiGuide) return;
+    setCopyingAiGuide(true);
+    try {
+      const ok = await appActions.copyAiOnboardingForUser();
+      if (ok) {
+        setCopiedAiGuide(true);
+        if (aiGuideTimerRef.current !== null) {
+          window.clearTimeout(aiGuideTimerRef.current);
+        }
+        aiGuideTimerRef.current = window.setTimeout(() => {
+          setCopiedAiGuide(false);
+          aiGuideTimerRef.current = null;
+        }, 2200);
+      }
+    } finally {
+      setCopyingAiGuide(false);
+    }
   };
 
   const handleOpenAppearanceSettings = () => {
@@ -491,7 +575,7 @@ export function Sidebar() {
                 : item.id === "nodes"
                   ? "后台正在刷新订阅、测速或捕捉节点，切回即可查看"
                   : item.id === "preaccel"
-                    ? "后台正在运行提速对比、线路测速或准备组件，切回即可查看"
+                    ? "后台正在探测链路、运行提速对比、线路测速或准备组件，切回即可查看"
                     : hasDirtyDraft
                       ? "后台正在更新地理库、检查更新或执行维护任务（另有未保存更改），切回即可查看"
                       : "后台正在更新地理库、检查更新或执行维护任务，切回即可查看";
@@ -575,9 +659,45 @@ export function Sidebar() {
         })}
       </nav>
 
+      {/* Persistent AI Onboarding Guide Button (Always visible across every page) */}
+      <div className="mt-2 border-t border-[var(--line)] pt-2">
+        <button
+          type="button"
+          disabled={copyingAiGuide}
+          onClick={() => void handleCopyAiOnboarding()}
+          title="复制「AI 新手上手指南 + 当前进度」，直接粘贴给任意 AI（如 ChatGPT / 豆包 / DeepSeek）就能一步步带你用猫猫云梯"
+          aria-label="复制 AI 新手上手指南与当前进度"
+          className={`group flex w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-2 text-left text-xs font-semibold transition-colors disabled:opacity-65 ${
+            copiedAiGuide
+              ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
+              : "border-[var(--accent)]/45 bg-[var(--accent-soft)]/80 text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+          }`}
+        >
+          <span className="inline-flex min-w-0 items-center gap-1.5 truncate">
+            {copiedAiGuide ? (
+              <Check className="h-3.5 w-3.5 shrink-0" />
+            ) : copyingAiGuide ? (
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            ) : null}
+            <span className="truncate">
+              {copiedAiGuide
+                ? "已复制，粘给 AI 即可"
+                : copyingAiGuide
+                  ? "正在生成指南…"
+                  : "🤖 AI 带我上手"}
+            </span>
+          </span>
+          {!copiedAiGuide && !copyingAiGuide && (
+            <span className="shrink-0 rounded-md bg-[var(--surface)]/85 px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)] group-hover:text-[var(--accent)]">
+              复制
+            </span>
+          )}
+        </button>
+      </div>
+
       {/* Bottom compact control console: hidden on overview page to avoid duplicating Hero controls & sparkline */}
       {activeNav === "overview" ? (
-        <div className="mt-3 border-t border-[var(--line)] pt-2.5">
+        <div className="mt-2 border-t border-[var(--line)] pt-2">
           <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)]/80 bg-[var(--card)]/75 px-2.5 py-2 text-[11px] text-[var(--text-secondary)]">
             <span className="inline-flex min-w-0 items-center gap-1.5">
               <span
@@ -599,7 +719,7 @@ export function Sidebar() {
           </div>
         </div>
       ) : (
-        <div className="mt-3 space-y-2 border-t border-[var(--line)] pt-2">
+        <div className="mt-2 space-y-2 border-t border-[var(--line)] pt-2">
           <TrafficSparkline variant="mini" />
 
           {/* System Proxy / Virtual Network Card Quick Capsules */}

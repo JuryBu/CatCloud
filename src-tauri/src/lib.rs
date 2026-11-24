@@ -259,6 +259,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::toggle_global_preaccel,
             commands::update_global_preaccel_settings,
             commands::install_windivert_driver,
+            commands::verify_global_preaccel,
             commands::relaunch_as_admin_for_global_preaccel,
             commands::select_preaccel_relay,
             commands::failover_preaccel,
@@ -292,6 +293,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::cancel_live_capture_session,
             commands::export_shell_env,
             commands::export_sanitized_diagnostics,
+            commands::build_ai_onboarding_prompt,
             commands::get_geodata_status,
             commands::refresh_geo_db,
             commands::check_app_update,
@@ -523,6 +525,7 @@ pub fn run_with_paths(paths: AppPaths) {
                 tauri::async_runtime::spawn(async move {
                     if let Some(st) = auto_handle.try_state::<AppState>() {
                         if enable_tun_flag && default_platform().capabilities().is_elevated {
+                            let _cfg_guard = st.config_transition_lock.lock().await;
                             let has_enabled = commands::has_enabled_nodes(&st).unwrap_or(false);
                             if !has_enabled {
                                 st.log_app_event(
@@ -629,8 +632,14 @@ pub fn run_with_paths(paths: AppPaths) {
                         }
                         let has_nodes = commands::has_enabled_nodes(&st).unwrap_or(false);
                         if has_nodes {
-                            if let Err(err) = commands::start_core_internal(&auto_handle, &st).await {
-                                tracing::info!("auto-start core skipped: {err}");
+                            let _cfg_guard = st.config_transition_lock.lock().await;
+                            let latest_cfg = st.snapshot_config();
+                            if (latest_cfg.system_proxy.enabled || latest_cfg.tun.enabled)
+                                && !st.adapter.has_live_controller().await
+                            {
+                                if let Err(err) = commands::start_core_internal(&auto_handle, &st).await {
+                                    tracing::info!("auto-start core skipped: {err}");
+                                }
                             }
                         }
                     }
@@ -739,6 +748,11 @@ fn spawn_proxy_guard(app: &tauri::AppHandle) {
             if st.shutting_down.load(Ordering::SeqCst) {
                 break;
             }
+            // Skip tick while a config/proxy/TUN transition or core reload is in progress so
+            // ProxyGuard never reports spurious drift mid-transition.
+            let Ok(_cfg_guard) = Arc::clone(&st.config_transition_lock).try_lock_owned() else {
+                continue;
+            };
             let cfg = st.snapshot_config();
             if !(cfg.system_proxy.enabled && cfg.system_proxy.proxy_guard.enabled) {
                 continue;

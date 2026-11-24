@@ -63,8 +63,8 @@ use catcloud_core::subscription::live_capture::{
 use catcloud_core::subscription::{
     ADAPTER_REASON_MANUAL, AdapterConfig, AdapterCooldownGuard, AdapterRequest, FetchOptions,
     ParsedSubscription, SubscriptionPayloadFormat, apply_parsed_subscription,
-    fetch_and_parse_subscription_with_options, inspect_process_source as core_inspect_process_source,
-    invoke_external_adapter, parse_controller_proxies_json, parse_subscription_payload,
+    inspect_process_source as core_inspect_process_source, invoke_external_adapter,
+    parse_controller_proxies_json, parse_subscription_payload,
     preview_from_text as core_preview_from_text,
 };
 use catcloud_core::updater::Updater;
@@ -825,6 +825,10 @@ pub struct CoreRuntimeInfoDto {
     pub global_windivert_active: bool,
     #[serde(default)]
     pub preaccel_install_state: String,
+    #[serde(default)]
+    pub global_preaccel_verify_state: String,
+    #[serde(default)]
+    pub global_preaccel_verify_ms: Option<u64>,
     #[serde(default)]
     pub node_health_hints: HashMap<String, NodeHealthHintDto>,
     pub preaccel_relay_name: Option<String>,
@@ -1593,6 +1597,14 @@ pub(crate) fn is_proxy_takeover_active(core_running: bool, cfg: &AppConfig) -> b
 }
 
 pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState {
+    build_tray_menu_state_with_verify_override(app, state, None)
+}
+
+fn build_tray_menu_state_with_verify_override(
+    app: &AppHandle,
+    state: &AppState,
+    verify_override: Option<(&str, Option<u64>)>,
+) -> TrayMenuState {
     let cfg = state.snapshot_config();
     let win = lifecycle::window_mode_snapshot(app);
 
@@ -1727,6 +1739,12 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
 
     let rt = state.snapshot_runtime();
     let global_status = state.snapshot_global_preaccel();
+    let verify_state = verify_override
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| global_status.verify_state.clone());
+    let verify_ms = verify_override
+        .map(|(_, ms)| ms)
+        .unwrap_or(global_status.verify_latency_ms);
     let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
     let global_mode_label = if !cfg.preaccel.enabled && !global_status.running {
         None
@@ -1774,6 +1792,8 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
             global_enabled: cfg.preaccel.enabled,
             global_running: global_status.is_windivert_active,
             global_mode_label,
+            global_preaccel_verify_state: verify_state,
+            global_preaccel_verify_ms: verify_ms,
         },
         subscriptions: TraySubscriptionSummary {
             total_remaining_label: if total_remaining > 0 {
@@ -1787,6 +1807,13 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
 }
 
 pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
+    build_tray_visual_state_with_verify_override(state, None)
+}
+
+fn build_tray_visual_state_with_verify_override(
+    state: &AppState,
+    verify_override: Option<(&str, Option<u64>)>,
+) -> TrayVisualState {
     let cfg = state.snapshot_config();
     let rt = state.snapshot_runtime();
     let global_status = state.snapshot_global_preaccel();
@@ -1851,11 +1878,22 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         .unwrap_or((None, None, false));
 
     let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
-    let preaccel_active = (proxy_active && cfg.preaccel.enabled && has_enabled_relays)
-        || global_status.is_windivert_active;
+    let verify_state = verify_override
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| global_status.verify_state.clone());
+    let verify_ms = verify_override
+        .map(|(_, ms)| ms)
+        .unwrap_or(global_status.verify_latency_ms);
+    let verify_state_trimmed = verify_state.trim();
+    let preaccel_verify_degraded = cfg.preaccel.enabled && verify_state_trimmed == "degraded";
+    let preaccel_verify_probing = cfg.preaccel.enabled && verify_state_trimmed == "probing";
+    let preaccel_active = !preaccel_verify_degraded
+        && !preaccel_verify_probing
+        && ((proxy_active && cfg.preaccel.enabled && has_enabled_relays)
+            || global_status.is_windivert_active);
     let health = if rt.last_error.is_some() {
         TrayHealthState::Error
-    } else if portal_required {
+    } else if portal_required || preaccel_verify_degraded {
         TrayHealthState::Warn
     } else if preaccel_active {
         TrayHealthState::PreAccel
@@ -1871,20 +1909,31 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         .cloned()
         .or(configured_relay_name);
 
-    let preaccel_summary = if proxy_active && cfg.preaccel.enabled && has_enabled_relays {
+    let preaccel_summary = if preaccel_verify_degraded {
+        Some("已保护回退（请查看国内提速环境放行指引）".to_string())
+    } else if preaccel_verify_probing {
+        Some("探测链路中…".to_string())
+    } else if proxy_active && cfg.preaccel.enabled && has_enabled_relays {
         let prefix = if global_status.is_windivert_active {
-            "全局+代理提速中"
+            match verify_ms.filter(|_| verify_state_trimmed == "verified") {
+                Some(ms) => format!("全局+代理提速中 ({ms} ms)"),
+                None => "全局+代理提速中".to_string(),
+            }
         } else {
-            "国内提速中"
+            "国内提速中".to_string()
         };
         match active_relay_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(relay) => Some(format!("{prefix} · {relay}")),
-            None => Some(prefix.to_string()),
+            None => Some(prefix),
         }
     } else if global_status.is_windivert_active {
+        let prefix = match verify_ms.filter(|_| verify_state_trimmed == "verified") {
+            Some(ms) => format!("全局提速中 ({ms} ms)"),
+            None => "全局提速中".to_string(),
+        };
         match active_relay_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(relay) => Some(format!("全局提速中 · {relay}")),
-            None => Some("全局提速中".to_string()),
+            Some(relay) => Some(format!("{prefix} · {relay}")),
+            None => Some(prefix),
         }
     } else if cfg.preaccel.enabled
         && matches!(
@@ -1938,6 +1987,8 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         icon_mode,
         health,
         tooltip: info.format_tooltip(),
+        global_preaccel_verify_state: verify_state,
+        global_preaccel_verify_ms: verify_ms,
     }
 }
 
@@ -1987,6 +2038,13 @@ fn tun_needs_admin_error_message() -> String {
 }
 
 pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, String> {
+    build_runtime_info_dto_with_verify_override(state, None)
+}
+
+fn build_runtime_info_dto_with_verify_override(
+    state: &AppState,
+    verify_override: Option<(&str, Option<u64>)>,
+) -> Result<CoreRuntimeInfoDto, String> {
     let cfg = state.snapshot_config();
     let rt = state.snapshot_runtime();
     let plat = default_platform();
@@ -2062,10 +2120,21 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
     };
 
     let global_status = state.snapshot_global_preaccel();
+    let verify_state = verify_override
+        .map(|(s, _)| s.to_string())
+        .unwrap_or_else(|| global_status.verify_state.clone());
+    let verify_ms = verify_override
+        .map(|(_, ms)| ms)
+        .unwrap_or(global_status.verify_latency_ms);
+    let verify_state_trimmed = verify_state.trim();
+    let preaccel_verify_degraded = cfg.preaccel.enabled && verify_state_trimmed == "degraded";
+    let preaccel_verify_probing = cfg.preaccel.enabled && verify_state_trimmed == "probing";
     let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
     let has_enabled_relays = !relays.is_empty();
-    let preaccel_active = (proxy_active && cfg.preaccel.enabled && has_enabled_relays)
-        || global_status.is_windivert_active;
+    let preaccel_active = !preaccel_verify_degraded
+        && !preaccel_verify_probing
+        && ((proxy_active && cfg.preaccel.enabled && has_enabled_relays)
+            || global_status.is_windivert_active);
     let active_node_latency_ms =
         state.resolve_node_latency_ms(&active_node_id, active_snap.as_ref());
     let node_health_hints = state.snapshot_node_health_hints();
@@ -2085,7 +2154,7 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
 
     let status_label = if rt.last_error.is_some() {
         "error".to_string()
-    } else if portal_required {
+    } else if portal_required || preaccel_verify_degraded {
         "warn".to_string()
     } else if preaccel_active {
         "preaccel".to_string()
@@ -2141,6 +2210,8 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         global_preaccel_connections: global_status.active_connections,
         global_windivert_active: global_status.is_windivert_active,
         preaccel_install_state: global_status.install_state,
+        global_preaccel_verify_state: verify_state,
+        global_preaccel_verify_ms: verify_ms,
         node_health_hints,
         preaccel_relay_name: active_relay_name,
         captive_portal_required: portal_required,
@@ -2159,6 +2230,35 @@ pub fn emit_runtime_snapshot(app: &AppHandle, state: &AppState) {
     if let Ok(dto) = build_runtime_info_dto(state) {
         let _ = app.emit(EVENT_RUNTIME, dto);
     }
+}
+
+pub fn emit_config_updated(app: &AppHandle, cfg: &AppConfig) {
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(cfg));
+}
+
+pub fn refresh_tray(app: &AppHandle, state: &AppState) {
+    let _ = tray::sync_tray_menu(app, &build_tray_menu_state(app, state));
+    let _ = tray::sync_tray_visual(app, &build_tray_visual_state(state));
+}
+
+fn emit_preaccel_verify_override_snapshots(
+    app: &AppHandle,
+    state: &AppState,
+    verify_state: &str,
+    verify_ms: Option<u64>,
+) {
+    let override_val = Some((verify_state, verify_ms));
+    if let Ok(dto) = build_runtime_info_dto_with_verify_override(state, override_val) {
+        let _ = app.emit(EVENT_RUNTIME, dto);
+    }
+    let _ = tray::sync_tray_menu(
+        app,
+        &build_tray_menu_state_with_verify_override(app, state, override_val),
+    );
+    let _ = tray::sync_tray_visual(
+        app,
+        &build_tray_visual_state_with_verify_override(state, override_val),
+    );
 }
 
 pub fn map_tray_click(action: &CoreTrayClickAction) -> TrayClickAction {
@@ -2256,22 +2356,23 @@ pub fn apply_configured_shortcuts(
 }
 
 /// Auto-create a default "默认路线" multi-group when nodes exist but no multi-group is configured yet.
-fn ensure_default_group_if_empty(state: &AppState) {
+/// Returns `true` when a new default group was created and persisted into config.
+fn ensure_default_group_if_empty(state: &AppState) -> bool {
     let created_group_id = {
         let Ok(db) = state.storage.lock() else {
-            return;
+            return false;
         };
         let Ok(groups) = db.list_multi_groups() else {
-            return;
+            return false;
         };
         if !groups.is_empty() {
-            return;
+            return false;
         }
         let Ok(nodes) = db.list_nodes() else {
-            return;
+            return false;
         };
         if nodes.is_empty() {
-            return;
+            return false;
         }
         let member_node_ids: Vec<String> = nodes
             .iter()
@@ -2289,7 +2390,7 @@ fn ensure_default_group_if_empty(state: &AppState) {
             ..MultiGroup::default()
         };
         if db.upsert_multi_group(&group).is_err() {
-            return;
+            return false;
         }
         group.id
     };
@@ -2301,6 +2402,7 @@ fn ensure_default_group_if_empty(state: &AppState) {
             *guard = cfg;
         }
     }
+    true
 }
 
 pub fn sync_app_side_effects(app: &AppHandle, state: &AppState, cfg: &AppConfig) {
@@ -2970,15 +3072,9 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         tracing::warn!("核心启动后同步系统代理端口失败：{err}");
     }
 
-    // Coordinate with standalone global pre-acceleration:
-    // - When TUN is active on the main core, TUN already captures all host traffic into the main
-    //   core's in-core 443 pre-acceleration, so pause the redundant standalone 443 tunnel.
-    // - When running without TUN (system proxy only or idle), WinDivert excludes CatCloud's entire
-    //   PID tree (including the main core) with zero self-loop, so keep the standalone engine
-    //   running (or start it if the unified domestic pre-acceleration switch is enabled) to
-    //   simultaneously accelerate third-party proxy cores and CLI tools.
-    let latest_cfg = state.snapshot_config();
-    let tun_active = status.running && latest_cfg.tun.enabled;
+    // Coordinate with standalone global pre-acceleration using the SAME launch-time `cfg`
+    // snapshot so startup logs and side effects never contradict each other across concurrent toggles.
+    let tun_active = status.running && cfg.tun.enabled;
     if tun_active && state.global_preaccel.status().running {
         let _ = state.global_preaccel.stop().await;
         state.log_app_event(
@@ -2994,22 +3090,22 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         };
         state.global_preaccel.sync_main_core_pid(main_pid);
         if !state.shutting_down.load(Ordering::SeqCst)
-            && latest_cfg.preaccel.enabled
+            && cfg.preaccel.enabled
             && !tun_active
             && load_enabled_preaccel_relays(state).is_ok_and(|relays| !relays.is_empty())
         {
             if !state.global_preaccel.status().running {
-                if let Err(err) = start_global_preaccel_engine(state, &latest_cfg).await {
+                if let Err(err) = start_global_preaccel_engine(state, &cfg).await {
                     tracing::debug!(
                         "start_core_locked standalone global preaccel sync skipped: {err}"
                     );
                 }
             }
-            maybe_spawn_auto_windivert_download(app, state, &latest_cfg);
+            maybe_spawn_auto_windivert_download(app, state, &cfg);
         }
     }
 
-    sync_app_side_effects(app, state, &latest_cfg);
+    sync_app_side_effects(app, state, &cfg);
     build_runtime_info_dto(state)
 }
 
@@ -3461,6 +3557,7 @@ pub async fn apply_system_proxy_internal(
         .map_err(|e| format!("读取配置文件失败：{e}"))?;
     disk_cfg.preaccel.reconcile_unified_enabled();
 
+    let mut started_core_here = false;
     let mut cfg = disk_cfg.clone();
     if !state.adapter.has_live_controller().await {
         // Boot core first WITHOUT dirty-writing `system_proxy.enabled = true` to disk.
@@ -3478,9 +3575,24 @@ pub async fn apply_system_proxy_internal(
             sync_app_side_effects(app, state, &rollback);
             return Err(format!("开启系统代理前启动核心失败：{err}"));
         }
+        started_core_here = true;
         cfg = state.snapshot_config();
         cfg.system_proxy.enabled = true;
-        config::save(&state.paths, &cfg).map_err(|e| format!("保存系统代理配置失败：{e}"))?;
+        if let Err(e) = config::save(&state.paths, &cfg) {
+            let mut rollback = state.snapshot_config();
+            rollback.system_proxy.enabled = old_sys_proxy_enabled;
+            if let Ok(mut guard) = state.config.write() {
+                *guard = rollback.clone();
+            }
+            if started_core_here && !rollback.system_proxy.enabled && !rollback.tun.enabled {
+                if let Err(stop_err) = stop_core_internal(app, state).await {
+                    tracing::warn!("保存系统代理配置失败回滚后停止新拉起核心异常：{stop_err}");
+                }
+            }
+            let latest = state.snapshot_config();
+            sync_app_side_effects(app, state, &latest);
+            return Err(format!("保存系统代理配置失败：{e}"));
+        }
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
         }
@@ -3490,7 +3602,10 @@ pub async fn apply_system_proxy_internal(
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
         }
-        if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
+        // Pass `force = false` so SHA-256 deduplication skips redundant Mihomo reloads when the
+        // core is already running and only the OS system proxy toggle changed, while still picking
+        // up any external disk/SQLite changes cleanly.
+        if let Some(outcome) = trigger_reload_if_running(app, state, false).await {
             if outcome.rejected {
                 let mut rollback = state.snapshot_config();
                 rollback.system_proxy.enabled = old_sys_proxy_enabled;
@@ -3517,6 +3632,12 @@ pub async fn apply_system_proxy_internal(
         Ok(false) => {
             // Concurrent stop_core or shutdown disabled system proxy while we were enabling.
             let latest = state.snapshot_config();
+            if started_core_here && !latest.system_proxy.enabled && !latest.tun.enabled {
+                if let Err(stop_err) = stop_core_internal(app, state).await {
+                    tracing::warn!("系统代理取消后停止新拉起核心异常：{stop_err}");
+                }
+            }
+            let latest = state.snapshot_config();
             sync_app_side_effects(app, state, &latest);
             let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest));
             return Ok(false);
@@ -3528,12 +3649,20 @@ pub async fn apply_system_proxy_internal(
             if let Ok(mut guard) = state.config.write() {
                 *guard = rollback.clone();
             }
+            if started_core_here && !rollback.system_proxy.enabled && !rollback.tun.enabled {
+                // Lock order: already holding outer `config_transition_lock` -> inner `core_lifecycle_lock`.
+                if let Err(stop_err) = stop_core_internal(app, state).await {
+                    tracing::warn!("写入操作系统代理失败回滚后停止新拉起核心异常：{stop_err}");
+                }
+            }
             state.log_app_event(
                 "error",
                 "系统代理",
                 &format!("写入操作系统代理失败，已回滚配置：{err}"),
             );
-            sync_app_side_effects(app, state, &rollback);
+            let latest = state.snapshot_config();
+            sync_app_side_effects(app, state, &latest);
+            let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest));
             return Err(err);
         }
     }
@@ -3789,6 +3918,7 @@ async fn select_single_node_with_closed(
     if trimmed.is_empty() {
         return Err("节点标识不能为空".to_string());
     }
+    let _cfg_guard = state.config_transition_lock.lock().await;
 
     let prev_cfg = state.snapshot_config();
     let prev_single_id = if prev_cfg.route_mode == RouteTargetMode::Single {
@@ -3927,6 +4057,7 @@ async fn select_group_node_core(
     prev_node_name_hint: Option<String>,
     activate_group: bool,
 ) -> Result<SwitchResultDto, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let (mut group, target_node, prev_id, prev_node_name, snap) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let group = db
@@ -4533,6 +4664,7 @@ where
         return Ok(latest);
     }
 
+    let mut started_core_here = false;
     if needs_core_boot {
         if let Err(err) = start_core_internal(app, state).await {
             let _ = config::save(&state.paths, &old);
@@ -4542,6 +4674,7 @@ where
             sync_app_side_effects(app, state, &old);
             return Err(format!("保存配置后启动代理核心失败：{err}"));
         }
+        started_core_here = true;
     } else if has_core_config_changes(&old, &next) {
         if let Some(outcome) = trigger_reload_if_running(app, state, false).await {
             if outcome.rejected {
@@ -4575,7 +4708,15 @@ where
             if let Ok(mut guard) = state.config.write() {
                 *guard = old.clone();
             }
-            sync_app_side_effects(app, state, &old);
+            if started_core_here && !old.system_proxy.enabled && !old.tun.enabled {
+                // Lock order: already holding outer `config_transition_lock` -> inner `core_lifecycle_lock`.
+                if let Err(stop_err) = stop_core_internal(app, state).await {
+                    tracing::warn!("配置切换写入系统代理失败回滚后停止新拉起核心异常：{stop_err}");
+                }
+            }
+            let latest = state.snapshot_config();
+            sync_app_side_effects(app, state, &latest);
+            let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest));
             return Err(err);
         }
     }
@@ -4704,6 +4845,8 @@ pub async fn start_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreRuntimeInfoDto, String> {
+    // Strictly uphold lock ordering: outer `config_transition_lock` -> inner `core_lifecycle_lock`.
+    let _cfg_guard = state.config_transition_lock.lock().await;
     start_core_internal(&app, &state).await
 }
 
@@ -4712,6 +4855,7 @@ pub async fn stop_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreRuntimeInfoDto, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     stop_core_internal(&app, &state).await
 }
 
@@ -4723,14 +4867,15 @@ pub async fn disable_all_proxy_and_stop_core(
     disable_all_proxy_and_stop_core_internal(&app, &state).await
 }
 
-#[tauri::command]
-pub async fn restart_core(
-    app: AppHandle,
-    state: State<'_, AppState>,
+/// Restart managed core cleanly. Caller MUST already hold outer `state.config_transition_lock`.
+/// Internally acquires inner `state.core_lifecycle_lock` to preserve strict lock ordering.
+async fn restart_core_locked(
+    app: &AppHandle,
+    state: &AppState,
 ) -> Result<CoreRuntimeInfoDto, String> {
     let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
-    stop_core_for_restart_locked(&state).await?;
-    match start_core_locked(&app, &state).await {
+    stop_core_for_restart_locked(state).await?;
+    match start_core_locked(app, state).await {
         Ok(dto) => Ok(dto),
         Err(err) => {
             // If restart fails, flip in-memory flags first, then clear owned OS proxy & save
@@ -4745,11 +4890,11 @@ pub async fn restart_core(
                     *guard = cfg.clone();
                 }
             }
-            let _ = clear_system_proxy_if_owned_with_hint(&state, was_sys_proxy_enabled);
+            let _ = clear_system_proxy_if_owned_with_hint(state, was_sys_proxy_enabled);
             if flags_changed {
                 let _ = config::save(&state.paths, &cfg);
             }
-            sync_app_side_effects(&app, &state, &cfg);
+            sync_app_side_effects(app, state, &cfg);
             state.log_app_event(
                 "error",
                 "核心",
@@ -4761,11 +4906,21 @@ pub async fn restart_core(
 }
 
 #[tauri::command]
+pub async fn restart_core(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreRuntimeInfoDto, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    restart_core_locked(&app, &state).await
+}
+
+#[tauri::command]
 pub async fn reload_core_config(
     app: AppHandle,
     state: State<'_, AppState>,
     force_disk_reload: Option<bool>,
 ) -> Result<ReloadOutcome, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let force = force_disk_reload.unwrap_or(true);
     let mut disk_cfg = config::load_or_init(&state.paths).map_err(|e| e.to_string())?;
     disk_cfg.preaccel.reconcile_unified_enabled();
@@ -4781,15 +4936,18 @@ pub async fn reload_core_config(
         return Ok(outcome);
     }
     // Core is stopped: still validate & compile candidate YAML so agents get real pre-flight feedback.
-    let mut outcome = state
-        .hot_reload
-        .apply_disk_reload(DiskReloadOptions {
-            force,
-            verify_with_binary: true,
-            allow_l3_restart: false,
-            ..DiskReloadOptions::default()
-        })
-        .await;
+    let mut outcome = {
+        let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
+        state
+            .hot_reload
+            .apply_disk_reload(DiskReloadOptions {
+                force,
+                verify_with_binary: true,
+                allow_l3_restart: false,
+                ..DiskReloadOptions::default()
+            })
+            .await
+    };
     if outcome.rejected {
         if let Some(err) = outcome.error.take() {
             let formatted = format_mihomo_error_for_user(&err);
@@ -4807,6 +4965,7 @@ pub async fn set_proxy_mode(
     state: State<'_, AppState>,
     mode: ProxyMode,
 ) -> Result<ProxyMode, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let prev_cfg = state.snapshot_config();
     let prev_mode = prev_cfg.proxy_mode.clone();
     let mut cfg = prev_cfg;
@@ -5321,6 +5480,7 @@ pub async fn set_active_group(
     // Sanitize ghost active_node_id and auto-pick best healthy candidate before activating group.
     let reconciled = reconcile_group_best_node_internal(&app, &state, &trimmed, false, false).await?;
 
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let prev_cfg = state.snapshot_config();
     let was_single = prev_cfg.route_mode == RouteTargetMode::Single;
     let group_changed = prev_cfg.active_group_id.as_deref() != Some(trimmed.as_str());
@@ -5737,6 +5897,7 @@ pub async fn delete_multi_group(
         }
         let _ = trigger_reload_if_running(&app, &state, false).await;
         let latest_cfg = state.snapshot_config();
+        emit_config_updated(&app, &latest_cfg);
         sync_app_side_effects(&app, &state, &latest_cfg);
     }
     Ok(deleted)
@@ -6588,23 +6749,138 @@ pub fn list_subscriptions(state: State<'_, AppState>) -> Result<Vec<Subscription
     db.list_subscriptions().map_err(|e| e.to_string())
 }
 
+fn unwrap_clash_subscription_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let parsed = reqwest::Url::parse(trimmed).ok()?;
+    let scheme = parsed.scheme().to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "clash" | "clashmeta" | "mihomo") {
+        return None;
+    }
+    for (k, v) in parsed.query_pairs() {
+        if k.eq_ignore_ascii_case("url") {
+            let candidate = v.trim();
+            let lower = candidate.to_ascii_lowercase();
+            if lower.starts_with("http://") || lower.starts_with("https://") {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn normalize_subscription_url_for_dedup(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let effective = unwrap_clash_subscription_url(trimmed).unwrap_or_else(|| trimmed.to_string());
+    let eff_trimmed = effective.trim();
+    if let Ok(mut parsed) = reqwest::Url::parse(eff_trimmed) {
+        parsed.set_fragment(None);
+        return Some(parsed.to_string());
+    }
+    if let Some((scheme, rest)) = eff_trimmed.split_once("://") {
+        let (host_port, tail) = match rest.find(['/', '?', '#']) {
+            Some(idx) => (&rest[..idx], &rest[idx..]),
+            None => (rest, ""),
+        };
+        let tail_no_frag = tail.split('#').next().unwrap_or(tail);
+        return Some(format!(
+            "{}://{}{}",
+            scheme.to_ascii_lowercase(),
+            host_port.to_ascii_lowercase(),
+            tail_no_frag
+        ));
+    }
+    Some(eff_trimmed.to_string())
+}
+
+fn upsert_subscription_in_storage(
+    db: &Storage,
+    mut record: SubscriptionRecord,
+) -> Result<SubscriptionRecord, String> {
+    let requested_id = record.id.trim().to_string();
+    if record.kind == SubscriptionKind::Url {
+        let trimmed_url = record.url_or_cmd.trim().to_string();
+        record.url_or_cmd = unwrap_clash_subscription_url(&trimmed_url).unwrap_or(trimmed_url);
+    }
+
+    let existing_by_id = if requested_id.is_empty() {
+        None
+    } else {
+        db.get_subscription(&requested_id)
+            .map_err(|e| e.to_string())?
+    };
+
+    if existing_by_id.is_some() {
+        // Explicit update of an existing subscription ID: update in place without cross-ID merging.
+        record.id = requested_id;
+        db.upsert_subscription(&record).map_err(|e| e.to_string())?;
+        return Ok(record);
+    }
+
+    // New or empty ID for a URL subscription: deduplicate by normalized URL to prevent duplicate
+    // subscriptions and doubled nodes.
+    if record.kind == SubscriptionKind::Url {
+        if let Some(target_key) = normalize_subscription_url_for_dedup(&record.url_or_cmd) {
+            let existing_subs = db.list_subscriptions().map_err(|e| e.to_string())?;
+            if let Some(matched) = existing_subs.into_iter().find(|s| {
+                s.kind == SubscriptionKind::Url
+                    && normalize_subscription_url_for_dedup(&s.url_or_cmd).as_deref()
+                        == Some(target_key.as_str())
+            }) {
+                record.id = matched.id;
+                if record.name.trim().is_empty() {
+                    record.name = matched.name;
+                }
+                if record.traffic_total_bytes == 0 && record.traffic_used_bytes == 0 {
+                    record.traffic_used_bytes = matched.traffic_used_bytes;
+                    record.traffic_total_bytes = matched.traffic_total_bytes;
+                }
+                if record.expires_at.is_none() {
+                    record.expires_at = matched.expires_at;
+                }
+                if record.etag.is_none() {
+                    record.etag = matched.etag;
+                }
+                if record.last_ok_at.is_none() {
+                    record.last_ok_at = matched.last_ok_at;
+                }
+                if record.last_error.is_none() {
+                    record.last_error = matched.last_error;
+                }
+                db.upsert_subscription(&record).map_err(|e| e.to_string())?;
+                return Ok(record);
+            }
+        }
+    }
+
+    if requested_id.is_empty() {
+        record.id = format!("sub-{}", uuid::Uuid::new_v4().simple());
+    } else {
+        record.id = requested_id;
+    }
+    db.upsert_subscription(&record).map_err(|e| e.to_string())?;
+    Ok(record)
+}
+
 #[tauri::command]
 pub fn upsert_subscription(
     app: AppHandle,
     state: State<'_, AppState>,
-    mut record: SubscriptionRecord,
+    record: SubscriptionRecord,
 ) -> Result<SubscriptionRecord, String> {
-    if record.id.trim().is_empty() {
-        record.id = format!("sub-{}", uuid::Uuid::new_v4().simple());
-    }
-    {
+    let saved = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        db.upsert_subscription(&record).map_err(|e| e.to_string())?;
-    }
-    ensure_default_group_if_empty(&state);
+        upsert_subscription_in_storage(&db, record)?
+    };
+    let created_default_group = ensure_default_group_if_empty(&state);
     let cfg = state.snapshot_config();
+    if created_default_group {
+        emit_config_updated(&app, &cfg);
+    }
     sync_app_side_effects(&app, &state, &cfg);
-    Ok(record)
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -6699,16 +6975,29 @@ async fn refresh_process_adapter_subscription(
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .build()
-            .map_err(|e| format!("初始化控制接口请求客户端失败：{e}"))?;
+            .map_err(|e| {
+                tracing::warn!(
+                    sub_id = %sub.id,
+                    error = %app_log::sanitize_log_line(&e.to_string()),
+                    "初始化控制接口请求客户端失败"
+                );
+                "初始化控制接口请求客户端失败，请稍后重试".to_string()
+            })?;
         let mut req = client.get(&endpoint);
         if let Some(ref sec) = secret {
             req = req.bearer_auth(sec);
         }
         let mut resp = req.send().await.map_err(|e| {
+            tracing::warn!(
+                sub_id = %sub.id,
+                endpoint = %app_log::sanitize_log_line(&endpoint),
+                error = %app_log::sanitize_log_line(&e.to_string()),
+                "连接代理控制接口失败"
+            );
             if e.is_timeout() {
-                format!("连接控制接口（{endpoint}）超时，请确认目标代理软件正在运行")
+                "连接控制接口超时，请确认目标代理软件正在运行".to_string()
             } else {
-                format!("无法连接到控制接口（{endpoint}），请确认地址端口正确且目标程序已启动：{e}")
+                "无法连接到控制接口，请确认地址端口正确且目标代理软件已启动".to_string()
             }
         })?;
         let status = resp.status();
@@ -6731,11 +7020,14 @@ async fn refresh_process_adapter_subscription(
             }
         }
         let mut body = Vec::new();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| format!("读取控制接口响应失败：{e}"))?
-        {
+        while let Some(chunk) = resp.chunk().await.map_err(|e| {
+            tracing::warn!(
+                sub_id = %sub.id,
+                error = %app_log::sanitize_log_line(&e.to_string()),
+                "读取控制接口响应失败"
+            );
+            "读取控制接口响应失败，请确认目标代理软件运行正常后重试".to_string()
+        })? {
             if body.len().saturating_add(chunk.len()) > MAX_CTRL_BYTES {
                 return Err("控制接口返回数据超过 16 MiB 上限，已安全终止读取".to_string());
             }
@@ -6743,7 +7035,8 @@ async fn refresh_process_adapter_subscription(
         }
 
         let (nodes, meta_only_count, total_entries, mut warnings) =
-            parse_controller_proxies_json(&sub.id, &body).map_err(|e| e.to_string())?;
+            parse_controller_proxies_json(&sub.id, &body)
+                .map_err(|e| format_subscription_error_zh(&e.to_string()))?;
         if nodes.is_empty() {
             if meta_only_count > 0 {
                 return Err(format!(
@@ -6768,32 +7061,39 @@ async fn refresh_process_adapter_subscription(
         });
     }
 
-    let adapter_cfg = AdapterConfig::from_command_line(raw)
-        .map_err(|e| format!("外部适配器命令格式不正确，请检查路径与引号配对：{e}"))?;
+    let adapter_cfg = AdapterConfig::from_command_line(raw).map_err(|e| {
+        tracing::warn!(
+            sub_id = %sub.id,
+            error = %app_log::sanitize_log_line(&e.to_string()),
+            "外部适配器命令格式不正确"
+        );
+        "外部适配器命令格式不正确，请检查路径与引号配对".to_string()
+    })?;
     let req = AdapterRequest::new(ADAPTER_REASON_MANUAL, sub.id.clone(), Vec::new());
     let nodes = invoke_external_adapter(&adapter_cfg, &req, Some(&state.adapter_cooldown))
         .await
         .map_err(|e| {
             let msg = e.to_string();
+            tracing::warn!(
+                sub_id = %sub.id,
+                program = %app_log::sanitize_log_line(&adapter_cfg.program),
+                error = %app_log::sanitize_log_line(&msg),
+                "外部适配器执行失败"
+            );
             if !msg.contains("cooldown") {
                 state.adapter_cooldown.reset(&sub.id);
             }
             if msg.contains("cooldown") {
-                format!("外部适配器刷新过于频繁，请稍候片刻再试（{msg}）")
+                "外部适配器刷新过于频繁，请稍候片刻再试".to_string()
             } else if msg.contains("failed to spawn") {
-                format!(
-                    "无法启动外部适配器程序「{}」，请确认命令路径正确且具有可执行权限：{msg}",
-                    adapter_cfg.program
-                )
+                "无法启动外部适配器程序，请确认命令路径正确且具有可执行权限".to_string()
             } else if msg.contains("timed out") {
                 format!(
                     "外部适配器执行超时（超过 {} 秒），请检查脚本是否卡住",
                     adapter_cfg.timeout_sec
                 )
             } else {
-                format!(
-                    "外部适配器未能返回有效节点，请确认脚本输出符合 catcloud-adapter/v1 规范：{msg}"
-                )
+                "外部适配器未能返回有效节点，请确认脚本输出格式符合要求".to_string()
             }
         })?;
     Ok(ParsedSubscription {
@@ -6805,24 +7105,367 @@ async fn refresh_process_adapter_subscription(
     })
 }
 
+fn extract_local_system_proxy_url(spec: &SystemProxySpec) -> Option<String> {
+    if !spec.enabled || spec.port == 0 {
+        return None;
+    }
+    if spec
+        .pac_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return None;
+    }
+    let host_raw = spec.host.trim();
+    if host_raw.is_empty() {
+        return None;
+    }
+    if host_raw.contains("://") {
+        let parsed = reqwest::Url::parse(host_raw).ok()?;
+        let scheme = match parsed.scheme().to_ascii_lowercase().as_str() {
+            "http" => "http",
+            "https" => "https",
+            "socks5" => "socks5",
+            "socks5h" => "socks5h",
+            _ => return None,
+        };
+        let port = parsed.port().unwrap_or(spec.port);
+        if port == 0 {
+            return None;
+        }
+        let host = parsed.host_str()?.trim();
+        if host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" {
+            return Some(format!("{scheme}://127.0.0.1:{port}"));
+        }
+        if host == "::1" || host == "[::1]" {
+            return Some(format!("{scheme}://[::1]:{port}"));
+        }
+        return None;
+    }
+    let bare = host_raw.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") || bare == "127.0.0.1" {
+        Some(format!("http://127.0.0.1:{}", spec.port))
+    } else if bare == "::1" {
+        Some(format!("http://[::1]:{}", spec.port))
+    } else {
+        None
+    }
+}
+
+/// Build deduplicated proxy fallback candidates for subscription fetching:
+/// 1. Direct (`None`) first so domestic-accessible feeds refresh at full speed without detour.
+/// 2. CatCloud main core local mixed port (`http://127.0.0.1:<mixed_port>`) when running.
+/// 3. Active OS local loopback system proxy (`127.0.0.1` / `localhost` / `[::1]`) when distinct.
+fn build_subscription_proxy_candidates_from(
+    catcloud_mixed_port: Option<u16>,
+    sys_proxy: Option<&SystemProxySpec>,
+) -> Vec<Option<String>> {
+    let mut out: Vec<Option<String>> = Vec::with_capacity(3);
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // Always try direct first.
+    out.push(None);
+
+    let mut push_unique = |url: String| {
+        let key = url.trim().trim_end_matches('/').to_ascii_lowercase();
+        if !key.is_empty() && seen.insert(key) {
+            out.push(Some(url));
+        }
+    };
+
+    if let Some(port) = catcloud_mixed_port.filter(|&p| p > 0) {
+        push_unique(format!("http://127.0.0.1:{port}"));
+    }
+
+    if let Some(spec) = sys_proxy {
+        if let Some(local_proxy) = extract_local_system_proxy_url(spec) {
+            push_unique(local_proxy);
+        }
+    }
+
+    out
+}
+
+fn contains_cjk_char(text: &str) -> bool {
+    text.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+}
+
+const SAFE_SUBSCRIPTION_ZH_ASCII_TOKENS: &[&str] = &[
+    "http",
+    "https",
+    "tls",
+    "utf-8",
+    "utf8",
+    "yaml",
+    "json",
+    "mib",
+    "kb",
+    "mb",
+    "gb",
+    "base64",
+    "uri",
+    "url",
+    "proxies",
+    "outbounds",
+    "sing-box",
+    "clash",
+    "mihomo",
+    "server",
+    "port",
+    "secret",
+    "4xx",
+    "5xx",
+];
+
+fn has_embedded_http_url(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    for pat in ["http://", "https://"] {
+        let mut rest = lower.as_str();
+        while let Some(pos) = rest.find(pat) {
+            let after = &rest[pos + pat.len()..];
+            if after
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'[')
+            {
+                return true;
+            }
+            rest = after;
+        }
+    }
+    false
+}
+
+/// Detect whether an error string still contains raw English exception tails (e.g. `（invalid ...）`,
+/// `expected ...`, `dns error`, `connection refused`, `timed out`, `status 4xx/5xx`, OS errors, or
+/// embedded URLs) so they are never leaked into user-facing prompts or SQLite `last_error`.
+fn contains_english_error_residue(text: &str) -> bool {
+    if has_embedded_http_url(text) {
+        return true;
+    }
+    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-')) {
+        let trimmed = token.trim_matches('-');
+        let alpha_count = trimmed.bytes().filter(u8::is_ascii_alphabetic).count();
+        if alpha_count < 2 {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if !SAFE_SUBSCRIPTION_ZH_ASCII_TOKENS.contains(&lower.as_str()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_http_status_code(text: &str, code: &str) -> bool {
+    let bytes = text.as_bytes();
+    let code_len = code.len();
+    let mut offset = 0usize;
+    while let Some(rel) = text[offset..].find(code) {
+        let idx = offset + rel;
+        let prev_ok = idx == 0 || !bytes[idx - 1].is_ascii_digit();
+        let next_idx = idx + code_len;
+        let next_ok = next_idx == bytes.len() || !bytes[next_idx].is_ascii_digit();
+        if prev_ok && next_ok {
+            return true;
+        }
+        offset = idx + 1;
+    }
+    false
+}
+
+/// Ensure subscription fetch/parse error strings persisted to SQLite and surfaced to users are
+/// strictly clean, actionable plain Chinese. Any raw English error or mixed-language exception tail
+/// is logged (sanitized) via `tracing::warn!` and mapped to a pure-Chinese category message.
+fn format_subscription_error_zh(raw: &str) -> String {
+    let cleaned = raw.replace(['\r', '\n'], " ").trim().to_string();
+    if cleaned.is_empty() {
+        return "拉取或解析订阅失败，请检查订阅链接是否有效".to_string();
+    }
+    if contains_cjk_char(&cleaned) && !contains_english_error_residue(&cleaned) {
+        return cleaned;
+    }
+
+    tracing::warn!(
+        raw_error = %app_log::sanitize_log_line(&cleaned),
+        "订阅错误包含原始英文或未归类异常详情，已转为纯中文提示"
+    );
+
+    let lower = cleaned.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") || cleaned.contains("超时") {
+        "拉取订阅超时：直连与本机代理均未在规定时间内响应，请检查网络连接或开启代理后重试"
+            .to_string()
+    } else if lower.contains("dns")
+        || lower.contains("failed to lookup")
+        || lower.contains("no such host")
+        || lower.contains("name or service not known")
+        || cleaned.contains("域名无法解析")
+    {
+        "订阅域名解析失败：无法解析该订阅地址，请检查网络或开启代理后重试".to_string()
+    } else if lower.contains("connection refused")
+        || lower.contains("actively refused")
+        || cleaned.contains("拒绝连接")
+    {
+        "连接订阅服务器或本地代理被拒绝，请确认订阅链接可用且本地代理正常运行".to_string()
+    } else if lower.contains("connection reset")
+        || lower.contains("forcibly closed")
+        || lower.contains("unexpected eof")
+        || lower.contains("broken pipe")
+        || cleaned.contains("被对方重置")
+        || cleaned.contains("意外中断")
+    {
+        "拉取订阅时连接被远端中断，可能需要通过代理访问该订阅链接".to_string()
+    } else if lower.contains("certificate")
+        || lower.contains("tls")
+        || lower.contains("ssl")
+        || lower.contains("handshake")
+        || lower.contains("rustls")
+        || lower.contains("openssl")
+    {
+        "拉取订阅时安全连接（TLS）握手失败，请检查系统时间或网络环境后重试".to_string()
+    } else if lower.contains("too many redirects")
+        || lower.contains("redirect")
+        || cleaned.contains("重定向")
+    {
+        "订阅链接重定向次数过多，可能存在循环跳转，请检查订阅地址".to_string()
+    } else if lower.contains("relative url")
+        || lower.contains("empty host")
+        || lower.contains("invalid url")
+        || lower.contains("invalid port")
+        || lower.contains("invalid domain")
+        || lower.contains("invalid ipv")
+        || lower.contains("invalid proxy")
+        || cleaned.contains("链接格式不正确")
+        || cleaned.contains("代理地址")
+    {
+        "订阅链接或代理地址格式不正确，请确认完整复制了 http:// 或 https:// 订阅地址".to_string()
+    } else if contains_http_status_code(&lower, "401") || lower.contains("unauthorized") {
+        "订阅认证失败（HTTP 401），链接里的访问令牌可能已失效或被重置".to_string()
+    } else if contains_http_status_code(&lower, "403") || lower.contains("forbidden") {
+        "订阅服务器拒绝访问（HTTP 403），可能被防火墙拦截、需要通过代理拉取或链接已失效"
+            .to_string()
+    } else if contains_http_status_code(&lower, "404") || lower.contains("not found") {
+        "订阅地址不存在（HTTP 404），请确认复制了完整的订阅链接".to_string()
+    } else if contains_http_status_code(&lower, "410") {
+        "该订阅链接已被服务商下线（HTTP 410），请重新获取最新订阅地址".to_string()
+    } else if contains_http_status_code(&lower, "429") || lower.contains("too many requests") {
+        "订阅请求过于频繁（HTTP 429），请稍候片刻再试".to_string()
+    } else if contains_http_status_code(&lower, "500")
+        || contains_http_status_code(&lower, "502")
+        || contains_http_status_code(&lower, "503")
+        || contains_http_status_code(&lower, "504")
+        || lower.contains("status 5")
+        || lower.contains("5xx")
+    {
+        "订阅服务器暂时异常（HTTP 5xx），请稍后再试".to_string()
+    } else if contains_http_status_code(&lower, "400")
+        || lower.contains("status 4")
+        || lower.contains("4xx")
+    {
+        "订阅服务器拒绝了本次请求（HTTP 4xx），请确认订阅链接有效且未失效".to_string()
+    } else if lower.contains("no such file")
+        || lower.contains("cannot find the file")
+        || lower.contains("os error 2")
+    {
+        "未找到本地订阅文件，请确认文件未被移动或删除".to_string()
+    } else if lower.contains("permission denied")
+        || lower.contains("access is denied")
+        || lower.contains("os error 5")
+        || lower.contains("os error 13")
+    {
+        "无权限读取订阅来源，请检查文件或程序访问权限".to_string()
+    } else if lower.contains("cooldown") {
+        "订阅刷新过于频繁，请稍候片刻再试".to_string()
+    } else if lower.contains("expected ")
+        || lower.contains("invalid ")
+        || lower.contains("missing field")
+        || lower.contains("unknown variant")
+        || lower.contains("yaml")
+        || lower.contains("json")
+        || lower.contains("base64")
+        || lower.contains("utf-8")
+        || lower.contains("decode")
+        || lower.contains("parse")
+        || cleaned.contains("解析")
+    {
+        "订阅内容格式无法解析，请确认该链接返回的是有效的节点订阅配置".to_string()
+    } else if lower.contains("error sending request") || lower.contains("connect") {
+        "无法连接到订阅服务器，请检查网络连接或开启代理后重试".to_string()
+    } else {
+        "拉取或解析订阅失败，请检查订阅链接是否有效或稍后重试".to_string()
+    }
+}
+
 async fn refresh_single_subscription_inner(
     state: &AppState,
     sub: &SubscriptionRecord,
 ) -> Result<serde_json::Value, String> {
     let parsed = match sub.kind {
         SubscriptionKind::Url => {
-            fetch_and_parse_subscription_with_options(
-                sub,
-                Duration::from_secs(20),
+            let live_rt = state.adapter.status().await;
+            let catcloud_mixed_port = if live_rt.running && live_rt.mixed_port > 0 {
+                Some(live_rt.mixed_port)
+            } else {
+                None
+            };
+            let sys_proxy = tokio::task::spawn_blocking(|| {
+                default_platform().read_system_proxy().ok()
+            })
+            .await
+            .ok()
+            .flatten();
+            let proxy_candidates = build_subscription_proxy_candidates_from(
+                catcloud_mixed_port,
+                sys_proxy.as_ref(),
+            );
+            let fetched = catcloud_core::subscription::parser::fetch_subscription_url_with_fallback(
+                &sub.url_or_cmd,
+                &proxy_candidates,
                 &FetchOptions::default(),
             )
             .await
-            .map_err(|e| e.to_string())?
+            .map_err(|e| format_subscription_error_zh(&e.to_string()))?;
+
+            if let Some(ref used_proxy) = fetched.used_proxy {
+                state.log_app_event(
+                    "info",
+                    "订阅",
+                    &format!(
+                        "订阅「{}」直连未通，已自动通过本地代理（{used_proxy}）拉取成功",
+                        sub.name
+                    ),
+                );
+            }
+
+            let mut parsed = fetched
+                .parse(&sub.id)
+                .map_err(|e| format_subscription_error_zh(&e.to_string()))?;
+            if parsed.etag.is_none() {
+                parsed.etag = fetched.etag;
+            }
+            parsed
         }
         SubscriptionKind::File | SubscriptionKind::Migrated => {
-            let raw = std::fs::read(&sub.url_or_cmd)
-                .map_err(|e| format!("无法读取本地订阅文件「{}」：{e}", sub.url_or_cmd))?;
-            parse_subscription_payload(&sub.id, &raw, None).map_err(|e| e.to_string())?
+            let raw = std::fs::read(&sub.url_or_cmd).map_err(|e| {
+                tracing::warn!(
+                    sub_id = %sub.id,
+                    path = %app_log::sanitize_log_line(&sub.url_or_cmd),
+                    error = %app_log::sanitize_log_line(&e.to_string()),
+                    "读取本地订阅文件失败"
+                );
+                match e.kind() {
+                    std::io::ErrorKind::NotFound => {
+                        "未找到本地订阅文件，请确认文件未被移动或删除".to_string()
+                    }
+                    std::io::ErrorKind::PermissionDenied => {
+                        "无权限读取本地订阅文件，请检查文件访问权限".to_string()
+                    }
+                    _ => "无法读取本地订阅文件，请确认文件路径有效且未被其它程序占用".to_string(),
+                }
+            })?;
+            parse_subscription_payload(&sub.id, &raw, None)
+                .map_err(|e| format_subscription_error_zh(&e.to_string()))?
         }
         SubscriptionKind::ProcessAdapter => {
             refresh_process_adapter_subscription(state, sub).await?
@@ -6830,10 +7473,14 @@ async fn refresh_single_subscription_inner(
     };
 
     let node_count = {
-        let mut db = state.storage.lock().map_err(|e| e.to_string())?;
-        apply_parsed_subscription(&mut db, sub, &parsed).map_err(|e| e.to_string())?
+        let mut db = state.storage.lock().map_err(|e| {
+            tracing::warn!(error = %app_log::sanitize_log_line(&e.to_string()), "锁定订阅数据库失败");
+            "本地数据库繁忙，请稍后重试".to_string()
+        })?;
+        apply_parsed_subscription(&mut db, sub, &parsed)
+            .map_err(|e| format_subscription_error_zh(&e.to_string()))?
     };
-    ensure_default_group_if_empty(state);
+    let _ = ensure_default_group_if_empty(state);
     Ok(serde_json::json!({
         "sub_id": sub.id,
         "node_count": node_count,
@@ -6859,25 +7506,36 @@ pub async fn refresh_subscription(
             .ok_or_else(|| format!("未找到指定订阅（{sub_id}）"))?
     };
     let result = refresh_single_subscription_inner(&state, &sub).await;
-    if let Err(ref err) = result {
-        if let Ok(db) = state.storage.lock() {
-            let _ = db.update_subscription_refresh_status(
-                &sub.id,
-                None,
-                None,
-                Some(err.as_str()),
-                None,
-                None,
-                None,
+    match result {
+        Err(err) => {
+            let sanitized_err = app_log::sanitize_log_line(&format_subscription_error_zh(&err));
+            if let Ok(db) = state.storage.lock() {
+                let _ = db.update_subscription_refresh_status(
+                    &sub.id,
+                    None,
+                    None,
+                    Some(sanitized_err.as_str()),
+                    None,
+                    None,
+                    None,
+                );
+            }
+            state.log_app_event(
+                "warn",
+                "订阅",
+                &format!("刷新订阅「{}」失败：{sanitized_err}", sub.name),
             );
+            Err(sanitized_err)
         }
-    } else {
-        prune_node_health_pool_from_db(&state);
-        let _ = trigger_reload_if_running(&app, &state, false).await;
-        let cfg = state.snapshot_config();
-        sync_app_side_effects(&app, &state, &cfg);
+        Ok(val) => {
+            prune_node_health_pool_from_db(&state);
+            let _ = trigger_reload_if_running(&app, &state, false).await;
+            let cfg = state.snapshot_config();
+            emit_config_updated(&app, &cfg);
+            sync_app_side_effects(&app, &state, &cfg);
+            Ok(val)
+        }
     }
-    result
 }
 
 #[tauri::command]
@@ -6904,7 +7562,24 @@ pub async fn refresh_all_subscriptions(
                 total_nodes += v.get("node_count").and_then(|c| c.as_u64()).unwrap_or(0) as usize;
             }
             Err(err) => {
-                errors.push(format!("{}: {err}", sub.name));
+                let sanitized_err = app_log::sanitize_log_line(&format_subscription_error_zh(&err));
+                if let Ok(db) = state.storage.lock() {
+                    let _ = db.update_subscription_refresh_status(
+                        &sub.id,
+                        None,
+                        None,
+                        Some(sanitized_err.as_str()),
+                        None,
+                        None,
+                        None,
+                    );
+                }
+                state.log_app_event(
+                    "warn",
+                    "订阅",
+                    &format!("批量刷新订阅「{}」失败：{sanitized_err}", sub.name),
+                );
+                errors.push(format!("{}: {sanitized_err}", sub.name));
             }
         }
     }
@@ -6912,6 +7587,7 @@ pub async fn refresh_all_subscriptions(
         prune_node_health_pool_from_db(&state);
         let _ = trigger_reload_if_running(&app, &state, false).await;
         let cfg = state.snapshot_config();
+        emit_config_updated(&app, &cfg);
         sync_app_side_effects(&app, &state, &cfg);
     }
     Ok(serde_json::json!({
@@ -6943,6 +7619,100 @@ fn load_enabled_preaccel_relays(state: &AppState) -> Result<Vec<PreAccelRelay>, 
     db.list_preaccel_relays(true).map_err(|e| e.to_string())
 }
 
+fn log_global_preaccel_verify_status(
+    state: &AppState,
+    stage_label: &str,
+    status: &GlobalPreAccelStatus,
+) {
+    let iface = status
+        .bound_physical_interface
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("未绑定/自动路由");
+    let security = if status.detected_security_products.is_empty() {
+        "未检出拦截类安全软件".to_string()
+    } else {
+        status.detected_security_products.join(" / ")
+    };
+    let perm = if status.is_elevated {
+        "管理员"
+    } else {
+        "普通用户"
+    };
+    let detail_reason = status
+        .verify_message
+        .as_deref()
+        .or(status.last_error.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("无附加说明");
+
+    match status.verify_state.as_str() {
+        "verified" => {
+            let latency_text = status
+                .verify_latency_ms
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_else(|| "--".to_string());
+            state.log_app_event(
+                "info",
+                "国内提速",
+                &format!(
+                    "{stage_label}：底层透明加速自动探测通过（模式：{}，物理网卡：{iface}，探测耗时：{latency_text}，安全环境：{security}，权限：{perm}）— {detail_reason}",
+                    status.mode
+                ),
+            );
+        }
+        "degraded" => {
+            state.log_app_event(
+                "warning",
+                "国内提速",
+                &format!(
+                    "{stage_label}：底层透明加速自动探测触发保护熔断，已安全退回本地独立 443 通道（模式：{}，物理网卡：{iface}，安全环境：{security}，权限：{perm}）— {detail_reason}",
+                    status.mode
+                ),
+            );
+        }
+        "failed" => {
+            state.log_app_event(
+                "warning",
+                "国内提速",
+                &format!(
+                    "{stage_label}：底层透明加速组件加载或探测失败（模式：{}，物理网卡：{iface}，安全环境：{security}，权限：{perm}）— {detail_reason}",
+                    status.mode
+                ),
+            );
+        }
+        "probing" => {
+            state.log_app_event(
+                "info",
+                "国内提速",
+                &format!(
+                    "{stage_label}：底层透明加速链路正在探测中（模式：{}，物理网卡：{iface}，安全环境：{security}）",
+                    status.mode
+                ),
+            );
+        }
+        other => {
+            let state_desc = if !status.running {
+                "独立底层引擎未运行"
+            } else if status.is_windivert_active {
+                "底层透明加速运行中（待探测）"
+            } else {
+                "运行于本地独立 443 通道（未进入底层透明拦截）"
+            };
+            state.log_app_event(
+                "info",
+                "国内提速",
+                &format!(
+                    "{stage_label}：{state_desc}（模式：{}，探测状态：{other}，物理网卡：{iface}，安全环境：{security}，权限：{perm}）— {detail_reason}",
+                    status.mode
+                ),
+            );
+        }
+    }
+}
+
 async fn start_global_preaccel_engine(
     state: &AppState,
     cfg: &AppConfig,
@@ -6954,9 +7724,14 @@ async fn start_global_preaccel_engine(
     let excluded_pids = collect_excluded_pids_for_global_preaccel(state);
     state
         .global_preaccel
+        .sync_main_core_pid(excluded_pids.first().copied());
+    let status = state
+        .global_preaccel
         .start(cfg, &relays, &excluded_pids)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    log_global_preaccel_verify_status(state, "启动底层提速引擎", &status);
+    Ok(status)
 }
 
 async fn sync_running_global_preaccel_if_active(state: &AppState, cfg: &AppConfig) {
@@ -7116,10 +7891,19 @@ fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &
                     );
 
                     if default_platform().capabilities().is_elevated {
-                        if !st.shutting_down.load(Ordering::SeqCst) && latest_cfg.preaccel.enabled {
+                        // Acquire outer `config_transition_lock` before checking latest config/TUN
+                        // and upgrading/starting WinDivert so TUN and WinDivert can never race open.
+                        let _cfg_guard = st.config_transition_lock.lock().await;
+                        let latest_cfg = st.snapshot_config();
+                        let latest_rt = st.snapshot_runtime();
+                        let tun_active = (latest_rt.running
+                            || st.adapter.has_live_controller().await)
+                            && latest_cfg.tun.enabled;
+                        if !st.shutting_down.load(Ordering::SeqCst)
+                            && latest_cfg.preaccel.enabled
+                            && !tun_active
+                        {
                             let cur_global = st.snapshot_global_preaccel();
-                            let latest_rt = st.snapshot_runtime();
-                            let tun_active = latest_rt.running && latest_cfg.tun.enabled;
                             if cur_global.running && !cur_global.is_windivert_active {
                                 match load_enabled_preaccel_relays(&st) {
                                     Ok(relays) if !relays.is_empty() => {
@@ -7135,10 +7919,10 @@ fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &
                                             .await
                                         {
                                             Ok(upgraded) if upgraded.is_windivert_active => {
-                                                st.log_app_event(
-                                                    "info",
-                                                    "国内提速",
-                                                    "WinDivert 驱动已自动安装完成，已免重启原地热升格为底层透明提速模式",
+                                                log_global_preaccel_verify_status(
+                                                    &st,
+                                                    "WinDivert 自动安装后原地热升格",
+                                                    &upgraded,
                                                 );
                                             }
                                             Ok(upgraded) => {
@@ -7151,24 +7935,11 @@ fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &
                                                         },
                                                     );
                                                 }
-                                                let reason = upgraded
-                                                    .last_error
-                                                    .as_deref()
-                                                    .filter(|s| !s.trim().is_empty())
-                                                    .unwrap_or(if !upgraded.running {
-                                                        "独立通道已停止"
-                                                    } else if !upgraded.windivert_available {
-                                                        "未检测到可用驱动文件"
-                                                    } else {
-                                                        "继续保持本地独立 443 通道"
-                                                    });
-                                                st.log_app_event(
-                                                    "warning",
-                                                    "国内提速",
-                                                    &format!(
-                                                        "WinDivert 驱动就绪后未切入底层透明模式（模式：{}，原因：{reason}）",
-                                                        upgraded.mode
-                                                    ),
+                                                let final_upgraded = st.snapshot_global_preaccel();
+                                                log_global_preaccel_verify_status(
+                                                    &st,
+                                                    "WinDivert 自动安装后热升格探测",
+                                                    &final_upgraded,
                                                 );
                                             }
                                             Err(err) => {
@@ -7177,6 +7948,12 @@ fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &
                                                 {
                                                     st.global_preaccel.set_install_state("failed");
                                                 }
+                                                let failed_st = st.snapshot_global_preaccel();
+                                                log_global_preaccel_verify_status(
+                                                    &st,
+                                                    "WinDivert 自动安装后原地热升格失败",
+                                                    &failed_st,
+                                                );
                                                 st.log_app_event(
                                                     "warning",
                                                     "国内提速",
@@ -7191,7 +7968,7 @@ fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &
                                         st.global_preaccel.set_install_state("ready");
                                     }
                                 }
-                            } else if !cur_global.running && !tun_active {
+                            } else if !cur_global.running {
                                 if load_enabled_preaccel_relays(&st)
                                     .is_ok_and(|relays| !relays.is_empty())
                                 {
@@ -7223,6 +8000,7 @@ fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &
                         } else {
                             st.global_preaccel.set_install_state("ready");
                         }
+                        drop(_cfg_guard);
                     } else {
                         st.global_preaccel.set_install_state("need_elevation");
                         st.log_app_event(
@@ -7473,6 +8251,7 @@ pub async fn update_global_preaccel_settings(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let mut cfg = state.snapshot_config();
     cfg.preaccel.global_scope = parsed_scope;
     cfg.preaccel.global_target_processes = normalized_processes;
@@ -7484,7 +8263,10 @@ pub async fn update_global_preaccel_settings(
     }
 
     let was_running = state.global_preaccel.status().running;
-    let status = if was_running {
+    let core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let tun_active = core_running && cfg.tun.enabled;
+    let status = if was_running && cfg.preaccel.enabled && !tun_active {
         match start_global_preaccel_engine(&state, &cfg).await {
             Ok(st) => st,
             Err(err) => {
@@ -7592,89 +8374,96 @@ pub async fn install_windivert_driver(
             ),
         );
 
-        let current = state.snapshot_global_preaccel();
-        let latest_rt = state.snapshot_runtime();
-        let tun_active = latest_rt.running && latest_cfg.tun.enabled;
-
         if default_platform().capabilities().is_elevated {
-            if current.running && !current.is_windivert_active {
-                match load_enabled_preaccel_relays(&state) {
-                    Ok(relays) if !relays.is_empty() => {
-                        let excluded_pids = collect_excluded_pids_for_global_preaccel(&state);
-                        match state
-                            .global_preaccel
-                            .upgrade_to_windivert_in_place(&latest_cfg, &relays, &excluded_pids)
-                            .await
-                        {
-                            Ok(upgraded) if upgraded.is_windivert_active => {
-                                state.log_app_event(
-                                    "info",
-                                    "国内提速",
-                                    "驱动安装完成，已免重启原地热升格为 WinDivert 最底层透明接管模式",
-                                );
-                            }
-                            Ok(upgraded) => {
-                                if upgraded.install_state == "verifying" {
-                                    state.global_preaccel.set_install_state(
-                                        if upgraded.windivert_available {
-                                            "ready"
-                                        } else {
-                                            "idle"
-                                        },
+            // Acquire outer `config_transition_lock` before checking latest config/TUN and
+            // upgrading/starting WinDivert so TUN and WinDivert can never race open.
+            let _cfg_guard = state.config_transition_lock.lock().await;
+            let latest_cfg = state.snapshot_config();
+            let latest_rt = state.snapshot_runtime();
+            let tun_active = (latest_rt.running || state.adapter.has_live_controller().await)
+                && latest_cfg.tun.enabled;
+            let current = state.snapshot_global_preaccel();
+            if !state.shutting_down.load(Ordering::SeqCst)
+                && latest_cfg.preaccel.enabled
+                && !tun_active
+            {
+                if current.running && !current.is_windivert_active {
+                    match load_enabled_preaccel_relays(&state) {
+                        Ok(relays) if !relays.is_empty() => {
+                            let excluded_pids = collect_excluded_pids_for_global_preaccel(&state);
+                            match state
+                                .global_preaccel
+                                .upgrade_to_windivert_in_place(&latest_cfg, &relays, &excluded_pids)
+                                .await
+                            {
+                                Ok(upgraded) if upgraded.is_windivert_active => {
+                                    log_global_preaccel_verify_status(
+                                        &state,
+                                        "WinDivert 安装后原地热升格",
+                                        &upgraded,
                                     );
                                 }
-                                let reason = upgraded
-                                    .last_error
-                                    .as_deref()
-                                    .filter(|s| !s.trim().is_empty())
-                                    .unwrap_or(if !upgraded.running {
-                                        "独立通道已停止"
-                                    } else if !upgraded.windivert_available {
-                                        "未检测到可用驱动文件"
-                                    } else {
-                                        "继续保持本地独立 443 通道"
-                                    });
-                                state.log_app_event(
-                                    "warning",
-                                    "国内提速",
-                                    &format!(
-                                        "WinDivert 驱动安装完成，但未切入底层透明模式（模式：{}，原因：{reason}）",
-                                        upgraded.mode
-                                    ),
-                                );
+                                Ok(upgraded) => {
+                                    if upgraded.install_state == "verifying" {
+                                        state.global_preaccel.set_install_state(
+                                            if upgraded.windivert_available {
+                                                "ready"
+                                            } else {
+                                                "idle"
+                                            },
+                                        );
+                                    }
+                                    let final_upgraded = state.snapshot_global_preaccel();
+                                    log_global_preaccel_verify_status(
+                                        &state,
+                                        "WinDivert 安装后热升格探测",
+                                        &final_upgraded,
+                                    );
+                                }
+                                Err(err) => {
+                                    if state.snapshot_global_preaccel().install_state == "verifying"
+                                    {
+                                        state.global_preaccel.set_install_state("failed");
+                                    }
+                                    let failed_st = state.snapshot_global_preaccel();
+                                    log_global_preaccel_verify_status(
+                                        &state,
+                                        "WinDivert 安装后原地热升格失败",
+                                        &failed_st,
+                                    );
+                                    state.log_app_event(
+                                        "warning",
+                                        "国内提速",
+                                        &format!(
+                                            "驱动就绪后原地热升格 WinDivert 透明模式失败：{err}"
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
+                            state.global_preaccel.set_install_state("ready");
+                        }
+                    }
+                } else if !current.running {
+                    if load_enabled_preaccel_relays(&state).is_ok_and(|relays| !relays.is_empty()) {
+                        match start_global_preaccel_engine(&state, &latest_cfg).await {
+                            Ok(_) => {
+                                if state.snapshot_global_preaccel().install_state == "verifying" {
+                                    state.global_preaccel.set_install_state("ready");
+                                }
                             }
                             Err(err) => {
-                                if state.snapshot_global_preaccel().install_state == "verifying" {
-                                    state.global_preaccel.set_install_state("failed");
-                                }
+                                state.global_preaccel.set_install_state("ready");
                                 state.log_app_event(
                                     "warning",
                                     "国内提速",
-                                    &format!("驱动就绪后原地热升格 WinDivert 透明模式失败：{err}"),
+                                    &format!("驱动就绪后自动启动 WinDivert 透明模式失败：{err}"),
                                 );
                             }
                         }
-                    }
-                    _ => {
+                    } else {
                         state.global_preaccel.set_install_state("ready");
-                    }
-                }
-            } else if !current.running && latest_cfg.preaccel.enabled && !tun_active {
-                if load_enabled_preaccel_relays(&state).is_ok_and(|relays| !relays.is_empty()) {
-                    match start_global_preaccel_engine(&state, &latest_cfg).await {
-                        Ok(_) => {
-                            if state.snapshot_global_preaccel().install_state == "verifying" {
-                                state.global_preaccel.set_install_state("ready");
-                            }
-                        }
-                        Err(err) => {
-                            state.global_preaccel.set_install_state("ready");
-                            state.log_app_event(
-                                "warning",
-                                "国内提速",
-                                &format!("驱动就绪后自动启动 WinDivert 透明模式失败：{err}"),
-                            );
-                        }
                     }
                 } else {
                     state.global_preaccel.set_install_state("ready");
@@ -7682,13 +8471,85 @@ pub async fn install_windivert_driver(
             } else {
                 state.global_preaccel.set_install_state("ready");
             }
+            drop(_cfg_guard);
         } else {
             state.global_preaccel.set_install_state("need_elevation");
         }
 
-        sync_app_side_effects(&app, &state, &latest_cfg);
-        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
+        let final_cfg = state.snapshot_config();
+        sync_app_side_effects(&app, &state, &final_cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&final_cfg));
         Ok(state.snapshot_global_preaccel())
+    }
+}
+
+#[tauri::command]
+pub async fn verify_global_preaccel(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<GlobalPreAccelStatus, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let cfg = state.snapshot_config();
+    let rt = state.snapshot_runtime();
+    let core_running = rt.running || state.adapter.has_live_controller().await;
+    let tun_active = core_running && cfg.tun.enabled;
+    if !cfg.preaccel.enabled || tun_active {
+        return Ok(state.snapshot_global_preaccel());
+    }
+
+    let main_core_pid = if rt.running {
+        rt.pid.filter(|&p| p > 0)
+    } else {
+        None
+    };
+    let is_admin = default_platform().capabilities().is_elevated;
+    let relays = load_enabled_preaccel_relays(&state).unwrap_or_default();
+    let excluded_pids = collect_excluded_pids_for_global_preaccel(&state);
+
+    state.global_preaccel.sync_main_core_pid(main_core_pid);
+    tracing::debug!(
+        is_admin,
+        ?main_core_pid,
+        bin_dir = %state.paths.bin_dir.display(),
+        preaccel_enabled = cfg.preaccel.enabled,
+        "running on-demand WinDivert dataplane reverification"
+    );
+
+    // Push immediate `probing` runtime & tray snapshot before starting dataplane verification so
+    // the UI and system tray never falsely show active status while probing is in flight.
+    if cfg!(all(target_os = "windows", not(target_arch = "aarch64")))
+        && state.snapshot_global_preaccel().running
+    {
+        emit_preaccel_verify_override_snapshots(&app, &state, "probing", None);
+    }
+
+    match state
+        .global_preaccel
+        .reverify_windivert(&cfg, &relays, &excluded_pids)
+        .await
+    {
+        Ok(status) => {
+            log_global_preaccel_verify_status(&state, "手动重新探测底层提速", &status);
+            emit_runtime_snapshot(&app, &state);
+            refresh_tray(&app, &state);
+            Ok(status)
+        }
+        Err(err) => {
+            let err_msg = err.to_string();
+            let latest = state.snapshot_global_preaccel();
+            log_global_preaccel_verify_status(&state, "手动重新探测底层提速失败", &latest);
+            state.log_app_event(
+                "warning",
+                "国内提速",
+                &format!(
+                    "手动重新探测底层提速异常（权限：{}）：{err_msg}",
+                    if is_admin { "管理员" } else { "普通用户" }
+                ),
+            );
+            emit_runtime_snapshot(&app, &state);
+            refresh_tray(&app, &state);
+            Err(err_msg)
+        }
     }
 }
 
@@ -7715,10 +8576,10 @@ pub async fn relaunch_as_admin_for_global_preaccel(
     }
 }
 
-#[tauri::command]
-pub async fn select_preaccel_relay(
-    app: AppHandle,
-    state: State<'_, AppState>,
+/// Switch active pre-acceleration relay. Caller MUST already hold outer `state.config_transition_lock`.
+async fn select_preaccel_relay_locked(
+    app: &AppHandle,
+    state: &AppState,
     relay_id: String,
 ) -> Result<String, String> {
     let relay = {
@@ -7742,15 +8603,25 @@ pub async fn select_preaccel_relay(
             )
             .await;
     }
-    sync_running_global_preaccel_if_active(&state, &cfg).await;
+    sync_running_global_preaccel_if_active(state, &cfg).await;
     state.log_app_event(
         "info",
         "国内提速",
         &format!("已切换国内提速中转至「{}」", relay.name),
     );
-    sync_app_side_effects(&app, &state, &cfg);
+    sync_app_side_effects(app, state, &cfg);
     let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
     Ok(relay.id)
+}
+
+#[tauri::command]
+pub async fn select_preaccel_relay(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    relay_id: String,
+) -> Result<String, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    select_preaccel_relay_locked(&app, &state, relay_id).await
 }
 
 #[tauri::command]
@@ -7758,6 +8629,7 @@ pub async fn failover_preaccel(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Option<String>, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let relays = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         db.list_preaccel_relays(true).map_err(|e| e.to_string())?
@@ -7773,7 +8645,7 @@ pub async fn failover_preaccel(
         .and_then(|id| relays.iter().position(|r| r.id == id))
         .unwrap_or(relays.len() - 1);
     let next = &relays[(cur_idx + 1) % relays.len()];
-    let selected = select_preaccel_relay(app, state, next.id.clone()).await?;
+    let selected = select_preaccel_relay_locked(&app, &state, next.id.clone()).await?;
     Ok(Some(selected))
 }
 
@@ -8780,10 +9652,25 @@ pub async fn benchmark_preaccel_comparison(
     let down_boost_ratio = calc_boost_ratio(accelerated.down_mbps, direct.down_mbps);
 
     let overall_ok = accelerated.ok || direct.ok;
-    let log_level = if accelerated.ok && direct.ok && accelerated.error.is_none() && direct.error.is_none() {
-        "info"
+    let log_level = if accelerated.ok { "info" } else { "warning" };
+    let direct_note = if accelerated.ok && !direct.ok {
+        let reason = direct
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("直连对照通道超时或不可达");
+        format!(" | 说明：提速边实测畅通，普通直连对照组未完成（{reason}，常见于运营商对海外非 443 端口限速或丢包）")
+    } else if accelerated.ok && direct.error.is_some() {
+        let reason = direct
+            .error
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("部分阶段超时");
+        format!(" | 说明：提速边实测畅通，直连对照组存在部分超时（{reason}）")
     } else {
-        "warning"
+        String::new()
     };
     let relay_rtt_text = relay_real_rtt_ms
         .map(|v| format!("{v:.1}ms"))
@@ -8792,7 +9679,7 @@ pub async fn benchmark_preaccel_comparison(
         log_level,
         "对比测速",
         &format!(
-            "对比测速完成：中转「{}」(真实RTT={relay_rtt_text}) / 节点「{}」| 提速边[{}] | 直连边[{}] | 上行倍率={:?} 下行倍率={:?}",
+            "对比测速完成：中转「{}」(真实RTT={relay_rtt_text}) / 节点「{}」| 提速边[{}] | 直连边[{}] | 上行倍率={:?} 下行倍率={:?}{direct_note}",
             relay.name,
             target_node.name,
             format_side_log_summary(&accelerated),
@@ -9624,9 +10511,10 @@ pub async fn apply_migration_nodes(
         persist_migration_nodes(&mut db, source_name, nodes)?
     };
     prune_node_health_pool_from_db(&state);
-    ensure_default_group_if_empty(&state);
+    let _ = ensure_default_group_if_empty(&state);
     let _ = trigger_reload_if_running(&app, &state, false).await;
     let cfg = state.snapshot_config();
+    emit_config_updated(&app, &cfg);
     sync_app_side_effects(&app, &state, &cfg);
     Ok(count)
 }
@@ -9800,6 +10688,69 @@ fn merge_sanitized_recent_logs(
     }
 }
 
+const DIAGNOSTICS_LOG_SCAN_LIMIT: usize = 240;
+const DIAGNOSTICS_KEY_EVENTS_LIMIT: usize = 25;
+const DIAGNOSTICS_TAIL_LOGS_LIMIT: usize = 35;
+const DIAGNOSTICS_JSON_RECENT_LOGS_LIMIT: usize = 60;
+const ONBOARDING_KEY_EVENTS_LIMIT: usize = 6;
+
+/// Sanitize arbitrary single-line or multi-line text before embedding into AI prompts or logs.
+fn sanitize_log_text(raw: &str) -> String {
+    raw.lines()
+        .map(app_log::sanitize_log_line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Return `true` when a formatted log line is a routine `[mihomo] [TCP]` / `[mihomo] [UDP]`
+/// connection forwarding line at `info`/`debug` level (never filtering out `warning` or `error`
+/// lines or application lifecycle/reload/switch/preaccel/ProxyGuard events).
+fn is_routine_mihomo_traffic_log_line(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains(" [warning] ")
+        || lower.contains(" [warn] ")
+        || lower.contains(" [error] ")
+    {
+        return false;
+    }
+    lower.contains("[mihomo] [tcp]")
+        || lower.contains("[mihomo] [udp]")
+        || lower.contains(" [info] [tcp]")
+        || lower.contains(" [info] [udp]")
+        || lower.contains(" [debug] [tcp]")
+        || lower.contains(" [debug] [udp]")
+}
+
+/// Smart diagnostic log sampler returning:
+/// 1. Up to `key_limit` most recent key non-traffic events (excluding routine TCP/UDP forwarding)
+/// 2. Up to `tail_limit` most recent raw tail log lines
+fn sample_diagnostic_logs(
+    all_logs: &[String],
+    key_limit: usize,
+    tail_limit: usize,
+) -> (Vec<String>, Vec<String>) {
+    let key_events = if key_limit == 0 {
+        Vec::new()
+    } else {
+        let filtered: Vec<String> = all_logs
+            .iter()
+            .filter(|line| !is_routine_mihomo_traffic_log_line(line))
+            .cloned()
+            .collect();
+        let start = filtered.len().saturating_sub(key_limit);
+        filtered[start..].to_vec()
+    };
+
+    let tail_logs = if tail_limit == 0 {
+        Vec::new()
+    } else {
+        let start = all_logs.len().saturating_sub(tail_limit);
+        all_logs[start..].to_vec()
+    };
+
+    (key_events, tail_logs)
+}
+
 fn collect_sanitized_recent_logs(state: &AppState, limit: usize) -> Vec<String> {
     if limit == 0 {
         return Vec::new();
@@ -9836,6 +10787,41 @@ fn format_geodata_brief(geodata: &serde_json::Value) -> String {
     .join(" / ")
 }
 
+fn format_global_preaccel_brief(global_status: &GlobalPreAccelStatus, enabled: bool) -> String {
+    let iface = global_status
+        .bound_physical_interface
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(app_log::sanitize_log_line)
+        .unwrap_or_else(|| "自动路由/未绑定".to_string());
+    let security = if global_status.detected_security_products.is_empty() {
+        "未检出拦截类安全软件".to_string()
+    } else {
+        app_log::sanitize_log_line(&global_status.detected_security_products.join(" / "))
+    };
+    let verify_desc = match global_status.verify_state.as_str() {
+        "verified" => match global_status.verify_latency_ms {
+            Some(ms) => format!("自动探测畅通（{ms} ms）"),
+            None => "自动探测畅通".to_string(),
+        },
+        "probing" => "正在自动探测链路".to_string(),
+        "degraded" => "已触发保护熔断并退回本地 443 通道".to_string(),
+        "failed" => "底层组件加载或探测失败".to_string(),
+        _ => "尚未探测".to_string(),
+    };
+    let mode_desc = if !enabled && !global_status.running {
+        "未开启"
+    } else if global_status.is_windivert_active {
+        "底层透明加速（WinDivert 运行中）"
+    } else if global_status.running {
+        "本地独立 443 通道（SOCKS5 待命）"
+    } else {
+        "已开启（待启动或由虚拟网卡主核心统一接管）"
+    };
+    format!("{mode_desc} ｜ 探测状态：{verify_desc} ｜ 物理出口网卡：{iface} ｜ 安全环境：{security}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_ai_diagnostics_markdown(
     app_version: &str,
@@ -9845,29 +10831,37 @@ fn build_ai_diagnostics_markdown(
     cfg: &AppConfig,
     rt: &CoreRuntimeStatus,
     runtime_dto: Option<&CoreRuntimeInfoDto>,
+    global_status: &GlobalPreAccelStatus,
     counts: (usize, usize, usize, usize),
     conn_summary: ConnectionSummaryCounts,
     core_mem_bytes: u64,
     geodata_status: &serde_json::Value,
     last_error: Option<&str>,
-    recent_logs: &[String],
+    key_event_logs: &[String],
+    tail_logs: &[String],
 ) -> String {
     let (sub_count, node_count, group_count, relay_count) = counts;
     let route_mode = runtime_dto
         .map(|d| d.route_mode.as_str())
         .unwrap_or_else(|| cfg.route_mode.as_str());
-    let active_group_name = runtime_dto
-        .map(|d| d.active_group_name.as_str())
-        .unwrap_or("默认路线");
-    let active_node_name = runtime_dto
-        .map(|d| d.active_node_name.as_str())
-        .unwrap_or("未选择");
+    let active_group_name = app_log::sanitize_log_line(
+        runtime_dto
+            .map(|d| d.active_group_name.as_str())
+            .unwrap_or("默认路线"),
+    );
+    let active_node_name = app_log::sanitize_log_line(
+        runtime_dto
+            .map(|d| d.active_node_name.as_str())
+            .unwrap_or("未选择"),
+    );
     let active_node_region = runtime_dto
         .map(|d| d.active_node_region.as_str())
         .unwrap_or("--");
-    let preaccel_relay_name = runtime_dto
-        .and_then(|d| d.preaccel_relay_name.as_deref())
-        .unwrap_or("未配置");
+    let preaccel_relay_name = app_log::sanitize_log_line(
+        runtime_dto
+            .and_then(|d| d.preaccel_relay_name.as_deref())
+            .unwrap_or("未配置"),
+    );
     let mixed_port = if rt.running { rt.mixed_port } else { cfg.mixed_port };
     let controller_port = if rt.running {
         rt.controller_port
@@ -9885,12 +10879,19 @@ fn build_ai_diagnostics_markdown(
     } else {
         "--".to_string()
     };
-    let last_err_text = last_error.unwrap_or("无");
+    let last_err_text = last_error
+        .map(sanitize_log_text)
+        .unwrap_or_else(|| "无".to_string());
 
-    let logs_block = if recent_logs.is_empty() {
+    let key_events_block = if key_event_logs.is_empty() {
+        "（暂无关键非连接流水事件）".to_string()
+    } else {
+        key_event_logs.join("\n")
+    };
+    let tail_logs_block = if tail_logs.is_empty() {
         "（暂无运行日志记录）".to_string()
     } else {
-        recent_logs.join("\n")
+        tail_logs.join("\n")
     };
     let cli_fence_lang = if cfg!(target_os = "windows") || os_label.starts_with("windows") {
         "powershell"
@@ -9898,41 +10899,94 @@ fn build_ai_diagnostics_markdown(
         "bash"
     };
 
+    let elevated_label = if is_elevated { "是" } else { "否" };
+    let portable_label = if is_portable { "是" } else { "否" };
+    let core_state_label = if rt.running { "运行中" } else { "已停止" };
+    let proxy_mode_label = cfg.proxy_mode.as_str();
+    let sys_proxy_label = if cfg.system_proxy.enabled {
+        "已开启"
+    } else {
+        "关闭"
+    };
+    let tun_label = if cfg.tun.enabled { "已开启" } else { "关闭" };
+    let tun_stack_label = cfg.tun.stack_mode.as_str();
+    let mem_tier_label = format_memory_tier_label(&cfg.core_runtime.memory_tier);
+    let gogc_val = cfg.core_runtime.gogc;
+    let domestic_direct_label = if cfg.rules_override.domestic_direct_enabled {
+        "开启"
+    } else {
+        "关闭"
+    };
+    let block_quic_label = if cfg.rules_override.block_quic_udp_443 {
+        "开启"
+    } else {
+        "关闭"
+    };
+    let preaccel_label = if cfg.preaccel.enabled {
+        "已开启"
+    } else {
+        "关闭"
+    };
+    let skip_443_label = if cfg.preaccel.skip_443_native {
+        "是"
+    } else {
+        "否"
+    };
+    let global_preaccel_brief = format_global_preaccel_brief(global_status, cfg.preaccel.enabled);
+    let ipv6_core_label = if cfg.core_ipv6 { "开启" } else { "关闭" };
+    let ipv6_dns_label = if cfg.dns.ipv6 { "开启" } else { "关闭" };
+    let geodata_brief = format_geodata_brief(geodata_status);
+    let app_conns = conn_summary.app_connections;
+    let direct_conns = conn_summary.direct_connections;
+    let proxied_conns = conn_summary.proxied_connections;
+    let tunnel_conns = conn_summary.tunnel_connections;
+    let key_count = key_event_logs.len();
+    let tail_count = tail_logs.len();
+
     format!(
         "请帮我排查猫猫云梯（CatCloud）当前问题。\n\
 \n\
-> 以下诊断包已自动完成隐私脱敏（订阅凭据、密码、Token、Secret 与公网 IP 末段均已隐藏），请先基于状态与日志定位根因并给出清晰步骤。\n\
+> 以下诊断包已自动完成隐私脱敏（订阅凭据、密码、Token、Secret 与公网 IP 末段均已隐藏），请先基于状态与关键事件日志定位根因并给出清晰步骤。\n\
 \n\
 ## 1. 运行状态摘要\n\
 \n\
 | 项目 | 当前状态 |\n\
 | --- | --- |\n\
-| 应用版本 / 环境 | CatCloud v{app_version} · {os_label} · 管理员权限：{} · 便携模式：{} |\n\
-| 代理核心 | {}（Mihomo {core_version}，内核内存：{core_mem_text}） |\n\
-| 代理模式 / 路由方式 | `{}` / `{route_mode}` |\n\
+| 应用版本 / 环境 | CatCloud v{app_version} · {os_label} · 管理员权限：{elevated_label} · 便携模式：{portable_label} |\n\
+| 代理核心 | {core_state_label}（Mihomo {core_version}，内核内存：{core_mem_text}） |\n\
+| 代理模式 / 路由方式 | `{proxy_mode_label}` / `{route_mode}` |\n\
 | 当前路线组 / 节点 | 分组「{active_group_name}」 → 节点「{active_node_name}」（地区：{active_node_region}） |\n\
 | 本地端口 | 混合端口 `{mixed_port}` / 控制端口 `{controller_port}` / DNS `{dns_port}` |\n\
-| 流量接管 | 系统代理：{} · 虚拟网卡（TUN）：{}（协议栈 `{}`） |\n\
-| 内存档位 | `{}`（GOGC={}） |\n\
+| 流量接管 | 系统代理：{sys_proxy_label} · 虚拟网卡（TUN）：{tun_label}（协议栈 `{tun_stack_label}`） |\n\
+| 内存档位 | `{mem_tier_label}`（GOGC={gogc_val}） |\n\
 | 最近异常 | {last_err_text} |\n\
 \n\
 ## 2. 分流与加速配置要点\n\
 \n\
-- 国内直连规则：{} ｜ 阻断 QUIC（UDP/443）：{}\n\
-- 国内 443 预加速：{}（当前中转：{preaccel_relay_name}，跳过 443 原生节点：{}）\n\
-- IPv6 开关：核心数据面 {} ｜ DNS 解析 {}\n\
-- GeoData 状态：{}\n\
+- 国内直连规则：{domestic_direct_label} ｜ 阻断 QUIC（UDP/443）：{block_quic_label}\n\
+- 国内 443 预加速：{preaccel_label}（当前中转：{preaccel_relay_name}，跳过 443 原生节点：{skip_443_label}）\n\
+- 底层提速诊断：{global_preaccel_brief}\n\
+- IPv6 开关：核心数据面 {ipv6_core_label} ｜ DNS 解析 {ipv6_dns_label}\n\
+- GeoData 状态：{geodata_brief}\n\
 - 本地资产统计：订阅 {sub_count} 个 · 节点 {node_count} 个 · 智能多选组 {group_count} 个 · 国内中转 {relay_count} 个\n\
 \n\
 ## 3. 当前连接分布\n\
 \n\
-- 真实应用连接：{} 条（直连 {} 条 · 代理 {} 条）\n\
-- 底层提速隧道（`Inner`）：{} 条（已从应用连接数中排除）\n\
+- 真实应用连接：{app_conns} 条（直连 {direct_conns} 条 · 代理 {proxied_conns} 条）\n\
+- 底层提速隧道（`Inner`）：{tunnel_conns} 条（已从应用连接数中排除）\n\
 \n\
-## 4. 最近脱敏运行日志（最近 {} 条）\n\
+## 4. 脱敏运行日志（智能采样：近 {key_count} 条关键事件 + 近 {tail_count} 条全量尾日志）\n\
+\n\
+### 4.1 关键非连接流水事件（近 {key_count} 条，已排除普通 TCP/UDP 转发）\n\
 \n\
 ```text\n\
-{logs_block}\n\
+{key_events_block}\n\
+```\n\
+\n\
+### 4.2 最新全量尾日志（近 {tail_count} 条）\n\
+\n\
+```text\n\
+{tail_logs_block}\n\
 ```\n\
 \n\
 ## 5. 本机只读 `catcloud` CLI 进一步排查指引\n\
@@ -9947,49 +11001,345 @@ catcloud group list --json\n\
 catcloud node list --json\n\
 catcloud preaccel pool --json\n\
 catcloud docs export network_reload --format json\n\
-```\n",
-        if is_elevated { "是" } else { "否" },
-        if is_portable { "是" } else { "否" },
-        if rt.running { "运行中" } else { "已停止" },
-        cfg.proxy_mode.as_str(),
-        if cfg.system_proxy.enabled {
-            "已开启"
-        } else {
-            "关闭"
-        },
-        if cfg.tun.enabled { "已开启" } else { "关闭" },
-        cfg.tun.stack_mode.as_str(),
-        format_memory_tier_label(&cfg.core_runtime.memory_tier),
-        cfg.core_runtime.gogc,
-        if cfg.rules_override.domestic_direct_enabled {
-            "开启"
-        } else {
-            "关闭"
-        },
-        if cfg.rules_override.block_quic_udp_443 {
-            "开启"
-        } else {
-            "关闭"
-        },
-        if cfg.preaccel.enabled {
-            "已开启"
-        } else {
-            "关闭"
-        },
-        if cfg.preaccel.skip_443_native {
-            "是"
-        } else {
-            "否"
-        },
-        if cfg.core_ipv6 { "开启" } else { "关闭" },
-        if cfg.dns.ipv6 { "开启" } else { "关闭" },
-        format_geodata_brief(geodata_status),
-        conn_summary.app_connections,
-        conn_summary.direct_connections,
-        conn_summary.proxied_connections,
-        conn_summary.tunnel_connections,
-        recent_logs.len(),
+```\n"
     )
+}
+
+fn format_onboarding_os_label_zh(os_raw: &str) -> &'static str {
+    let lower = os_raw.trim().to_ascii_lowercase();
+    if lower.contains("windows") || lower.contains("win") {
+        "Windows 电脑"
+    } else if lower.contains("macos") || lower.contains("darwin") || lower.contains("mac") {
+        "macOS 电脑"
+    } else if lower.contains("linux") {
+        "Linux 电脑"
+    } else {
+        "桌面电脑"
+    }
+}
+
+fn format_onboarding_preaccel_plain_zh(
+    global_status: &GlobalPreAccelStatus,
+    enabled: bool,
+    tun_enabled: bool,
+    core_running: bool,
+) -> String {
+    let main_desc = if !enabled && !global_status.running {
+        "已关闭".to_string()
+    } else {
+        match global_status.verify_state.as_str() {
+            "verified" => match global_status.verify_latency_ms {
+                Some(ms) => format!("已开启并在底层实测生效（{ms} ms）"),
+                None => "已开启并在底层实测生效".to_string(),
+            },
+            "probing" => "已开启，正在自动探测链路".to_string(),
+            "degraded" => "已开启，底层探测未通过已自动保护回退".to_string(),
+            "failed" => "已开启，底层提速组件暂未就绪".to_string(),
+            _ => {
+                if global_status.is_windivert_active {
+                    "已开启并在底层运行中（等待自动探测）".to_string()
+                } else if core_running && tun_enabled {
+                    "已开启（由全局代理模式统一接管提速）".to_string()
+                } else if matches!(
+                    global_status.install_state.as_str(),
+                    "downloading" | "verifying"
+                ) {
+                    "已开启，正在后台自动准备提速组件".to_string()
+                } else if global_status.install_state == "need_elevation" {
+                    "已开启，需以管理员身份重启后为其它软件自动提速".to_string()
+                } else if global_status.running {
+                    "已开启（本机独立提速通道待命中）".to_string()
+                } else {
+                    "已开启（待启动）".to_string()
+                }
+            }
+        }
+    };
+
+    let mut parts = vec![main_desc];
+    if let Some(iface) = global_status
+        .bound_physical_interface
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        parts.push(format!("当前上网网卡：{}", app_log::sanitize_log_line(iface)));
+    }
+    if global_status.detected_security_products.is_empty() {
+        parts.push("安全软件环境：未发现常见拦截类安全软件".to_string());
+    } else {
+        parts.push(format!(
+            "检测到安全软件：{}",
+            app_log::sanitize_log_line(&global_status.detected_security_products.join(" / "))
+        ));
+    }
+    parts.join(" ｜ ")
+}
+
+fn strip_log_timestamp_and_level_prefix(line: &str) -> &str {
+    let mut s = line.trim();
+    // Strip leading ISO-8601 timestamp token such as `2026-11-24T12:00:00Z `
+    if let Some((first, rest)) = s.split_once(' ') {
+        if first.len() >= 19 && first.as_bytes().get(4) == Some(&b'-') && first.contains(':') {
+            s = rest.trim_start();
+        }
+    }
+    // Strip leading `[info]` / `[warning]` / `[error]` / `[warn]` tag
+    if s.starts_with('[') {
+        if let Some(close) = s.find(']') {
+            let tag = &s[1..close];
+            if matches!(
+                tag.to_ascii_lowercase().as_str(),
+                "info" | "warn" | "warning" | "error" | "debug" | "trace"
+            ) {
+                s = s[close + 1..].trim_start();
+            }
+        }
+    }
+    s
+}
+
+/// Keep at most `limit` high-value, sanitized Chinese status events suitable for onboarding
+/// beginners (dropping routine traffic lines, debug/trace noise, and heavy English low-level logs).
+fn filter_onboarding_key_events(all_logs: &[String], limit: usize) -> Vec<String> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let filtered: Vec<String> = all_logs
+        .iter()
+        .filter(|line| {
+            if is_routine_mihomo_traffic_log_line(line) {
+                return false;
+            }
+            let lower = line.to_ascii_lowercase();
+            if lower.contains(" [debug] ") || lower.contains(" [trace] ") {
+                return false;
+            }
+            let body = strip_log_timestamp_and_level_prefix(line);
+            let cjk_count = body
+                .chars()
+                .filter(|c| ('\u{4E00}'..='\u{9FFF}').contains(c))
+                .count();
+            if cjk_count < 2 {
+                return false;
+            }
+            let ascii_letters = body.bytes().filter(u8::is_ascii_alphabetic).count();
+            !(ascii_letters > 24 && ascii_letters > cjk_count * 3)
+        })
+        .map(|line| sanitize_log_text(line))
+        .collect();
+    let start = filtered.len().saturating_sub(limit);
+    filtered[start..].to_vec()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_ai_onboarding_prompt_markdown(
+    app_version: &str,
+    os_label: &str,
+    is_elevated: bool,
+    cfg: &AppConfig,
+    rt: &CoreRuntimeStatus,
+    runtime_dto: Option<&CoreRuntimeInfoDto>,
+    global_status: &GlobalPreAccelStatus,
+    counts: (usize, usize, usize, usize, usize, usize),
+    last_error: Option<&str>,
+    key_event_logs: &[String],
+) -> String {
+    let (sub_count, total_nodes, enabled_nodes, tested_nodes, group_count, relay_count) = counts;
+    let os_label_zh = format_onboarding_os_label_zh(os_label);
+    let route_mode = runtime_dto
+        .map(|d| d.route_mode.as_str())
+        .unwrap_or_else(|| cfg.route_mode.as_str());
+    let route_mode_zh = if route_mode == "single" {
+        "单节点直选"
+    } else {
+        "智能多选组"
+    };
+    let active_group_name = app_log::sanitize_log_line(
+        runtime_dto
+            .map(|d| d.active_group_name.as_str())
+            .unwrap_or("尚未创建"),
+    );
+    let active_node_name = app_log::sanitize_log_line(
+        runtime_dto
+            .map(|d| d.active_node_name.as_str())
+            .unwrap_or("待导入节点"),
+    );
+    let active_node_region = runtime_dto
+        .map(|d| d.active_node_region.as_str())
+        .unwrap_or("--");
+    let selection_desc = if total_nodes == 0 {
+        "尚未导入任何节点".to_string()
+    } else if route_mode == "single" {
+        format!("单节点「{active_node_name}」（地区：{active_node_region}）")
+    } else {
+        format!("智能多选组「{active_group_name}」 → 当前生效节点「{active_node_name}」（地区：{active_node_region}）")
+    };
+
+    let core_state = if rt.running { "运行中" } else { "未启动" };
+    let proxy_mode_zh = match cfg.proxy_mode {
+        ProxyMode::Rule => "规则分流（国内外自动分流）",
+        ProxyMode::Global => "全局代理",
+        ProxyMode::Direct => "全部直连",
+    };
+    let sys_proxy_zh = if cfg.system_proxy.enabled {
+        "已开启"
+    } else {
+        "未开启"
+    };
+    let tun_zh = if cfg.tun.enabled {
+        "已开启"
+    } else {
+        "未开启"
+    };
+    let admin_zh = if is_elevated {
+        "已是管理员权限"
+    } else {
+        "普通用户权限"
+    };
+    let preaccel_brief = format_onboarding_preaccel_plain_zh(
+        global_status,
+        cfg.preaccel.enabled,
+        cfg.tun.enabled,
+        rt.running,
+    );
+    let security_guidance_line = global_status
+        .security_guidance
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|g| format!("- 安全软件放行提示：{}\n", sanitize_log_text(g)))
+        .unwrap_or_default();
+    let last_err_line = last_error
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|e| format!("- 最近异常提示：{}\n", sanitize_log_text(e)))
+        .unwrap_or_else(|| "- 最近异常提示：无\n".to_string());
+
+    let filtered_events = filter_onboarding_key_events(key_event_logs, ONBOARDING_KEY_EVENTS_LIMIT);
+    let events_block = if filtered_events.is_empty() {
+        "（暂无近期关键状态事件）".to_string()
+    } else {
+        filtered_events.join("\n")
+    };
+
+    let onboarding_guide = catcloud_core::agent_docs::render_zh_onboarding_guide().trim();
+
+    format!(
+        "# 请做我的「猫猫云梯（CatCloud）」新手手把手上手导师\n\
+\n\
+## 给 AI 导师的对话说明\n\
+\n\
+你好！我正在使用桌面代理管理工具「猫猫云梯（CatCloud）」，我可能是完全不懂代理、协议或网络术语的新手。\n\
+请你严格按照以下方式一步一步带我上手：\n\
+\n\
+1. **先看现状，再带下一步**：请仔细阅读最下方「我当前的实时脱敏状态快照」，先用 1～2 句大白话告诉我我现在走到了哪一步。\n\
+2. **一次只教当下最该做的下一小步**：千万不要一口气把所有教程全倒出来！每次只给我 1 个具体、马上能点的小操作，等我回复做完后再继续带我走下一步。\n\
+3. **严格用界面上的准确中文按钮名指路**：请对照下方官方上手总纲中的页面名称和按钮名告诉我“点左边哪一页 → 点哪个按钮”，**不要甩源码、配置文件字段名或命令行/终端黑话**（除非我主动要求了解高级用法）。\n\
+4. **遇异常优先解卡**：如果我的状态快照里显示有报错、未导入节点、或安全软件拦截提示，请先优先帮我把这个卡点解决掉。\n\
+\n\
+---\n\
+\n\
+{onboarding_guide}\n\
+\n\
+---\n\
+\n\
+## 我当前的实时脱敏状态快照\n\
+\n\
+> 以下信息已自动完成隐私脱敏（订阅链接凭据、密码、Token、本地用户名与非系统盘路径、私网及公网 IP 末段均已隐藏），可直接安全发给 AI。\n\
+\n\
+- 软件版本与环境：猫猫云梯 v{app_version} · {os_label_zh} · {admin_zh}\n\
+- 资产进度：订阅 {sub_count} 个 · 节点共 {total_nodes} 个（已启用 {enabled_nodes} 个，已测速 {tested_nodes} 个） · 智能多选组 {group_count} 个 · 国内中转 {relay_count} 条\n\
+- 当前路线方式与选中项：{route_mode_zh} ｜ {selection_desc}\n\
+- 代理与网络接管：代理核心「{core_state}」 ｜ 分流模式「{proxy_mode_zh}」 ｜ 系统代理「{sys_proxy_zh}」 ｜ 虚拟网卡「{tun_zh}」\n\
+- 国内提速与本机环境：{preaccel_brief}\n\
+{security_guidance_line}{last_err_line}\
+\n\
+### 最近关键事件（最多 {ONBOARDING_KEY_EVENTS_LIMIT} 条，已过滤普通连接与底层调试信息）\n\
+\n\
+```text\n\
+{events_block}\n\
+```\n\
+\n\
+请根据我上面当前的真实进度，告诉我现在最先应该做的**下一小步**是什么吧！\n"
+    )
+}
+
+#[tauri::command]
+pub async fn build_ai_onboarding_prompt(state: State<'_, AppState>) -> Result<String, String> {
+    let cfg = state.snapshot_config();
+    let rt = state.snapshot_runtime();
+    let plat = default_platform();
+    let caps = plat.capabilities();
+    let runtime_dto = build_runtime_info_dto(&state).ok();
+    let global_status = state.snapshot_global_preaccel();
+
+    let (sub_count, total_nodes, enabled_nodes, tested_nodes, group_count, relay_count) = {
+        let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let subs = db.list_subscriptions().map(|v| v.len()).unwrap_or(0);
+        let nodes = db.list_nodes().unwrap_or_default();
+        let total = nodes.len();
+        let enabled = nodes.iter().filter(|n| n.enabled).count();
+        let tested = if nodes.is_empty() {
+            0
+        } else {
+            let node_ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+            db.get_probe_snapshots_batch(&node_ids, None)
+                .map(|snaps| {
+                    snaps
+                        .values()
+                        .filter(|s| {
+                            s.latency_ms.is_some_and(|ms| ms.is_finite() && ms > 0.0)
+                                || s.up_mbps.is_some_and(|v| v.is_finite() && v > 0.0)
+                                || s.down_mbps.is_some_and(|v| v.is_finite() && v > 0.0)
+                                || s.ok
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let groups = db.list_multi_groups().map(|v| v.len()).unwrap_or(0);
+        let relays = db.list_preaccel_relays(false).map(|v| v.len()).unwrap_or(0);
+        (subs, total, enabled, tested, groups, relays)
+    };
+
+    let last_error = rt
+        .last_error
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(app_log::sanitize_log_line)
+        .or_else(|| state.last_app_error_snapshot());
+
+    let logger = Arc::clone(&state.app_logger);
+    let disk_logs = tokio::task::spawn_blocking(move || {
+        logger.read_recent_lines(DIAGNOSTICS_LOG_SCAN_LIMIT)
+    })
+    .await
+    .unwrap_or_default();
+    let mem_logs = state.telemetry.logs_snapshot();
+    let merged_logs = merge_sanitized_recent_logs(disk_logs, mem_logs, DIAGNOSTICS_LOG_SCAN_LIMIT);
+    let key_events = filter_onboarding_key_events(&merged_logs, ONBOARDING_KEY_EVENTS_LIMIT);
+
+    Ok(build_ai_onboarding_prompt_markdown(
+        env!("CARGO_PKG_VERSION"),
+        &caps.os,
+        caps.is_elevated,
+        &cfg,
+        &rt,
+        runtime_dto.as_ref(),
+        &global_status,
+        (
+            sub_count,
+            total_nodes,
+            enabled_nodes,
+            tested_nodes,
+            group_count,
+            relay_count,
+        ),
+        last_error.as_deref(),
+        &key_events,
+    ))
 }
 
 #[cfg(test)]
@@ -10010,6 +11360,7 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
     let plat = default_platform();
     let caps = plat.capabilities();
     let runtime_dto = build_runtime_info_dto(state).ok();
+    let global_status = state.snapshot_global_preaccel();
     let (sub_count, node_count, group_count, relay_count) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         (
@@ -10054,33 +11405,49 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         .filter(|s| !s.is_empty())
         .map(app_log::sanitize_log_line)
         .or_else(|| state.last_app_error_snapshot());
-    let recent_logs = match preloaded_disk_logs {
+    let all_merged_logs = match preloaded_disk_logs {
         Some(disk_lines) => {
             let mem_logs = state.telemetry.logs_snapshot();
-            merge_sanitized_recent_logs(disk_lines, mem_logs, 60)
+            merge_sanitized_recent_logs(disk_lines, mem_logs, DIAGNOSTICS_LOG_SCAN_LIMIT)
         }
-        None => collect_sanitized_recent_logs(state, 60),
+        None => collect_sanitized_recent_logs(state, DIAGNOSTICS_LOG_SCAN_LIMIT),
+    };
+    let (key_event_logs, tail_logs) = sample_diagnostic_logs(
+        &all_merged_logs,
+        DIAGNOSTICS_KEY_EVENTS_LIMIT,
+        DIAGNOSTICS_TAIL_LOGS_LIMIT,
+    );
+    let recent_logs = {
+        let start = all_merged_logs
+            .len()
+            .saturating_sub(DIAGNOSTICS_JSON_RECENT_LOGS_LIMIT);
+        all_merged_logs[start..].to_vec()
     };
 
     let route_mode = runtime_dto
         .as_ref()
         .map(|d| d.route_mode.clone())
         .unwrap_or_else(|| cfg.route_mode.as_str().to_string());
-    let active_group_name = runtime_dto
-        .as_ref()
-        .map(|d| d.active_group_name.clone())
-        .unwrap_or_else(|| "默认路线".to_string());
-    let active_node_name = runtime_dto
-        .as_ref()
-        .map(|d| d.active_node_name.clone())
-        .unwrap_or_else(|| "待导入节点".to_string());
+    let active_group_name = app_log::sanitize_log_line(
+        runtime_dto
+            .as_ref()
+            .map(|d| d.active_group_name.as_str())
+            .unwrap_or("默认路线"),
+    );
+    let active_node_name = app_log::sanitize_log_line(
+        runtime_dto
+            .as_ref()
+            .map(|d| d.active_node_name.as_str())
+            .unwrap_or("待导入节点"),
+    );
     let active_node_region = runtime_dto
         .as_ref()
         .map(|d| d.active_node_region.clone())
         .unwrap_or_else(|| "--".to_string());
     let preaccel_relay_name = runtime_dto
         .as_ref()
-        .and_then(|d| d.preaccel_relay_name.clone());
+        .and_then(|d| d.preaccel_relay_name.as_deref())
+        .map(app_log::sanitize_log_line);
 
     let os_label = format!("{} {}", caps.os, caps.arch);
     let ai_prompt_markdown = build_ai_diagnostics_markdown(
@@ -10091,12 +11458,14 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         &cfg,
         &rt,
         runtime_dto.as_ref(),
+        &global_status,
         (sub_count, node_count, group_count, relay_count),
         conn_summary,
         core_mem_bytes,
         &geodata_status,
         last_error.as_deref(),
-        &recent_logs,
+        &key_event_logs,
+        &tail_logs,
     );
 
     Ok(serde_json::json!({
@@ -10145,6 +11514,7 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
             "proxied_connections": conn_summary.proxied_connections,
         },
         "last_error": last_error,
+        "key_event_logs": key_event_logs,
         "recent_logs": recent_logs,
         "ai_prompt_markdown": ai_prompt_markdown,
         "sanitized": true
@@ -10185,9 +11555,11 @@ pub async fn export_sanitized_diagnostics(
     }
 
     let logger = Arc::clone(&state.app_logger);
-    let disk_logs = tokio::task::spawn_blocking(move || logger.read_recent_lines(60))
-        .await
-        .unwrap_or_default();
+    let disk_logs = tokio::task::spawn_blocking(move || {
+        logger.read_recent_lines(DIAGNOSTICS_LOG_SCAN_LIMIT)
+    })
+    .await
+    .unwrap_or_default();
 
     build_sanitized_diagnostics_report_with_disk_logs(&state, live_snap.as_ref(), Some(disk_logs))
 }
@@ -10964,6 +12336,7 @@ pub async fn import_backup_bundle(
     prune_node_health_pool_from_db(&state);
     let _ = trigger_reload_if_running(&app, &state, true).await;
     let cfg = state.snapshot_config();
+    emit_config_updated(&app, &cfg);
     sync_app_side_effects(&app, &state, &cfg);
 
     let message = if skipped_redacted_relays > 0 {
@@ -11025,6 +12398,7 @@ pub async fn hot_swap_core(
         return Err(format!("所选内核文件不存在：{trimmed}"));
     }
     let sha256 = compute_file_sha256(&candidate).map_err(|e| e.to_string())?;
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let mut cfg = state.snapshot_config();
     cfg.core_runtime.custom_binary_path = Some(candidate.display().to_string());
     config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
@@ -11032,7 +12406,7 @@ pub async fn hot_swap_core(
         *guard = cfg.clone();
     }
     let version = if state.adapter.has_live_controller().await {
-        let rt = restart_core(app, state).await?;
+        let rt = restart_core_locked(&app, &state).await?;
         rt.core_version
     } else {
         "已配置".to_string()
@@ -13627,5 +15001,466 @@ mod tests {
         );
         assert_eq!(fallback, vec!["n-b".to_string(), "n-c".to_string()]);
         assert!(!fallback.contains(&"n-a".to_string()));
+    }
+
+    #[test]
+    fn subscription_proxy_candidates_prefer_direct_then_core_then_distinct_local_sys_proxy() {
+        let local_same = SystemProxySpec {
+            enabled: true,
+            host: "localhost".to_string(),
+            port: 7890,
+            bypass: Vec::new(),
+            pac_url: None,
+        };
+        assert_eq!(
+            build_subscription_proxy_candidates_from(Some(7890), Some(&local_same)),
+            vec![None, Some("http://127.0.0.1:7890".to_string())]
+        );
+
+        let local_other = SystemProxySpec {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 10809,
+            bypass: Vec::new(),
+            pac_url: None,
+        };
+        assert_eq!(
+            build_subscription_proxy_candidates_from(Some(7890), Some(&local_other)),
+            vec![
+                None,
+                Some("http://127.0.0.1:7890".to_string()),
+                Some("http://127.0.0.1:10809".to_string()),
+            ]
+        );
+
+        // Remote LAN/corporate proxy or PAC URL must be ignored for local fallback.
+        let remote_proxy = SystemProxySpec {
+            enabled: true,
+            host: "192.168.1.20".to_string(),
+            port: 8080,
+            bypass: Vec::new(),
+            pac_url: None,
+        };
+        let pac_proxy = SystemProxySpec {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 10809,
+            bypass: Vec::new(),
+            pac_url: Some("http://127.0.0.1:10808/proxy.pac".to_string()),
+        };
+        assert_eq!(
+            build_subscription_proxy_candidates_from(None, Some(&remote_proxy)),
+            vec![None]
+        );
+        assert_eq!(
+            build_subscription_proxy_candidates_from(None, Some(&pac_proxy)),
+            vec![None]
+        );
+    }
+
+    #[test]
+    fn sample_diagnostic_logs_separates_key_events_from_routine_mihomo_traffic() {
+        let mut logs = Vec::new();
+        for i in 0..30 {
+            logs.push(format!(
+                "2026-11-24T12:00:{i:02}Z [info] [核心] 代理核心事件 #{i}"
+            ));
+        }
+        logs.push(
+            "2026-11-24T12:01:00Z [warning] [mihomo] [TCP] 127.0.0.1:50000 --> example.com:443 dial error"
+                .to_string(),
+        );
+        for i in 0..60 {
+            logs.push(format!(
+                "2026-11-24T12:02:{:02}Z [info] [mihomo] [TCP] 127.0.0.1:{} --> example.invalid:443 match Match using Proxy",
+                i % 60,
+                40000 + i
+            ));
+            logs.push(format!(
+                "2026-11-24T12:03:{:02}Z [info] [mihomo] [UDP] 127.0.0.1:{} --> 8.8.8.*:53 match GeoIP using DIRECT",
+                i % 60,
+                41000 + i
+            ));
+        }
+
+        let (key_events, tail_logs) = sample_diagnostic_logs(&logs, 25, 35);
+        assert_eq!(key_events.len(), 25);
+        assert_eq!(tail_logs.len(), 35);
+        assert!(key_events
+            .last()
+            .is_some_and(|l| l.contains("[warning] [mihomo] [TCP]")));
+        assert!(key_events.iter().all(|l| !l.contains("[info] [mihomo] [TCP]")));
+        assert!(key_events.iter().all(|l| !l.contains("[info] [mihomo] [UDP]")));
+    }
+
+    #[test]
+    fn onboarding_prompt_and_runtime_verify_fields_render_sanitized_chinese_guide() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_onboarding_verify_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, AppConfig::default(), storage, job_guard);
+
+        let dto = build_runtime_info_dto(&state).expect("build runtime dto");
+        assert_eq!(dto.global_preaccel_verify_state, "idle");
+        assert_eq!(dto.global_preaccel_verify_ms, None);
+
+        let mut cfg = state.snapshot_config();
+        cfg.preaccel.enabled = true;
+
+        let mut global_st = GlobalPreAccelStatus::default();
+        global_st.running = true;
+        global_st.mode = "windivert".to_string();
+        global_st.is_windivert_active = true;
+        global_st.verify_state = "verified".to_string();
+        global_st.verify_latency_ms = Some(38);
+        global_st.bound_physical_interface = Some("WLAN".to_string());
+        global_st.detected_security_products = vec!["Windows 安全中心（Defender）".to_string()];
+        global_st.security_guidance = Some(
+            "请将目录 `D:\\SecretPortable\\CatCloud\\bin` 加入排除项".to_string(),
+        );
+
+        let sample_events = vec![
+            "2026-11-24T12:00:00Z [info] [mihomo] Start initial compatible provider Proxy".to_string(),
+            "2026-11-24T12:00:01Z [debug] [核心] 调试信息不应出现".to_string(),
+            "2026-11-24T12:00:02Z [info] [应用/订阅] 事件一：已导入 5 个节点".to_string(),
+            "2026-11-24T12:00:03Z [info] [应用/测速] 事件二：完成 3 个节点省流快测".to_string(),
+            "2026-11-24T12:00:04Z [info] [应用/代理] 事件三：已开启系统代理".to_string(),
+            "2026-11-24T12:00:05Z [info] [应用/分流] 事件四：已切换为规则分流模式".to_string(),
+            "2026-11-24T12:00:06Z [info] [应用/路线] 事件五：已切换到低延迟节点".to_string(),
+            "2026-11-24T12:00:07Z [info] [应用/环境] 事件六：检测到网卡状态更新".to_string(),
+            "2026-11-24T12:00:08Z [info] [应用/国内提速] 事件七：探测通过 38 ms 内网 192.168.1.9".to_string(),
+        ];
+
+        let md = build_ai_onboarding_prompt_markdown(
+            "0.1.0",
+            "windows x86_64",
+            true,
+            &cfg,
+            &state.snapshot_runtime(),
+            Some(&dto),
+            &global_st,
+            (1, 5, 5, 3, 1, 1),
+            Some("上次测试失败 trojan://secret_pw@203.0.113.88:443?token=abc123"),
+            &sample_events,
+        );
+        assert!(md.contains("新手手把手上手导师"));
+        assert!(md.contains("下一小步"));
+        assert!(md.contains("Windows 电脑"));
+        assert!(!md.contains("windows x86_64"));
+        assert!(md.contains("已开启并在底层实测生效（38 ms）"));
+        assert!(!md.contains("WinDivert 运行中"));
+        assert!(!md.contains("SOCKS5 待命"));
+        assert!(md.contains("已测速 3 个"));
+        assert!(md.contains("WLAN"));
+        assert!(md.contains("38 ms"));
+        assert!(!md.contains("SecretPortable"));
+        assert!(md.contains("<LOCAL_PATH>/bin"));
+        assert!(!md.contains("secret_pw"));
+        assert!(!md.contains("abc123"));
+        assert!(!md.contains("203.0.113.88"));
+        assert!(md.contains("203.0.113.*"));
+        assert!(!md.contains("192.168.1.9"));
+        assert!(md.contains("192.168.1.*"));
+        assert!(!md.contains("Start initial compatible provider"));
+        assert!(!md.contains("调试信息不应出现"));
+        assert!(!md.contains("事件一"));
+        assert!(md.contains("事件二"));
+        assert!(md.contains("事件七"));
+
+        // Verify degraded plain-Chinese wording without jargon.
+        global_st.verify_state = "degraded".to_string();
+        global_st.is_windivert_active = false;
+        let degraded_md = build_ai_onboarding_prompt_markdown(
+            "0.1.0",
+            "macos aarch64",
+            false,
+            &cfg,
+            &state.snapshot_runtime(),
+            Some(&dto),
+            &global_st,
+            (1, 5, 5, 0, 1, 1),
+            None,
+            &[],
+        );
+        assert!(degraded_md.contains("macOS 电脑"));
+        assert!(degraded_md.contains("已开启，底层探测未通过已自动保护回退"));
+        assert!(degraded_md.contains("已测速 0 个"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn tray_visual_state_reflects_probing_and_degraded_verify_states() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_tray_verify_state_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        let state = AppState::new(paths, cfg, storage, job_guard);
+
+        let degraded = build_tray_visual_state_with_verify_override(&state, Some(("degraded", None)));
+        assert_eq!(degraded.health, TrayHealthState::Warn);
+        assert_eq!(degraded.global_preaccel_verify_state, "degraded");
+        assert!(degraded
+            .tooltip
+            .contains("已保护回退（请查看国内提速环境放行指引）"));
+
+        let probing = build_tray_visual_state_with_verify_override(&state, Some(("probing", None)));
+        assert_ne!(probing.health, TrayHealthState::PreAccel);
+        assert_eq!(probing.global_preaccel_verify_state, "probing");
+        assert!(probing.tooltip.contains("探测链路中…"));
+        assert!(!probing.tooltip.contains("全局提速中"));
+
+        let dto_degraded =
+            build_runtime_info_dto_with_verify_override(&state, Some(("degraded", None)))
+                .expect("build degraded dto");
+        assert_eq!(dto_degraded.status, "warn");
+        assert_eq!(dto_degraded.global_preaccel_verify_state, "degraded");
+
+        let dto_probing =
+            build_runtime_info_dto_with_verify_override(&state, Some(("probing", None)))
+                .expect("build probing dto");
+        assert!(!dto_probing.preaccel_active);
+        assert_eq!(dto_probing.global_preaccel_verify_state, "probing");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn format_subscription_error_zh_eliminates_all_english_error_residue() {
+        let cases = [
+            (
+                "订阅链接格式不正确，请确认完整复制了链接（relative URL without a base）",
+                "格式不正确",
+            ),
+            (
+                "拉取订阅失败（invalid certificate: self signed）",
+                "握手失败",
+            ),
+            (
+                "解析失败：expected mapping at line 12 column 4",
+                "格式无法解析",
+            ),
+            (
+                "请求异常：dns error: failed to lookup address information",
+                "域名解析失败",
+            ),
+            (
+                "代理连接失败：tcp connect error: connection refused (os error 10061)",
+                "被拒绝",
+            ),
+            (
+                "拉取失败：operation timed out after 15s",
+                "超时",
+            ),
+            (
+                "上游响应错误：status 403 forbidden",
+                "HTTP 403",
+            ),
+            (
+                "上游响应错误：status 502 bad gateway",
+                "HTTP 5xx",
+            ),
+            (
+                "weird unknown upstream xyz failure without category",
+                "拉取或解析订阅失败",
+            ),
+            (
+                "网络请求失败（error sending request for url (https://secret:pw@sub.example.com/get)）",
+                "无法连接到订阅服务器",
+            ),
+        ];
+
+        for (raw, expected_substr) in cases {
+            let formatted = format_subscription_error_zh(raw);
+            assert!(
+                formatted.contains(expected_substr),
+                "expected `{expected_substr}` in `{formatted}` (from `{raw}`)"
+            );
+            assert!(
+                !contains_english_error_residue(&formatted),
+                "english residue leaked in `{formatted}` (from `{raw}`)"
+            );
+            assert!(!formatted.contains("weird unknown"));
+            assert!(!formatted.contains("relative URL"));
+            assert!(!formatted.contains("expected mapping"));
+            assert!(!formatted.contains("secret:pw"));
+        }
+
+        // Clean pure-Chinese messages pass through unchanged.
+        let clean_zh = "订阅认证失败（HTTP 401），链接里的访问令牌可能已失效或被重置";
+        assert_eq!(format_subscription_error_zh(clean_zh), clean_zh);
+    }
+
+    #[test]
+    fn upsert_subscription_deduplicates_normalized_and_clash_wrapped_urls() {
+        let db = Storage::open_in_memory().expect("open in-memory storage");
+
+        let first = upsert_subscription_in_storage(
+            &db,
+            SubscriptionRecord {
+                id: String::new(),
+                name: "主力机场".to_string(),
+                kind: SubscriptionKind::Url,
+                url_or_cmd: "  https://Sub.Example.COM:443/api/sub?token=AbC123  ".to_string(),
+                traffic_total_bytes: 100 * 1024 * 1024,
+                traffic_used_bytes: 20 * 1024 * 1024,
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("insert first sub");
+        assert!(!first.id.is_empty());
+
+        // Same URL with different casing + new ID should reuse existing record instead of duplicating.
+        let second = upsert_subscription_in_storage(
+            &db,
+            SubscriptionRecord {
+                id: "sub-new-dup-id".to_string(),
+                name: "主力机场（重命名）".to_string(),
+                kind: SubscriptionKind::Url,
+                url_or_cmd: "HTTPS://sub.example.com/api/sub?token=AbC123".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("dedup second sub");
+        assert_eq!(second.id, first.id);
+        assert_eq!(second.name, "主力机场（重命名）");
+        assert_eq!(second.traffic_total_bytes, 100 * 1024 * 1024);
+        assert_eq!(db.list_subscriptions().unwrap().len(), 1);
+
+        // clash:// one-click install link wrapping the exact same URL also deduplicates & unwraps.
+        let third = upsert_subscription_in_storage(
+            &db,
+            SubscriptionRecord {
+                id: String::new(),
+                name: String::new(),
+                kind: SubscriptionKind::Url,
+                url_or_cmd: "clash://install-config?url=https%3A%2F%2Fsub.example.com%2Fapi%2Fsub%3Ftoken%3DAbC123&name=Ignored".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("dedup clash wrapped sub");
+        assert_eq!(third.id, first.id);
+        assert_eq!(third.name, "主力机场（重命名）");
+        assert_eq!(
+            third.url_or_cmd,
+            "https://sub.example.com/api/sub?token=AbC123"
+        );
+        assert_eq!(db.list_subscriptions().unwrap().len(), 1);
+
+        // Explicit update of an existing ID updates that ID directly.
+        let updated = upsert_subscription_in_storage(
+            &db,
+            SubscriptionRecord {
+                id: first.id.clone(),
+                name: "显式更新".to_string(),
+                kind: SubscriptionKind::Url,
+                url_or_cmd: "https://other.example.com/sub?token=xyz".to_string(),
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .expect("explicit update by id");
+        assert_eq!(updated.id, first.id);
+        assert_eq!(updated.name, "显式更新");
+        assert_eq!(db.list_subscriptions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn diagnostics_route_summary_sanitizes_sensitive_group_node_and_relay_names() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_diag_route_sanitize_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+
+        storage
+            .upsert_subscription(&SubscriptionRecord {
+                id: "s-1".to_string(),
+                name: "测试订阅".to_string(),
+                kind: SubscriptionKind::Url,
+                url_or_cmd: "https://sub.example.com/api".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .expect("upsert subscription");
+        storage
+            .upsert_node(&ProxyNode {
+                id: "n-1".to_string(),
+                sub_id: "s-1".to_string(),
+                name: "日本节点 203.0.113.88 token=node_secret_99".to_string(),
+                region_code: "JP".to_string(),
+                protocol: "trojan".to_string(),
+                server: "203.0.113.88".to_string(),
+                port: 443,
+                enabled: true,
+                ..Default::default()
+            })
+            .expect("upsert node");
+        storage
+            .upsert_multi_group(&MultiGroup {
+                id: "g-1".to_string(),
+                name: "公司组 192.168.10.55 C:\\Users\\John Doe\\cfg".to_string(),
+                member_node_ids: vec!["n-1".to_string()],
+                active_node_id: Some("n-1".to_string()),
+                ..Default::default()
+            })
+            .expect("upsert group");
+        storage
+            .upsert_preaccel_relay(&PreAccelRelay {
+                id: "r-1".to_string(),
+                name: "杭州中转 10.8.0.12 secret=relay_pw_1".to_string(),
+                server: "198.51.100.12".to_string(),
+                port: 443,
+                protocol: "trojan".to_string(),
+                password: "pw".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .expect("upsert relay");
+
+        let mut cfg = AppConfig::default();
+        cfg.active_group_id = Some("g-1".to_string());
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.active_relay_id = Some("r-1".to_string());
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, cfg, storage, job_guard);
+
+        let report =
+            build_sanitized_diagnostics_report(&state, None).expect("build diagnostics report");
+        let route_summary = &report["route_summary"];
+        let g_name = route_summary["active_group_name"].as_str().unwrap();
+        let n_name = route_summary["active_node_name"].as_str().unwrap();
+        let r_name = route_summary["preaccel_relay_name"].as_str().unwrap();
+
+        assert!(!g_name.contains("192.168.10.55"));
+        assert!(!g_name.contains("John Doe"));
+        assert!(g_name.contains("192.168.10.*"));
+        assert!(g_name.contains(r"C:\Users\<USER>\cfg"));
+
+        assert!(!n_name.contains("203.0.113.88"));
+        assert!(!n_name.contains("node_secret_99"));
+        assert!(n_name.contains("203.0.113.*"));
+        assert!(n_name.contains("token=<REDACTED>"));
+
+        assert!(!r_name.contains("10.8.0.12"));
+        assert!(!r_name.contains("relay_pw_1"));
+        assert!(r_name.contains("10.8.0.*"));
+        assert!(r_name.contains("secret=<REDACTED>"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

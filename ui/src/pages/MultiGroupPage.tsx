@@ -1194,7 +1194,7 @@ function buildMultiGroupAgentMarkdown(group: MultiGroup, meta: TriggerMeta): str
   );
 
   return [
-    `# CatCloud Agent Guide: Smart Multi-Group (${group.name})`,
+    `# 猫猫云梯 · 智能多选组 AI 助手协同指南（${group.name}）`,
     "",
     "> 按站点粘性优选、受控均衡、安全 AST 自定义加权公式与三选一兜底策略协同规范。",
     "",
@@ -2344,21 +2344,11 @@ export function MultiGroupPage() {
 
   const handleCopyAgentGuide = async () => {
     if (!selectedGroup) return;
-    let md = buildMultiGroupAgentMarkdown(selectedGroup, currentTriggerMeta);
-    if (inTauri) {
-      try {
-        const exported = await catcloudApi.exportAgentDocs("multigroup", false);
-        if (exported && exported.trim()) {
-          md = exported;
-        }
-      } catch {
-        /* fallback to local markdown */
-      }
-    }
+    const md = buildMultiGroupAgentMarkdown(selectedGroup, currentTriggerMeta);
     const ok = await copyToClipboard(md);
     if (ok) {
       setCopiedGuide(true);
-      appActions.showToast("已复制 AI 助手协同指南（Markdown）", "ok");
+      appActions.showToast("已复制当前多选组的中文 AI 助手协同指南", "ok");
       if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
       copyTimerRef.current = window.setTimeout(() => {
         setCopiedGuide(false);
@@ -3408,7 +3398,7 @@ export function MultiGroupPage() {
                 {viewMode === "members" && selectedGroup.member_node_ids.length === 0
                   ? "当前多选组里还没有节点"
                   : enabledNodes.length === 0
-                    ? "节点库里还没有节点，请先去「节点与订阅」导入订阅"
+                    ? "节点库里还没有节点，请先去「节点与测速 → 订阅与导入」导入订阅"
                     : "没有找到符合当前筛选条件的节点"}
               </p>
               {viewMode === "members" &&

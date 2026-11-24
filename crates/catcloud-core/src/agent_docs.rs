@@ -1,6 +1,72 @@
 use crate::error::{CatError, CatResult};
 use serde::{Deserialize, Serialize};
 
+/// Built-in module ID for the beginner-friendly Chinese AI onboarding guide.
+pub const ONBOARDING_DOC_ID: &str = "onboarding";
+
+/// Pure-Chinese beginner AI mentor guide covering CatCloud's 5 core workflows
+/// and exact UI button/page paths, with zero internal jargon.
+const ZH_ONBOARDING_GUIDE: &str = r#"# 猫猫云梯（CatCloud）新手上手总纲（给 AI 导师的教学参考）
+
+> **给 AI 助手的教学规则（请务必遵守）：**
+> 1. 对面很可能是第一次使用网络代理工具的新手，请全程用**零门槛、亲切易懂的大白话**交流，不要抛源码、技术黑话或命令行指令（除非用户主动询问终端命令）。
+> 2. 请严格结合本消息下方附带的「用户当前实时状态快照」判断用户正处于哪一步，**每次只教当下最需要做的下一小步**，等用户操作完回复后，再带下一步，不要一次性倾倒长篇教程。
+> 3. 给用户指路时，请严格使用下文写明的**猫猫云梯真实中文界面名称与按钮路径**，不要凭空编造菜单名。
+
+---
+
+## 一、猫猫云梯 5 大核心玩法与界面准确路径
+
+### 1. 导入节点（页面：`节点与测速 → 订阅与导入`）
+没有节点时第一步先拿节点，界面顶部提供 3 种零门槛方式，任选其一即可：
+- **方式 A · 粘贴订阅链接（最推荐）**：把服务商给的 `http://` 或 `https://` 订阅链接（也支持常见一键导入链接）粘进输入框并点击导入。猫猫云梯会先尝试快速直连拉取；若直连受阻，会自动尝试通过本机已有代理回退拉取。
+- **方式 B · 粘贴配置文本 / 本地文件 / 只读扫描已有软件**：手里只有单条节点链接、配置文本或配置文件时，可直接粘贴导入；如果电脑里本来就装过常见开源代理软件，也可在迁移卡片点「自动扫描并导入」只读迁入，不会改动原软件的任何文件。
+- **方式 C · `1→2→3` 实时捕捉运行中的软件**：如果手头只有专用客户端、找不到订阅链接，点「从正在运行的软件抓节点」卡片里的「打开 1→2→3 实时捕捉向导」按三步操作：
+  1. **第 1 步选软件**：在列表中勾选正在运行的软件（如果它缩在右下角系统托盘里，勾选带「托盘运行中」标记的项，或点开一次它的窗口即可置顶）；
+  2. **第 2 步触发动作**：回到原软件里点一次「刷新/更新订阅」或「连接」，猫猫云梯会自动监听新生成的明文节点配置；
+  3. **第 3 步查看并导入**：抓到节点后点「结束捕捉并整理」查看结果并一键导入。若原软件对配置做了加密保护无法明文读取，软件会诚实提示，此时建议回服务商官网找标准订阅链接。
+
+### 2. 选路方式：`智能多选组` vs 单节点（页面：`智能多选组` / `总览`）
+导入节点后会自动建好「默认路线」，你可以按需求选两种方式：
+- **智能多选组（日常最推荐）**：
+  - 支持**跨多家服务商混池**，把不同来源的好节点装进同一个组里统一挑；
+  - 支持**低倍率优先 + 高倍率兜底**：平时自动用省流量的低倍率节点，低倍率全挂或卡顿时自动切去高倍率应急，恢复后再切回来；
+  - **平时粘性锁定（防 AI 封号/掉登录）**：只要当前节点健康流畅，就一直稳稳固定走这一条，不会像普通轮询那样动不动乱跳 IP，特别适合使用各类海外 AI 网页、AI 编程助手和需要稳定地区登录的网站。
+- **单节点模式**：想手动固定只走某一条指定地区的节点时，在`总览`或`节点与测速`直接切到单节点即可。
+
+### 3. 零干扰测速与节点体检（页面：`节点与测速`）
+测速在独立沙箱里完成，**测速过程不会打断你正在看的网页、视频或对话连接**：
+- **省流快测（推荐先跑）**：只花极少流量，一次性测出各节点真实延迟、是否被「谷歌送中」（IP 被误判到中国大陆导致搜索和 AI 受限）、以及主流 AI 服务的解锁状态；
+- **完整测速（按需跑）**：实测节点的真实上传和下载带宽，帮助`智能多选组`自动把又快又稳的线路排到前面。
+
+### 4. 国内提速（页面：`国内提速`）
+如果你在校园网或部分宽带环境下，遇到「下载很快、但上传被限速到 2～4 Mbps、给 AI 传图片或发大文件极慢、高端口经常断流」的情况，可以启用`国内提速`：
+- 通过纯 IP 443 端口加密中转突破国内宽带对非 443 端口的上传限速，并且原生 443 节点会自动跳过不绕路；
+- 既能加速猫猫云梯自己管理的节点，也支持开启**全局提速**，直接给电脑上其它正在运行的代理软件同步提速。如果日常上传本来就很快，这一页完全可以保持关闭。
+
+### 5. 日常开关、模式区别与省内存（页面：`总览`、`设置`）
+- **一键代理开关**：在`总览`点主开关即可开启或关闭上网加速；
+- **系统代理 vs 虚拟网卡（TUN 模式）区别**：
+  - **系统代理**：日常用浏览器（Chrome / Edge 等）和大多数桌面软件开它就够了，不需要管理员权限，最省心；
+  - **虚拟网卡（TUN 模式）**：当你发现终端命令行、开发工具、游戏或某些不走系统代理的桌面软件连不上外网时，再在`总览`打开「虚拟网卡（TUN 模式）」接管整机流量（Windows 首次开启会请求管理员权限）。
+- **悬浮小窗与托盘省内存**：
+  - 在`总览`顶部可以打开小巧的**悬浮小窗**，随时瞄一眼网速和当前线路；
+  - 平时设置好以后，直接点右上角关闭主窗口，猫猫云梯会缩进右下角**系统托盘**并释放界面窗口内存，代理照常稳定在后台跑；想调整时点托盘图标就能瞬间打开。
+
+---
+
+## 二、建议的 4 步极简引导节奏（供 AI 对照状态推进）
+1. **状态：0 个节点** → 先引导去 `节点与测速 → 订阅与导入`，问用户手头是「有订阅链接」「有配置文本/已有软件」还是「只有正在跑的专用软件」，只教对应那 1 种导入操作。
+2. **状态：已有节点，但代理未开启** → 引导回到 `总览`，先打开总开关与「系统代理」，再在「常用网站连通检测」卡片点「测一下」确认已经能正常访问海外网页。
+3. **状态：已连上，想挑更稳更快或用 AI 不掉线** → 引导去 `节点与测速` 先跑一次省流快测（挑延迟低、未送中、AI 解锁的节点），再在 `智能多选组` 里勾选心仪节点开启粘性优选。
+4. **状态：上传特别慢/传图卡顿，或终端/游戏不走代理** → 分别引导按需了解 `国内提速` 或在 `总览` 开启「虚拟网卡（TUN 模式）」。
+"#;
+
+/// Return the pure-Chinese beginner AI onboarding guide covering all 5 core CatCloud workflows.
+pub fn render_zh_onboarding_guide() -> &'static str {
+    ZH_ONBOARDING_GUIDE
+}
+
 /// Four-section dual-read (Human + AI Agent) guidance contract embedded in every core module.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentModuleDoc {
@@ -55,12 +121,38 @@ impl AgentModuleDoc {
     }
 }
 
-/// Return all 6 built-in four-section Agent-friendly module guides.
+/// Return all 7 built-in four-section Agent-friendly module guides (including beginner onboarding).
 pub fn list_agent_docs() -> Vec<AgentModuleDoc> {
     vec![
         AgentModuleDoc {
+            module_id: ONBOARDING_DOC_ID.to_string(),
+            title: "新手全中文上手总纲（给 AI 导师）".to_string(),
+            summary: "面向零基础新手与陌生 AI 助手的纯中文上手总纲，涵盖猫猫云梯 5 大核心玩法与准确中文界面路径，指导 AI 按当前进度每次只教下一小步。".to_string(),
+            when_to_use_and_signals: vec![
+                "首次安装或刚打开猫猫云梯，还不清楚如何导入节点、测速、选路线或开启代理开关时。".to_string(),
+                "准备把当前进度直接粘贴给任意陌生 AI 助手，请对方用大白话一步步带着上手操作时。".to_string(),
+                "需要快速核对猫猫云梯 5 大核心功能（导入/捕捉、智能多选组、节点测速、国内提速、总览开关）的准确中文页面入口时。".to_string(),
+            ],
+            external_prereqs_and_schema: vec![
+                "无需提前学习任何命令行或专业术语；只需准备订阅链接、节点配置文本，或电脑里已有的代理客户端即可开始。".to_string(),
+                "搭配软件自动生成的实时脱敏状态快照一起发给 AI，可让 AI 精准识别当前停在哪一步，避免答非所问。".to_string(),
+            ],
+            gui_and_cli_verification: vec![
+                "导入节点：打开「节点与测速 → 订阅与导入」，支持订阅链接、粘贴文本/本地扫描，以及 1→2→3 实时捕捉运行中的软件（含托盘/后台软件）。".to_string(),
+                "选路与测速：在「节点与测速」跑省流快测或完整测速；在「智能多选组」配置跨家混池、低倍率优先+高倍率兜底与平时粘性防 AI 封号。".to_string(),
+                "国内提速与开关：上传受限时在「国内提速」配置纯 IP 443 提速或全局提速；日常在「总览」切换代理开关、系统代理、虚拟网卡（TUN 模式）与悬浮小窗。".to_string(),
+                "设置与导出：在「设置」调整通用偏好、网络选项或导出完整中文新手总纲（CLI：`catcloud docs export onboarding`）。".to_string(),
+            ],
+            rollback_and_troubleshooting: vec![
+                "若导入订阅失败，先确认链接完整且未过期，软件已内置直连失败自动回退本机代理拉取。".to_string(),
+                "若浏览器正常但命令行/游戏连不上，在「总览」开启「虚拟网卡（TUN 模式）」即可接管整机流量；随时可一键关闭恢复直连。".to_string(),
+                "遇到异常可点击首页「复制排障诊断给 AI」，把脱敏运行状态与关键事件一并发给 AI 定位原因。".to_string(),
+            ],
+            contract_example: String::new(),
+        },
+        AgentModuleDoc {
             module_id: "preaccel".to_string(),
-            title: "Domestic Pre-Acceleration (国内预加速)".to_string(),
+            title: "Domestic Pre-Acceleration (国内提速)".to_string(),
             summary: "Front-end domestic TCP :443 pure-IP TLS relay chain (dialer-proxy) with active-standby failover, domestic 204 health probing, and campus portal detection.".to_string(),
             when_to_use_and_signals: vec![
                 "Single-stream upload on non-443 proxy ports is throttled around 2-4 Mbps while TCP :443 TLS sustains 50-250+ Mbps.".to_string(),
@@ -74,7 +166,7 @@ pub fn list_agent_docs() -> Vec<AgentModuleDoc> {
                 "Health probe URL MUST remain domestic (`http://connectivitycheck.platform.hicloud.com/generate_204` or `http://connect.rom.miui.com/generate_204`); overseas `gstatic` URLs are rejected.".to_string(),
             ],
             gui_and_cli_verification: vec![
-                "GUI: Open '国内预加速' -> Import `mmrelay/v1` -> Verify '自动跳过原生 443 节点' -> Run 443 vs non-443 benchmark.".to_string(),
+                "GUI: Open '国内提速' -> Import `mmrelay/v1` -> Verify '自动跳过原生 443 节点' -> Run 443 vs non-443 benchmark.".to_string(),
                 "CLI import: `catcloud preaccel add --file relay.mmrelay.json --json`".to_string(),
                 "CLI pool status: `catcloud preaccel pool --json`".to_string(),
                 "CLI end-to-end verification: `catcloud preaccel test --json` (checks domestic 204, anti-loop DIRECT rules, and active-standby failover).".to_string(),
@@ -150,7 +242,7 @@ pub fn list_agent_docs() -> Vec<AgentModuleDoc> {
         },
         AgentModuleDoc {
             module_id: "probes".to_string(),
-            title: "Zero-Interference Isolated Probe Registry (隔离探针引擎)".to_string(),
+            title: "Zero-Interference Isolated Probe Registry (节点与测速)".to_string(),
             summary: "Ephemeral isolated Mihomo probe core (`127.0.0.1` only, `redir-host`, `GOMEMLIMIT=32MiB`) with extensible URL, upload/download, 60s keep-alive, Google region truth, and unlock probes.".to_string(),
             when_to_use_and_signals: vec![
                 "Nodes appear 'pingable' yet stall on real AI requests, multi-image uploads, or 20-60s silent streams.".to_string(),
@@ -162,7 +254,7 @@ pub fn list_agent_docs() -> Vec<AgentModuleDoc> {
                 "Google cleanliness hard gate checks Google-side ground truth (`google.cn` redirect, YouTube GL, AI Studio availability); CF-vs-YT mismatch is logged as an advisory risk tag only.".to_string(),
             ],
             gui_and_cli_verification: vec![
-                "GUI: Open '隔离测速' -> Add custom probe (`latency|upload|download|keepalive|google_cn|unlock_regex|external_cmd`) -> Run 3-stage funnel.".to_string(),
+                "GUI: Open '节点与测速' -> Add custom probe (`latency|upload|download|keepalive|google_cn|unlock_regex|external_cmd`) -> Run 3-stage funnel.".to_string(),
                 "CLI run probes: `catcloud probe run --tier l1 --json`".to_string(),
                 "CLI register custom probe: `catcloud probe add --id custom_api --kind upload --url https://example.com/up --json`".to_string(),
             ],
@@ -183,19 +275,19 @@ pub fn list_agent_docs() -> Vec<AgentModuleDoc> {
         },
         AgentModuleDoc {
             module_id: "nodes_ingest".to_string(),
-            title: "Multi-Dimensional Nodes, Migration & Process Adapter (节点与对口)".to_string(),
-            summary: "Multi-provider subscription pool with 0-node/error protection, read-only local config migration, process inspection, and open `catcloud-adapter/v1` slots.".to_string(),
+            title: "Multi-Dimensional Nodes, Live Capture & Process Adapter (订阅与导入)".to_string(),
+            summary: "Multi-provider subscription pool with proxy-fallback refresh, 0-node/error protection, read-only local config migration, 1->2->3 live app capture, and open `catcloud-adapter/v1` slots.".to_string(),
             when_to_use_and_signals: vec![
-                "Consolidating nodes from multiple subscriptions or local open-source proxy clients into one filterable cross-provider pool.".to_string(),
+                "Consolidating nodes from multiple subscriptions, local open-source proxy clients, or running desktop proxy apps into one filterable cross-provider pool.".to_string(),
                 "Integrating dynamic-endpoint sources that rotate nodes via a user-supplied refresh script (`catcloud-adapter/v1`).".to_string(),
             ],
             external_prereqs_and_schema: vec![
-                "Supports Clash/Mihomo YAML (with YAML merge anchors, capped at 16 MiB) and Base64/plain URI lists.".to_string(),
+                "Supports Clash/Mihomo YAML (with YAML merge anchors, capped at 16 MiB), sing-box JSON (`outbounds`), and Base64/plain URI lists.".to_string(),
                 "External adapter scripts receive JSON on `stdin` and return `{\"schema\":\"catcloud-adapter/v1\",\"nodes\":[...],\"yaml\":\"...\"}` on `stdout` (subject to `>= 60s` anti-storm cooldown).".to_string(),
-                "Process attachment only inspects read-only CLI flags (`-d`, `-f`, `-ext-ctl`) and open standard controller endpoints; never alters third-party files.".to_string(),
+                "Process attachment and 1->2->3 live capture only inspect read-only CLI flags, plaintext config changes, and open loopback controller endpoints; never alter third-party files.".to_string(),
             ],
             gui_and_cli_verification: vec![
-                "GUI: Open '节点与订阅' -> Filter by provider / region / multiplier / protocol / 443-native / probe status -> Multi-select across providers into any multi-group.".to_string(),
+                "GUI: Open '节点与测速 → 订阅与导入' -> Import subscription URL, paste config text, scan local clients, or run 1->2->3 live capture -> Filter & multi-select across providers into any multi-group.".to_string(),
                 "CLI list nodes: `catcloud node list --region TW --max-multiplier 1.0 --json`".to_string(),
                 "CLI import / migrate / attach: `catcloud node import --file sub.yaml --json`, `catcloud node migrate --scan --json`, `catcloud node attach-process --list --json`.".to_string(),
             ],
@@ -230,7 +322,7 @@ pub fn list_agent_docs() -> Vec<AgentModuleDoc> {
                 "L3 changes (ports, TUN stack, kernel swap) restart only the core child process; toggling the main proxy switch off->on always forces a fresh disk reload.".to_string(),
             ],
             gui_and_cli_verification: vec![
-                "GUI: Open '设置与 CLI' -> Configure Proxy Guard, TUN stack, advanced DNS/Fallback-filter, GeoData 4-item refresh, or copy PowerShell/CMD/Bash env snippets.".to_string(),
+                "GUI: Open '设置' -> Configure Proxy Guard, TUN stack, advanced DNS/Fallback-filter, GeoData 4-item refresh, or copy PowerShell/CMD/Bash env snippets.".to_string(),
                 "CLI validate before apply: `catcloud config validate --json`".to_string(),
                 "CLI hot reload: `catcloud config reload --json`".to_string(),
                 "CLI shell env & sanitized diagnostics: `catcloud config export-env --shell powershell --json`, `catcloud config diag --json`.".to_string(),
@@ -285,7 +377,7 @@ pub fn get_agent_doc(module_id: &str) -> CatResult<AgentModuleDoc> {
     list_agent_docs()
         .into_iter()
         .find(|d| d.module_id == needle)
-        .ok_or_else(|| CatError::NotFound(format!("unknown agent doc module `{module_id}`")))
+        .ok_or_else(|| CatError::NotFound(format!("未找到指定的助手指南模块「{module_id}」")))
 }
 
 /// Export either one module or `"all"` modules as Markdown or JSON.
@@ -296,9 +388,20 @@ pub fn export_agent_docs(module_id: &str, as_json: bool) -> CatResult<String> {
         if as_json {
             Ok(serde_json::to_string_pretty(&all)?)
         } else {
-            let rendered: Vec<String> = all.iter().map(AgentModuleDoc::to_markdown).collect();
+            let rendered: Vec<String> = all
+                .iter()
+                .map(|doc| {
+                    if doc.module_id == ONBOARDING_DOC_ID {
+                        render_zh_onboarding_guide().to_string()
+                    } else {
+                        doc.to_markdown()
+                    }
+                })
+                .collect();
             Ok(rendered.join("\n---\n\n"))
         }
+    } else if needle == ONBOARDING_DOC_ID && !as_json {
+        Ok(render_zh_onboarding_guide().to_string())
     } else {
         let doc = get_agent_doc(&needle)?;
         if as_json {
@@ -314,9 +417,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_contains_all_six_core_modules_with_four_sections() {
+    fn registry_contains_all_seven_core_modules_with_four_sections_and_fresh_ui_names() {
         let docs = list_agent_docs();
-        assert_eq!(docs.len(), 6);
+        assert_eq!(docs.len(), 7);
+        assert!(docs.iter().any(|d| d.module_id == ONBOARDING_DOC_ID));
+
         for doc in &docs {
             assert!(!doc.when_to_use_and_signals.is_empty(), "{}", doc.module_id);
             assert!(!doc.external_prereqs_and_schema.is_empty(), "{}", doc.module_id);
@@ -327,18 +432,50 @@ mod tests {
             assert!(md.contains("## 2. External Prerequisites"));
             assert!(md.contains("## 3. GUI & Headless CLI"));
             assert!(md.contains("## 4. Rollback & Troubleshooting"));
+
+            // Ensure outdated Chinese UI page names never regress.
+            for outdated in ["国内预加速", "隔离测速", "节点与订阅", "设置与 CLI"] {
+                assert!(
+                    !md.contains(outdated),
+                    "module `{}` still contains outdated page name `{outdated}`",
+                    doc.module_id
+                );
+            }
         }
+    }
+
+    #[test]
+    fn zh_onboarding_guide_covers_five_core_workflows_and_exact_ui_paths() {
+        let guide = render_zh_onboarding_guide();
+        assert!(guide.contains("每次只教当下最需要做的下一小步"));
+        assert!(guide.contains("节点与测速 → 订阅与导入"));
+        assert!(guide.contains("1→2→3"));
+        assert!(guide.contains("智能多选组"));
+        assert!(guide.contains("节点与测速"));
+        assert!(guide.contains("国内提速"));
+        assert!(guide.contains("总览"));
+        assert!(guide.contains("虚拟网卡（TUN 模式）"));
+        assert!(guide.contains("悬浮小窗"));
+        assert!(guide.contains("系统托盘"));
+
+        for outdated in ["国内预加速", "隔离测速", "节点与订阅", "设置与 CLI"] {
+            assert!(!guide.contains(outdated), "onboarding guide contains outdated `{outdated}`");
+        }
+
+        let exported_md = export_agent_docs(ONBOARDING_DOC_ID, false).expect("export onboarding md");
+        assert_eq!(exported_md, guide);
     }
 
     #[test]
     fn export_single_and_all_in_json_and_markdown() {
         let json_all = export_agent_docs("all", true).expect("export all json");
         let parsed: Vec<AgentModuleDoc> = serde_json::from_str(&json_all).expect("parse json");
-        assert_eq!(parsed.len(), 6);
+        assert_eq!(parsed.len(), 7);
 
         let preaccel_md = export_agent_docs("preaccel", false).expect("export preaccel md");
         assert!(preaccel_md.contains("mmrelay/v1"));
         assert!(preaccel_md.contains("hicloud.com"));
+        assert!(preaccel_md.contains("国内提速"));
 
         assert!(export_agent_docs("nonexistent_module", false).is_err());
     }

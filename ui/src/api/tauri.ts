@@ -86,6 +86,13 @@ export type PreAccelInstallState =
   | "need_elevation"
   | "failed";
 
+export type PreAccelVerifyState =
+  | "idle"
+  | "probing"
+  | "verified"
+  | "degraded"
+  | "failed";
+
 export interface AcceleratedProcessStat {
   process_name: string;
   pid: number;
@@ -114,6 +121,13 @@ export interface GlobalPreAccelStatus {
   is_windivert_active?: boolean;
   install_state?: PreAccelInstallState;
   process_stats?: AcceleratedProcessStat[];
+  verify_state?: PreAccelVerifyState;
+  verify_latency_ms?: number | null;
+  verify_message?: string | null;
+  verify_checked_at_ms?: number | null;
+  detected_security_products?: string[];
+  security_guidance?: string | null;
+  bound_physical_interface?: string | null;
 }
 
 export const DEFAULT_GLOBAL_PREACCEL_STATUS: GlobalPreAccelStatus = {
@@ -133,6 +147,13 @@ export const DEFAULT_GLOBAL_PREACCEL_STATUS: GlobalPreAccelStatus = {
   is_windivert_active: false,
   install_state: "idle",
   process_stats: [],
+  verify_state: "idle",
+  verify_latency_ms: null,
+  verify_message: null,
+  verify_checked_at_ms: null,
+  detected_security_products: [],
+  security_guidance: null,
+  bound_physical_interface: null,
 };
 
 export interface UpdateConfig {
@@ -459,6 +480,8 @@ export interface CoreRuntimeInfo {
   global_preaccel_connections?: number;
   global_windivert_active?: boolean;
   preaccel_install_state?: string;
+  global_preaccel_verify_state?: PreAccelVerifyState;
+  global_preaccel_verify_ms?: number | null;
   node_health_hints?: Record<string, NodeHealthHintDto>;
   captive_portal_required: boolean;
   system_proxy_enabled: boolean;
@@ -789,6 +812,7 @@ export interface LiveCaptureEventItem {
 export interface LiveCaptureStatusDto {
   session_id: string;
   active: boolean;
+  timed_out?: boolean;
   step_app_ready: boolean;
   step_activity_seen: boolean;
   step_nodes_ready: boolean;
@@ -801,6 +825,8 @@ export interface LiveCaptureStatusDto {
   preview_nodes: ProxyNode[];
   unsupported_reason: string | null;
 }
+
+export type CaptureSessionStatus = LiveCaptureStatusDto;
 
 export interface LiveCaptureOutcomeDto {
   session_id: string;
@@ -940,21 +966,60 @@ const FRIENDLY_ERROR_RULES: ReadonlyArray<{ pattern: RegExp; message: string }> 
     message: "远端提前断开连接，请稍后重试",
   },
   {
-    pattern: /\b403\s+forbidden\b|status\s+code\s*403\b|http\s+403\b/i,
-    message: "目标服务器拒绝访问（403），链接可能已失效或受限",
-  },
-  {
-    pattern: /\b404\s+not\s+found\b|status\s+code\s*404\b|http\s+404\b/i,
-    message: "目标地址不存在（404），请检查链接是否填写正确",
-  },
-  {
-    pattern: /\b429\s+too\s+many\s+requests\b|status\s+code\s*429\b|http\s+429\b/i,
-    message: "请求过于频繁（429），请稍后再试",
+    pattern:
+      /<!doctype\s+html|<html\b|returned\s+html|html\s+(?:page|document|response)|webpage\s+instead\s+of/i,
+    message:
+      "订阅链接返回了网页内容而不是节点列表（可能链接已失效、需要登录或被防火墙拦截），请确认复制的是原始订阅链接",
   },
   {
     pattern:
-      /\b50[0234]\b.*(?:bad\s+gateway|service\s+unavailable|gateway\s+timeout|internal\s+server)|status\s+code\s*50[0234]\b/i,
-    message: "远端服务器暂时繁忙或不可用，请稍后重试",
+      /clash\s+yaml\s+document\s+does\s+not\s+contain\s+a\s+['"]?proxies['"]?\s+section|does\s+not\s+contain\s+a\s+['"]?proxies['"]?\s+section|missing\s+['"]?proxies['"]?\s+section/i,
+    message:
+      "订阅内容里没有找到节点列表（缺少 proxies 配置段），请确认这不是纯分流规则文件或失效链接",
+  },
+  {
+    pattern: /expected\s+yaml\s+mapping\s+at\s+top\s+level/i,
+    message:
+      "订阅返回的内容不是有效的节点配置格式（可能返回了网页提示或链接已过期），请检查订阅链接是否正确",
+  },
+  {
+    pattern:
+      /subscription\s+payload\s+is\s+empty|empty\s+subscription|no\s+valid\s+proxy\s+nodes/i,
+    message: "订阅返回的内容为空或未包含可用节点，已保留现有节点未覆盖",
+  },
+  {
+    pattern:
+      /invalid\s+subscription\s+url|unsupported\s+subscription\s+scheme|relative\s+url\s+without\s+a\s+base/i,
+    message: "订阅链接格式无效，请粘贴以 http:// 或 https:// 开头的完整订阅地址",
+  },
+  {
+    pattern:
+      /non-2xx\s+status\s*401\b|\b401\s+unauthorized\b|status\s+code\s*401\b|http\s+401\b/i,
+    message: "订阅或目标地址需要登录认证（401），链接可能已过期或缺少校验参数",
+  },
+  {
+    pattern:
+      /non-2xx\s+status\s*403\b|\b403\s+forbidden\b|status\s+code\s*403\b|http\s+403\b/i,
+    message: "目标服务器拒绝访问（403），订阅链接可能已失效、过期或受地区限制",
+  },
+  {
+    pattern:
+      /non-2xx\s+status\s*404\b|\b404\s+not\s+found\b|status\s+code\s*404\b|http\s+404\b/i,
+    message: "目标地址不存在（404），请检查订阅链接是否复制完整",
+  },
+  {
+    pattern:
+      /non-2xx\s+status\s*429\b|\b429\s+too\s+many\s+requests\b|status\s+code\s*429\b|http\s+429\b/i,
+    message: "请求过于频繁（429），请稍等片刻后再试",
+  },
+  {
+    pattern:
+      /non-2xx\s+status\s*50[0234]\b|\b50[0234]\b.*(?:bad\s+gateway|service\s+unavailable|gateway\s+timeout|internal\s+server)|status\s+code\s*50[0234]\b|http\s+50[0234]\b/i,
+    message: "远端服务器暂时繁忙或不可用（5xx），请稍后重试",
+  },
+  {
+    pattern: /non-2xx\s+status\s+\d+/i,
+    message: "订阅服务器返回异常状态，请确认链接有效或稍后重试",
   },
   {
     pattern:
@@ -1598,6 +1663,14 @@ const VALID_PREACCEL_INSTALL_STATES = new Set<PreAccelInstallState>([
   "failed",
 ]);
 
+const VALID_PREACCEL_VERIFY_STATES = new Set<PreAccelVerifyState>([
+  "idle",
+  "probing",
+  "verified",
+  "degraded",
+  "failed",
+]);
+
 function normalizeAcceleratedProcessStats(raw: unknown): AcceleratedProcessStat[] {
   if (!Array.isArray(raw)) return [];
   const safeNum = (v: unknown): number =>
@@ -1644,6 +1717,13 @@ function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
           ? "ready"
           : "need_elevation"
         : "idle";
+  const rawVerifyState =
+    typeof r.verify_state === "string"
+      ? (r.verify_state.trim().toLowerCase() as PreAccelVerifyState)
+      : "idle";
+  const verifyState: PreAccelVerifyState = VALID_PREACCEL_VERIFY_STATES.has(rawVerifyState)
+    ? rawVerifyState
+    : "idle";
   const safeNum = (v: unknown): number =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
   return {
@@ -1670,6 +1750,36 @@ function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
     is_windivert_active: isWindivertActive,
     install_state: installState,
     process_stats: normalizeAcceleratedProcessStats(r.process_stats),
+    verify_state: verifyState,
+    verify_latency_ms:
+      typeof r.verify_latency_ms === "number" &&
+      Number.isFinite(r.verify_latency_ms) &&
+      r.verify_latency_ms >= 0
+        ? r.verify_latency_ms
+        : null,
+    verify_message:
+      typeof r.verify_message === "string" && r.verify_message.trim()
+        ? r.verify_message.trim()
+        : null,
+    verify_checked_at_ms:
+      typeof r.verify_checked_at_ms === "number" &&
+      Number.isFinite(r.verify_checked_at_ms) &&
+      r.verify_checked_at_ms > 0
+        ? r.verify_checked_at_ms
+        : null,
+    detected_security_products: Array.isArray(r.detected_security_products)
+      ? r.detected_security_products
+          .filter((x): x is string => typeof x === "string" && x.trim().length > 0)
+          .map((x) => x.trim())
+      : [],
+    security_guidance:
+      typeof r.security_guidance === "string" && r.security_guidance.trim()
+        ? r.security_guidance.trim()
+        : null,
+    bound_physical_interface:
+      typeof r.bound_physical_interface === "string" && r.bound_physical_interface.trim()
+        ? r.bound_physical_interface.trim()
+        : null,
   };
 }
 
@@ -1690,6 +1800,14 @@ let mockGlobalPreAccel: GlobalPreAccelStatus = {
   is_windivert_active: false,
   install_state: detectNavigatorOs() === "windows" ? "ready" : "idle",
   process_stats: [],
+  verify_state: "idle",
+  verify_latency_ms: null,
+  verify_message: null,
+  verify_checked_at_ms: null,
+  detected_security_products:
+    detectNavigatorOs() === "windows" ? ["Windows 安全中心（Defender）"] : [],
+  security_guidance: null,
+  bound_physical_interface: detectNavigatorOs() === "windows" ? "WLAN" : null,
 };
 
 let mockRuntime: CoreRuntimeInfo = {
@@ -1719,6 +1837,8 @@ let mockRuntime: CoreRuntimeInfo = {
   global_preaccel_connections: 0,
   global_windivert_active: false,
   preaccel_install_state: detectNavigatorOs() === "windows" ? "ready" : "idle",
+  global_preaccel_verify_state: "idle",
+  global_preaccel_verify_ms: null,
   node_health_hints: {
     "node-jp-01": { latency_ms: 68, status: "healthy", cooldown_remaining_sec: 0 },
     "node-sg-02": { latency_ms: 82, status: "healthy", cooldown_remaining_sec: 0 },
@@ -1766,6 +1886,8 @@ function syncMockPreAccelRuntime(): void {
     global_preaccel_connections: mockGlobalPreAccel.active_connections,
     global_windivert_active: isWindivertActive,
     preaccel_install_state: mockGlobalPreAccel.install_state ?? "idle",
+    global_preaccel_verify_state: mockGlobalPreAccel.verify_state ?? "idle",
+    global_preaccel_verify_ms: mockGlobalPreAccel.verify_latency_ms ?? null,
     status: nextStatus,
   };
 }
@@ -1815,6 +1937,16 @@ function startMockGlobalPreAccel(): void {
           last_seen_ms: nowMs,
         }))
       : [],
+    verify_state: useWinDivert ? "verified" : "idle",
+    verify_latency_ms: useWinDivert ? 36 : null,
+    verify_message: useWinDivert
+      ? "演示模式：实测经由透明拦截与国内 443 中转连通正常（36 ms）"
+      : null,
+    verify_checked_at_ms: useWinDivert ? nowMs : null,
+    detected_security_products:
+      os === "windows" ? ["Windows 安全中心（Defender）"] : [],
+    security_guidance: null,
+    bound_physical_interface: os === "windows" ? "WLAN" : null,
   };
 }
 
@@ -1828,6 +1960,11 @@ function stopMockGlobalPreAccel(): void {
     last_error: null,
     is_windivert_active: false,
     process_stats: [],
+    verify_state: "idle",
+    verify_latency_ms: null,
+    verify_message: null,
+    verify_checked_at_ms: null,
+    security_guidance: null,
   };
 }
 
@@ -1874,6 +2011,76 @@ interface MockLiveCaptureState {
   watchDirs: string[];
   startedAtMs: number;
   supportsPlainNodes: boolean;
+}
+
+function normalizeLiveCaptureStatus(
+  raw: unknown,
+  fallbackSessionId = ""
+): LiveCaptureStatusDto {
+  const safeNum = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+  if (!raw || typeof raw !== "object") {
+    return {
+      session_id: fallbackSessionId,
+      active: false,
+      timed_out: false,
+      step_app_ready: false,
+      step_activity_seen: false,
+      step_nodes_ready: false,
+      elapsed_sec: 0,
+      captured_node_count: 0,
+      opaque_change_detected: false,
+      target_name: "目标软件",
+      watch_dirs: [],
+      events: [],
+      preview_nodes: [],
+      unsupported_reason: null,
+    };
+  }
+  const r = raw as Partial<LiveCaptureStatusDto>;
+  const active = Boolean(r.active);
+  const elapsedSec = safeNum(r.elapsed_sec);
+  const timedOut =
+    typeof r.timed_out === "boolean"
+      ? r.timed_out
+      : !active && elapsedSec >= 180;
+  const previewNodes = Array.isArray(r.preview_nodes) ? r.preview_nodes : [];
+  const rawEvents = Array.isArray(r.events) ? r.events : [];
+  const events: LiveCaptureEventItem[] = rawEvents
+    .filter((ev): ev is LiveCaptureEventItem => Boolean(ev && typeof ev === "object"))
+    .map((ev) => ({
+      timestamp_ms: safeNum(ev.timestamp_ms),
+      kind: typeof ev.kind === "string" ? ev.kind : "info",
+      message: typeof ev.message === "string" ? ev.message : "",
+    }))
+    .filter((ev) => ev.message.length > 0);
+  return {
+    session_id:
+      typeof r.session_id === "string" && r.session_id.trim()
+        ? r.session_id.trim()
+        : fallbackSessionId,
+    active,
+    timed_out: timedOut,
+    step_app_ready: Boolean(r.step_app_ready),
+    step_activity_seen: Boolean(r.step_activity_seen),
+    step_nodes_ready: Boolean(r.step_nodes_ready),
+    elapsed_sec: elapsedSec,
+    captured_node_count: Math.max(safeNum(r.captured_node_count), previewNodes.length),
+    opaque_change_detected: Boolean(r.opaque_change_detected),
+    target_name:
+      typeof r.target_name === "string" && r.target_name.trim()
+        ? r.target_name.trim()
+        : "目标软件",
+    watch_dirs: Array.isArray(r.watch_dirs)
+      ? r.watch_dirs.filter((d): d is string => typeof d === "string" && d.trim().length > 0)
+      : [],
+    events,
+    preview_nodes: previewNodes,
+    unsupported_reason:
+      typeof r.unsupported_reason === "string" && r.unsupported_reason.trim()
+        ? r.unsupported_reason.trim()
+        : null,
+  };
 }
 
 let mockLiveCapture: MockLiveCaptureState | null = null;
@@ -2800,6 +3007,33 @@ export const catcloudApi = {
     return true;
   },
 
+  async verifyGlobalPreAccel(): Promise<GlobalPreAccelStatus> {
+    if (isTauriEnv()) {
+      const raw = await tauriInvokeOrThrow<unknown>("verify_global_preaccel");
+      return normalizeGlobalPreAccelStatus(raw);
+    }
+    const nowMs = Date.now();
+    if (!mockGlobalPreAccel.running && mockConfig.preaccel.enabled) {
+      try {
+        startMockGlobalPreAccel();
+      } catch {
+        /* preserve current mock state when no enabled relay exists */
+      }
+    }
+    mockGlobalPreAccel = {
+      ...mockGlobalPreAccel,
+      verify_state: "verified",
+      verify_latency_ms: 36,
+      verify_message: "演示模式：实测经由透明拦截与国内 443 中转连通正常（36 ms）",
+      verify_checked_at_ms: nowMs,
+      detected_security_products: ["Windows 安全中心（Defender）"],
+      security_guidance: null,
+      bound_physical_interface: "WLAN",
+    };
+    syncMockPreAccelRuntime();
+    return structuredClone(mockGlobalPreAccel);
+  },
+
   async failoverPreAccel(): Promise<string | null> {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<string | null>("failover_preaccel");
@@ -3216,15 +3450,17 @@ export const catcloudApi = {
 
   async pollLiveCaptureSession(sessionId: string): Promise<LiveCaptureStatusDto> {
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<LiveCaptureStatusDto>("poll_live_capture_session", {
+      const raw = await tauriInvokeOrThrow<unknown>("poll_live_capture_session", {
         sessionId,
       });
+      return normalizeLiveCaptureStatus(raw, sessionId);
     }
     const session = mockLiveCapture;
     if (!session || session.sessionId !== sessionId) {
       return {
         session_id: sessionId,
         active: false,
+        timed_out: false,
         step_app_ready: false,
         step_activity_seen: false,
         step_nodes_ready: false,
@@ -3239,6 +3475,7 @@ export const catcloudApi = {
       };
     }
     const elapsedSec = Math.max(0, Math.floor((Date.now() - session.startedAtMs) / 1000));
+    const timedOut = elapsedSec >= 180;
     const activitySeen = elapsedSec >= 1;
     const nodesReady = session.supportsPlainNodes && elapsedSec >= 2;
     const opaqueDetected = !session.supportsPlainNodes && elapsedSec >= 2;
@@ -3272,9 +3509,17 @@ export const catcloudApi = {
         message: "检测到加密或私有格式配置变动，暂未读取到明文节点",
       });
     }
+    if (timedOut) {
+      events.push({
+        timestamp_ms: session.startedAtMs + 180_000,
+        kind: "warn",
+        message: "已达 3 分钟捕捉上限，已自动暂停监控；若已抓到内容可直接点击整理查看结果",
+      });
+    }
     return {
       session_id: session.sessionId,
-      active: true,
+      active: !timedOut,
+      timed_out: timedOut,
       step_app_ready: true,
       step_activity_seen: activitySeen,
       step_nodes_ready: nodesReady,
@@ -3369,6 +3614,71 @@ export const catcloudApi = {
         ? normalized
         : "bash";
     return buildShellEnvFallback(kind, mockConfig.mixed_port);
+  },
+
+  async buildAiOnboardingPrompt(): Promise<string> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<string>("build_ai_onboarding_prompt");
+    }
+    const modeLabel =
+      mockRuntime.proxy_mode === "rule"
+        ? "规则模式（国内直连、海外走代理）"
+        : mockRuntime.proxy_mode === "global"
+          ? "全局模式（全部走代理）"
+          : "直连模式（不走代理）";
+    const routeSummary =
+      mockRuntime.route_mode === "single"
+        ? `单节点模式 → ${mockRuntime.active_node_name || "未选择"}`
+        : `智能多选组（${mockRuntime.active_group_name || "未启用"}）→ 当前出口：${mockRuntime.active_node_name || "待选择"}`;
+    const proxyOn =
+      mockRuntime.running && (mockRuntime.system_proxy_enabled || mockRuntime.tun_enabled);
+    const preaccelSummary = mockGlobalPreAccel.is_windivert_active
+      ? `已开启（猫猫代理与其它代理软件均在提速中，绑定网卡：${mockGlobalPreAccel.bound_physical_interface ?? "自动"}）`
+      : mockRuntime.preaccel_active
+        ? `已开启（当前主力中转：${mockRuntime.preaccel_relay_name ?? "已启用中转"}）`
+        : "未开启";
+
+    return [
+      "# 你好，请做我的「猫猫云梯（CatCloud）」一对一新手向导",
+      "",
+      "## 给 AI 的引导要求（请务必遵守）",
+      "- 我可能是第一次接触代理软件的新手，**不要甩源码、代码术语或命令行黑话**，请全程用通俗大白话解释。",
+      "- 请严格结合最下方「我当前的真实进度快照」，先判断我现在卡在哪一步，**每次只教我当下最需要做的下一小步**（最多 2～3 个清晰动作），等我做完反馈你再继续下一步。",
+      "- 指路时请直接使用下方列出的**猫猫云梯界面准确中文菜单与按钮名称**，方便我一眼找到。",
+      "- 以下信息均已自动隐私脱敏，不包含真实订阅链接、密码或公网 IP。",
+      "",
+      "## 猫猫云梯 5 大核心玩法与界面准确路径",
+      "1. **导入节点（第一步，没有节点时先做这个）**",
+      "   - 路径：左侧菜单「**节点与测速**」→ 顶部切到「**订阅与导入**」标签页。",
+      "   - 方式 1「**粘贴订阅链接**」：贴入 `https://` 订阅链接或 `clash://install-config?url=...` 一键订阅链接，点「**一键导入**」；若贴的是单节点链接（如 `vless://`、`vmess://`、`trojan://` 等），点提示里的「**转到「粘贴配置文本」导入**」。",
+      "   - 方式 2「**从电脑已有梯子导入**」：点「**自动扫描并导入**」，只读复制电脑上已有 Clash Verge / FlClash / v2rayN 的配置，或切到「**粘贴配置文本 / 节点链接**」直接粘贴，绝不改动原软件。",
+      "   - 方式 3「**从正在运行的软件抓节点**」：点「**打开 1→2→3 实时捕捉向导**」，选定正在运行（含缩在系统托盘）的专用软件，切去点一次「更新订阅」或「连接」，就能自动抢读可用节点。",
+      "2. **节点测速与 AI 解锁体检**",
+      "   - 路径：左侧菜单「**节点与测速**」→「**节点与测速**」主表。",
+      "   - 特点：所有测速都在独立隔离通道运行，不影响正在打开的网页。支持省流快测延迟、测「延迟 + 谷歌防送中 + ChatGPT / Claude / Gemini / Windsurf 解锁」，或完整测上下行网速。",
+      "   - 单节点直用：看中哪条节点直接点行尾「**用它**」固定使用。",
+      "3. **智能多选组（混池省流量 + 稳连防 AI 封号）**",
+      "   - 路径：左侧菜单「**智能多选组**」。",
+      "   - 玩法：把多家订阅的低倍率日常节点放进同一个池子，默认「粘性最优」锁住最快且谷歌不送中的节点（避免 AI 工具因频繁换 IP 触发风控）；异常时自动秒切，主池全掉线时可临时借用高倍率备用组并自动回切。",
+      "4. **国内提速（破宽带上传限速 + 加速其它代理软件）**",
+      "   - 路径：左侧菜单「**国内提速**」（或在「**总览**」直接点「**国内提速**」开关）。",
+      "   - 玩法：导入国内 443 纯 IP 中转后，自动加速非 443 海外节点的上传速度并跳过已是高速通道的原生 443 节点；开启后不仅加速猫猫云梯本身，Windows 下还能自动加速电脑上正在运行的其它代理软件。",
+      "5. **总览日常开关、虚拟网卡与省内存**",
+      "   - 路径：左侧菜单「**总览**」。",
+      "   - 开关：点左上角大按钮「**点击开启代理**」即可上网；日常选「**规则**」模式（国内直连、海外走代理）。",
+      "   - 接管方式：「**系统代理**」覆盖浏览器和大多数常见软件；「**虚拟网卡**」可接管终端、游戏与不走系统代理的桌面软件（首次开启按提示授权即可）。",
+      "   - 轻量常驻：顶部操作区提供「**悬浮小窗**」和「**托盘省内存**」（关闭主界面仅留右下角托盘图标，大幅降内存）。",
+      "",
+      "## 我当前的实时进度快照（浏览器演示预览）",
+      `- 版本与系统：猫猫云梯 v${mockRuntime.app_version}（${mockRuntime.os_label}）`,
+      `- 节点与测速：已导入 **${mockNodes.length}** 个节点，来自 **${mockSubscriptions.length}** 个订阅来源，已有 **${mockGroups.length}** 个智能多选组`,
+      `- 代理总开关：**${proxyOn ? "已开启" : "未开启"}**（核心：${mockRuntime.running ? "运行中" : "未启动"} | 模式：${modeLabel}）`,
+      `- 接管状态：系统代理 ${mockRuntime.system_proxy_enabled ? "已开启" : "未开启"} ｜ 虚拟网卡 ${mockRuntime.tun_enabled ? "已开启" : "未开启"}`,
+      `- 当前路线：${routeSummary}`,
+      `- 国内提速：${preaccelSummary}`,
+      "",
+      "请根据我上面的进度，用温和清晰的语言告诉我：**我现在最应该先点哪里、下一步做什么？**",
+    ].join("\n");
   },
 
   async exportSanitizedDiagnostics(): Promise<SanitizedDiagnosticsDto> {

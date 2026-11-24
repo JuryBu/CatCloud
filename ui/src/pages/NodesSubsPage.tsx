@@ -1,6 +1,7 @@
 import {
   AlertTriangle,
   ArrowLeft,
+  ArrowRight,
   ArrowUpDown,
   Check,
   CheckCircle2,
@@ -36,6 +37,7 @@ import { createPortal } from "react-dom";
 import {
   type DesktopAppCandidate,
   type LiveCaptureOutcomeDto,
+  type LiveCaptureStatusDto,
   type MigrationPreviewDto,
   type MultiGroup,
   type PreAccelOverrideMode,
@@ -339,6 +341,122 @@ function inferSubNameFromUrl(rawUrl: string): string {
     /* use fallback */
   }
   return "我的订阅";
+}
+
+const SINGLE_NODE_URI_RE =
+  /^(?:vless|vmess|trojan|ss|ssr|hysteria2|hy2|tuic|anytls):\/\//i;
+
+function isSingleNodeShareUri(raw: string): boolean {
+  const firstLine = raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0 && !line.startsWith("#"));
+  if (!firstLine) return false;
+  return SINGLE_NODE_URI_RE.test(firstLine);
+}
+
+function containsSingleNodeShareUriLine(raw: string): boolean {
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .some((line) => line.length > 0 && !line.startsWith("#") && SINGLE_NODE_URI_RE.test(line));
+}
+
+function normalizeSubSourceForCompare(kind: "url" | "file", raw: string): string {
+  const trimmed = raw.trim();
+  if (kind !== "url") return trimmed;
+  return trimmed.replace(/^(https?:\/\/[^/?#]+)/i, (prefix) => prefix.toLowerCase());
+}
+
+function parseClashInstallConfigUrl(
+  raw: string
+): { url: string; name?: string } | null {
+  const trimmed = raw.trim();
+  if (!/^(?:clash|clashmeta):\/\/install-config\b/i.test(trimmed)) {
+    return null;
+  }
+  const queryIdx = trimmed.indexOf("?");
+  if (queryIdx < 0) {
+    return null;
+  }
+  const query = trimmed.slice(queryIdx + 1);
+  const urlParamMatch = /(?:^|&)url=/i.exec(query);
+  if (!urlParamMatch) {
+    return null;
+  }
+
+  const beforeUrl = query.slice(0, urlParamMatch.index);
+  const afterUrl = query.slice(urlParamMatch.index + urlParamMatch[0].length);
+  let targetUrl = "";
+  let rawName = "";
+
+  if (/^https?:\/\//i.test(afterUrl)) {
+    // Plaintext nested URL: capture everything up to outer &name= (or end of string) so nested &flag=clash params are preserved
+    const nameMatch = /&name=([^&]*)/i.exec(afterUrl);
+    if (nameMatch && nameMatch.index !== undefined) {
+      targetUrl = afterUrl.slice(0, nameMatch.index).trim();
+      rawName = nameMatch[1]?.trim() ?? "";
+    } else {
+      targetUrl = afterUrl.trim();
+    }
+    if (!rawName && beforeUrl) {
+      try {
+        rawName = new URLSearchParams(beforeUrl).get("name")?.trim() ?? "";
+      } catch {
+        /* ignore malformed leading query */
+      }
+    }
+  } else {
+    // Percent-encoded nested URL (single or double encoded)
+    const nextAmpIdx = afterUrl.indexOf("&");
+    targetUrl = (nextAmpIdx >= 0 ? afterUrl.slice(0, nextAmpIdx) : afterUrl).trim();
+    for (let i = 0; i < 2; i += 1) {
+      if (/^https?:\/\//i.test(targetUrl)) break;
+      if (!/%[0-9a-f]{2}/i.test(targetUrl)) break;
+      try {
+        const decoded = decodeURIComponent(targetUrl).trim();
+        if (decoded === targetUrl) break;
+        targetUrl = decoded;
+      } catch {
+        break;
+      }
+    }
+    try {
+      const parsed = new URL(trimmed);
+      rawName = parsed.searchParams.get("name")?.trim() ?? "";
+    } catch {
+      const nameMatch = /(?:^|&)name=([^&]*)/i.exec(query);
+      rawName = nameMatch?.[1]?.trim() ?? "";
+    }
+  }
+
+  if (!targetUrl || !/^https?:\/\//i.test(targetUrl)) {
+    return null;
+  }
+
+  let decodedName = rawName;
+  if (rawName) {
+    try {
+      decodedName = decodeURIComponent(rawName).trim();
+    } catch {
+      decodedName = rawName;
+    }
+  }
+  return {
+    url: targetUrl,
+    name: decodedName || undefined,
+  };
+}
+
+function hasPausedCaptureSession(cap: {
+  active: boolean;
+  timedOut?: boolean;
+  sessionId: string | null;
+  status: LiveCaptureStatusDto | null;
+}): boolean {
+  const hasSessionRef = Boolean(cap.sessionId || cap.status?.session_id);
+  if (!hasSessionRef || cap.active) return false;
+  return Boolean(cap.timedOut || (cap.status && !cap.status.active));
 }
 
 function migrationClientLabel(kind: string): string {
@@ -699,7 +817,7 @@ function parsePastedConfigPreview(rawInput: string): MigrationPreviewItem {
       .filter((l) => Boolean(l) && !l.startsWith("#"));
     for (const line of uriLines) {
       const protoMatch =
-        /^(vless|vmess|trojan|ss|hy2|hysteria2|tuic|anytls):\/\//i.exec(line);
+        /^(vless|vmess|trojan|ssr|ss|hy2|hysteria2|tuic|anytls):\/\//i.exec(line);
       if (!protoMatch) continue;
       const rawProto = protoMatch[1].toLowerCase();
       const protocol = rawProto === "hy2" ? "hysteria2" : rawProto;
@@ -817,6 +935,8 @@ function isAiUnlocked(probe: ProbeSnapshot | undefined): boolean {
 
 interface MigrationDrawerProps {
   open: boolean;
+  initialTab?: "scan" | "paste";
+  initialPasteText?: string | null;
   onClose: () => void;
   onImport: (
     preview: MigrationPreviewItem,
@@ -825,7 +945,13 @@ interface MigrationDrawerProps {
   ) => Promise<boolean>;
 }
 
-function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
+function MigrationDrawer({
+  open,
+  initialTab = "scan",
+  initialPasteText = null,
+  onClose,
+  onImport,
+}: MigrationDrawerProps) {
   const [tab, setTab] = useState<"scan" | "paste">("scan");
   const [scanningKind, setScanningKind] = useState<
     "all" | "clash_verge" | "flclash" | "v2rayn" | "custom_dir" | "custom_file" | null
@@ -1020,6 +1146,58 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
     []
   );
 
+  const parsePasteContent = useCallback(
+    async (rawText: string, preferredName = "") => {
+      const trimmed = rawText.trim();
+      if (!trimmed) {
+        appActions.showToast("请先粘贴配置文件内容或节点链接", "warn");
+        return;
+      }
+      try {
+        let parsed: MigrationPreviewItem;
+        if (isTauriEnv()) {
+          const res = await catcloudApi.previewMigrationFromText(
+            preferredName.trim() || "粘贴导入的节点",
+            trimmed
+          );
+          parsed = {
+            id: `mig-clip-${Date.now()}`,
+            source_kind: "clipboard_text",
+            client_label: res.name || "粘贴的配置文本",
+            source_path: null,
+            nodes: Array.isArray(res.nodes) ? res.nodes : [],
+            prepend_rules: Array.isArray(res.prepend_rules) ? res.prepend_rules : [],
+            append_rules: Array.isArray(res.append_rules) ? res.append_rules : [],
+            warnings: Array.isArray(res.warnings) ? res.warnings : [],
+          };
+        } else {
+          parsed = parsePastedConfigPreview(trimmed);
+        }
+        setPastePreview(parsed);
+        setPasteSubName(
+          (prev) => prev.trim() || preferredName.trim() || parsed.client_label || "粘贴导入的节点"
+        );
+        const parsedRuleCount = parsed.prepend_rules.length + parsed.append_rules.length;
+        if (parsed.nodes.length > 0) {
+          appActions.showToast(
+            `解析成功：找到 ${parsed.nodes.length} 个可用节点`,
+            "ok"
+          );
+        } else if (parsedRuleCount > 0) {
+          appActions.showToast(
+            `仅识别到 ${parsedRuleCount} 条分流规则、无可用节点，无法直接作为节点订阅导入`,
+            "warn"
+          );
+        } else {
+          appActions.showToast("没有识别出可用节点，请检查粘贴的内容是否完整", "warn");
+        }
+      } catch (err) {
+        appActions.showToast(`解析失败：${formatErrorMessage(err)}`, "warn");
+      }
+    },
+    []
+  );
+
   useEffect(() => {
     if (!open) {
       openSessionRef.current = false;
@@ -1027,15 +1205,34 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
     }
     if (!openSessionRef.current) {
       openSessionRef.current = true;
-      setTab("scan");
-      void runScanClient("all", true);
+      if (initialTab === "paste") {
+        setTab("paste");
+        if (initialPasteText && initialPasteText.trim()) {
+          const seed = initialPasteText.trim();
+          setPasteText(seed);
+          setPastePreview(null);
+          setPasteSubName("");
+          void parsePasteContent(seed);
+        }
+      } else {
+        setTab("scan");
+        void runScanClient("all", true);
+      }
     }
     const onKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === "Escape" && !importing) onClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, importing, onClose, runScanClient]);
+  }, [
+    open,
+    importing,
+    onClose,
+    runScanClient,
+    initialTab,
+    initialPasteText,
+    parsePasteContent,
+  ]);
 
   if (!open) return null;
 
@@ -1056,49 +1253,7 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
 
   const handleParsePaste = async () => {
     if (importing) return;
-    if (!pasteText.trim()) {
-      appActions.showToast("请先粘贴配置文件内容或节点链接", "warn");
-      return;
-    }
-    try {
-      let parsed: MigrationPreviewItem;
-      if (isTauriEnv()) {
-        const res = await catcloudApi.previewMigrationFromText(
-          pasteSubName.trim() || "粘贴导入的节点",
-          pasteText
-        );
-        parsed = {
-          id: `mig-clip-${Date.now()}`,
-          source_kind: "clipboard_text",
-          client_label: res.name || "粘贴的配置文本",
-          source_path: null,
-          nodes: Array.isArray(res.nodes) ? res.nodes : [],
-          prepend_rules: Array.isArray(res.prepend_rules) ? res.prepend_rules : [],
-          append_rules: Array.isArray(res.append_rules) ? res.append_rules : [],
-          warnings: Array.isArray(res.warnings) ? res.warnings : [],
-        };
-      } else {
-        parsed = parsePastedConfigPreview(pasteText);
-      }
-      setPastePreview(parsed);
-      setPasteSubName((prev) => prev.trim() || parsed.client_label || "粘贴导入的节点");
-      const parsedRuleCount = parsed.prepend_rules.length + parsed.append_rules.length;
-      if (parsed.nodes.length > 0) {
-        appActions.showToast(
-          `解析成功：找到 ${parsed.nodes.length} 个可用节点`,
-          "ok"
-        );
-      } else if (parsedRuleCount > 0) {
-        appActions.showToast(
-          `仅识别到 ${parsedRuleCount} 条分流规则、无可用节点，无法直接作为节点订阅导入`,
-          "warn"
-        );
-      } else {
-        appActions.showToast("没有识别出可用节点，请检查粘贴的内容是否完整", "warn");
-      }
-    } catch (err) {
-      appActions.showToast(`解析失败：${formatErrorMessage(err)}`, "warn");
-    }
+    await parsePasteContent(pasteText, pasteSubName);
   };
 
   const handleConfirmImport = async () => {
@@ -1677,11 +1832,14 @@ function ProcessAttachDrawer({
   const captureStatus = bgCapture.status;
   const finishingCapture = bgCapture.finishing;
   const outcome = bgCapture.outcome;
+  const isCapturePaused = hasPausedCaptureSession(bgCapture);
 
   const [step, setStep] = useState<1 | 2 | 3>(() =>
     bgCapture.outcome
       ? 3
-      : (bgCapture.active && bgCapture.sessionId) || bgCapture.finishing
+      : (bgCapture.active && bgCapture.sessionId) ||
+          hasPausedCaptureSession(bgCapture) ||
+          bgCapture.finishing
         ? 2
         : 1
   );
@@ -1704,6 +1862,7 @@ function ProcessAttachDrawer({
   openRef.current = open;
   const baselinePidsRef = useRef<number[] | null>(null);
   const userPickedManuallyRef = useRef(false);
+  const fetchCandidatesInFlightRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1731,6 +1890,8 @@ function ProcessAttachDrawer({
 
   const fetchCandidates = useCallback(
     async (isInitialBaseline: boolean, showLoadingSpinner: boolean) => {
+      if (fetchCandidatesInFlightRef.current) return;
+      fetchCandidatesInFlightRef.current = true;
       if (showLoadingSpinner) {
         setLoadingApps(true);
       }
@@ -1770,6 +1931,7 @@ function ProcessAttachDrawer({
           );
         }
       } finally {
+        fetchCandidatesInFlightRef.current = false;
         if (showLoadingSpinner && mountedRef.current) {
           setLoadingApps(false);
         }
@@ -1778,7 +1940,7 @@ function ProcessAttachDrawer({
     [sortCandidates]
   );
 
-  // When opening the drawer, seamlessly resume Step 3 (ready outcome) or Step 2 (active/finishing session)
+  // When opening the drawer, seamlessly resume Step 3 (ready outcome) or Step 2 (active/paused/finishing session)
   useEffect(() => {
     if (!open) return;
     const latestCapture = appStore.getState().bgTasks.capture;
@@ -1794,7 +1956,11 @@ function ProcessAttachDrawer({
       setImportingOutcome(false);
       return;
     }
-    if ((latestCapture.active && latestCapture.sessionId) || latestCapture.finishing) {
+    if (
+      (latestCapture.active && latestCapture.sessionId) ||
+      hasPausedCaptureSession(latestCapture) ||
+      latestCapture.finishing
+    ) {
       setStep(2);
       setStartingCapture(false);
       return;
@@ -1821,16 +1987,12 @@ function ProcessAttachDrawer({
     setImportName((prev) => prev.trim() || `抓取 · ${label}`);
   }, [open, bgCapture.outcome, bgCapture.targetName]);
 
-  // Step 1: Silently detect newly launched desktop apps every 1.5s
+  // Step 1: Silently detect newly launched desktop apps every 1.5s (shares fetchCandidatesInFlightRef)
   useEffect(() => {
     if (!open || step !== 1) return;
-    let inFlight = false;
     const timer = window.setInterval(() => {
-      if (inFlight || !openRef.current) return;
-      inFlight = true;
-      void fetchCandidates(false, false).finally(() => {
-        inFlight = false;
-      });
+      if (!openRef.current || fetchCandidatesInFlightRef.current) return;
+      void fetchCandidates(false, false);
     }, 1500);
     return () => {
       window.clearInterval(timer);
@@ -1839,15 +2001,30 @@ function ProcessAttachDrawer({
 
   const safeClose = useCallback(() => {
     if (finishingCapture || importingOutcome) return;
-    if (appStore.getState().bgTasks.capture.active) {
+    const latestCapture = appStore.getState().bgTasks.capture;
+    if (latestCapture.outcome && !latestCapture.outcome.supported) {
+      appActions.clearLiveCaptureOutcome();
+    } else if (step === 3 && latestCapture.outcome?.supported) {
+      appActions.showToast(
+        "已暂存捕捉到的节点，随时可点击卡片继续确认导入",
+        "info",
+        3600
+      );
+    } else if (latestCapture.active) {
       appActions.showToast(
         "实时捕捉继续在后台运行，随时可点击向导按钮回来查看进度",
         "info",
         3600
       );
+    } else if (hasPausedCaptureSession(latestCapture)) {
+      appActions.showToast(
+        "已为你保留捕捉快照，随时可点击导入页的捕捉卡片回来整理查看",
+        "info",
+        3600
+      );
     }
     onClose();
-  }, [finishingCapture, importingOutcome, onClose]);
+  }, [finishingCapture, importingOutcome, onClose, step]);
 
   useEffect(() => {
     if (!open) return;
@@ -2041,7 +2218,9 @@ function ProcessAttachDrawer({
             title={
               step === 2 && bgCapture.active
                 ? "收起窗口（实时捕捉将继续在后台进行）"
-                : "关闭软件实时捕捉向导"
+                : step === 2 && isCapturePaused
+                  ? "收起窗口（已保留本次捕捉快照，可随时回来查看）"
+                  : "关闭软件实时捕捉向导"
             }
             className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
             aria-label="关闭软件实时捕捉向导"
@@ -2089,17 +2268,24 @@ function ProcessAttachDrawer({
         <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
           {step === 1 && (
             <div className="space-y-3.5">
-              {/* Auto-detect Tip Banner */}
-              <div className="flex items-start gap-2.5 rounded-xl border border-[var(--line)] bg-[var(--accent-soft)]/55 px-3.5 py-2.5 text-xs text-[var(--text-secondary)]">
-                <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
-                <div className="min-w-0 leading-relaxed">
-                  直接点选下方已打开的软件；如果还没启动，现在去打开它，猫猫每{" "}
-                  <span className="cc-mono font-semibold text-[var(--text)]">1.5 秒</span>{" "}
-                  自动发现新启动的软件并置顶标为
-                  <span className="mx-1 rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
-                    刚打开
-                  </span>
-                  。
+              {/* Auto-detect Tip Banner + Tray Hint */}
+              <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--accent-soft)]/55 px-3.5 py-2.5 text-xs text-[var(--text-secondary)]">
+                <div className="flex items-start gap-2.5">
+                  <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
+                  <div className="min-w-0 leading-relaxed">
+                    直接点选下方已打开的软件；如果还没启动，现在去打开它，猫猫每{" "}
+                    <span className="cc-mono font-semibold text-[var(--text)]">1.5 秒</span>{" "}
+                    自动发现新启动的软件并置顶标为
+                    <span className="mx-1 rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                      刚打开
+                    </span>
+                    。
+                  </div>
+                </div>
+                <div className="border-t border-[var(--line)]/60 pt-1.5 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                  没看到软件？若它缩在右下角系统托盘，请直接勾选带「
+                  <span className="font-medium text-[var(--text)]">托盘运行中</span>
+                  」标记的项，或点开一次它的窗口就会自动置顶。
                 </div>
               </div>
 
@@ -2155,13 +2341,30 @@ function ProcessAttachDrawer({
                 <div className="space-y-2">
                   {filteredCandidates.map((cand) => {
                     const active = selectedCandidate?.pid === cand.pid;
+                    const isTrayCandidate =
+                      /托盘|后台运行/.test(cand.friendly_name) ||
+                      /托盘|后台运行/.test(cand.window_title);
+                    const cleanedFriendlyName = cand.friendly_name
+                      .trim()
+                      .replace(
+                        /\s*[（(]\s*(?:托盘\/后台运行中|托盘运行中|后台运行中)\s*[)）]\s*$/u,
+                        ""
+                      )
+                      .trim();
+                    const cleanedWindowTitle = cand.window_title
+                      .trim()
+                      .replace(
+                        /\s*[（(]\s*(?:托盘\/后台运行中|托盘运行中|后台运行中)\s*[)）]\s*$/u,
+                        ""
+                      )
+                      .trim();
                     const primaryTitle =
-                      cand.friendly_name.trim() ||
-                      cand.window_title.trim() ||
+                      cleanedFriendlyName ||
+                      cleanedWindowTitle ||
                       cand.process_name;
                     const showWindowSubtitle =
-                      Boolean(cand.window_title.trim()) &&
-                      cand.window_title.trim() !== primaryTitle;
+                      Boolean(cleanedWindowTitle) &&
+                      cleanedWindowTitle !== primaryTitle;
 
                     return (
                       <button
@@ -2187,6 +2390,11 @@ function ProcessAttachDrawer({
                             {cand.is_newly_opened && (
                               <span className="shrink-0 rounded-full bg-[var(--green)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
                                 刚打开
+                              </span>
+                            )}
+                            {isTrayCandidate && (
+                              <span className="shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                                托盘运行中
                               </span>
                             )}
                             {cand.likely_proxy_client && (
@@ -2233,28 +2441,83 @@ function ProcessAttachDrawer({
 
           {step === 2 && (
             <div className="space-y-4">
-              {/* Plain-Language Action Guide */}
-              <div className="rounded-2xl border border-[var(--accent)]/50 bg-[var(--accent-soft)]/55 p-4">
-                <div className="flex items-start gap-3">
-                  <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] text-[var(--accent-ink)]">
-                    <RefreshCw className="h-4 w-4 animate-spin" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="text-xs font-semibold text-[var(--text)]">
-                        正在实时监控：{captureStatus?.target_name || "目标软件"}
-                      </span>
-                      <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--green)]">
-                        <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
-                        已监控 {captureStatus?.elapsed_sec ?? 0} 秒
-                      </span>
+              {/* Plain-Language Action Guide (Active Monitoring vs Auto-Paused Timeout Summary) */}
+              {isCapturePaused ? (
+                <div className="space-y-3 rounded-2xl border border-[var(--amber)]/55 bg-[var(--amber-soft)]/55 p-4">
+                  <div className="flex items-start gap-3">
+                    <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--amber)] text-[var(--accent-ink)]">
+                      <Clock className="h-4 w-4" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-semibold text-[var(--text)]">
+                          已达 3 分钟捕捉上限并自动暂停监控
+                        </span>
+                        <span className="inline-flex items-center gap-1 rounded-full bg-[var(--surface)]/85 px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--amber)]">
+                          已暂停 · 共监控 {captureStatus?.elapsed_sec ?? 180} 秒
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-xs leading-relaxed text-[var(--text-secondary)]">
+                        {(captureStatus?.captured_node_count ?? 0) > 0
+                          ? `目标软件「${captureStatus?.target_name || bgCapture.targetName || "目标软件"}」已抢读到的 ${captureStatus!.captured_node_count} 个节点已安全保留，点击下方即可整理并确认导入。`
+                          : `目标软件「${captureStatus?.target_name || bgCapture.targetName || "目标软件"}」的监控已自动暂停。你仍可点击查看最终捕捉状态，或重新开始捕捉。`}
+                      </p>
                     </div>
-                    <p className="mt-1.5 text-xs leading-relaxed text-[var(--text)]">
-                      请切到你选中的软件里点击「更新订阅」或「连接」，猫猫正在后台实时盯着新配置变动…
-                    </p>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 pl-11">
+                    <button
+                      type="button"
+                      disabled={finishingCapture}
+                      onClick={() => void handleFinishCapture()}
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                    >
+                      {finishingCapture ? (
+                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <CheckCircle2 className="h-3.5 w-3.5" />
+                      )}
+                      <span>
+                        {finishingCapture
+                          ? "正在整理…"
+                          : (captureStatus?.captured_node_count ?? 0) > 0
+                            ? `整理并查看已捕捉内容（${captureStatus!.captured_node_count}）`
+                            : "整理并查看已捕捉内容"}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={finishingCapture}
+                      onClick={() => void handleCancelCaptureToStep1()}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                    >
+                      <RotateCcw className="h-3.5 w-3.5" />
+                      <span>重新开始捕捉</span>
+                    </button>
                   </div>
                 </div>
-              </div>
+              ) : (
+                <div className="rounded-2xl border border-[var(--accent)]/50 bg-[var(--accent-soft)]/55 p-4">
+                  <div className="flex items-start gap-3">
+                    <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] text-[var(--accent-ink)]">
+                      <RefreshCw className="h-4 w-4 animate-spin" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-semibold text-[var(--text)]">
+                          正在实时监控：{captureStatus?.target_name || "目标软件"}
+                        </span>
+                        <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--green)]">
+                          <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                          已监控 {captureStatus?.elapsed_sec ?? 0} 秒
+                        </span>
+                      </div>
+                      <p className="mt-1.5 text-xs leading-relaxed text-[var(--text)]">
+                        请切到你选中的软件里点击「更新订阅」或「连接」，猫猫正在后台实时盯着新配置变动…
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Live Sub-Step Status Lamps */}
               <div className="grid grid-cols-3 gap-2">
@@ -2610,9 +2873,13 @@ function ProcessAttachDrawer({
           {step === 2 && (
             <>
               <span className="truncate text-[11px] text-[var(--muted)]">
-                {(captureStatus?.captured_node_count ?? 0) > 0
-                  ? `已抢读 ${captureStatus!.captured_node_count} 个节点，随时可结束整理`
-                  : "切到目标软件点击更新订阅或连接后，再点右侧结束"}
+                {isCapturePaused
+                  ? (captureStatus?.captured_node_count ?? 0) > 0
+                    ? `捕捉已暂停，已安全保留 ${captureStatus!.captured_node_count} 个节点`
+                    : "已达 3 分钟捕捉上限并自动暂停监控"
+                  : (captureStatus?.captured_node_count ?? 0) > 0
+                    ? `已抢读 ${captureStatus!.captured_node_count} 个节点，随时可结束整理`
+                    : "切到目标软件点击更新订阅或连接后，再点右侧结束"}
               </span>
               <div className="flex shrink-0 items-center gap-2">
                 <button
@@ -2621,7 +2888,7 @@ function ProcessAttachDrawer({
                   onClick={() => void handleCancelCaptureToStep1()}
                   className="rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
                 >
-                  取消捕捉
+                  {isCapturePaused ? "重新开始捕捉" : "取消捕捉"}
                 </button>
                 <button
                   type="button"
@@ -2635,14 +2902,20 @@ function ProcessAttachDrawer({
                 >
                   {finishingCapture ? (
                     <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  ) : isCapturePaused ? (
+                    <CheckCircle2 className="h-3.5 w-3.5" />
                   ) : (
                     <Square className="h-3 w-3 fill-current" />
                   )}
                   {finishingCapture
                     ? "正在整理…"
-                    : (captureStatus?.captured_node_count ?? 0) > 0
-                      ? `结束捕捉并整理（${captureStatus!.captured_node_count}）`
-                      : "结束捕捉并整理"}
+                    : isCapturePaused
+                      ? (captureStatus?.captured_node_count ?? 0) > 0
+                        ? `整理并查看已捕捉内容（${captureStatus!.captured_node_count}）`
+                        : "整理并查看已捕捉内容"
+                      : (captureStatus?.captured_node_count ?? 0) > 0
+                        ? `结束捕捉并整理（${captureStatus!.captured_node_count}）`
+                        : "结束捕捉并整理"}
                 </button>
               </div>
             </>
@@ -2745,18 +3018,91 @@ export function NodesSubsPage({
   const [showLocalFileForm, setShowLocalFileForm] = useState(false);
   const [newSubName, setNewSubName] = useState("");
   const [newSubSource, setNewSubSource] = useState("");
+  const [pastedMultilineNodes, setPastedMultilineNodes] = useState<string | null>(null);
   const subUrlInputRef = useRef<HTMLInputElement | null>(null);
   const [localFileName, setLocalFileName] = useState("");
   const [localFilePath, setLocalFilePath] = useState("");
-  const [newSubIntervalSec, setNewSubIntervalSec] = useState(21600);
+  const [importSuccessBanner, setImportSuccessBanner] = useState<{
+    count: number;
+    sourceName: string;
+    subId: string | null;
+  } | null>(null);
+  const [copyingAiOnboarding, setCopyingAiOnboarding] = useState(false);
+  const [copiedAiOnboarding, setCopiedAiOnboarding] = useState(false);
+  const aiGuideTimerRef = useRef<number | null>(null);
 
   // Drawers & Delete Confirmation
   const [migrationOpen, setMigrationOpen] = useState(false);
+  const [migrationInitialTab, setMigrationInitialTab] = useState<"scan" | "paste">("scan");
+  const [migrationInitialPaste, setMigrationInitialPaste] = useState<string | null>(null);
   const [processAttachOpen, setProcessAttachOpen] = useState(false);
   const [pendingDeleteSub, setPendingDeleteSub] = useState<SubscriptionRecord | null>(null);
   const [deletingSub, setDeletingSub] = useState(false);
-  const closeMigration = useCallback(() => setMigrationOpen(false), []);
+  const closeMigration = useCallback(() => {
+    setMigrationOpen(false);
+    setMigrationInitialTab("scan");
+    setMigrationInitialPaste(null);
+  }, []);
+  const openMigrationScan = useCallback(() => {
+    setMigrationInitialTab("scan");
+    setMigrationInitialPaste(null);
+    setMigrationOpen(true);
+  }, []);
+  const openMigrationWithPaste = useCallback((rawText: string) => {
+    setMigrationInitialTab("paste");
+    setMigrationInitialPaste(rawText.trim());
+    setMigrationOpen(true);
+    setNewSubSource("");
+    setPastedMultilineNodes(null);
+  }, []);
   const closeProcessAttach = useCallback(() => setProcessAttachOpen(false), []);
+
+  useEffect(() => {
+    return () => {
+      if (aiGuideTimerRef.current !== null) {
+        window.clearTimeout(aiGuideTimerRef.current);
+        aiGuideTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleCopyAiOnboarding = useCallback(async () => {
+    if (copyingAiOnboarding) return;
+    setCopyingAiOnboarding(true);
+    try {
+      const ok = await appActions.copyAiOnboardingForUser();
+      if (ok) {
+        setCopiedAiOnboarding(true);
+        if (aiGuideTimerRef.current !== null) {
+          window.clearTimeout(aiGuideTimerRef.current);
+        }
+        aiGuideTimerRef.current = window.setTimeout(() => {
+          setCopiedAiOnboarding(false);
+          aiGuideTimerRef.current = null;
+        }, 2200);
+      }
+    } finally {
+      setCopyingAiOnboarding(false);
+    }
+  }, [copyingAiOnboarding]);
+
+  const isSingleNodeUrlInput = useMemo(
+    () => Boolean(pastedMultilineNodes) || isSingleNodeShareUri(newSubSource),
+    [newSubSource, pastedMultilineNodes]
+  );
+  const pastedMultilineNodeCount = useMemo(() => {
+    if (!pastedMultilineNodes) return 0;
+    return pastedMultilineNodes
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith("#") && SINGLE_NODE_URI_RE.test(line))
+      .length;
+  }, [pastedMultilineNodes]);
+  const isCapturePaused =
+    !bgCapture.active &&
+    !bgCapture.finishing &&
+    !bgCapture.outcome &&
+    hasPausedCaptureSession(bgCapture);
 
   useEffect(() => {
     if (!pendingDeleteSub) return;
@@ -3086,14 +3432,18 @@ export function NodesSubsPage({
   const inTauri = isTauriEnv();
 
   const syncListsFromBackend = async () => {
-    const [latestSubs, latestNodes, latestGroups] = await Promise.all([
+    const [subsRes, nodesRes, groupsRes, rtRes, cfgRes] = await Promise.allSettled([
       catcloudApi.listSubscriptions(),
       catcloudApi.listNodes(),
       catcloudApi.listGroups(),
+      catcloudApi.getRuntimeInfo(),
+      catcloudApi.getConfig(),
     ]);
-    appActions.syncSubscriptions(latestSubs);
-    appActions.syncNodes(latestNodes);
-    appActions.syncGroups(latestGroups);
+    if (subsRes.status === "fulfilled") appActions.syncSubscriptions(subsRes.value);
+    if (nodesRes.status === "fulfilled") appActions.syncNodes(nodesRes.value);
+    if (groupsRes.status === "fulfilled") appActions.syncGroups(groupsRes.value);
+    if (rtRes.status === "fulfilled") appActions.syncRuntime(rtRes.value);
+    if (cfgRes.status === "fulfilled") appActions.syncConfig(cfgRes.value);
   };
 
   const refreshSingleSubscription = async (
@@ -3115,7 +3465,8 @@ export function NodesSubsPage({
     rawName: string
   ) => {
     if (importingSub) return;
-    const source = rawSource.trim();
+    let source = rawSource.trim();
+    let effectiveNameInput = rawName.trim();
     if (!source) {
       appActions.showToast(
         kind === "url"
@@ -3125,30 +3476,74 @@ export function NodesSubsPage({
       );
       return;
     }
-    if (kind === "url" && !/^https?:\/\//i.test(source)) {
-      appActions.showToast("订阅链接需要以 http:// 或 https:// 开头", "warn");
-      return;
+
+    if (kind === "url") {
+      const clashInstall = parseClashInstallConfigUrl(source);
+      if (clashInstall) {
+        source = clashInstall.url;
+        setNewSubSource(clashInstall.url);
+        if (!effectiveNameInput && clashInstall.name) {
+          effectiveNameInput = clashInstall.name;
+          setNewSubName(clashInstall.name);
+        }
+        appActions.showToast("已自动识别一键订阅链接并提取真实订阅地址", "info");
+      }
+
+      if (isSingleNodeShareUri(source)) {
+        appActions.showToast(
+          "检测到这是单节点分享链接，请点击输入框下方的「转到「粘贴配置文本」导入」",
+          "warn",
+          4500
+        );
+        return;
+      }
+
+      if (!/^https?:\/\//i.test(source)) {
+        appActions.showToast(
+          "订阅链接需要以 http:// 或 https:// 开头（也支持 clash://install-config?url=... 一键订阅链接）",
+          "warn"
+        );
+        return;
+      }
     }
+
+    const latestSubsSnapshot = appStore.getState().subscriptions;
+    const normalizedTargetSource = normalizeSubSourceForCompare(kind, source);
+    const existingSub =
+      latestSubsSnapshot.find(
+        (s) =>
+          s.kind === kind &&
+          normalizeSubSourceForCompare(kind, getSubSource(s)) === normalizedTargetSource
+      ) ?? null;
+
     const name =
-      rawName.trim() ||
+      effectiveNameInput ||
+      existingSub?.name ||
       (kind === "url"
         ? inferSubNameFromUrl(source)
         : source.split(/[\\/]/).pop()?.replace(/\.[^.]+$/, "") || "本地配置");
 
-    const subId = `sub-${kind}-${Date.now()}`;
-    const nextSub: SubscriptionRecord = {
-      id: subId,
-      name,
-      kind,
-      url_or_cmd: source,
-      refresh_interval_sec: newSubIntervalSec,
-      traffic_used_bytes: 0,
-      traffic_total_bytes: 0,
-      expires_at: null,
-      last_ok_at: null,
-      last_error: null,
-      enabled: true,
-    };
+    const subId = existingSub ? existingSub.id : `sub-${kind}-${Date.now()}`;
+    const nextSub: SubscriptionRecord = existingSub
+      ? {
+          ...existingSub,
+          name,
+          url_or_cmd: source,
+          enabled: true,
+        }
+      : {
+          id: subId,
+          name,
+          kind,
+          url_or_cmd: source,
+          refresh_interval_sec: 0,
+          traffic_used_bytes: 0,
+          traffic_total_bytes: 0,
+          expires_at: null,
+          last_ok_at: null,
+          last_error: null,
+          enabled: true,
+        };
 
     appActions.setSubsImporting(true);
     appActions.setMascotState("searching");
@@ -3156,31 +3551,103 @@ export function NodesSubsPage({
       if (inTauri) {
         try {
           const saved = await catcloudApi.upsertSubscription(nextSub);
+          const isNewlyCreatedEmptySub =
+            !existingSub &&
+            !saved.last_ok_at &&
+            !latestSubsSnapshot.some((s) => s.id === saved.id);
           let refreshNotice = "";
           let refreshWarn = false;
+          let importedNodeCount = 0;
+          let rollbackErrorDetail = "";
           try {
             const res = await catcloudApi.refreshSubscription(saved.id);
-            refreshNotice = `，已拉回 ${res.node_count} 个节点`;
+            importedNodeCount = res.node_count;
+            if (isNewlyCreatedEmptySub && importedNodeCount === 0) {
+              refreshWarn = true;
+              rollbackErrorDetail =
+                res.warnings.length > 0
+                  ? formatErrorMessage(res.warnings[0])
+                  : "未解析到任何可用节点";
+            } else {
+              refreshNotice = `，已拉回 ${res.node_count} 个节点`;
+            }
           } catch (refreshErr) {
             refreshWarn = true;
-            refreshNotice = `，拉取失败（${formatErrorMessage(refreshErr)}）`;
+            rollbackErrorDetail = formatErrorMessage(refreshErr);
+            refreshNotice = `，拉取失败（${rollbackErrorDetail}）`;
           }
+
+          if (refreshWarn && isNewlyCreatedEmptySub) {
+            try {
+              await catcloudApi.deleteSubscription(saved.id);
+            } catch {
+              /* ignore orphan cleanup failure */
+            }
+            await syncListsFromBackend();
+            appActions.showToast(
+              `导入「${name}」失败（${rollbackErrorDetail || "订阅拉取异常"}），请检查${kind === "url" ? "链接" : "路径"}后重试`,
+              "warn",
+              5000
+            );
+            return;
+          }
+
           await syncListsFromBackend();
-          if (kind === "url") {
-            setNewSubName("");
-            setNewSubSource("");
-          } else {
-            setLocalFileName("");
-            setLocalFilePath("");
-            setShowLocalFileForm(false);
+          if (!refreshWarn) {
+            if (kind === "url") {
+              setNewSubName("");
+              setNewSubSource("");
+              setPastedMultilineNodes(null);
+            } else {
+              setLocalFileName("");
+              setLocalFilePath("");
+              setShowLocalFileForm(false);
+            }
+            if (importedNodeCount > 0) {
+              setImportSuccessBanner({
+                count: importedNodeCount,
+                sourceName: name,
+                subId: saved.id,
+              });
+            }
           }
           appActions.showToast(
-            `已导入「${name}」${refreshNotice}`,
+            `${existingSub ? "已刷新已有订阅" : "已导入"}「${name}」${refreshNotice}`,
             refreshWarn ? "warn" : "ok"
           );
         } catch (err) {
           appActions.showToast(`导入订阅失败：${formatErrorMessage(err)}`, "warn");
         }
+        return;
+      }
+
+      const latestState = appStore.getState();
+      if (existingSub) {
+        const nowIso = new Date().toISOString();
+        const existingNodeCount = latestState.nodes.filter(
+          (n) => n.sub_id === existingSub.id
+        ).length;
+        appActions.syncSubscriptions(
+          latestState.subscriptions.map((item) =>
+            item.id === existingSub.id
+              ? { ...item, name, last_ok_at: nowIso, last_error: null }
+              : item
+          )
+        );
+        if (kind === "url") {
+          setNewSubName("");
+          setNewSubSource("");
+        } else {
+          setLocalFileName("");
+          setLocalFilePath("");
+          setShowLocalFileForm(false);
+        }
+        setImportSuccessBanner({
+          count: Math.max(1, existingNodeCount),
+          sourceName: name,
+          subId: existingSub.id,
+        });
+        appActions.showToast(`已复用并刷新已有订阅「${name}」（演示预览）`, "ok");
         return;
       }
 
@@ -3205,7 +3672,6 @@ export function NodesSubsPage({
         enabled: true,
       };
 
-      const latestState = appStore.getState();
       appActions.syncSubscriptions([...latestState.subscriptions, previewSub]);
       appActions.syncNodes([...latestState.nodes, seedNode]);
       if (kind === "url") {
@@ -3216,6 +3682,11 @@ export function NodesSubsPage({
         setLocalFilePath("");
         setShowLocalFileForm(false);
       }
+      setImportSuccessBanner({
+        count: 1,
+        sourceName: name,
+        subId,
+      });
       appActions.showToast(`已导入「${name}」（演示预览）`, "ok");
     } finally {
       appActions.setSubsImporting(false);
@@ -3310,6 +3781,13 @@ export function NodesSubsPage({
           ? await persistMigratedRules(preview.prepend_rules, preview.append_rules)
           : { savedCount: 0, error: null };
         await syncListsFromBackend();
+        if (count > 0) {
+          setImportSuccessBanner({
+            count,
+            sourceName: customName,
+            subId: null,
+          });
+        }
         if (ruleRes.error) {
           appActions.showToast(
             `已导入 ${count} 个节点，但分流规则保存失败：${ruleRes.error}`,
@@ -3356,6 +3834,11 @@ export function NodesSubsPage({
       ? await persistMigratedRules(preview.prepend_rules, preview.append_rules)
       : { savedCount: 0, error: null };
 
+    setImportSuccessBanner({
+      count: importedNodes.length,
+      sourceName: customName,
+      subId,
+    });
     appActions.showToast(
       `导入完成：已保存 ${importedNodes.length} 个节点${ruleRes.savedCount > 0 ? `、${ruleRes.savedCount} 条分流规则` : ""}（原软件未改动）`,
       "ok"
@@ -3389,6 +3872,13 @@ export function NodesSubsPage({
             capturedNodes
           );
           await syncListsFromBackend();
+          if (importedCount > 0) {
+            setImportSuccessBanner({
+              count: importedCount,
+              sourceName: cleanName,
+              subId: null,
+            });
+          }
           appActions.showToast(
             `已永久导入「${cleanName}」（共 ${importedCount} 个节点）`,
             "ok"
@@ -3404,7 +3894,7 @@ export function NodesSubsPage({
           name: cleanName,
           kind: subKind,
           url_or_cmd: outcome.source_path!.trim(),
-          refresh_interval_sec: 1800,
+          refresh_interval_sec: 0,
           traffic_used_bytes: 0,
           traffic_total_bytes: 0,
           expires_at: null,
@@ -3437,6 +3927,13 @@ export function NodesSubsPage({
         if (!usedFallbackSnapshot) {
           setFilterSubId(saved.id);
         }
+        if (importedCount > 0) {
+          setImportSuccessBanner({
+            count: importedCount,
+            sourceName: cleanName,
+            subId: usedFallbackSnapshot ? null : saved.id,
+          });
+        }
         appActions.showToast(
           `已导入「${cleanName}」（共 ${importedCount} 个节点）`,
           "ok"
@@ -3464,7 +3961,7 @@ export function NodesSubsPage({
       name: cleanName,
       kind: subKind,
       url_or_cmd: outcome.source_path?.trim() || "live-capture://snapshot",
-      refresh_interval_sec: useMigratedPersistence ? 0 : 1800,
+      refresh_interval_sec: 0,
       traffic_used_bytes: 0,
       traffic_total_bytes: 0,
       expires_at: null,
@@ -3475,6 +3972,11 @@ export function NodesSubsPage({
     appActions.syncSubscriptions([...subscriptions, previewSub]);
     appActions.syncNodes([...nodes, ...boundNodes]);
     setFilterSubId(subId);
+    setImportSuccessBanner({
+      count: boundNodes.length,
+      sourceName: cleanName,
+      subId,
+    });
     appActions.showToast(
       `已导入「${cleanName}」（共 ${boundNodes.length} 个节点）`,
       "ok"
@@ -3663,7 +4165,7 @@ export function NodesSubsPage({
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-base font-semibold tracking-tight text-[var(--text)]">
-                节点与订阅
+                节点与测速
               </h1>
               <span className="rounded-full bg-[var(--accent-soft)] px-2.5 py-0.5 cc-mono text-[11px] font-medium text-[var(--accent)]">
                 {subscriptions.length} 个订阅 · {nodes.length} 个节点 · {native443Count} 个直连 443
@@ -3737,6 +4239,94 @@ export function NodesSubsPage({
       </section>
       )}
 
+      {/* Persistent Post-Import Next-Step Guidance Banner */}
+      {importSuccessBanner && (
+        <section
+          aria-label="导入成功后续指引"
+          className="cc-card cc-glass flex flex-wrap items-center justify-between gap-2.5 rounded-2xl border-[var(--green)]/50 bg-[var(--green-soft)]/55 px-4 py-3"
+        >
+          <div className="flex min-w-0 flex-1 items-center gap-2.5 text-xs">
+            <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--green)]" />
+            <div className="min-w-0 leading-relaxed text-[var(--text)]">
+              已成功导入{" "}
+              <strong className="cc-mono font-semibold text-[var(--green)]">
+                {importSuccessBanner.count}
+              </strong>{" "}
+              个节点（{importSuccessBanner.sourceName}）并自动归入路线组！接下来建议：
+            </div>
+          </div>
+
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                if (onViewSubNodes) {
+                  onViewSubNodes(importSuccessBanner.subId);
+                } else {
+                  appActions.openNodesWorkspace("nodes", importSuccessBanner.subId);
+                }
+              }}
+              className="inline-flex items-center gap-1 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+            >
+              <span>去测速并挑最优节点</span>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => appActions.setNav("overview")}
+              className="inline-flex items-center gap-1 rounded-xl border border-[var(--green)]/50 bg-[var(--card)] px-3 py-1.5 text-xs font-semibold text-[var(--green)] transition-colors hover:bg-[var(--green)] hover:text-[var(--accent-ink)]"
+            >
+              <span>回总览一键开启代理</span>
+              <ArrowRight className="h-3.5 w-3.5" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setImportSuccessBanner(null)}
+              className="inline-flex h-7 w-7 items-center justify-center rounded-lg text-[var(--muted)] transition-colors hover:bg-[var(--card)] hover:text-[var(--text)]"
+              aria-label="关闭引导提示"
+              title="关闭提示"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </section>
+      )}
+
+      {/* Lightweight Beginner AI Onboarding Strip above the 3 Import Cards */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-[var(--accent)]/30 bg-[var(--accent-soft)]/40 px-3.5 py-2 text-xs">
+        <div className="flex min-w-0 items-center gap-2 text-[var(--text-secondary)]">
+          <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+          <span className="truncate">
+            第一次用不知道怎么找或导入节点？让 AI 看你当前画面一步步教你
+          </span>
+        </div>
+        <button
+          type="button"
+          disabled={copyingAiOnboarding}
+          onClick={() => void handleCopyAiOnboarding()}
+          className={`inline-flex shrink-0 items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-semibold transition-colors disabled:opacity-60 ${
+            copiedAiOnboarding
+              ? "bg-[var(--green-soft)] text-[var(--green)]"
+              : "bg-[var(--card)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
+          }`}
+        >
+          {copiedAiOnboarding ? (
+            <>
+              <Check className="h-3.5 w-3.5 shrink-0" />
+              <span>已复制，直接粘给任意 AI</span>
+            </>
+          ) : (
+            <span>
+              {copyingAiOnboarding
+                ? "正在生成指南…"
+                : "点我复制给 AI 一步步教你 →"}
+            </span>
+          )}
+        </button>
+      </div>
+
       {/* ====================================================================
        * 2. Beginner-Friendly 3-Card Quick Import Hub
        * ==================================================================== */}
@@ -3762,7 +4352,7 @@ export function NodesSubsPage({
                     </h2>
                   </div>
                   <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                    贴上机场给的订阅地址，点一下立刻拉回节点
+                    贴上机场给的订阅地址（支持一键订阅链接），点一下立刻拉回节点
                   </p>
                 </div>
               </div>
@@ -3784,15 +4374,68 @@ export function NodesSubsPage({
               ref={subUrlInputRef}
               type="text"
               value={newSubSource}
-              onChange={(e) => setNewSubSource(e.target.value)}
+              onPaste={(e) => {
+                const pasted = e.clipboardData?.getData("text/plain") ?? "";
+                if (/[\r\n]/.test(pasted) && containsSingleNodeShareUriLine(pasted)) {
+                  e.preventDefault();
+                  const lines = pasted
+                    .split(/\r?\n/)
+                    .map((line) => line.trim())
+                    .filter((line) => line.length > 0);
+                  const firstUriLine =
+                    lines.find(
+                      (line) => !line.startsWith("#") && SINGLE_NODE_URI_RE.test(line)
+                    ) ??
+                    lines[0] ??
+                    "";
+                  setPastedMultilineNodes(pasted);
+                  setNewSubSource(firstUriLine);
+                  return;
+                }
+                setPastedMultilineNodes(null);
+              }}
+              onChange={(e) => {
+                const rawVal = e.target.value;
+                setPastedMultilineNodes(null);
+                const clashInstall = parseClashInstallConfigUrl(rawVal);
+                if (clashInstall) {
+                  setNewSubSource(clashInstall.url);
+                  if (!newSubName.trim() && clashInstall.name) {
+                    setNewSubName(clashInstall.name);
+                  }
+                  appActions.showToast("已自动识别一键订阅链接并提取订阅地址", "info");
+                } else {
+                  setNewSubSource(rawVal);
+                }
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter") {
                   void submitSubscriptionSource("url", newSubSource, newSubName);
                 }
               }}
-              placeholder="粘贴 https:// 开头的订阅链接..."
+              placeholder="粘贴 https:// 订阅链接或 clash:// 一键订阅链接..."
               className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 cc-mono text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
             />
+
+            {isSingleNodeUrlInput && (
+              <div className="space-y-1.5 rounded-xl border border-[var(--amber)]/50 bg-[var(--amber-soft)]/60 px-3 py-2 text-[11px] text-[var(--amber)]">
+                <div className="leading-relaxed">
+                  {pastedMultilineNodes && pastedMultilineNodeCount > 1
+                    ? `检测到粘贴了 ${pastedMultilineNodeCount} 条单节点分享链接（已完整保留换行），可以直接用「粘贴配置文本」一次性导入：`
+                    : "检测到这是单个节点分享链接（而非订阅网址），可以直接用「粘贴配置文本」导入："}
+                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    openMigrationWithPaste(pastedMultilineNodes ?? newSubSource)
+                  }
+                  className="inline-flex items-center gap-1 rounded-lg bg-[var(--accent)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                >
+                  <span>转到「粘贴配置文本」导入</span>
+                  <ArrowRight className="h-3 w-3" />
+                </button>
+              </div>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
@@ -3843,13 +4486,13 @@ export function NodesSubsPage({
               </div>
             </div>
             <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-              自动找 Clash Verge / FlClash / v2rayN 等其他代理客户端已有配置，只读安全复制，不改你原来的软件。
+              自动找 Clash Verge / FlClash / v2rayN 等其他代理客户端已有配置，或直接粘贴配置文本 / 单节点链接，只读安全复制。
             </p>
           </div>
 
           <button
             type="button"
-            onClick={() => setMigrationOpen(true)}
+            onClick={openMigrationScan}
             className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--green)]/50 bg-[var(--green-soft)] px-4 py-2 text-xs font-semibold text-[var(--green)] transition-opacity hover:opacity-90"
           >
             <Search className="h-3.5 w-3.5" />
@@ -3862,7 +4505,9 @@ export function NodesSubsPage({
           className={`cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl p-4 ${
             bgCapture.active || bgCapture.finishing || bgCapture.outcome
               ? "border-[var(--green)]/60 ring-1 ring-[var(--green)]/25"
-              : ""
+              : isCapturePaused
+                ? "border-[var(--amber)]/60 ring-1 ring-[var(--amber)]/25"
+                : ""
           }`}
         >
           <div className="space-y-2">
@@ -3889,6 +4534,11 @@ export function NodesSubsPage({
                 <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
                   <CheckCircle2 className="h-2.5 w-2.5" />
                   待确认导入
+                </span>
+              ) : isCapturePaused ? (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
+                  <Clock className="h-2.5 w-2.5" />
+                  已暂停
                 </span>
               ) : bgCapture.active ? (
                 <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
@@ -3924,6 +4574,25 @@ export function NodesSubsPage({
                   "，点击下方查看结果详情。"
                 )}
               </p>
+            ) : isCapturePaused ? (
+              <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+                对{" "}
+                <strong className="font-semibold text-[var(--text)]">
+                  {bgCapture.status?.target_name || bgCapture.targetName || "目标软件"}
+                </strong>{" "}
+                的捕捉已达 3 分钟上限并自动暂停
+                {(bgCapture.status?.captured_node_count ?? 0) > 0 ? (
+                  <>
+                    ，已保留{" "}
+                    <strong className="cc-mono text-[var(--green)]">
+                      {bgCapture.status!.captured_node_count}
+                    </strong>{" "}
+                    个已抓到的节点，点击下方整理查看。
+                  </>
+                ) : (
+                  "，点击下方查看已捕捉内容或重新开始。"
+                )}
+              </p>
             ) : bgCapture.active ? (
               <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
                 正在后台实时监控{" "}
@@ -3949,13 +4618,17 @@ export function NodesSubsPage({
             className={`inline-flex w-full items-center justify-center gap-1.5 rounded-xl border px-4 py-2 text-xs font-semibold transition-opacity hover:opacity-90 ${
               bgCapture.active || bgCapture.finishing || bgCapture.outcome
                 ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
-                : "border-[var(--sky)]/50 bg-[var(--sky-soft)] text-[var(--sky)]"
+                : isCapturePaused
+                  ? "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)]"
+                  : "border-[var(--sky)]/50 bg-[var(--sky-soft)] text-[var(--sky)]"
             }`}
           >
             {bgCapture.active || bgCapture.finishing ? (
               <RefreshCw className="h-3.5 w-3.5 animate-spin" />
             ) : bgCapture.outcome ? (
               <CheckCircle2 className="h-3.5 w-3.5" />
+            ) : isCapturePaused ? (
+              <Clock className="h-3.5 w-3.5" />
             ) : (
               <Cpu className="h-3.5 w-3.5" />
             )}
@@ -3965,13 +4638,19 @@ export function NodesSubsPage({
                 ? bgCapture.outcome.supported && bgCapture.outcome.nodes.length > 0
                   ? `继续确认导入（已抓 ${bgCapture.outcome.nodes.length} 个节点）`
                   : "查看捕捉结果"
-                : bgCapture.active
-                  ? `继续查看实时捕捉进度${
+                : isCapturePaused
+                  ? `捕捉已暂停 · 点击查看已抓到的内容${
                       (bgCapture.status?.captured_node_count ?? 0) > 0
-                        ? `（已抓 ${bgCapture.status!.captured_node_count}）`
+                        ? `（${bgCapture.status!.captured_node_count}）`
                         : ""
                     }`
-                  : "打开 1→2→3 实时捕捉向导"}
+                  : bgCapture.active
+                    ? `继续查看实时捕捉进度${
+                        (bgCapture.status?.captured_node_count ?? 0) > 0
+                          ? `（已抓 ${bgCapture.status!.captured_node_count}）`
+                          : ""
+                      }`
+                    : "打开 1→2→3 实时捕捉向导"}
           </button>
         </div>
       </section>
@@ -3993,7 +4672,7 @@ export function NodesSubsPage({
           </div>
 
           <div className="grid grid-cols-1 gap-3 md:grid-cols-12">
-            <label className="text-[11px] text-[var(--muted)] md:col-span-3">
+            <label className="text-[11px] text-[var(--muted)] md:col-span-4">
               名称（可选）
               <input
                 type="text"
@@ -4004,7 +4683,7 @@ export function NodesSubsPage({
               />
             </label>
 
-            <label className="text-[11px] text-[var(--muted)] md:col-span-6">
+            <label className="text-[11px] text-[var(--muted)] md:col-span-8">
               本地配置文件路径
               <input
                 type="text"
@@ -4014,28 +4693,11 @@ export function NodesSubsPage({
                 className="mt-1 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 cc-mono text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
               />
             </label>
-
-            <div className="text-[11px] text-[var(--muted)] md:col-span-3">
-              <span className="block">自动刷新周期</span>
-              <AppSelect
-                aria-label="自动刷新周期"
-                size="sm"
-                value={String(newSubIntervalSec)}
-                onChange={(v) => setNewSubIntervalSec(Number(v))}
-                options={[
-                  { value: "21600", label: "每 6 小时" },
-                  { value: "43200", label: "每 12 小时" },
-                  { value: "86400", label: "每 24 小时" },
-                  { value: "0", label: "仅手动刷新" },
-                ]}
-                className="mt-1 w-full"
-              />
-            </div>
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5 text-[11px] text-[var(--muted)]">
             <span>
-              如果文件暂时读不到或内容为空，会自动保留原有节点不会丢失。
+              本地文件更新后可随时在下方订阅卡片点击「刷新」同步最新节点；若文件暂时读不到或内容为空，会自动保留原有节点不会丢失。
             </span>
             <button
               type="button"
@@ -4254,7 +4916,7 @@ export function NodesSubsPage({
                   {sub.last_error && (
                     <div className="flex items-start gap-1.5 rounded-lg bg-[var(--amber-soft)] px-2 py-1.5 text-[10px] leading-snug text-[var(--amber)]">
                       <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
-                      <span>{sub.last_error}</span>
+                      <span>{formatErrorMessage(sub.last_error)}</span>
                     </div>
                   )}
 
@@ -5068,6 +5730,8 @@ export function NodesSubsPage({
        * ==================================================================== */}
       <MigrationDrawer
         open={migrationOpen}
+        initialTab={migrationInitialTab}
+        initialPasteText={migrationInitialPaste}
         onClose={closeMigration}
         onImport={handleMigrationImport}
       />

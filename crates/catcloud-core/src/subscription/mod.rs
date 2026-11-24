@@ -18,11 +18,14 @@ pub use migrator::{
     preview_from_file, preview_from_text, scan_local_clients, scan_path_readonly,
 };
 pub use parser::{
-    DEFAULT_SUBSCRIPTION_USER_AGENT, FetchOptions, MAX_SUBSCRIPTION_BYTES, ParsedSubscription,
-    SubscriptionPayloadFormat, SubscriptionUserInfo, apply_parsed_subscription,
-    detect_is_443_native, detect_region_code, extract_auto_tags, extract_multiplier,
-    fetch_and_parse_subscription, fetch_and_parse_subscription_with_options, normalize_protocol,
-    parse_subscription_payload, parse_userinfo_header,
+    DEFAULT_SUBSCRIPTION_TIMEOUT, DEFAULT_SUBSCRIPTION_USER_AGENT, FetchOptions,
+    FetchedSubscription, MAX_SUBSCRIPTION_BYTES, ParsedSubscription, SubscriptionPayloadFormat,
+    SubscriptionUserInfo, apply_parsed_subscription, detect_is_443_native, detect_region_code,
+    extract_auto_tags, extract_multiplier, fetch_and_parse_subscription,
+    fetch_and_parse_subscription_with_fallback, fetch_and_parse_subscription_with_options,
+    fetch_subscription_url, fetch_subscription_url_with_fallback,
+    fetch_subscription_url_with_fallback_timeout, normalize_protocol, parse_subscription_payload,
+    parse_userinfo_header,
 };
 pub use process_attach::{
     AttachRecommendation, DEFAULT_CONTROLLER_PROBE_TIMEOUT, ProcessCandidate,

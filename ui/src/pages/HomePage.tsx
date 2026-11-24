@@ -334,6 +334,8 @@ export function HomePage() {
 
   const [copyingAiDiag, setCopyingAiDiag] = useState(false);
   const [copiedAiDiag, setCopiedAiDiag] = useState(false);
+  const [copyingAiOnboarding, setCopyingAiOnboarding] = useState(false);
+  const [copiedAiOnboarding, setCopiedAiOnboarding] = useState(false);
 
   const timerIdsRef = useRef<number[]>([]);
   const nodeDropdownRef = useRef<HTMLDivElement | null>(null);
@@ -587,6 +589,14 @@ export function HomePage() {
   const trafficStatusSentence = (() => {
     if (!isProxyEnabled) {
       if (preaccelSummary.realWinDivertActive) {
+        if (preaccelSummary.verifyState === "probing") {
+          return "未开启猫猫代理 · 正在自动探测全局提速链路…";
+        }
+        if (preaccelSummary.verifyState === "verified") {
+          return preaccelSummary.verifyLatencyMs
+            ? `未开启猫猫代理 · 全局提速已探测畅通（${preaccelSummary.verifyLatencyMs} ms）`
+            : "未开启猫猫代理 · 全局提速已探测畅通";
+        }
         return "未开启猫猫代理 · 全局国内提速运行中（正在加速其它代理软件）";
       }
       if (preaccelSummary.enabled) {
@@ -598,6 +608,12 @@ export function HomePage() {
         }
         if (preaccelSummary.installState === "need_elevation") {
           return "未开启代理 · 提速组件已就绪（需管理员权限以加速其它软件）";
+        }
+        if (preaccelSummary.verifyState === "probing") {
+          return "未开启猫猫代理 · 正在自动探测全局提速链路…";
+        }
+        if (preaccelSummary.verifyState === "degraded") {
+          return "未开启代理 · 底层拦截已自动保护回退（本地通道待命）";
         }
         return "未开启代理 · 国内提速本地通道待命";
       }
@@ -624,7 +640,11 @@ export function HomePage() {
   const preAccelPillLabel = (() => {
     if (!preaccelSummary.enabled) return "国内提速";
     if (!isProxyEnabled) {
-      if (preaccelSummary.realWinDivertActive) return "全局提速中";
+      if (preaccelSummary.realWinDivertActive) {
+        if (preaccelSummary.verifyState === "probing") return "探测中…";
+        if (preaccelSummary.verifyState === "verified") return "已探测畅通";
+        return "全局提速中";
+      }
       if (
         preaccelSummary.installState === "downloading" ||
         preaccelSummary.installState === "verifying"
@@ -632,6 +652,8 @@ export function HomePage() {
         return "准备组件…";
       }
       if (preaccelSummary.installState === "need_elevation") return "需管理员";
+      if (preaccelSummary.verifyState === "probing") return "探测中…";
+      if (preaccelSummary.verifyState === "degraded") return "已保护回退";
     }
     return "国内提速";
   })();
@@ -818,6 +840,20 @@ export function HomePage() {
     await appActions.runRefreshExitIp();
   };
 
+  const handleCopyAiOnboarding = async () => {
+    if (copyingAiOnboarding) return;
+    setCopyingAiOnboarding(true);
+    try {
+      const ok = await appActions.copyAiOnboardingForUser();
+      if (ok) {
+        setCopiedAiOnboarding(true);
+        scheduleTimeout(() => setCopiedAiOnboarding(false), 2200);
+      }
+    } finally {
+      setCopyingAiOnboarding(false);
+    }
+  };
+
   const handleCopyAiDiag = async () => {
     if (copyingAiDiag) return;
     setCopyingAiDiag(true);
@@ -837,9 +873,13 @@ export function HomePage() {
     : runtime.system_proxy_enabled
       ? "系统代理已接管"
       : preaccelSummary.realWinDivertActive
-        ? "全局提速运行中"
+        ? preaccelSummary.verifyState === "probing"
+          ? "探测链路中"
+          : "全局提速运行中"
         : preaccelSummary.enabled
-          ? "本地通道待命"
+          ? preaccelSummary.verifyState === "degraded"
+            ? "已保护回退"
+            : "本地通道待命"
           : "本地待命";
 
   const memSubLabel =
@@ -899,7 +939,7 @@ export function HomePage() {
       {/* Gentle two-step onboarding banner when no nodes have been imported yet */}
       {initialized && nodes.length === 0 && (
         <section className="cc-card cc-glass rounded-2xl border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 p-4">
-          <div className="flex flex-col gap-3.5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex flex-col gap-3.5 lg:flex-row lg:items-center lg:justify-between">
             <div className="space-y-2">
               <div className="flex items-center gap-2">
                 <Sparkles className="h-4 w-4 text-[var(--accent)]" />
@@ -919,16 +959,44 @@ export function HomePage() {
                   <span>打开下方代理总开关，即可轻松上网</span>
                 </div>
               </div>
+              <p className="text-[11px] text-[var(--muted)]">
+                不知道节点是什么？点一下直接粘给任意 AI，它会按你的当前画面手把手教你
+              </p>
             </div>
 
-            <button
-              type="button"
-              onClick={() => appActions.setNav("nodes")}
-              className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-            >
-              <span>去导入节点</span>
-              <ArrowRight className="h-3.5 w-3.5" />
-            </button>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => appActions.openNodesWorkspace("subs")}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+              >
+                <span>去导入节点</span>
+                <ArrowRight className="h-3.5 w-3.5" />
+              </button>
+
+              <button
+                type="button"
+                disabled={copyingAiOnboarding}
+                onClick={() => void handleCopyAiOnboarding()}
+                className={`inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl border px-3.5 py-2.5 text-xs font-semibold transition-colors disabled:opacity-60 ${
+                  copiedAiOnboarding
+                    ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
+                    : "border-[var(--accent)]/55 bg-[var(--card)] text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                }`}
+                title="一键复制新手上手指南与当前进度，粘给 ChatGPT / 豆包 / DeepSeek 即可手把手教学"
+              >
+                {copiedAiOnboarding ? (
+                  <>
+                    <Check className="h-3.5 w-3.5 shrink-0" />
+                    <span>已复制上手指南</span>
+                  </>
+                ) : (
+                  <span>
+                    {copyingAiOnboarding ? "正在生成…" : "🤖 复制发给 AI，一步步教我用"}
+                  </span>
+                )}
+              </button>
+            </div>
           </div>
         </section>
       )}
@@ -1125,7 +1193,11 @@ export function HomePage() {
                         }
                         title={`${preaccelSummary.detailText} · 点击前往国内提速页查看`}
                       >
-                        <Zap className="h-3 w-3" />
+                        {preaccelSummary.verifyState === "probing" ? (
+                          <RefreshCw className="h-3 w-3 animate-spin" />
+                        ) : (
+                          <Zap className="h-3 w-3" />
+                        )}
                         <span>
                           {preaccelSummary.badgeText}
                           {preaccelSummary.subBadgeText && preaccelSummary.proxyActive
@@ -1710,6 +1782,31 @@ export function HomePage() {
                 <Minimize2 className="h-3.5 w-3.5 text-[var(--green)]" />
                 <span>托盘省内存</span>
               </button>
+
+              <button
+                type="button"
+                disabled={copyingAiOnboarding}
+                onClick={() => void handleCopyAiOnboarding()}
+                className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors disabled:opacity-60 ${
+                  copiedAiOnboarding
+                    ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
+                    : "border-[var(--accent)]/40 bg-[var(--accent-soft)]/60 text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                }`}
+                title="复制新手上手指南与当前进度，直接粘贴给任意 AI 一步步教你用猫猫云梯"
+              >
+                {copiedAiOnboarding ? (
+                  <Check className="h-3.5 w-3.5 shrink-0" />
+                ) : (
+                  <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                )}
+                <span>
+                  {copiedAiOnboarding
+                    ? "已复制指南"
+                    : copyingAiOnboarding
+                      ? "生成中…"
+                      : "AI 带我用"}
+                </span>
+              </button>
             </div>
           </div>
         </div>
@@ -1947,7 +2044,7 @@ export function HomePage() {
         </div>
       </section>
 
-      {/* Compact Agent-Friendly Troubleshooting Strip */}
+      {/* Compact Agent-Friendly Onboarding & Troubleshooting Strip */}
       <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl border-[var(--accent)]/30 px-4 py-3">
         <div className="flex min-w-0 flex-1 items-center gap-2.5">
           <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
@@ -1955,13 +2052,15 @@ export function HomePage() {
           </span>
           <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-1.5">
-              <h2 className="text-xs font-semibold text-[var(--text)]">AI 助手排查</h2>
+              <h2 className="text-xs font-semibold text-[var(--text)]">
+                AI 新手指导与排障助手
+              </h2>
               <span className="rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
                 自动隐私脱敏
               </span>
             </div>
             <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-              连不上、变慢或想让 AI 帮你调分流规则？一键复制状态与脱敏日志直接发给 AI 助手
+              新手不知道怎么下手，或遇到连不上、变慢、想调分流规则？一键复制发给任意 AI 帮你解决
             </p>
           </div>
         </div>
@@ -1969,10 +2068,29 @@ export function HomePage() {
         <div className="flex shrink-0 flex-wrap items-center gap-1.5">
           <button
             type="button"
+            disabled={copyingAiOnboarding}
+            onClick={() => void handleCopyAiOnboarding()}
+            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+            title="一键复制小白上手指南与当前进度，直接粘贴给任意 AI 就能手把手带你操作"
+          >
+            {copiedAiOnboarding ? (
+              <>
+                <Check className="h-3.5 w-3.5 shrink-0" />
+                <span>已复制上手指南</span>
+              </>
+            ) : (
+              <span>
+                {copyingAiOnboarding ? "正在生成…" : "🤖 复制上手指南给 AI（推荐小白）"}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
             disabled={copyingAiDiag}
             onClick={() => void handleCopyAiDiag()}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-            title="一键复制脱敏后的运行状态、最近日志与只读 CLI 指引，直接粘贴给 AI 助手排查"
+            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--accent)]/45 bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--accent)] transition-opacity hover:opacity-90 disabled:opacity-60"
+            title="一键复制脱敏后的运行状态、最近日志与只读 CLI 指引，直接粘贴给 AI 助手排查故障"
           >
             {copiedAiDiag ? (
               <>
@@ -1980,7 +2098,7 @@ export function HomePage() {
                 <span>已复制诊断包</span>
               </>
             ) : (
-              <span>{copyingAiDiag ? "正在打包…" : "🤖 复制诊断给 AI"}</span>
+              <span>{copyingAiDiag ? "正在打包…" : "🩺 复制排障诊断给 AI"}</span>
             )}
           </button>
 

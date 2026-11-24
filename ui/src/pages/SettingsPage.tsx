@@ -100,7 +100,6 @@ interface ExtendedSettings {
   proxyServerNameserver: string;
   fallbackFilterGeoip: boolean;
   fallbackFilterGeoipCode: string;
-  fallbackFilterGeosite: string;
   fallbackFilterIpcidr: string;
   fallbackFilterDomain: string;
   appendRules: string;
@@ -150,7 +149,6 @@ const DEFAULT_EXTENDED: ExtendedSettings = {
   proxyServerNameserver: "https://223.5.5.5/dns-query",
   fallbackFilterGeoip: true,
   fallbackFilterGeoipCode: "CN",
-  fallbackFilterGeosite: "gfw",
   fallbackFilterIpcidr: "240.0.0.0/4, 0.0.0.0/32, 198.51.100.0/24",
   fallbackFilterDomain: "+.google.com, +.github.com, +.youtube.com",
   appendRules: "",
@@ -333,6 +331,14 @@ function renderGeoStatusSummary(
 
 const AGENT_DOCS = [
   {
+    id: "onboarding",
+    title: "0. 新手上手总纲",
+    goal: "给任意 AI 助手一份零门槛纯中文猫猫云梯全功能导览，让 AI 结合你的当前进度一步步带你完成导入、测速、开代理与提速。",
+    keys: "总览、节点与测速（订阅与导入 / 1→2→3 实时抓节点）、智能多选组、国内提速、悬浮小窗与托盘省内存",
+    workflow: "点击侧栏「🤖 AI 带我上手」或上方按钮一键复制上手指南 + 当前进度快照，直接粘贴给任意 AI 即可开始手把手教学。",
+    guardrails: "全程使用界面准确中文按钮名称、零源码/终端黑话，自动隐私脱敏不含真实订阅链接、密码或公网 IP。",
+  },
+  {
     id: "preaccel",
     title: "1. 国内提速",
     goal: "为非原生 443 节点提供国内中转加速，自动豁免原生 443 并防校园网门户误判。",
@@ -359,9 +365,9 @@ const AGENT_DOCS = [
   {
     id: "nodes_ingest",
     title: "4. 节点导入与抓取",
-    goal: "支持多源订阅聚合、本地配置导入、友商配置迁移及只读进程/代理适配器抓取。",
-    keys: "subscriptions[], nodes[], update_interval_sec, multiplier, is_443_native, preaccel_override",
-    workflow: "导入或刷新订阅后按大洲/地区、协议和原生 443 标签筛选，批量加入智能多选组。",
+    goal: "支持多源订阅聚合、本地配置导入、已有代理软件迁移及 1→2→3 实时抓取运行软件节点。",
+    keys: "subscriptions[], nodes[], multiplier, is_443_native, preaccel_override",
+    workflow: "在「节点与测速 → 订阅与导入」导入节点后，按大洲/地区、协议和原生 443 标签筛选，单节点直用或批量加入智能多选组。",
     guardrails: "拉取失败或内容为空时自动保留旧节点；所有导入凭据仅保存在本机隔离配置。",
   },
   {
@@ -396,7 +402,7 @@ const CLI_SNIPPETS = [
   { cmd: "catcloud preaccel pool --json", desc: "查看国内提速中转池状态" },
   { cmd: "catcloud probe list --json", desc: "查看已注册的测速探针列表" },
   { cmd: "catcloud config diag --json", desc: "导出完整脱敏诊断信息" },
-  { cmd: "catcloud docs export all --json", desc: "导出全套 6 模块 AI 协作文档" },
+  { cmd: "catcloud docs export all --json", desc: "导出全套 AI 协作文档（含上手总纲）" },
 ] as const;
 
 const INPUT_CLS =
@@ -515,9 +521,6 @@ function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
     fallbackFilterGeoip: dns?.fallback_filter?.geoip ?? DEFAULT_EXTENDED.fallbackFilterGeoip,
     fallbackFilterGeoipCode:
       dns?.fallback_filter?.geoip_code ?? DEFAULT_EXTENDED.fallbackFilterGeoipCode,
-    fallbackFilterGeosite: Array.isArray(dns?.fallback_filter?.geosite)
-      ? dns.fallback_filter.geosite.join(", ")
-      : DEFAULT_EXTENDED.fallbackFilterGeosite,
     fallbackFilterIpcidr: Array.isArray(dns?.fallback_filter?.ipcidr)
       ? dns.fallback_filter.ipcidr.join(", ")
       : DEFAULT_EXTENDED.fallbackFilterIpcidr,
@@ -581,7 +584,6 @@ function buildExtendedPatch(ext: ExtendedSettings): Record<string, unknown> {
       fallback_filter: {
         geoip: ext.fallbackFilterGeoip,
         geoip_code: ext.fallbackFilterGeoipCode.trim() || "CN",
-        geosite: splitCsvOrLines(ext.fallbackFilterGeosite),
         ipcidr: splitCsvOrLines(ext.fallbackFilterIpcidr),
         domain: splitCsvOrLines(ext.fallbackFilterDomain),
       },
@@ -688,11 +690,34 @@ function buildMergedSettingsPatch(
 
 async function copyText(text: string, label: string): Promise<void> {
   try {
-    await navigator.clipboard.writeText(text);
-    appActions.showToast(`已复制${label}`, "ok");
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+      appActions.showToast(`已复制${label}`, "ok");
+      return;
+    }
   } catch {
-    appActions.showToast(`剪贴板不可用，请手动复制${label}`, "warn");
+    /* fall through to legacy textarea copy */
   }
+  try {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.setAttribute("readonly", "");
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    el.style.top = "0";
+    el.style.opacity = "0";
+    document.body.appendChild(el);
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    if (ok) {
+      appActions.showToast(`已复制${label}`, "ok");
+      return;
+    }
+  } catch {
+    /* ignore legacy copy failure */
+  }
+  appActions.showToast(`剪贴板不可用，请手动复制${label}`, "warn");
 }
 
 function buildFallbackYaml(cfg: AppConfig, ext: ExtendedSettings): string {
@@ -737,8 +762,6 @@ ${list(ext.proxyServerNameserver, "    ")}
   fallback-filter:
     geoip: ${ext.fallbackFilterGeoip}
     geoip-code: ${ext.fallbackFilterGeoipCode}
-    geosite:
-${list(ext.fallbackFilterGeosite, "      ")}
     ipcidr:
 ${list(ext.fallbackFilterIpcidr, "      ")}
     domain:
@@ -1596,18 +1619,35 @@ export function SettingsPage() {
     await copyText(text, `${labelMap[sh]} 代理命令`);
   };
 
+  const handleCopyAiOnboarding = async () => {
+    await appActions.copyAiOnboardingForUser();
+  };
+
   const handleCopyDiagnostics = async () => {
     await appActions.copySanitizedDiagnosticsForAi();
   };
 
-  const handleCopyAgentDoc = async (moduleId: string, label: string, fallbackMd: string) => {
-    let text = fallbackMd;
+  const handleCopyAgentDoc = async (
+    moduleId: string,
+    label: string,
+    chineseMd: string,
+    asJson = false
+  ) => {
+    if (!asJson) {
+      await copyText(chineseMd, label);
+      return;
+    }
+    const fallbackJsonObj =
+      moduleId === "all"
+        ? AGENT_DOCS
+        : AGENT_DOCS.find((d) => d.id === moduleId) ?? AGENT_DOCS[0];
+    let text = JSON.stringify(fallbackJsonObj, null, 2);
     if (inTauri) {
       try {
-        const res = await catcloudApi.exportAgentDocs(moduleId, false);
+        const res = await catcloudApi.exportAgentDocs(moduleId, true);
         if (res && res.trim()) text = res;
       } catch {
-        /* fallback */
+        /* fallback to structured JSON built from local docs */
       }
     }
     await copyText(text, label);
@@ -2604,24 +2644,14 @@ export function SettingsPage() {
                         label="启用地区过滤"
                       />
                     </div>
-                    <div className="grid grid-cols-2 gap-2">
-                      <label className="text-[11px] text-[var(--muted)]">
-                        直连地区代码
-                        <input
-                          value={ext.fallbackFilterGeoipCode}
-                          onChange={(e) => patchExt("fallbackFilterGeoipCode", e.target.value)}
-                          className={`${INPUT_CLS} mt-1 cc-mono`}
-                        />
-                      </label>
-                      <label className="text-[11px] text-[var(--muted)]">
-                        防污染域名集合
-                        <input
-                          value={ext.fallbackFilterGeosite}
-                          onChange={(e) => patchExt("fallbackFilterGeosite", e.target.value)}
-                          className={`${INPUT_CLS} mt-1 cc-mono`}
-                        />
-                      </label>
-                    </div>
+                    <label className="block text-[11px] text-[var(--muted)]">
+                      直连地区代码
+                      <input
+                        value={ext.fallbackFilterGeoipCode}
+                        onChange={(e) => patchExt("fallbackFilterGeoipCode", e.target.value)}
+                        className={`${INPUT_CLS} mt-1 cc-mono`}
+                      />
+                    </label>
                     <label className="block text-[11px] text-[var(--muted)]">
                       异常 IP 网段过滤
                       <input
@@ -3303,41 +3333,72 @@ export function SettingsPage() {
               <div className="space-y-4 border-t border-[var(--line)] p-4">
                 <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--accent)]/30 bg-[var(--accent-soft)]/35 px-3.5 py-2.5">
                   <div className="text-xs text-[var(--text-secondary)]">
-                    <strong className="text-[var(--text)]">需要 AI 帮你排障或调分流？</strong>
-                    一键复制脱敏后的运行状态、最近日志与只读命令指引，直接粘贴给 Antigravity / Codex / ChatGPT。
+                    <strong className="text-[var(--text)]">需要 AI 教你上手、排障或调分流？</strong>
+                    一键复制新手上手指南或脱敏诊断包，直接粘贴给任意 AI（如 ChatGPT / 豆包 / DeepSeek）。
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => void handleCopyDiagnostics()}
-                    className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-                  >
-                    <Copy className="h-3.5 w-3.5" />
-                    <span>🤖 复制诊断包给 AI</span>
-                  </button>
+                  <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyAiOnboarding()}
+                      className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                      <span>🤖 复制上手指南给 AI</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyDiagnostics()}
+                      className={BTN_CLS}
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                      <span>🩺 复制排障诊断给 AI</span>
+                    </button>
+                  </div>
                 </div>
                 <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
                 <Card
                   title="AI 协作说明文档"
-                  sub="点选模块预览，或一键复制发给 AI 辅助排障与配置"
+                  sub="点选模块预览，所见即所得复制中文指南，或复制 JSON 规格给 AI"
                   action={
-                    <div className="flex gap-1.5">
+                    <div className="flex flex-wrap gap-1.5">
                       <button
                         type="button"
                         onClick={() =>
-                          void handleCopyAgentDoc(activeDoc.id, "本节说明", docMd(activeDoc))
+                          void handleCopyAgentDoc(
+                            activeDoc.id,
+                            `${activeDoc.title}中文指南`,
+                            docMd(activeDoc),
+                            false
+                          )
                         }
                         className={BTN_CLS}
                       >
                         <Copy className="h-3.5 w-3.5" />
-                        <span>复制本节</span>
+                        <span>复制中文</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void handleCopyAgentDoc(
+                            activeDoc.id,
+                            `${activeDoc.title} JSON 规格`,
+                            docMd(activeDoc),
+                            true
+                          )
+                        }
+                        className={BTN_CLS}
+                      >
+                        <Code2 className="h-3.5 w-3.5" />
+                        <span>复制 JSON</span>
                       </button>
                       <button
                         type="button"
                         onClick={() =>
                           void handleCopyAgentDoc(
                             "all",
-                            "全套说明文档",
-                            AGENT_DOCS.map(docMd).join("\n\n")
+                            "全套中文说明文档",
+                            AGENT_DOCS.map(docMd).join("\n\n"),
+                            false
                           )
                         }
                         className={BTN_CLS}

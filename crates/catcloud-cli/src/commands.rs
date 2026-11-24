@@ -34,7 +34,8 @@ use catcloud_core::subscription::migrator::{
     scan_custom_path_readonly, scan_local_clients,
 };
 use catcloud_core::subscription::parser::{
-    apply_parsed_subscription, fetch_and_parse_subscription, parse_subscription_payload,
+    FetchOptions, apply_parsed_subscription, fetch_and_parse_subscription_with_fallback,
+    parse_subscription_payload,
 };
 use catcloud_core::subscription::process_attach::{inspect_process_source, list_process_candidates};
 use catcloud_core::updater::{
@@ -467,7 +468,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let mut db = open_storage(paths)?;
                 let (sub_rec, parsed) = if let Some(file) = args.file {
                     let bytes = std::fs::read(&file)
-                        .with_context(|| format!("failed to read {}", file.display()))?;
+                        .with_context(|| format!("无法读取本地订阅文件：{}", file.display()))?;
                     let sub_rec = catcloud_core::models::SubscriptionRecord {
                         id: args.sub_id.clone(),
                         name: args.name.clone(),
@@ -485,10 +486,33 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         url_or_cmd: url,
                         ..Default::default()
                     };
-                    let parsed = fetch_and_parse_subscription(&sub_rec, Duration::from_secs(20)).await?;
+                    let mut proxy_candidates: Vec<Option<String>> = vec![None];
+                    if let Ok(cfg) = config::load_or_init(paths) {
+                        if cfg.mixed_port > 0 {
+                            proxy_candidates.push(Some(format!(
+                                "http://127.0.0.1:{}",
+                                cfg.mixed_port
+                            )));
+                        }
+                    }
+                    for env_key in ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+                        if let Ok(val) = std::env::var(env_key) {
+                            let trimmed = val.trim();
+                            if !trimmed.is_empty() {
+                                proxy_candidates.push(Some(trimmed.to_string()));
+                            }
+                        }
+                    }
+                    let parsed = fetch_and_parse_subscription_with_fallback(
+                        &sub_rec,
+                        Duration::from_secs(20),
+                        &proxy_candidates,
+                        &FetchOptions::default(),
+                    )
+                    .await?;
                     (sub_rec, parsed)
                 } else {
-                    anyhow::bail!("either --file or --url must be provided");
+                    anyhow::bail!("请提供 --file（本地订阅文件）或 --url（订阅链接）");
                 };
                 let count = parsed.nodes.len();
                 apply_parsed_subscription(&mut db, &sub_rec, &parsed)?;

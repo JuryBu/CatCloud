@@ -35,6 +35,7 @@ import { detectNavigatorOs, resolvePlatformOs } from "../utils/platform";
 import {
   isRealWinDivertActive,
   normalizePreAccelInstallState,
+  normalizePreAccelVerifyState,
   resolvePreAccelSummary,
 } from "../utils/preaccelStatus";
 
@@ -44,6 +45,7 @@ export type {
   GlobalPreAccelMode,
   GlobalPreAccelScope,
   GlobalPreAccelStatus,
+  PreAccelVerifyState,
   ProxyMode,
   ResolvedTheme,
   RouteTargetMode,
@@ -478,6 +480,7 @@ export interface BgTasksState {
     campusResult: CampusPortalStatus | null;
     campusError: string | null;
     installingDriver: boolean;
+    verifyingGlobal: boolean;
   };
   subs: {
     refreshingAll: boolean;
@@ -507,6 +510,7 @@ export interface BgTasksState {
   capture: {
     sessionId: string | null;
     active: boolean;
+    timedOut: boolean;
     finishing: boolean;
     targetName: string | null;
     status: LiveCaptureStatusDto | null;
@@ -625,7 +629,8 @@ export function selectHasBackgroundActivity(s: AppState): {
       s.bgTasks.preaccel.relaysTestingAll ||
       s.bgTasks.preaccel.relaysTestingIds.length > 0 ||
       s.bgTasks.preaccel.campusChecking ||
-      s.bgTasks.preaccel.installingDriver
+      s.bgTasks.preaccel.installingDriver ||
+      s.bgTasks.preaccel.verifyingGlobal
   );
   const nodes = Boolean(
     s.probeProgress.running ||
@@ -754,6 +759,8 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       global_preaccel_socks_port: null,
       global_preaccel_connections: 0,
       preaccel_install_state: "idle",
+      global_preaccel_verify_state: "idle",
+      global_preaccel_verify_ms: null,
       node_health_hints: {},
       captive_portal_required: false,
       system_proxy_enabled: false,
@@ -792,6 +799,8 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       global_preaccel_socks_port: null,
       global_preaccel_connections: 0,
       preaccel_install_state: "idle",
+      global_preaccel_verify_state: "idle",
+      global_preaccel_verify_ms: null,
       node_health_hints: {},
       captive_portal_required: false,
       system_proxy_enabled: initialConfig.system_proxy_enabled,
@@ -895,6 +904,7 @@ function createInitialBgTasks(): BgTasksState {
       campusResult: null,
       campusError: null,
       installingDriver: false,
+      verifyingGlobal: false,
     },
     subs: {
       refreshingAll: false,
@@ -924,6 +934,7 @@ function createInitialBgTasks(): BgTasksState {
     capture: {
       sessionId: null,
       active: false,
+      timedOut: false,
       finishing: false,
       targetName: null,
       status: null,
@@ -1209,6 +1220,7 @@ function stopLiveCapturePolling(): void {
 
 function startLiveCapturePolling(sessionId: string, expectedGen: number): void {
   stopLiveCapturePolling();
+  let consecutiveFailures = 0;
   const pollOnce = () => {
     if (liveCapturePollInFlight) return;
     const currentCapture = state.bgTasks.capture;
@@ -1224,6 +1236,7 @@ function startLiveCapturePolling(sessionId: string, expectedGen: number): void {
     void catcloudApi
       .pollLiveCaptureSession(sessionId)
       .then((latestStatus) => {
+        consecutiveFailures = 0;
         const latestCapture = state.bgTasks.capture;
         if (
           expectedGen !== captureGen ||
@@ -1232,21 +1245,59 @@ function startLiveCapturePolling(sessionId: string, expectedGen: number): void {
         ) {
           return;
         }
+        const isTimedOutOrStopped =
+          Boolean(latestStatus.timed_out) || !latestStatus.active;
         updateBgTasks((bg) => ({
           ...bg,
           capture: {
             ...bg.capture,
-            active: latestStatus.active,
+            sessionId: bg.capture.sessionId || latestStatus.session_id || sessionId,
+            active: latestStatus.active && !latestStatus.timed_out,
+            timedOut: isTimedOutOrStopped ? true : bg.capture.timedOut,
             targetName: latestStatus.target_name || bg.capture.targetName,
             status: latestStatus,
           },
         }));
-        if (!latestStatus.active) {
+        if (isTimedOutOrStopped) {
           stopLiveCapturePolling();
         }
       })
-      .catch(() => {
-        /* tolerate transient poll hiccup while session remains open */
+      .catch((err) => {
+        if (expectedGen !== captureGen) {
+          stopLiveCapturePolling();
+          return;
+        }
+        const latestCapture = state.bgTasks.capture;
+        if (!latestCapture.active || latestCapture.sessionId !== sessionId) {
+          stopLiveCapturePolling();
+          return;
+        }
+        consecutiveFailures += 1;
+        const rawErrMsg =
+          err instanceof Error
+            ? err.message
+            : typeof err === "string"
+              ? err
+              : String(err ?? "");
+        const formattedErrMsg = formatErrorMessage(err);
+        const isSessionMissing =
+          /not\s*found|不存在|已失效|expired/i.test(rawErrMsg) ||
+          /not\s*found|不存在|已失效|expired/i.test(formattedErrMsg);
+        if (isSessionMissing || consecutiveFailures >= 3) {
+          stopLiveCapturePolling();
+          updateBgTasks((bg) => ({
+            ...bg,
+            capture: {
+              ...bg.capture,
+              active: false,
+              timedOut: false,
+              finishing: false,
+              sessionId: null,
+              status: null,
+            },
+          }));
+          pushToast("捕捉会话已失效，请重新开始", "warn", 4200);
+        }
       })
       .finally(() => {
         liveCapturePollInFlight = false;
@@ -1720,14 +1771,18 @@ export const appStore = {
         info.global_windivert_active !== state.runtime.global_windivert_active ||
         info.global_preaccel_mode !== state.runtime.global_preaccel_mode ||
         info.global_preaccel_socks_port !== state.runtime.global_preaccel_socks_port ||
-        info.preaccel_install_state !== state.runtime.preaccel_install_state;
+        info.preaccel_install_state !== state.runtime.preaccel_install_state ||
+        info.global_preaccel_verify_state !== state.runtime.global_preaccel_verify_state ||
+        info.global_preaccel_verify_ms !== state.runtime.global_preaccel_verify_ms;
       const hasGlobalRuntimePatch =
         info.global_preaccel_active !== undefined ||
         info.global_windivert_active !== undefined ||
         info.global_preaccel_mode !== undefined ||
         info.global_preaccel_socks_port !== undefined ||
         info.global_preaccel_connections !== undefined ||
-        info.preaccel_install_state !== undefined;
+        info.preaccel_install_state !== undefined ||
+        info.global_preaccel_verify_state !== undefined ||
+        info.global_preaccel_verify_ms !== undefined;
       setState((prev) => {
         const nextRunning = info.global_preaccel_active ?? prev.globalPreAccel.running;
         const nextMode = info.global_preaccel_mode ?? prev.globalPreAccel.mode;
@@ -1739,6 +1794,14 @@ export const appStore = {
           info.preaccel_install_state !== undefined
             ? normalizePreAccelInstallState(info.preaccel_install_state)
             : prev.globalPreAccel.install_state;
+        const nextVerifyState =
+          info.global_preaccel_verify_state !== undefined
+            ? normalizePreAccelVerifyState(info.global_preaccel_verify_state)
+            : (prev.globalPreAccel.verify_state ?? "idle");
+        const nextVerifyMs =
+          info.global_preaccel_verify_ms !== undefined
+            ? info.global_preaccel_verify_ms
+            : (prev.globalPreAccel.verify_latency_ms ?? null);
         return {
           ...prev,
           runtime: {
@@ -1746,6 +1809,12 @@ export const appStore = {
             global_windivert_active: nextWinDivertActive,
             preaccel_install_state:
               info.preaccel_install_state ?? prev.runtime.preaccel_install_state,
+            global_preaccel_verify_state:
+              info.global_preaccel_verify_state ?? prev.runtime.global_preaccel_verify_state,
+            global_preaccel_verify_ms:
+              info.global_preaccel_verify_ms !== undefined
+                ? info.global_preaccel_verify_ms
+                : prev.runtime.global_preaccel_verify_ms,
             node_health_hints: info.node_health_hints ?? prev.runtime.node_health_hints,
           },
           globalPreAccel: hasGlobalRuntimePatch
@@ -1755,6 +1824,8 @@ export const appStore = {
                 mode: nextMode,
                 is_windivert_active: nextWinDivertActive,
                 install_state: nextInstallState,
+                verify_state: nextVerifyState,
+                verify_latency_ms: nextVerifyMs,
                 socks_port:
                   info.global_preaccel_socks_port !== undefined
                     ? info.global_preaccel_socks_port
@@ -2058,6 +2129,57 @@ export const appActions = {
     );
   },
 
+  async copyAiOnboardingForUser(): Promise<boolean> {
+    const writeClipboard = async (text: string): Promise<boolean> => {
+      try {
+        if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        /* fallback to textarea execCommand */
+      }
+      if (typeof document === "undefined") return false;
+      try {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.style.position = "fixed";
+        el.style.left = "-9999px";
+        el.style.opacity = "0";
+        document.body.appendChild(el);
+        el.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(el);
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      const prompt = await catcloudApi.buildAiOnboardingPrompt();
+      const text = prompt.trim();
+      if (!text) {
+        pushToast("新手上手指南生成为空，请稍后重试", "warn");
+        return false;
+      }
+      const copied = await writeClipboard(text);
+      if (copied) {
+        pushToast(
+          "已复制「AI 新手上手指南 + 当前进度」，直接粘贴给任意 AI（如 ChatGPT / 豆包 / DeepSeek）就能带你一步步操作",
+          "ok",
+          5200
+        );
+        return true;
+      }
+      pushToast("无法写入剪贴板，请检查系统剪贴板权限后重试", "warn");
+      return false;
+    } catch (err) {
+      pushToast(`生成 AI 上手指南失败：${formatErrorMessage(err)}`, "warn");
+      return false;
+    }
+  },
+
   async copySanitizedDiagnosticsForAi(extraSanitizedLogs?: string): Promise<boolean> {
     const writeClipboard = async (text: string): Promise<boolean> => {
       try {
@@ -2209,7 +2331,27 @@ export const appActions = {
         try {
           const status = await catcloudApi.getGlobalPreAccelStatus();
           latestStatus = status;
-          setState((prev) => ({ ...prev, globalPreAccel: status }));
+          setState((prev) => {
+            const nextWinDivertActive = Boolean(
+              status.is_windivert_active ?? (status.running && status.mode === "windivert")
+            );
+            return {
+              ...prev,
+              globalPreAccel: status,
+              runtime: {
+                ...prev.runtime,
+                global_preaccel_active: status.running,
+                global_preaccel_mode: status.mode,
+                global_preaccel_socks_port: status.socks_port,
+                global_preaccel_connections: status.active_connections,
+                global_windivert_active: nextWinDivertActive,
+                preaccel_install_state:
+                  status.install_state ?? prev.runtime.preaccel_install_state,
+                global_preaccel_verify_state: status.verify_state ?? "idle",
+                global_preaccel_verify_ms: status.verify_latency_ms ?? null,
+              },
+            };
+          });
         } catch {
           latestStatus = state.globalPreAccel;
         }
@@ -2287,6 +2429,10 @@ export const appActions = {
                 active_connections: 0,
                 accelerated_processes: [],
                 process_stats: [],
+                verify_state: "idle",
+                verify_latency_ms: null,
+                verify_message: null,
+                security_guidance: null,
               };
 
       const nextWinDivertActive = Boolean(
@@ -2296,7 +2442,15 @@ export const appActions = {
 
       const nextRt: CoreRuntimeInfo =
         rtRes.status === "fulfilled"
-          ? rtRes.value
+          ? {
+              ...rtRes.value,
+              global_preaccel_verify_state:
+                rtRes.value.global_preaccel_verify_state ?? nextGlobal.verify_state ?? "idle",
+              global_preaccel_verify_ms:
+                rtRes.value.global_preaccel_verify_ms !== undefined
+                  ? rtRes.value.global_preaccel_verify_ms
+                  : (nextGlobal.verify_latency_ms ?? null),
+            }
           : {
               ...state.runtime,
               preaccel_enabled: applied,
@@ -2308,6 +2462,8 @@ export const appActions = {
               global_preaccel_socks_port: nextGlobal.socks_port,
               global_preaccel_connections: nextGlobal.active_connections,
               preaccel_install_state: nextGlobal.install_state ?? "idle",
+              global_preaccel_verify_state: nextGlobal.verify_state ?? "idle",
+              global_preaccel_verify_ms: nextGlobal.verify_latency_ms ?? null,
             };
 
       setState((prev) => ({
@@ -2327,7 +2483,33 @@ export const appActions = {
 
       if (summary.proxyActive) {
         if (summary.realWinDivertActive) {
-          pushToast("已开启国内提速（猫猫代理与其它代理软件均已走 443 加速）", "ok", 4200);
+          if (summary.verifyState === "probing") {
+            pushToast(
+              "已开启国内提速（猫猫代理已加速，正在自动探测其它代理软件链路…）",
+              "ok",
+              4200
+            );
+          } else if (summary.verifyState === "verified" && summary.verifyLatencyMs) {
+            pushToast(
+              `已开启国内提速（猫猫代理与其它软件均已走 443 加速，实测 ${summary.verifyLatencyMs} ms）`,
+              "ok",
+              4200
+            );
+          } else {
+            pushToast("已开启国内提速（猫猫代理与其它代理软件均已走 443 加速）", "ok", 4200);
+          }
+        } else if (summary.verifyState === "probing") {
+          pushToast(
+            "已开启国内提速（猫猫代理已加速，正在自动探测其它代理软件链路…）",
+            "ok",
+            4200
+          );
+        } else if (summary.verifyState === "degraded") {
+          pushToast(
+            "已开启国内提速（猫猫代理已加速；其它软件底层拦截已保护回退，可前往查看指引）",
+            "warn",
+            4800
+          );
         } else if (
           summary.installState === "downloading" ||
           summary.installState === "verifying"
@@ -2350,7 +2532,26 @@ export const appActions = {
           pushToast(`已开启国内提速${relayHint}`, "ok");
         }
       } else if (summary.realWinDivertActive) {
-        pushToast("已开启国内提速，正在自动加速电脑上其它代理软件", "ok", 4200);
+        if (summary.verifyState === "probing") {
+          pushToast("已开启国内提速，正在自动探测其它代理软件加速链路…", "info", 4200);
+        } else if (summary.verifyState === "verified" && summary.verifyLatencyMs) {
+          pushToast(
+            `已开启国内提速并实测畅通（${summary.verifyLatencyMs} ms），正在自动加速其它代理软件`,
+            "ok",
+            4200
+          );
+        } else {
+          pushToast("已开启国内提速，正在自动加速电脑上其它代理软件", "ok", 4200);
+        }
+      } else if (summary.verifyState === "probing") {
+        pushToast("已开启国内提速，正在自动探测其它代理软件加速链路…", "info", 4200);
+      } else if (summary.verifyState === "degraded") {
+        pushToast(
+          nextGlobal.verify_message ||
+            "底层拦截未畅通，已自动停止拦截防止断网，请查看环境放行指引",
+          "warn",
+          5000
+        );
       } else if (
         summary.installState === "downloading" ||
         summary.installState === "verifying"
@@ -3085,7 +3286,7 @@ export const appActions = {
 
     const hasComparableNode = state.nodes.some((n) => !isUdpOnlyProtocol(n.protocol));
     if (inDesktop && !hasComparableNode) {
-      pushToast("还没有可对比的海外节点，请先在「节点与订阅」中导入节点", "warn");
+      pushToast("还没有可对比的海外节点，请先在「节点与测速 → 订阅与导入」中导入节点", "warn");
       return null;
     }
 
@@ -3390,6 +3591,79 @@ export const appActions = {
 
   async runInstallWinDivertDriver(): Promise<void> {
     await appActions.installWinDivertDriver();
+  },
+
+  async runVerifyGlobalPreAccel(): Promise<GlobalPreAccelStatus | null> {
+    return runInFlight(
+      "preaccel:verifyGlobal",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          preaccel: { ...bg.preaccel, verifyingGlobal: true },
+        }));
+        try {
+          const status = await catcloudApi.verifyGlobalPreAccel();
+          const rt = await catcloudApi.getRuntimeInfo().catch(() => null);
+          setState((prev) => {
+            const nextWinDivertActive = Boolean(
+              status.is_windivert_active ?? (status.running && status.mode === "windivert")
+            );
+            const baseRuntime = rt ?? prev.runtime;
+            return {
+              ...prev,
+              globalPreAccel: status,
+              runtime: {
+                ...baseRuntime,
+                global_preaccel_active: status.running,
+                global_preaccel_mode: status.mode,
+                global_preaccel_socks_port: status.socks_port,
+                global_preaccel_connections: status.active_connections,
+                global_windivert_active: nextWinDivertActive,
+                preaccel_install_state:
+                  status.install_state ?? baseRuntime.preaccel_install_state,
+                global_preaccel_verify_state: status.verify_state ?? "idle",
+                global_preaccel_verify_ms: status.verify_latency_ms ?? null,
+              },
+            };
+          });
+
+          const verifyState = normalizePreAccelVerifyState(status.verify_state);
+          if (verifyState === "verified") {
+            const msHint = hasValidPositiveLatency(status.verify_latency_ms)
+              ? `（实测 ${formatMsShort(status.verify_latency_ms)}）`
+              : "";
+            pushToast(`全局提速链路探测畅通${msHint}`, "ok", 4200);
+          } else if (verifyState === "degraded") {
+            pushToast(
+              status.verify_message ||
+                "底层拦截未畅通，已自动停止拦截防止断网，请查看环境放行指引",
+              "warn",
+              5200
+            );
+          } else if (verifyState === "failed") {
+            pushToast(
+              `链路探测未通过：${status.verify_message || status.last_error || "请检查中转线路与网络环境"}`,
+              "warn",
+              4800
+            );
+          } else if (verifyState === "probing") {
+            pushToast("正在后台自动探测提速链路，请稍候…", "info", 3200);
+          } else {
+            pushToast(status.verify_message || "已完成当前提速链路检查", "info", 3200);
+          }
+          return status;
+        } catch (err) {
+          pushToast(`重新探测链路失败：${formatErrorMessage(err)}`, "warn", 4400);
+          return null;
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: { ...bg.preaccel, verifyingGlobal: false },
+          }));
+        }
+      },
+      { mascot: true }
+    );
   },
 
   async runIsolatedProbesBg(params: {
@@ -3772,20 +4046,29 @@ export const appActions = {
         try {
           if (isTauriEnv()) {
             const res = await catcloudApi.refreshAllSubscriptions();
-            const [latestSubs, latestNodes, latestGroups] = await Promise.all([
-              catcloudApi.listSubscriptions(),
-              catcloudApi.listNodes(),
-              catcloudApi.listGroups(),
-            ]);
+            const [subsRes, nodesRes, groupsRes, rtRes, cfgRes] =
+              await Promise.allSettled([
+                catcloudApi.listSubscriptions(),
+                catcloudApi.listNodes(),
+                catcloudApi.listGroups(),
+                catcloudApi.getRuntimeInfo(),
+                catcloudApi.getConfig(),
+              ]);
             setState((prev) => ({
               ...prev,
-              subscriptions: latestSubs,
-              nodes: latestNodes,
-              groups: latestGroups,
+              subscriptions:
+                subsRes.status === "fulfilled" ? subsRes.value : prev.subscriptions,
+              nodes: nodesRes.status === "fulfilled" ? nodesRes.value : prev.nodes,
+              groups: groupsRes.status === "fulfilled" ? groupsRes.value : prev.groups,
+              runtime: rtRes.status === "fulfilled" ? rtRes.value : prev.runtime,
+              config:
+                cfgRes.status === "fulfilled"
+                  ? mergeIncomingAppConfig(cfgRes.value, prev.config)
+                  : prev.config,
             }));
             if (res.errors.length > 0) {
               pushToast(
-                `已刷新 ${res.refreshed} 个订阅（共 ${res.total_nodes} 节点），${res.errors.length} 个失败：${res.errors[0]}`,
+                `已刷新 ${res.refreshed} 个订阅（共 ${res.total_nodes} 节点），${res.errors.length} 个失败：${formatErrorMessage(res.errors[0])}`,
                 "warn"
               );
             } else {
@@ -3850,18 +4133,30 @@ export const appActions = {
         try {
           if (isTauriEnv() && !simulateFault) {
             const res = await catcloudApi.refreshSubscription(subId);
-            const [latestSubs, latestNodes, latestGroups] = await Promise.all([
-              catcloudApi.listSubscriptions(),
-              catcloudApi.listNodes(),
-              catcloudApi.listGroups(),
-            ]);
+            const [subsRes, nodesRes, groupsRes, rtRes, cfgRes] =
+              await Promise.allSettled([
+                catcloudApi.listSubscriptions(),
+                catcloudApi.listNodes(),
+                catcloudApi.listGroups(),
+                catcloudApi.getRuntimeInfo(),
+                catcloudApi.getConfig(),
+              ]);
             setState((prev) => ({
               ...prev,
-              subscriptions: latestSubs,
-              nodes: latestNodes,
-              groups: latestGroups,
+              subscriptions:
+                subsRes.status === "fulfilled" ? subsRes.value : prev.subscriptions,
+              nodes: nodesRes.status === "fulfilled" ? nodesRes.value : prev.nodes,
+              groups: groupsRes.status === "fulfilled" ? groupsRes.value : prev.groups,
+              runtime: rtRes.status === "fulfilled" ? rtRes.value : prev.runtime,
+              config:
+                cfgRes.status === "fulfilled"
+                  ? mergeIncomingAppConfig(cfgRes.value, prev.config)
+                  : prev.config,
             }));
-            const warnNote = res.warnings.length > 0 ? `（提醒：${res.warnings[0]}）` : "";
+            const warnNote =
+              res.warnings.length > 0
+                ? `（提醒：${formatErrorMessage(res.warnings[0])}）`
+                : "";
             pushToast(
               `${resolveSubName()} 已刷新，当前 ${res.node_count} 个节点${warnNote}`,
               res.warnings.length > 0 ? "warn" : "ok"
@@ -4473,6 +4768,7 @@ export const appActions = {
       capture: {
         sessionId: null,
         active: false,
+        timedOut: false,
         finishing: false,
         targetName: null,
         status: null,
@@ -4496,6 +4792,7 @@ export const appActions = {
       const initialStatus: LiveCaptureStatusDto = {
         session_id: started.session_id,
         active: true,
+        timed_out: false,
         step_app_ready: true,
         step_activity_seen: false,
         step_nodes_ready: false,
@@ -4519,6 +4816,7 @@ export const appActions = {
         capture: {
           sessionId: started.session_id,
           active: true,
+          timedOut: false,
           finishing: false,
           targetName,
           status: initialStatus,
@@ -4536,6 +4834,7 @@ export const appActions = {
         capture: {
           sessionId: null,
           active: false,
+          timedOut: false,
           finishing: false,
           targetName: null,
           status: null,
@@ -4560,6 +4859,7 @@ export const appActions = {
           capture: {
             sessionId: null,
             active: false,
+            timedOut: false,
             finishing: false,
             targetName: bg.capture.outcome ? bg.capture.targetName : null,
             status: null,
@@ -4586,6 +4886,7 @@ export const appActions = {
           capture: {
             sessionId: null,
             active: false,
+            timedOut: false,
             finishing: false,
             targetName: outcome.target_name || bg.capture.targetName,
             status: null,
@@ -4602,6 +4903,7 @@ export const appActions = {
           capture: {
             sessionId: null,
             active: false,
+            timedOut: false,
             finishing: false,
             targetName: null,
             status: null,
@@ -4626,6 +4928,7 @@ export const appActions = {
       capture: {
         sessionId: null,
         active: false,
+        timedOut: false,
         finishing: false,
         targetName: null,
         status: null,
@@ -4648,6 +4951,7 @@ export const appActions = {
         ...bg,
         capture: {
           ...bg.capture,
+          timedOut: bg.capture.active ? bg.capture.timedOut : false,
           finishing: false,
           outcome: null,
         },

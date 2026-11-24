@@ -392,7 +392,7 @@ function buildAiDeployGuide(probeUrl: string, skip443: boolean): string {
     "",
     "## 3. 导入方式与常用命令",
     "- 图形界面：打开「国内提速」→ 点击右上角「+ 添加中转」→ 手动填表或直接粘贴下方格式的 JSON / 导入码。",
-    "- 查看中转列表：`catcloud relay list --json`",
+    "- 查看中转列表：`catcloud preaccel pool --json`",
     "- 查看运行状态：`catcloud status --json`",
     "- 重载当前配置：`catcloud config reload --json`",
     "",
@@ -451,9 +451,12 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-function formatClockStamp(isoOrNow?: string): string {
-  const d = isoOrNow ? new Date(isoOrNow) : new Date();
-  if (Number.isNaN(d.getTime())) return isoOrNow ?? "--";
+function formatClockStamp(isoOrMs?: string | number | null): string {
+  const d =
+    isoOrMs !== undefined && isoOrMs !== null && isoOrMs !== ""
+      ? new Date(isoOrMs)
+      : new Date();
+  if (Number.isNaN(d.getTime())) return typeof isoOrMs === "string" ? isoOrMs : "--";
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
@@ -546,6 +549,7 @@ export function PreAccelPage() {
 
   // Global background task bindings (survive page switches)
   const installingDriver = bgPreaccel.installingDriver;
+  const verifyingGlobal = bgPreaccel.verifyingGlobal;
   const probingAll = bgPreaccel.relaysTestingAll;
   const probingIdsSet = useMemo(
     () => new Set(bgPreaccel.relaysTestingIds),
@@ -655,15 +659,20 @@ export function PreAccelPage() {
     runtime.preaccel_install_state === "downloading" ||
     runtime.preaccel_install_state === "verifying";
 
+  const verifyProbingActive =
+    verifyingGlobal ||
+    globalPreAccel.verify_state === "probing" ||
+    runtime.global_preaccel_verify_state === "probing";
+
   useEffect(() => {
-    if (!enabled && !globalPreAccel.running && !installBusy) return;
-    const intervalMs = installBusy ? 1500 : 5000;
+    if (!enabled && !globalPreAccel.running && !installBusy && !verifyProbingActive) return;
+    const intervalMs = installBusy || verifyProbingActive ? 1500 : 5000;
     const timer = window.setInterval(() => {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void appActions.refreshGlobalPreAccelStatus();
     }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [enabled, globalPreAccel.running, installBusy]);
+  }, [enabled, globalPreAccel.running, installBusy, verifyProbingActive]);
 
   useEffect(() => {
     let active = true;
@@ -924,6 +933,11 @@ export function PreAccelPage() {
     } finally {
       setRefreshingGlobal(false);
     }
+  };
+
+  const handleVerifyGlobalPreAccel = async () => {
+    if (verifyingGlobal) return;
+    await appActions.runVerifyGlobalPreAccel();
   };
 
   const handleSelectGlobalScope = async (nextScope: GlobalPreAccelScope) => {
@@ -1438,7 +1452,7 @@ export function PreAccelPage() {
       return;
     }
     if (inTauri && benchmarkableNodes.length === 0) {
-      appActions.showToast("还没有可对比的海外节点，请先在「节点与订阅」中导入节点", "warn");
+      appActions.showToast("还没有可对比的海外节点，请先在「节点与测速 → 订阅与导入」中导入节点", "warn");
       return;
     }
     await appActions.runPreAccelBenchmark(resolvedCompareNodeId || null);
@@ -1455,21 +1469,10 @@ export function PreAccelPage() {
   );
 
   const handleCopyGuide = async () => {
-    let textToCopy = guideMarkdown;
-    if (inTauri) {
-      try {
-        const exported = await catcloudApi.exportAgentDocs("preaccel", false);
-        if (exported && exported.trim()) {
-          textToCopy = exported;
-        }
-      } catch {
-        /* fallback to local guide markdown */
-      }
-    }
-    const ok = await copyText(textToCopy);
+    const ok = await copyText(guideMarkdown);
     if (ok) {
       setCopiedGuide(true);
-      appActions.showToast("已复制给 AI 助手的部署说明", "ok");
+      appActions.showToast("已复制给 AI 助手的中文部署说明", "ok");
       scheduleTimer(() => setCopiedGuide(false), 2200);
     } else {
       appActions.showToast("复制失败，请手动选中文本复制", "warn");
@@ -1544,6 +1547,39 @@ export function PreAccelPage() {
     installingDriver ||
     preaccelSummary.installState === "downloading" ||
     preaccelSummary.installState === "verifying";
+  const isProbingVerify = verifyingGlobal || preaccelSummary.verifyState === "probing";
+  const isDegradedVerify = preaccelSummary.verifyState === "degraded";
+  const isVerifiedVerify =
+    preaccelSummary.realWinDivertActive && preaccelSummary.verifyState === "verified";
+  const showReprobeButton =
+    isWindows && preaccelSummary.enabled && !isPreparingDriver && !needsWindowsElevation;
+  const detectedSecurityProducts = globalPreAccel.detected_security_products ?? [];
+  const securityGuidanceText = globalPreAccel.security_guidance?.trim() || null;
+  const verifyMessageText = globalPreAccel.verify_message?.trim() || null;
+  const showSecurityGuidanceBox =
+    globalPreAccel.verify_state === "degraded" ||
+    (Boolean(securityGuidanceText) && !preaccelSummary.realWinDivertActive);
+  const verifyCheckedClock =
+    typeof globalPreAccel.verify_checked_at_ms === "number" &&
+    globalPreAccel.verify_checked_at_ms > 0
+      ? formatClockStamp(globalPreAccel.verify_checked_at_ms)
+      : null;
+  const verifyStateFallbackLabel = (() => {
+    switch (preaccelSummary.verifyState) {
+      case "probing":
+        return "正在自动探测…";
+      case "verified":
+        return preaccelSummary.verifyLatencyMs
+          ? `探测畅通（${preaccelSummary.verifyLatencyMs} ms）`
+          : "探测畅通";
+      case "degraded":
+        return "已自动保护回退";
+      case "failed":
+        return "探测未通过";
+      default:
+        return "尚未探测";
+    }
+  })();
 
   const topStatusBadge = (() => {
     const label =
@@ -1579,7 +1615,9 @@ export function PreAccelPage() {
               <span
                 className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${topStatusBadge.cls}`}
               >
-                {isPreparingDriver && <Loader2 className="h-3 w-3 animate-spin" />}
+                {(isPreparingDriver || isProbingVerify) && (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                )}
                 <span>{topStatusBadge.label}</span>
               </span>
             </div>
@@ -1674,6 +1712,8 @@ export function PreAccelPage() {
                 isPreparingDriver ||
                 needsWindowsElevation ||
                 preaccelSummary.installState === "failed" ||
+                isDegradedVerify ||
+                isProbingVerify ||
                 preaccelSummary.tone === "amber"
                   ? "border-[var(--amber)]/45 bg-[var(--amber-soft)]/50"
                   : preaccelSummary.realWinDivertActive || preaccelSummary.proxyActive
@@ -1682,10 +1722,11 @@ export function PreAccelPage() {
               }`}
             >
               <div className="flex min-w-0 flex-1 items-center gap-2">
-                {isPreparingDriver ? (
+                {isPreparingDriver || isProbingVerify ? (
                   <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--amber)]" />
                 ) : needsWindowsElevation ||
                   preaccelSummary.installState === "failed" ||
+                  isDegradedVerify ||
                   preaccelSummary.tone === "amber" ? (
                   <ShieldAlert className="h-4 w-4 shrink-0 text-[var(--amber)]" />
                 ) : preaccelSummary.realWinDivertActive || preaccelSummary.proxyActive ? (
@@ -1694,8 +1735,36 @@ export function PreAccelPage() {
                   <Clock className="h-4 w-4 shrink-0 text-[var(--amber)]" />
                 )}
                 <div className="min-w-0 flex-1">
-                  <div className="font-medium text-[var(--text)]">
-                    {preaccelSummary.detailText}
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <span className="font-medium text-[var(--text)]">
+                      {preaccelSummary.detailText}
+                    </span>
+                    {isProbingVerify ? (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--amber)]">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        <span>正在自动探测…</span>
+                      </span>
+                    ) : isVerifiedVerify ? (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10.5px] font-semibold text-[var(--green)]">
+                        <Check className="h-3 w-3" />
+                        <span className="cc-mono cc-tabular">
+                          链路已验证
+                          {preaccelSummary.verifyLatencyMs
+                            ? ` ${preaccelSummary.verifyLatencyMs} ms`
+                            : ""}
+                        </span>
+                      </span>
+                    ) : isDegradedVerify ? (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--amber)]">
+                        <ShieldAlert className="h-3 w-3" />
+                        <span>已自动停止拦截防断网</span>
+                      </span>
+                    ) : preaccelSummary.verifyState === "failed" ? (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--red-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--red)]">
+                        <AlertTriangle className="h-3 w-3" />
+                        <span>链路探测未通过</span>
+                      </span>
+                    ) : null}
                   </div>
                   {preaccelSummary.realWinDivertActive && (
                     <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-[var(--text-secondary)]">
@@ -1780,6 +1849,21 @@ export function PreAccelPage() {
                   </button>
                 )}
 
+                {showReprobeButton && (
+                  <button
+                    type="button"
+                    disabled={isProbingVerify}
+                    onClick={() => void handleVerifyGlobalPreAccel()}
+                    className="inline-flex items-center gap-1 rounded-xl border border-[var(--accent)]/45 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/55 disabled:opacity-60"
+                    title="重新实测底层透明拦截与国内 443 中转链路连通性"
+                  >
+                    <RefreshCw
+                      className={`h-3 w-3 ${isProbingVerify ? "animate-spin" : ""}`}
+                    />
+                    <span>{isProbingVerify ? "探测中…" : "重新探测"}</span>
+                  </button>
+                )}
+
                 <button
                   type="button"
                   disabled={refreshingGlobal}
@@ -1792,6 +1876,52 @@ export function PreAccelPage() {
                 </button>
               </div>
             </div>
+
+            {/* 琥珀色环境指引提示框：仅在熔断降级或存在放行指引且底层拦截未运行时展示 */}
+            {showSecurityGuidanceBox && (
+              <div className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-[var(--amber)]/50 bg-[var(--amber-soft)]/55 px-3.5 py-2.5 text-xs">
+                <div className="flex min-w-0 flex-1 items-start gap-2">
+                  <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[var(--amber)]" />
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <span className="font-semibold text-[var(--text)]">环境放行指引</span>
+                      {detectedSecurityProducts.map((prod) => (
+                        <span
+                          key={prod}
+                          className="rounded-md border border-[var(--amber)]/40 bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                        >
+                          {prod}
+                        </span>
+                      ))}
+                    </div>
+                    {verifyMessageText && (
+                      <p className="text-[11px] leading-relaxed text-[var(--text)]">
+                        {verifyMessageText}
+                      </p>
+                    )}
+                    {securityGuidanceText && (
+                      <p className="whitespace-pre-line text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                        {securityGuidanceText}
+                      </p>
+                    )}
+                  </div>
+                </div>
+
+                {showReprobeButton && (
+                  <button
+                    type="button"
+                    disabled={isProbingVerify}
+                    onClick={() => void handleVerifyGlobalPreAccel()}
+                    className="inline-flex shrink-0 items-center gap-1 rounded-xl border border-[var(--amber)]/60 bg-[var(--card)] px-2.5 py-1 text-[11px] font-semibold text-[var(--amber)] transition-colors hover:border-[var(--amber)] hover:bg-[var(--amber-soft)]/70 disabled:opacity-60"
+                  >
+                    <RefreshCw
+                      className={`h-3 w-3 ${isProbingVerify ? "animate-spin" : ""}`}
+                    />
+                    <span>{isProbingVerify ? "探测中…" : "重新探测"}</span>
+                  </button>
+                )}
+              </div>
+            )}
 
             {/* 已自动识别并加速的进程小胶囊列表（含连接数与流量） */}
             {(processStats.length > 0 ||
@@ -2814,18 +2944,22 @@ export function PreAccelPage() {
                       </span>
                       <span
                         className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                          preaccelSummary.realWinDivertActive
-                            ? "bg-[var(--green-soft)] text-[var(--green)]"
-                            : globalPreAccel.windivert_available
-                              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
-                              : "bg-[var(--amber-soft)] text-[var(--amber)]"
+                          preaccelSummary.verifyState === "probing"
+                            ? "bg-[var(--amber-soft)] text-[var(--amber)]"
+                            : preaccelSummary.realWinDivertActive
+                              ? "bg-[var(--green-soft)] text-[var(--green)]"
+                              : globalPreAccel.windivert_available
+                                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                : "bg-[var(--amber-soft)] text-[var(--amber)]"
                         }`}
                       >
-                        {preaccelSummary.realWinDivertActive
-                          ? "运行中"
-                          : globalPreAccel.windivert_available
-                            ? "组件已就绪"
-                            : "尚未下载"}
+                        {preaccelSummary.verifyState === "probing"
+                          ? "探测链路中…"
+                          : preaccelSummary.realWinDivertActive
+                            ? "运行中"
+                            : globalPreAccel.windivert_available
+                              ? "组件已就绪"
+                              : "尚未下载"}
                       </span>
                       <span
                         className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
@@ -2887,6 +3021,56 @@ export function PreAccelPage() {
                       </button>
                     )}
                   </div>
+                </div>
+
+                {/* 紧凑一行环境诊断信息：物理出口网卡 + 安全环境标签 + 上次探测时间与结论 */}
+                <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)]/75 px-3 py-2 text-[11px]">
+                  <span className="inline-flex items-center gap-1 text-[var(--muted)]">
+                    <span>物理出口网卡：</span>
+                    <strong className="cc-mono font-medium text-[var(--text)]">
+                      {globalPreAccel.bound_physical_interface || "自动识别"}
+                    </strong>
+                  </span>
+
+                  <span className="inline-flex flex-wrap items-center gap-1 text-[var(--muted)]">
+                    <span>安全环境：</span>
+                    {detectedSecurityProducts.length > 0 ? (
+                      detectedSecurityProducts.map((prod) => (
+                        <span
+                          key={prod}
+                          className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]"
+                        >
+                          {prod}
+                        </span>
+                      ))
+                    ) : (
+                      <span className="text-[var(--text-secondary)]">常规环境</span>
+                    )}
+                  </span>
+
+                  <span
+                    className="inline-flex min-w-0 items-center gap-1 text-[var(--muted)]"
+                    title={verifyMessageText ?? verifyStateFallbackLabel}
+                  >
+                    <span className="shrink-0">上次探测：</span>
+                    {verifyCheckedClock && (
+                      <span className="cc-mono shrink-0 text-[var(--text-secondary)]">
+                        {verifyCheckedClock}
+                      </span>
+                    )}
+                    <span
+                      className={`truncate font-medium ${
+                        isVerifiedVerify
+                          ? "text-[var(--green)]"
+                          : isDegradedVerify || preaccelSummary.verifyState === "failed"
+                            ? "text-[var(--amber)]"
+                            : "text-[var(--text-secondary)]"
+                      }`}
+                    >
+                      {verifyCheckedClock ? "· " : ""}
+                      {verifyMessageText ?? verifyStateFallbackLabel}
+                    </span>
+                  </span>
                 </div>
 
                 {localSocksAddress && (

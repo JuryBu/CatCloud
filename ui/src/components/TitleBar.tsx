@@ -16,6 +16,20 @@ function resolveModeBadge(
       return { label: "核心异常", dotColor: "var(--red)" };
     }
     if (preaccel.realWinDivertActive) {
+      if (preaccel.verifyState === "probing") {
+        return {
+          label: "探测链路中…",
+          dotColor: "var(--amber)",
+        };
+      }
+      if (preaccel.verifyState === "verified") {
+        return {
+          label: preaccel.verifyLatencyMs
+            ? `已畅通 ${preaccel.verifyLatencyMs}ms`
+            : "已探测畅通",
+          dotColor: status === "warn" ? "var(--amber)" : "var(--green)",
+        };
+      }
       return {
         label: "全局提速中",
         dotColor: status === "warn" ? "var(--amber)" : "var(--accent)",
@@ -28,6 +42,12 @@ function resolveModeBadge(
       if (preaccel.installState === "need_elevation") {
         return { label: "提速需管理员", dotColor: "var(--amber)" };
       }
+      if (preaccel.verifyState === "probing") {
+        return { label: "探测链路中…", dotColor: "var(--amber)" };
+      }
+      if (preaccel.verifyState === "degraded") {
+        return { label: "已保护回退", dotColor: "var(--amber)" };
+      }
       return { label: "本地通道待命", dotColor: "var(--amber)" };
     }
     if (status === "warn") {
@@ -36,10 +56,11 @@ function resolveModeBadge(
     return { label: "待命", dotColor: "var(--muted)" };
   }
 
+  const isProbing = preaccel.enabled && preaccel.verifyState === "probing";
   const dotColor =
     status === "error"
       ? "var(--red)"
-      : status === "warn"
+      : status === "warn" || isProbing
         ? "var(--amber)"
         : preaccel.enabled
           ? "var(--accent)"
@@ -48,9 +69,11 @@ function resolveModeBadge(
   const modeLabel =
     proxyMode === "global" ? "全局" : proxyMode === "direct" ? "直连" : "规则";
   const label = preaccel.enabled
-    ? preaccel.realWinDivertActive
-      ? `${modeLabel} · 全局提速`
-      : `${modeLabel} · 提速`
+    ? isProbing
+      ? `${modeLabel} · 探测链路中…`
+      : preaccel.realWinDivertActive
+        ? `${modeLabel} · 全局提速`
+        : `${modeLabel} · 提速`
     : modeLabel;
   return { label, dotColor };
 }

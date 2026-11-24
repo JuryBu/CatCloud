@@ -3,7 +3,9 @@ use crate::error::{CatError, CatResult};
 use crate::models::{AppConfig, GlobalPreAccelScope, PreAccelConfig, PreAccelRelay};
 use crate::paths::{AppPaths, normalize_os_path};
 use crate::platform::default_platform;
-use crate::preaccel::generator::{PREACCEL_SELECT_GROUP, build_preaccel_compile_plan};
+use crate::preaccel::generator::{
+    PREACCEL_SELECT_GROUP, build_preaccel_compile_plan, host_to_direct_rule,
+};
 use crate::preaccel::schema::{parse_server_ip, sanitize_relay_for_domestic_443};
 use crate::process_guard::JobGuard;
 use serde::{Deserialize, Serialize};
@@ -69,6 +71,14 @@ pub const MAX_NAT_ENTRIES: usize = 4096;
 /// Idle eviction timeout for stale NAT table entries.
 pub const NAT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Grace period keeping a closing NAT entry alive so final `FIN-ACK` / `RST` return packets
+/// still translate back to the client cleanly without leaving half-closed sockets or overly
+/// delaying ephemeral port reuse.
+pub const NAT_CLOSING_GRACE: Duration = Duration::from_secs(4);
+
+/// Internal detection tag reserved for the built-in WinDivert loopback dataplane self-test flow.
+pub const SELF_TEST_DETECTED_BY: &str = "self_test";
+
 /// Maximum number of distinct recent accelerated process names retained in status snapshots.
 const MAX_RECENT_PROCESSES: usize = 32;
 
@@ -130,19 +140,23 @@ const SYSTEM_AND_SELF_EXCLUDED_PROCESSES: &[&str] = &[
 /// Compile a minimal, zero-TUN, zero-DNS, zero-controller Mihomo YAML configuration for
 /// the standalone domestic :443 active-standby pre-acceleration SOCKS5 tunnel.
 ///
-/// Guarantees:
-/// - Only enabled domestic relays are included; `:443` relays have unfiled third-party SNI
-///   stripped (`sanitize_relay_for_domestic_443`) and `skip-cert-verify: true` for pure IPs.
-/// - Reuses `preaccel::generator::build_preaccel_compile_plan` to emit `⚡ 国内预加速入口`
-///   (`select`) -> `🔄 预加速自动双活` (`fallback`, domestic 204 probe, `lazy: false`).
-/// - Listens strictly on `127.0.0.1:<socks_port>` (`allow-lan: false`), never sets
-///   `external-controller`, never writes system proxy, disables `tun` and `dns`.
-/// - Pins all relay public IPs, domestic 204 probe hosts, and private/loopback CIDRs as
-///   top-priority `DIRECT,no-resolve` rules ahead of `MATCH,⚡ 国内预加速入口` to prevent loops.
+/// Backward-compatible wrapper compiling without explicit `interface-name` binding.
 pub fn compile_standalone_preaccel_yaml(
     cfg: &AppConfig,
     relays: &[PreAccelRelay],
     socks_port: u16,
+) -> CatResult<String> {
+    compile_standalone_preaccel_yaml_with_interface(cfg, relays, socks_port, None)
+}
+
+/// Compile the standalone domestic `:443` dual-active SOCKS5 tunnel YAML, optionally pinning
+/// outbound sockets to a confirmed physical exit NIC (`interface-name`) so third-party VPN/TUN
+/// adapters cannot hijack or loop CatCloud's domestic `:443` relay connections.
+pub fn compile_standalone_preaccel_yaml_with_interface(
+    cfg: &AppConfig,
+    relays: &[PreAccelRelay],
+    socks_port: u16,
+    physical_interface: Option<&str>,
 ) -> CatResult<String> {
     if socks_port == 0 {
         return Err(CatError::Validation(
@@ -150,7 +164,7 @@ pub fn compile_standalone_preaccel_yaml(
         ));
     }
 
-    let sanitized_relays: Vec<PreAccelRelay> = relays
+    let mut sanitized_relays: Vec<PreAccelRelay> = relays
         .iter()
         .filter(|r| r.enabled)
         .map(|r| {
@@ -161,6 +175,7 @@ pub fn compile_standalone_preaccel_yaml(
             }
         })
         .collect();
+    sanitized_relays.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
 
     if sanitized_relays.is_empty() {
         return Err(CatError::Validation(
@@ -190,6 +205,12 @@ pub fn compile_standalone_preaccel_yaml(
         Value::String("127.0.0.1".to_string()),
     );
     root.insert(Value::String("allow-lan".to_string()), Value::Bool(false));
+    if let Some(iface) = physical_interface.map(str::trim).filter(|s| !s.is_empty()) {
+        root.insert(
+            Value::String("interface-name".to_string()),
+            Value::String(iface.to_string()),
+        );
+    }
     root.insert(
         Value::String("mode".to_string()),
         Value::String("rule".to_string()),
@@ -255,13 +276,18 @@ pub fn compile_standalone_preaccel_yaml(
         Value::Sequence(plan.proxy_groups),
     );
 
-    let mut rules: Vec<String> = Vec::with_capacity(plan.anti_loop_rules.len() + 12);
+    let mut rules: Vec<String> = Vec::with_capacity(sanitized_relays.len() + 12);
     let mut seen: HashSet<String> = HashSet::new();
 
-    for rule in plan.anti_loop_rules {
-        let key = rule.to_ascii_lowercase();
-        if seen.insert(key) {
-            rules.push(rule);
+    // Only emit anti-loop DIRECT rules for the enabled domestic relay endpoints themselves
+    // (explicitly excluding `probe_url` / domestic 204 endpoints) so dataplane self-test
+    // probes arriving over SOCKS5 must traverse the :443 relay group instead of bypassing via DIRECT.
+    for relay in &sanitized_relays {
+        if let Some(rule) = host_to_direct_rule(&relay.server) {
+            let key = rule.to_ascii_lowercase();
+            if seen.insert(key) {
+                rules.push(rule);
+            }
         }
     }
 
@@ -307,11 +333,17 @@ pub struct StandalonePreAccelTunnel {
     work_dir: PathBuf,
     config_path: PathBuf,
     active_relays: Vec<String>,
+    bound_physical_interface: Option<String>,
     job_guard: Arc<JobGuard>,
 }
 
 impl StandalonePreAccelTunnel {
     /// Compile and launch an isolated standalone :443 pre-acceleration Mihomo subprocess.
+    ///
+    /// On Windows, automatically detects the primary active physical exit NIC (e.g. `WLAN` or
+    /// `以太网`) and pins `interface-name` so third-party proxy TUN adapters cannot hijack
+    /// CatCloud's domestic `:443` relay connections; if binding that interface fails on an
+    /// unusual adapter setup, automatically retries once without `interface-name`.
     pub async fn start(
         paths: &AppPaths,
         cfg: &AppConfig,
@@ -326,8 +358,69 @@ impl StandalonePreAccelTunnel {
             )
         })?;
 
+        #[cfg(target_os = "windows")]
+        let detected_physical_if: Option<String> = tokio::task::spawn_blocking(|| {
+            super::windivert_win::detect_primary_physical_interface().map(|i| i.friendly_name)
+        })
+        .await
+        .ok()
+        .flatten();
+        #[cfg(not(target_os = "windows"))]
+        let detected_physical_if: Option<String> = None;
+
+        if let Some(ref iface) = detected_physical_if {
+            match Self::start_with_interface(
+                paths,
+                &mihomo_bin,
+                cfg,
+                relays,
+                Arc::clone(&job_guard),
+                preferred_socks_port,
+                Some(iface.as_str()),
+            )
+            .await
+            {
+                Ok(tunnel) => return Ok(tunnel),
+                Err(err) => {
+                    tracing::warn!(
+                        "standalone 443 tunnel failed with interface-name `{iface}` ({err}); retrying without explicit interface binding"
+                    );
+                }
+            }
+        }
+
+        Self::start_with_interface(
+            paths,
+            &mihomo_bin,
+            cfg,
+            relays,
+            job_guard,
+            preferred_socks_port,
+            None,
+        )
+        .await
+    }
+
+    async fn start_with_interface(
+        paths: &AppPaths,
+        mihomo_bin: &Path,
+        cfg: &AppConfig,
+        relays: &[PreAccelRelay],
+        job_guard: Arc<JobGuard>,
+        preferred_socks_port: Option<u16>,
+        physical_interface: Option<&str>,
+    ) -> CatResult<Self> {
         let socks_port = allocate_loopback_tcp_port(preferred_socks_port, cfg)?;
-        let yaml = compile_standalone_preaccel_yaml(cfg, relays, socks_port)?;
+        let yaml = compile_standalone_preaccel_yaml_with_interface(
+            cfg,
+            relays,
+            socks_port,
+            physical_interface,
+        )?;
+        let bound_physical_interface = physical_interface
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
 
         let active_relays: Vec<String> = {
             let mut enabled: Vec<&PreAccelRelay> = relays.iter().filter(|r| r.enabled).collect();
@@ -354,7 +447,7 @@ impl StandalonePreAccelTunnel {
             .map(Stdio::from)
             .unwrap_or_else(|_| Stdio::null());
 
-        let norm_bin = normalize_os_path(&mihomo_bin);
+        let norm_bin = normalize_os_path(mihomo_bin);
         let norm_work = normalize_os_path(&work_dir);
         let norm_cfg = normalize_os_path(&config_path);
 
@@ -417,6 +510,7 @@ impl StandalonePreAccelTunnel {
                     work_dir,
                     config_path,
                     active_relays,
+                    bound_physical_interface,
                     job_guard,
                 });
             }
@@ -448,6 +542,10 @@ impl StandalonePreAccelTunnel {
 
     pub fn active_relays(&self) -> &[String] {
         &self.active_relays
+    }
+
+    pub fn bound_physical_interface(&self) -> Option<&str> {
+        self.bound_physical_interface.as_deref()
     }
 
     pub fn work_dir(&self) -> &Path {
@@ -724,18 +822,18 @@ pub struct WinDivertPaths {
 /// Locate co-located `WinDivert64.dll` (or `WinDivert.dll`) and `WinDivert64.sys` in strict
 /// priority order: `custom_dir` -> `paths.bin_dir` -> `<exe_dir>/resources/bin` -> `<exe_dir>`.
 ///
-/// Always returns `None` on Windows ARM64 because official WinDivert v2.2.2 provides no native
-/// ARM64 kernel driver.
+/// Short-circuits immediately to `None` with zero filesystem IO on non-Windows hosts and on
+/// Windows ARM64 (where official WinDivert v2.2.2 provides no native ARM64 kernel driver).
 pub fn locate_windivert_files(
     paths: &AppPaths,
     custom_dir: Option<&str>,
 ) -> Option<(PathBuf, PathBuf)> {
-    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
     {
         let _ = (paths, custom_dir);
         None
     }
-    #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+    #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
     {
         let exe_dir = std::env::current_exe()
             .ok()
@@ -1181,9 +1279,10 @@ pub fn verify_and_extract_windivert_zip(
     write_windivert_binary_with_av_hint(&sys_64, &sys_data, dest_dir)?;
 
     if !dll_64.is_file() || !sys_64.is_file() {
+        let products = detect_host_security_products();
+        let guidance = build_security_guidance(&products, Some(dest_dir), "download_or_write");
         return Err(CatError::Security(format!(
-            "WinDivert 驱动文件写入后被安全软件移除或隔离。该文件为官方签名开源驱动 WinDivert v2.2.2（已通过 SHA-256 校验），请将目录 `{}` 加入 Windows 安全中心/杀毒软件排除项后重试。",
-            dest_dir.display()
+            "WinDivert 驱动文件写入后被安全软件移除或隔离。{guidance}"
         )));
     }
 
@@ -1204,17 +1303,114 @@ fn write_windivert_binary_with_av_hint(
             let av_blocked = io_err.kind() == std::io::ErrorKind::PermissionDenied
                 || matches!(io_err.raw_os_error(), Some(5 | 225 | 226));
             if av_blocked {
+                let products = detect_host_security_products();
+                let guidance =
+                    build_security_guidance(&products, Some(bin_dir), "download_or_write");
                 Err(CatError::Security(format!(
-                    "写入 `{}` 时被杀毒软件或 Windows Defender 拦截（{}）。WinDivert v2.2.2 为官方开源网络过滤驱动（已通过 SHA-256 校验），请将目录 `{}` 添加到安全软件白名单后重试。",
+                    "写入 `{}` 时被安全软件拦截（{}）。{guidance}",
                     target.display(),
                     io_err,
-                    bin_dir.display()
                 )))
             } else {
                 Err(CatError::Io(io_err))
             }
         }
         Err(other) => Err(other),
+    }
+}
+
+/// Classify installed/active Windows security & firewall products from running process basenames.
+///
+/// Third-party security suites (Huorong, 360, Tencent PC Manager, Kaspersky, etc.) are ordered
+/// ahead of built-in Windows Security (Defender) so user guidance targets the active filter first.
+pub fn classify_security_products_from_process_names(process_names: &[String]) -> Vec<String> {
+    let lowers: HashSet<String> = process_names
+        .iter()
+        .map(|raw| normalize_process_basename(raw))
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    const RULES: &[(&[&str], &str)] = &[
+        (
+            &["hipsdaemon.exe", "wsctrl.exe", "hipstray.exe", "hipsmain.exe"],
+            "火绒安全",
+        ),
+        (
+            &["360tray.exe", "360safe.exe", "zhudongfangyu.exe", "360sd.exe", "360rp.exe"],
+            "360 安全卫士",
+        ),
+        (&["qqpctray.exe", "qqpcrtp.exe", "qqpcsvc.exe"], "腾讯电脑管家"),
+        (&["avp.exe", "avpui.exe"], "卡巴斯基安全软件"),
+        (&["ekrn.exe", "egui.exe"], "ESET 安全软件"),
+        (&["bdagent.exe", "vsserv.exe"], "Bitdefender"),
+        (&["mcshield.exe", "mfemms.exe"], "McAfee 安全软件"),
+        (&["msmpeng.exe", "mpdefendercoreservice.exe"], "Windows 安全中心（Defender）"),
+    ];
+
+    let mut detected = Vec::new();
+    for (patterns, label) in RULES {
+        if patterns.iter().any(|p| lowers.contains(*p)) {
+            detected.push((*label).to_string());
+        }
+    }
+    detected
+}
+
+/// Read-only best-effort detection of security products active on the current host.
+pub fn detect_host_security_products() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        super::windivert_win::detect_windows_security_products()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Build actionable, plain-Chinese security/firewall allowlist guidance tailored to the
+/// host's detected security products (`stage`: `"download_or_write" | "driver_load" | "self_test_blocked"`).
+pub fn build_security_guidance(
+    products: &[String],
+    bin_dir: Option<&Path>,
+    stage: &str,
+) -> String {
+    let dir_hint = bin_dir
+        .map(|d| format!("目录 `{}`", d.display()))
+        .unwrap_or_else(|| "猫猫云梯所在目录".to_string());
+
+    let primary = products.first().map(String::as_str);
+    let action_desc = match stage {
+        "download_or_write" => format!(
+            "WinDivert v2.2.2 为官方签名开源网络过滤组件（已通过 SHA-256 校验），请将{dir_hint}加入信任/排除区后点击重试。"
+        ),
+        "driver_load" => format!(
+            "请确认以管理员身份运行，并将{dir_hint}加入信任区；如近期装过其它网络加速/抓包软件，可重启电脑或关闭冲突拦截后重试。"
+        ),
+        _ => format!(
+            "猫猫云梯已自动停止底层拦截以防止断网。请将{dir_hint}及主程序加入信任/网络放行区后，点击「重新探测」恢复自动加速。"
+        ),
+    };
+
+    match primary {
+        Some("火绒安全") => format!(
+            "检测到当前电脑运行「火绒安全」：打开火绒 → 防护中心 → 信任区添加{dir_hint}（如开启联网控制/防火墙，一并放行猫猫云梯本地回环流量），然后重试。{action_desc}"
+        ),
+        Some("360 安全卫士") => format!(
+            "检测到当前电脑运行「360 安全卫士」：打开 360 → 木马查杀/防护中心 → 信任区添加{dir_hint}，并在流量防火墙中放行猫猫云梯后重试。{action_desc}"
+        ),
+        Some("腾讯电脑管家") => format!(
+            "检测到当前电脑运行「腾讯电脑管家」：打开电脑管家 → 病毒查杀 → 信任区添加{dir_hint}，放行猫猫云梯网络拦截组件后重试。{action_desc}"
+        ),
+        Some("Windows 安全中心（Defender）") => format!(
+            "检测到当前为原生「Windows 安全中心（Defender）」：打开 Windows 安全中心 → 病毒和威胁防护 → 管理设置 → 添加排除项，将{dir_hint}加入文件夹排除项后重试。{action_desc}"
+        ),
+        Some(other) => format!(
+            "检测到当前电脑运行「{other}」：请在该安全软件的信任/排除区中添加{dir_hint}并放行猫猫云梯的本地转发流量后重试。{action_desc}"
+        ),
+        None => format!(
+            "如电脑开启了 Windows 安全中心、火绒或其它防火墙/杀毒软件，请将{dir_hint}加入信任排除项并放行本地转发后重试。{action_desc}"
+        ),
     }
 }
 
@@ -1265,7 +1461,7 @@ pub fn build_windivert_filter(relay_ipv4s: &[Ipv4Addr], local_redirect_port: u16
     }
 
     format!(
-        "ip and tcp and (({}) or (outbound and tcp.SrcPort == {}))",
+        "ip and tcp and (({}) or (outbound and ip.SrcAddr == 127.0.0.1 and ip.DstAddr == 127.0.0.1 and tcp.SrcPort == {}))",
         outbound_terms.join(" and "),
         local_redirect_port
     )
@@ -1298,15 +1494,22 @@ pub fn collect_enabled_relay_ipv4s(relays: &[PreAccelRelay]) -> Vec<Ipv4Addr> {
     set.into_iter().collect()
 }
 
-/// Decide whether a Windows network interface row describes a real physical Ethernet/Wi-Fi NIC
-/// (excluding TUN/TAP, Hyper-V, VMware, VirtualBox, Loopback, VPN, and virtual adapters).
+/// Decide whether a Windows network interface row describes a real physical exit NIC
+/// (Ethernet, Wi-Fi, PPPoE dial-up, or 4G/5G cellular WWAN), strictly excluding TUN/TAP,
+/// Hyper-V, VMware, VirtualBox, Loopback, PPTP/L2TP/SSTP/IKEv2, VPN, and virtual adapters.
 pub fn is_physical_nic_descriptor(if_type: u32, oper_status: i32, descr: &str) -> bool {
     const IF_TYPE_ETHERNET: u32 = 6;
+    const IF_TYPE_PPP: u32 = 23;
     const IF_TYPE_WIFI: u32 = 71;
+    const IF_TYPE_WWANPP: u32 = 243;
+    const IF_TYPE_WWANPP2: u32 = 244;
     const OPER_CONNECTED: i32 = 4;
     const OPER_OPERATIONAL: i32 = 5;
 
-    if if_type != IF_TYPE_ETHERNET && if_type != IF_TYPE_WIFI {
+    if !matches!(
+        if_type,
+        IF_TYPE_ETHERNET | IF_TYPE_PPP | IF_TYPE_WIFI | IF_TYPE_WWANPP | IF_TYPE_WWANPP2
+    ) {
         return false;
     }
     if oper_status != OPER_OPERATIONAL && oper_status != OPER_CONNECTED {
@@ -1326,6 +1529,10 @@ pub fn is_physical_nic_descriptor(if_type: u32, oper_status: i32, descr: &str) -
         "sing-tun",
         "mihomo",
         "clash",
+        "pptp",
+        "l2tp",
+        "sstp",
+        "ikev2",
         "hyper-v",
         "vethernet",
         "vmware",
@@ -1338,7 +1545,6 @@ pub fn is_physical_nic_descriptor(if_type: u32, oper_status: i32, descr: &str) -
         "teredo",
         "isatap",
         "pseudo",
-        "wan miniport",
         "bluetooth",
         "km-test",
         "virtual",
@@ -1348,7 +1554,14 @@ pub fn is_physical_nic_descriptor(if_type: u32, oper_status: i32, descr: &str) -
         "wsl",
         "docker",
     ];
-    !VIRTUAL_NIC_KEYWORDS.iter().any(|kw| lower.contains(kw))
+    if VIRTUAL_NIC_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return false;
+    }
+    // Exempt Windows PPPoE dial-up ("WAN Miniport (PPPOE)") while rejecting non-PPPoE miniports.
+    if lower.contains("wan miniport") && !lower.contains("pppoe") {
+        return false;
+    }
+    true
 }
 
 /// Normalize a process path or executable name down to lowercase basename (e.g. `"mihomo.exe"`).
@@ -1583,10 +1796,11 @@ impl ExcludedPidTracker {
 /// Key identifying a local client TCP endpoint in the self-loop NAT table.
 pub type NatKey = (Ipv4Addr, u16);
 
-/// Recorded original remote endpoint, process identity, & interface metadata for one transparently
-/// redirected flow.
+/// Recorded original endpoints, process identity, & interface metadata for one transparently
+/// redirected flow in the loopback NAT table.
 #[derive(Debug, Clone)]
 pub struct NatEntry {
+    pub orig_src_ip: Ipv4Addr,
     pub orig_dst_ip: Ipv4Addr,
     pub orig_dst_port: u16,
     pub if_idx: u32,
@@ -1595,9 +1809,11 @@ pub struct NatEntry {
     pub process_name: String,
     pub detected_by: String,
     pub last_seen: Instant,
+    pub closing_since: Option<Instant>,
 }
 
-/// Bounded-capacity transparent TCP NAT table with idle timeout and oldest-access LRU eviction.
+/// Bounded-capacity transparent TCP NAT table with idle timeout, closing-grace retention for
+/// clean `FIN-ACK` / `RST` teardown, and oldest-access LRU eviction.
 #[derive(Debug)]
 pub struct NatTable {
     max_entries: usize,
@@ -1614,19 +1830,64 @@ impl NatTable {
         }
     }
 
+    fn is_entry_expired(entry: &NatEntry, now: Instant, idle_timeout: Duration) -> bool {
+        if let Some(closing_at) = entry.closing_since {
+            if now.saturating_duration_since(closing_at) >= NAT_CLOSING_GRACE {
+                return true;
+            }
+        }
+        now.saturating_duration_since(entry.last_seen) >= idle_timeout
+    }
+
+    /// Return `true` when `key` has a non-expired entry that would collide with an incoming new
+    /// flow `(incoming_src_ip, incoming_dst_ip, incoming_dst_port)`:
+    /// 1. Active (`closing_since.is_none()`) entry belonging to a DIFFERENT `orig_src_ip`
+    ///    (multi-NIC ephemeral port collision); OR
+    /// 2. Closing (`closing_since.is_some()`, still within `NAT_CLOSING_GRACE`) entry whose
+    ///    recorded `(orig_src_ip, orig_dst_ip, orig_dst_port)` differs from the incoming flow,
+    ///    so the new flow passes through safely without clobbering trailing `FIN-ACK`/`RST`
+    ///    translation for the closing flow.
+    pub fn has_active_conflict(
+        &self,
+        key: &NatKey,
+        incoming_src_ip: Ipv4Addr,
+        incoming_dst_ip: Ipv4Addr,
+        incoming_dst_port: u16,
+    ) -> bool {
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(existing) = guard.get(key) else {
+            return false;
+        };
+        let now = Instant::now();
+        if Self::is_entry_expired(existing, now, self.idle_timeout) {
+            guard.remove(key);
+            return false;
+        }
+        if existing.closing_since.is_some() {
+            existing.orig_src_ip != incoming_src_ip
+                || existing.orig_dst_ip != incoming_dst_ip
+                || existing.orig_dst_port != incoming_dst_port
+        } else {
+            existing.orig_src_ip != incoming_src_ip
+        }
+    }
+
     /// Insert or update a NAT mapping, evicting expired or least-recently-used entries if full.
     pub fn insert(&self, key: NatKey, entry: NatEntry) {
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let now = entry.last_seen;
         if !guard.contains_key(&key) && guard.len() >= self.max_entries {
             let timeout = self.idle_timeout;
-            guard.retain(|_, v| now.saturating_duration_since(v.last_seen) < timeout);
+            guard.retain(|_, v| !Self::is_entry_expired(v, now, timeout));
+            // Prefer evicting already-closing entries before live flows when at capacity.
             while guard.len() >= self.max_entries {
-                if let Some(oldest_key) = guard
+                let candidate = guard
                     .iter()
-                    .min_by_key(|(_, v)| v.last_seen)
-                    .map(|(k, _)| *k)
-                {
+                    .filter(|(_, v)| v.closing_since.is_some())
+                    .min_by_key(|(_, v)| v.closing_since.unwrap_or(v.last_seen))
+                    .or_else(|| guard.iter().min_by_key(|(_, v)| v.last_seen))
+                    .map(|(k, _)| *k);
+                if let Some(oldest_key) = candidate {
                     guard.remove(&oldest_key);
                 } else {
                     break;
@@ -1641,7 +1902,7 @@ impl NatTable {
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.get_mut(key)?;
         let now = Instant::now();
-        if now.saturating_duration_since(entry.last_seen) >= self.idle_timeout {
+        if Self::is_entry_expired(entry, now, self.idle_timeout) {
             guard.remove(key);
             return None;
         }
@@ -1655,6 +1916,56 @@ impl NatTable {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(key)
+    }
+
+    /// Mark the NAT entry for `key` as closing (retaining translation for `NAT_CLOSING_GRACE`
+    /// so trailing `FIN-ACK`/`RST` return packets still map back to the client) only when its
+    /// recorded original tuple matches `(orig_src_ip, orig_dst_ip, orig_dst_port)`.
+    pub fn mark_closing_if_matching(
+        &self,
+        key: &NatKey,
+        orig_src_ip: Ipv4Addr,
+        orig_dst_ip: Ipv4Addr,
+        orig_dst_port: u16,
+    ) -> bool {
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.get_mut(key) {
+            if entry.orig_src_ip == orig_src_ip
+                && entry.orig_dst_ip == orig_dst_ip
+                && entry.orig_dst_port == orig_dst_port
+            {
+                entry.closing_since.get_or_insert_with(Instant::now);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove the NAT entry for `key` ONLY when it is still active (`closing_since.is_none()`)
+    /// and its recorded original tuple matches `(src_ip, dst_ip, dst_port)`.
+    ///
+    /// Guarantees bypass/error paths never erase another flow or an entry retained in its
+    /// `NAT_CLOSING_GRACE` teardown window.
+    pub fn remove_active_if_matching(
+        &self,
+        key: &NatKey,
+        src_ip: Ipv4Addr,
+        dst_ip: Ipv4Addr,
+        dst_port: u16,
+    ) -> bool {
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let matches = guard.get(key).is_some_and(|entry| {
+            entry.closing_since.is_none()
+                && entry.orig_src_ip == src_ip
+                && entry.orig_dst_ip == dst_ip
+                && entry.orig_dst_port == dst_port
+        });
+        if matches {
+            guard.remove(key);
+            true
+        } else {
+            false
+        }
     }
 
     /// Remove the NAT entry for `key` only when its recorded original destination matches
@@ -1774,6 +2085,101 @@ pub fn rewrite_ipv4_tcp_src(
     buf[12..16].copy_from_slice(&new_src_ip.octets());
     buf[ihl_bytes..ihl_bytes + 2].copy_from_slice(&new_src_port.to_be_bytes());
     true
+}
+
+/// Rewrite an outbound IPv4 TCP packet in-place for loopback reflection into the local
+/// `127.0.0.1:<redirect_port>` transparent proxy listener:
+/// - `ip.SrcAddr = 127.0.0.1`
+/// - `ip.DstAddr = 127.0.0.1`
+/// - `tcp.DstPort = redirect_port` (preserving `tcp.SrcPort` as the NAT lookup key)
+///
+/// Using loopback (`127.0.0.1 -> 127.0.0.1`, injected `Outbound = true`) avoids Windows
+/// physical-NIC LAND-attack (`src == dst`) drops and bypasses Windows Defender / third-party
+/// firewall public-inbound rules cleanly with zero LAN exposure.
+pub fn rewrite_ipv4_tcp_to_loopback(
+    buf: &mut [u8],
+    ihl_bytes: usize,
+    redirect_port: u16,
+) -> bool {
+    if ihl_bytes < 20 || buf.len() < ihl_bytes + 20 {
+        return false;
+    }
+    let lo = Ipv4Addr::LOCALHOST.octets();
+    buf[12..16].copy_from_slice(&lo);
+    buf[16..20].copy_from_slice(&lo);
+    buf[ihl_bytes + 2..ihl_bytes + 4].copy_from_slice(&redirect_port.to_be_bytes());
+    true
+}
+
+/// Rewrite a return IPv4 TCP packet coming back from `127.0.0.1:<redirect_port>` in-place
+/// back to the client's original remote/local tuple before inbound injection:
+/// - `ip.SrcAddr = orig_dst_ip`
+/// - `ip.DstAddr = orig_src_ip`
+/// - `tcp.SrcPort = orig_dst_port` (preserving `tcp.DstPort`)
+pub fn rewrite_ipv4_tcp_from_loopback(
+    buf: &mut [u8],
+    ihl_bytes: usize,
+    orig_dst_ip: Ipv4Addr,
+    orig_dst_port: u16,
+    orig_src_ip: Ipv4Addr,
+) -> bool {
+    if ihl_bytes < 20 || buf.len() < ihl_bytes + 20 {
+        return false;
+    }
+    buf[12..16].copy_from_slice(&orig_dst_ip.octets());
+    buf[16..20].copy_from_slice(&orig_src_ip.octets());
+    buf[ihl_bytes..ihl_bytes + 2].copy_from_slice(&orig_dst_port.to_be_bytes());
+    true
+}
+
+/// Clamp the TCP MSS option (`Kind=2, Len=4`) inside a `SYN` / `SYN-ACK` header to at most
+/// `max_mss` (typically `1460` for standard Ethernet/Wi-Fi MTU 1500), preventing oversized
+/// loopback MSS announcements (`65495`) from causing path/LSO anomalies on physical NICs.
+pub fn clamp_tcp_syn_mss(buf: &mut [u8], ihl_bytes: usize, max_mss: u16) -> bool {
+    if ihl_bytes < 20 || buf.len() < ihl_bytes + 20 || max_mss == 0 {
+        return false;
+    }
+    let data_offset_words = ((buf[ihl_bytes + 12] >> 4) & 0x0F) as usize;
+    if data_offset_words <= 5 {
+        return false;
+    }
+    let tcp_hdr_len = data_offset_words * 4;
+    let opt_start = ihl_bytes + 20;
+    let opt_end = ihl_bytes.saturating_add(tcp_hdr_len);
+    if opt_end > buf.len() || opt_end <= opt_start {
+        return false;
+    }
+
+    let mut pos = opt_start;
+    while pos < opt_end {
+        let kind = buf[pos];
+        if kind == 0 {
+            // End of Options List
+            break;
+        }
+        if kind == 1 {
+            // NOP
+            pos += 1;
+            continue;
+        }
+        if pos + 1 >= opt_end {
+            break;
+        }
+        let len = buf[pos + 1] as usize;
+        if len < 2 || pos + len > opt_end {
+            break;
+        }
+        if kind == 2 && len == 4 {
+            let current_mss = u16::from_be_bytes([buf[pos + 2], buf[pos + 3]]);
+            if current_mss > max_mss {
+                buf[pos + 2..pos + 4].copy_from_slice(&max_mss.to_be_bytes());
+                return true;
+            }
+            return false;
+        }
+        pos += len;
+    }
+    false
 }
 
 /// Structured per-process live acceleration telemetry entry reported in `GlobalPreAccelStatus`.
@@ -2146,8 +2552,9 @@ impl Drop for ActiveConnGuard {
     }
 }
 
-/// RAII guard releasing a flow's NAT table entry on exit only if it still maps to the
-/// original destination, preventing stale port-reuse hijacking while protecting newer flows.
+/// RAII guard marking a flow's NAT table entry as closing on exit (keeping it alive for
+/// `NAT_CLOSING_GRACE` so trailing `FIN-ACK` / `RST` packets still translate cleanly back to
+/// the client) only if it still maps to the same original tuple.
 #[cfg_attr(
     any(not(target_os = "windows"), target_arch = "aarch64"),
     allow(dead_code)
@@ -2155,14 +2562,19 @@ impl Drop for ActiveConnGuard {
 struct NatEntryCleanupGuard {
     nat_table: Arc<NatTable>,
     key: NatKey,
+    orig_src_ip: Ipv4Addr,
     orig_dst_ip: Ipv4Addr,
     orig_dst_port: u16,
 }
 
 impl Drop for NatEntryCleanupGuard {
     fn drop(&mut self) {
-        self.nat_table
-            .remove_if_matching(&self.key, self.orig_dst_ip, self.orig_dst_port);
+        self.nat_table.mark_closing_if_matching(
+            &self.key,
+            self.orig_src_ip,
+            self.orig_dst_ip,
+            self.orig_dst_port,
+        );
     }
 }
 
@@ -2311,22 +2723,22 @@ pub async fn socks5_noauth_connect_ipv4(
     Ok(())
 }
 
-/// Forward an accepted self-loop TCP connection through the standalone :443 SOCKS5 tunnel.
+/// Forward an accepted loopback-reflected TCP connection through the standalone :443 SOCKS5 tunnel.
 ///
 /// Security invariant: any connection whose `(peer_ip, peer_port)` is not registered in
-/// `nat_table` is dropped immediately without opening an upstream socket, ensuring the
-/// temporary `0.0.0.0:<redirect_port>` listener never exposes an open proxy to the LAN.
+/// `nat_table` is dropped immediately without opening an upstream socket.
 #[cfg_attr(
     any(not(target_os = "windows"), target_arch = "aarch64"),
     allow(dead_code)
 )]
 pub(super) async fn forward_redirected_stream(
-    client_stream: TcpStream,
+    mut client_stream: TcpStream,
     peer_addr: SocketAddr,
     socks_port: u16,
     nat_table: Arc<NatTable>,
     metrics: Arc<GlobalPreAccelMetrics>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    self_test_accepted: Option<Arc<AtomicU64>>,
 ) {
     if *shutdown_rx.borrow() {
         return;
@@ -2336,24 +2748,36 @@ pub(super) async fn forward_redirected_stream(
     };
     let key = (*peer_v4.ip(), peer_v4.port());
     let Some(entry) = nat_table.get_and_touch(&key) else {
-        // Unregistered external/local scanner: close immediately.
+        // Unregistered local scanner: close immediately.
         return;
     };
     let _nat_cleanup = NatEntryCleanupGuard {
         nat_table,
         key,
+        orig_src_ip: entry.orig_src_ip,
         orig_dst_ip: entry.orig_dst_ip,
         orig_dst_port: entry.orig_dst_port,
     };
 
     let _ = client_stream.set_nodelay(true);
-    let active_guard = ActiveConnGuard::acquire_for_process(
-        Arc::clone(&metrics),
-        entry.owner_pid,
-        &entry.process_name,
-        &entry.detected_by,
-    );
-    let process_counters = active_guard.process_counters();
+    let is_self_test = entry.detected_by == SELF_TEST_DETECTED_BY;
+    if is_self_test {
+        if let Some(ref counter) = self_test_accepted {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let active_guard = if is_self_test {
+        None
+    } else {
+        Some(ActiveConnGuard::acquire_for_process(
+            Arc::clone(&metrics),
+            entry.owner_pid,
+            &entry.process_name,
+            &entry.detected_by,
+        ))
+    };
+    let process_counters = active_guard.as_ref().and_then(ActiveConnGuard::process_counters);
 
     let socks_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
     let connect_res = tokio::select! {
@@ -2364,6 +2788,11 @@ pub(super) async fn forward_redirected_stream(
         ) => res,
     };
     let Ok(Ok(mut upstream)) = connect_res else {
+        tracing::debug!(
+            "global preaccel failed to connect standalone SOCKS5 127.0.0.1:{socks_port} for {}:{}",
+            entry.orig_dst_ip,
+            entry.orig_dst_port
+        );
         return;
     };
     let _ = upstream.set_nodelay(true);
@@ -2378,18 +2807,33 @@ pub(super) async fn forward_redirected_stream(
             socks5_noauth_connect_ipv4(&mut upstream, entry.orig_dst_ip, entry.orig_dst_port),
         ) => res,
     };
-    if !matches!(handshake_res, Ok(Ok(()))) {
+    if let Err(err) = match handshake_res {
+        Ok(inner) => inner,
+        Err(_) => Err(CatError::Core("SOCKS5 握手超时".to_string())),
+    } {
+        tracing::debug!(
+            "global preaccel SOCKS5 CONNECT to {}:{} failed: {err}",
+            entry.orig_dst_ip,
+            entry.orig_dst_port
+        );
         return;
     }
 
     if *shutdown_rx.borrow() {
         return;
     }
-    let mut counting_client =
-        CountingTcpStream::client_side(client_stream, metrics, process_counters);
-    tokio::select! {
-        _ = tokio::io::copy_bidirectional(&mut counting_client, &mut upstream) => {}
-        _ = shutdown_rx.changed() => {}
+    if is_self_test {
+        tokio::select! {
+            _ = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream) => {}
+            _ = shutdown_rx.changed() => {}
+        }
+    } else {
+        let mut counting_client =
+            CountingTcpStream::client_side(client_stream, metrics, process_counters);
+        tokio::select! {
+            _ = tokio::io::copy_bidirectional(&mut counting_client, &mut upstream) => {}
+            _ = shutdown_rx.changed() => {}
+        }
     }
 }
 
@@ -2401,12 +2845,26 @@ fn default_install_state() -> String {
     "idle".to_string()
 }
 
+fn default_verify_state() -> String {
+    "idle".to_string()
+}
+
 fn normalize_install_state(raw: &str) -> &'static str {
     match raw.trim().to_ascii_lowercase().as_str() {
         "downloading" => "downloading",
         "verifying" => "verifying",
         "ready" => "ready",
         "need_elevation" => "need_elevation",
+        "failed" => "failed",
+        _ => "idle",
+    }
+}
+
+fn normalize_verify_state(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "probing" => "probing",
+        "verified" => "verified",
+        "degraded" => "degraded",
         "failed" => "failed",
         _ => "idle",
     }
@@ -2426,6 +2884,28 @@ pub struct GlobalPreAccelStatus {
     /// `"idle" | "downloading" | "verifying" | "ready" | "need_elevation" | "failed"`.
     #[serde(default = "default_install_state")]
     pub install_state: String,
+    /// Live dataplane self-test verification state:
+    /// `"idle" | "probing" | "verified" | "degraded" | "failed"`.
+    #[serde(default = "default_verify_state")]
+    pub verify_state: String,
+    /// End-to-end latency (ms) measured during the last successful WinDivert dataplane self-test.
+    #[serde(default)]
+    pub verify_latency_ms: Option<u64>,
+    /// Plain-Chinese summary of the last dataplane self-test outcome.
+    #[serde(default)]
+    pub verify_message: Option<String>,
+    /// Unix epoch timestamp (ms) of the last completed dataplane self-test.
+    #[serde(default)]
+    pub verify_checked_at_ms: Option<u64>,
+    /// Security / firewall products detected read-only on this host (e.g. Huorong, Defender, 360).
+    #[serde(default)]
+    pub detected_security_products: Vec<String>,
+    /// Actionable Chinese guidance tailored to the host's security products when blocked/degraded.
+    #[serde(default)]
+    pub security_guidance: Option<String>,
+    /// Physical exit NIC friendly name bound by the standalone `:443` tunnel (e.g. `"WLAN"`).
+    #[serde(default)]
+    pub bound_physical_interface: Option<String>,
     pub socks_port: Option<u16>,
     pub windivert_available: bool,
     pub windivert_path: Option<String>,
@@ -2448,6 +2928,13 @@ impl Default for GlobalPreAccelStatus {
             mode: "off".to_string(),
             is_windivert_active: false,
             install_state: default_install_state(),
+            verify_state: default_verify_state(),
+            verify_latency_ms: None,
+            verify_message: None,
+            verify_checked_at_ms: None,
+            detected_security_products: Vec::new(),
+            security_guidance: None,
+            bound_physical_interface: None,
             socks_port: None,
             windivert_available: false,
             windivert_path: None,
@@ -2464,6 +2951,27 @@ impl Default for GlobalPreAccelStatus {
     }
 }
 
+#[derive(Debug, Clone)]
+struct VerifySnapshot {
+    state: String,
+    latency_ms: Option<u64>,
+    message: Option<String>,
+    checked_at_ms: Option<u64>,
+    security_guidance: Option<String>,
+}
+
+impl Default for VerifySnapshot {
+    fn default() -> Self {
+        Self {
+            state: default_verify_state(),
+            latency_ms: None,
+            message: None,
+            checked_at_ms: None,
+            security_guidance: None,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ActiveGlobalRuntime {
     #[cfg(target_os = "windows")]
@@ -2472,6 +2980,7 @@ struct ActiveGlobalRuntime {
     mode: String,
     socks_port: u16,
     active_relays: Vec<String>,
+    bound_physical_interface: Option<String>,
 }
 
 impl ActiveGlobalRuntime {
@@ -2497,6 +3006,8 @@ pub struct GlobalPreAccelManager {
     metrics: Arc<GlobalPreAccelMetrics>,
     last_error: Mutex<Option<String>>,
     install_state: Mutex<String>,
+    verify_snapshot: Mutex<VerifySnapshot>,
+    detected_security_products: Mutex<Vec<String>>,
     custom_windivert_dir: Mutex<Option<String>>,
     synced_main_core_pid: Mutex<Option<u32>>,
 }
@@ -2511,6 +3022,8 @@ impl GlobalPreAccelManager {
             metrics: Arc::new(GlobalPreAccelMetrics::default()),
             last_error: Mutex::new(None),
             install_state: Mutex::new(default_install_state()),
+            verify_snapshot: Mutex::new(VerifySnapshot::default()),
+            detected_security_products: Mutex::new(Vec::new()),
             custom_windivert_dir: Mutex::new(None),
             synced_main_core_pid: Mutex::new(None),
         }
@@ -2533,6 +3046,27 @@ impl GlobalPreAccelManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    fn set_verify_snapshot(&self, snapshot: VerifySnapshot) {
+        if let Ok(mut guard) = self.verify_snapshot.lock() {
+            *guard = VerifySnapshot {
+                state: normalize_verify_state(&snapshot.state).to_string(),
+                ..snapshot
+            };
+        }
+    }
+
+    fn reset_verify_snapshot(&self) {
+        self.set_verify_snapshot(VerifySnapshot::default());
+    }
+
+    fn refresh_detected_security_products(&self) -> Vec<String> {
+        let products = detect_host_security_products();
+        if let Ok(mut guard) = self.detected_security_products.lock() {
+            *guard = products.clone();
+        }
+        products
     }
 
     /// Dynamically synchronize the external main Mihomo core PID excluded from Windows
@@ -2575,7 +3109,17 @@ impl GlobalPreAccelManager {
         extra_excluded_pids: &[u32],
     ) -> CatResult<GlobalPreAccelStatus> {
         let _op = self.op_lock.lock().await;
+        self.start_locked(cfg, relays, extra_excluded_pids, &_op)
+            .await
+    }
 
+    async fn start_locked(
+        &self,
+        cfg: &AppConfig,
+        relays: &[PreAccelRelay],
+        extra_excluded_pids: &[u32],
+        _op_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> CatResult<GlobalPreAccelStatus> {
         {
             let mut dir_guard = self
                 .custom_windivert_dir
@@ -2594,6 +3138,8 @@ impl GlobalPreAccelManager {
         }
         self.metrics.reset();
         self.set_last_error(None);
+        self.reset_verify_snapshot();
+        let detected_products = self.refresh_detected_security_products();
 
         let tunnel = match StandalonePreAccelTunnel::start(
             &self.paths,
@@ -2613,6 +3159,7 @@ impl GlobalPreAccelManager {
 
         let socks_port = tunnel.socks_port();
         let active_relays = tunnel.active_relays().to_vec();
+        let bound_physical_interface = tunnel.bound_physical_interface().map(ToString::to_string);
         #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
         let mut mode = "local_socks5".to_string();
         #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
@@ -2625,7 +3172,7 @@ impl GlobalPreAccelManager {
 
         #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
         {
-            let _ = extra_excluded_pids;
+            let _ = (extra_excluded_pids, detected_products);
             self.set_last_error(Some(WINDIVERT_ARM64_UNSUPPORTED_MSG.to_string()));
         }
 
@@ -2661,6 +3208,7 @@ impl GlobalPreAccelManager {
                 }
 
                 let relay_ipv4s = collect_enabled_relay_ipv4s(relays);
+                let bin_dir = dll_path.parent().map(Path::to_path_buf);
                 let engine_cfg = super::windivert_win::WinDivertEngineConfig {
                     dll_path,
                     socks_port,
@@ -2674,17 +3222,78 @@ impl GlobalPreAccelManager {
                 };
 
                 match super::windivert_win::WinDivertEngine::start(engine_cfg).await {
-                    Ok(engine) => {
-                        win_engine = Some(engine);
-                        mode = "windivert".to_string();
-                        self.set_install_state("ready");
-                        self.set_last_error(None);
+                    Ok(mut engine) => {
+                        self.set_verify_snapshot(VerifySnapshot {
+                            state: "probing".to_string(),
+                            latency_ms: None,
+                            message: Some("正在自动探测底层透明加速链路…".to_string()),
+                            checked_at_ms: None,
+                            security_guidance: None,
+                        });
+                        let probe_urls = build_self_test_probe_urls(&cfg.preaccel.probe_url);
+                        let probe_refs: Vec<&str> = probe_urls.iter().map(String::as_str).collect();
+                        let outcome = engine
+                            .run_self_test(&probe_refs, Duration::from_secs(4))
+                            .await;
+                        match outcome {
+                            super::windivert_win::WinDivertSelfTestOutcome::Passed {
+                                latency_ms,
+                                probe_host,
+                                status_code,
+                            } => {
+                                win_engine = Some(engine);
+                                mode = "windivert".to_string();
+                                self.set_install_state("ready");
+                                self.set_last_error(None);
+                                self.set_verify_snapshot(VerifySnapshot {
+                                    state: "verified".to_string(),
+                                    latency_ms: Some(latency_ms),
+                                    message: Some(format!(
+                                        "自动探测畅通：经由底层透明拦截与国内 443 中转连通 {probe_host}（HTTP {status_code}，{latency_ms} ms）"
+                                    )),
+                                    checked_at_ms: Some(now_epoch_ms()),
+                                    security_guidance: None,
+                                });
+                            }
+                            other => {
+                                // Fail-safe circuit breaker: immediately tear down WinDivert
+                                // interception so broken packet injection never blackholes the host.
+                                let _ = tokio::task::spawn_blocking(move || engine.stop_sync())
+                                    .await;
+                                let (msg, guidance) = classify_self_test_failure(
+                                    &other,
+                                    &detected_products,
+                                    bin_dir.as_deref(),
+                                );
+                                self.set_install_state("ready");
+                                self.set_last_error(Some(msg.clone()));
+                                self.set_verify_snapshot(VerifySnapshot {
+                                    state: "degraded".to_string(),
+                                    latency_ms: None,
+                                    message: Some(msg),
+                                    checked_at_ms: Some(now_epoch_ms()),
+                                    security_guidance: guidance,
+                                });
+                            }
+                        }
                     }
                     Err(err) => {
+                        let guidance = build_security_guidance(
+                            &detected_products,
+                            bin_dir.as_deref(),
+                            "driver_load",
+                        );
                         self.set_install_state("failed");
                         self.set_last_error(Some(format!(
-                            "WinDivert 透明内核引擎启动失败，已降级为本地独立 443 SOCKS5 隧道 ({err})"
+                            "WinDivert 透明内核引擎启动失败，已降级为本地独立 443 SOCKS5 隧道（{err}）"
                         )));
+                        self.set_verify_snapshot(VerifySnapshot {
+                            state: "failed".to_string(),
+                            latency_ms: None,
+                            message: Some(err.to_string()),
+                            checked_at_ms: Some(now_epoch_ms()),
+                            security_guidance: Some(guidance),
+                        });
                     }
                 }
             } else {
@@ -2701,7 +3310,7 @@ impl GlobalPreAccelManager {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let _ = extra_excluded_pids;
+            let _ = (extra_excluded_pids, detected_products);
         }
 
         #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
@@ -2720,6 +3329,7 @@ impl GlobalPreAccelManager {
                 mode,
                 socks_port,
                 active_relays,
+                bound_physical_interface,
             });
         }
 
@@ -2733,6 +3343,7 @@ impl GlobalPreAccelManager {
                 mode,
                 socks_port,
                 active_relays,
+                bound_physical_interface,
             });
         }
 
@@ -2749,7 +3360,17 @@ impl GlobalPreAccelManager {
         extra_excluded_pids: &[u32],
     ) -> CatResult<GlobalPreAccelStatus> {
         let _op = self.op_lock.lock().await;
+        self.upgrade_to_windivert_in_place_locked(cfg, relays, extra_excluded_pids, &_op)
+            .await
+    }
 
+    async fn upgrade_to_windivert_in_place_locked(
+        &self,
+        cfg: &AppConfig,
+        relays: &[PreAccelRelay],
+        extra_excluded_pids: &[u32],
+        _op_guard: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> CatResult<GlobalPreAccelStatus> {
         {
             let mut dir_guard = self
                 .custom_windivert_dir
@@ -2833,6 +3454,8 @@ impl GlobalPreAccelManager {
             }
 
             let relay_ipv4s = collect_enabled_relay_ipv4s(relays);
+            let bin_dir = dll_path.parent().map(Path::to_path_buf);
+            let detected_products = self.refresh_detected_security_products();
             let engine_cfg = super::windivert_win::WinDivertEngineConfig {
                 dll_path,
                 socks_port,
@@ -2846,51 +3469,263 @@ impl GlobalPreAccelManager {
             };
 
             match super::windivert_win::WinDivertEngine::start(engine_cfg).await {
-                Ok(engine) => {
-                    let (installed, displaced_engine) = {
-                        let synced_guard = self
-                            .synced_main_core_pid
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        engine.sync_main_core_pid(*synced_guard);
-                        let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(rt) = rt_guard.as_mut() {
-                            let old = rt.engine.replace(engine);
-                            rt.mode = "windivert".to_string();
-                            (true, old)
-                        } else {
-                            (false, Some(engine))
+                Ok(mut engine) => {
+                    self.set_verify_snapshot(VerifySnapshot {
+                        state: "probing".to_string(),
+                        latency_ms: None,
+                        message: Some("正在自动探测底层透明加速链路…".to_string()),
+                        checked_at_ms: None,
+                        security_guidance: None,
+                    });
+                    let probe_urls = build_self_test_probe_urls(&cfg.preaccel.probe_url);
+                    let probe_refs: Vec<&str> = probe_urls.iter().map(String::as_str).collect();
+                    let outcome = engine
+                        .run_self_test(&probe_refs, Duration::from_secs(4))
+                        .await;
+                    match outcome {
+                        super::windivert_win::WinDivertSelfTestOutcome::Passed {
+                            latency_ms,
+                            probe_host,
+                            status_code,
+                        } => {
+                            let (installed, displaced_engine) = {
+                                let synced_guard = self
+                                    .synced_main_core_pid
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                engine.sync_main_core_pid(*synced_guard);
+                                let mut rt_guard =
+                                    self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(rt) = rt_guard.as_mut() {
+                                    let old = rt.engine.replace(engine);
+                                    rt.mode = "windivert".to_string();
+                                    (true, old)
+                                } else {
+                                    (false, Some(engine))
+                                }
+                            };
+                            if let Some(mut stale) = displaced_engine {
+                                let _ =
+                                    tokio::task::spawn_blocking(move || stale.stop_sync()).await;
+                            }
+                            if installed {
+                                self.set_install_state("ready");
+                                self.set_last_error(None);
+                                self.set_verify_snapshot(VerifySnapshot {
+                                    state: "verified".to_string(),
+                                    latency_ms: Some(latency_ms),
+                                    message: Some(format!(
+                                        "自动探测畅通：经由底层透明拦截与国内 443 中转连通 {probe_host}（HTTP {status_code}，{latency_ms} ms）"
+                                    )),
+                                    checked_at_ms: Some(now_epoch_ms()),
+                                    security_guidance: None,
+                                });
+                            } else {
+                                let wd_ready = locate_windivert_files(
+                                    &self.paths,
+                                    cfg.preaccel.windivert_dir.as_deref(),
+                                )
+                                .is_some();
+                                if wd_ready && is_elevated {
+                                    self.set_install_state("ready");
+                                } else if wd_ready {
+                                    self.set_install_state("need_elevation");
+                                } else {
+                                    self.set_install_state("idle");
+                                }
+                                self.reset_verify_snapshot();
+                            }
+                            Ok(self.status())
                         }
-                    };
-                    if let Some(mut stale) = displaced_engine {
-                        let _ = tokio::task::spawn_blocking(move || stale.stop_sync()).await;
-                    }
-                    if installed {
-                        self.set_install_state("ready");
-                        self.set_last_error(None);
-                    } else {
-                        let wd_ready = locate_windivert_files(
-                            &self.paths,
-                            cfg.preaccel.windivert_dir.as_deref(),
-                        )
-                        .is_some();
-                        if wd_ready && is_elevated {
+                        other => {
+                            let _ =
+                                tokio::task::spawn_blocking(move || engine.stop_sync()).await;
+                            let (msg, guidance) = classify_self_test_failure(
+                                &other,
+                                &detected_products,
+                                bin_dir.as_deref(),
+                            );
                             self.set_install_state("ready");
-                        } else if wd_ready {
-                            self.set_install_state("need_elevation");
-                        } else {
-                            self.set_install_state("idle");
+                            self.set_last_error(Some(msg.clone()));
+                            self.set_verify_snapshot(VerifySnapshot {
+                                state: "degraded".to_string(),
+                                latency_ms: None,
+                                message: Some(msg),
+                                checked_at_ms: Some(now_epoch_ms()),
+                                security_guidance: guidance,
+                            });
+                            Ok(self.status())
                         }
                     }
-                    Ok(self.status())
                 }
                 Err(err) => {
+                    let guidance = build_security_guidance(
+                        &detected_products,
+                        bin_dir.as_deref(),
+                        "driver_load",
+                    );
                     self.set_install_state("failed");
                     self.set_last_error(Some(format!(
-                        "WinDivert 驱动就绪后原地热升格失败，继续保持本地独立 443 通道 ({err})"
+                        "WinDivert 驱动就绪后原地热升格失败，继续保持本地独立 443 通道（{err}）"
                     )));
+                    self.set_verify_snapshot(VerifySnapshot {
+                        state: "failed".to_string(),
+                        latency_ms: None,
+                        message: Some(err.to_string()),
+                        checked_at_ms: Some(now_epoch_ms()),
+                        security_guidance: Some(guidance),
+                    });
                     Err(err)
                 }
+            }
+        }
+    }
+
+    /// Re-verify live transparent WinDivert dataplane connectivity on demand (e.g. after
+    /// switching Wi-Fi/Ethernet, toggling a third-party TUN, or allowlisting CatCloud in
+    /// Huorong / Windows Defender / 360).
+    ///
+    /// - When already running in `windivert` mode, runs an active non-disruptive dataplane
+    ///   self-test and triggers automatic fail-safe downgrade to `local_socks5` if blocked.
+    /// - When previously degraded to `local_socks5` (with driver + admin privileges available),
+    ///   re-detects the current primary physical NIC and attempts a clean upgrade + self-test.
+    pub async fn reverify_windivert(
+        &self,
+        cfg: &AppConfig,
+        relays: &[PreAccelRelay],
+        extra_excluded_pids: &[u32],
+    ) -> CatResult<GlobalPreAccelStatus> {
+        #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+        {
+            let _ = (cfg, relays, extra_excluded_pids);
+            return Ok(self.status());
+        }
+
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        {
+            let _op = self.op_lock.lock().await;
+            let detected_products = self.refresh_detected_security_products();
+
+            let (running, is_windivert, bound_if, bin_dir) = {
+                let wd_dir =
+                    locate_windivert_files(&self.paths, cfg.preaccel.windivert_dir.as_deref())
+                        .and_then(|(dll, _)| dll.parent().map(Path::to_path_buf));
+                let guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.as_ref() {
+                    Some(rt) => (
+                        true,
+                        rt.mode == "windivert" && rt.engine.is_some(),
+                        rt.bound_physical_interface.clone(),
+                        wd_dir,
+                    ),
+                    None => (false, false, None, wd_dir),
+                }
+            };
+
+            if !running {
+                return Ok(self.status());
+            }
+
+            if is_windivert {
+                self.set_verify_snapshot(VerifySnapshot {
+                    state: "probing".to_string(),
+                    latency_ms: None,
+                    message: Some("正在重新探测底层透明加速链路…".to_string()),
+                    checked_at_ms: None,
+                    security_guidance: None,
+                });
+
+                // Temporarily take the engine handle out of the mutex while running the async probe
+                // so status snapshots never block and `op_lock` guarantees exclusive lifecycle control.
+                let engine_opt = {
+                    let mut guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                    guard.as_mut().and_then(|rt| rt.engine.take())
+                };
+                if let Some(mut engine) = engine_opt {
+                    let probe_urls = build_self_test_probe_urls(&cfg.preaccel.probe_url);
+                    let probe_refs: Vec<&str> = probe_urls.iter().map(String::as_str).collect();
+                    let outcome = engine
+                        .run_self_test(&probe_refs, Duration::from_secs(4))
+                        .await;
+                    match outcome {
+                        super::windivert_win::WinDivertSelfTestOutcome::Passed {
+                            latency_ms,
+                            probe_host,
+                            status_code,
+                        } => {
+                            let leftover_engine = {
+                                let mut guard =
+                                    self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(rt) = guard.as_mut() {
+                                    rt.engine = Some(engine);
+                                    rt.mode = "windivert".to_string();
+                                    None
+                                } else {
+                                    Some(engine)
+                                }
+                            };
+                            if let Some(mut orphan) = leftover_engine {
+                                let _ = tokio::task::spawn_blocking(move || orphan.stop_sync())
+                                    .await;
+                                return Ok(self.status());
+                            }
+                            self.set_last_error(None);
+                            self.set_verify_snapshot(VerifySnapshot {
+                                state: "verified".to_string(),
+                                latency_ms: Some(latency_ms),
+                                message: Some(format!(
+                                    "自动探测畅通：经由底层透明拦截与国内 443 中转连通 {probe_host}（HTTP {status_code}，{latency_ms} ms）"
+                                )),
+                                checked_at_ms: Some(now_epoch_ms()),
+                                security_guidance: None,
+                            });
+                            return Ok(self.status());
+                        }
+                        other => {
+                            let _ = tokio::task::spawn_blocking(move || engine.stop_sync()).await;
+                            {
+                                let mut guard =
+                                    self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                                if let Some(rt) = guard.as_mut() {
+                                    rt.mode = "local_socks5".to_string();
+                                }
+                            }
+                            let (msg, guidance) = classify_self_test_failure(
+                                &other,
+                                &detected_products,
+                                bin_dir.as_deref(),
+                            );
+                            self.set_last_error(Some(msg.clone()));
+                            self.set_verify_snapshot(VerifySnapshot {
+                                state: "degraded".to_string(),
+                                latency_ms: None,
+                                message: Some(msg),
+                                checked_at_ms: Some(now_epoch_ms()),
+                                security_guidance: guidance,
+                            });
+                            return Ok(self.status());
+                        }
+                    }
+                }
+            }
+
+            // Currently running in `local_socks5`: check if primary physical NIC changed
+            // (e.g. switched Ethernet <-> Wi-Fi) and retry full start or in-place upgrade
+            // while holding the SAME `_op` lock so a concurrent `stop()` can never be resurrected.
+            let latest_physical_if = tokio::task::spawn_blocking(|| {
+                super::windivert_win::detect_primary_physical_interface().map(|i| i.friendly_name)
+            })
+            .await
+            .ok()
+            .flatten();
+            let need_tunnel_rebuild = latest_physical_if != bound_if;
+
+            if need_tunnel_rebuild {
+                self.start_locked(cfg, relays, extra_excluded_pids, &_op)
+                    .await
+            } else {
+                self.upgrade_to_windivert_in_place_locked(cfg, relays, extra_excluded_pids, &_op)
+                    .await
             }
         }
     }
@@ -2906,6 +3741,8 @@ impl GlobalPreAccelManager {
             rt.stop().await;
         }
         self.metrics.clear_active_connections();
+        self.reset_verify_snapshot();
+        self.set_last_error(None);
         Ok(self.status())
     }
 
@@ -2926,7 +3763,7 @@ impl GlobalPreAccelManager {
         let windivert_available = wd_files.is_some();
         let windivert_path = wd_files.map(|(dll, _)| dll.to_string_lossy().to_string());
 
-        let (running, mode, socks_port, active_relays) = {
+        let (running, mode, socks_port, active_relays, bound_physical_interface) = {
             let guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
             match guard.as_ref() {
                 Some(rt) => (
@@ -2934,8 +3771,9 @@ impl GlobalPreAccelManager {
                     rt.mode.clone(),
                     Some(rt.socks_port),
                     rt.active_relays.clone(),
+                    rt.bound_physical_interface.clone(),
                 ),
-                None => (false, "off".to_string(), None, Vec::new()),
+                None => (false, "off".to_string(), None, Vec::new(), None),
             }
         };
 
@@ -2965,6 +3803,17 @@ impl GlobalPreAccelManager {
             }
         };
 
+        let verify_snap = self
+            .verify_snapshot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let detected_security_products = self
+            .detected_security_products
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
         let last_error = self
             .last_error
             .lock()
@@ -2976,6 +3825,13 @@ impl GlobalPreAccelManager {
             mode,
             is_windivert_active,
             install_state,
+            verify_state: verify_snap.state,
+            verify_latency_ms: verify_snap.latency_ms,
+            verify_message: verify_snap.message,
+            verify_checked_at_ms: verify_snap.checked_at_ms,
+            detected_security_products,
+            security_guidance: verify_snap.security_guidance,
+            bound_physical_interface,
             socks_port,
             windivert_available,
             windivert_path,
@@ -2994,6 +3850,80 @@ impl GlobalPreAccelManager {
     fn set_last_error(&self, err: Option<String>) {
         if let Ok(mut guard) = self.last_error.lock() {
             *guard = err;
+        }
+    }
+}
+
+/// Build an ordered list of non-443 domestic HTTP probe URLs for verifying WinDivert dataplane
+/// transparent interception end-to-end (configured domestic URL first, followed by Huawei & MIUI
+/// HTTP 204 endpoints).
+#[cfg_attr(
+    any(not(target_os = "windows"), target_arch = "aarch64"),
+    allow(dead_code)
+)]
+pub fn build_self_test_probe_urls(configured_probe_url: &str) -> Vec<String> {
+    let mut urls: Vec<String> = Vec::with_capacity(3);
+    let mut push_unique_http = |raw: &str| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let Ok(parsed) = Url::parse(trimmed) else {
+            return;
+        };
+        if !parsed.scheme().eq_ignore_ascii_case("http") {
+            return;
+        }
+        if parsed.port_or_known_default() == Some(443) {
+            return;
+        }
+        if !urls.iter().any(|u| u.eq_ignore_ascii_case(trimmed)) {
+            urls.push(trimmed.to_string());
+        }
+    };
+
+    push_unique_http(configured_probe_url);
+    push_unique_http(crate::preaccel::generator::DEFAULT_DOMESTIC_204_PRIMARY);
+    push_unique_http(crate::preaccel::generator::DEFAULT_DOMESTIC_204_FALLBACK);
+    urls
+}
+
+#[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+fn classify_self_test_failure(
+    outcome: &super::windivert_win::WinDivertSelfTestOutcome,
+    detected_products: &[String],
+    bin_dir: Option<&Path>,
+) -> (String, Option<String>) {
+    match outcome {
+        super::windivert_win::WinDivertSelfTestOutcome::Passed { .. } => {
+            ("底层透明加速探测已通过".to_string(), None)
+        }
+        super::windivert_win::WinDivertSelfTestOutcome::BlockedAtDataplane {
+            intercepted,
+            accepted,
+            send_errors,
+            detail,
+        } => {
+            let msg = format!(
+                "底层透明加速自动探测未通过（拦截 {intercepted} 包、到达本地转发 {accepted} 次、注入异常 {send_errors} 次）：{detail}。已自动停止拦截以防断网，并安全退回本地独立 443 通道"
+            );
+            let guidance =
+                build_security_guidance(detected_products, bin_dir, "self_test_blocked");
+            (msg, Some(guidance))
+        }
+        super::windivert_win::WinDivertSelfTestOutcome::NoPacketIntercepted { detail } => {
+            let msg = format!(
+                "底层透明加速自动探测未捕获到物理网卡出站测试包：{detail}。已自动停止拦截并安全退回本地独立 443 通道"
+            );
+            let guidance =
+                build_security_guidance(detected_products, bin_dir, "self_test_blocked");
+            (msg, Some(guidance))
+        }
+        super::windivert_win::WinDivertSelfTestOutcome::TunnelUnreachable { detail } => {
+            let msg = format!(
+                "底层透明拦截已送达本机转发口，但经由国内 443 中转访问探测地址失败：{detail}。已自动停止拦截防止其它软件超时，请先测速确认国内中转线路畅通后点击「重新探测」"
+            );
+            (msg, None)
         }
     }
 }
@@ -3131,7 +4061,9 @@ mod tests {
         assert!(filter.contains("(ip.DstAddr < 192.168.0.0 or ip.DstAddr > 192.168.255.255)"));
         assert!(filter.contains("(ip.DstAddr < 198.18.0.0 or ip.DstAddr > 198.19.255.255)"));
         assert!(filter.contains("ip.DstAddr < 224.0.0.0"));
-        assert!(filter.contains("(outbound and tcp.SrcPort == 54321)"));
+        assert!(filter.contains(
+            "(outbound and ip.SrcAddr == 127.0.0.1 and ip.DstAddr == 127.0.0.1 and tcp.SrcPort == 54321)"
+        ));
 
         // Must never contain CIDR syntax (invalid in WinDivert) or GeoIP CN bypass.
         assert!(!filter.contains('/'));
@@ -3195,7 +4127,8 @@ mod tests {
         assert_eq!(fallback["lazy"].as_bool(), Some(false));
         assert!(fallback["url"].as_str().unwrap().contains("hicloud.com"));
 
-        // Verify top-level DIRECT anti-loop rules precede MATCH.
+        // Verify top-level relay DIRECT anti-loop rules precede MATCH while probe_url / domestic
+        // 204 domains are excluded from standalone rules so self-test probes always traverse :443.
         let rules: Vec<&str> = doc["rules"]
             .as_sequence()
             .unwrap()
@@ -3210,18 +4143,17 @@ mod tests {
             .iter()
             .position(|r| *r == "IP-CIDR,198.51.100.20/32,DIRECT,no-resolve")
             .expect("relay 2 direct rule");
-        let idx_probe = rules
-            .iter()
-            .position(|r| *r == "DOMAIN,connectivitycheck.platform.hicloud.com,DIRECT")
-            .expect("domestic 204 direct rule");
         let idx_match = rules
             .iter()
             .position(|r| *r == format!("MATCH,{PREACCEL_SELECT_GROUP}"))
             .expect("MATCH preaccel select group");
         assert!(idx_tx < idx_match);
         assert!(idx_ali < idx_match);
-        assert!(idx_probe < idx_match);
         assert!(!rules.contains(&"IP-CIDR,192.0.2.99/32,DIRECT,no-resolve"));
+        assert!(!rules.iter().any(|r| {
+            let lower = r.to_ascii_lowercase();
+            lower.contains("hicloud.com") || lower.contains("miui.com")
+        }));
     }
 
     #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
@@ -3336,8 +4268,9 @@ mod tests {
         let table = NatTable::new(2, Duration::from_secs(60));
         let now = Instant::now();
         table.insert(
-            (Ipv4Addr::new(192, 0, 2, 10), 40001),
+            (Ipv4Addr::LOCALHOST, 40001),
             NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
                 orig_dst_ip: Ipv4Addr::new(203, 0, 113, 50),
                 orig_dst_port: 8443,
                 if_idx: 7,
@@ -3346,11 +4279,13 @@ mod tests {
                 process_name: "mihomo.exe".to_string(),
                 detected_by: "open_core_name".to_string(),
                 last_seen: now - Duration::from_secs(10),
+                closing_since: None,
             },
         );
         table.insert(
-            (Ipv4Addr::new(192, 0, 2, 10), 40002),
+            (Ipv4Addr::LOCALHOST, 40002),
             NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
                 orig_dst_ip: Ipv4Addr::new(203, 0, 113, 51),
                 orig_dst_port: 9443,
                 if_idx: 7,
@@ -3359,12 +4294,14 @@ mod tests {
                 process_name: "xray.exe".to_string(),
                 detected_by: "open_core_name".to_string(),
                 last_seen: now - Duration::from_secs(5),
+                closing_since: None,
             },
         );
         // Third entry evicts oldest (40001).
         table.insert(
-            (Ipv4Addr::new(192, 0, 2, 10), 40003),
+            (Ipv4Addr::LOCALHOST, 40003),
             NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
                 orig_dst_ip: Ipv4Addr::new(203, 0, 113, 52),
                 orig_dst_port: 2053,
                 if_idx: 7,
@@ -3373,11 +4310,49 @@ mod tests {
                 process_name: "ssh.exe".to_string(),
                 detected_by: "manual".to_string(),
                 last_seen: now,
+                closing_since: None,
             },
         );
         assert_eq!(table.len(), 2);
-        assert!(table.get_and_touch(&(Ipv4Addr::new(192, 0, 2, 10), 40001)).is_none());
-        assert!(table.get_and_touch(&(Ipv4Addr::new(192, 0, 2, 10), 40003)).is_some());
+        assert!(table.get_and_touch(&(Ipv4Addr::LOCALHOST, 40001)).is_none());
+        assert!(table.get_and_touch(&(Ipv4Addr::LOCALHOST, 40003)).is_some());
+        assert!(table.has_active_conflict(
+            &(Ipv4Addr::LOCALHOST, 40003),
+            Ipv4Addr::new(192, 0, 2, 99),
+            Ipv4Addr::new(203, 0, 113, 52),
+            2053
+        ));
+        assert!(!table.has_active_conflict(
+            &(Ipv4Addr::LOCALHOST, 40003),
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 52),
+            2053
+        ));
+        assert!(table.mark_closing_if_matching(
+            &(Ipv4Addr::LOCALHOST, 40003),
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 52),
+            2053
+        ));
+        // During the 4s closing grace window, any different 4-tuple conflicts to prevent cross-flow RST.
+        assert!(table.has_active_conflict(
+            &(Ipv4Addr::LOCALHOST, 40003),
+            Ipv4Addr::new(192, 0, 2, 99),
+            Ipv4Addr::new(203, 0, 113, 52),
+            2053
+        ));
+        assert!(table.has_active_conflict(
+            &(Ipv4Addr::LOCALHOST, 40003),
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 88),
+            2053
+        ));
+        assert!(!table.has_active_conflict(
+            &(Ipv4Addr::LOCALHOST, 40003),
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 52),
+            2053
+        ));
 
         // Build minimal 40-byte IPv4 + TCP SYN packet and test parse + dst/src rewrite.
         let mut pkt = [0u8; 40];
@@ -3534,7 +4509,7 @@ mod tests {
                 let m = Arc::clone(&metrics_clone);
                 let rx = shutdown_rx.clone();
                 tokio::spawn(async move {
-                    forward_redirected_stream(stream, peer, socks_port, n, m, rx).await;
+                    forward_redirected_stream(stream, peer, socks_port, n, m, rx, None).await;
                 });
             }
         });
@@ -3558,6 +4533,7 @@ mod tests {
         nat_table.insert(
             local_ep,
             NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
                 orig_dst_ip: Ipv4Addr::new(203, 0, 113, 77),
                 orig_dst_port: 8443,
                 if_idx: 1,
@@ -3566,6 +4542,7 @@ mod tests {
                 process_name: "sing-box.exe".to_string(),
                 detected_by: "system_proxy_host".to_string(),
                 last_seen: Instant::now(),
+                closing_since: None,
             },
         );
 
@@ -3583,7 +4560,11 @@ mod tests {
 
         assert_eq!(metrics.total_connections.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
-        assert!(nat_table.is_empty());
+        // NAT entry stays in closing-grace retention for clean FIN-ACK teardown instead of immediate deletion.
+        let closing_entry = nat_table
+            .get_and_touch(&local_ep)
+            .expect("entry should stay in closing grace");
+        assert!(closing_entry.closing_since.is_some());
         assert!(metrics.up_bytes.load(Ordering::Relaxed) >= 5);
         assert!(metrics.down_bytes.load(Ordering::Relaxed) >= 6);
         assert_eq!(
@@ -3613,6 +4594,7 @@ mod tests {
         table.insert(
             key_a,
             NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
                 orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
                 orig_dst_port: 8443,
                 if_idx: 3,
@@ -3621,11 +4603,13 @@ mod tests {
                 process_name: "app-a.exe".to_string(),
                 detected_by: "manual".to_string(),
                 last_seen: now,
+                closing_since: None,
             },
         );
         table.insert(
             key_b,
             NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
                 orig_dst_ip: Ipv4Addr::new(203, 0, 113, 20),
                 orig_dst_port: 2053,
                 if_idx: 3,
@@ -3634,6 +4618,7 @@ mod tests {
                 process_name: "app-b.exe".to_string(),
                 detected_by: "local_proxy_listener".to_string(),
                 last_seen: now,
+                closing_since: None,
             },
         );
 
@@ -3784,6 +4769,7 @@ mod tests {
         nat_table.insert(
             local_ep,
             NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
                 orig_dst_ip: Ipv4Addr::new(203, 0, 113, 88),
                 orig_dst_port: 8443,
                 if_idx: 1,
@@ -3792,6 +4778,7 @@ mod tests {
                 process_name: "stalled.exe".to_string(),
                 detected_by: "manual".to_string(),
                 last_seen: Instant::now(),
+                closing_since: None,
             },
         );
 
@@ -3799,8 +4786,16 @@ mod tests {
         let metrics_ref = Arc::clone(&metrics);
         let fwd_task = tokio::spawn(async move {
             let (stream, peer) = redir_listener.accept().await.unwrap();
-            forward_redirected_stream(stream, peer, socks_port, nat_ref, metrics_ref, shutdown_rx)
-                .await;
+            forward_redirected_stream(
+                stream,
+                peer,
+                socks_port,
+                nat_ref,
+                metrics_ref,
+                shutdown_rx,
+                None,
+            )
+            .await;
         });
 
         let _client = client_sock.connect(redir_addr).await.unwrap();
@@ -3817,7 +4812,29 @@ mod tests {
 
         socks_hold.abort();
         assert_eq!(metrics.active_connections.load(Ordering::Relaxed), 0);
-        assert!(nat_table.is_empty());
+        // Entry transitions to graceful FIN-ACK closing grace rather than hard-dropping mid-close.
+        let closed_entry = nat_table
+            .get_and_touch(&local_ep)
+            .expect("closing grace entry remains briefly for FIN-ACK rewrite");
+        assert!(closed_entry.closing_since.is_some());
+        assert!(nat_table.has_active_conflict(
+            &local_ep,
+            Ipv4Addr::new(192, 0, 2, 11),
+            Ipv4Addr::new(203, 0, 113, 88),
+            8443
+        ));
+        assert!(nat_table.has_active_conflict(
+            &local_ep,
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 99),
+            8443
+        ));
+        assert!(!nat_table.has_active_conflict(
+            &local_ep,
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 88),
+            8443
+        ));
     }
 
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
@@ -4064,6 +5081,12 @@ mod tests {
             serde_json::from_str(legacy_json).expect("deserialize legacy GlobalPreAccelStatus");
         assert!(!parsed.is_windivert_active);
         assert_eq!(parsed.install_state, "idle");
+        assert_eq!(parsed.verify_state, "idle");
+        assert!(parsed.verify_latency_ms.is_none());
+        assert!(parsed.verify_message.is_none());
+        assert!(parsed.detected_security_products.is_empty());
+        assert!(parsed.security_guidance.is_none());
+        assert!(parsed.bound_physical_interface.is_none());
         assert!(parsed.process_stats.is_empty());
 
         // Manager install state normalization and reporting.
@@ -4225,5 +5248,420 @@ mod tests {
         assert!(snap3.contains(&tunnel_pid));
         assert!(snap3.contains(&webview_pid));
         assert!(!snap3.contains(&probe_pid));
+    }
+
+    #[test]
+    fn loopback_packet_rewrite_mss_clamp_and_interface_binding_work() {
+        // 1. Standalone YAML writes `interface-name` when a physical NIC is provided.
+        let cfg = AppConfig::default();
+        let relays = vec![sample_anytls_relay_with_dirty_sni()];
+        let yaml_bound = compile_standalone_preaccel_yaml_with_interface(
+            &cfg,
+            &relays,
+            17909,
+            Some("WLAN"),
+        )
+        .expect("compile with physical interface");
+        let doc: Value = serde_yaml_ng::from_str(&yaml_bound).expect("valid yaml");
+        assert_eq!(doc["interface-name"].as_str(), Some("WLAN"));
+
+        let yaml_unbound = compile_standalone_preaccel_yaml_with_interface(
+            &cfg,
+            &relays,
+            17909,
+            Some("   "),
+        )
+        .expect("compile with blank interface");
+        let doc_unbound: Value = serde_yaml_ng::from_str(&yaml_unbound).expect("valid yaml");
+        assert!(doc_unbound.get("interface-name").is_none());
+
+        // 2. Outbound packet rewrite to 127.0.0.1 loopback + return packet restoration + MSS clamping.
+        let mut pkt = [0u8; 44]; // 20B IPv4 + 24B TCP (including 4B MSS option)
+        pkt[0] = 0x45;
+        pkt[9] = 6;
+        pkt[12..16].copy_from_slice(&[192, 168, 2, 10]);
+        pkt[16..20].copy_from_slice(&[203, 0, 113, 44]);
+        pkt[20..22].copy_from_slice(&51234u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&2053u16.to_be_bytes());
+        pkt[32] = 6 << 4; // TCP data offset = 24 bytes
+        pkt[33] = Ipv4TcpMeta::FLAG_SYN | Ipv4TcpMeta::FLAG_ACK;
+        // TCP Option Kind=2 (MSS), Len=4, Value=65495 (Windows loopback giant MSS)
+        pkt[40] = 2;
+        pkt[41] = 4;
+        pkt[42..44].copy_from_slice(&65495u16.to_be_bytes());
+
+        assert!(rewrite_ipv4_tcp_to_loopback(&mut pkt, 20, 48888));
+        let lo_meta = parse_ipv4_tcp_packet(&pkt).expect("parse loopback packet");
+        assert_eq!(lo_meta.src_ip, Ipv4Addr::LOCALHOST);
+        assert_eq!(lo_meta.dst_ip, Ipv4Addr::LOCALHOST);
+        assert_eq!(lo_meta.src_port, 51234);
+        assert_eq!(lo_meta.dst_port, 48888);
+
+        // Simulate return packet from 127.0.0.1:48888 -> 127.0.0.1:51234
+        pkt[20..22].copy_from_slice(&48888u16.to_be_bytes());
+        pkt[22..24].copy_from_slice(&51234u16.to_be_bytes());
+        assert!(rewrite_ipv4_tcp_from_loopback(
+            &mut pkt,
+            20,
+            Ipv4Addr::new(203, 0, 113, 44),
+            2053,
+            Ipv4Addr::new(192, 168, 2, 10),
+        ));
+        assert!(clamp_tcp_syn_mss(&mut pkt, 20, 1460));
+        assert!(!clamp_tcp_syn_mss(&mut pkt, 20, 1460)); // already clamped
+
+        let ret_meta = parse_ipv4_tcp_packet(&pkt).expect("parse restored packet");
+        assert_eq!(ret_meta.src_ip, Ipv4Addr::new(203, 0, 113, 44));
+        assert_eq!(ret_meta.dst_ip, Ipv4Addr::new(192, 168, 2, 10));
+        assert_eq!(ret_meta.src_port, 2053);
+        assert_eq!(ret_meta.dst_port, 51234);
+        assert_eq!(u16::from_be_bytes([pkt[42], pkt[43]]), 1460);
+    }
+
+    #[test]
+    fn security_product_classification_and_tailored_guidance_cover_huorong_360_and_defender() {
+        let procs = vec![
+            "MsMpEng.exe".to_string(),
+            "HipsDaemon.exe".to_string(),
+            "svchost.exe".to_string(),
+        ];
+        let products = classify_security_products_from_process_names(&procs);
+        // Third-party security suite (Huorong) ranks ahead of Defender.
+        assert_eq!(
+            products,
+            vec![
+                "火绒安全".to_string(),
+                "Windows 安全中心（Defender）".to_string()
+            ]
+        );
+        let guide_hr = build_security_guidance(
+            &products,
+            Some(Path::new(r"C:\CatCloud\bin")),
+            "self_test_blocked",
+        );
+        assert!(guide_hr.contains("火绒安全"));
+        assert!(guide_hr.contains("信任区"));
+        assert!(guide_hr.contains("重新探测"));
+
+        let defender_only =
+            classify_security_products_from_process_names(&["msmpeng.exe".to_string()]);
+        assert_eq!(
+            defender_only,
+            vec!["Windows 安全中心（Defender）".to_string()]
+        );
+        let guide_def = build_security_guidance(
+            &defender_only,
+            Some(Path::new(r"C:\CatCloud\bin")),
+            "download_or_write",
+        );
+        assert!(guide_def.contains("Windows 安全中心"));
+        assert!(guide_def.contains("排除项"));
+
+        let suite_360 =
+            classify_security_products_from_process_names(&["360Tray.exe".to_string()]);
+        assert_eq!(suite_360, vec!["360 安全卫士".to_string()]);
+        let guide_360 = build_security_guidance(&suite_360, None, "driver_load");
+        assert!(guide_360.contains("360 安全卫士"));
+
+        // Self-test probe URL list strictly retains HTTP non-443 endpoints and deduplicates.
+        let urls = build_self_test_probe_urls("https://example.com:443/check");
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].starts_with("http://"));
+        assert!(urls[1].starts_with("http://"));
+    }
+
+    #[tokio::test]
+    async fn self_test_redirected_stream_increments_counter_without_polluting_user_metrics() {
+        let mock_socks = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socks_port = mock_socks.local_addr().unwrap().port();
+        let socks_task = tokio::spawn(async move {
+            let (mut sock, _) = mock_socks.accept().await.unwrap();
+            let mut greet = [0u8; 3];
+            sock.read_exact(&mut greet).await.unwrap();
+            sock.write_all(&[0x05, 0x00]).await.unwrap();
+            let mut req = [0u8; 10];
+            sock.read_exact(&mut req).await.unwrap();
+            sock.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+            let mut buf = [0u8; 64];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = sock.shutdown().await;
+        });
+
+        let redir_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redir_addr = redir_listener.local_addr().unwrap();
+        let nat_table = Arc::new(NatTable::new(16, Duration::from_secs(60)));
+        let metrics = Arc::new(GlobalPreAccelMetrics::default());
+        let accepted_counter = Arc::new(AtomicU64::new(0));
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let nat_c = Arc::clone(&nat_table);
+        let met_c = Arc::clone(&metrics);
+        let acc_c = Arc::clone(&accepted_counter);
+        let accept_task = tokio::spawn(async move {
+            let (stream, peer) = redir_listener.accept().await.unwrap();
+            forward_redirected_stream(stream, peer, socks_port, nat_c, met_c, shutdown_rx, Some(acc_c))
+                .await;
+        });
+
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let local_ep = match sock.local_addr().unwrap() {
+            SocketAddr::V4(v4) => (*v4.ip(), v4.port()),
+            _ => unreachable!(),
+        };
+        nat_table.insert(
+            local_ep,
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 80),
+                orig_dst_port: 80,
+                if_idx: 1,
+                sub_if_idx: 0,
+                owner_pid: std::process::id(),
+                process_name: "catcloud-desktop.exe".to_string(),
+                detected_by: SELF_TEST_DETECTED_BY.to_string(),
+                last_seen: Instant::now(),
+                closing_since: None,
+            },
+        );
+
+        let mut client = sock.connect(redir_addr).await.unwrap();
+        client
+            .write_all(b"GET /generate_204 HTTP/1.1\r\nHost: test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = [0u8; 64];
+        let n = client.read(&mut resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp[..n]).contains("204"));
+        drop(client);
+        let _ = socks_task.await;
+        let _ = accept_task.await;
+
+        assert_eq!(accepted_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.total_connections.load(Ordering::Relaxed), 0);
+        assert!(metrics.recent_processes_snapshot().is_empty());
+        assert!(metrics.snapshot().is_empty());
+    }
+
+    #[test]
+    fn standalone_preaccel_yaml_excludes_ip_and_domain_probe_url_from_direct_rules() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.probe_url = "http://203.0.113.204/generate_204".to_string();
+        cfg.preaccel.fallback_probe_url = "http://connect.rom.miui.com/generate_204".to_string();
+        cfg.preaccel.campus_direct_domains = vec!["portal.campus.example.edu".to_string()];
+
+        let mut domain_relay = sample_vless_relay_with_dirty_sni();
+        domain_relay.id = "relay-domain-443".to_string();
+        domain_relay.server = "relay-cn.example.com".to_string();
+        domain_relay.priority = 30;
+
+        let relays = vec![sample_anytls_relay_with_dirty_sni(), domain_relay];
+        let yaml_str =
+            compile_standalone_preaccel_yaml_with_interface(&cfg, &relays, 17912, Some("WLAN"))
+                .expect("compile standalone yaml");
+        let doc: Value = serde_yaml_ng::from_str(&yaml_str).expect("parse standalone yaml");
+        let rules: Vec<&str> = doc["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+
+        assert!(rules.contains(&"IP-CIDR,203.0.113.10/32,DIRECT,no-resolve"));
+        assert!(rules.contains(&"DOMAIN,relay-cn.example.com,DIRECT"));
+        assert!(!rules.iter().any(|r| r.contains("203.0.113.204")));
+        assert!(!rules.iter().any(|r| {
+            let lower = r.to_ascii_lowercase();
+            lower.contains("hicloud.com")
+                || lower.contains("miui.com")
+                || lower.contains("campus.example.edu")
+        }));
+        let expected_match = format!("MATCH,{PREACCEL_SELECT_GROUP}");
+        assert_eq!(rules.last().copied(), Some(expected_match.as_str()));
+    }
+
+    #[test]
+    fn is_physical_nic_descriptor_allows_pppoe_and_cellular_while_blocking_vpns_and_miniports() {
+        // Real physical NICs: Ethernet (6), Wi-Fi (71), PPPoE dial-up (23), 4G/5G WWAN (243/244).
+        assert!(is_physical_nic_descriptor(
+            6,
+            5,
+            "Intel(R) Ethernet Controller I225-V"
+        ));
+        assert!(is_physical_nic_descriptor(
+            71,
+            4,
+            "Qualcomm FastConnect 6900 Wi-Fi 6E"
+        ));
+        assert!(is_physical_nic_descriptor(23, 5, "WAN Miniport (PPPOE)"));
+        assert!(is_physical_nic_descriptor(
+            23,
+            5,
+            "WAN Miniport (PPPoE) 宽带连接"
+        ));
+        assert!(is_physical_nic_descriptor(
+            243,
+            5,
+            "Qualcomm Snapdragon X55 5G Modem"
+        ));
+        assert!(is_physical_nic_descriptor(
+            244,
+            4,
+            "Fibocom L850-GL 4G LTE"
+        ));
+
+        // Non-PPPoE WAN Miniports and VPN dial-up protocols must stay strictly blocked.
+        assert!(!is_physical_nic_descriptor(23, 5, "WAN Miniport (PPTP)"));
+        assert!(!is_physical_nic_descriptor(23, 5, "WAN Miniport (L2TP)"));
+        assert!(!is_physical_nic_descriptor(23, 5, "WAN Miniport (SSTP)"));
+        assert!(!is_physical_nic_descriptor(23, 5, "WAN Miniport (IKEv2)"));
+        assert!(!is_physical_nic_descriptor(23, 5, "WAN Miniport (IP)"));
+        assert!(!is_physical_nic_descriptor(23, 5, "Corp L2TP Dialer"));
+        assert!(!is_physical_nic_descriptor(23, 5, "WAN Miniport (PPPOE) VPN"));
+
+        // Virtual / TUN / container / hypervisor adapters remain strictly blocked.
+        assert!(!is_physical_nic_descriptor(6, 5, "Wintun Userspace Tunnel"));
+        assert!(!is_physical_nic_descriptor(6, 5, "WireGuard Tunnel"));
+        assert!(!is_physical_nic_descriptor(6, 5, "Clash Meta Adapter"));
+        assert!(!is_physical_nic_descriptor(6, 5, "Mihomo TUN"));
+        assert!(!is_physical_nic_descriptor(6, 5, "TAP-Windows Adapter V9"));
+        assert!(!is_physical_nic_descriptor(6, 5, "VMware Network Adapter VMnet8"));
+        assert!(!is_physical_nic_descriptor(6, 5, "VirtualBox Host-Only Ethernet"));
+        assert!(!is_physical_nic_descriptor(243, 5, "Virtual Cellular VPN"));
+        assert!(!is_physical_nic_descriptor(23, 2, "WAN Miniport (PPPOE)")); // oper_status down
+    }
+
+    #[test]
+    fn nat_table_closing_grace_blocks_port_reuse_cross_flow_and_remove_active_guards_closing() {
+        assert_eq!(NAT_CLOSING_GRACE, Duration::from_secs(4));
+
+        let table = NatTable::new(16, Duration::from_secs(60));
+        let key = (Ipv4Addr::LOCALHOST, 52100);
+        let src_a = Ipv4Addr::new(192, 0, 2, 10);
+        let src_b = Ipv4Addr::new(192, 0, 2, 11);
+        let dst_a = Ipv4Addr::new(203, 0, 113, 10);
+        let dst_b = Ipv4Addr::new(203, 0, 113, 20);
+        let now = Instant::now();
+
+        table.insert(
+            key,
+            NatEntry {
+                orig_src_ip: src_a,
+                orig_dst_ip: dst_a,
+                orig_dst_port: 8443,
+                if_idx: 4,
+                sub_if_idx: 0,
+                owner_pid: 7001,
+                process_name: "proxy-core.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: now,
+                closing_since: None,
+            },
+        );
+
+        // Active entry: mismatching 4-tuple cannot be removed by `remove_active_if_matching`.
+        assert!(!table.remove_active_if_matching(&key, src_b, dst_a, 8443));
+        assert!(!table.remove_active_if_matching(&key, src_a, dst_b, 8443));
+        assert!(!table.remove_active_if_matching(&key, src_a, dst_a, 9443));
+        assert!(table.get_and_touch(&key).is_some());
+
+        // Transition to closing grace: `remove_active_if_matching` must refuse even exact 4-tuple.
+        assert!(table.mark_closing_if_matching(&key, src_a, dst_a, 8443));
+        assert!(!table.remove_active_if_matching(&key, src_a, dst_a, 8443));
+        assert!(table.get_and_touch(&key).is_some());
+
+        // Closing grace conflicts with any different 4-tuple reusing the ephemeral source port.
+        assert!(table.has_active_conflict(&key, src_b, dst_a, 8443));
+        assert!(table.has_active_conflict(&key, src_a, dst_b, 8443));
+        assert!(table.has_active_conflict(&key, src_a, dst_a, 9443));
+        assert!(!table.has_active_conflict(&key, src_a, dst_a, 8443));
+
+        // Once the 4s closing grace elapses, conflict clears and the stale entry is evicted.
+        table.insert(
+            key,
+            NatEntry {
+                orig_src_ip: src_a,
+                orig_dst_ip: dst_a,
+                orig_dst_port: 8443,
+                if_idx: 4,
+                sub_if_idx: 0,
+                owner_pid: 7001,
+                process_name: "proxy-core.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: now,
+                closing_since: Some(now - Duration::from_secs(5)),
+            },
+        );
+        assert!(!table.has_active_conflict(&key, src_a, dst_b, 9443));
+        assert!(table.is_empty());
+
+        // Re-insert active entry and verify exact active removal works cleanly.
+        table.insert(
+            key,
+            NatEntry {
+                orig_src_ip: src_a,
+                orig_dst_ip: dst_a,
+                orig_dst_port: 8443,
+                if_idx: 4,
+                sub_if_idx: 0,
+                owner_pid: 7001,
+                process_name: "proxy-core.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: Instant::now(),
+                closing_since: None,
+            },
+        );
+        assert!(table.remove_active_if_matching(&key, src_a, dst_a, 8443));
+        assert!(table.is_empty());
+    }
+
+    #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+    #[test]
+    fn locate_windivert_files_short_circuits_on_non_windows_x64() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-wd-shortcircuit-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.join("data"), true).unwrap();
+        std::fs::write(paths.bin_dir.join("WinDivert64.dll"), b"dll").unwrap();
+        std::fs::write(paths.bin_dir.join("WinDivert64.sys"), b"sys").unwrap();
+
+        assert!(locate_windivert_files(&paths, None).is_none());
+        assert!(locate_windivert_paths(&paths, None).is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn reverify_windivert_when_stopped_never_resurrects_runtime() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-reverify-stopped-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.join("data"), true).unwrap();
+        let job_guard = Arc::new(JobGuard::new().unwrap());
+        let manager = GlobalPreAccelManager::new(paths, job_guard);
+        let cfg = AppConfig::default();
+        let relays = vec![sample_anytls_relay_with_dirty_sni()];
+
+        let stopped = manager.stop().await.expect("stop idle manager");
+        assert!(!stopped.running);
+        assert_eq!(stopped.mode, "off");
+
+        let reverified = manager
+            .reverify_windivert(&cfg, &relays, &[])
+            .await
+            .expect("reverify stopped manager");
+        assert!(!reverified.running);
+        assert_eq!(reverified.mode, "off");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
