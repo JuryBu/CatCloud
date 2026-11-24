@@ -1,5 +1,6 @@
 import {
   Activity,
+  AlertTriangle,
   ArrowDown,
   ArrowRight,
   ArrowUp,
@@ -33,6 +34,7 @@ import {
   Zap,
 } from "lucide-react";
 import { type FormEvent, memo, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   type ExitIpInfo,
   type MultiGroupMode,
@@ -42,12 +44,12 @@ import {
   type SiteCheckItem,
   catcloudApi,
   formatErrorMessage,
-  isTauriEnv,
 } from "../api/tauri";
 import { MASCOT_STATE_LABELS, type MascotState, MascotSprite } from "../components/MascotSprite";
 import { TrafficSparkline, formatBytes, formatRate } from "../components/TrafficSparkline";
 import { appActions, useAppSelector, useLatestTraffic } from "../store/appStore";
 import { resolvePlatformOs } from "../utils/platform";
+import { resolvePreAccelSummary } from "../utils/preaccelStatus";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
 
 const PROXY_MODE_OPTIONS: ReadonlyArray<{ id: ProxyMode; label: string; hint: string }> = [
@@ -191,7 +193,7 @@ const HomeLiveKpiGrid = memo(function HomeLiveKpiGrid({
       sub: connSub,
       title:
         tunnelCount > 0
-          ? `真实应用连接 ${traffic.connections} 条（另含 ${tunnelCount} 条国内底层提速隧道，未重复计入）`
+          ? `真实应用连接 ${traffic.connections} 条（另含 ${tunnelCount} 条国内提速隧道，未重复计入）`
           : `真实应用连接 ${traffic.connections} 条`,
       accent: "var(--text)",
       icon: Activity,
@@ -310,8 +312,11 @@ export function HomePage() {
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
   const subscriptions = useAppSelector((s) => s.subscriptions);
-  const storeExitIp = useAppSelector((s) => s.exitIp);
-  const storeQuickSites = useAppSelector((s) => s.quickSites);
+  const exitIp = useAppSelector((s) => s.exitIp);
+  const sites = useAppSelector((s) => s.quickSites);
+  const checkingSites = useAppSelector((s) => s.bgTasks.home.checkingQuickSites);
+  const refreshingIp = useAppSelector((s) => s.bgTasks.home.refreshingExitIp);
+  const ipMasked = useAppSelector((s) => s.sessionDrafts.home.ipMasked);
   const mascotState = useAppSelector((s) => s.mascotState);
   const initialized = useAppSelector((s) => s.initialized);
 
@@ -321,43 +326,20 @@ export function HomePage() {
   const [nodeSearch, setNodeSearch] = useState("");
   const [switchingNode, setSwitchingNode] = useState(false);
 
-  const [sites, setSites] = useState<SiteCheckItem[]>(storeQuickSites);
-  const [customSiteIds, setCustomSiteIds] = useState<string[]>([]);
   const [showAddSite, setShowAddSite] = useState(false);
   const [newSiteName, setNewSiteName] = useState("");
   const [newSiteUrl, setNewSiteUrl] = useState("");
-  const [checkingSites, setCheckingSites] = useState(false);
+  const [pendingRemoveSite, setPendingRemoveSite] = useState<SiteCheckItem | null>(null);
+  const [removingSite, setRemovingSite] = useState(false);
 
-  const [exitIp, setExitIp] = useState<ExitIpInfo>(storeExitIp);
-  const [ipMasked, setIpMasked] = useState(true);
-  const [refreshingIp, setRefreshingIp] = useState(false);
   const [copyingAiDiag, setCopyingAiDiag] = useState(false);
   const [copiedAiDiag, setCopiedAiDiag] = useState(false);
 
-  const syncedSitesRef = useRef(false);
   const timerIdsRef = useRef<number[]>([]);
-  const pageRootRef = useRef<HTMLDivElement | null>(null);
   const nodeDropdownRef = useRef<HTMLDivElement | null>(null);
   const nodeSearchInputRef = useRef<HTMLInputElement | null>(null);
 
   const isSingleMode = runtime.route_mode === "single";
-
-  useEffect(() => {
-    if (typeof window !== "undefined") {
-      window.scrollTo({ top: 0, behavior: "auto" });
-    }
-    const scrollContainer =
-      pageRootRef.current?.closest("main > div") ??
-      pageRootRef.current?.parentElement ??
-      (typeof document !== "undefined" ? document.querySelector("main > div") : null);
-    if (scrollContainer && typeof scrollContainer.scrollTo === "function") {
-      scrollContainer.scrollTo({ top: 0, behavior: "auto" });
-    }
-    const mainEl = typeof document !== "undefined" ? document.querySelector("main") : null;
-    if (mainEl && typeof mainEl.scrollTo === "function") {
-      mainEl.scrollTo({ top: 0, behavior: "auto" });
-    }
-  }, []);
 
   useEffect(() => {
     return () => {
@@ -369,17 +351,15 @@ export function HomePage() {
   }, []);
 
   useEffect(() => {
-    if (initialized && !syncedSitesRef.current) {
-      syncedSitesRef.current = true;
-      setSites(storeQuickSites);
-    }
-  }, [storeQuickSites, initialized]);
-
-  useEffect(() => {
-    if (initialized) {
-      setExitIp(storeExitIp);
-    }
-  }, [storeExitIp, initialized]);
+    if (!pendingRemoveSite) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape" && !removingSite) {
+        setPendingRemoveSite(null);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [pendingRemoveSite, removingSite]);
 
   useEffect(() => {
     if (isSingleMode) {
@@ -486,23 +466,52 @@ export function HomePage() {
         })
       : groupCandidateNodes;
 
+    const healthHints = runtime.node_health_hints;
+    const resolveSortMetric = (id: string) => {
+      const p = probes[id];
+      const hint = healthHints?.[id];
+      const hintStatus = hint?.status;
+      const isCooldown = hintStatus === "cooldown";
+      const freshMs =
+        (hintStatus === "healthy" || hintStatus === "probation") &&
+        typeof hint?.latency_ms === "number" &&
+        Number.isFinite(hint.latency_ms) &&
+        hint.latency_ms > 0
+          ? hint.latency_ms
+          : null;
+      const snapMs =
+        p &&
+        p.ok !== false &&
+        typeof p.latency_ms === "number" &&
+        Number.isFinite(p.latency_ms)
+          ? p.latency_ms
+          : null;
+      const latency = freshMs ?? (isCooldown ? null : snapMs);
+      const ok = latency !== null;
+      const failed = !ok && (isCooldown || p?.ok === false);
+      return { ok, latency, failed };
+    };
+
     return [...filtered].sort((a, b) => {
       if (a.id === currentNodeId) return -1;
       if (b.id === currentNodeId) return 1;
-      const pa = probes[a.id];
-      const pb = probes[b.id];
-      const aOk = pa ? pa.ok !== false && pa.latency_ms !== null : false;
-      const bOk = pb ? pb.ok !== false && pb.latency_ms !== null : false;
-      if (aOk !== bOk) return aOk ? -1 : 1;
-      if (aOk && bOk && pa && pb && pa.latency_ms !== null && pb.latency_ms !== null) {
-        return pa.latency_ms - pb.latency_ms;
+      const ma = resolveSortMetric(a.id);
+      const mb = resolveSortMetric(b.id);
+      if (ma.ok !== mb.ok) return ma.ok ? -1 : 1;
+      if (ma.ok && mb.ok && ma.latency !== null && mb.latency !== null) {
+        return ma.latency - mb.latency;
       }
-      const aFailed = pa?.ok === false;
-      const bFailed = pb?.ok === false;
-      if (aFailed !== bFailed) return aFailed ? 1 : -1;
+      if (ma.failed !== mb.failed) return ma.failed ? 1 : -1;
       return a.name.localeCompare(b.name);
     });
-  }, [currentNodeId, groupCandidateNodes, nodeMenuOpen, nodeSearch, probes]);
+  }, [
+    currentNodeId,
+    groupCandidateNodes,
+    nodeMenuOpen,
+    nodeSearch,
+    probes,
+    runtime.node_health_hints,
+  ]);
 
   const visibleDropdownNodes = useMemo(
     () => sortedFilteredNodes.slice(0, MAX_VISIBLE_QUICK_NODES),
@@ -551,8 +560,15 @@ export function HomePage() {
       ? getRegionLabel(displayRegionCode)
       : "";
 
-  const displayLatencyMs =
-    runtime.active_node_latency_ms ?? activeNodeProbe?.latency_ms ?? null;
+  const liveActiveLatencyMs =
+    typeof runtime.active_node_latency_ms === "number" &&
+    Number.isFinite(runtime.active_node_latency_ms) &&
+    runtime.active_node_latency_ms > 0
+      ? runtime.active_node_latency_ms
+      : null;
+  const displayLatencyMs = liveActiveLatencyMs ?? activeNodeProbe?.latency_ms ?? null;
+  const displayLatencyOk =
+    liveActiveLatencyMs !== null ? true : activeNodeProbe ? activeNodeProbe.ok : null;
   const displayUpMbps =
     runtime.active_node_up_mbps ?? activeNodeProbe?.up_mbps ?? null;
   const displayDownMbps = activeNodeProbe?.down_mbps ?? null;
@@ -561,25 +577,29 @@ export function HomePage() {
 
   // Main power switch state & human-friendly traffic status
   const platformOs = resolvePlatformOs(runtime.os_label);
-  const isProxyEnabled =
-    runtime.running && (runtime.system_proxy_enabled || runtime.tun_enabled);
-  const isGlobalPreAccelRunning = Boolean(
-    runtime.global_preaccel_active || globalPreAccel.running
+  const preaccelSummary = resolvePreAccelSummary(
+    runtime,
+    globalPreAccel,
+    config.preaccel.enabled
   );
-  const effectiveGlobalMode = runtime.global_preaccel_mode ?? globalPreAccel.mode ?? "off";
-  const effectiveGlobalPort =
-    runtime.global_preaccel_socks_port ?? globalPreAccel.socks_port ?? null;
-  const isPreAccelConfigOn = Boolean(runtime.preaccel_enabled ?? config.preaccel.enabled);
-  const isProxyPreAccelRunning = Boolean(
-    isProxyEnabled && (runtime.preaccel_active || isPreAccelConfigOn)
-  );
-  const isStandaloneGlobalOnly = !isProxyEnabled && isGlobalPreAccelRunning;
-  const isAnyPreAccelActive = isProxyPreAccelRunning || isGlobalPreAccelRunning;
+  const isProxyEnabled = preaccelSummary.proxyActive;
 
   const trafficStatusSentence = (() => {
     if (!isProxyEnabled) {
-      if (isGlobalPreAccelRunning) {
-        return "未开启猫猫代理 · 底层全局国内提速运行中（正在加速其它软件）";
+      if (preaccelSummary.realWinDivertActive) {
+        return "未开启猫猫代理 · 全局国内提速运行中（正在加速其它代理软件）";
+      }
+      if (preaccelSummary.enabled) {
+        if (
+          preaccelSummary.installState === "downloading" ||
+          preaccelSummary.installState === "verifying"
+        ) {
+          return "未开启代理 · 正在后台准备提速组件…";
+        }
+        if (preaccelSummary.installState === "need_elevation") {
+          return "未开启代理 · 提速组件已就绪（需管理员权限以加速其它软件）";
+        }
+        return "未开启代理 · 国内提速本地通道待命";
       }
       return runtime.running
         ? "未开启代理，仅本地待命，不走流量"
@@ -597,22 +617,23 @@ export function HomePage() {
     return "已接管电脑网络流量";
   })();
 
-  const preAccelPillTitle = (() => {
-    if (isStandaloneGlobalOnly) {
-      if (effectiveGlobalMode === "windivert") {
-        return "底层全局国内提速运行中（WinDivert 正在自动加速电脑上其它梯子与工具）· 点击关闭";
+  const preAccelPillTitle = preaccelSummary.enabled
+    ? `${preaccelSummary.badgeText}（${preaccelSummary.detailText}）· 点击关闭`
+    : "一键开启国内提速（开启后猫猫云梯与电脑上其它代理软件都会一起走国内 443 提速）";
+
+  const preAccelPillLabel = (() => {
+    if (!preaccelSummary.enabled) return "国内提速";
+    if (!isProxyEnabled) {
+      if (preaccelSummary.realWinDivertActive) return "全局提速中";
+      if (
+        preaccelSummary.installState === "downloading" ||
+        preaccelSummary.installState === "verifying"
+      ) {
+        return "准备组件…";
       }
-      const portText = effectiveGlobalPort ? `127.0.0.1:${effectiveGlobalPort}` : "本地端口";
-      return `独立本地 443 通道运行中（${portText}）· 点击关闭`;
+      if (preaccelSummary.installState === "need_elevation") return "需管理员";
     }
-    if (isProxyPreAccelRunning) {
-      const relayLabel = runtime.preaccel_relay_name || "主力国内中转";
-      return `国内提速运行中（正通过「${relayLabel}」加速代理上传）· 点击关闭`;
-    }
-    if (isPreAccelConfigOn) {
-      return "国内提速已开启就绪（开启代理或底层全局提速后自动生效）· 点击关闭";
-    }
-    return "一键开启国内提速（开代理时加速猫猫流量，关代理时可独立给电脑上其它软件加速）";
+    return "国内提速";
   })();
 
   const tunPillTitle = runtime.tun_admin_ready
@@ -634,11 +655,12 @@ export function HomePage() {
   };
 
   // Dual-form mascot: cream cat idle by default, working sprite during probing/switching/toggling
-  const effectiveMascotState: MascotState = checkingSites
-    ? "searching"
-    : switchingNode || togglingProxy || togglingPreAccel
-      ? "thinking"
-      : mascotState;
+  const effectiveMascotState: MascotState =
+    checkingSites || refreshingIp
+      ? "searching"
+      : switchingNode || togglingProxy || togglingPreAccel
+        ? "thinking"
+        : mascotState;
 
   const handleToggleMainPower = async () => {
     if (togglingProxy) return;
@@ -656,20 +678,7 @@ export function HomePage() {
         }
         await appActions.toggleSystemProxy(true);
       } else {
-        const hadSysProxy = runtime.system_proxy_enabled;
-        const hadTun = runtime.tun_enabled;
-        const bothEnabled = hadSysProxy && hadTun;
-        let sysOk = true;
-        let tunOk = true;
-        if (hadSysProxy) {
-          sysOk = await appActions.toggleSystemProxy(false, bothEnabled);
-        }
-        if (hadTun) {
-          tunOk = await appActions.toggleTun(false, bothEnabled);
-        }
-        if (bothEnabled && sysOk && tunOk) {
-          appActions.showToast("已关闭系统代理与虚拟网卡", "info");
-        }
+        await appActions.disableAllProxyAndStopCore();
       }
     } catch (err) {
       appActions.showToast(`切换代理开关失败：${formatErrorMessage(err)}`, "warn");
@@ -735,31 +744,7 @@ export function HomePage() {
 
   const handleCheckSites = async () => {
     if (checkingSites) return;
-    setCheckingSites(true);
-    appActions.setMascotState("searching");
-    try {
-      const freshSites = await catcloudApi.checkQuickSites();
-      if (isTauriEnv()) {
-        setSites(freshSites);
-        appActions.syncQuickSites(freshSites);
-      } else {
-        const freshById = new Map(freshSites.map((item) => [item.id, item]));
-        setSites((prev) => {
-          const baseList = prev.length > 0 ? prev : freshSites;
-          return baseList.map((site) => {
-            const updated = freshById.get(site.id);
-            if (updated) return updated;
-            return { ...site, latency_ms: 88, ok: true };
-          });
-        });
-      }
-      appActions.showToast("网站连通检测完成", "ok");
-    } catch (err) {
-      appActions.showToast(`网站检测失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setCheckingSites(false);
-      appActions.setMascotState("idle");
-    }
+    await appActions.runQuickSitesCheck();
   };
 
   const handleAddSite = async (ev: FormEvent) => {
@@ -794,67 +779,43 @@ export function HomePage() {
     const saved = await persistQuickSites(nextSites);
     if (!saved) return;
 
-    setSites(nextSites);
-    setCustomSiteIds((prev) => [...prev, id]);
     setNewSiteName("");
     setNewSiteUrl("");
     setShowAddSite(false);
     appActions.showToast(`已添加站点：${trimmedName}`, "ok");
   };
 
-  const handleRemoveSite = async (site: SiteCheckItem) => {
-    const label = formatQuickSiteName(site.name);
-    if (typeof window !== "undefined" && !window.confirm(`确定要移除检测网站「${label}」吗？`)) {
-      return;
+  const handleRequestRemoveSite = (site: SiteCheckItem) => {
+    setPendingRemoveSite(site);
+  };
+
+  const handleConfirmRemoveSite = async () => {
+    if (!pendingRemoveSite || removingSite) return;
+    const target = pendingRemoveSite;
+    const label = formatQuickSiteName(target.name);
+    setRemovingSite(true);
+    try {
+      const nextSites = sites.filter((item) => item.id !== target.id);
+      const saved = await persistQuickSites(nextSites);
+      if (!saved) return;
+      setPendingRemoveSite(null);
+      appActions.showToast(`已移除站点：${label}`, "info");
+    } finally {
+      setRemovingSite(false);
     }
-    const nextSites = sites.filter((item) => item.id !== site.id);
-    const saved = await persistQuickSites(nextSites);
-    if (!saved) return;
-    setSites(nextSites);
-    setCustomSiteIds((prev) => prev.filter((item) => item !== site.id));
-    appActions.showToast(`已移除站点：${label}`, "info");
   };
 
   const handleResetDefaultSites = async () => {
     const nextSites = DEFAULT_QUICK_SITES.map((s) => ({ ...s }));
     const saved = await persistQuickSites(nextSites);
     if (!saved) return;
-    setSites(nextSites);
-    setCustomSiteIds([]);
     setShowAddSite(false);
     appActions.showToast("已恢复默认的 4 个常用检测网站", "ok");
   };
 
   const handleRefreshExitIp = async () => {
     if (refreshingIp) return;
-    setRefreshingIp(true);
-    appActions.setMascotState("searching");
-    try {
-      const info = await catcloudApi.getExitIpInfo();
-      setExitIp(info);
-      appActions.syncExitIp(info);
-      if (hasRealExitIp(info)) {
-        appActions.showToast("出口信息已更新", "ok");
-      } else {
-        const detailParts = [info.isp, info.location]
-          .map((s) => s?.trim() ?? "")
-          .filter(
-            (s) => s.length > 0 && s !== "未连接" && s !== "待检测" && s !== "待核心启动探测"
-          );
-        const detail = Array.from(new Set(detailParts)).join(" · ");
-        appActions.showToast(
-          detail ? `未获取到出口 IP：${detail}` : "未获取到出口 IP，请确认核心已启动且节点连通",
-          "warn"
-        );
-      }
-    } catch (err) {
-      appActions.showToast(`检测出口信息失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      scheduleTimeout(() => {
-        setRefreshingIp(false);
-        appActions.setMascotState("idle");
-      }, 240);
-    }
+    await appActions.runRefreshExitIp();
   };
 
   const handleCopyAiDiag = async () => {
@@ -875,9 +836,11 @@ export function HomePage() {
     ? "虚拟网卡已接管"
     : runtime.system_proxy_enabled
       ? "系统代理已接管"
-      : isGlobalPreAccelRunning
-        ? "底层提速运行中"
-        : "本地待命";
+      : preaccelSummary.realWinDivertActive
+        ? "全局提速运行中"
+        : preaccelSummary.enabled
+          ? "本地通道待命"
+          : "本地待命";
 
   const memSubLabel =
     config.gomemlimit_mb === 0
@@ -932,7 +895,7 @@ export function HomePage() {
           };
 
   return (
-    <div ref={pageRootRef} className="space-y-3 pb-3">
+    <div className="space-y-3 pb-3">
       {/* Gentle two-step onboarding banner when no nodes have been imported yet */}
       {initialized && nodes.length === 0 && (
         <section className="cc-card cc-glass rounded-2xl border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 p-4">
@@ -1019,9 +982,11 @@ export function HomePage() {
                   <p
                     title={trafficStatusSentence}
                     className={`mt-0.5 truncate text-xs ${
-                      isStandaloneGlobalOnly
+                      !isProxyEnabled && preaccelSummary.realWinDivertActive
                         ? "font-medium text-[var(--accent)]"
-                        : "text-[var(--text-secondary)]"
+                        : !isProxyEnabled && preaccelSummary.enabled
+                          ? "font-medium text-[var(--amber)]"
+                          : "text-[var(--text-secondary)]"
                     }`}
                   >
                     {trafficStatusSentence}
@@ -1091,23 +1056,21 @@ export function HomePage() {
                 <button
                   type="button"
                   disabled={togglingPreAccel}
-                  aria-pressed={isAnyPreAccelActive || isPreAccelConfigOn}
+                  aria-pressed={preaccelSummary.enabled}
                   onClick={() => void handleTogglePreAccelQuick()}
                   className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:opacity-65 ${
-                    isStandaloneGlobalOnly
-                      ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)]"
-                      : isProxyPreAccelRunning
-                        ? "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
-                        : isPreAccelConfigOn
-                          ? "border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 text-[var(--accent)]"
-                          : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+                    !preaccelSummary.enabled
+                      ? "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+                      : preaccelSummary.tone === "amber"
+                        ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)]"
+                        : "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
                   }`}
                   title={preAccelPillTitle}
                 >
                   <Zap
                     className={`h-3.5 w-3.5 ${togglingPreAccel ? "animate-pulse" : ""}`}
                   />
-                  <span>{isStandaloneGlobalOnly ? "底层提速中" : "国内提速"}</span>
+                  <span>{preAccelPillLabel}</span>
                 </button>
               </div>
             </div>
@@ -1144,37 +1107,30 @@ export function HomePage() {
                     </span>
 
                     {/* Domestic Pre-Acceleration Status Tag */}
-                    {(isAnyPreAccelActive || isPreAccelConfigOn) && (
+                    {(preaccelSummary.enabled || preaccelSummary.realWinDivertActive) && (
                       <button
                         type="button"
                         onClick={() => appActions.setNav("preaccel")}
                         className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold transition-opacity hover:opacity-90 ${
-                          isStandaloneGlobalOnly
-                            ? "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)]"
-                            : isProxyPreAccelRunning
-                              ? "border-[var(--green)]/50 bg-[var(--green-soft)]"
-                              : "border-[var(--accent)]/45 bg-[var(--accent-soft)]/70 text-[var(--accent)]"
+                          preaccelSummary.tone === "green"
+                            ? "border-[var(--green)]/50 bg-[var(--green-soft)]"
+                            : preaccelSummary.tone === "accent"
+                              ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
+                              : "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)]"
                         }`}
                         style={
-                          isProxyPreAccelRunning
+                          preaccelSummary.tone === "green"
                             ? { color: "color-mix(in srgb, var(--green) 78%, var(--text))" }
                             : undefined
                         }
-                        title={
-                          isStandaloneGlobalOnly
-                            ? "独立底层全局提速运行中，点击前往国内提速页查看详情"
-                            : isProxyPreAccelRunning
-                              ? "国内提速运行中，点击查看国内提速设置"
-                              : "国内提速已开启就绪，点击前往国内提速页配置"
-                        }
+                        title={`${preaccelSummary.detailText} · 点击前往国内提速页查看`}
                       >
                         <Zap className="h-3 w-3" />
                         <span>
-                          {isStandaloneGlobalOnly
-                            ? "底层提速中"
-                            : isProxyPreAccelRunning
-                              ? "国内提速中"
-                              : "提速已就绪"}
+                          {preaccelSummary.badgeText}
+                          {preaccelSummary.subBadgeText && preaccelSummary.proxyActive
+                            ? ` · ${preaccelSummary.subBadgeText}`
+                            : ""}
                         </span>
                       </button>
                     )}
@@ -1241,17 +1197,16 @@ export function HomePage() {
                           <strong
                             className="cc-mono font-semibold"
                             style={{
-                              color: getLatencyColor(
-                                displayLatencyMs,
-                                activeNodeProbe ? activeNodeProbe.ok : null
-                              ),
+                              color: getLatencyColor(displayLatencyMs, displayLatencyOk),
                             }}
                           >
-                            {activeNodeProbe?.ok === false
-                              ? "超时"
-                              : displayLatencyMs !== null
-                                ? `${Math.round(displayLatencyMs)} ms`
-                                : "未测"}
+                            {liveActiveLatencyMs !== null
+                              ? `${Math.round(liveActiveLatencyMs)} ms`
+                              : activeNodeProbe?.ok === false
+                                ? "超时"
+                                : displayLatencyMs !== null
+                                  ? `${Math.round(displayLatencyMs)} ms`
+                                  : "未测"}
                           </strong>
                         </span>
                         <span>
@@ -1354,17 +1309,16 @@ export function HomePage() {
                             <strong
                               className="cc-mono font-semibold"
                               style={{
-                                color: getLatencyColor(
-                                  displayLatencyMs,
-                                  activeNodeProbe ? activeNodeProbe.ok : null
-                                ),
+                                color: getLatencyColor(displayLatencyMs, displayLatencyOk),
                               }}
                             >
-                              {activeNodeProbe?.ok === false
-                                ? "超时"
-                                : displayLatencyMs !== null
-                                  ? `${Math.round(displayLatencyMs)} ms`
-                                  : "未测"}
+                              {liveActiveLatencyMs !== null
+                                ? `${Math.round(liveActiveLatencyMs)} ms`
+                                : activeNodeProbe?.ok === false
+                                  ? "超时"
+                                  : displayLatencyMs !== null
+                                    ? `${Math.round(displayLatencyMs)} ms`
+                                    : "未测"}
                             </strong>
                           </span>
                           <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap cc-mono">
@@ -1493,12 +1447,40 @@ export function HomePage() {
                           {visibleDropdownNodes.map((node) => {
                             const isCurrent = node.id === currentNodeId;
                             const snap = probes[node.id];
-                            const lat = snap?.latency_ms ?? null;
+                            const hint = runtime.node_health_hints?.[node.id];
+                            const isHintHealthy =
+                              hint?.status === "healthy" || hint?.status === "probation";
+                            const isHintCooldown = hint?.status === "cooldown";
+                            const hintLatency =
+                              isHintHealthy &&
+                              typeof hint?.latency_ms === "number" &&
+                              Number.isFinite(hint.latency_ms) &&
+                              hint.latency_ms > 0
+                                ? hint.latency_ms
+                                : null;
+                            const freshLatency =
+                              isCurrent && liveActiveLatencyMs !== null
+                                ? liveActiveLatencyMs
+                                : hintLatency;
+                            const lat =
+                              freshLatency ??
+                              (isHintCooldown ? null : (snap?.latency_ms ?? null));
+                            const latOk =
+                              freshLatency !== null
+                                ? true
+                                : isHintCooldown
+                                  ? false
+                                  : snap
+                                    ? snap.ok
+                                    : null;
                             const up = snap?.up_mbps ?? null;
                             const down = snap?.down_mbps ?? null;
                             const googleState = getProbeGoogleState(snap);
                             const aiInfo = getProbeAiBadges(snap);
-                            const latColor = getLatencyColor(lat, snap ? snap.ok : null);
+                            const latColor =
+                              isHintCooldown && freshLatency === null
+                                ? "var(--amber)"
+                                : getLatencyColor(lat, latOk);
                             const nodeRegionCode = resolveNodeRegionCode(node);
                             return (
                               <button
@@ -1578,11 +1560,17 @@ export function HomePage() {
                                     </span>
                                   )}
                                   <span className="font-semibold" style={{ color: latColor }}>
-                                    {snap?.ok === false
-                                      ? "超时"
-                                      : lat !== null
-                                        ? `${Math.round(lat)} ms`
-                                        : "未测"}
+                                    {freshLatency !== null
+                                      ? `${Math.round(freshLatency)} ms`
+                                      : isHintCooldown
+                                        ? hint && hint.cooldown_remaining_sec > 0
+                                          ? `冷却 ${Math.ceil(hint.cooldown_remaining_sec)}s`
+                                          : "冷却中"
+                                        : snap?.ok === false
+                                          ? "超时"
+                                          : lat !== null
+                                            ? `${Math.round(lat)} ms`
+                                            : "未测"}
                                   </span>
                                 </div>
                               </button>
@@ -1808,7 +1796,7 @@ export function HomePage() {
 
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
             {sites.map((site) => {
-              const isCustom = customSiteIds.includes(site.id);
+              const isCustom = site.id.startsWith("site-custom-");
               const color = getLatencyColor(site.latency_ms, site.ok);
               const displaySiteName = formatQuickSiteName(site.name);
               return (
@@ -1847,7 +1835,7 @@ export function HomePage() {
                     </span>
                     <button
                       type="button"
-                      onClick={() => void handleRemoveSite(site)}
+                      onClick={() => handleRequestRemoveSite(site)}
                       className="rounded-md p-1 text-[var(--muted)] opacity-0 transition-opacity hover:bg-[var(--card)] hover:text-[var(--red)] group-hover:opacity-100"
                       title={`移除 ${displaySiteName}`}
                       aria-label={`移除 ${displaySiteName}`}
@@ -1884,7 +1872,9 @@ export function HomePage() {
                 {hasExitIpData && (
                   <button
                     type="button"
-                    onClick={() => setIpMasked((prev) => !prev)}
+                    onClick={() =>
+                      appActions.patchSessionDraft("home", { ipMasked: !ipMasked })
+                    }
                     className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
                     title={ipMasked ? "点击查看完整地址" : "点击隐藏末尾数字"}
                   >
@@ -2046,6 +2036,86 @@ export function HomePage() {
           </span>
         </div>
       </footer>
+
+      {/* In-Page Two-Step Confirmation Modal for Removing a Quick Check Site */}
+      {pendingRemoveSite &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => {
+              if (!removingSite) setPendingRemoveSite(null);
+            }}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="确认移除检测网站"
+              onClick={(e) => e.stopPropagation()}
+              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--amber-soft)] text-[var(--amber)]">
+                    <AlertTriangle className="h-4 w-4" />
+                  </span>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                      确认移除检测网站？
+                    </h3>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                      确定要从常用网站连通检测列表中移除「
+                      <span className="font-semibold text-[var(--text)]">
+                        {formatQuickSiteName(pendingRemoveSite.name)}
+                      </span>
+                      」吗？移除后可随时重新添加，或点击「恢复默认」还原预设站点。
+                    </p>
+                    <p
+                      className="mt-1.5 truncate cc-mono rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11px] text-[var(--muted)]"
+                      title={pendingRemoveSite.url}
+                    >
+                      {pendingRemoveSite.url}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={removingSite}
+                  onClick={() => setPendingRemoveSite(null)}
+                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+                  aria-label="关闭弹窗"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={removingSite}
+                  onClick={() => setPendingRemoveSite(null)}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text)] disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={removingSite}
+                  onClick={() => void handleConfirmRemoveSite()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--red)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+                >
+                  {removingSite ? (
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Trash2 className="h-3.5 w-3.5" />
+                  )}
+                  <span>{removingSite ? "正在移除…" : "确认移除"}</span>
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
     </div>
   );
 }

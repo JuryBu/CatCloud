@@ -6,9 +6,8 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
-  Copy,
+  Clock,
   Cpu,
-  Download,
   FileCode2,
   FileText,
   Filter,
@@ -25,7 +24,8 @@ import {
   Server,
   ShieldAlert,
   ShieldCheck,
-  Terminal,
+  Sparkles,
+  Square,
   Trash2,
   Upload,
   X,
@@ -34,12 +34,12 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  type DesktopAppCandidate,
+  type LiveCaptureOutcomeDto,
   type MigrationPreviewDto,
   type MultiGroup,
   type PreAccelOverrideMode,
   type ProbeSnapshot,
-  type ProcessCandidateDto,
-  type ProcessInspectResult,
   type ProxyNode,
   type SubscriptionRecord,
   catcloudApi,
@@ -51,7 +51,8 @@ import {
   ContinentRegionFilter,
   PaginationBar,
 } from "../components/ContinentRegionFilter";
-import { appActions, useAppSelector } from "../store/appStore";
+import { GroupMembershipPopover } from "../components/GroupMembershipPopover";
+import { appActions, appStore, useAppSelector } from "../store/appStore";
 import {
   type ContinentId,
   buildContinentRegionStats,
@@ -93,55 +94,6 @@ interface MigrationPreviewItem {
   append_rules: string[];
   warnings: string[];
 }
-
-interface ProcessCandidateItem {
-  pid: number;
-  name: string;
-  exe_path: string | null;
-  cmdline: string[];
-  detected_config_dir: string | null;
-  detected_config_file: string | null;
-  detected_controller_addr: string | null;
-  likely_proxy_client: boolean;
-}
-
-type AttachRecommendationItem =
-  | {
-      mode: "read_only_local_file";
-      path: string;
-      node_count: number;
-      reason: string;
-    }
-  | {
-      mode: "public_controller_api";
-      endpoint_url: string;
-      proxy_count: number;
-      requires_secret: boolean;
-      reason: string;
-    }
-  | {
-      mode: "external_adapter_template";
-      schema: string;
-      suggested_command: string;
-      template_script: string;
-      reason: string;
-    };
-
-interface ProcessInspectionItem {
-  pid: number;
-  process_name: string;
-  readable_yaml_file: string | null;
-  yaml_node_count: number;
-  controller_url: string | null;
-  controller_reachable: boolean;
-  controller_requires_secret: boolean;
-  controller_proxy_count: number;
-  recommendation: AttachRecommendationItem;
-  notes: string[];
-  preview_nodes: ProxyNode[];
-}
-
-const ADAPTER_SCHEMA_V1 = "catcloud-adapter/v1";
 
 const SUB_KIND_LABELS: Record<SubscriptionRecord["kind"], string> = {
   url: "订阅链接",
@@ -314,74 +266,12 @@ const DEMO_MIGRATION_SCANS: Record<
   },
 };
 
-const DEMO_PROCESS_CANDIDATES: ProcessCandidateItem[] = [
-  {
-    pid: 14208,
-    name: "mihomo.exe",
-    exe_path: "C:\\Users\\<USER>\\Tools\\mihomo\\mihomo.exe",
-    cmdline: [
-      "mihomo.exe",
-      "-d",
-      "C:\\Users\\<USER>\\AppData\\Roaming\\clash-demo",
-      "-f",
-      "runtime.yaml",
-      "-ext-ctl",
-      "127.0.0.1:19091",
-    ],
-    detected_config_dir: "C:\\Users\\<USER>\\AppData\\Roaming\\clash-demo",
-    detected_config_file:
-      "C:\\Users\\<USER>\\AppData\\Roaming\\clash-demo\\runtime.yaml",
-    detected_controller_addr: "127.0.0.1:19091",
-    likely_proxy_client: true,
-  },
-  {
-    pid: 18540,
-    name: "clash-meta.exe",
-    exe_path: "C:\\Users\\<USER>\\Tools\\clash-meta\\clash-meta.exe",
-    cmdline: ["clash-meta.exe", "--ext-ctl=127.0.0.1:19092"],
-    detected_config_dir: null,
-    detected_config_file: null,
-    detected_controller_addr: "127.0.0.1:19092",
-    likely_proxy_client: true,
-  },
-  {
-    pid: 22196,
-    name: "mihomo-secure.exe",
-    exe_path: "C:\\Users\\<USER>\\Tools\\mihomo-secure\\mihomo-secure.exe",
-    cmdline: ["mihomo-secure.exe", "-ext-ctl", "0.0.0.0:19093"],
-    detected_config_dir: null,
-    detected_config_file: null,
-    detected_controller_addr: "0.0.0.0:19093",
-    likely_proxy_client: true,
-  },
-  {
-    pid: 26812,
-    name: "custom-tunnel-client.exe",
-    exe_path: "C:\\Users\\<USER>\\Tools\\custom-tunnel\\custom-tunnel-client.exe",
-    cmdline: ["custom-tunnel-client.exe", "--profile=managed"],
-    detected_config_dir: null,
-    detected_config_file: null,
-    detected_controller_addr: null,
-    likely_proxy_client: true,
-  },
-  {
-    pid: 9312,
-    name: "node.exe",
-    exe_path: "C:\\Program Files\\nodejs\\node.exe",
-    cmdline: ["node.exe", "vite", "--port", "5173"],
-    detected_config_dir: null,
-    detected_config_file: null,
-    detected_controller_addr: null,
-    likely_proxy_client: false,
-  },
-];
-
 /* ============================================================================
- * Helpers: Formatting, Backend DTO Mappers, Pure Client-Side Parser & Template
+ * Helpers: Formatting, Backend DTO Mappers & Pure Client-Side Parser
  * ============================================================================ */
 
 function getSubSource(sub: SubscriptionRecord): string {
-  return sub.url_or_cmd || sub.source || "";
+  return sub.url_or_cmd || "";
 }
 
 function maskSubscriptionSource(raw: string): string {
@@ -636,107 +526,6 @@ function mergeScannedMigrationItems(
   return Array.from(mergedByKey.values());
 }
 
-function mapProcessCandidateDto(dto: ProcessCandidateDto): ProcessCandidateItem {
-  return {
-    pid: dto.pid,
-    name: dto.name,
-    exe_path: dto.exe_path ?? null,
-    cmdline: Array.isArray(dto.cmdline) ? dto.cmdline : [],
-    detected_config_dir: dto.detected_config_dir ?? null,
-    detected_config_file: dto.detected_config_file ?? null,
-    detected_controller_addr: dto.detected_controller_addr ?? null,
-    likely_proxy_client: Boolean(dto.likely_proxy_client),
-  };
-}
-
-function mapProcessInspectToUi(
-  proc: ProcessCandidateItem,
-  res: ProcessInspectResult
-): ProcessInspectionItem {
-  const processName = res.process_name || res.name || proc.name;
-  const configPath =
-    res.readable_yaml_file ?? res.config_path ?? proc.detected_config_file ?? null;
-  const rawCtrl =
-    res.controller_url ?? res.controller_addr ?? proc.detected_controller_addr ?? null;
-  const normalizedCtrl = rawCtrl
-    ? rawCtrl.startsWith("http://") || rawCtrl.startsWith("https://")
-      ? rawCtrl
-      : `http://${rawCtrl.replace(/^0\.0\.0\.0/, "127.0.0.1")}`
-    : null;
-  const yamlNodeCount =
-    typeof res.yaml_node_count === "number"
-      ? res.yaml_node_count
-      : configPath && typeof res.node_count === "number"
-        ? res.node_count
-        : 0;
-  const controllerProxyCount =
-    typeof res.controller_proxy_count === "number"
-      ? res.controller_proxy_count
-      : normalizedCtrl && typeof res.node_count === "number"
-        ? res.node_count
-        : 0;
-  const controllerReachable =
-    typeof res.controller_reachable === "boolean"
-      ? res.controller_reachable
-      : Boolean(normalizedCtrl);
-  const controllerRequiresSecret = Boolean(res.controller_requires_secret);
-  const rawNotes = Array.isArray(res.notes)
-    ? res.notes
-    : Array.isArray(res.warnings)
-      ? res.warnings
-      : [];
-  const template = renderAdapterTemplateScript(processName);
-
-  let recommendation: AttachRecommendationItem;
-  if (res.recommendation && typeof res.recommendation === "object") {
-    recommendation = res.recommendation;
-  } else if (configPath) {
-    recommendation = {
-      mode: "read_only_local_file",
-      path: configPath,
-      node_count: yamlNodeCount,
-      reason:
-        "找到了该软件正在使用的配置文件，可以直接安全读取节点，不会修改原文件。",
-    };
-  } else if (normalizedCtrl) {
-    recommendation = {
-      mode: "public_controller_api",
-      endpoint_url: `${normalizedCtrl.replace(/\/+$/, "")}/proxies`,
-      proxy_count: controllerProxyCount,
-      requires_secret: controllerRequiresSecret,
-      reason: controllerRequiresSecret
-        ? "检测到本地软件接口，填入访问口令后即可安全读取节点列表。"
-        : "检测到该软件的本地公开接口，可以直接安全抓取可用节点。",
-    };
-  } else {
-    recommendation = {
-      mode: "external_adapter_template",
-      schema: ADAPTER_SCHEMA_V1,
-      suggested_command: `python3 adapters/${processName.replace(/\.exe$/i, "")}_adapter.py`,
-      template_script: template,
-      reason:
-        "这个软件没有公开配置文件或本地接口，暂时无法直接自动抓节点。建议优先尝试「粘贴订阅链接」或「从电脑已有梯子导入」，也可在下方展开高级自定义刷新脚本。",
-    };
-  }
-
-  return {
-    pid: res.pid ?? proc.pid,
-    process_name: processName,
-    readable_yaml_file: configPath,
-    yaml_node_count: yamlNodeCount,
-    controller_url: normalizedCtrl,
-    controller_reachable: controllerReachable,
-    controller_requires_secret: controllerRequiresSecret,
-    controller_proxy_count: controllerProxyCount,
-    recommendation,
-    notes:
-      rawNotes.length > 0
-        ? rawNotes
-        : ["安全只读模式：仅读取配置或本地公开接口，不会修改对方软件。"],
-    preview_nodes: [],
-  };
-}
-
 function formatTimeShort(iso: string | null): string {
   if (!iso) return "尚未刷新";
   const d = new Date(iso);
@@ -793,197 +582,6 @@ function extractMultiplierFromName(name: string): number {
   if (!m) return 1.0;
   const val = Number(m[1]);
   return Number.isFinite(val) && val >= 0 ? val : 1.0;
-}
-
-function renderAdapterTemplateScript(targetLabel: string): string {
-  const safeLabel =
-    targetLabel.replace(/["\\\r\n]/g, "").slice(0, 64) || "custom-source";
-  return `#!/usr/bin/env python3
-"""
-CatCloud external subscription adapter template (${ADAPTER_SCHEMA_V1}).
-Target hint: ${safeLabel}
-
-Contract:
-  - Read JSON request from stdin: {"reason", "sub_id", "failed_servers"}
-  - Print JSON response to stdout (<= 16 MiB):
-    {"schema": "${ADAPTER_SCHEMA_V1}", "nodes": [...], "yaml": null}
-"""
-import json
-import sys
-
-
-def main() -> None:
-    raw_req = sys.stdin.read().strip()
-    req = json.loads(raw_req) if raw_req else {}
-    _reason = req.get("reason", "manual")
-    _sub_id = req.get("sub_id", "adapter")
-    _failed = set(req.get("failed_servers") or [])
-
-    # Replace the sample node below with your own dynamic node source.
-    response = {
-        "schema": "${ADAPTER_SCHEMA_V1}",
-        "nodes": [
-            {
-                "name": "JP Sample 1x",
-                "type": "vless",
-                "server": "203.0.113.10",
-                "port": 443,
-                "uuid": "00000000-0000-4000-8000-000000000001",
-                "tls": True,
-                "servername": "node.example.invalid",
-                "udp": True,
-            }
-        ],
-        "yaml": None,
-    }
-    sys.stdout.write(json.dumps(response, ensure_ascii=False))
-
-
-if __name__ == "__main__":
-    main()
-`;
-}
-
-function buildMockInspection(proc: ProcessCandidateItem): ProcessInspectionItem {
-  const template = renderAdapterTemplateScript(proc.name);
-
-  if (proc.detected_config_file) {
-    return {
-      pid: proc.pid,
-      process_name: proc.name,
-      readable_yaml_file: proc.detected_config_file,
-      yaml_node_count: 2,
-      controller_url: proc.detected_controller_addr
-        ? `http://${proc.detected_controller_addr.replace(/^0\.0\.0\.0/, "127.0.0.1")}`
-        : null,
-      controller_reachable: Boolean(proc.detected_controller_addr),
-      controller_requires_secret: false,
-      controller_proxy_count: 2,
-      recommendation: {
-        mode: "read_only_local_file",
-        path: proc.detected_config_file,
-        node_count: 2,
-        reason:
-          "找到了该软件正在使用的配置文件，可以直接安全读取节点，不会修改原文件。",
-      },
-      notes: [
-        "仅只读打开配置文件提取节点，不会修改原软件目录。",
-        "关联后支持定期安全同步节点，读取异常会自动保留旧节点。",
-      ],
-      preview_nodes: [
-        {
-          id: `proc-${proc.pid}-jp-1`,
-          sub_id: `sub-proc-${proc.pid}`,
-          name: `JP-Proc-${proc.pid} · 1x`,
-          protocol: "vless",
-          server: "203.0.113.81",
-          port: 443,
-          region_code: "JP",
-          multiplier: 1.0,
-          is_443_native: true,
-          preaccel_override: null,
-          tags: ["process-readonly", "native-443"],
-          enabled: true,
-        },
-        {
-          id: `proc-${proc.pid}-sg-2`,
-          sub_id: `sub-proc-${proc.pid}`,
-          name: `SG-Proc-${proc.pid} · 1.5x`,
-          protocol: "trojan",
-          server: "198.51.100.82",
-          port: 8443,
-          region_code: "SG",
-          multiplier: 1.5,
-          is_443_native: false,
-          preaccel_override: null,
-          tags: ["process-readonly"],
-          enabled: true,
-        },
-      ],
-    };
-  }
-
-  if (proc.detected_controller_addr) {
-    const normalized = `http://${proc.detected_controller_addr.replace(/^0\.0\.0\.0/, "127.0.0.1")}`;
-    const requiresSecret = proc.name.includes("secure");
-    return {
-      pid: proc.pid,
-      process_name: proc.name,
-      readable_yaml_file: null,
-      yaml_node_count: 0,
-      controller_url: normalized,
-      controller_reachable: true,
-      controller_requires_secret: requiresSecret,
-      controller_proxy_count: requiresSecret ? 0 : 2,
-      recommendation: {
-        mode: "public_controller_api",
-        endpoint_url: `${normalized}/proxies`,
-        proxy_count: requiresSecret ? 0 : 2,
-        requires_secret: requiresSecret,
-        reason: requiresSecret
-          ? "检测到该软件的本地接口设有访问口令，填入后即可安全抓取节点。"
-          : "检测到该软件的本地公开接口，可以直接安全抓取可用节点。",
-      },
-      notes: [
-        `仅在本机安全读取接口 ${normalized}/proxies。`,
-        "不会修改原软件配置，也不会影响它正常运行。",
-      ],
-      preview_nodes: [
-        {
-          id: `proc-ctl-${proc.pid}-us-1`,
-          sub_id: `sub-proc-${proc.pid}`,
-          name: `US-Controller-${proc.pid} · 1x`,
-          protocol: "anytls",
-          server: "203.0.113.85",
-          port: 443,
-          region_code: "US",
-          multiplier: 1.0,
-          is_443_native: true,
-          preaccel_override: null,
-          tags: ["controller-api", "native-443"],
-          enabled: true,
-        },
-        {
-          id: `proc-ctl-${proc.pid}-tw-2`,
-          sub_id: `sub-proc-${proc.pid}`,
-          name: `TW-Controller-${proc.pid} · 2x`,
-          protocol: "vless",
-          server: "198.51.100.86",
-          port: 443,
-          region_code: "TW",
-          multiplier: 2.0,
-          is_443_native: true,
-          preaccel_override: null,
-          tags: ["controller-api", "native-443"],
-          enabled: true,
-        },
-      ],
-    };
-  }
-
-  return {
-    pid: proc.pid,
-    process_name: proc.name,
-    readable_yaml_file: null,
-    yaml_node_count: 0,
-    controller_url: null,
-    controller_reachable: false,
-    controller_requires_secret: false,
-    controller_proxy_count: 0,
-    recommendation: {
-      mode: "external_adapter_template",
-      schema: ADAPTER_SCHEMA_V1,
-      suggested_command: `python3 adapters/${proc.name.replace(/\.exe$/i, "")}_adapter.py`,
-      template_script: template,
-      reason:
-        "这个软件没有公开配置文件或本地接口，暂时无法直接自动抓节点。建议优先尝试「粘贴订阅链接」或「从电脑已有梯子导入」，也可在下方展开高级自定义刷新脚本。",
-    },
-    notes: [
-      "安全只读原则：不会读取受保护的程序内存或私密数据。",
-      "如果你熟悉写脚本，可以在下方「高级：自定义刷新脚本」中接入自定义来源。",
-    ],
-    preview_nodes: [],
-  };
 }
 
 function parsePastedConfigPreview(rawInput: string): MigrationPreviewItem {
@@ -2039,276 +1637,388 @@ function MigrationDrawer({ open, onClose, onImport }: MigrationDrawerProps) {
 }
 
 /* ============================================================================
- * Slide-Over Drawer 2: Manual Process Smart Attach & catcloud-adapter/v1 Slot
+ * Slide-Over Drawer 2: 1 -> 2 -> 3 Live Capture Wizard
  * ============================================================================ */
+
+const UNSUPPORTED_CAPTURE_NOTICE =
+  "该软件暂不支持直接抓取，建议尝试其它支持的软件或前往官网查看是否提供标准订阅链接";
+
+function isSelfCatCloudCandidate(cand: DesktopAppCandidate): boolean {
+  const joined = `${cand.friendly_name} ${cand.window_title} ${cand.process_name}`.toLowerCase();
+  return joined.includes("catcloud") || joined.includes("猫猫云梯");
+}
+
+function formatCaptureEventTime(tsMs: number): string {
+  const d = new Date(tsMs);
+  if (Number.isNaN(d.getTime())) return "--:--:--";
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
+}
 
 interface ProcessAttachDrawerProps {
   open: boolean;
   onClose: () => void;
-  onAttachSource: (payload: {
+  onConfirmCapture: (payload: {
     name: string;
-    source: string;
-    kind: SubscriptionRecord["kind"];
-    nodes: ProxyNode[];
-  }) => void | Promise<void>;
+    outcome: LiveCaptureOutcomeDto;
+  }) => Promise<boolean>;
+  onGoToSubUrl: () => void;
 }
 
 function ProcessAttachDrawer({
   open,
   onClose,
-  onAttachSource,
+  onConfirmCapture,
+  onGoToSubUrl,
 }: ProcessAttachDrawerProps) {
-  const inTauri = isTauriEnv();
-  const [onlyLikelyProxy, setOnlyLikelyProxy] = useState(true);
+  const bgCapture = useAppSelector((s) => s.bgTasks.capture);
+  const captureStatus = bgCapture.status;
+  const finishingCapture = bgCapture.finishing;
+  const outcome = bgCapture.outcome;
+
+  const [step, setStep] = useState<1 | 2 | 3>(() =>
+    bgCapture.outcome
+      ? 3
+      : (bgCapture.active && bgCapture.sessionId) || bgCapture.finishing
+        ? 2
+        : 1
+  );
   const [keyword, setKeyword] = useState("");
-  const [loadingList, setLoadingList] = useState(false);
-  const [candidates, setCandidates] = useState<ProcessCandidateItem[]>(() =>
-    inTauri ? [] : DEMO_PROCESS_CANDIDATES
-  );
-  const [selectedPid, setSelectedPid] = useState<number | null>(() =>
-    inTauri ? null : DEMO_PROCESS_CANDIDATES[0].pid
-  );
-  const [inspecting, setInspecting] = useState(false);
-  const [inspection, setInspection] = useState<ProcessInspectionItem | null>(() =>
-    inTauri ? null : buildMockInspection(DEMO_PROCESS_CANDIDATES[0])
-  );
-  const [bearerSecret, setBearerSecret] = useState("");
-  const [showAdapterSlot, setShowAdapterSlot] = useState(false);
-  const [adapterCmd, setAdapterCmd] = useState(
-    "python3 adapters/custom_tunnel_adapter.py"
-  );
-  const [adapterCooldownSec, setAdapterCooldownSec] = useState(60);
-  const [adapterTimeoutSec, setAdapterTimeoutSec] = useState(30);
-  const [copiedScript, setCopiedScript] = useState(false);
-  const copyTimerRef = useRef<number | null>(null);
+  const [loadingApps, setLoadingApps] = useState(false);
+  const [candidates, setCandidates] = useState<DesktopAppCandidate[]>([]);
+  const [selectedPid, setSelectedPid] = useState<number | null>(null);
+  const [startingCapture, setStartingCapture] = useState(false);
+  const [importName, setImportName] = useState(() => {
+    if (!bgCapture.outcome) return "";
+    const label =
+      bgCapture.outcome.target_name?.trim() || bgCapture.targetName || "桌面软件";
+    return `抓取 · ${label}`;
+  });
+  const [nodeFilter, setNodeFilter] = useState("");
+  const [importingOutcome, setImportingOutcome] = useState(false);
+
+  const mountedRef = useRef(true);
+  const openRef = useRef(open);
+  openRef.current = open;
+  const baselinePidsRef = useRef<number[] | null>(null);
+  const userPickedManuallyRef = useRef(false);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
-      if (copyTimerRef.current !== null) {
-        window.clearTimeout(copyTimerRef.current);
-      }
+      mountedRef.current = false;
+      // Never cancel active background capture session on unmount; polling lives globally in appStore
     };
   }, []);
+
+  const sortCandidates = useCallback((list: DesktopAppCandidate[]): DesktopAppCandidate[] => {
+    return list
+      .filter((c) => !isSelfCatCloudCandidate(c))
+      .sort((a, b) => {
+        if (a.is_newly_opened !== b.is_newly_opened) {
+          return a.is_newly_opened ? -1 : 1;
+        }
+        if (a.likely_proxy_client !== b.likely_proxy_client) {
+          return a.likely_proxy_client ? -1 : 1;
+        }
+        return (a.friendly_name || a.process_name).localeCompare(
+          b.friendly_name || b.process_name
+        );
+      });
+  }, []);
+
+  const fetchCandidates = useCallback(
+    async (isInitialBaseline: boolean, showLoadingSpinner: boolean) => {
+      if (showLoadingSpinner) {
+        setLoadingApps(true);
+      }
+      try {
+        const baselineArg = isInitialBaseline
+          ? undefined
+          : (baselinePidsRef.current ?? undefined);
+        const rawList = await catcloudApi.listDesktopAppCandidates(baselineArg);
+        if (!mountedRef.current || !openRef.current) return;
+
+        const cleaned = sortCandidates(rawList);
+        if (isInitialBaseline) {
+          baselinePidsRef.current = cleaned.map((c) => c.pid);
+        }
+        setCandidates(cleaned);
+
+        setSelectedPid((prev) => {
+          if (prev !== null && cleaned.some((c) => c.pid === prev)) {
+            if (!userPickedManuallyRef.current) {
+              const newlyOpened = cleaned.find((c) => c.is_newly_opened);
+              if (newlyOpened) return newlyOpened.pid;
+            }
+            return prev;
+          }
+          const preferred =
+            cleaned.find((c) => c.is_newly_opened) ??
+            cleaned.find((c) => c.likely_proxy_client) ??
+            cleaned[0] ??
+            null;
+          return preferred ? preferred.pid : null;
+        });
+      } catch (err) {
+        if (showLoadingSpinner && mountedRef.current) {
+          appActions.showToast(
+            `获取桌面软件列表失败：${formatErrorMessage(err)}`,
+            "warn"
+          );
+        }
+      } finally {
+        if (showLoadingSpinner && mountedRef.current) {
+          setLoadingApps(false);
+        }
+      }
+    },
+    [sortCandidates]
+  );
+
+  // When opening the drawer, seamlessly resume Step 3 (ready outcome) or Step 2 (active/finishing session)
+  useEffect(() => {
+    if (!open) return;
+    const latestCapture = appStore.getState().bgTasks.capture;
+    if (latestCapture.outcome) {
+      setStep(3);
+      setStartingCapture(false);
+      const label =
+        latestCapture.outcome.target_name?.trim() ||
+        latestCapture.targetName ||
+        "桌面软件";
+      setImportName((prev) => prev.trim() || `抓取 · ${label}`);
+      setNodeFilter("");
+      setImportingOutcome(false);
+      return;
+    }
+    if ((latestCapture.active && latestCapture.sessionId) || latestCapture.finishing) {
+      setStep(2);
+      setStartingCapture(false);
+      return;
+    }
+    setStep(1);
+    setKeyword("");
+    setCandidates([]);
+    setSelectedPid(null);
+    setStartingCapture(false);
+    setImportName("");
+    setNodeFilter("");
+    setImportingOutcome(false);
+    baselinePidsRef.current = null;
+    userPickedManuallyRef.current = false;
+    void fetchCandidates(true, true);
+  }, [open, fetchCandidates]);
+
+  // Automatically advance to Step 3 whenever a background finish produces an outcome while drawer is open
+  useEffect(() => {
+    if (!open || !bgCapture.outcome) return;
+    setStep(3);
+    const label =
+      bgCapture.outcome.target_name?.trim() || bgCapture.targetName || "桌面软件";
+    setImportName((prev) => prev.trim() || `抓取 · ${label}`);
+  }, [open, bgCapture.outcome, bgCapture.targetName]);
+
+  // Step 1: Silently detect newly launched desktop apps every 1.5s
+  useEffect(() => {
+    if (!open || step !== 1) return;
+    let inFlight = false;
+    const timer = window.setInterval(() => {
+      if (inFlight || !openRef.current) return;
+      inFlight = true;
+      void fetchCandidates(false, false).finally(() => {
+        inFlight = false;
+      });
+    }, 1500);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [open, step, fetchCandidates]);
+
+  const safeClose = useCallback(() => {
+    if (finishingCapture || importingOutcome) return;
+    if (appStore.getState().bgTasks.capture.active) {
+      appActions.showToast(
+        "实时捕捉继续在后台运行，随时可点击向导按钮回来查看进度",
+        "info",
+        3600
+      );
+    }
+    onClose();
+  }, [finishingCapture, importingOutcome, onClose]);
 
   useEffect(() => {
     if (!open) return;
     const onKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") onClose();
+      if (ev.key === "Escape") safeClose();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, onClose]);
-
-  useEffect(() => {
-    if (!open || !inTauri) return;
-    let cancelled = false;
-    setLoadingList(true);
-    void catcloudApi
-      .listRunningProcesses(false)
-      .then((list) => {
-        if (cancelled) return;
-        setCandidates(list.map(mapProcessCandidateDto));
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          appActions.showToast(`读取运行中的软件列表失败：${formatErrorMessage(err)}`, "warn");
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingList(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [open, inTauri]);
+  }, [open, safeClose]);
 
   const filteredCandidates = useMemo(() => {
     const kw = keyword.trim().toLowerCase();
-    return candidates.filter((proc) => {
-      if (onlyLikelyProxy && !proc.likely_proxy_client) return false;
-      if (!kw) return true;
+    if (!kw) return candidates;
+    return candidates.filter((cand) => {
       return (
-        proc.name.toLowerCase().includes(kw) ||
-        String(proc.pid).includes(kw) ||
-        proc.cmdline.join(" ").toLowerCase().includes(kw)
+        cand.friendly_name.toLowerCase().includes(kw) ||
+        cand.window_title.toLowerCase().includes(kw) ||
+        cand.process_name.toLowerCase().includes(kw) ||
+        String(cand.pid).includes(kw)
       );
     });
-  }, [candidates, onlyLikelyProxy, keyword]);
+  }, [candidates, keyword]);
 
-  if (!open) return null;
+  const selectedCandidate = useMemo(
+    () =>
+      candidates.find((c) => c.pid === selectedPid) ??
+      filteredCandidates[0] ??
+      null,
+    [candidates, filteredCandidates, selectedPid]
+  );
 
-  const selectedProc =
-    candidates.find((c) => c.pid === selectedPid) ?? filteredCandidates[0] ?? null;
+  const newlyOpenedCount = useMemo(
+    () => candidates.filter((c) => c.is_newly_opened).length,
+    [candidates]
+  );
 
-  const refreshProcesses = async () => {
-    setLoadingList(true);
-    try {
-      if (inTauri) {
-        const ipcList = await catcloudApi.listRunningProcesses(false);
-        const mapped = ipcList.map(mapProcessCandidateDto);
-        setCandidates(mapped);
-        appActions.showToast(`已刷新运行中的软件列表（共 ${mapped.length} 项）`, "info");
-      } else {
-        setCandidates(DEMO_PROCESS_CANDIDATES);
-        appActions.showToast(`演示模式：共找到 ${DEMO_PROCESS_CANDIDATES.length} 个示例软件`, "info");
-      }
-    } catch (err) {
-      appActions.showToast(`刷新软件列表失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setLoadingList(false);
+  const outcomeRegionStats = useMemo(() => {
+    if (!outcome || outcome.nodes.length === 0) return [] as Array<{ code: string; label: string; count: number }>;
+    const counts = new Map<string, number>();
+    for (const node of outcome.nodes) {
+      const code = resolveNodeRegionCode(node);
+      counts.set(code, (counts.get(code) ?? 0) + 1);
     }
-  };
+    return Array.from(counts.entries())
+      .map(([code, count]) => ({ code, label: getRegionLabel(code), count }))
+      .sort((a, b) => b.count - a.count);
+  }, [outcome]);
 
-  const inspectSelected = async (proc: ProcessCandidateItem) => {
-    setSelectedPid(proc.pid);
-    setInspecting(true);
-    setShowAdapterSlot(false);
-    setBearerSecret("");
-    try {
-      let report: ProcessInspectionItem;
-      if (inTauri) {
-        const ipcInspect = await catcloudApi.inspectProcessSource(proc.pid);
-        report = mapProcessInspectToUi(proc, ipcInspect);
-      } else {
-        report = buildMockInspection(proc);
-      }
-      setInspection(report);
-      if (report.recommendation.mode === "external_adapter_template") {
-        setAdapterCmd(report.recommendation.suggested_command);
-      } else {
-        setAdapterCmd(
-          `python3 adapters/${proc.name.replace(/\.exe$/i, "")}_adapter.py`
-        );
-      }
-    } catch (err) {
-      appActions.showToast(`识别该软件失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setInspecting(false);
-    }
-  };
-
-  const activeTemplateScript =
-    inspection?.recommendation.mode === "external_adapter_template"
-      ? inspection.recommendation.template_script
-      : renderAdapterTemplateScript(selectedProc?.name ?? "custom-source");
-
-  const handleCopyScript = async () => {
-    try {
-      await navigator.clipboard.writeText(activeTemplateScript);
-      setCopiedScript(true);
-      appActions.showToast("已复制自定义刷新脚本模板", "ok");
-      if (copyTimerRef.current !== null) {
-        window.clearTimeout(copyTimerRef.current);
-      }
-      copyTimerRef.current = window.setTimeout(() => {
-        copyTimerRef.current = null;
-        setCopiedScript(false);
-      }, 1800);
-    } catch {
-      appActions.showToast("复制失败，请手动选中代码区域复制", "warn");
-    }
-  };
-
-  const handleDownloadScript = () => {
-    const fileStem = (selectedProc?.name ?? "custom_source")
-      .replace(/\.exe$/i, "")
-      .replace(/[^a-zA-Z0-9_-]/g, "_");
-    const blob = new Blob([activeTemplateScript], {
-      type: "text/x-python;charset=utf-8",
+  const filteredOutcomeNodes = useMemo(() => {
+    if (!outcome) return [] as ProxyNode[];
+    const kw = nodeFilter.trim().toLowerCase();
+    if (!kw) return outcome.nodes;
+    return outcome.nodes.filter((n) => {
+      const regionCode = resolveNodeRegionCode(n);
+      return (
+        n.name.toLowerCase().includes(kw) ||
+        n.server.toLowerCase().includes(kw) ||
+        n.protocol.toLowerCase().includes(kw) ||
+        regionCode.toLowerCase().includes(kw) ||
+        getRegionLabel(regionCode).toLowerCase().includes(kw)
+      );
     });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${fileStem}_catcloud_adapter.py`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    appActions.showToast("已下载自定义刷新脚本模板", "ok");
+  }, [outcome, nodeFilter]);
+
+  const handleStartLiveCapture = async () => {
+    if (!selectedCandidate || startingCapture) return;
+    setStartingCapture(true);
+    try {
+      const started = await appActions.startLiveCaptureBg(selectedCandidate.pid);
+      if (!started || !mountedRef.current) return;
+      setImportName("");
+      setNodeFilter("");
+      setStep(2);
+    } finally {
+      if (mountedRef.current) {
+        setStartingCapture(false);
+      }
+    }
   };
 
-  const handleBindReadOnlySource = () => {
-    if (!inspection) return;
-    if (inspection.recommendation.mode === "read_only_local_file") {
-      onAttachSource({
-        name: `软件抓取 · ${inspection.process_name}`,
-        source: inspection.recommendation.path,
-        kind: "file",
-        nodes: inTauri ? [] : inspection.preview_nodes,
-      });
-      onClose();
+  const handleCancelCaptureToStep1 = async () => {
+    await appActions.cancelLiveCaptureBg();
+    if (!mountedRef.current) return;
+    setImportName("");
+    setNodeFilter("");
+    setStep(1);
+    void fetchCandidates(false, false);
+  };
+
+  const handleFinishCapture = async () => {
+    if (finishingCapture) return;
+    const latestCapture = appStore.getState().bgTasks.capture;
+    const fallbackTargetName =
+      latestCapture.status?.target_name || latestCapture.targetName || "已捕捉软件";
+    if (!latestCapture.sessionId && !latestCapture.status?.session_id) {
+      setStep(latestCapture.outcome ? 3 : 1);
       return;
     }
-    if (inspection.recommendation.mode === "public_controller_api") {
-      const trimmedSecret = bearerSecret.trim();
-      if (inspection.recommendation.requires_secret && !trimmedSecret) {
-        appActions.showToast(
-          "该软件的本地接口需要口令，请先填入后再抓取",
-          "warn"
-        );
-        return;
+    const res = await appActions.finishLiveCaptureBg();
+    if (!mountedRef.current) return;
+    if (!res) {
+      setStep(1);
+      return;
+    }
+    const label = res.target_name?.trim() || fallbackTargetName;
+    setImportName(`抓取 · ${label}`);
+    setNodeFilter("");
+    setStep(3);
+  };
+
+  const handleConfirmImportOutcome = async () => {
+    if (!outcome || !outcome.supported || outcome.nodes.length === 0 || importingOutcome) {
+      return;
+    }
+    const finalName =
+      importName.trim() || `抓取 · ${outcome.target_name || "桌面软件"}`;
+    setImportingOutcome(true);
+    try {
+      const ok = await onConfirmCapture({ name: finalName, outcome });
+      if (ok) {
+        appActions.clearLiveCaptureOutcome();
+        if (mountedRef.current) {
+          setImportName("");
+          setNodeFilter("");
+          onClose();
+        }
       }
-      const sourceWithSecret = trimmedSecret
-        ? `${inspection.recommendation.endpoint_url}|secret=${trimmedSecret}`
-        : inspection.recommendation.endpoint_url;
-      onAttachSource({
-        name: `接口抓取 · ${inspection.process_name}`,
-        source: sourceWithSecret,
-        kind: "process_adapter",
-        nodes: inTauri ? [] : inspection.preview_nodes,
-      });
-      onClose();
+    } finally {
+      if (mountedRef.current) {
+        setImportingOutcome(false);
+      }
     }
   };
 
-  const handleRegisterAdapterSlot = () => {
-    const trimmedCmd = adapterCmd.trim();
-    if (!trimmedCmd) {
-      appActions.showToast("请先填写自定义刷新脚本的执行命令", "warn");
-      return;
-    }
-    const safeCooldown = Math.max(60, Math.round(adapterCooldownSec));
-    const safeTimeout = Math.min(300, Math.max(5, Math.round(adapterTimeoutSec)));
-    const procLabel = selectedProc?.name ?? "external";
-    const subId = `sub-adapter-${Date.now()}`;
-    onAttachSource({
-      name: `自定义脚本 · ${procLabel}`,
-      source: inTauri ? trimmedCmd : `${trimmedCmd} [timeout=${safeTimeout}s, cooldown=${safeCooldown}s]`,
-      kind: "process_adapter",
-      nodes: inTauri
-        ? []
-        : [
-            {
-              id: `${subId}-sample-1`,
-              sub_id: subId,
-              name: `JP-Script-${procLabel.replace(/\.exe$/i, "")} · 1x`,
-              protocol: "vless",
-              server: "203.0.113.90",
-              port: 443,
-              region_code: "JP",
-              multiplier: 1.0,
-              is_443_native: true,
-              preaccel_override: null,
-              tags: ["adapter-v1", "native-443"],
-              enabled: true,
-            },
-          ],
-    });
+  const handleResetToStep1 = async () => {
+    await appActions.cancelLiveCaptureBg();
+    if (!mountedRef.current) return;
+    setImportName("");
+    setNodeFilter("");
+    setStep(1);
+    void fetchCandidates(false, true);
+  };
+
+  const handleSwitchToSubUrl = () => {
+    void appActions.cancelLiveCaptureBg();
     onClose();
+    onGoToSubUrl();
   };
 
-  if (typeof document === "undefined") return null;
+  if (!open || typeof document === "undefined") return null;
+
+  const wizardSteps: ReadonlyArray<{ id: 1 | 2 | 3; badge: string; title: string }> = [
+    { id: 1, badge: "1", title: "选择或打开专用软件" },
+    { id: 2, badge: "2", title: "更新订阅实时捕捉" },
+    { id: 3, badge: "3", title: "结束并整理结果" },
+  ];
+
+  const isOutcomeSupported = Boolean(
+    outcome && outcome.supported && outcome.nodes.length > 0
+  );
 
   return createPortal(
     <div
       className="fixed inset-0 z-50 flex justify-end bg-black/45"
       role="dialog"
       aria-modal="true"
-      aria-label="从正在运行的软件抓节点"
-      onClick={onClose}
+      aria-label="从正在运行的软件实时抓节点"
+      onClick={safeClose}
     >
       <div
-        className="cc-surface flex h-full w-full max-w-[760px] flex-col border-l border-[var(--line-strong)] shadow-2xl"
+        className="cc-surface flex h-full w-full max-w-[680px] flex-col border-l border-[var(--line-strong)] shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -2317,399 +2027,676 @@ function ProcessAttachDrawer({
             <div className="flex items-center gap-2">
               <Cpu className="h-4 w-4 text-[var(--accent)]" />
               <h2 className="text-sm font-semibold text-[var(--text)]">
-                从正在运行的软件抓节点
+                实时捕捉向导 · 从正在运行的软件抓节点
               </h2>
             </div>
             <p className="mt-1 text-xs text-[var(--muted)]">
-              先打开你的专用梯子软件，点选左侧对应程序，自动识别并安全抓取可用节点（只读，不修改原软件）。
+              按三步操作即可自动监控并安全提取可用节点（全程只读，不会改动原软件）。
             </p>
           </div>
           <button
             type="button"
-            onClick={onClose}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
-            aria-label="关闭软件抓取窗口"
+            disabled={finishingCapture || importingOutcome}
+            onClick={safeClose}
+            title={
+              step === 2 && bgCapture.active
+                ? "收起窗口（实时捕捉将继续在后台进行）"
+                : "关闭软件实时捕捉向导"
+            }
+            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
+            aria-label="关闭软件实时捕捉向导"
           >
             <X className="h-4 w-4" />
           </button>
         </div>
 
-        {/* Filter Bar */}
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] px-5 py-2.5">
-          <div className="relative min-w-[200px] flex-1">
-            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-            <input
-              type="text"
-              value={keyword}
-              onChange={(e) => setKeyword(e.target.value)}
-              placeholder="搜索软件名称或进程号..."
-              className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
-            />
-          </div>
-          <div className="flex items-center gap-2">
-            <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-[var(--text-secondary)]">
-              <input
-                type="checkbox"
-                checked={onlyLikelyProxy}
-                onChange={(e) => setOnlyLikelyProxy(e.target.checked)}
-                className="accent-[var(--accent)]"
-              />
-              只看常见代理软件
-            </label>
-            <button
-              type="button"
-              onClick={() => void refreshProcesses()}
-              disabled={loadingList}
-              className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
-            >
-              <RefreshCw
-                className={`h-3.5 w-3.5 ${loadingList ? "animate-spin" : ""}`}
-              />
-              重新扫描
-            </button>
-          </div>
-        </div>
-
-        {/* Two-Pane Body */}
-        <div className="grid min-h-0 flex-1 grid-cols-1 overflow-y-auto md:grid-cols-12">
-          {/* Left: Process Candidate List */}
-          <div className="space-y-2 border-b border-[var(--line)] p-4 md:col-span-5 md:border-b-0 md:border-r md:overflow-y-auto">
-            <div className="text-[11px] font-medium text-[var(--muted)]">
-              正在运行的软件（{filteredCandidates.length}）
-            </div>
-            {filteredCandidates.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-[var(--line)] p-4 text-center text-xs text-[var(--muted)]">
-                没找到匹配的程序，请先打开你的梯子软件，或取消勾选「只看常见代理软件」
-              </div>
-            ) : (
-              filteredCandidates.map((proc) => {
-                const active = selectedProc?.pid === proc.pid;
-                return (
-                  <button
-                    key={proc.pid}
-                    type="button"
-                    onClick={() => void inspectSelected(proc)}
-                    className={`w-full rounded-xl border p-3 text-left transition-colors ${
-                      active
-                        ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                        : "border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)]"
+        {/* Top 1 -> 2 -> 3 Progress Stepper */}
+        <div className="border-b border-[var(--line)] bg-[var(--bg-elevated)]/60 px-5 py-3">
+          <ol className="grid grid-cols-3 gap-2">
+            {wizardSteps.map((item) => {
+              const completed = step > item.id;
+              const active = step === item.id;
+              return (
+                <li
+                  key={item.id}
+                  className={`flex items-center gap-2 rounded-xl border px-2.5 py-2 text-xs transition-colors ${
+                    completed
+                      ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
+                      : active
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
+                        : "border-[var(--line)] bg-[var(--card)]/70 text-[var(--muted)]"
+                  }`}
+                >
+                  <span
+                    className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full cc-mono text-[11px] font-bold ${
+                      completed
+                        ? "bg-[var(--green)] text-[var(--accent-ink)]"
+                        : active
+                          ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+                          : "bg-[var(--bg-elevated)] text-[var(--muted)]"
                     }`}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="truncate text-xs font-semibold text-[var(--text)]">
-                        {proc.name}
-                      </span>
-                      <span className="cc-mono shrink-0 rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                        #{proc.pid}
-                      </span>
-                    </div>
+                    {completed ? <Check className="h-3 w-3 stroke-[2.5]" /> : item.badge}
+                  </span>
+                  <span className="truncate">{item.title}</span>
+                </li>
+              );
+            })}
+          </ol>
+        </div>
 
-                    <div className="mt-1.5 flex flex-wrap gap-1">
-                      {proc.detected_config_dir && (
-                        <span className="rounded bg-[var(--sky-soft)] px-1.5 py-0.5 text-[10px] text-[var(--sky)]">
-                          有配置目录
-                        </span>
-                      )}
-                      {proc.detected_config_file && (
-                        <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] text-[var(--green)]">
-                          找到配置文件
-                        </span>
-                      )}
-                      {proc.detected_controller_addr && (
-                        <span className="rounded bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] text-[var(--accent)]">
-                          找到本地接口
-                        </span>
-                      )}
-                      {!proc.detected_config_file &&
-                        !proc.detected_controller_addr && (
-                          <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                            未发现公开配置
-                          </span>
-                        )}
-                    </div>
-                  </button>
-                );
-              })
-            )}
-          </div>
-
-          {/* Right: Inspection Report & Attach Actions */}
-          <div className="space-y-3.5 p-4 md:col-span-7 md:overflow-y-auto">
-            {!selectedProc ? (
-              <div className="rounded-xl border border-dashed border-[var(--line)] p-6 text-center text-xs text-[var(--muted)]">
-                请点击左侧正在运行的软件，自动识别可用的节点来源
-              </div>
-            ) : (
-              <>
-                {/* Selected Software Summary */}
-                <div className="rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <Terminal className="h-4 w-4 text-[var(--accent)]" />
-                      <span className="text-xs font-semibold text-[var(--text)]">
-                        {selectedProc.name}
-                      </span>
-                      <span className="cc-mono text-[11px] text-[var(--muted)]">
-                        进程 #{selectedProc.pid}
-                      </span>
-                    </div>
-                    <button
-                      type="button"
-                      disabled={inspecting}
-                      onClick={() => void inspectSelected(selectedProc)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
-                    >
-                      <RefreshCw
-                        className={`h-3 w-3 ${inspecting ? "animate-spin" : ""}`}
-                      />
-                      重新识别
-                    </button>
-                  </div>
-
-                  <dl className="mt-2.5 space-y-1.5 text-[11px]">
-                    <div className="flex items-start justify-between gap-3">
-                      <dt className="shrink-0 text-[var(--muted)]">配置目录</dt>
-                      <dd className="cc-selectable break-all text-right cc-mono text-[var(--text-secondary)]">
-                        {selectedProc.detected_config_dir ?? "未检测到"}
-                      </dd>
-                    </div>
-                    <div className="flex items-start justify-between gap-3">
-                      <dt className="shrink-0 text-[var(--muted)]">配置文件</dt>
-                      <dd className="cc-selectable break-all text-right cc-mono text-[var(--text-secondary)]">
-                        {selectedProc.detected_config_file ?? "未检测到"}
-                      </dd>
-                    </div>
-                    <div className="flex items-start justify-between gap-3">
-                      <dt className="shrink-0 text-[var(--muted)]">本地接口</dt>
-                      <dd className="cc-selectable text-right cc-mono text-[var(--accent)]">
-                        {selectedProc.detected_controller_addr ?? "未检测到"}
-                      </dd>
-                    </div>
-                  </dl>
+        {/* Body */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">
+          {step === 1 && (
+            <div className="space-y-3.5">
+              {/* Auto-detect Tip Banner */}
+              <div className="flex items-start gap-2.5 rounded-xl border border-[var(--line)] bg-[var(--accent-soft)]/55 px-3.5 py-2.5 text-xs text-[var(--text-secondary)]">
+                <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
+                <div className="min-w-0 leading-relaxed">
+                  直接点选下方已打开的软件；如果还没启动，现在去打开它，猫猫每{" "}
+                  <span className="cc-mono font-semibold text-[var(--text)]">1.5 秒</span>{" "}
+                  自动发现新启动的软件并置顶标为
+                  <span className="mx-1 rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                    刚打开
+                  </span>
+                  。
                 </div>
+              </div>
 
-                {/* Probe Result Card */}
-                {inspection && (
-                  <div className="space-y-3 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] p-3.5">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <span className="text-xs font-semibold text-[var(--text)]">
-                        识别结果与抓取方式
-                      </span>
-                      <span
-                        className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                          inspection.recommendation.mode ===
-                          "external_adapter_template"
-                            ? "bg-[var(--amber-soft)] text-[var(--amber)]"
-                            : "bg-[var(--green-soft)] text-[var(--green)]"
+              {/* Search & Manual Refresh */}
+              <div className="flex flex-wrap items-center gap-2">
+                <div className="relative min-w-[200px] flex-1">
+                  <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+                  <input
+                    type="text"
+                    value={keyword}
+                    onChange={(e) => setKeyword(e.target.value)}
+                    placeholder="按窗口标题、软件名或进程号搜索..."
+                    className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+                  />
+                </div>
+                <button
+                  type="button"
+                  disabled={loadingApps}
+                  onClick={() => void fetchCandidates(false, true)}
+                  className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${loadingApps ? "animate-spin" : ""}`}
+                  />
+                  重新扫描
+                </button>
+              </div>
+
+              {/* List Header */}
+              <div className="flex items-center justify-between text-[11px] text-[var(--muted)]">
+                <span>当前桌面可见软件（{filteredCandidates.length}）</span>
+                {newlyOpenedCount > 0 ? (
+                  <span className="inline-flex items-center gap-1 font-medium text-[var(--green)]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                    新发现 {newlyOpenedCount} 个刚打开软件
+                  </span>
+                ) : (
+                  <span>静默监测新打开软件中…</span>
+                )}
+              </div>
+
+              {/* Desktop App Candidates List */}
+              {loadingApps && candidates.length === 0 ? (
+                <div className="flex items-center justify-center gap-2 rounded-xl border border-dashed border-[var(--line)] py-12 text-xs text-[var(--muted)]">
+                  <RefreshCw className="h-4 w-4 animate-spin text-[var(--accent)]" />
+                  <span>正在扫描电脑上已打开的桌面软件…</span>
+                </div>
+              ) : filteredCandidates.length === 0 ? (
+                <div className="rounded-xl border border-dashed border-[var(--line)] px-4 py-10 text-center text-xs text-[var(--muted)]">
+                  没有匹配到已打开的桌面软件，请先启动你的专用软件或清空搜索词。
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {filteredCandidates.map((cand) => {
+                    const active = selectedCandidate?.pid === cand.pid;
+                    const primaryTitle =
+                      cand.friendly_name.trim() ||
+                      cand.window_title.trim() ||
+                      cand.process_name;
+                    const showWindowSubtitle =
+                      Boolean(cand.window_title.trim()) &&
+                      cand.window_title.trim() !== primaryTitle;
+
+                    return (
+                      <button
+                        key={cand.pid}
+                        type="button"
+                        onClick={() => {
+                          userPickedManuallyRef.current = true;
+                          setSelectedPid(cand.pid);
+                        }}
+                        className={`flex w-full cursor-pointer items-start justify-between gap-3 rounded-xl border p-3 text-left transition-colors ${
+                          active
+                            ? "border-[var(--accent)] bg-[var(--accent-soft)] ring-1 ring-[var(--accent)]/30"
+                            : cand.is_newly_opened
+                              ? "border-[var(--green)]/50 bg-[var(--green-soft)]/35 hover:border-[var(--green)]"
+                              : "border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)]"
                         }`}
                       >
-                        {inspection.recommendation.mode === "read_only_local_file"
-                          ? "可直接读取配置文件"
-                          : inspection.recommendation.mode ===
-                              "public_controller_api"
-                            ? "可直接通过本地接口抓取"
-                            : "暂不支持直接自动抓取"}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="truncate text-xs font-semibold text-[var(--text)]">
+                              {primaryTitle}
+                            </span>
+                            {cand.is_newly_opened && (
+                              <span className="shrink-0 rounded-full bg-[var(--green)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
+                                刚打开
+                              </span>
+                            )}
+                            {cand.likely_proxy_client && (
+                              <span className="shrink-0 rounded-full bg-[var(--sky-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--sky)]">
+                                常见代理工具
+                              </span>
+                            )}
+                          </div>
+                          {showWindowSubtitle && (
+                            <div
+                              className="mt-0.5 truncate text-[11px] text-[var(--text-secondary)]"
+                              title={cand.window_title}
+                            >
+                              {cand.window_title}
+                            </div>
+                          )}
+                          <div className="mt-1 flex flex-wrap items-center gap-2 cc-mono text-[10.5px] text-[var(--muted)]">
+                            <span>{cand.process_name}</span>
+                            <span>#{cand.pid}</span>
+                            {cand.related_pids.length > 1 && (
+                              <span className="rounded bg-[var(--bg-elevated)] px-1.5 py-0.2">
+                                关联 {cand.related_pids.length} 个进程
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <span
+                          className={`mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition-colors ${
+                            active
+                              ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]"
+                              : "border-[var(--line-strong)] bg-[var(--bg-elevated)]"
+                          }`}
+                          aria-hidden="true"
+                        >
+                          {active && <Check className="h-3 w-3 stroke-[2.5]" />}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {step === 2 && (
+            <div className="space-y-4">
+              {/* Plain-Language Action Guide */}
+              <div className="rounded-2xl border border-[var(--accent)]/50 bg-[var(--accent-soft)]/55 p-4">
+                <div className="flex items-start gap-3">
+                  <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] text-[var(--accent-ink)]">
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-[var(--text)]">
+                        正在实时监控：{captureStatus?.target_name || "目标软件"}
+                      </span>
+                      <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 cc-mono text-[10px] font-medium text-[var(--green)]">
+                        <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                        已监控 {captureStatus?.elapsed_sec ?? 0} 秒
                       </span>
                     </div>
-
-                    <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-                      {inspection.recommendation.reason}
+                    <p className="mt-1.5 text-xs leading-relaxed text-[var(--text)]">
+                      请切到你选中的软件里点击「更新订阅」或「连接」，猫猫正在后台实时盯着新配置变动…
                     </p>
+                  </div>
+                </div>
+              </div>
 
-                    {/* Probe Telemetry Summary */}
-                    <div className="grid grid-cols-2 gap-2 text-[11px]">
-                      <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2">
-                        <div className="text-[var(--muted)]">配置文件识别</div>
-                        <div className="mt-0.5 cc-mono font-medium text-[var(--text)]">
-                          {inspection.readable_yaml_file
-                            ? `可读取 · ${inspection.yaml_node_count} 个节点`
-                            : "未发现可读配置文件"}
-                        </div>
-                      </div>
-                      <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2">
-                        <div className="text-[var(--muted)]">本地接口识别</div>
-                        <div className="mt-0.5 cc-mono font-medium text-[var(--text)]">
-                          {inspection.controller_reachable
-                            ? inspection.controller_requires_secret
-                              ? "已开启（需要访问口令）"
-                              : `已开启 · ${inspection.controller_proxy_count} 个节点`
-                            : "未开启或不可访问"}
-                        </div>
-                      </div>
-                    </div>
+              {/* Live Sub-Step Status Lamps */}
+              <div className="grid grid-cols-3 gap-2">
+                {(
+                  [
+                    {
+                      ok: Boolean(captureStatus?.step_app_ready),
+                      label: "已锁定目标软件",
+                    },
+                    {
+                      ok: Boolean(captureStatus?.step_activity_seen),
+                      label: "检测到配置变动",
+                    },
+                    {
+                      ok: Boolean(captureStatus?.step_nodes_ready),
+                      label: "已抢读到明文节点",
+                    },
+                  ] as const
+                ).map((lamp, idx) => (
+                  <div
+                    key={idx}
+                    className={`flex items-center gap-2 rounded-xl border px-3 py-2.5 text-xs ${
+                      lamp.ok
+                        ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)] font-medium"
+                        : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)]"
+                    }`}
+                  >
+                    <span
+                      className={`h-2 w-2 shrink-0 rounded-full ${
+                        lamp.ok ? "bg-[var(--green)]" : "bg-[var(--line-strong)]"
+                      }`}
+                    />
+                    <span className="truncate">{lamp.label}</span>
+                  </div>
+                ))}
+              </div>
 
-                    {/* Direct Bind Action for File or Public Controller */}
-                    {inspection.recommendation.mode ===
-                      "read_only_local_file" && (
-                      <div className="space-y-2 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5">
-                        <div className="break-all cc-mono text-[11px] text-[var(--text)]">
-                          {inspection.recommendation.path}
+              {/* Captured Count & Opaque Hint */}
+              <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
+                <div className="rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5">
+                  <div className="text-[11px] text-[var(--muted)]">已抢读可用节点</div>
+                  <div className="mt-1 flex items-baseline gap-1.5">
+                    <span
+                      className={`cc-mono text-2xl font-bold ${
+                        (captureStatus?.captured_node_count ?? 0) > 0
+                          ? "text-[var(--green)]"
+                          : "text-[var(--text)]"
+                      }`}
+                    >
+                      {captureStatus?.captured_node_count ?? 0}
+                    </span>
+                    <span className="text-xs text-[var(--muted)]">个节点</span>
+                  </div>
+                </div>
+
+                <div className="rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5">
+                  <div className="text-[11px] text-[var(--muted)]">
+                    实时监听目录（{captureStatus?.watch_dirs.length ?? 0}）
+                  </div>
+                  <div className="mt-1 space-y-0.5 cc-mono text-[10.5px] text-[var(--text-secondary)]">
+                    {(captureStatus?.watch_dirs.length ?? 0) > 0 ? (
+                      captureStatus!.watch_dirs.slice(0, 2).map((dir, i) => (
+                        <div key={i} className="truncate" title={dir}>
+                          {dir}
                         </div>
-                        <button
-                          type="button"
-                          onClick={handleBindReadOnlySource}
-                          className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
-                        >
-                          <Link2 className="h-3.5 w-3.5" />
-                          一键抓取这些节点（{inspection.recommendation.node_count} 个）
-                        </button>
+                      ))
+                    ) : (
+                      <div className="text-[var(--muted)]">
+                        监控进程树与临时配置目录中…
                       </div>
                     )}
+                  </div>
+                </div>
+              </div>
 
-                    {inspection.recommendation.mode ===
-                      "public_controller_api" && (
-                      <div className="space-y-2 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5">
-                        <div className="cc-mono text-[11px] text-[var(--accent)]">
-                          {inspection.recommendation.endpoint_url}
-                        </div>
-                        {inspection.recommendation.requires_secret && (
-                          <input
-                            type="password"
-                            value={bearerSecret}
-                            onChange={(e) => setBearerSecret(e.target.value)}
-                            placeholder="填入该软件的本地接口访问口令..."
-                            className="w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                          />
-                        )}
-                        <button
-                          type="button"
-                          onClick={handleBindReadOnlySource}
-                          className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
-                        >
-                          <Link2 className="h-3.5 w-3.5" />
-                          一键从本地接口抓取节点
-                        </button>
-                      </div>
-                    )}
-
-                    {/* Notes */}
-                    <ul className="space-y-1 text-[11px] text-[var(--muted)]">
-                      {inspection.notes.map((note, idx) => (
-                        <li key={idx} className="flex items-start gap-1.5">
-                          <CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-[var(--green)]" />
-                          <span>{note}</span>
-                        </li>
-                      ))}
-                    </ul>
+              {captureStatus?.opaque_change_detected &&
+                (captureStatus.captured_node_count ?? 0) === 0 && (
+                  <div className="flex items-start gap-2 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2.5 text-xs text-[var(--amber)]">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>
+                      已检测到该软件写入非明文或加密格式配置，暂未读出明文节点。可尝试再次点击「更新订阅」或点击下方「结束捕捉并整理」查看结果。
+                    </span>
                   </div>
                 )}
 
-                {/* Collapsible Advanced: Custom Refresh Script */}
-                <div className="overflow-hidden rounded-xl border border-[var(--line)] bg-[var(--card)]">
-                  <button
-                    type="button"
-                    onClick={() => setShowAdapterSlot((v) => !v)}
-                    className="flex w-full items-center justify-between gap-2 px-3.5 py-2.5 text-left text-xs font-medium text-[var(--text-secondary)] hover:bg-[var(--bg-elevated)]/60 hover:text-[var(--text)]"
-                  >
-                    <span className="inline-flex items-center gap-1.5">
-                      <FileCode2 className="h-3.5 w-3.5 text-[var(--muted)]" />
-                      高级：自定义刷新脚本
-                    </span>
-                    {showAdapterSlot ? (
-                      <ChevronDown className="h-3.5 w-3.5 text-[var(--muted)]" />
-                    ) : (
-                      <ChevronRight className="h-3.5 w-3.5 text-[var(--muted)]" />
-                    )}
-                  </button>
-
-                  {showAdapterSlot && (
-                    <div className="space-y-3 border-t border-[var(--line)] p-3.5">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <span className="text-[11px] text-[var(--muted)]">
-                          供熟悉编程的用户接入自定义来源（协议：{ADAPTER_SCHEMA_V1}）
-                        </span>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => void handleCopyScript()}
-                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
-                          >
-                            {copiedScript ? (
-                              <Check className="h-3 w-3 text-[var(--green)]" />
-                            ) : (
-                              <Copy className="h-3 w-3" />
-                            )}
-                            {copiedScript ? "已复制" : "复制模板"}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={handleDownloadScript}
-                            className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)]"
-                          >
-                            <Download className="h-3 w-3" />
-                            下载 .py
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="rounded-lg bg-[var(--bg-elevated)] p-2.5 text-[11px] text-[var(--muted)]">
-                        标准协议：<span className="cc-mono text-[var(--text)]">stdin</span> 传入{" "}
-                        <span className="cc-mono">{`{"reason","sub_id","failed_servers"}`}</span>，
-                        <span className="cc-mono text-[var(--text)]">stdout</span> 返回{" "}
-                        <span className="cc-mono">{`{"schema":"catcloud-adapter/v1","nodes":[...],"yaml":null}`}</span>
-                        （上限 16 MiB，冷却 &gt;= 60s）。
-                      </div>
-
-                      <pre className="cc-selectable max-h-52 overflow-auto rounded-lg border border-[var(--line)] bg-[var(--bg)] p-3 cc-mono text-[11px] leading-relaxed text-[var(--text-secondary)]">
-                        {activeTemplateScript}
-                      </pre>
-
-                      <div className="grid grid-cols-1 gap-2 sm:grid-cols-12">
-                        <label className="text-[11px] text-[var(--muted)] sm:col-span-6">
-                          脚本启动命令
-                          <input
-                            type="text"
-                            value={adapterCmd}
-                            onChange={(e) => setAdapterCmd(e.target.value)}
-                            className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                          />
-                        </label>
-                        <label className="text-[11px] text-[var(--muted)] sm:col-span-3">
-                          超时 (秒)
-                          <input
-                            type="number"
-                            min={5}
-                            max={300}
-                            value={adapterTimeoutSec}
-                            onChange={(e) =>
-                              setAdapterTimeoutSec(Number(e.target.value) || 30)
-                            }
-                            className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                          />
-                        </label>
-                        <label className="text-[11px] text-[var(--muted)] sm:col-span-3">
-                          冷却 (&gt;=60s)
-                          <input
-                            type="number"
-                            min={60}
-                            max={86400}
-                            value={adapterCooldownSec}
-                            onChange={(e) =>
-                              setAdapterCooldownSec(
-                                Math.max(60, Number(e.target.value) || 60)
-                              )
-                            }
-                            className="mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 cc-mono text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
-                          />
-                        </label>
-                      </div>
-
-                      <div className="flex justify-end">
-                        <button
-                          type="button"
-                          onClick={handleRegisterAdapterSlot}
-                          className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
-                        >
-                          <Plus className="h-3.5 w-3.5" />
-                          添加自定义刷新脚本
-                        </button>
-                      </div>
+              {/* Live Event Stream */}
+              <div className="rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5">
+                <div className="mb-2 flex items-center justify-between text-[11px]">
+                  <span className="inline-flex items-center gap-1.5 font-semibold text-[var(--text)]">
+                    <Clock className="h-3.5 w-3.5 text-[var(--accent)]" />
+                    实时监测动态
+                  </span>
+                  <span className="cc-mono text-[var(--muted)]">
+                    {captureStatus?.events.length ?? 0} 条记录
+                  </span>
+                </div>
+                <div className="max-h-44 space-y-1.5 overflow-y-auto pr-1 text-xs">
+                  {(captureStatus?.events.length ?? 0) === 0 ? (
+                    <div className="py-4 text-center text-[11px] text-[var(--muted)]">
+                      等待目标软件触发更新订阅或连接动作…
                     </div>
+                  ) : (
+                    captureStatus!.events.map((ev, idx) => {
+                      const dotClass =
+                        ev.kind === "nodes" || ev.kind === "hit"
+                          ? "bg-[var(--green)]"
+                          : ev.kind === "opaque" || ev.kind === "warn"
+                            ? "bg-[var(--amber)]"
+                            : "bg-[var(--accent)]";
+                      return (
+                        <div
+                          key={`${ev.timestamp_ms}-${idx}`}
+                          className="flex items-start gap-2 rounded-lg bg-[var(--bg-elevated)] px-2.5 py-1.5 text-[11px]"
+                        >
+                          <span
+                            className={`mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full ${dotClass}`}
+                          />
+                          <span className="cc-mono shrink-0 text-[10px] text-[var(--muted)]">
+                            {formatCaptureEventTime(ev.timestamp_ms)}
+                          </span>
+                          <span className="min-w-0 flex-1 leading-relaxed text-[var(--text-secondary)]">
+                            {ev.message}
+                          </span>
+                        </div>
+                      );
+                    })
                   )}
                 </div>
-              </>
-            )}
-          </div>
+              </div>
+
+              {/* Quick Preview of Captured Nodes if already found */}
+              {captureStatus && captureStatus.preview_nodes.length > 0 && (
+                <div className="rounded-xl border border-[var(--green)]/40 bg-[var(--green-soft)]/35 p-3">
+                  <div className="mb-1.5 flex items-center justify-between text-[11px] font-medium text-[var(--green)]">
+                    <span>已抢读节点预览</span>
+                    <span className="cc-mono">
+                      共 {captureStatus.captured_node_count} 个
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    {captureStatus.preview_nodes.slice(0, 3).map((n, idx) => (
+                      <div
+                        key={`${n.id}-${idx}`}
+                        className="flex items-center justify-between gap-2 rounded-lg bg-[var(--card)]/90 px-2.5 py-1 text-[11px]"
+                      >
+                        <span className="truncate font-medium text-[var(--text)]">
+                          {n.name}
+                        </span>
+                        <span className="cc-mono shrink-0 text-[10px] text-[var(--muted)]">
+                          {n.protocol.toUpperCase()} · {resolveNodeRegionCode(n)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {step === 3 && outcome && (
+            isOutcomeSupported ? (
+              <div className="space-y-4">
+                {/* Success Header */}
+                <div className="flex items-start gap-3 rounded-2xl border border-[var(--green)]/45 bg-[var(--green-soft)]/60 p-4">
+                  <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-[var(--green)]" />
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm font-semibold text-[var(--text)]">
+                      成功捕捉到 {outcome.nodes.length} 个可用节点！
+                    </div>
+                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                      来源软件：
+                      <strong className="font-semibold text-[var(--text)]">
+                        {outcome.target_name || "桌面软件"}
+                      </strong>
+                      {" · "}
+                      {outcome.is_ephemeral_source || outcome.source_kind === "migrated"
+                        ? "将以永久节点方式安全落库，重启后也不会失效。"
+                        : outcome.source_kind === "file"
+                          ? "已识别到稳定配置文件，将以只读方式关联并导入节点。"
+                          : "已识别到本地公开接口，将以只读方式关联并导入节点。"}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Region Distribution */}
+                {outcomeRegionStats.length > 0 && (
+                  <div className="space-y-1.5">
+                    <div className="text-[11px] font-medium text-[var(--muted)]">
+                      地区分布
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {outcomeRegionStats.slice(0, 10).map((stat) => (
+                        <span
+                          key={stat.code}
+                          className="inline-flex items-center gap-1 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] text-[var(--text)]"
+                        >
+                          <span>{stat.label}</span>
+                          <span className="cc-mono font-semibold text-[var(--accent)]">
+                            {stat.count}
+                          </span>
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Subscription Name Input */}
+                <label className="block text-xs text-[var(--muted)]">
+                  导入后的订阅名称
+                  <input
+                    type="text"
+                    disabled={importingOutcome}
+                    value={importName}
+                    onChange={(e) => setImportName(e.target.value)}
+                    placeholder={`抓取 · ${outcome.target_name || "桌面软件"}`}
+                    className="mt-1.5 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-60"
+                  />
+                </label>
+
+                {/* Full Captured Node Preview */}
+                <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-[var(--text)]">
+                      捕获节点预览（{filteredOutcomeNodes.length} / {outcome.nodes.length}）
+                    </span>
+                    {outcome.nodes.length > 8 && (
+                      <div className="relative w-48">
+                        <Search className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-[var(--muted)]" />
+                        <input
+                          type="text"
+                          value={nodeFilter}
+                          onChange={(e) => setNodeFilter(e.target.value)}
+                          placeholder="筛选预览节点..."
+                          className="w-full rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] py-1 pl-6 pr-2 text-[11px] text-[var(--text)] focus:border-[var(--accent)] focus:outline-none"
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="max-h-60 space-y-1.5 overflow-y-auto pr-1">
+                    {filteredOutcomeNodes.map((node, idx) => {
+                      const regionCode = resolveNodeRegionCode(node);
+                      return (
+                        <div
+                          key={`${node.id}-${idx}`}
+                          className="flex items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs"
+                        >
+                          <div className="min-w-0">
+                            <div className="truncate font-medium text-[var(--text)]">
+                              {node.name}
+                            </div>
+                            <div className="cc-mono text-[10px] text-[var(--muted)]">
+                              {node.protocol.toUpperCase()} · {node.server}:{node.port}
+                            </div>
+                          </div>
+                          <div className="flex shrink-0 items-center gap-1.5 cc-mono text-[10px]">
+                            <span
+                              title={getRegionLabel(regionCode)}
+                              className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[var(--text-secondary)]"
+                            >
+                              {regionCode}
+                            </span>
+                            <span className="rounded bg-[var(--accent-soft)] px-1.5 py-0.5 text-[var(--accent)]">
+                              {node.multiplier}x
+                            </span>
+                            {node.is_443_native && (
+                              <span className="rounded bg-[var(--green-soft)] px-1.5 py-0.5 text-[var(--green)]">
+                                直连 443
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </div>
+            ) : (
+              /* Clean Unsupported Empty State */
+              <div className="flex min-h-[320px] flex-col items-center justify-center px-4 py-8 text-center">
+                <div className="flex h-12 w-12 items-center justify-center rounded-2xl border border-[var(--amber)]/40 bg-[var(--amber-soft)] text-[var(--amber)]">
+                  <AlertTriangle className="h-6 w-6" />
+                </div>
+                <h3 className="mt-4 text-sm font-semibold text-[var(--text)]">
+                  未能直接抓取到明文节点
+                </h3>
+                <p className="mt-2 max-w-md text-xs leading-relaxed text-[var(--text-secondary)]">
+                  {UNSUPPORTED_CAPTURE_NOTICE}
+                </p>
+                {outcome.unsupported_reason &&
+                  outcome.unsupported_reason.trim() !== UNSUPPORTED_CAPTURE_NOTICE && (
+                    <p className="mt-2 max-w-md rounded-lg bg-[var(--bg-elevated)] px-3 py-1.5 text-[11px] text-[var(--muted)]">
+                      {outcome.unsupported_reason}
+                    </p>
+                  )}
+                <div className="mt-6 flex flex-wrap items-center justify-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => void handleResetToStep1()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-4 py-2 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                  >
+                    <ArrowLeft className="h-3.5 w-3.5" />
+                    返回重选其它软件
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleSwitchToSubUrl}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                  >
+                    <Link2 className="h-3.5 w-3.5" />
+                    去粘贴订阅链接
+                  </button>
+                </div>
+              </div>
+            )
+          )}
+        </div>
+
+        {/* Footer Actions */}
+        <div className="flex items-center justify-between gap-2 border-t border-[var(--line)] px-5 py-3">
+          {step === 1 && (
+            <>
+              <span className="truncate text-[11px] text-[var(--muted)]">
+                {selectedCandidate
+                  ? `已选：${selectedCandidate.friendly_name || selectedCandidate.process_name}`
+                  : "请先选择一个桌面软件"}
+              </span>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  onClick={safeClose}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)]"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={!selectedCandidate || startingCapture}
+                  onClick={() => void handleStartLiveCapture()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  {startingCapture ? (
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Play className="h-3.5 w-3.5" />
+                  )}
+                  {startingCapture ? "正在启动…" : "开始实时捕捉"}
+                </button>
+              </div>
+            </>
+          )}
+
+          {step === 2 && (
+            <>
+              <span className="truncate text-[11px] text-[var(--muted)]">
+                {(captureStatus?.captured_node_count ?? 0) > 0
+                  ? `已抢读 ${captureStatus!.captured_node_count} 个节点，随时可结束整理`
+                  : "切到目标软件点击更新订阅或连接后，再点右侧结束"}
+              </span>
+              <div className="flex shrink-0 items-center gap-2">
+                <button
+                  type="button"
+                  disabled={finishingCapture}
+                  onClick={() => void handleCancelCaptureToStep1()}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
+                >
+                  取消捕捉
+                </button>
+                <button
+                  type="button"
+                  disabled={finishingCapture}
+                  onClick={() => void handleFinishCapture()}
+                  className={`inline-flex items-center gap-1.5 rounded-xl px-4 py-1.5 text-xs font-semibold transition-opacity hover:opacity-90 disabled:opacity-50 ${
+                    (captureStatus?.captured_node_count ?? 0) > 0
+                      ? "bg-[var(--green)] text-[var(--accent-ink)]"
+                      : "bg-[var(--accent)] text-[var(--accent-ink)]"
+                  }`}
+                >
+                  {finishingCapture ? (
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Square className="h-3 w-3 fill-current" />
+                  )}
+                  {finishingCapture
+                    ? "正在整理…"
+                    : (captureStatus?.captured_node_count ?? 0) > 0
+                      ? `结束捕捉并整理（${captureStatus!.captured_node_count}）`
+                      : "结束捕捉并整理"}
+                </button>
+              </div>
+            </>
+          )}
+
+          {step === 3 && (
+            <>
+              <span className="truncate text-[11px] text-[var(--muted)]">
+                {isOutcomeSupported
+                  ? "安全只读提取，不会修改原软件配置"
+                  : "换个支持的软件或使用标准订阅链接"}
+              </span>
+              <div className="flex shrink-0 items-center gap-2">
+                {isOutcomeSupported ? (
+                  <>
+                    <button
+                      type="button"
+                      disabled={importingOutcome}
+                      onClick={() => void handleResetToStep1()}
+                      className="rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
+                    >
+                      返回重选
+                    </button>
+                    <button
+                      type="button"
+                      disabled={importingOutcome || !outcome}
+                      onClick={() => void handleConfirmImportOutcome()}
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                    >
+                      {importingOutcome ? (
+                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Check className="h-3.5 w-3.5" />
+                      )}
+                      {importingOutcome
+                        ? "正在导入…"
+                        : `确认导入全部 ${outcome?.nodes.length ?? 0} 个节点`}
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      appActions.clearLiveCaptureOutcome();
+                      onClose();
+                    }}
+                    className="rounded-xl border border-[var(--line)] bg-[var(--card)] px-3.5 py-1.5 text-xs text-[var(--text)] hover:border-[var(--accent)]"
+                  >
+                    关闭
+                  </button>
+                )}
+              </div>
+            </>
+          )}
         </div>
       </div>
     </div>,
@@ -2736,6 +2723,8 @@ export function NodesSubsPage({
   const storeGroups = useAppSelector((s) => s.groups);
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.config.preaccel);
+  const subsBg = useAppSelector((s) => s.bgTasks.subs);
+  const bgCapture = useAppSelector((s) => s.bgTasks.capture);
   const isSingleMode = runtime.route_mode === "single";
 
   // Directly subscribe to appStore so edits on other pages always stay in sync
@@ -2743,14 +2732,20 @@ export function NodesSubsPage({
   const nodes = storeNodes;
   const groups = storeGroups;
 
+  // Global background subscription & capture task state (survives tab & route switches)
+  const refreshingAll = subsBg.refreshingAll;
+  const refreshingIdSet = useMemo(
+    () => new Set(subsBg.refreshingIds),
+    [subsBg.refreshingIds]
+  );
+  const importingSub = subsBg.importing;
+
   // Top subscription controls & quick import form
-  const [refreshingIds, setRefreshingIds] = useState<Record<string, boolean>>({});
-  const [refreshingAll, setRefreshingAll] = useState(false);
-  const [importingSub, setImportingSub] = useState(false);
   const [selectingSingleNodeId, setSelectingSingleNodeId] = useState<string | null>(null);
   const [showLocalFileForm, setShowLocalFileForm] = useState(false);
   const [newSubName, setNewSubName] = useState("");
   const [newSubSource, setNewSubSource] = useState("");
+  const subUrlInputRef = useRef<HTMLInputElement | null>(null);
   const [localFileName, setLocalFileName] = useState("");
   const [localFilePath, setLocalFilePath] = useState("");
   const [newSubIntervalSec, setNewSubIntervalSec] = useState(21600);
@@ -3089,16 +3084,6 @@ export function NodesSubsPage({
   /* ---------- Subscription Actions ---------- */
 
   const inTauri = isTauriEnv();
-  const timersRef = useRef<number[]>([]);
-
-  useEffect(() => {
-    return () => {
-      for (const id of timersRef.current) {
-        window.clearTimeout(id);
-      }
-      timersRef.current = [];
-    };
-  }, []);
 
   const syncListsFromBackend = async () => {
     const [latestSubs, latestNodes, latestGroups] = await Promise.all([
@@ -3111,121 +3096,17 @@ export function NodesSubsPage({
     appActions.syncGroups(latestGroups);
   };
 
-  const waitManaged = (ms: number) =>
-    new Promise<void>((resolve) => {
-      const id = window.setTimeout(() => {
-        timersRef.current = timersRef.current.filter((item) => item !== id);
-        resolve();
-      }, ms);
-      timersRef.current.push(id);
-    });
-
   const refreshSingleSubscription = async (
     sub: SubscriptionRecord,
     simulateFault = false
   ) => {
-    setRefreshingIds((prev) => ({ ...prev, [sub.id]: true }));
-    appActions.setMascotState("searching");
-
-    if (inTauri && !simulateFault) {
-      try {
-        const res = await catcloudApi.refreshSubscription(sub.id);
-        await syncListsFromBackend();
-        const warnNote = res.warnings.length > 0 ? `（提醒：${res.warnings[0]}）` : "";
-        appActions.showToast(
-          `${sub.name} 已刷新，当前 ${res.node_count} 个节点${warnNote}`,
-          res.warnings.length > 0 ? "warn" : "ok"
-        );
-      } catch (err) {
-        const errMsg = formatErrorMessage(err);
-        appActions.syncSubscriptions(
-          subscriptions.map((item) =>
-            item.id === sub.id ? { ...item, last_error: errMsg } : item
-          )
-        );
-        appActions.showToast(
-          `${sub.name} 刷新失败（已保留现有节点）：${errMsg}`,
-          "warn"
-        );
-      } finally {
-        setRefreshingIds((prev) => ({ ...prev, [sub.id]: false }));
-        appActions.setMascotState("idle");
-      }
-      return;
-    }
-
-    // Browser preview mode
-    await waitManaged(240);
-    const nowIso = new Date().toISOString();
-    if (simulateFault) {
-      const errMsg =
-        "远端返回异常或 0 个节点，已自动中止覆盖并保留现有老节点与自建规则";
-      appActions.syncSubscriptions(
-        subscriptions.map((item) =>
-          item.id === sub.id ? { ...item, last_error: errMsg } : item
-        )
-      );
-      appActions.showToast(
-        `${sub.name} 刷新异常（预览演练）：已自动保护老节点与自建规则`,
-        "warn"
-      );
-    } else {
-      appActions.syncSubscriptions(
-        subscriptions.map((item) =>
-          item.id === sub.id
-            ? { ...item, last_ok_at: nowIso, last_error: null }
-            : item
-        )
-      );
-      appActions.showToast(`${sub.name} 已安全刷新`, "ok");
-    }
-
-    setRefreshingIds((prev) => ({ ...prev, [sub.id]: false }));
-    appActions.setMascotState("idle");
+    if (refreshingIdSet.has(sub.id) || refreshingAll) return;
+    await appActions.runRefreshSingleSubscription(sub.id, { simulateFault });
   };
 
   const refreshAllSubscriptions = async () => {
     if (subscriptions.length === 0 || refreshingAll) return;
-    setRefreshingAll(true);
-    appActions.setMascotState("searching");
-
-    if (inTauri) {
-      try {
-        const res = await catcloudApi.refreshAllSubscriptions();
-        await syncListsFromBackend();
-        if (res.errors.length > 0) {
-          appActions.showToast(
-            `已刷新 ${res.refreshed} 个订阅（共 ${res.total_nodes} 节点），${res.errors.length} 个失败：${res.errors[0]}`,
-            "warn"
-          );
-        } else {
-          appActions.showToast(
-            `已刷新 ${res.refreshed} 个启用订阅，共 ${res.total_nodes} 个节点`,
-            "ok"
-          );
-        }
-      } catch (err) {
-        appActions.showToast(`批量刷新订阅失败：${formatErrorMessage(err)}`, "warn");
-      } finally {
-        setRefreshingAll(false);
-        appActions.setMascotState("idle");
-      }
-      return;
-    }
-
-    await waitManaged(300);
-    const nowIso = new Date().toISOString();
-    appActions.syncSubscriptions(
-      subscriptions.map((item) =>
-        item.enabled ? { ...item, last_ok_at: nowIso, last_error: null } : item
-      )
-    );
-    setRefreshingAll(false);
-    appActions.setMascotState("idle");
-    appActions.showToast(
-      `已刷新 ${subscriptions.filter((s) => s.enabled).length} 个已启用的订阅`,
-      "ok"
-    );
+    await appActions.runRefreshAllSubscriptions();
   };
 
   const submitSubscriptionSource = async (
@@ -3260,7 +3141,6 @@ export function NodesSubsPage({
       name,
       kind,
       url_or_cmd: source,
-      source,
       refresh_interval_sec: newSubIntervalSec,
       traffic_used_bytes: 0,
       traffic_total_bytes: 0,
@@ -3270,7 +3150,7 @@ export function NodesSubsPage({
       enabled: true,
     };
 
-    setImportingSub(true);
+    appActions.setSubsImporting(true);
     appActions.setMascotState("searching");
     try {
       if (inTauri) {
@@ -3325,8 +3205,9 @@ export function NodesSubsPage({
         enabled: true,
       };
 
-      appActions.syncSubscriptions([...subscriptions, previewSub]);
-      appActions.syncNodes([...nodes, seedNode]);
+      const latestState = appStore.getState();
+      appActions.syncSubscriptions([...latestState.subscriptions, previewSub]);
+      appActions.syncNodes([...latestState.nodes, seedNode]);
       if (kind === "url") {
         setNewSubName("");
         setNewSubSource("");
@@ -3337,7 +3218,7 @@ export function NodesSubsPage({
       }
       appActions.showToast(`已导入「${name}」（演示预览）`, "ok");
     } finally {
-      setImportingSub(false);
+      appActions.setSubsImporting(false);
       appActions.setMascotState("idle");
     }
   };
@@ -3459,7 +3340,6 @@ export function NodesSubsPage({
       name: customName,
       kind: "migrated",
       url_or_cmd: sourceVal,
-      source: sourceVal,
       refresh_interval_sec: 0,
       traffic_used_bytes: 0,
       traffic_total_bytes: 0,
@@ -3483,77 +3363,131 @@ export function NodesSubsPage({
     return true;
   };
 
-  const handleProcessAttach = async (payload: {
+  const handleLiveCaptureImport = async (payload: {
     name: string;
-    source: string;
-    kind: SubscriptionRecord["kind"];
-    nodes: ProxyNode[];
-  }) => {
-    const subId = `sub-proc-${Date.now()}`;
-    const nextSub: SubscriptionRecord = {
-      id: subId,
-      name: payload.name,
-      kind: payload.kind,
-      url_or_cmd: payload.source,
-      source: payload.source,
-      refresh_interval_sec: 1800,
-      traffic_used_bytes: 0,
-      traffic_total_bytes: 0,
-      expires_at: null,
-      last_ok_at: null,
-      last_error: null,
-      enabled: true,
-    };
+    outcome: LiveCaptureOutcomeDto;
+  }): Promise<boolean> => {
+    const { name, outcome } = payload;
+    const cleanName = name.trim() || `抓取 · ${outcome.target_name || "桌面软件"}`;
+    const capturedNodes = Array.isArray(outcome.nodes) ? outcome.nodes : [];
+    if (!outcome.supported || capturedNodes.length === 0) {
+      appActions.showToast("未捕获到可导入节点", "warn");
+      return false;
+    }
+
+    const useMigratedPersistence =
+      outcome.is_ephemeral_source ||
+      outcome.source_kind === "migrated" ||
+      outcome.source_kind === "none" ||
+      !outcome.source_path?.trim();
 
     if (inTauri) {
       try {
+        if (useMigratedPersistence) {
+          const importedCount = await catcloudApi.applyMigrationNodes(
+            cleanName,
+            capturedNodes
+          );
+          await syncListsFromBackend();
+          appActions.showToast(
+            `已永久导入「${cleanName}」（共 ${importedCount} 个节点）`,
+            "ok"
+          );
+          return true;
+        }
+
+        const subKind: SubscriptionRecord["kind"] =
+          outcome.source_kind === "process_adapter" ? "process_adapter" : "file";
+        const subId = `sub-capture-${Date.now()}`;
+        const nextSub: SubscriptionRecord = {
+          id: subId,
+          name: cleanName,
+          kind: subKind,
+          url_or_cmd: outcome.source_path!.trim(),
+          refresh_interval_sec: 1800,
+          traffic_used_bytes: 0,
+          traffic_total_bytes: 0,
+          expires_at: null,
+          last_ok_at: null,
+          last_error: null,
+          enabled: true,
+        };
         const saved = await catcloudApi.upsertSubscription(nextSub);
-        let note = "";
-        let refreshErrMsg: string | null = null;
-        if (payload.nodes.length > 0) {
-          const imported = await catcloudApi.applyMigrationNodes(payload.name, payload.nodes);
-          note = `（已保存 ${imported} 个节点）`;
-        } else {
+        let importedCount = 0;
+        let usedFallbackSnapshot = false;
+        try {
+          const refreshed = await catcloudApi.refreshSubscription(saved.id);
+          importedCount = refreshed.node_count;
+        } catch {
+          importedCount = 0;
+        }
+        if (importedCount === 0) {
           try {
-            const refreshed = await catcloudApi.refreshSubscription(saved.id);
-            note = `（已抓回 ${refreshed.node_count} 个节点）`;
-          } catch (refreshErr) {
-            refreshErrMsg = formatErrorMessage(refreshErr);
+            await catcloudApi.deleteSubscription(saved.id);
+          } catch {
+            /* ignore empty subscription cleanup failure */
           }
+          importedCount = await catcloudApi.applyMigrationNodes(
+            cleanName,
+            capturedNodes
+          );
+          usedFallbackSnapshot = true;
         }
         await syncListsFromBackend();
-        setFilterSubId(saved.id);
-        if (refreshErrMsg) {
-          appActions.showToast(
-            `已添加「${payload.name}」，但抓节点失败：${refreshErrMsg}`,
-            "warn"
-          );
-        } else {
-          appActions.showToast(`已关联 ${payload.name}${note}`, "ok");
+        if (!usedFallbackSnapshot) {
+          setFilterSubId(saved.id);
         }
+        appActions.showToast(
+          `已导入「${cleanName}」（共 ${importedCount} 个节点）`,
+          "ok"
+        );
+        return true;
       } catch (err) {
-        appActions.showToast(`抓取软件节点失败：${formatErrorMessage(err)}`, "warn");
+        appActions.showToast(`导入捕捉节点失败：${formatErrorMessage(err)}`, "warn");
+        return false;
       }
-      return;
     }
 
-    const boundNodes: ProxyNode[] = payload.nodes.map((node, idx) => ({
+    const subId = `sub-capture-${Date.now()}`;
+    const subKind: SubscriptionRecord["kind"] = useMigratedPersistence
+      ? "migrated"
+      : outcome.source_kind === "process_adapter"
+        ? "process_adapter"
+        : "file";
+    const boundNodes: ProxyNode[] = capturedNodes.map((node, idx) => ({
       ...node,
       id: `${subId}-${idx + 1}`,
       sub_id: subId,
     }));
     const previewSub: SubscriptionRecord = {
-      ...nextSub,
+      id: subId,
+      name: cleanName,
+      kind: subKind,
+      url_or_cmd: outcome.source_path?.trim() || "live-capture://snapshot",
+      refresh_interval_sec: useMigratedPersistence ? 0 : 1800,
+      traffic_used_bytes: 0,
+      traffic_total_bytes: 0,
+      expires_at: null,
       last_ok_at: new Date().toISOString(),
+      last_error: null,
+      enabled: true,
     };
     appActions.syncSubscriptions([...subscriptions, previewSub]);
     appActions.syncNodes([...nodes, ...boundNodes]);
     setFilterSubId(subId);
     appActions.showToast(
-      `已抓取 ${payload.name}（共 ${boundNodes.length} 个节点）`,
+      `已导入「${cleanName}」（共 ${boundNodes.length} 个节点）`,
       "ok"
     );
+    return true;
   };
+
+  const handleFocusSubUrlInput = useCallback(() => {
+    window.setTimeout(() => {
+      subUrlInputRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+      subUrlInputRef.current?.focus();
+    }, 40);
+  }, []);
 
   /* ---------- Node Selection, Batch Group Join/Remove & PreAccel Override ---------- */
 
@@ -3653,32 +3587,6 @@ export function NodesSubsPage({
       );
     } catch (err) {
       appActions.showToast(`移出多选组失败：${formatErrorMessage(err)}`, "warn");
-    }
-  };
-
-  const handleToggleSingleGroupMember = async (nodeId: string) => {
-    if (!targetGroup) return;
-    const inGroup = targetGroupMemberSet.has(nodeId);
-    const nextMembers = inGroup
-      ? targetGroup.member_node_ids.filter((id) => id !== nodeId)
-      : [...targetGroup.member_node_ids, nodeId];
-
-    try {
-      const updated = await catcloudApi.updateMultiGroupMembers(
-        targetGroup.id,
-        nextMembers
-      );
-      appActions.syncGroups(
-        groups.map((g) => (g.id === updated.id ? updated : g))
-      );
-      appActions.showToast(
-        inGroup
-          ? `已从「${targetGroup.name}」移出该节点`
-          : `已加入「${targetGroup.name}」`,
-        "ok"
-      );
-    } catch (err) {
-      appActions.showToast(`更新组成员失败：${formatErrorMessage(err)}`, "warn");
     }
   };
 
@@ -3873,6 +3781,7 @@ export function NodesSubsPage({
             </div>
 
             <input
+              ref={subUrlInputRef}
               type="text"
               value={newSubSource}
               onChange={(e) => setNewSubSource(e.target.value)}
@@ -3949,33 +3858,120 @@ export function NodesSubsPage({
         </div>
 
         {/* Card 3: Capture Nodes from Running Software */}
-        <div className="cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl p-4">
+        <div
+          className={`cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl p-4 ${
+            bgCapture.active || bgCapture.finishing || bgCapture.outcome
+              ? "border-[var(--green)]/60 ring-1 ring-[var(--green)]/25"
+              : ""
+          }`}
+        >
           <div className="space-y-2">
-            <div className="flex items-center gap-2.5">
-              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--sky-soft)] text-[var(--sky)]">
-                <Cpu className="h-4 w-4" />
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--sky-soft)] text-[var(--sky)]">
+                  <Cpu className="h-4 w-4" />
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--sky)] text-[10px] font-bold text-[var(--accent-ink)]">
+                    3
+                  </span>
+                  <h2 className="text-sm font-semibold text-[var(--text)]">
+                    从正在运行的软件抓节点
+                  </h2>
+                </div>
               </div>
-              <div className="flex items-center gap-1.5">
-                <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--sky)] text-[10px] font-bold text-[var(--accent-ink)]">
-                  3
+              {bgCapture.finishing ? (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
+                  <RefreshCw className="h-2.5 w-2.5 animate-spin" />
+                  整理中
                 </span>
-                <h2 className="text-sm font-semibold text-[var(--text)]">
-                  从正在运行的软件抓节点
-                </h2>
-              </div>
+              ) : bgCapture.outcome ? (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                  <CheckCircle2 className="h-2.5 w-2.5" />
+                  待确认导入
+                </span>
+              ) : bgCapture.active ? (
+                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                  <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                  捕捉中
+                </span>
+              ) : null}
             </div>
-            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-              先打开你的专用梯子软件，点这里自动识别并抓取可用节点。
-            </p>
+            {bgCapture.finishing ? (
+              <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+                正在整理{" "}
+                <strong className="font-semibold text-[var(--text)]">
+                  {bgCapture.status?.target_name || bgCapture.targetName || "目标软件"}
+                </strong>{" "}
+                的捕捉结果，完成后即可一键确认导入节点。
+              </p>
+            ) : bgCapture.outcome ? (
+              <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+                已从{" "}
+                <strong className="font-semibold text-[var(--text)]">
+                  {bgCapture.outcome.target_name || bgCapture.targetName || "目标软件"}
+                </strong>{" "}
+                整理完成
+                {bgCapture.outcome.supported && bgCapture.outcome.nodes.length > 0 ? (
+                  <>
+                    ，共捕捉{" "}
+                    <strong className="cc-mono text-[var(--green)]">
+                      {bgCapture.outcome.nodes.length}
+                    </strong>{" "}
+                    个可用节点，点击下方继续确认导入。
+                  </>
+                ) : (
+                  "，点击下方查看结果详情。"
+                )}
+              </p>
+            ) : bgCapture.active ? (
+              <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+                正在后台实时监控{" "}
+                <strong className="font-semibold text-[var(--text)]">
+                  {bgCapture.status?.target_name || bgCapture.targetName || "目标软件"}
+                </strong>
+                （已监控 {bgCapture.status?.elapsed_sec ?? 0} 秒 · 已抢读{" "}
+                <strong className="cc-mono text-[var(--green)]">
+                  {bgCapture.status?.captured_node_count ?? 0}
+                </strong>{" "}
+                个节点），点击下方随时返回整理导入。
+              </p>
+            ) : (
+              <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+                按 1→2→3 实时捕捉向导，选定已打开或新启动的专用软件，点击更新订阅即可自动提取可用节点。
+              </p>
+            )}
           </div>
 
           <button
             type="button"
             onClick={() => setProcessAttachOpen(true)}
-            className="inline-flex w-full items-center justify-center gap-1.5 rounded-xl border border-[var(--sky)]/50 bg-[var(--sky-soft)] px-4 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90"
+            className={`inline-flex w-full items-center justify-center gap-1.5 rounded-xl border px-4 py-2 text-xs font-semibold transition-opacity hover:opacity-90 ${
+              bgCapture.active || bgCapture.finishing || bgCapture.outcome
+                ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
+                : "border-[var(--sky)]/50 bg-[var(--sky-soft)] text-[var(--sky)]"
+            }`}
           >
-            <Cpu className="h-3.5 w-3.5" />
-            识别运行中的软件
+            {bgCapture.active || bgCapture.finishing ? (
+              <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+            ) : bgCapture.outcome ? (
+              <CheckCircle2 className="h-3.5 w-3.5" />
+            ) : (
+              <Cpu className="h-3.5 w-3.5" />
+            )}
+            {bgCapture.finishing
+              ? "正在整理捕捉结果…"
+              : bgCapture.outcome
+                ? bgCapture.outcome.supported && bgCapture.outcome.nodes.length > 0
+                  ? `继续确认导入（已抓 ${bgCapture.outcome.nodes.length} 个节点）`
+                  : "查看捕捉结果"
+                : bgCapture.active
+                  ? `继续查看实时捕捉进度${
+                      (bgCapture.status?.captured_node_count ?? 0) > 0
+                        ? `（已抓 ${bgCapture.status!.captured_node_count}）`
+                        : ""
+                    }`
+                  : "打开 1→2→3 实时捕捉向导"}
           </button>
         </div>
       </section>
@@ -4115,7 +4111,7 @@ export function NodesSubsPage({
             const expire = formatExpireInfo(sub.expires_at);
             const nodeCount = subNodeCountMap.get(sub.id) ?? 0;
             const isSelectedFilter = !embeddedSubsOnly && filterSubId === sub.id;
-            const isRefreshing = Boolean(refreshingIds[sub.id]) || refreshingAll;
+            const isRefreshing = refreshingIdSet.has(sub.id) || refreshingAll;
             const maskedSource = maskSubscriptionSource(getSubSource(sub));
 
             return (
@@ -4740,7 +4736,6 @@ export function NodesSubsPage({
                   const aiInfo = getNodeAiInfo(probe);
                   const subName = subNameMap.get(node.sub_id) ?? node.sub_id;
                   const memberGroups = nodeGroupMembership.get(node.id) ?? [];
-                  const inTargetGroup = targetGroupMemberSet.has(node.id);
                   const regionCode = resolveNodeRegionCode(node);
                   const regionLabel = getRegionLabel(regionCode);
                   const isSingleActive =
@@ -5037,28 +5032,7 @@ export function NodesSubsPage({
                             )}
                           </button>
 
-                          <button
-                            type="button"
-                            disabled={!targetGroup}
-                            onClick={() => void handleToggleSingleGroupMember(node.id)}
-                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
-                              inTargetGroup
-                                ? "border-[var(--green)] bg-[var(--green-soft)] text-[var(--green)] hover:opacity-85"
-                                : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)]"
-                            }`}
-                          >
-                            {inTargetGroup ? (
-                              <>
-                                <Check className="h-3 w-3 shrink-0" />
-                                <span>已在组</span>
-                              </>
-                            ) : (
-                              <>
-                                <Plus className="h-3 w-3 shrink-0" />
-                                <span>加组</span>
-                              </>
-                            )}
-                          </button>
+                          <GroupMembershipPopover node={node} variant="pill" />
                         </div>
                       </td>
                     </tr>
@@ -5090,7 +5064,7 @@ export function NodesSubsPage({
       )}
 
       {/* ====================================================================
-       * 7. Slide-Over Drawers: Legacy Read-Only Migration & Process Attach
+       * 7. Slide-Over Drawers: Legacy Read-Only Migration & Live Capture Wizard
        * ==================================================================== */}
       <MigrationDrawer
         open={migrationOpen}
@@ -5101,7 +5075,8 @@ export function NodesSubsPage({
       <ProcessAttachDrawer
         open={processAttachOpen}
         onClose={closeProcessAttach}
-        onAttachSource={handleProcessAttach}
+        onConfirmCapture={handleLiveCaptureImport}
+        onGoToSubUrl={handleFocusSubUrlInput}
       />
 
       {/* Delete Subscription Two-Step Confirmation Modal */}

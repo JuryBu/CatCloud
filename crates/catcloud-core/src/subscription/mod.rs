@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod live_capture;
 pub mod migrator;
 pub mod parser;
 pub mod process_attach;
@@ -10,6 +11,7 @@ pub use adapter::{
     MIN_ADAPTER_COOLDOWN_SEC, invoke_external_adapter, parse_adapter_response,
     render_adapter_template_script,
 };
+pub use live_capture::*;
 pub use migrator::{
     MigrationImportOptions, MigrationImportReport, MigrationPreview, MigrationSourceKind,
     apply_migration_rules_to_config, discover_known_client_paths, import_migration_preview,

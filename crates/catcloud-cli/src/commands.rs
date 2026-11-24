@@ -1074,6 +1074,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let mut cfg = config::load_or_init(paths)?;
                 if let Some(en) = enabled {
                     cfg.preaccel.enabled = en;
+                    cfg.preaccel.global_bypass_enabled = en;
                 }
                 if let Some(skip) = skip_443_native {
                     cfg.preaccel.skip_443_native = skip;
@@ -2384,9 +2385,15 @@ mod tests {
 
         let (payload_after, _) =
             build_global_preaccel_status_payload(&paths).expect("status after windivert");
-        assert_eq!(payload_after["windivert_available"], json!(true));
-        assert!(payload_after["windivert_dll"].as_str().is_some());
-        assert!(payload_after["windivert_sys"].as_str().is_some());
+        if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+            assert_eq!(payload_after["windivert_available"], json!(false));
+            assert!(payload_after["windivert_dll"].is_null());
+            assert!(payload_after["windivert_sys"].is_null());
+        } else {
+            assert_eq!(payload_after["windivert_available"], json!(true));
+            assert!(payload_after["windivert_dll"].as_str().is_some());
+            assert!(payload_after["windivert_sys"].as_str().is_some());
+        }
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

@@ -22,8 +22,6 @@ pub mod menu_id {
     pub const QUICK_SWITCH_NEXT_BEST_PREFIX: &str = "tray:group_next:";
     pub const GROUP_SELECT_PREFIX: &str = "tray:group_select:";
     pub const PREACCEL_TOGGLE: &str = "tray:preaccel:toggle";
-    pub const TOGGLE_GLOBAL_PREACCEL: &str = "tray:preaccel:toggle_global";
-    pub const PREACCEL_TOGGLE_GLOBAL_SUB: &str = "tray:preaccel:toggle_global_sub";
     pub const PREACCEL_FAILOVER_NEXT: &str = "tray:preaccel:failover";
     pub const PREACCEL_RELAY_PREFIX: &str = "tray:preaccel:relay:";
     pub const SUBS_REFRESH_ALL: &str = "tray:subs:refresh_all";
@@ -407,8 +405,8 @@ pub fn parse_menu_action(id: &str) -> Option<TrayAction> {
         menu_id::MODE_GLOBAL => Some(TrayAction::SetProxyMode(TrayProxyMode::Global)),
         menu_id::MODE_DIRECT => Some(TrayAction::SetProxyMode(TrayProxyMode::Direct)),
         menu_id::PREACCEL_TOGGLE => Some(TrayAction::TogglePreAccel),
-        menu_id::TOGGLE_GLOBAL_PREACCEL | menu_id::PREACCEL_TOGGLE_GLOBAL_SUB => {
-            Some(TrayAction::ToggleGlobalPreAccel)
+        "tray:preaccel:toggle_global" | "tray:preaccel:toggle_global_sub" => {
+            Some(TrayAction::TogglePreAccel)
         }
         menu_id::PREACCEL_FAILOVER_NEXT => Some(TrayAction::FailoverPreAccel),
         menu_id::SUBS_REFRESH_ALL => Some(TrayAction::RefreshSubscriptions),
@@ -647,31 +645,27 @@ fn format_preaccel_submenu_title(preaccel: &TrayPreAccelSummary) -> String {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
-    let status_tag = if preaccel.global_running {
-        match preaccel.global_mode_label.as_deref().map(str::trim) {
-            Some("dual") => "已开启·全局+代理",
-            Some("local_socks5") | Some("本地443通道") => "本地443通道就绪",
-            Some("windivert") | Some("底层全局提速") => "底层全局提速中",
-            Some(custom) if !custom.is_empty() => custom,
-            _ if preaccel.enabled => "已开启·全局+代理",
-            _ => "底层全局提速中",
-        }
-    } else if preaccel.enabled {
-        match preaccel.global_mode_label.as_deref().map(str::trim) {
-            Some("standby") => "已开启·待启动",
-            _ => "已开启·代理提速",
-        }
-    } else if preaccel.global_enabled {
-        "底层全局提速·待启动"
-    } else {
+    let unified_on = preaccel.enabled || preaccel.global_enabled || preaccel.global_running;
+    let status_tag = if !unified_on {
         "已关闭"
+    } else {
+        match preaccel.global_mode_label.as_deref().map(str::trim) {
+            Some("dual") => "已开启·猫云+其它软件",
+            Some("windivert") | Some("底层全局提速") if preaccel.global_running => "全局提速中",
+            Some("downloading") => "准备提速组件中",
+            Some("need_elevation") => "需管理员权限",
+            Some("local_socks5") | Some("本地443通道") => "本地通道待命",
+            Some("standby") => "已开启·待启动",
+            _ if preaccel.enabled => "已开启",
+            _ => "本地通道待命",
+        }
     };
 
     match active_suffix {
-        Some(label) if preaccel.enabled || preaccel.global_running || preaccel.global_enabled => {
-            format!("国内加速入口 ({status_tag} · {label})")
+        Some(label) if unified_on => {
+            format!("国内提速 ({status_tag} · {label})")
         }
-        _ => format!("国内加速入口 ({status_tag})"),
+        _ => format!("国内提速 ({status_tag})"),
     }
 }
 
@@ -799,34 +793,27 @@ pub fn build_tray_menu<R: Runtime>(
         sub
     };
 
-    // Domestic Pre-Acceleration submenu
+    // Domestic Pre-Acceleration submenu (single unified toggle across the entire app)
     let preaccel_title = format_preaccel_submenu_title(&state.preaccel);
     let preaccel_submenu = Submenu::new(app, preaccel_title, true)?;
+    let preaccel_unified_checked =
+        state.preaccel.enabled || state.preaccel.global_enabled || state.preaccel.global_running;
     let preaccel_toggle = CheckMenuItem::with_id(
         app,
         menu_id::PREACCEL_TOGGLE,
-        "启用代理内国内加速入口",
+        "开启国内提速（猫云与其它软件同步生效）",
         true,
-        state.preaccel.enabled,
-        None::<&str>,
-    )?;
-    let preaccel_global_sub_toggle = CheckMenuItem::with_id(
-        app,
-        menu_id::PREACCEL_TOGGLE_GLOBAL_SUB,
-        "启用底层全局国内提速（免开代理/给其它软件）",
-        true,
-        state.preaccel.global_enabled || state.preaccel.global_running,
+        preaccel_unified_checked,
         None::<&str>,
     )?;
     let preaccel_failover = MenuItem::with_id(
         app,
         menu_id::PREACCEL_FAILOVER_NEXT,
-        "⚡ 切换备用加速入口",
+        "⚡ 切换备用中转线路",
         state.preaccel.relays.len() > 1,
         None::<&str>,
     )?;
     preaccel_submenu.append(&preaccel_toggle)?;
-    preaccel_submenu.append(&preaccel_global_sub_toggle)?;
     preaccel_submenu.append(&preaccel_failover)?;
     preaccel_submenu.append(&PredefinedMenuItem::separator(app)?)?;
     if state.preaccel.relays.is_empty() {
@@ -887,14 +874,6 @@ pub fn build_tray_menu<R: Runtime>(
         "TUN 虚拟网卡模式",
         true,
         state.tun_enabled,
-        None::<&str>,
-    )?;
-    let global_preaccel = CheckMenuItem::with_id(
-        app,
-        menu_id::TOGGLE_GLOBAL_PREACCEL,
-        "底层全局国内提速（免开代理）",
-        true,
-        state.preaccel.global_enabled || state.preaccel.global_running,
         None::<&str>,
     )?;
     let windowless = CheckMenuItem::with_id(
@@ -974,7 +953,7 @@ pub fn build_tray_menu<R: Runtime>(
     let sep4 = PredefinedMenuItem::separator(app)?;
     let sep5 = PredefinedMenuItem::separator(app)?;
 
-    let items: [&dyn IsMenuItem<R>; 22] = [
+    let items: [&dyn IsMenuItem<R>; 21] = [
         &open_main,
         &toggle_capsule,
         &sep1,
@@ -988,7 +967,6 @@ pub fn build_tray_menu<R: Runtime>(
         &sep3,
         &sys_proxy,
         &tun_mode,
-        &global_preaccel,
         &windowless,
         &sep4,
         &copy_env,
@@ -1382,14 +1360,18 @@ mod tests {
     }
 
     #[test]
-    fn toggle_global_preaccel_menu_id_parsing_and_diff() {
+    fn unified_preaccel_menu_id_parsing_and_diff() {
         assert_eq!(
-            parse_menu_action(menu_id::TOGGLE_GLOBAL_PREACCEL),
-            Some(TrayAction::ToggleGlobalPreAccel)
+            parse_menu_action(menu_id::PREACCEL_TOGGLE),
+            Some(TrayAction::TogglePreAccel)
         );
         assert_eq!(
-            parse_menu_action(menu_id::PREACCEL_TOGGLE_GLOBAL_SUB),
-            Some(TrayAction::ToggleGlobalPreAccel)
+            parse_menu_action("tray:preaccel:toggle_global"),
+            Some(TrayAction::TogglePreAccel)
+        );
+        assert_eq!(
+            parse_menu_action("tray:preaccel:toggle_global_sub"),
+            Some(TrayAction::TogglePreAccel)
         );
 
         let initial = TrayMenuState::default();
@@ -1402,6 +1384,7 @@ mod tests {
         assert!(!runtime.should_rebuild_menu(&initial));
 
         let mut global_on = initial.clone();
+        global_on.preaccel.enabled = true;
         global_on.preaccel.global_enabled = true;
         global_on.preaccel.global_running = true;
         global_on.preaccel.global_mode_label = Some("windivert".into());
@@ -1417,7 +1400,7 @@ mod tests {
     #[test]
     fn preaccel_submenu_title_and_global_tooltip_clamp_utf16() {
         let closed = TrayPreAccelSummary::default();
-        assert_eq!(format_preaccel_submenu_title(&closed), "国内加速入口 (已关闭)");
+        assert_eq!(format_preaccel_submenu_title(&closed), "国内提速 (已关闭)");
 
         let proxy_only = TrayPreAccelSummary {
             enabled: true,
@@ -1426,7 +1409,7 @@ mod tests {
         };
         assert_eq!(
             format_preaccel_submenu_title(&proxy_only),
-            "国内加速入口 (已开启·代理提速 · 杭州443)"
+            "国内提速 (已开启 · 杭州443)"
         );
 
         let standby = TrayPreAccelSummary {
@@ -1437,7 +1420,7 @@ mod tests {
         };
         assert_eq!(
             format_preaccel_submenu_title(&standby),
-            "国内加速入口 (已开启·待启动 · 杭州443)"
+            "国内提速 (已开启·待启动 · 杭州443)"
         );
 
         let windivert = TrayPreAccelSummary {
@@ -1450,7 +1433,7 @@ mod tests {
         };
         assert_eq!(
             format_preaccel_submenu_title(&windivert),
-            "国内加速入口 (底层全局提速中 · 杭州443)"
+            "国内提速 (全局提速中 · 杭州443)"
         );
 
         let local_socks = TrayPreAccelSummary {
@@ -1463,7 +1446,7 @@ mod tests {
         };
         assert_eq!(
             format_preaccel_submenu_title(&local_socks),
-            "国内加速入口 (本地443通道就绪 · 杭州443)"
+            "国内提速 (本地通道待命 · 杭州443)"
         );
 
         let dual = TrayPreAccelSummary {
@@ -1476,7 +1459,7 @@ mod tests {
         };
         assert_eq!(
             format_preaccel_submenu_title(&dual),
-            "国内加速入口 (已开启·全局+代理 · 杭州443)"
+            "国内提速 (已开启·猫云+其它软件 · 杭州443)"
         );
 
         let info = TrayTooltipInfo {
@@ -1486,14 +1469,14 @@ mod tests {
             tun_enabled: false,
             system_proxy_enabled: false,
             preaccel_summary: Some(
-                "底层全局提速中 · 杭州阿里云443高带宽中转节点超长名称测试测试测试 (127.0.0.1:17895)"
+                "全局提速中 · 杭州阿里云443高带宽中转节点超长名称测试测试测试 (127.0.0.1:17895)"
                     .into(),
             ),
             primary_group_summary: Some("主力路线组 -> 🇯🇵 Tokyo 01 超长节点名测试测试测试".into()),
             realtime_speed: None,
         };
         let formatted = info.format_tooltip();
-        assert!(formatted.contains("预加速: 底层全局提速中"));
+        assert!(formatted.contains("预加速: 全局提速中"));
         assert!(formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
     }
 }

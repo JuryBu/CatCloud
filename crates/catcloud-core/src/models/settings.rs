@@ -26,16 +26,16 @@ pub const DEFAULT_HOTKEY_TOGGLE_CAPSULE: &str = "Alt+Shift+C";
 
 /// Default target executable names intercepted by the standalone global domestic :443
 /// pre-acceleration engine when `global_scope == GlobalPreAccelScope::ProxyAppsOnly`.
+///
+/// Only generic open-source proxy cores and remote transfer tools are listed here;
+/// third-party proxy hosts are detected dynamically at runtime.
 pub const DEFAULT_GLOBAL_PREACCEL_PROCESSES: &[&str] = &[
-    "verge-mihomo.exe",
     "mihomo.exe",
-    "FlClashCore.exe",
     "clash-meta.exe",
     "clash.exe",
     "xray.exe",
     "sing-box.exe",
     "v2ray.exe",
-    "v2rayN.exe",
     "hysteria.exe",
     "tuic-client.exe",
     "ssh.exe",
@@ -727,6 +727,29 @@ impl Default for PreAccelConfig {
     }
 }
 
+impl PreAccelConfig {
+    /// Synchronize the unified domestic pre-acceleration master switch so both
+    /// in-core (`enabled`) and standalone/global (`global_bypass_enabled`) flags
+    /// always stay aligned as a single source of truth.
+    pub fn sync_unified_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+        self.global_bypass_enabled = enabled;
+    }
+
+    /// Reconcile legacy split flags (`enabled` vs `global_bypass_enabled`) into one
+    /// unified master switch state and align both fields in-place.
+    pub fn reconcile_unified_enabled(&mut self) -> bool {
+        let unified = self.enabled || self.global_bypass_enabled;
+        self.sync_unified_enabled(unified);
+        unified
+    }
+
+    /// Return whether the unified domestic pre-acceleration master switch is enabled.
+    pub fn is_unified_enabled(&self) -> bool {
+        self.enabled
+    }
+}
+
 /// Action triggered by left or middle clicking the system tray icon.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -1096,16 +1119,29 @@ mod tests {
         assert_eq!(legacy.core_runtime.gogc, 25);
         assert!(!legacy.core_runtime.compile_all_nodes);
 
-        // Stage 10 global pre-acceleration defaults & backward-compatible deserialization.
+        // Stage 10/12 global pre-acceleration defaults & backward-compatible deserialization.
+        assert!(!cfg.preaccel.enabled);
         assert!(!cfg.preaccel.global_bypass_enabled);
+        assert!(!cfg.preaccel.is_unified_enabled());
         assert_eq!(cfg.preaccel.global_scope, GlobalPreAccelScope::ProxyAppsOnly);
         assert!(cfg.preaccel.windivert_dir.is_none());
-        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "verge-mihomo.exe"));
-        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "FlClashCore.exe"));
-        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "clash.exe"));
-        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "hysteria.exe"));
-        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "tuic-client.exe"));
-        assert!(cfg.preaccel.global_target_processes.iter().any(|p| p == "rsync.exe"));
+        assert_eq!(
+            cfg.preaccel.global_target_processes,
+            vec![
+                "mihomo.exe",
+                "clash-meta.exe",
+                "clash.exe",
+                "xray.exe",
+                "sing-box.exe",
+                "v2ray.exe",
+                "hysteria.exe",
+                "tuic-client.exe",
+                "ssh.exe",
+                "scp.exe",
+                "sftp.exe",
+                "rsync.exe",
+            ]
+        );
         assert!(!legacy.preaccel.global_bypass_enabled);
         assert_eq!(legacy.preaccel.global_scope, GlobalPreAccelScope::ProxyAppsOnly);
         assert_eq!(
@@ -1113,6 +1149,37 @@ mod tests {
             DEFAULT_GLOBAL_PREACCEL_PROCESSES.len()
         );
         assert!(legacy.preaccel.windivert_dir.is_none());
+
+        // Unified master switch helper keeps `enabled` and `global_bypass_enabled` aligned.
+        let mut preaccel = PreAccelConfig::default();
+        preaccel.sync_unified_enabled(true);
+        assert!(preaccel.enabled);
+        assert!(preaccel.global_bypass_enabled);
+        assert!(preaccel.is_unified_enabled());
+
+        preaccel.sync_unified_enabled(false);
+        assert!(!preaccel.enabled);
+        assert!(!preaccel.global_bypass_enabled);
+        assert!(!preaccel.is_unified_enabled());
+
+        // Legacy split states reconcile cleanly to unified `true`, then turn off cleanly.
+        preaccel.enabled = false;
+        preaccel.global_bypass_enabled = true;
+        assert!(preaccel.reconcile_unified_enabled());
+        assert!(preaccel.enabled);
+        assert!(preaccel.global_bypass_enabled);
+
+        preaccel.enabled = true;
+        preaccel.global_bypass_enabled = false;
+        assert!(preaccel.reconcile_unified_enabled());
+        assert!(preaccel.enabled);
+        assert!(preaccel.global_bypass_enabled);
+
+        preaccel.enabled = false;
+        preaccel.global_bypass_enabled = false;
+        assert!(!preaccel.reconcile_unified_enabled());
+        assert!(!preaccel.enabled);
+        assert!(!preaccel.global_bypass_enabled);
         assert_eq!(
             serde_json::to_string(&GlobalPreAccelScope::AllNon443Tcp).unwrap(),
             "\"all_non_443_tcp\""

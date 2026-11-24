@@ -34,7 +34,7 @@ import {
 } from "../api/tauri";
 import { AppSelect, type AppSelectOption } from "../components/AppSelect";
 import { formatBytes, formatRate } from "../components/TrafficSparkline";
-import { appActions, useAppSelector } from "../store/appStore";
+import { appActions, appStore, useAppSelector } from "../store/appStore";
 import { isBoolPref, oneOfPref, usePersistedState } from "../utils/uiPrefs";
 
 type ActiveTab = "rules" | "connections";
@@ -609,6 +609,8 @@ function formatDuration(startedAtMs: number, nowMs: number): string {
   return `${h}h ${m % 60}m`;
 }
 
+let pausedConnectionsSnapshot: LiveConnection[] | null = null;
+
 export function RulesConnsPage() {
   const groups = useAppSelector((s) => s.groups);
   const preAccelRelays = useAppSelector((s) => s.preAccelRelays);
@@ -616,7 +618,18 @@ export function RulesConnsPage() {
   const preAccelEnabled = useAppSelector(
     (s) => s.runtime.preaccel_active || s.config.preaccel.enabled
   );
+  const ruleSearch = useAppSelector((s) => s.sessionDrafts.rulesConns.ruleSearch);
+  const connSearch = useAppSelector((s) => s.sessionDrafts.rulesConns.connSearch);
+  const connPaused = useAppSelector((s) => s.sessionDrafts.rulesConns.connPaused);
   const inTauri = isTauriEnv();
+
+  const setRuleSearch = useCallback((value: string) => {
+    appActions.patchSessionDraft("rulesConns", { ruleSearch: value });
+  }, []);
+
+  const setConnSearch = useCallback((value: string) => {
+    appActions.patchSessionDraft("rulesConns", { connSearch: value });
+  }, []);
 
   const defaultGroupTarget = groups[0]?.name || "DIRECT";
 
@@ -637,7 +650,6 @@ export function RulesConnsPage() {
   const [userRules, setUserRules] = useState<ManagedRuleItem[]>([]);
   const [loadingRules, setLoadingRules] = useState<boolean>(true);
   const [savingRules, setSavingRules] = useState<boolean>(false);
-  const [ruleSearch, setRuleSearch] = useState<string>("");
   const [ruleLayerFilter, setRuleLayerFilter] = useState<"all" | RuleLayer>("all");
   const [showYamlPreview, setShowYamlPreview] = usePersistedState<boolean>(
     "rulesconns.showYamlPreview",
@@ -657,10 +669,12 @@ export function RulesConnsPage() {
   const [newNoResolve, setNewNoResolve] = useState<boolean>(false);
 
   // --- Tab B: Connections State ---
-  const [connections, setConnections] = useState<LiveConnection[]>(() =>
-    inTauri ? [] : buildPreviewConnections(preAccelEnabled)
-  );
-  const [connSearch, setConnSearch] = useState<string>("");
+  const [connections, setConnections] = useState<LiveConnection[]>(() => {
+    if (connPaused && pausedConnectionsSnapshot) {
+      return pausedConnectionsSnapshot;
+    }
+    return inTauri ? [] : buildPreviewConnections(preAccelEnabled);
+  });
   const [connGroupFilter, setConnGroupFilter] = useState<string>("all");
   const [connSort, setConnSort] = usePersistedState<ConnSortKey>(
     "rulesconns.connSort",
@@ -679,7 +693,6 @@ export function RulesConnsPage() {
   );
   const [connPage, setConnPage] = useState<number>(1);
   const [pageJumpInput, setPageJumpInput] = useState<string>("");
-  const [connPaused, setConnPaused] = useState<boolean>(false);
   const [confirmCloseAll, setConfirmCloseAll] = useState<boolean>(false);
   const [nowTick, setNowTick] = useState<number>(() => Date.now());
   const [refreshingConns, setRefreshingConns] = useState<boolean>(false);
@@ -914,17 +927,32 @@ export function RulesConnsPage() {
     [inTauri]
   );
 
+  const connPausedRef = useRef<boolean>(connPaused);
+  connPausedRef.current = connPaused;
+
   // Fetch active connection count once on mount (even on Rules tab) when core is running,
-  // and clear stale connections when core stops.
+  // and clear stale connections when core stops. Preserve frozen snapshot while paused.
   useEffect(() => {
     if (!inTauri) return;
     if (!runtime.running) {
       prevSnapRef.current = new Map();
+      pausedConnectionsSnapshot = null;
       setConnections([]);
+      return;
+    }
+    if (connPausedRef.current && pausedConnectionsSnapshot !== null) {
       return;
     }
     void fetchLiveConnections(false, false);
   }, [fetchLiveConnections, inTauri, runtime.running]);
+
+  useEffect(() => {
+    if (connPaused) {
+      pausedConnectionsSnapshot = connections;
+    } else {
+      pausedConnectionsSnapshot = null;
+    }
+  }, [connPaused, connections]);
 
   // Re-evaluate custom relay names whenever preAccelRelays updates
   useEffect(() => {
@@ -1940,7 +1968,11 @@ export function RulesConnsPage() {
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => setConnPaused((p) => !p)}
+                onClick={() => {
+                  const nextPaused = !appStore.getState().sessionDrafts.rulesConns.connPaused;
+                  pausedConnectionsSnapshot = nextPaused ? connections : null;
+                  appActions.patchSessionDraft("rulesConns", { connPaused: nextPaused });
+                }}
                 className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--line-strong)]"
               >
                 {connPaused ? (

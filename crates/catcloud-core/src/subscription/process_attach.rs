@@ -81,10 +81,12 @@ pub fn list_process_candidates(only_likely_proxy: bool) -> Vec<ProcessCandidate>
             .with_exe(UpdateKind::Always),
     );
     let system = System::new_with_specifics(refresh);
+    let self_pids = crate::subscription::live_capture::collect_self_pid_tree(&system);
 
     let mut candidates: Vec<ProcessCandidate> = system
         .processes()
         .iter()
+        .filter(|(pid, _)| !self_pids.contains(&pid.as_u32()))
         .map(|(pid, proc_info)| {
             let name = proc_info.name().to_string_lossy().into_owned();
             let exe_path = proc_info.exe().map(Path::to_path_buf);
@@ -661,8 +663,6 @@ fn is_likely_proxy_process(
     const KNOWN_KEYWORDS: &[&str] = &[
         "mihomo",
         "clash",
-        "verge",
-        "flclash",
         "sing-box",
         "xray",
         "v2ray",

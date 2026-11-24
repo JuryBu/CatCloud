@@ -7,6 +7,7 @@
 pub mod arbiter;
 pub mod evaluator;
 pub mod formula;
+pub mod health_pool;
 
 pub use arbiter::{
     ArbiterAction, ArbiterDecision, ArbiterGroupMemory, BUILTIN_REJECT_TARGET,
@@ -17,12 +18,18 @@ pub use arbiter::{
 pub use evaluator::{
     ActiveNodeAssessment, EvaluatedCandidate, GroupEvaluationReport, TriggerRuleHit,
     build_eval_context, build_eval_context_for_probe, evaluate_dynamic_filter,
-    evaluate_group_candidates,
+    evaluate_group_candidates, evaluate_group_candidates_with_runtime,
 };
 pub use formula::{
     DEFAULT_COST_EFFECTIVE_FORMULA, DEFAULT_MAX_PERF_FORMULA, DEFAULT_MISSING_PING_MS, EvalContext,
     FormulaExpr, MAX_AST_DEPTH, MAX_AST_NODES, MAX_EXPR_LEN, default_cost_effective_formula,
     default_max_perf_formula, validate_formula,
+};
+pub use health_pool::{
+    BACKOFF_COOLDOWN_SECS, BACKGROUND_SWEEP_MIN_INTERVAL, DEGRADED_PENALTY_CAP,
+    DEGRADED_PENALTY_STEP, EWMA_ALPHA, FAILED_PENALTY_BASE, FAILED_PENALTY_STAGE_STEP,
+    MAX_BACKOFF_STAGE, NodeHealthHintDto, NodeHealthPool, RECOVERY_CHECK_MIN_INTERVAL,
+    RECOVERY_STREAK_REQUIRED, RuntimeDualHealth, RuntimeNodeHealth, backoff_cooldown_secs,
 };
 
 #[cfg(test)]

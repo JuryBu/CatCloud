@@ -43,7 +43,12 @@ import {
 } from "../api/tauri";
 import { AppSelect } from "../components/AppSelect";
 import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
-import { appActions, appStore, useAppSelector } from "../store/appStore";
+import {
+  appActions,
+  appStore,
+  selectIsProbeEngineBusy,
+  useAppSelector,
+} from "../store/appStore";
 import {
   type ContinentId,
   buildContinentRegionStats,
@@ -1250,24 +1255,56 @@ async function copyToClipboard(text: string): Promise<boolean> {
  * Main Component: Three-Column Human-Friendly Smart Multi-Group Workbench
  * ============================================================================ */
 
+interface MultiGroupDraftCache {
+  dirtyGroupIds: Record<string, boolean>;
+  draftGroupsById: Record<string, MultiGroup>;
+  triggerMetas: Record<string, TriggerMeta>;
+}
+
+let multiGroupDraftCache: MultiGroupDraftCache = {
+  dirtyGroupIds: {},
+  draftGroupsById: {},
+  triggerMetas: {},
+};
+
 export function MultiGroupPage() {
   const storeGroups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
-  const probeProgress = useAppSelector((s) => s.probeProgress);
   const subscriptions = useAppSelector((s) => s.subscriptions);
   const runtime = useAppSelector((s) => s.runtime);
   const isGroupMode = runtime.route_mode !== "single";
   const initialized = useAppSelector((s) => s.initialized);
+  const probingNodeIds = useAppSelector((s) => s.bgTasks.groups.probingNodeIds);
+  const evaluatingGroupId = useAppSelector((s) => s.bgTasks.groups.evaluatingGroupId);
+  const evalReports = useAppSelector((s) => s.bgTasks.groups.evalReports);
+  const isProbeEngineBusy = useAppSelector(selectIsProbeEngineBusy);
+  const benchmarkRunning = useAppSelector((s) => s.bgTasks.preaccel.benchmark.running);
+  const savedDraftSelectedId = useAppSelector((s) => s.sessionDrafts.multiGroup.selectedId);
   const inTauri = isTauriEnv();
 
   // Local group drafts (keeps unsaved strategy edits per group while syncing live active_node_id & members)
-  const [groups, setGroups] = useState<MultiGroup[]>(storeGroups);
-  const [selectedId, setSelectedId] = useState<string>(
-    runtime.active_group_id || storeGroups[0]?.id || ""
+  const [groups, setGroups] = useState<MultiGroup[]>(() =>
+    storeGroups.map((sg) => {
+      if (multiGroupDraftCache.dirtyGroupIds[sg.id] && multiGroupDraftCache.draftGroupsById[sg.id]) {
+        return {
+          ...multiGroupDraftCache.draftGroupsById[sg.id],
+          member_node_ids: sg.member_node_ids,
+          active_node_id: sg.active_node_id,
+        };
+      }
+      return sg;
+    })
   );
-  const [triggerMetas, setTriggerMetas] = useState<Record<string, TriggerMeta>>({});
-  const [dirtyGroupIds, setDirtyGroupIds] = useState<Record<string, boolean>>({});
+  const [selectedId, setSelectedId] = useState<string>(
+    () => savedDraftSelectedId || runtime.active_group_id || storeGroups[0]?.id || ""
+  );
+  const [triggerMetas, setTriggerMetas] = useState<Record<string, TriggerMeta>>(() => ({
+    ...multiGroupDraftCache.triggerMetas,
+  }));
+  const [dirtyGroupIds, setDirtyGroupIds] = useState<Record<string, boolean>>(() => ({
+    ...multiGroupDraftCache.dirtyGroupIds,
+  }));
 
   // Left sidebar: create form & two-step delete confirmation
   const [showCreateForm, setShowCreateForm] = useState(false);
@@ -1305,7 +1342,6 @@ export function MultiGroupPage() {
   const [confirmClearMembers, setConfirmClearMembers] = useState(false);
   const [switchingNext, setSwitchingNext] = useState(false);
   const [selectingNodeId, setSelectingNodeId] = useState<string | null>(null);
-  const [probingNodeIds, setProbingNodeIds] = useState<Record<string, boolean>>({});
 
   // Right strategy drawer: collapsed by default so node grid gets huge breathing room
   const [drawerOpen, setDrawerOpen] = usePersistedState<boolean>(
@@ -1319,8 +1355,6 @@ export function MultiGroupPage() {
     isBoolPref
   );
   const [savingGroup, setSavingGroup] = useState(false);
-  const [evaluating, setEvaluating] = useState(false);
-  const [evalReport, setEvalReport] = useState<GroupEvaluationReport | null>(null);
   const [newRuleInput, setNewRuleInput] = useState("");
   const [customGateInput, setCustomGateInput] = useState("");
   const [copiedGuide, setCopiedGuide] = useState(false);
@@ -1329,6 +1363,8 @@ export function MultiGroupPage() {
     ok: boolean;
     error: string | null;
   } | null>(null);
+
+  const probingNodeIdSet = useMemo(() => new Set(probingNodeIds), [probingNodeIds]);
 
   // Stable order snapshot so clicking node cards in "all" view toggles colors in-place without jumping!
   const [pinnedOrder, setPinnedOrder] = useState<{
@@ -1363,7 +1399,7 @@ export function MultiGroupPage() {
     setGroups((prev) => {
       const prevById = new Map(prev.map((g) => [g.id, g]));
       return storeGroups.map((sg) => {
-        const local = prevById.get(sg.id);
+        const local = prevById.get(sg.id) ?? multiGroupDraftCache.draftGroupsById[sg.id];
         if (local && dirtyGroupIdsRef.current[sg.id]) {
           return {
             ...local,
@@ -1381,13 +1417,66 @@ export function MultiGroupPage() {
       }
       return storeGroups[0]?.id ?? "";
     });
+    setDirtyGroupIds((prev) => {
+      const validIds = new Set(storeGroups.map((g) => g.id));
+      let changed = false;
+      const next: Record<string, boolean> = {};
+      for (const [id, isDirty] of Object.entries(prev)) {
+        if (isDirty && validIds.has(id)) {
+          next[id] = true;
+        } else if (isDirty) {
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
   }, [storeGroups, initialized, runtime.active_group_id]);
+
+  // Persist selectedId & dirty draft flag to sessionDrafts (and keep unsaved strategy edits across route switches)
+  useEffect(() => {
+    if (selectedId && selectedId !== appStore.getState().sessionDrafts.multiGroup.selectedId) {
+      appActions.patchSessionDraft("multiGroup", { selectedId });
+    }
+  }, [selectedId]);
+
+  const hasDirtyDrafts = useMemo(
+    () => Object.values(dirtyGroupIds).some(Boolean),
+    [dirtyGroupIds]
+  );
+
+  useEffect(() => {
+    const dirtyIds: Record<string, boolean> = {};
+    const draftGroupsById: Record<string, MultiGroup> = {};
+    const nextTriggerMetas: Record<string, TriggerMeta> = {};
+    for (const g of groups) {
+      if (dirtyGroupIds[g.id]) {
+        dirtyIds[g.id] = true;
+        draftGroupsById[g.id] = g;
+        if (triggerMetas[g.id]) {
+          nextTriggerMetas[g.id] = triggerMetas[g.id];
+        }
+      }
+    }
+    multiGroupDraftCache = {
+      dirtyGroupIds: dirtyIds,
+      draftGroupsById,
+      triggerMetas: nextTriggerMetas,
+    };
+    if (hasDirtyDrafts !== appStore.getState().sessionDrafts.multiGroup.hasDirtyDrafts) {
+      appActions.patchSessionDraft("multiGroup", { hasDirtyDrafts });
+    }
+  }, [groups, dirtyGroupIds, triggerMetas, hasDirtyDrafts]);
 
   const selectedGroup = useMemo(
     () => groups.find((g) => g.id === selectedId) ?? groups[0] ?? null,
     [groups, selectedId]
   );
   const selectedGroupId = selectedGroup?.id ?? null;
+  const evaluating = Boolean(selectedGroup && evaluatingGroupId === selectedGroup.id);
+  const anyEvaluating = evaluatingGroupId !== null;
+  const evalReport: GroupEvaluationReport | null = selectedGroup
+    ? (evalReports[selectedGroup.id] ?? null)
+    : null;
 
   // Refresh pinned display ordering when switching groups or changing view/filters
   useEffect(() => {
@@ -1399,7 +1488,6 @@ export function MultiGroupPage() {
     });
     setEditingName(false);
     setConfirmClearMembers(false);
-    setEvalReport(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedGroup?.id, viewMode]);
 
@@ -1899,31 +1987,8 @@ export function MultiGroupPage() {
   };
 
   const handleProbeSingleNode = async (node: ProxyNode) => {
-    if (probingNodeIds[node.id] || probeProgress.running) return;
-    setProbingNodeIds((prev) => ({ ...prev, [node.id]: true }));
-    try {
-      const res = await catcloudApi.runIsolatedProbes([node.id], [], "unlock", false);
-      if (res.snapshots && Object.keys(res.snapshots).length > 0) {
-        const merged = { ...appStore.getState().probes, ...res.snapshots };
-        appActions.syncProbes(merged);
-      }
-      const snap = res.snapshots?.[node.id];
-      if (snap && snap.ok && snap.latency_ms !== null) {
-        appActions.showToast(`测速完成：${node.name} · ${Math.round(snap.latency_ms)} ms`, "ok");
-      } else if (res.errors.length > 0) {
-        appActions.showToast(`测速提示：${res.errors[0]}`, "warn");
-      } else {
-        appActions.showToast(`${node.name} 暂时连接超时，可稍后再试`, "warn");
-      }
-    } catch (err) {
-      appActions.showToast(`测速失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setProbingNodeIds((prev) => {
-        const next = { ...prev };
-        delete next[node.id];
-        return next;
-      });
-    }
+    if (probingNodeIdSet.has(node.id) || isProbeEngineBusy) return;
+    await appActions.runMultiGroupNodeProbe(node.id);
   };
 
   const handleAddFilteredToGroup = () => {
@@ -2255,10 +2320,10 @@ export function MultiGroupPage() {
   };
 
   const handleEvaluateBackend = async () => {
-    if (!selectedGroup || evaluating) return;
-    setEvaluating(true);
-    try {
-      if (isSelectedDirty) {
+    if (!selectedGroup || evaluating || anyEvaluating || savingGroup) return;
+    if (isSelectedDirty) {
+      setSavingGroup(true);
+      try {
         const payload = normalizeGroupForBackend(selectedGroup, currentTriggerMeta);
         const saved = await catcloudApi.upsertMultiGroup(payload);
         setGroups((prev) => {
@@ -2267,31 +2332,14 @@ export function MultiGroupPage() {
           return next;
         });
         setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
+      } catch (err) {
+        appActions.showToast(`保存策略失败：${formatErrorMessage(err)}`, "warn");
+        return;
+      } finally {
+        setSavingGroup(false);
       }
-      const report = await catcloudApi.evaluateMultiGroup(selectedGroup.id);
-      setEvalReport(report);
-      const latestProbes = appStore.getState().probes;
-      const evalIds = new Set<string>();
-      for (const c of report.gate_passed) evalIds.add(c.node_id);
-      for (const c of report.gate_rejected) evalIds.add(c.node_id);
-      if (evalIds.size === 0) {
-        for (const id of selectedGroup.member_node_ids) evalIds.add(id);
-      }
-      let untestedCnt = 0;
-      for (const id of evalIds) {
-        if (!latestProbes[id]) untestedCnt += 1;
-      }
-      appActions.showToast(
-        untestedCnt > 0
-          ? `评估完成：候选 ${report.pool_size} 个 · 达标 ${report.healthy_candidates.length} 个（其中 ${untestedCnt} 个尚未测速）`
-          : `评估完成：候选 ${report.pool_size} 个 · 达标 ${report.healthy_candidates.length} 个`,
-        "ok"
-      );
-    } catch (err) {
-      appActions.showToast(`后端评估失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setEvaluating(false);
     }
+    await appActions.runEvaluateMultiGroup(selectedGroup.id);
   };
 
   const handleCopyAgentGuide = async () => {
@@ -3045,8 +3093,39 @@ export function MultiGroupPage() {
                 const isLiveActive = isActive && isRuntimeActiveGroup;
                 const isMember = memberIdSet.has(node.id);
                 const snap = probes[node.id];
+                const healthHint = runtime.node_health_hints?.[node.id];
+                const liveHintLatencyMs =
+                  healthHint &&
+                  typeof healthHint.latency_ms === "number" &&
+                  Number.isFinite(healthHint.latency_ms) &&
+                  healthHint.latency_ms > 0
+                    ? healthHint.latency_ms
+                    : null;
+                const healthBadge =
+                  healthHint?.status === "cooldown"
+                    ? {
+                        label:
+                          healthHint.cooldown_remaining_sec > 0
+                            ? `冷却 ${Math.ceil(healthHint.cooldown_remaining_sec)}s`
+                            : "临时冷却",
+                        cls: "bg-[var(--red-soft)]/80 text-[var(--red)]",
+                        title: "近期连续探活失败，暂时降权冷却，到期将自动低频复检恢复",
+                      }
+                    : healthHint?.status === "probation"
+                      ? {
+                          label: "恢复确认中",
+                          cls: "bg-[var(--sky-soft)] text-[var(--sky)]",
+                          title: "刚从冷却恢复，正处于观察期，持续稳定后自动恢复正常权重",
+                        }
+                      : healthHint?.status === "degraded"
+                        ? {
+                            label: "轻微波动",
+                            cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+                            title: "最近探活出现轻微抖动或单源波动，后台正持续观察",
+                          }
+                        : null;
                 const subName = subNameById.get(node.sub_id) ?? "订阅节点";
-                const isProbing = Boolean(probingNodeIds[node.id]);
+                const isProbing = probingNodeIdSet.has(node.id);
                 const isSelecting = selectingNodeId === node.id;
                 const gateEval = assessNodeAgainstGates(node, snap, selectedGroup.hard_gates);
                 const regionCode = resolveNodeRegionCode(node);
@@ -3176,10 +3255,42 @@ export function MultiGroupPage() {
                       })()}
                     </div>
 
-                    {/* Bottom row: gentle probe status + 2 quick actions ("测" & "用它") */}
+                    {/* Bottom row: gentle probe status + live health pool hint + 2 quick actions ("测" & "用它") */}
                     <div className="flex items-center justify-between gap-2 pt-0.5">
                       <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px]">
-                        {!snap ? (
+                        {liveHintLatencyMs !== null ? (
+                          <>
+                            <span
+                              title="后台轻探活最新延迟"
+                              className="cc-mono cc-tabular font-semibold"
+                              style={{ color: formatLatencyTone(liveHintLatencyMs) }}
+                            >
+                              {Math.round(liveHintLatencyMs)} ms
+                            </span>
+                            {snap?.up_mbps !== null && snap?.up_mbps !== undefined && (
+                              <span className="cc-mono cc-tabular text-[10px] text-[var(--coral)]">
+                                ↑{snap.up_mbps.toFixed(1)}M
+                              </span>
+                            )}
+                            {snap?.down_mbps !== null && snap?.down_mbps !== undefined && (
+                              <span className="cc-mono cc-tabular text-[10px] text-[var(--sky)]">
+                                ↓
+                                {snap.down_mbps >= 100
+                                  ? Math.round(snap.down_mbps)
+                                  : snap.down_mbps.toFixed(1)}
+                                M
+                              </span>
+                            )}
+                            {gateEval.hasMeasuredFailure && (
+                              <span
+                                title={`实测未达标：${gateEval.failedReasons.join("、")}`}
+                                className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                              >
+                                实测未达标
+                              </span>
+                            )}
+                          </>
+                        ) : !snap ? (
                           <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
                             待测
                           </span>
@@ -3220,6 +3331,14 @@ export function MultiGroupPage() {
                             )}
                           </>
                         )}
+                        {healthBadge && (
+                          <span
+                            title={healthBadge.title}
+                            className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${healthBadge.cls}`}
+                          >
+                            {healthBadge.label}
+                          </span>
+                        )}
                       </div>
 
                       <div
@@ -3228,12 +3347,16 @@ export function MultiGroupPage() {
                       >
                         <button
                           type="button"
-                          disabled={isProbing || probeProgress.running}
+                          disabled={isProbing || isProbeEngineBusy}
                           onClick={() => void handleProbeSingleNode(node)}
                           title={
-                            probeProgress.running
-                              ? "测速任务进行中，请等待当前测速完成"
-                              : "快速测一下这个节点的延迟与解锁"
+                            isProbing
+                              ? "正在快速测速中…"
+                              : benchmarkRunning
+                                ? "国内提速对比测速正在后台进行，完成后可测速"
+                                : isProbeEngineBusy
+                                  ? "测速任务进行中，请等待当前测速完成"
+                                  : "快速测一下这个节点的延迟与解锁"
                           }
                           className="inline-flex items-center gap-0.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
                         >
@@ -4082,12 +4205,20 @@ export function MultiGroupPage() {
                     <div className="space-y-2 border-t border-[var(--line)]/70 pt-2.5">
                       <button
                         type="button"
-                        disabled={evaluating}
+                        disabled={evaluating || anyEvaluating || savingGroup}
                         onClick={() => void handleEvaluateBackend()}
                         className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
                       >
-                        <RefreshCw className={`h-3 w-3 ${evaluating ? "animate-spin" : ""}`} />
-                        <span>{evaluating ? "模拟打分中..." : "立即模拟打分排序"}</span>
+                        <RefreshCw
+                          className={`h-3 w-3 ${evaluating || anyEvaluating ? "animate-spin" : ""}`}
+                        />
+                        <span>
+                          {evaluating
+                            ? "模拟打分中..."
+                            : anyEvaluating
+                              ? "其它分组评估中..."
+                              : "立即模拟打分排序"}
+                        </span>
                       </button>
 
                       {evalReport && (

@@ -505,12 +505,149 @@ fn restore_capsule_default_bounds<R: Runtime>(
     }
 }
 
+#[cfg(target_os = "windows")]
+const CAPSULE_SUBCLASS_UID: usize = 0xCA7C_1001;
+#[cfg(target_os = "windows")]
+const CAPSULE_HARD_MAX_LOGICAL_W: i32 = 560;
+#[cfg(target_os = "windows")]
+const CAPSULE_HARD_MAX_LOGICAL_H: i32 = 140;
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn capsule_win32_subclass_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _uid: usize,
+    _ref_data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MINMAXINFO, SC_MAXIMIZE, WM_GETMINMAXINFO, WM_NCDESTROY, WM_NCLBUTTONDBLCLK,
+        WM_SYSCOMMAND,
+    };
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        match msg {
+            WM_SYSCOMMAND => {
+                if (wparam & 0xFFF0) == (SC_MAXIMIZE as usize) {
+                    return 0;
+                }
+            }
+            WM_NCLBUTTONDBLCLK => {
+                return 0;
+            }
+            WM_GETMINMAXINFO => {
+                let res = unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) };
+                if lparam != 0 {
+                    let dpi = unsafe { GetDpiForWindow(hwnd) };
+                    let eff_dpi: i64 = if dpi == 0 {
+                        96
+                    } else {
+                        i64::from(dpi).clamp(48, 960)
+                    };
+                    let max_w = ((i64::from(CAPSULE_HARD_MAX_LOGICAL_W) * eff_dpi + 48) / 96)
+                        .clamp(1, i64::from(i32::MAX)) as i32;
+                    let max_h = ((i64::from(CAPSULE_HARD_MAX_LOGICAL_H) * eff_dpi + 48) / 96)
+                        .clamp(1, i64::from(i32::MAX)) as i32;
+                    let mmi = lparam as *mut MINMAXINFO;
+                    unsafe {
+                        if (*mmi).ptMaxTrackSize.x <= 0 || (*mmi).ptMaxTrackSize.x > max_w {
+                            (*mmi).ptMaxTrackSize.x = max_w;
+                        }
+                        if (*mmi).ptMaxTrackSize.y <= 0 || (*mmi).ptMaxTrackSize.y > max_h {
+                            (*mmi).ptMaxTrackSize.y = max_h;
+                        }
+                        if (*mmi).ptMaxSize.x <= 0 || (*mmi).ptMaxSize.x > max_w {
+                            (*mmi).ptMaxSize.x = max_w;
+                        }
+                        if (*mmi).ptMaxSize.y <= 0 || (*mmi).ptMaxSize.y > max_h {
+                            (*mmi).ptMaxSize.y = max_h;
+                        }
+                    }
+                }
+                return res;
+            }
+            WM_NCDESTROY => {
+                unsafe {
+                    let _ = RemoveWindowSubclass(
+                        hwnd,
+                        Some(capsule_win32_subclass_proc),
+                        CAPSULE_SUBCLASS_UID,
+                    );
+                }
+            }
+            _ => {}
+        }
+
+        unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+    }))
+    .unwrap_or(0)
+}
+
+/// Install a lightweight Windows subclass guard on the floating capsule HWND that removes
+/// `WS_MAXIMIZEBOX` (preserving `WS_THICKFRAME` for 8-way resize) and blocks `SC_MAXIMIZE`,
+/// `WM_NCLBUTTONDBLCLK`, and oversized `WM_GETMINMAXINFO` Aero Snap transitions.
+pub fn install_capsule_win32_guard<R: Runtime>(win: &tauri::WebviewWindow<R>) {
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(raw_hwnd) = win.hwnd() else {
+            return;
+        };
+        let hwnd_addr = raw_hwnd.0 as usize;
+        let _ = win.run_on_main_thread(move || {
+            use windows_sys::Win32::Foundation::HWND;
+            use windows_sys::Win32::UI::Shell::SetWindowSubclass;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GWL_STYLE, GetWindowLongW, IsWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+                SWP_NOSIZE, SWP_NOZORDER, SetWindowLongW, SetWindowPos, WS_MAXIMIZEBOX,
+            };
+
+            let hwnd = hwnd_addr as HWND;
+            if hwnd.is_null() || unsafe { IsWindow(hwnd) == 0 } {
+                return;
+            }
+            unsafe {
+                let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+                if (style & WS_MAXIMIZEBOX) != 0 {
+                    SetWindowLongW(hwnd, GWL_STYLE, (style & !WS_MAXIMIZEBOX) as i32);
+                    let _ = SetWindowPos(
+                        hwnd,
+                        std::ptr::null_mut(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE
+                            | SWP_NOSIZE
+                            | SWP_NOZORDER
+                            | SWP_FRAMECHANGED
+                            | SWP_NOACTIVATE,
+                    );
+                }
+                let _ = SetWindowSubclass(
+                    hwnd,
+                    Some(capsule_win32_subclass_proc),
+                    CAPSULE_SUBCLASS_UID,
+                    0,
+                );
+            }
+        });
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = win;
+    }
+}
+
 /// Ensure the floating capsule window is created and visible.
 pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
     let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         if !DESTROYING_CAPSULE.load(Ordering::SeqCst) {
             if let Some(win) = app_handle.get_webview_window(CAPSULE_WINDOW_LABEL) {
+                install_capsule_win32_guard(&win);
                 restore_capsule_default_bounds(&app_handle, &win);
                 let _ = win.show();
                 let _ = win.set_focus();
@@ -531,6 +668,7 @@ pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
         .await;
 
         if let Some(win) = app_handle.get_webview_window(CAPSULE_WINDOW_LABEL) {
+            install_capsule_win32_guard(&win);
             restore_capsule_default_bounds(&app_handle, &win);
             let _ = win.show();
             return;
@@ -550,6 +688,7 @@ pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
 
         match WebviewWindowBuilder::from_config(&app_handle, &cfg).and_then(|b| b.build()) {
             Ok(win) => {
+                install_capsule_win32_guard(&win);
                 restore_capsule_default_bounds(&app_handle, &win);
                 let _ = win.show();
                 emit_window_mode_changed(&app_handle);
@@ -606,6 +745,7 @@ pub fn toggle_capsule_window<R: Runtime>(app: &AppHandle<R>) {
 
         match WebviewWindowBuilder::from_config(&app_handle, &cfg).and_then(|b| b.build()) {
             Ok(win) => {
+                install_capsule_win32_guard(&win);
                 restore_capsule_default_bounds(&app_handle, &win);
                 let _ = win.show();
                 emit_window_mode_changed(&app_handle);
@@ -629,9 +769,28 @@ pub fn handle_window_event<R: Runtime>(
             MAIN_WINDOW_LABEL if destroy_on_close => {
                 api.prevent_close();
                 let app = window.app_handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    enter_windowless_mode(&app);
-                });
+                let has_bg = app
+                    .try_state::<crate::commands::AppState>()
+                    .map(|st| {
+                        st.probe_running.load(Ordering::SeqCst)
+                            || st.windivert_installing.load(Ordering::SeqCst)
+                            || st.live_capture.has_active_session()
+                            || st
+                                .refreshing_sub_ids
+                                .lock()
+                                .map(|g| !g.is_empty())
+                                .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if has_bg {
+                    let _ = window.hide();
+                    sync_macos_activation_policy(&app);
+                    emit_window_mode_changed(&app);
+                } else {
+                    tauri::async_runtime::spawn(async move {
+                        enter_windowless_mode(&app);
+                    });
+                }
             }
             CAPSULE_WINDOW_LABEL => {
                 api.prevent_close();
@@ -669,6 +828,13 @@ pub fn handle_window_event<R: Runtime>(
             CAPSULE_WINDOW_LABEL => {
                 DESTROYING_CAPSULE.store(false, Ordering::SeqCst);
                 let app = window.app_handle();
+                if let Some(st) = app.try_state::<crate::commands::AppState>() {
+                    let mut drag_guard = st
+                        .capsule_drag
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *drag_guard = None;
+                }
                 sync_macos_activation_policy(app);
                 emit_window_mode_changed(app);
                 if is_windowless_mode(app) {

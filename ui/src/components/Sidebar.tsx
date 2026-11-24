@@ -28,11 +28,13 @@ import {
   type ResolvedTheme,
   type ThemeMode,
   appActions,
+  selectHasBackgroundActivity,
   useAppSelector,
 } from "../store/appStore";
 import { MascotSprite } from "./MascotSprite";
 import { TrafficSparkline } from "./TrafficSparkline";
 import { resolvePlatformOs } from "../utils/platform";
+import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
 
 export interface NavItemSpec {
   id: NavRouteId;
@@ -102,21 +104,28 @@ const PROXY_MODES: ReadonlyArray<{ id: ProxyMode; label: string; hint: string }>
   { id: "direct", label: "直连", hint: "全部流量直接连接" },
 ];
 
-function resolveStatusLabel(
-  status: string,
-  proxyActive: boolean,
-  proxyPreAccelActive: boolean,
-  globalPreAccelRunning: boolean
-): string {
+function resolveStatusLabel(status: string, preaccel: PreAccelSummary): string {
   if (status === "error") return "核心异常";
   if (status === "warn") return "路线存在波动";
-  if (proxyPreAccelActive && globalPreAccelRunning) return "全局 + 代理提速中";
-  if (proxyPreAccelActive) return "代理提速运行中";
-  if (!proxyActive) {
-    return globalPreAccelRunning ? "底层提速中" : "待命状态";
+  if (preaccel.proxyActive) {
+    if (preaccel.enabled) {
+      return preaccel.realWinDivertActive
+        ? "国内提速中（猫云 + 其它软件）"
+        : "国内提速运行中";
+    }
+    return "代理运行中";
   }
-  if (globalPreAccelRunning) return "代理与底层提速中";
-  return "代理运行中";
+  if (preaccel.realWinDivertActive) return "全局提速中";
+  if (preaccel.enabled) {
+    if (preaccel.installState === "downloading" || preaccel.installState === "verifying") {
+      return "正在准备提速组件…";
+    }
+    if (preaccel.installState === "need_elevation") {
+      return "国内提速需管理员权限";
+    }
+    return "本地通道待命";
+  }
+  return "待命状态";
 }
 
 export function Sidebar() {
@@ -128,6 +137,13 @@ export function Sidebar() {
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const isProbeRunning = useAppSelector((s) => s.probeProgress.running);
+  const bgPreaccel = useAppSelector((s) => selectHasBackgroundActivity(s).preaccel);
+  const bgNodes = useAppSelector((s) => selectHasBackgroundActivity(s).nodes);
+  const bgGroups = useAppSelector((s) => selectHasBackgroundActivity(s).groups);
+  const bgHome = useAppSelector((s) => selectHasBackgroundActivity(s).home);
+  const bgSettings = useAppSelector((s) => selectHasBackgroundActivity(s).settings);
+  const multiGroupHasDirty = useAppSelector((s) => s.sessionDrafts.multiGroup.hasDirtyDrafts);
+  const settingsHasDirty = useAppSelector((s) => s.sessionDrafts.settings.hasDirtyDrafts);
   const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
   const tunAdminPromptBusy = useAppSelector((s) => s.tunAdminPromptBusy);
   const tunAdminPromptReason = useAppSelector((s) => s.tunAdminPromptReason);
@@ -135,15 +151,47 @@ export function Sidebar() {
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
   const platformOs = resolvePlatformOs(runtime.os_label);
-  const proxyActive =
-    runtime.running && (runtime.system_proxy_enabled || runtime.tun_enabled);
-  const isGlobalPreAccelRunning = Boolean(
-    globalPreAccel.running || runtime.global_preaccel_active
+  const preaccelSummary = resolvePreAccelSummary(
+    runtime,
+    globalPreAccel,
+    preAccelEnabledConfig
   );
-  const isPreAccelEnabled = Boolean(runtime.preaccel_enabled ?? preAccelEnabledConfig);
-  const isProxyPreAccelActive = proxyActive && isPreAccelEnabled;
-  const isPreAccelActive = isProxyPreAccelActive || isGlobalPreAccelRunning;
-  const isStandaloneGlobalOnly = !isProxyPreAccelActive && isGlobalPreAccelRunning;
+  const preaccelNavBadge = (() => {
+    if (!preaccelSummary.enabled && !preaccelSummary.realWinDivertActive) {
+      return null;
+    }
+    if (preaccelSummary.proxyActive) {
+      return {
+        label: "提速中",
+        cls: "bg-[var(--accent-soft)] text-[var(--accent)]",
+      };
+    }
+    if (preaccelSummary.realWinDivertActive) {
+      return {
+        label: "全局提速",
+        cls: "bg-[var(--accent-soft)] text-[var(--accent)]",
+      };
+    }
+    if (
+      preaccelSummary.installState === "downloading" ||
+      preaccelSummary.installState === "verifying"
+    ) {
+      return {
+        label: "准备中",
+        cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+      };
+    }
+    if (preaccelSummary.installState === "need_elevation") {
+      return {
+        label: "需提权",
+        cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+      };
+    }
+    return {
+      label: "待命",
+      cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+    };
+  })();
 
   useEffect(() => {
     if (!tunAdminPromptOpen) return;
@@ -181,18 +229,17 @@ export function Sidebar() {
       ? "var(--red)"
       : runtime.status === "warn"
         ? "var(--amber)"
-        : isProxyPreAccelActive || isGlobalPreAccelRunning
+        : preaccelSummary.proxyActive && preaccelSummary.enabled
           ? "var(--accent)"
-          : proxyActive
-            ? "var(--green)"
-            : "var(--muted)";
+          : preaccelSummary.realWinDivertActive
+            ? "var(--accent)"
+            : preaccelSummary.enabled
+              ? "var(--amber)"
+              : preaccelSummary.proxyActive
+                ? "var(--green)"
+                : "var(--muted)";
 
-  const statusLabel = resolveStatusLabel(
-    runtime.status,
-    proxyActive,
-    isProxyPreAccelActive,
-    isGlobalPreAccelRunning
-  );
+  const statusLabel = resolveStatusLabel(runtime.status, preaccelSummary);
 
   const tunElevationCopy =
     platformOs === "linux"
@@ -413,6 +460,52 @@ export function Sidebar() {
           const Icon = item.icon;
           const isActive =
             activeNav === item.id || (item.id === "nodes" && activeNav === "speedtest");
+          const hasBgTask =
+            item.id === "overview"
+              ? bgHome
+              : item.id === "groups"
+                ? bgGroups
+                : item.id === "nodes"
+                  ? bgNodes
+                  : item.id === "preaccel"
+                    ? bgPreaccel
+                    : item.id === "settings"
+                      ? bgSettings
+                      : false;
+          const hasDirtyDraft =
+            item.id === "groups"
+              ? multiGroupHasDirty
+              : item.id === "settings"
+                ? settingsHasDirty
+                : false;
+          const showBgDot =
+            !isActive && hasBgTask && !(item.id === "nodes" && isProbeRunning);
+          const showDirtyDot = !isActive && !showBgDot && hasDirtyDraft;
+          const bgDotTitle =
+            item.id === "overview"
+              ? "后台正在检测网站连通或出口信息，切回即可查看"
+              : item.id === "groups"
+                ? hasDirtyDraft
+                  ? "后台正在测速或评估多选组（另有未应用的策略改动），切回即可查看"
+                  : "后台正在测速或评估多选组，切回即可查看"
+                : item.id === "nodes"
+                  ? "后台正在刷新订阅、测速或捕捉节点，切回即可查看"
+                  : item.id === "preaccel"
+                    ? "后台正在运行提速对比、线路测速或准备组件，切回即可查看"
+                    : hasDirtyDraft
+                      ? "后台正在更新地理库、检查更新或执行维护任务（另有未保存更改），切回即可查看"
+                      : "后台正在更新地理库、检查更新或执行维护任务，切回即可查看";
+          const dirtyDotTitle =
+            item.id === "groups"
+              ? "有未应用的策略改动，切回可继续编辑"
+              : "有未保存的设置更改，切回可继续保存";
+          const hasRightIndicator =
+            (item.id === "nodes" && isProbeRunning) ||
+            (item.id === "preaccel" && Boolean(preaccelNavBadge)) ||
+            (item.id === "overview" && runtime.captive_portal_required) ||
+            showBgDot ||
+            showDirtyDot;
+
           return (
             <button
               key={item.id}
@@ -440,27 +533,42 @@ export function Sidebar() {
               />
               <span className="truncate">{item.label}</span>
 
-              {item.id === "nodes" && isProbeRunning && (
-                <span className="ml-auto shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
-                  测速中
+              {hasRightIndicator && (
+                <span className="ml-auto flex shrink-0 items-center gap-1.5">
+                  {item.id === "nodes" && isProbeRunning && (
+                    <span className="shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                      测速中
+                    </span>
+                  )}
+                  {item.id === "preaccel" && preaccelNavBadge && (
+                    <span
+                      title={preaccelSummary.detailText}
+                      className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${preaccelNavBadge.cls}`}
+                    >
+                      {preaccelNavBadge.label}
+                    </span>
+                  )}
+                  {item.id === "overview" && runtime.captive_portal_required && (
+                    <span
+                      className="h-2 w-2 rounded-full bg-[var(--red)]"
+                      title="校园网待认证"
+                    />
+                  )}
+                  {showBgDot && (
+                    <span
+                      className="h-1.5 w-1.5 rounded-full bg-[var(--amber)] ring-2 ring-[var(--amber-soft)]"
+                      title={bgDotTitle}
+                      aria-label={bgDotTitle}
+                    />
+                  )}
+                  {showDirtyDot && (
+                    <span
+                      className="h-1.5 w-1.5 rounded-full bg-[var(--muted)]/75"
+                      title={dirtyDotTitle}
+                      aria-label={dirtyDotTitle}
+                    />
+                  )}
                 </span>
-              )}
-              {item.id === "preaccel" && isPreAccelActive && (
-                <span
-                  className={`ml-auto shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
-                    isStandaloneGlobalOnly
-                      ? "bg-[var(--amber-soft)] text-[var(--amber)]"
-                      : "bg-[var(--accent-soft)] text-[var(--accent)]"
-                  }`}
-                >
-                  {isStandaloneGlobalOnly ? "底层提速中" : "提速中"}
-                </span>
-              )}
-              {item.id === "overview" && runtime.captive_portal_required && (
-                <span
-                  className="ml-auto h-2 w-2 rounded-full bg-[var(--red)]"
-                  title="校园网待认证"
-                />
               )}
             </button>
           );

@@ -15,10 +15,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener as StdTcp
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
@@ -71,6 +71,28 @@ pub const NAT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Maximum number of distinct recent accelerated process names retained in status snapshots.
 const MAX_RECENT_PROCESSES: usize = 32;
+
+/// Maximum number of distinct per-process telemetry buckets tracked simultaneously.
+const MAX_PROCESS_STATS: usize = 64;
+
+/// Generic open-source proxy core / tunnel executable stems recognized dynamically
+/// without hardcoding any proprietary or commercial client names.
+const OPEN_SOURCE_PROXY_CORE_STEMS: &[&str] = &[
+    "mihomo",
+    "clash",
+    "xray",
+    "v2ray",
+    "sing-box",
+    "singbox",
+    "hysteria",
+    "tuic",
+    "trojan",
+    "tun2socks",
+    "naive",
+    "shadowsocks",
+    "sslocal",
+    "ss-local",
+];
 
 /// Maximum startup readiness wait for the standalone lightweight 443 Mihomo tunnel.
 const STANDALONE_TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(6);
@@ -783,19 +805,107 @@ pub fn locate_windivert_files_with_exe_dir(
     }
 }
 
-/// Download official WinDivert v2.2.2 (`WinDivert-2.2.2-A.zip`), strictly verify its SHA-256
-/// against `WINDIVERT_ZIP_SHA256`, and extract only `x64/WinDivert.dll` (installed as both
-/// `WinDivert.dll` and `WinDivert64.dll`) and `x64/WinDivert64.sys` into `paths.bin_dir`.
+/// Normalize and deduplicate ordered proxy candidates (`Some("http://...")` / `None` direct),
+/// preserving first-seen priority. Empty input defaults to `[None]` (direct connection).
+pub fn normalize_windivert_proxy_candidates(
+    raw_candidates: &[Option<String>],
+) -> Vec<Option<String>> {
+    if raw_candidates.is_empty() {
+        return vec![None];
+    }
+
+    let mut out: Vec<Option<String>> = Vec::with_capacity(raw_candidates.len());
+    let mut seen_direct = false;
+    let mut seen_proxies: HashSet<String> = HashSet::new();
+
+    for candidate in raw_candidates {
+        match candidate
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(proxy) => {
+                let key = proxy.trim_end_matches('/').to_ascii_lowercase();
+                if seen_proxies.insert(key) {
+                    out.push(Some(proxy.to_string()));
+                }
+            }
+            None => {
+                if !seen_direct {
+                    seen_direct = true;
+                    out.push(None);
+                }
+            }
+        }
+    }
+
+    if out.is_empty() {
+        out.push(None);
+    }
+    out
+}
+
+/// Convert an active, non-PAC `SystemProxySpec` into an HTTP proxy URL suitable for `reqwest::Proxy`.
+pub fn format_system_proxy_url(spec: &crate::platform::SystemProxySpec) -> Option<String> {
+    if !spec.enabled || spec.port == 0 {
+        return None;
+    }
+    if spec
+        .pac_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        return None;
+    }
+    let host = spec.host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    if host.contains("://") {
+        return Some(host.to_string());
+    }
+    if host.contains(':') && !host.starts_with('[') {
+        Some(format!("http://[{host}]:{}", spec.port))
+    } else {
+        Some(format!("http://{host}:{}", spec.port))
+    }
+}
+
+/// Build the standard 3-tier WinDivert download proxy fallback chain:
+/// 1. CatCloud main core local mixed port (when running)
+/// 2. Current OS active system proxy (e.g. an active third-party proxy on Windows)
+/// 3. Direct connection (`None`)
+pub fn build_default_windivert_proxy_candidates(
+    catcloud_mixed_port: Option<u16>,
+) -> Vec<Option<String>> {
+    let mut raw: Vec<Option<String>> = Vec::with_capacity(3);
+    if let Some(port) = catcloud_mixed_port.filter(|&p| p > 0) {
+        raw.push(Some(format!("http://127.0.0.1:{port}")));
+    }
+    if let Ok(spec) = default_platform().read_system_proxy() {
+        if let Some(url) = format_system_proxy_url(&spec) {
+            raw.push(Some(url));
+        }
+    }
+    raw.push(None);
+    normalize_windivert_proxy_candidates(&raw)
+}
+
+/// Download official WinDivert v2.2.2 (`WinDivert-2.2.2-A.zip`) trying each proxy candidate in
+/// deduplicated priority order (for example: CatCloud core -> active Windows system proxy ->
+/// direct), strictly enforcing `ALLOWED_WINDIVERT_HOSTS` and `WINDIVERT_ZIP_SHA256` on every
+/// attempt before extracting into `paths.bin_dir`.
 ///
 /// Never writes to Windows system directories. Returns actionable Chinese guidance if an
 /// antivirus or Windows Defender quarantines the driver binary, or if running on Windows ARM64.
-pub async fn download_and_install_windivert(
+pub async fn download_and_install_windivert_with_fallbacks(
     paths: &AppPaths,
-    proxy_url: Option<&str>,
+    proxy_candidates: &[Option<String>],
 ) -> CatResult<PathBuf> {
     #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
     {
-        let _ = (paths, proxy_url);
+        let _ = (paths, proxy_candidates);
         Err(CatError::Validation(
             WINDIVERT_ARM64_UNSUPPORTED_MSG.to_string(),
         ))
@@ -805,66 +915,158 @@ pub async fn download_and_install_windivert(
     {
         crate::init_crypto_provider();
 
-        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() > 5 {
-                return attempt.error(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "WinDivert 下载重定向次数超限",
-                ));
-            }
-            match validate_windivert_https_url(attempt.url().as_str()) {
-                Ok(()) => attempt.follow(),
-                Err(err) => attempt.error(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    err.to_string(),
-                )),
-            }
-        });
+        let candidates = normalize_windivert_proxy_candidates(proxy_candidates);
+        let total_attempts = candidates.len();
+        let mut attempt_errors: Vec<String> = Vec::with_capacity(total_attempts);
+        let mut last_err: Option<CatError> = None;
 
-        let mut builder = reqwest::Client::builder()
-            .redirect(redirect_policy)
-            .connect_timeout(Duration::from_secs(20))
-            .timeout(Duration::from_secs(120))
-            .user_agent(format!("CatCloud/{}", env!("CARGO_PKG_VERSION")));
+        for (idx, candidate) in candidates.iter().enumerate() {
+            let has_more = idx + 1 < total_attempts;
+            let connect_timeout = if has_more && candidate.is_some() {
+                Duration::from_secs(8)
+            } else {
+                Duration::from_secs(15)
+            };
+            let total_timeout = if has_more && candidate.is_some() {
+                Duration::from_secs(45)
+            } else {
+                Duration::from_secs(90)
+            };
 
-        if let Some(proxy) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) {
-            let parsed = reqwest::Proxy::all(proxy).map_err(|e| {
-                CatError::Validation(format!("无效的 WinDivert 下载代理地址 `{proxy}`: {e}"))
-            })?;
-            builder = builder.proxy(parsed);
+            let route_label = candidate.as_deref().unwrap_or("direct");
+            match download_windivert_archive_once(
+                candidate.as_deref(),
+                connect_timeout,
+                total_timeout,
+            )
+            .await
+            {
+                Ok(archive_bytes) => {
+                    match verify_and_extract_windivert_zip(
+                        &archive_bytes,
+                        WINDIVERT_ZIP_SHA256,
+                        &paths.bin_dir,
+                    ) {
+                        Ok(_) => return Ok(paths.bin_dir.clone()),
+                        Err(err) => {
+                            // Local disk / AV write interception cannot be solved by switching proxies.
+                            let is_local_write_block = matches!(&err, CatError::Io(_))
+                                || matches!(
+                                    &err,
+                                    CatError::Security(msg)
+                                        if msg.contains("杀毒软件") || msg.contains("安全软件")
+                                );
+                            if is_local_write_block {
+                                return Err(err);
+                            }
+                            attempt_errors.push(format!("[{route_label}] {err}"));
+                            last_err = Some(err);
+                        }
+                    }
+                }
+                Err(err) => {
+                    attempt_errors.push(format!("[{route_label}] {err}"));
+                    last_err = Some(err);
+                }
+            }
         }
 
-        let client = builder.build()?;
-        let mut resp = client
-            .get(WINDIVERT_DOWNLOAD_URL)
-            .send()
-            .await
-            .map_err(|e| CatError::Core(format!("下载官方 WinDivert v2.2.2 失败: {e}")))?;
+        if total_attempts == 1 {
+            if let Some(err) = last_err {
+                return Err(err);
+            }
+        }
 
-        if !resp.status().is_success() {
-            return Err(CatError::Core(format!(
-                "下载官方 WinDivert v2.2.2 失败，HTTP 状态码: {}",
-                resp.status()
+        Err(CatError::Core(format!(
+            "尝试 {total_attempts} 条下载通道后仍未能安装官方 WinDivert v2.2.2：{}",
+            attempt_errors.join("；")
+        )))
+    }
+}
+
+/// Download official WinDivert v2.2.2 (`WinDivert-2.2.2-A.zip`), strictly verify its SHA-256
+/// against `WINDIVERT_ZIP_SHA256`, and extract only `x64/WinDivert.dll` (installed as both
+/// `WinDivert.dll` and `WinDivert64.dll`) and `x64/WinDivert64.sys` into `paths.bin_dir`.
+///
+/// Backward-compatible single-route wrapper delegating to
+/// [`download_and_install_windivert_with_fallbacks`].
+pub async fn download_and_install_windivert(
+    paths: &AppPaths,
+    proxy_url: Option<&str>,
+) -> CatResult<PathBuf> {
+    let candidate = proxy_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    download_and_install_windivert_with_fallbacks(paths, &[candidate]).await
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
+async fn download_windivert_archive_once(
+    proxy_url: Option<&str>,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+) -> CatResult<Vec<u8>> {
+    let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > 5 {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "WinDivert 下载重定向次数超限",
+            ));
+        }
+        match validate_windivert_https_url(attempt.url().as_str()) {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                err.to_string(),
+            )),
+        }
+    });
+
+    let mut builder = reqwest::Client::builder()
+        .redirect(redirect_policy)
+        .connect_timeout(connect_timeout)
+        .timeout(total_timeout)
+        .user_agent(format!("CatCloud/{}", env!("CARGO_PKG_VERSION")));
+
+    if let Some(proxy) = proxy_url.map(str::trim).filter(|s| !s.is_empty()) {
+        let parsed = reqwest::Proxy::all(proxy).map_err(|e| {
+            CatError::Validation(format!("无效的 WinDivert 下载代理地址 `{proxy}`: {e}"))
+        })?;
+        builder = builder.proxy(parsed);
+    } else {
+        builder = builder.no_proxy();
+    }
+
+    let client = builder.build()?;
+    let mut resp = client
+        .get(WINDIVERT_DOWNLOAD_URL)
+        .send()
+        .await
+        .map_err(|e| CatError::Core(format!("下载官方 WinDivert v2.2.2 失败: {e}")))?;
+
+    if !resp.status().is_success() {
+        return Err(CatError::Core(format!(
+            "下载官方 WinDivert v2.2.2 失败，HTTP 状态码: {}",
+            resp.status()
+        )));
+    }
+
+    let mut archive_bytes: Vec<u8> = Vec::with_capacity(512 * 1024);
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| CatError::Core(format!("读取 WinDivert 下载流失败: {e}")))?
+    {
+        if archive_bytes.len().saturating_add(chunk.len()) > MAX_WINDIVERT_ZIP_BYTES {
+            return Err(CatError::Security(format!(
+                "WinDivert 压缩包超出安全体积上限 ({MAX_WINDIVERT_ZIP_BYTES} bytes)"
             )));
         }
-
-        let mut archive_bytes: Vec<u8> = Vec::with_capacity(512 * 1024);
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| CatError::Core(format!("读取 WinDivert 下载流失败: {e}")))?
-        {
-            if archive_bytes.len().saturating_add(chunk.len()) > MAX_WINDIVERT_ZIP_BYTES {
-                return Err(CatError::Security(format!(
-                    "WinDivert 压缩包超出安全体积上限 ({MAX_WINDIVERT_ZIP_BYTES} bytes)"
-                )));
-            }
-            archive_bytes.extend_from_slice(&chunk);
-        }
-
-        verify_and_extract_windivert_zip(&archive_bytes, WINDIVERT_ZIP_SHA256, &paths.bin_dir)?;
-        Ok(paths.bin_dir.clone())
+        archive_bytes.extend_from_slice(&chunk);
     }
+
+    Ok(archive_bytes)
 }
 
 #[cfg_attr(
@@ -1124,7 +1326,6 @@ pub fn is_physical_nic_descriptor(if_type: u32, oper_status: i32, descr: &str) -
         "sing-tun",
         "mihomo",
         "clash",
-        "flclash",
         "hyper-v",
         "vethernet",
         "vmware",
@@ -1160,8 +1361,80 @@ pub fn normalize_process_basename(raw: &str) -> String {
     base.to_ascii_lowercase()
 }
 
+/// Return `true` when `raw` resolves to an empty name, a core Windows OS process, or any
+/// CatCloud self executable that must never be transparently intercepted.
+pub fn is_system_or_self_excluded_process(raw: &str) -> bool {
+    let lower = normalize_process_basename(raw);
+    lower.is_empty()
+        || lower.starts_with("catcloud")
+        || SYSTEM_AND_SELF_EXCLUDED_PROCESSES
+            .iter()
+            .any(|sys| *sys == lower)
+}
+
+/// Return `true` when an executable path or basename matches a generic open-source
+/// proxy core stem (case-insensitive, never matching core OS processes or CatCloud self binaries).
+pub fn is_open_source_proxy_core_name(raw: &str) -> bool {
+    let lower = normalize_process_basename(raw);
+    if is_system_or_self_excluded_process(&lower) {
+        return false;
+    }
+    OPEN_SOURCE_PROXY_CORE_STEMS
+        .iter()
+        .any(|stem| lower.contains(stem))
+}
+
+/// Classify whether an outbound TCP flow from `(pid, process_name)` should be transparently
+/// redirected into the standalone `:443` pre-acceleration tunnel, returning the detection label
+/// when approved (`"system_proxy_host"`, `"local_proxy_listener"`, `"open_core_name"`, `"manual"`,
+/// or `"scope_all"`), or `None` when bypassed.
+///
+/// Safety precedence:
+/// 1. Unconditionally exclude `pid == 0`, `pid == 4`, every PID in `excluded_pids` (CatCloud full
+///    descendant tree, standalone tunnel, main core), unresolvable/empty process names, and
+///    `SYSTEM_AND_SELF_EXCLUDED_PROCESSES` / `catcloud*`.
+/// 2. Accept dynamic runtime proxy hosts (`detected_proxy_pids`).
+/// 3. Accept generic open-source proxy core stems (`OPEN_SOURCE_PROXY_CORE_STEMS`).
+/// 4. Accept explicitly configured user target executables (`target_processes_lower`).
+/// 5. In `AllNon443Tcp` scope, accept remaining public non-443 TCP flows as `"scope_all"`.
+pub fn classify_intercept_process(
+    pid: u32,
+    process_name: Option<&str>,
+    scope: GlobalPreAccelScope,
+    target_processes_lower: &HashSet<String>,
+    excluded_pids: &HashSet<u32>,
+    detected_proxy_pids: &HashMap<u32, &'static str>,
+) -> Option<&'static str> {
+    if pid == 0 || pid == 4 || excluded_pids.contains(&pid) {
+        return None;
+    }
+    let name = process_name?;
+    // Conservatively bypass processes whose executable name cannot be resolved (such as
+    // Windows PPL protected system processes) so they never bypass system exclusions.
+    let lower = normalize_process_basename(name);
+    if is_system_or_self_excluded_process(&lower) {
+        return None;
+    }
+    if let Some(&detected_reason) = detected_proxy_pids.get(&pid) {
+        return Some(detected_reason);
+    }
+    if is_open_source_proxy_core_name(&lower) {
+        return Some("open_core_name");
+    }
+    if target_processes_lower.contains(&lower) {
+        return Some("manual");
+    }
+    match scope {
+        GlobalPreAccelScope::ProxyAppsOnly => None,
+        GlobalPreAccelScope::AllNon443Tcp => Some("scope_all"),
+    }
+}
+
 /// Pure policy check deciding whether an outbound TCP flow from `(pid, process_name)` should
 /// be transparently redirected into the standalone :443 pre-acceleration tunnel.
+///
+/// Backward-compatible wrapper delegating to [`classify_intercept_process`] with an empty
+/// dynamic runtime detection map.
 pub fn should_intercept_process(
     pid: u32,
     process_name: Option<&str>,
@@ -1169,33 +1442,24 @@ pub fn should_intercept_process(
     target_processes_lower: &HashSet<String>,
     excluded_pids: &HashSet<u32>,
 ) -> bool {
-    if pid == 0 || pid == 4 || excluded_pids.contains(&pid) {
-        return false;
-    }
-    let Some(name) = process_name else {
-        // Conservatively bypass processes whose executable name cannot be resolved (such as
-        // Windows PPL protected system processes) so they never bypass system exclusions.
-        return false;
-    };
-    let lower = normalize_process_basename(name);
-    if lower.is_empty()
-        || SYSTEM_AND_SELF_EXCLUDED_PROCESSES
-            .iter()
-            .any(|sys| *sys == lower)
-    {
-        return false;
-    }
-    match scope {
-        GlobalPreAccelScope::ProxyAppsOnly => target_processes_lower.contains(&lower),
-        GlobalPreAccelScope::AllNon443Tcp => true,
-    }
+    let empty_detected: HashMap<u32, &'static str> = HashMap::new();
+    classify_intercept_process(
+        pid,
+        process_name,
+        scope,
+        target_processes_lower,
+        excluded_pids,
+        &empty_detected,
+    )
+    .is_some()
 }
 
 /// Thread-safe excluded-PID tracker shared between the control plane (`GlobalPreAccelManager` /
 /// `WinDivertEngine`) and the packet worker thread (`Arc<std::sync::RwLock<HashSet<u32>>>`).
 ///
-/// Always retains CatCloud's own PID, the standalone :443 tunnel subprocess PID, and any static
-/// startup exclusions while supporting live replacement/clearing of the external main core PID slot.
+/// Always retains CatCloud's own PID, the standalone :443 tunnel subprocess PID, any static
+/// startup exclusions, the dynamic full CatCloud descendant PID tree, and the external main core
+/// PID slot using a strict lock order (`main_core_pid -> descendant_pids -> active`).
 #[cfg_attr(
     any(not(target_os = "windows"), target_arch = "aarch64"),
     allow(dead_code)
@@ -1204,6 +1468,7 @@ pub fn should_intercept_process(
 pub(super) struct ExcludedPidTracker {
     pinned: HashSet<u32>,
     main_core_pid: Mutex<Option<u32>>,
+    descendant_pids: Mutex<HashSet<u32>>,
     active: Arc<std::sync::RwLock<HashSet<u32>>>,
 }
 
@@ -1238,6 +1503,7 @@ impl ExcludedPidTracker {
         Self {
             pinned,
             main_core_pid: Mutex::new(initial_main),
+            descendant_pids: Mutex::new(HashSet::new()),
             active: Arc::new(std::sync::RwLock::new(initial_set)),
         }
     }
@@ -1246,20 +1512,58 @@ impl ExcludedPidTracker {
         Arc::clone(&self.active)
     }
 
+    pub(super) fn snapshot_active(&self) -> HashSet<u32> {
+        self.active
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Return the current deduplicated root PIDs whose full Windows descendant subtrees
+    /// must be excluded (always includes `std::process::id()`, pinned PIDs, and `main_core_pid`).
+    pub(super) fn current_root_pids(&self) -> Vec<u32> {
+        let main_pid = *self.main_core_pid.lock().unwrap_or_else(|e| e.into_inner());
+        let mut roots: HashSet<u32> = self.pinned.clone();
+        let current_self_pid = std::process::id();
+        if current_self_pid > 0 {
+            roots.insert(current_self_pid);
+        }
+        if let Some(pid) = main_pid {
+            roots.insert(pid);
+        }
+        roots.into_iter().collect()
+    }
+
     /// Replace or clear only the external main core PID slot while unconditionally preserving
-    /// `std::process::id()`, the standalone tunnel PID, and all pinned exclusions.
+    /// `std::process::id()`, the standalone tunnel PID, all pinned exclusions, and the dynamic
+    /// descendant PID tree.
     pub(super) fn sync_main_core_pid(&self, main_core_pid: Option<u32>) {
         let next_pid = main_core_pid.filter(|&p| p > 0);
-        let mut slot = self.main_core_pid.lock().unwrap_or_else(|e| e.into_inner());
-        let prev_pid = *slot;
-        *slot = next_pid;
+        let mut main_slot = self.main_core_pid.lock().unwrap_or_else(|e| e.into_inner());
+        *main_slot = next_pid;
+        let descendants = self
+            .descendant_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.rebuild_active_locked(*main_slot, &descendants);
+    }
 
+    /// Replace the dynamically scanned CatCloud descendant PID tree while unconditionally
+    /// preserving pinned exclusions and the external main core PID slot.
+    pub(super) fn sync_descendant_pids(&self, descendants: HashSet<u32>) {
+        let cleaned: HashSet<u32> = descendants.into_iter().filter(|&p| p > 0).collect();
+        let main_slot = self.main_core_pid.lock().unwrap_or_else(|e| e.into_inner());
+        let mut desc_slot = self
+            .descendant_pids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *desc_slot = cleaned;
+        self.rebuild_active_locked(*main_slot, &desc_slot);
+    }
+
+    fn rebuild_active_locked(&self, main_core_pid: Option<u32>, descendants: &HashSet<u32>) {
         let mut set = self.active.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(old) = prev_pid {
-            if !self.pinned.contains(&old) {
-                set.remove(&old);
-            }
-        }
+        set.clear();
         for &pid in &self.pinned {
             set.insert(pid);
         }
@@ -1267,8 +1571,11 @@ impl ExcludedPidTracker {
         if current_self_pid > 0 {
             set.insert(current_self_pid);
         }
-        if let Some(new_pid) = next_pid {
-            set.insert(new_pid);
+        if let Some(pid) = main_core_pid {
+            set.insert(pid);
+        }
+        for &pid in descendants {
+            set.insert(pid);
         }
     }
 }
@@ -1276,14 +1583,17 @@ impl ExcludedPidTracker {
 /// Key identifying a local client TCP endpoint in the self-loop NAT table.
 pub type NatKey = (Ipv4Addr, u16);
 
-/// Recorded original remote endpoint & interface metadata for one transparently redirected flow.
+/// Recorded original remote endpoint, process identity, & interface metadata for one transparently
+/// redirected flow.
 #[derive(Debug, Clone)]
 pub struct NatEntry {
     pub orig_dst_ip: Ipv4Addr,
     pub orig_dst_port: u16,
     pub if_idx: u32,
     pub sub_if_idx: u32,
+    pub owner_pid: u32,
     pub process_name: String,
+    pub detected_by: String,
     pub last_seen: Instant,
 }
 
@@ -1466,6 +1776,73 @@ pub fn rewrite_ipv4_tcp_src(
     true
 }
 
+/// Structured per-process live acceleration telemetry entry reported in `GlobalPreAccelStatus`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AcceleratedProcessStat {
+    pub process_name: String,
+    pub pid: u32,
+    pub detected_by: String,
+    pub active_connections: usize,
+    pub total_connections: u64,
+    pub tx_bytes: u64,
+    pub rx_bytes: u64,
+    pub last_seen_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ProcessStatKey {
+    process_name_lower: String,
+    pid: u32,
+    detected_by: String,
+}
+
+#[derive(Debug)]
+struct ProcessCounters {
+    process_name: String,
+    pid: u32,
+    detected_by: String,
+    active_connections: AtomicUsize,
+    total_connections: AtomicU64,
+    tx_bytes: AtomicU64,
+    rx_bytes: AtomicU64,
+    last_seen_ms: AtomicU64,
+}
+
+fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn decrement_atomic_usize_saturating(counter: &AtomicUsize) {
+    let mut cur = counter.load(Ordering::Relaxed);
+    while let Err(actual) = counter.compare_exchange_weak(
+        cur,
+        cur.saturating_sub(1),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        cur = actual;
+    }
+}
+
+#[cfg_attr(
+    any(not(target_os = "windows"), target_arch = "aarch64"),
+    allow(dead_code)
+)]
+fn decrement_atomic_u64_saturating(counter: &AtomicU64) {
+    let mut cur = counter.load(Ordering::Relaxed);
+    while let Err(actual) = counter.compare_exchange_weak(
+        cur,
+        cur.saturating_sub(1),
+        Ordering::Relaxed,
+        Ordering::Relaxed,
+    ) {
+        cur = actual;
+    }
+}
+
 /// Shared lock-free telemetry counters for the standalone global :443 pre-acceleration engine.
 #[derive(Debug, Default)]
 pub struct GlobalPreAccelMetrics {
@@ -1474,6 +1851,7 @@ pub struct GlobalPreAccelMetrics {
     pub up_bytes: AtomicU64,
     pub down_bytes: AtomicU64,
     recent_processes: Mutex<VecDeque<String>>,
+    process_stats: Mutex<HashMap<ProcessStatKey, Arc<ProcessCounters>>>,
 }
 
 impl GlobalPreAccelMetrics {
@@ -1484,6 +1862,19 @@ impl GlobalPreAccelMetrics {
         self.down_bytes.store(0, Ordering::Relaxed);
         if let Ok(mut guard) = self.recent_processes.lock() {
             guard.clear();
+        }
+        if let Ok(mut guard) = self.process_stats.lock() {
+            guard.clear();
+        }
+    }
+
+    /// Zero out active connection gauges across both global and per-process counters (used on stop).
+    pub fn clear_active_connections(&self) {
+        self.active_connections.store(0, Ordering::Relaxed);
+        if let Ok(guard) = self.process_stats.lock() {
+            for pc in guard.values() {
+                pc.active_connections.store(0, Ordering::Relaxed);
+            }
         }
     }
 
@@ -1513,15 +1904,205 @@ impl GlobalPreAccelMetrics {
             .cloned()
             .collect()
     }
+
+    fn acquire_process_counters(
+        &self,
+        pid: u32,
+        process_name: &str,
+        detected_by: &str,
+    ) -> Option<Arc<ProcessCounters>> {
+        let display_name = {
+            let trimmed = process_name.trim();
+            if !trimmed.is_empty() {
+                trimmed.to_string()
+            } else if pid > 0 {
+                format!("pid:{pid}")
+            } else {
+                return None;
+            }
+        };
+        let reason = {
+            let trimmed = detected_by.trim();
+            if trimmed.is_empty() {
+                "unknown"
+            } else {
+                trimmed
+            }
+        };
+        let key = ProcessStatKey {
+            process_name_lower: display_name.to_ascii_lowercase(),
+            pid,
+            detected_by: reason.to_string(),
+        };
+
+        let mut guard = self
+            .process_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = guard.get(&key) {
+            return Some(Arc::clone(existing));
+        }
+
+        if guard.len() >= MAX_PROCESS_STATS {
+            // Evict the oldest idle process bucket first to maintain a hard memory bound.
+            let evict_key = guard
+                .iter()
+                .filter(|(_, pc)| pc.active_connections.load(Ordering::Relaxed) == 0)
+                .min_by_key(|(_, pc)| pc.last_seen_ms.load(Ordering::Relaxed))
+                .map(|(k, _)| k.clone());
+            if let Some(stale) = evict_key {
+                guard.remove(&stale);
+            } else {
+                // All 64 tracked buckets are actively transferring; skip inserting a 65th bucket.
+                return None;
+            }
+        }
+
+        let counters = Arc::new(ProcessCounters {
+            process_name: display_name,
+            pid,
+            detected_by: reason.to_string(),
+            active_connections: AtomicUsize::new(0),
+            total_connections: AtomicU64::new(0),
+            tx_bytes: AtomicU64::new(0),
+            rx_bytes: AtomicU64::new(0),
+            last_seen_ms: AtomicU64::new(now_epoch_ms()),
+        });
+        guard.insert(key, Arc::clone(&counters));
+        Some(counters)
+    }
+
+    /// Record a new redirected connection opening for `(pid, process_name, detected_by)`.
+    pub fn record_process_connection_open(
+        &self,
+        pid: u32,
+        process_name: &str,
+        detected_by: &str,
+    ) {
+        self.record_process(process_name);
+        if let Some(pc) = self.acquire_process_counters(pid, process_name, detected_by) {
+            pc.active_connections.fetch_add(1, Ordering::Relaxed);
+            pc.total_connections.fetch_add(1, Ordering::Relaxed);
+            pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Record a redirected connection closing for `(pid, process_name, detected_by)`.
+    pub fn record_process_connection_close(
+        &self,
+        pid: u32,
+        process_name: &str,
+        detected_by: &str,
+    ) {
+        let display_name = {
+            let trimmed = process_name.trim();
+            if !trimmed.is_empty() {
+                trimmed.to_string()
+            } else if pid > 0 {
+                format!("pid:{pid}")
+            } else {
+                return;
+            }
+        };
+        let reason = {
+            let trimmed = detected_by.trim();
+            if trimmed.is_empty() {
+                "unknown"
+            } else {
+                trimmed
+            }
+        };
+        let key = ProcessStatKey {
+            process_name_lower: display_name.to_ascii_lowercase(),
+            pid,
+            detected_by: reason.to_string(),
+        };
+        let guard = self
+            .process_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(pc) = guard.get(&key) {
+            decrement_atomic_usize_saturating(&pc.active_connections);
+            pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Accumulate transmitted (`tx_delta`) and received (`rx_delta`) bytes for a process bucket.
+    pub fn record_process_bytes(
+        &self,
+        pid: u32,
+        process_name: &str,
+        detected_by: &str,
+        tx_delta: u64,
+        rx_delta: u64,
+    ) {
+        if tx_delta == 0 && rx_delta == 0 {
+            return;
+        }
+        if let Some(pc) = self.acquire_process_counters(pid, process_name, detected_by) {
+            if tx_delta > 0 {
+                pc.tx_bytes.fetch_add(tx_delta, Ordering::Relaxed);
+            }
+            if rx_delta > 0 {
+                pc.rx_bytes.fetch_add(rx_delta, Ordering::Relaxed);
+            }
+            pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot per-process acceleration telemetry sorted by active connections descending,
+    /// then total transferred bytes (`tx_bytes + rx_bytes`) descending, then total connections.
+    pub fn process_stats_snapshot(&self) -> Vec<AcceleratedProcessStat> {
+        let guard = self
+            .process_stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut stats: Vec<AcceleratedProcessStat> = guard
+            .values()
+            .map(|pc| AcceleratedProcessStat {
+                process_name: pc.process_name.clone(),
+                pid: pc.pid,
+                detected_by: pc.detected_by.clone(),
+                active_connections: pc.active_connections.load(Ordering::Relaxed),
+                total_connections: pc.total_connections.load(Ordering::Relaxed),
+                tx_bytes: pc.tx_bytes.load(Ordering::Relaxed),
+                rx_bytes: pc.rx_bytes.load(Ordering::Relaxed),
+                last_seen_ms: pc.last_seen_ms.load(Ordering::Relaxed),
+            })
+            .collect();
+        drop(guard);
+
+        stats.sort_by(|a, b| {
+            b.active_connections
+                .cmp(&a.active_connections)
+                .then_with(|| {
+                    b.tx_bytes
+                        .saturating_add(b.rx_bytes)
+                        .cmp(&a.tx_bytes.saturating_add(a.rx_bytes))
+                })
+                .then_with(|| b.total_connections.cmp(&a.total_connections))
+                .then_with(|| b.last_seen_ms.cmp(&a.last_seen_ms))
+                .then_with(|| a.process_name.cmp(&b.process_name))
+                .then_with(|| a.pid.cmp(&b.pid))
+        });
+        stats
+    }
+
+    /// Alias for [`Self::process_stats_snapshot`] returning sorted per-process telemetry.
+    pub fn snapshot(&self) -> Vec<AcceleratedProcessStat> {
+        self.process_stats_snapshot()
+    }
 }
 
-/// RAII guard decrementing `active_connections` when a forwarded TCP stream terminates.
+/// RAII guard decrementing global and per-process `active_connections` when a forwarded TCP
+/// stream terminates.
 #[cfg_attr(
     any(not(target_os = "windows"), target_arch = "aarch64"),
     allow(dead_code)
 )]
 struct ActiveConnGuard {
     metrics: Arc<GlobalPreAccelMetrics>,
+    process_counters: Option<Arc<ProcessCounters>>,
 }
 
 #[cfg_attr(
@@ -1529,24 +2110,38 @@ struct ActiveConnGuard {
     allow(dead_code)
 )]
 impl ActiveConnGuard {
-    fn acquire(metrics: Arc<GlobalPreAccelMetrics>, process_name: &str) -> Self {
+    fn acquire_for_process(
+        metrics: Arc<GlobalPreAccelMetrics>,
+        pid: u32,
+        process_name: &str,
+        detected_by: &str,
+    ) -> Self {
         metrics.active_connections.fetch_add(1, Ordering::Relaxed);
         metrics.total_connections.fetch_add(1, Ordering::Relaxed);
         metrics.record_process(process_name);
-        Self { metrics }
+        let process_counters = metrics.acquire_process_counters(pid, process_name, detected_by);
+        if let Some(ref pc) = process_counters {
+            pc.active_connections.fetch_add(1, Ordering::Relaxed);
+            pc.total_connections.fetch_add(1, Ordering::Relaxed);
+            pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
+        }
+        Self {
+            metrics,
+            process_counters,
+        }
+    }
+
+    fn process_counters(&self) -> Option<Arc<ProcessCounters>> {
+        self.process_counters.clone()
     }
 }
 
 impl Drop for ActiveConnGuard {
     fn drop(&mut self) {
-        let mut cur = self.metrics.active_connections.load(Ordering::Relaxed);
-        while let Err(actual) = self.metrics.active_connections.compare_exchange_weak(
-            cur,
-            cur.saturating_sub(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            cur = actual;
+        decrement_atomic_u64_saturating(&self.metrics.active_connections);
+        if let Some(ref pc) = self.process_counters {
+            decrement_atomic_usize_saturating(&pc.active_connections);
+            pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
         }
     }
 }
@@ -1572,7 +2167,8 @@ impl Drop for NatEntryCleanupGuard {
 }
 
 /// Zero-copy `TcpStream` wrapper that atomically tracks real-time upload/download bytes
-/// from the client side (`read` = upload, `write` = download).
+/// from the client side (`read` = upload/tx, `write` = download/rx) across both global and
+/// per-process telemetry buckets without taking any mutex on the data path.
 #[cfg_attr(
     any(not(target_os = "windows"), target_arch = "aarch64"),
     allow(dead_code)
@@ -1580,6 +2176,7 @@ impl Drop for NatEntryCleanupGuard {
 struct CountingTcpStream {
     inner: TcpStream,
     metrics: Arc<GlobalPreAccelMetrics>,
+    process_counters: Option<Arc<ProcessCounters>>,
 }
 
 #[cfg_attr(
@@ -1587,8 +2184,16 @@ struct CountingTcpStream {
     allow(dead_code)
 )]
 impl CountingTcpStream {
-    fn client_side(inner: TcpStream, metrics: Arc<GlobalPreAccelMetrics>) -> Self {
-        Self { inner, metrics }
+    fn client_side(
+        inner: TcpStream,
+        metrics: Arc<GlobalPreAccelMetrics>,
+        process_counters: Option<Arc<ProcessCounters>>,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            process_counters,
+        }
     }
 }
 
@@ -1605,6 +2210,10 @@ impl AsyncRead for CountingTcpStream {
             let delta = buf.filled().len().saturating_sub(before) as u64;
             if delta > 0 {
                 this.metrics.up_bytes.fetch_add(delta, Ordering::Relaxed);
+                if let Some(ref pc) = this.process_counters {
+                    pc.tx_bytes.fetch_add(delta, Ordering::Relaxed);
+                    pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
+                }
             }
         }
         res
@@ -1621,9 +2230,14 @@ impl AsyncWrite for CountingTcpStream {
         let res = Pin::new(&mut this.inner).poll_write(cx, buf);
         if let Poll::Ready(Ok(n)) = &res {
             if *n > 0 {
+                let delta = *n as u64;
                 this.metrics
                     .down_bytes
-                    .fetch_add(*n as u64, Ordering::Relaxed);
+                    .fetch_add(delta, Ordering::Relaxed);
+                if let Some(ref pc) = this.process_counters {
+                    pc.rx_bytes.fetch_add(delta, Ordering::Relaxed);
+                    pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
+                }
             }
         }
         res
@@ -1733,7 +2347,13 @@ pub(super) async fn forward_redirected_stream(
     };
 
     let _ = client_stream.set_nodelay(true);
-    let _guard = ActiveConnGuard::acquire(Arc::clone(&metrics), &entry.process_name);
+    let active_guard = ActiveConnGuard::acquire_for_process(
+        Arc::clone(&metrics),
+        entry.owner_pid,
+        &entry.process_name,
+        &entry.detected_by,
+    );
+    let process_counters = active_guard.process_counters();
 
     let socks_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
     let connect_res = tokio::select! {
@@ -1765,7 +2385,8 @@ pub(super) async fn forward_redirected_stream(
     if *shutdown_rx.borrow() {
         return;
     }
-    let mut counting_client = CountingTcpStream::client_side(client_stream, metrics);
+    let mut counting_client =
+        CountingTcpStream::client_side(client_stream, metrics, process_counters);
     tokio::select! {
         _ = tokio::io::copy_bidirectional(&mut counting_client, &mut upstream) => {}
         _ = shutdown_rx.changed() => {}
@@ -1776,6 +2397,21 @@ pub(super) async fn forward_redirected_stream(
 // C. Unified Cross-Platform GlobalPreAccelManager & Status Snapshot
 // ============================================================================
 
+fn default_install_state() -> String {
+    "idle".to_string()
+}
+
+fn normalize_install_state(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "downloading" => "downloading",
+        "verifying" => "verifying",
+        "ready" => "ready",
+        "need_elevation" => "need_elevation",
+        "failed" => "failed",
+        _ => "idle",
+    }
+}
+
 /// Live status snapshot of the standalone global domestic :443 pre-acceleration engine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalPreAccelStatus {
@@ -1783,6 +2419,13 @@ pub struct GlobalPreAccelStatus {
     /// Active engine mode: `"off"`, `"windivert"` (Windows transparent kernel NAT), or
     /// `"local_socks5"` (cross-platform standalone 127.0.0.1 :443 dual-active SOCKS5 entry).
     pub mode: String,
+    /// Strictly `true` only when `running && mode == "windivert"`.
+    #[serde(default)]
+    pub is_windivert_active: bool,
+    /// Driver installation / elevation lifecycle state:
+    /// `"idle" | "downloading" | "verifying" | "ready" | "need_elevation" | "failed"`.
+    #[serde(default = "default_install_state")]
+    pub install_state: String,
     pub socks_port: Option<u16>,
     pub windivert_available: bool,
     pub windivert_path: Option<String>,
@@ -1792,6 +2435,8 @@ pub struct GlobalPreAccelStatus {
     pub up_bytes: u64,
     pub down_bytes: u64,
     pub accelerated_processes: Vec<String>,
+    #[serde(default)]
+    pub process_stats: Vec<AcceleratedProcessStat>,
     pub active_relays: Vec<String>,
     pub last_error: Option<String>,
 }
@@ -1801,6 +2446,8 @@ impl Default for GlobalPreAccelStatus {
         Self {
             running: false,
             mode: "off".to_string(),
+            is_windivert_active: false,
+            install_state: default_install_state(),
             socks_port: None,
             windivert_available: false,
             windivert_path: None,
@@ -1810,6 +2457,7 @@ impl Default for GlobalPreAccelStatus {
             up_bytes: 0,
             down_bytes: 0,
             accelerated_processes: Vec::new(),
+            process_stats: Vec::new(),
             active_relays: Vec::new(),
             last_error: None,
         }
@@ -1832,7 +2480,7 @@ impl ActiveGlobalRuntime {
         // native network flow resumes immediately with zero packet drops.
         #[cfg(target_os = "windows")]
         if let Some(mut engine) = self.engine.take() {
-            engine.stop_sync();
+            let _ = tokio::task::spawn_blocking(move || engine.stop_sync()).await;
         }
         self.tunnel.stop().await;
     }
@@ -1848,6 +2496,7 @@ pub struct GlobalPreAccelManager {
     runtime: Mutex<Option<ActiveGlobalRuntime>>,
     metrics: Arc<GlobalPreAccelMetrics>,
     last_error: Mutex<Option<String>>,
+    install_state: Mutex<String>,
     custom_windivert_dir: Mutex<Option<String>>,
     synced_main_core_pid: Mutex<Option<u32>>,
 }
@@ -1861,9 +2510,29 @@ impl GlobalPreAccelManager {
             runtime: Mutex::new(None),
             metrics: Arc::new(GlobalPreAccelMetrics::default()),
             last_error: Mutex::new(None),
+            install_state: Mutex::new(default_install_state()),
             custom_windivert_dir: Mutex::new(None),
             synced_main_core_pid: Mutex::new(None),
         }
+    }
+
+    /// Update the driver installation / elevation lifecycle state exposed in `GlobalPreAccelStatus`.
+    /// Accepted values: `"idle" | "downloading" | "verifying" | "ready" | "need_elevation" | "failed"`.
+    pub fn set_install_state(&self, state: &str) {
+        let normalized = normalize_install_state(state);
+        let mut guard = self
+            .install_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = normalized.to_string();
+    }
+
+    /// Read the currently stored driver installation / elevation lifecycle state.
+    pub fn install_state(&self) -> String {
+        self.install_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Dynamically synchronize the external main Mihomo core PID excluded from Windows
@@ -1967,6 +2636,14 @@ impl GlobalPreAccelManager {
                 locate_windivert_files(&self.paths, cfg.preaccel.windivert_dir.as_deref());
 
             if !is_elevated {
+                if wd_files.is_some() {
+                    self.set_install_state("need_elevation");
+                } else {
+                    let cur_state = self.install_state();
+                    if cur_state != "downloading" && cur_state != "verifying" {
+                        self.set_install_state("idle");
+                    }
+                }
                 self.set_last_error(Some(
                     "当前非管理员权限，已自动运行在本地独立 443 SOCKS5 隧道模式；如需透明加速其它软件请以管理员身份运行"
                         .to_string(),
@@ -2000,15 +2677,21 @@ impl GlobalPreAccelManager {
                     Ok(engine) => {
                         win_engine = Some(engine);
                         mode = "windivert".to_string();
+                        self.set_install_state("ready");
                         self.set_last_error(None);
                     }
                     Err(err) => {
+                        self.set_install_state("failed");
                         self.set_last_error(Some(format!(
                             "WinDivert 透明内核引擎启动失败，已降级为本地独立 443 SOCKS5 隧道 ({err})"
                         )));
                     }
                 }
             } else {
+                let cur_state = self.install_state();
+                if cur_state != "downloading" && cur_state != "verifying" {
+                    self.set_install_state("idle");
+                }
                 self.set_last_error(Some(
                     "尚未安装 WinDivert v2.2.2 驱动组件，已自动运行在本地独立 443 SOCKS5 隧道模式"
                         .to_string(),
@@ -2056,6 +2739,162 @@ impl GlobalPreAccelManager {
         Ok(self.status())
     }
 
+    /// Hot-upgrade a running `"local_socks5"` runtime in place to `"windivert"` transparent kernel
+    /// interception once WinDivert driver files are ready, without stopping or interrupting the
+    /// active standalone `:443` SOCKS5 tunnel.
+    pub async fn upgrade_to_windivert_in_place(
+        &self,
+        cfg: &AppConfig,
+        relays: &[PreAccelRelay],
+        extra_excluded_pids: &[u32],
+    ) -> CatResult<GlobalPreAccelStatus> {
+        let _op = self.op_lock.lock().await;
+
+        {
+            let mut dir_guard = self
+                .custom_windivert_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *dir_guard = cfg.preaccel.windivert_dir.clone();
+        }
+
+        #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+        {
+            let _ = (relays, extra_excluded_pids);
+            #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+            {
+                self.set_last_error(Some(WINDIVERT_ARM64_UNSUPPORTED_MSG.to_string()));
+            }
+            Ok(self.status())
+        }
+
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        {
+            let running_snapshot = {
+                let rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                rt_guard
+                    .as_ref()
+                    .map(|rt| (rt.mode == "windivert", rt.socks_port, rt.tunnel.pid()))
+            };
+
+            let Some((already_windivert, socks_port, tunnel_pid)) = running_snapshot else {
+                // Not running: reflect readiness/elevation accurately without starting a new tunnel.
+                let wd_ready =
+                    locate_windivert_files(&self.paths, cfg.preaccel.windivert_dir.as_deref())
+                        .is_some();
+                if wd_ready {
+                    if default_platform().capabilities().is_elevated {
+                        self.set_install_state("ready");
+                    } else {
+                        self.set_install_state("need_elevation");
+                    }
+                } else {
+                    self.set_install_state("idle");
+                }
+                return Ok(self.status());
+            };
+
+            if already_windivert {
+                self.set_install_state("ready");
+                self.set_last_error(None);
+                return Ok(self.status());
+            }
+
+            let Some((dll_path, _sys_path)) =
+                locate_windivert_files(&self.paths, cfg.preaccel.windivert_dir.as_deref())
+            else {
+                self.set_install_state("failed");
+                self.set_last_error(Some(
+                    "未找到 WinDivert v2.2.2 驱动文件（WinDivert64.dll / WinDivert64.sys），继续保持本地独立 443 通道"
+                        .to_string(),
+                ));
+                return Ok(self.status());
+            };
+
+            let is_elevated = default_platform().capabilities().is_elevated;
+            if !is_elevated {
+                self.set_install_state("need_elevation");
+                self.set_last_error(Some(
+                    "WinDivert 驱动已就绪，请以管理员身份重启猫猫云梯以启用底层透明提速"
+                        .to_string(),
+                ));
+                return Ok(self.status());
+            }
+
+            let synced_main_pid = *self
+                .synced_main_core_pid
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut static_excluded_pids: HashSet<u32> = HashSet::new();
+            for &pid in extra_excluded_pids {
+                if pid > 0 && Some(pid) != synced_main_pid {
+                    static_excluded_pids.insert(pid);
+                }
+            }
+
+            let relay_ipv4s = collect_enabled_relay_ipv4s(relays);
+            let engine_cfg = super::windivert_win::WinDivertEngineConfig {
+                dll_path,
+                socks_port,
+                relay_ipv4s,
+                scope: cfg.preaccel.global_scope,
+                target_processes: cfg.preaccel.global_target_processes.clone(),
+                excluded_pids: static_excluded_pids,
+                tunnel_pid,
+                main_core_pid: synced_main_pid,
+                metrics: Arc::clone(&self.metrics),
+            };
+
+            match super::windivert_win::WinDivertEngine::start(engine_cfg).await {
+                Ok(engine) => {
+                    let (installed, displaced_engine) = {
+                        let synced_guard = self
+                            .synced_main_core_pid
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        engine.sync_main_core_pid(*synced_guard);
+                        let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(rt) = rt_guard.as_mut() {
+                            let old = rt.engine.replace(engine);
+                            rt.mode = "windivert".to_string();
+                            (true, old)
+                        } else {
+                            (false, Some(engine))
+                        }
+                    };
+                    if let Some(mut stale) = displaced_engine {
+                        let _ = tokio::task::spawn_blocking(move || stale.stop_sync()).await;
+                    }
+                    if installed {
+                        self.set_install_state("ready");
+                        self.set_last_error(None);
+                    } else {
+                        let wd_ready = locate_windivert_files(
+                            &self.paths,
+                            cfg.preaccel.windivert_dir.as_deref(),
+                        )
+                        .is_some();
+                        if wd_ready && is_elevated {
+                            self.set_install_state("ready");
+                        } else if wd_ready {
+                            self.set_install_state("need_elevation");
+                        } else {
+                            self.set_install_state("idle");
+                        }
+                    }
+                    Ok(self.status())
+                }
+                Err(err) => {
+                    self.set_install_state("failed");
+                    self.set_last_error(Some(format!(
+                        "WinDivert 驱动就绪后原地热升格失败，继续保持本地独立 443 通道 ({err})"
+                    )));
+                    Err(err)
+                }
+            }
+        }
+    }
+
     /// Deterministically stop transparent interception and terminate the standalone :443 tunnel.
     pub async fn stop(&self) -> CatResult<GlobalPreAccelStatus> {
         let _op = self.op_lock.lock().await;
@@ -2066,7 +2905,7 @@ impl GlobalPreAccelManager {
         if let Some(rt) = current {
             rt.stop().await;
         }
-        self.metrics.active_connections.store(0, Ordering::Relaxed);
+        self.metrics.clear_active_connections();
         Ok(self.status())
     }
 
@@ -2100,6 +2939,32 @@ impl GlobalPreAccelManager {
             }
         };
 
+        let is_windivert_active = running && mode == "windivert";
+        let stored_install_state = self
+            .install_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let install_state = match stored_install_state.as_str() {
+            "downloading" | "verifying" | "failed" => stored_install_state,
+            _ => {
+                #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+                {
+                    if !windivert_available {
+                        "idle".to_string()
+                    } else if is_windivert_active || is_elevated {
+                        "ready".to_string()
+                    } else {
+                        "need_elevation".to_string()
+                    }
+                }
+                #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+                {
+                    stored_install_state
+                }
+            }
+        };
+
         let last_error = self
             .last_error
             .lock()
@@ -2109,6 +2974,8 @@ impl GlobalPreAccelManager {
         GlobalPreAccelStatus {
             running,
             mode,
+            is_windivert_active,
+            install_state,
             socks_port,
             windivert_available,
             windivert_path,
@@ -2118,6 +2985,7 @@ impl GlobalPreAccelManager {
             up_bytes: self.metrics.up_bytes.load(Ordering::Relaxed),
             down_bytes: self.metrics.down_bytes.load(Ordering::Relaxed),
             accelerated_processes: self.metrics.recent_processes_snapshot(),
+            process_stats: self.metrics.process_stats_snapshot(),
             active_relays,
             last_error,
         }
@@ -2474,7 +3342,9 @@ mod tests {
                 orig_dst_port: 8443,
                 if_idx: 7,
                 sub_if_idx: 0,
+                owner_pid: 2001,
                 process_name: "mihomo.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
                 last_seen: now - Duration::from_secs(10),
             },
         );
@@ -2485,7 +3355,9 @@ mod tests {
                 orig_dst_port: 9443,
                 if_idx: 7,
                 sub_if_idx: 0,
+                owner_pid: 2002,
                 process_name: "xray.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
                 last_seen: now - Duration::from_secs(5),
             },
         );
@@ -2497,7 +3369,9 @@ mod tests {
                 orig_dst_port: 2053,
                 if_idx: 7,
                 sub_if_idx: 0,
+                owner_pid: 2003,
                 process_name: "ssh.exe".to_string(),
+                detected_by: "manual".to_string(),
                 last_seen: now,
             },
         );
@@ -2551,7 +3425,7 @@ mod tests {
         assert!(!is_physical_nic_descriptor(24, 5, "Software Loopback Interface 1"));
 
         // Process interception scope & anti-loop exclusions
-        let targets: HashSet<String> = ["verge-mihomo.exe", "ssh.exe"]
+        let targets: HashSet<String> = ["ssh.exe", "custom-tool.exe"]
             .into_iter()
             .map(String::from)
             .collect();
@@ -2559,14 +3433,28 @@ mod tests {
 
         assert!(should_intercept_process(
             2000,
-            Some(r"C:\Program Files\Clash Verge\verge-mihomo.exe"),
+            Some(r"C:\Tools\ProxyCore\mihomo.exe"),
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &targets,
+            &excluded
+        ));
+        assert!(should_intercept_process(
+            2005,
+            Some(r"C:\Tools\OpenCore\custom-xray-runner.exe"),
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &targets,
+            &excluded
+        ));
+        assert!(should_intercept_process(
+            2006,
+            Some("ssh.exe"),
             GlobalPreAccelScope::ProxyAppsOnly,
             &targets,
             &excluded
         ));
         assert!(!should_intercept_process(
             1002,
-            Some("verge-mihomo.exe"),
+            Some("mihomo.exe"),
             GlobalPreAccelScope::AllNon443Tcp,
             &targets,
             &excluded
@@ -2574,6 +3462,13 @@ mod tests {
         assert!(!should_intercept_process(
             3000,
             Some("svchost.exe"),
+            GlobalPreAccelScope::AllNon443Tcp,
+            &targets,
+            &excluded
+        ));
+        assert!(!should_intercept_process(
+            3002,
+            Some("catcloud-probe-core.exe"),
             GlobalPreAccelScope::AllNon443Tcp,
             &targets,
             &excluded
@@ -2667,7 +3562,9 @@ mod tests {
                 orig_dst_port: 8443,
                 if_idx: 1,
                 sub_if_idx: 0,
-                process_name: "FlClashCore.exe".to_string(),
+                owner_pid: 4242,
+                process_name: "sing-box.exe".to_string(),
+                detected_by: "system_proxy_host".to_string(),
                 last_seen: Instant::now(),
             },
         );
@@ -2691,8 +3588,19 @@ mod tests {
         assert!(metrics.down_bytes.load(Ordering::Relaxed) >= 6);
         assert_eq!(
             metrics.recent_processes_snapshot(),
-            vec!["FlClashCore.exe".to_string()]
+            vec!["sing-box.exe".to_string()]
         );
+
+        let proc_stats = metrics.snapshot();
+        assert_eq!(proc_stats.len(), 1);
+        assert_eq!(proc_stats[0].process_name, "sing-box.exe");
+        assert_eq!(proc_stats[0].pid, 4242);
+        assert_eq!(proc_stats[0].detected_by, "system_proxy_host");
+        assert_eq!(proc_stats[0].active_connections, 0);
+        assert_eq!(proc_stats[0].total_connections, 1);
+        assert!(proc_stats[0].tx_bytes >= 5);
+        assert!(proc_stats[0].rx_bytes >= 6);
+        assert!(proc_stats[0].last_seen_ms > 0);
     }
 
     #[test]
@@ -2709,7 +3617,9 @@ mod tests {
                 orig_dst_port: 8443,
                 if_idx: 3,
                 sub_if_idx: 0,
+                owner_pid: 5100,
                 process_name: "app-a.exe".to_string(),
+                detected_by: "manual".to_string(),
                 last_seen: now,
             },
         );
@@ -2720,7 +3630,9 @@ mod tests {
                 orig_dst_port: 2053,
                 if_idx: 3,
                 sub_if_idx: 0,
+                owner_pid: 5101,
                 process_name: "app-b.exe".to_string(),
+                detected_by: "local_proxy_listener".to_string(),
                 last_seen: now,
             },
         );
@@ -2876,7 +3788,9 @@ mod tests {
                 orig_dst_port: 8443,
                 if_idx: 1,
                 sub_if_idx: 0,
+                owner_pid: 6001,
                 process_name: "stalled.exe".to_string(),
+                detected_by: "manual".to_string(),
                 last_seen: Instant::now(),
             },
         );
@@ -2932,5 +3846,384 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn classify_intercept_process_respects_exclusions_dynamic_hosts_open_stems_and_manual() {
+        let targets: HashSet<String> = ["ssh.exe", "custom-sync.exe"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let excluded: HashSet<u32> = [1001, 1002, 2001].into_iter().collect();
+        let mut detected: HashMap<u32, &'static str> = HashMap::new();
+        detected.insert(2001, "system_proxy_host"); // must still be blocked by `excluded`
+        detected.insert(2002, "system_proxy_host");
+        detected.insert(2003, "local_proxy_listener");
+
+        // 1. Excluded PIDs and system/self binaries ALWAYS win over dynamic detection or scope.
+        assert_eq!(
+            classify_intercept_process(
+                2001,
+                Some("mihomo.exe"),
+                GlobalPreAccelScope::AllNon443Tcp,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_intercept_process(
+                2002,
+                Some("catcloud.exe"),
+                GlobalPreAccelScope::AllNon443Tcp,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_intercept_process(
+                2002,
+                Some("catcloud-helper.exe"),
+                GlobalPreAccelScope::AllNon443Tcp,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_intercept_process(
+                2002,
+                Some("svchost.exe"),
+                GlobalPreAccelScope::AllNon443Tcp,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            None
+        );
+
+        // 2. Dynamic runtime detections classify arbitrary executable names without hardcoded lists.
+        assert_eq!(
+            classify_intercept_process(
+                2002,
+                Some("third-party-proxy-engine.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            Some("system_proxy_host")
+        );
+        assert_eq!(
+            classify_intercept_process(
+                2003,
+                Some("proxy-daemon.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            Some("local_proxy_listener")
+        );
+
+        // 3. Generic open-source core stems match even when not explicitly listed in `targets`.
+        assert_eq!(
+            classify_intercept_process(
+                3001,
+                Some(r"D:\Tools\sing-box-core.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            Some("open_core_name")
+        );
+        assert_eq!(
+            classify_intercept_process(
+                3002,
+                Some("tun2socks-win64.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            Some("open_core_name")
+        );
+
+        // 4. Explicit manual target names match as `"manual"`.
+        assert_eq!(
+            classify_intercept_process(
+                3003,
+                Some("custom-sync.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            Some("manual")
+        );
+
+        // 5. Unrelated apps bypass in `ProxyAppsOnly`, match `"scope_all"` in `AllNon443Tcp`.
+        assert_eq!(
+            classify_intercept_process(
+                3004,
+                Some("browser.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            None
+        );
+        assert_eq!(
+            classify_intercept_process(
+                3004,
+                Some("browser.exe"),
+                GlobalPreAccelScope::AllNon443Tcp,
+                &targets,
+                &excluded,
+                &detected,
+            ),
+            Some("scope_all")
+        );
+    }
+
+    #[test]
+    fn metrics_process_stats_aggregates_sorts_and_evicts_bounded_capacity() {
+        let metrics = GlobalPreAccelMetrics::default();
+
+        // Process A: 1 active connection, 100 bytes total.
+        metrics.record_process_connection_open(100, "mihomo.exe", "system_proxy_host");
+        metrics.record_process_bytes(100, "mihomo.exe", "system_proxy_host", 40, 60);
+
+        // Process B: 2 active connections, 50 bytes total -> ranks first by active_connections.
+        metrics.record_process_connection_open(200, "xray.exe", "local_proxy_listener");
+        metrics.record_process_connection_open(200, "xray.exe", "local_proxy_listener");
+        metrics.record_process_bytes(200, "xray.exe", "local_proxy_listener", 20, 30);
+
+        // Process C: 0 active connections, 5000 bytes total -> ranks behind active processes.
+        metrics.record_process_connection_open(300, "ssh.exe", "manual");
+        metrics.record_process_bytes(300, "ssh.exe", "manual", 2000, 3000);
+        metrics.record_process_connection_close(300, "ssh.exe", "manual");
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].process_name, "xray.exe");
+        assert_eq!(snap[0].active_connections, 2);
+        assert_eq!(snap[0].total_connections, 2);
+        assert_eq!(snap[1].process_name, "mihomo.exe");
+        assert_eq!(snap[1].active_connections, 1);
+        assert_eq!(snap[2].process_name, "ssh.exe");
+        assert_eq!(snap[2].active_connections, 0);
+        assert_eq!(snap[2].tx_bytes, 2000);
+        assert_eq!(snap[2].rx_bytes, 3000);
+
+        // Clearing active connections zeroes active gauges while preserving historical bytes.
+        metrics.clear_active_connections();
+        let after_clear = metrics.snapshot();
+        assert!(after_clear.iter().all(|s| s.active_connections == 0));
+        // With all active == 0, highest total bytes (`ssh.exe`, 5000 B) moves to rank 0.
+        assert_eq!(after_clear[0].process_name, "ssh.exe");
+
+        // Bounded capacity test: insert > MAX_PROCESS_STATS idle processes and assert hard cap.
+        for idx in 0..(MAX_PROCESS_STATS as u32 + 12) {
+            let pid = 10_000 + idx;
+            let name = format!("worker-{idx}.exe");
+            metrics.record_process_connection_open(pid, &name, "open_core_name");
+            metrics.record_process_connection_close(pid, &name, "open_core_name");
+        }
+        assert!(metrics.snapshot().len() <= MAX_PROCESS_STATS);
+
+        metrics.reset();
+        assert!(metrics.snapshot().is_empty());
+    }
+
+    #[test]
+    fn global_preaccel_status_backcompat_serde_and_install_state_transitions() {
+        // Legacy JSON missing new Stage 12 fields must deserialize cleanly with safe defaults.
+        let legacy_json = r#"{
+            "running": true,
+            "mode": "local_socks5",
+            "socks_port": 17908,
+            "windivert_available": false,
+            "windivert_path": null,
+            "is_elevated": false,
+            "active_connections": 0,
+            "total_connections": 0,
+            "up_bytes": 0,
+            "down_bytes": 0,
+            "accelerated_processes": [],
+            "active_relays": ["Relay-A"],
+            "last_error": null
+        }"#;
+        let parsed: GlobalPreAccelStatus =
+            serde_json::from_str(legacy_json).expect("deserialize legacy GlobalPreAccelStatus");
+        assert!(!parsed.is_windivert_active);
+        assert_eq!(parsed.install_state, "idle");
+        assert!(parsed.process_stats.is_empty());
+
+        // Manager install state normalization and reporting.
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-install-state-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.join("data"), true).unwrap();
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        let bin_dir = paths.bin_dir.clone();
+        let job_guard = Arc::new(JobGuard::new().unwrap());
+        let manager = GlobalPreAccelManager::new(paths, job_guard);
+
+        manager.set_install_state("downloading");
+        assert_eq!(manager.status().install_state, "downloading");
+        assert!(!manager.status().is_windivert_active);
+
+        manager.set_install_state("VERIFYING");
+        assert_eq!(manager.status().install_state, "verifying");
+
+        manager.set_install_state("need_elevation");
+        assert_eq!(manager.install_state(), "need_elevation");
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        {
+            let st_missing = manager.status();
+            if !st_missing.windivert_available {
+                assert_eq!(st_missing.install_state, "idle");
+            }
+            let dll_path = bin_dir.join("WinDivert64.dll");
+            let sys_path = bin_dir.join("WinDivert64.sys");
+            std::fs::write(&dll_path, b"stub-dll").unwrap();
+            std::fs::write(&sys_path, b"stub-sys").unwrap();
+            let st_present = manager.status();
+            assert!(st_present.windivert_available);
+            assert_eq!(
+                st_present.install_state,
+                if st_present.is_elevated {
+                    "ready"
+                } else {
+                    "need_elevation"
+                }
+            );
+            manager.set_install_state("ready");
+            let _ = std::fs::remove_file(&dll_path);
+            let _ = std::fs::remove_file(&sys_path);
+            let st_removed = manager.status();
+            if !st_removed.windivert_available {
+                assert_eq!(st_removed.install_state, "idle");
+            }
+        }
+        #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+        assert_eq!(manager.status().install_state, "need_elevation");
+
+        manager.set_install_state("failed");
+        assert_eq!(manager.status().install_state, "failed");
+
+        manager.set_install_state("unknown-bogus");
+        assert_eq!(manager.install_state(), "idle");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windivert_proxy_candidates_dedup_and_system_proxy_url_formatting() {
+        assert_eq!(normalize_windivert_proxy_candidates(&[]), vec![None]);
+
+        let raw = vec![
+            Some(" http://127.0.0.1:7890/ ".to_string()),
+            Some("HTTP://127.0.0.1:7890".to_string()),
+            Some("http://127.0.0.1:7897".to_string()),
+            None,
+            Some("   ".to_string()),
+            None,
+        ];
+        assert_eq!(
+            normalize_windivert_proxy_candidates(&raw),
+            vec![
+                Some("http://127.0.0.1:7890/".to_string()),
+                Some("http://127.0.0.1:7897".to_string()),
+                None,
+            ]
+        );
+
+        let enabled_v4 = crate::platform::SystemProxySpec {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 10809,
+            bypass: Vec::new(),
+            pac_url: None,
+        };
+        assert_eq!(
+            format_system_proxy_url(&enabled_v4).as_deref(),
+            Some("http://127.0.0.1:10809")
+        );
+
+        let enabled_v6 = crate::platform::SystemProxySpec {
+            enabled: true,
+            host: "::1".to_string(),
+            port: 10809,
+            bypass: Vec::new(),
+            pac_url: None,
+        };
+        assert_eq!(
+            format_system_proxy_url(&enabled_v6).as_deref(),
+            Some("http://[::1]:10809")
+        );
+
+        let pac_only = crate::platform::SystemProxySpec {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 7890,
+            bypass: Vec::new(),
+            pac_url: Some("http://127.0.0.1:17891/proxy.pac".to_string()),
+        };
+        assert_eq!(format_system_proxy_url(&pac_only), None);
+
+        let disabled = crate::platform::SystemProxySpec {
+            enabled: false,
+            host: "127.0.0.1".to_string(),
+            port: 7890,
+            bypass: Vec::new(),
+            pac_url: None,
+        };
+        assert_eq!(format_system_proxy_url(&disabled), None);
+    }
+
+    #[test]
+    fn excluded_pid_tracker_merges_descendant_tree_and_main_core_without_clobbering() {
+        let self_pid = std::process::id();
+        let tunnel_pid = self_pid.wrapping_add(11_001).max(100);
+        let main_pid = self_pid.wrapping_add(22_001).max(200);
+        let webview_pid = self_pid.wrapping_add(33_001).max(300);
+        let probe_pid = self_pid.wrapping_add(33_002).max(301);
+
+        let tracker = ExcludedPidTracker::new(self_pid, Some(tunnel_pid), [], Some(main_pid));
+        tracker.sync_descendant_pids([webview_pid, probe_pid, 0].into_iter().collect());
+
+        let snap1 = tracker.snapshot_active();
+        assert!(snap1.contains(&self_pid));
+        assert!(snap1.contains(&tunnel_pid));
+        assert!(snap1.contains(&main_pid));
+        assert!(snap1.contains(&webview_pid));
+        assert!(snap1.contains(&probe_pid));
+        assert!(!snap1.contains(&0));
+
+        // Clearing main_core_pid must keep descendant tree and pinned PIDs intact.
+        tracker.sync_main_core_pid(None);
+        let snap2 = tracker.snapshot_active();
+        assert!(snap2.contains(&self_pid));
+        assert!(snap2.contains(&tunnel_pid));
+        assert!(snap2.contains(&webview_pid));
+        assert!(snap2.contains(&probe_pid));
+        assert!(!snap2.contains(&main_pid));
+
+        // Refreshing descendant tree replaces stale descendants while retaining pinned PIDs.
+        tracker.sync_descendant_pids([webview_pid].into_iter().collect());
+        let snap3 = tracker.snapshot_active();
+        assert!(snap3.contains(&self_pid));
+        assert!(snap3.contains(&tunnel_pid));
+        assert!(snap3.contains(&webview_pid));
+        assert!(!snap3.contains(&probe_pid));
     }
 }

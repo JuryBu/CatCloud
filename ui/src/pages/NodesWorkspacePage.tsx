@@ -1,64 +1,93 @@
 import { ArrowLeft, Globe, Link2, Plus } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { appActions, useAppSelector } from "../store/appStore";
 import { NodesSubsPage } from "./NodesSubsPage";
 import { SpeedTestPage } from "./SpeedTestPage";
 
 type WorkspaceTab = "nodes" | "subs";
 
+let workspaceInitialTabAligned = false;
+
 export function NodesWorkspacePage() {
   const nodes = useAppSelector((s) => s.nodes);
   const subscriptions = useAppSelector((s) => s.subscriptions);
   const initialized = useAppSelector((s) => s.initialized);
   const nodesTabHint = useAppSelector((s) => s.nodesTabHint);
-  const isProbeRunning = useAppSelector((s) => s.probeProgress.running);
-
-  const userPickedTabRef = useRef(Boolean(nodesTabHint));
-  const [tab, setTab] = useState<WorkspaceTab>(() => {
-    if (nodesTabHint) return nodesTabHint.tab;
-    return nodes.length === 0 ? "subs" : "nodes";
-  });
-  const [activeSubFilter, setActiveSubFilter] = useState<string | null>(
-    () => nodesTabHint?.subId ?? null
+  const workspaceDraft = useAppSelector((s) => s.sessionDrafts.nodesWorkspace);
+  const isProbeRunning = useAppSelector(
+    (s) => s.probeProgress.running || s.bgTasks.probeLocalStarting
   );
+  const subsBg = useAppSelector((s) => s.bgTasks.subs);
+  const captureActive = useAppSelector(
+    (s) => s.bgTasks.capture.active || s.bgTasks.capture.finishing
+  );
+
+  const tab: WorkspaceTab = workspaceDraft.tab;
+  const activeSubFilter: string | null = workspaceDraft.filterSubId || null;
+  const isSubsBusy =
+    subsBg.refreshingAll ||
+    subsBg.refreshingIds.length > 0 ||
+    subsBg.importing ||
+    captureActive;
 
   // Consume navigation tab hints from other pages (e.g. HomePage / MultiGroupPage)
   useEffect(() => {
     if (!nodesTabHint) return;
-    userPickedTabRef.current = true;
-    setTab(nodesTabHint.tab);
+    workspaceInitialTabAligned = true;
+    appActions.patchSessionDraft("nodesWorkspace", {
+      tab: nodesTabHint.tab,
+      ...(nodesTabHint.subId !== undefined ? { filterSubId: nodesTabHint.subId ?? "" } : {}),
+    });
     if (nodesTabHint.subId !== undefined) {
-      setActiveSubFilter(nodesTabHint.subId ?? null);
+      appActions.patchSessionDraft("speedTest", {
+        sourceFilter: nodesTabHint.subId || "all",
+        page: 1,
+      });
     }
     appActions.consumeNodesTabHint();
   }, [nodesTabHint]);
 
-  // If mounted directly before backend hydration completes, align default tab once initialized
+  // Align initial default tab once after first backend hydration if user hasn't picked yet
   useEffect(() => {
-    if (!initialized || userPickedTabRef.current || nodesTabHint) return;
-    setTab(nodes.length === 0 ? "subs" : "nodes");
-  }, [initialized, nodes.length, nodesTabHint]);
+    if (!initialized || workspaceInitialTabAligned || nodesTabHint) return;
+    workspaceInitialTabAligned = true;
+    if (nodes.length === 0 && tab !== "subs") {
+      appActions.patchSessionDraft("nodesWorkspace", { tab: "subs" });
+    }
+  }, [initialized, nodes.length, nodesTabHint, tab]);
 
   const handleSelectTab = (next: WorkspaceTab) => {
-    userPickedTabRef.current = true;
-    setTab(next);
+    workspaceInitialTabAligned = true;
+    appActions.patchSessionDraft("nodesWorkspace", { tab: next });
   };
 
   const handleOpenSubs = () => {
-    userPickedTabRef.current = true;
-    setTab("subs");
+    workspaceInitialTabAligned = true;
+    appActions.patchSessionDraft("nodesWorkspace", { tab: "subs" });
   };
 
   const handleBackToNodes = () => {
-    userPickedTabRef.current = true;
-    setActiveSubFilter(null);
-    setTab("nodes");
+    workspaceInitialTabAligned = true;
+    appActions.patchSessionDraft("nodesWorkspace", {
+      tab: "nodes",
+      filterSubId: "",
+    });
+    appActions.patchSessionDraft("speedTest", {
+      sourceFilter: "all",
+      page: 1,
+    });
   };
 
   const handleViewSubNodes = (subId: string | null) => {
-    userPickedTabRef.current = true;
-    setActiveSubFilter(subId);
-    setTab("nodes");
+    workspaceInitialTabAligned = true;
+    appActions.patchSessionDraft("nodesWorkspace", {
+      tab: "nodes",
+      filterSubId: subId ?? "",
+    });
+    appActions.patchSessionDraft("speedTest", {
+      sourceFilter: subId || "all",
+      page: 1,
+    });
   };
 
   return (
@@ -104,6 +133,14 @@ export function NodesWorkspacePage() {
           >
             <Link2 className="h-3.5 w-3.5 shrink-0" />
             <span>订阅与导入（{subscriptions.length}）</span>
+            {isSubsBusy && (
+              <span
+                className={`cc-pulse-dot inline-block h-1.5 w-1.5 shrink-0 rounded-full ${
+                  captureActive ? "bg-[var(--green)]" : "bg-[var(--accent)]"
+                }`}
+                title={captureActive ? "正在后台实时捕捉节点" : "正在后台刷新或导入订阅"}
+              />
+            )}
           </button>
         </div>
 
@@ -130,7 +167,7 @@ export function NodesWorkspacePage() {
         </div>
       </div>
 
-      {/* Keep SpeedTestPage mounted with CSS `hidden` so selections, search, region filters, and pagination survive tab switches */}
+      {/* Symmetrically keep both tabs mounted via CSS `hidden` so state, filters, and drawers survive tab switches */}
       <div className={tab === "nodes" ? "contents" : "hidden"}>
         <SpeedTestPage
           embedded
@@ -138,12 +175,12 @@ export function NodesWorkspacePage() {
           onOpenSubs={handleOpenSubs}
         />
       </div>
-      {tab === "subs" && (
+      <div className={tab === "subs" ? "contents" : "hidden"}>
         <NodesSubsPage
           embeddedSubsOnly
           onViewSubNodes={handleViewSubNodes}
         />
-      )}
+      </div>
     </div>
   );
 }

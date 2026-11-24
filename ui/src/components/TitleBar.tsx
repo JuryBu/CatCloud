@@ -4,48 +4,54 @@ import { useEffect, useState } from "react";
 import { isTauriEnv } from "../api/tauri";
 import { useAppSelector } from "../store/appStore";
 import { resolvePlatformOs } from "../utils/platform";
+import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
 
 function resolveModeBadge(
-  proxyActive: boolean,
   status: string,
   proxyMode: string,
-  proxyPreaccelActive: boolean,
-  globalPreaccelActive: boolean
+  preaccel: PreAccelSummary
 ): { label: string; dotColor: string } {
+  if (!preaccel.proxyActive) {
+    if (status === "error") {
+      return { label: "核心异常", dotColor: "var(--red)" };
+    }
+    if (preaccel.realWinDivertActive) {
+      return {
+        label: "全局提速中",
+        dotColor: status === "warn" ? "var(--amber)" : "var(--accent)",
+      };
+    }
+    if (preaccel.enabled) {
+      if (preaccel.installState === "downloading" || preaccel.installState === "verifying") {
+        return { label: "准备提速组件…", dotColor: "var(--amber)" };
+      }
+      if (preaccel.installState === "need_elevation") {
+        return { label: "提速需管理员", dotColor: "var(--amber)" };
+      }
+      return { label: "本地通道待命", dotColor: "var(--amber)" };
+    }
+    if (status === "warn") {
+      return { label: "待认证", dotColor: "var(--amber)" };
+    }
+    return { label: "待命", dotColor: "var(--muted)" };
+  }
+
   const dotColor =
     status === "error"
       ? "var(--red)"
       : status === "warn"
         ? "var(--amber)"
-        : proxyPreaccelActive || globalPreaccelActive
+        : preaccel.enabled
           ? "var(--accent)"
-          : proxyActive
-            ? "var(--green)"
-            : "var(--muted)";
-
-  if (!proxyActive) {
-    if (status === "error") {
-      return { label: "核心异常", dotColor };
-    }
-    if (globalPreaccelActive) {
-      return {
-        label: "底层提速中",
-        dotColor: status === "warn" ? "var(--amber)" : "var(--accent)",
-      };
-    }
-    if (status === "warn") {
-      return { label: "待认证", dotColor };
-    }
-    return { label: "待命", dotColor };
-  }
+          : "var(--green)";
 
   const modeLabel =
     proxyMode === "global" ? "全局" : proxyMode === "direct" ? "直连" : "规则";
-  const label = proxyPreaccelActive
-    ? `${modeLabel} · 提速`
-    : globalPreaccelActive
-      ? `${modeLabel} · 底层提速`
-      : modeLabel;
+  const label = preaccel.enabled
+    ? preaccel.realWinDivertActive
+      ? `${modeLabel} · 全局提速`
+      : `${modeLabel} · 提速`
+    : modeLabel;
   return { label, dotColor };
 }
 
@@ -138,21 +144,13 @@ export function TitleBar() {
     }
   };
 
-  const proxyActive =
-    runtime.running && (runtime.system_proxy_enabled || runtime.tun_enabled);
-  const isPreAccelEnabled = Boolean(runtime.preaccel_enabled ?? preAccelEnabledConfig);
-  const isProxyPreAccelActive = proxyActive && isPreAccelEnabled;
-  const isGlobalPreAccelRunning = Boolean(
-    globalPreAccel.running || runtime.global_preaccel_active
+  const preaccelSummary = resolvePreAccelSummary(
+    runtime,
+    globalPreAccel,
+    preAccelEnabledConfig
   );
 
-  const badge = resolveModeBadge(
-    proxyActive,
-    runtime.status,
-    runtime.proxy_mode,
-    isProxyPreAccelActive,
-    isGlobalPreAccelRunning
-  );
+  const badge = resolveModeBadge(runtime.status, runtime.proxy_mode, preaccelSummary);
 
   const closeButtonLabel = minimizeToTrayOnClose
     ? "关闭（最小化到托盘）"

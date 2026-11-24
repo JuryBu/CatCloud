@@ -35,7 +35,6 @@ import {
 } from "lucide-react";
 import {
   type AppConfig,
-  type AppUpdateCheckResult,
   type FullAppConfig,
   type GeoDataFileStatus,
   type GeoDataStatusDto,
@@ -53,6 +52,7 @@ import { AppSelect } from "../components/AppSelect";
 import {
   BUILTIN_WALLPAPER_PRESETS,
   appActions,
+  appStore,
   getBeijingTimeLabel,
   useAppSelector,
 } from "../store/appStore";
@@ -866,7 +866,49 @@ function SegButtons<T extends string | number>({
   );
 }
 
-let lastCheckedUpdateInfo: AppUpdateCheckResult | null = null;
+const VALID_SETTINGS_TABS: readonly SettingsTabId[] = [
+  "system",
+  "appearance",
+  "dns",
+  "core",
+  "updates",
+];
+
+function isValidSettingsTab(value: string): value is SettingsTabId {
+  return (VALID_SETTINGS_TABS as readonly string[]).includes(value);
+}
+
+interface SettingsSessionDraftCache {
+  draft: AppConfig | null;
+  ext: ExtendedSettings | null;
+  extLoaded: boolean;
+  draftDirty: boolean;
+  extDirty: boolean;
+  coreBinaryPath: string;
+  yamlPreview: string | null;
+  yamlSha: string | null;
+}
+
+let settingsDraftCache: SettingsSessionDraftCache = {
+  draft: null,
+  ext: null,
+  extLoaded: false,
+  draftDirty: false,
+  extDirty: false,
+  coreBinaryPath: "",
+  yamlPreview: null,
+  yamlSha: null,
+};
+
+function clearSettingsDirtyDraftCache(): void {
+  settingsDraftCache = {
+    ...settingsDraftCache,
+    draft: null,
+    ext: null,
+    draftDirty: false,
+    extDirty: false,
+  };
+}
 
 export function SettingsPage() {
   const storeConfig = useAppSelector((s) => s.config);
@@ -876,6 +918,16 @@ export function SettingsPage() {
   const wallpaperError = useAppSelector((s) => s.wallpaperError);
   const settingsTabHint = useAppSelector((s) => s.settingsTabHint);
   const settingsOpenAgentDocs = useAppSelector((s) => s.settingsOpenAgentDocs);
+  const savedSettingsTab = useAppSelector((s) => s.sessionDrafts.settings.tab);
+  const geoStatus = useAppSelector((s) => s.bgTasks.settings.geoStatus);
+  const geoStatusLoading = useAppSelector((s) => s.bgTasks.settings.geoLoading);
+  const geoBusy = useAppSelector((s) => s.bgTasks.settings.geoBusy);
+  const checkingUpdate = useAppSelector((s) => s.bgTasks.settings.checkingUpdate);
+  const downloadingUpdate = useAppSelector((s) => s.bgTasks.settings.downloadingUpdate);
+  const updateInfo = useAppSelector((s) => s.bgTasks.settings.updateInfo);
+  const updateMsg = useAppSelector((s) => s.bgTasks.settings.updateMessage);
+  const coreOpBusy = useAppSelector((s) => s.bgTasks.settings.coreOpBusy);
+  const backupBusy = useAppSelector((s) => s.bgTasks.settings.backupBusy);
   const inTauri = isTauriEnv();
   const platformOs = resolvePlatformOs(runtime.os_label);
   const isWindows = platformOs === "windows";
@@ -901,9 +953,12 @@ export function SettingsPage() {
     }
   }, [platformOs, setSelectedShell]);
 
-  const [tab, setTab] = useState<SettingsTabId>(() =>
-    settingsOpenAgentDocs ? "updates" : (settingsTabHint ?? "system")
-  );
+  const [tab, setTab] = useState<SettingsTabId>(() => {
+    if (settingsOpenAgentDocs) return "updates";
+    if (settingsTabHint) return settingsTabHint;
+    if (isValidSettingsTab(savedSettingsTab)) return savedSettingsTab;
+    return "system";
+  });
   const devToolsSectionRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
@@ -912,9 +967,34 @@ export function SettingsPage() {
       appActions.consumeSettingsTabHint();
     }
   }, [settingsTabHint]);
-  const [draft, setDraft] = useState<AppConfig>(() => structuredClone(storeConfig));
-  const [ext, setExt] = useState<ExtendedSettings>(DEFAULT_EXTENDED);
-  const [extLoaded, setExtLoaded] = useState(false);
+
+  useEffect(() => {
+    if (tab !== appStore.getState().sessionDrafts.settings.tab) {
+      appActions.patchSessionDraft("settings", { tab });
+    }
+  }, [tab]);
+
+  const [draft, setDraft] = useState<AppConfig>(() => {
+    if (settingsDraftCache.draftDirty && settingsDraftCache.draft) {
+      return {
+        ...structuredClone(settingsDraftCache.draft),
+        personalization: structuredClone(storeConfig.personalization),
+        preaccel: structuredClone(storeConfig.preaccel),
+        system_proxy_enabled: storeConfig.system_proxy_enabled,
+        tun_enabled: storeConfig.tun_enabled,
+        proxy_mode: storeConfig.proxy_mode,
+      };
+    }
+    return structuredClone(storeConfig);
+  });
+  const [ext, setExt] = useState<ExtendedSettings>(() =>
+    settingsDraftCache.extDirty && settingsDraftCache.ext
+      ? structuredClone(settingsDraftCache.ext)
+      : DEFAULT_EXTENDED
+  );
+  const [extLoaded, setExtLoaded] = useState<boolean>(
+    () => settingsDraftCache.extDirty && settingsDraftCache.extLoaded
+  );
   const [extLoadError, setExtLoadError] = useState<string | null>(null);
   const [showSecret, setShowSecret] = useState(false);
   const [selectedWebUiIdx, setSelectedWebUiIdx] = usePersistedState<number>(
@@ -924,10 +1004,11 @@ export function SettingsPage() {
   );
   const [newWebUiName, setNewWebUiName] = useState("");
   const [newWebUiTpl, setNewWebUiTpl] = useState("");
-  const [coreBinaryPath, setCoreBinaryPath] = useState("");
-  const [coreOpBusy, setCoreOpBusy] = useState<string | null>(null);
-  const [draftDirty, setDraftDirty] = useState(false);
-  const [extDirty, setExtDirty] = useState(false);
+  const [coreBinaryPath, setCoreBinaryPath] = useState<string>(
+    () => settingsDraftCache.coreBinaryPath
+  );
+  const [draftDirty, setDraftDirty] = useState<boolean>(() => settingsDraftCache.draftDirty);
+  const [extDirty, setExtDirty] = useState<boolean>(() => settingsDraftCache.extDirty);
   const [saving, setSaving] = useState(false);
   const [pickingWallpaper, setPickingWallpaper] = useState(false);
   const [showUrlInput, setShowUrlInput] = useState(false);
@@ -964,41 +1045,47 @@ export function SettingsPage() {
     }, 80);
     return () => window.clearTimeout(timerId);
   }, [tab, showDevTools, pendingScrollToDevTools]);
-  const [yamlPreview, setYamlPreview] = useState<string | null>(null);
-  const [yamlSha, setYamlSha] = useState<string | null>(null);
-  const [yamlLoading, setYamlLoading] = useState(false);
-  const [geoBusy, setGeoBusy] = useState<GeoKey | "all" | null>(null);
-  const [geoStatus, setGeoStatus] = useState<GeoDataStatusDto | null>(null);
-  const [geoStatusLoading, setGeoStatusLoading] = useState(true);
-  const [confirmImportBackupOpen, setConfirmImportBackupOpen] = useState(false);
-  const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [downloadingUpdate, setDownloadingUpdate] = useState(false);
-  const [updateInfo, setUpdateInfoState] = useState<AppUpdateCheckResult | null>(
-    () => lastCheckedUpdateInfo
+  const [yamlPreview, setYamlPreview] = useState<string | null>(
+    () => settingsDraftCache.yamlPreview
   );
-  const [updateMsg, setUpdateMsg] = useState<string | null>(null);
+  const [yamlSha, setYamlSha] = useState<string | null>(() => settingsDraftCache.yamlSha);
+  const [yamlLoading, setYamlLoading] = useState(false);
+  const [confirmImportBackupOpen, setConfirmImportBackupOpen] = useState(false);
   const [activeDocId, setActiveDocId] = usePersistedState<AgentDocId>(
     "settings.activeDocId",
     AGENT_DOCS[0].id,
     AGENT_DOC_ID_VALIDATOR
   );
 
-  const setUpdateInfo = (
-    next:
-      | AppUpdateCheckResult
-      | null
-      | ((prev: AppUpdateCheckResult | null) => AppUpdateCheckResult | null)
-  ) => {
-    setUpdateInfoState((prev) => {
-      const resolved = typeof next === "function" ? next(prev) : next;
-      lastCheckedUpdateInfo = resolved;
-      return resolved;
-    });
-  };
-
   const dirty = draftDirty || extDirty;
   const dirtyRef = useRef(dirty);
   dirtyRef.current = dirty;
+  const extDirtyRef = useRef(extDirty);
+  extDirtyRef.current = extDirty;
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    settingsDraftCache = {
+      draft: draftDirty ? draft : null,
+      ext: extDirty ? ext : null,
+      extLoaded,
+      draftDirty,
+      extDirty,
+      coreBinaryPath,
+      yamlPreview,
+      yamlSha,
+    };
+    if (dirty !== appStore.getState().sessionDrafts.settings.hasDirtyDrafts) {
+      appActions.patchSessionDraft("settings", { hasDirtyDrafts: dirty });
+    }
+  }, [draft, ext, extLoaded, draftDirty, extDirty, dirty, coreBinaryPath, yamlPreview, yamlSha]);
+
   const sliderCommitTimerRef = useRef<number | null>(null);
   const pendingSliderPatchRef = useRef<Partial<AppConfig["personalization"]>>({});
 
@@ -1022,6 +1109,7 @@ export function SettingsPage() {
       setDraft((prev) => ({
         ...prev,
         personalization: structuredClone(storeConfig.personalization),
+        preaccel: structuredClone(storeConfig.preaccel),
         system_proxy_enabled: storeConfig.system_proxy_enabled,
         tun_enabled: storeConfig.tun_enabled,
         proxy_mode: storeConfig.proxy_mode,
@@ -1051,11 +1139,13 @@ export function SettingsPage() {
     try {
       const full = await catcloudApi.getFullConfig();
       if (isActive && !isActive()) return;
-      setExt(hydrateExtendedFromFullConfig(full));
+      if (!extDirtyRef.current) {
+        setExt(hydrateExtendedFromFullConfig(full));
+      }
       setExtLoaded(true);
       setExtLoadError(null);
       if (full.core_runtime?.custom_binary_path) {
-        setCoreBinaryPath(full.core_runtime.custom_binary_path);
+        setCoreBinaryPath((prev) => prev || full.core_runtime?.custom_binary_path || "");
       }
       if (typeof full.update?.auto_download === "boolean" && !dirtyRef.current) {
         setDraft((prev) => ({
@@ -1068,27 +1158,17 @@ export function SettingsPage() {
       }
     } catch (err) {
       if (isActive && !isActive()) return;
-      setExtLoaded(false);
-      setExtLoadError(formatErrorMessage(err) || "读取高级配置失败");
+      if (!extDirtyRef.current) {
+        setExtLoaded(false);
+        setExtLoadError(formatErrorMessage(err) || "读取高级配置失败");
+      }
     }
   };
 
   useEffect(() => {
     let active = true;
     void loadExtendedConfig(() => active);
-
-    setGeoStatusLoading(true);
-    void catcloudApi
-      .getGeodataStatus()
-      .then((status) => {
-        if (active) setGeoStatus(status);
-      })
-      .catch(() => {
-        /* ignore geodata status query errors */
-      })
-      .finally(() => {
-        if (active) setGeoStatusLoading(false);
-      });
+    void appActions.loadGeodataStatus();
 
     return () => {
       active = false;
@@ -1189,10 +1269,12 @@ export function SettingsPage() {
     setSaving(true);
     try {
       const normalizedRepo = normalizeUpdateRepo(draft.update.repo);
+      const latestStoreConfig = appStore.getState().config;
       const payload: AppConfig = {
         ...draft,
         memory_tier: tierFromMb(draft.gomemlimit_mb),
-        personalization: storeConfig.personalization,
+        personalization: latestStoreConfig.personalization,
+        preaccel: structuredClone(latestStoreConfig.preaccel),
         update: {
           ...draft.update,
           repo: normalizedRepo,
@@ -1232,8 +1314,11 @@ export function SettingsPage() {
             update: syncedUpdate,
           };
       dirtyRef.current = false;
+      extDirtyRef.current = false;
+      clearSettingsDirtyDraftCache();
       setDraftDirty(false);
       setExtDirty(false);
+      appActions.patchSessionDraft("settings", { hasDirtyDrafts: false });
       appActions.syncConfig(syncedConfig);
       const rt = await catcloudApi.getRuntimeInfo();
       appActions.syncRuntime(rt);
@@ -1270,58 +1355,18 @@ export function SettingsPage() {
   };
 
   const handleCoreAction = async (action: "start" | "stop" | "restart" | "reload") => {
-    if (coreOpBusy) return;
-    setCoreOpBusy(action);
-    try {
-      if (action === "reload") {
-        const outcome = await catcloudApi.reloadCoreConfig(false);
-        const rt = await catcloudApi.getRuntimeInfo();
-        appActions.syncRuntime(rt);
-        if (outcome.rejected || outcome.error) {
-          appActions.showToast(`热重载未生效：${outcome.error ?? "配置校验未通过"}`, "warn");
-        } else {
-          appActions.showToast("配置已热重载", "ok");
-        }
-      } else {
-        const rt =
-          action === "start"
-            ? await catcloudApi.startCore()
-            : action === "stop"
-              ? await catcloudApi.stopCore()
-              : await catcloudApi.restartCore();
-        appActions.syncRuntime(rt);
-        const labels = { start: "内核已启动", stop: "内核已停止", restart: "内核已重启" };
-        appActions.showToast(labels[action], "ok");
-      }
-    } catch (err) {
-      appActions.showToast(`内核操作失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setCoreOpBusy(null);
-    }
+    if (coreOpBusy !== null) return;
+    await appActions.runCoreOperation(action);
   };
 
   const handleHotSwapCore = async () => {
+    if (coreOpBusy !== null) return;
     const path = coreBinaryPath.trim();
     if (!path) {
       appActions.showToast("请先输入内核程序的完整路径", "warn");
       return;
     }
-    setCoreOpBusy("hotswap");
-    try {
-      const res = await catcloudApi.hotSwapCore(path);
-      const rt = await catcloudApi.getRuntimeInfo();
-      appActions.syncRuntime(rt);
-      appActions.showToast(
-        res.ok
-          ? `内核热换成功：${res.version ?? res.binary_path}`
-          : `内核热换失败：${res.message}`,
-        res.ok ? "ok" : "warn"
-      );
-    } catch (err) {
-      appActions.showToast(`内核热换失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setCoreOpBusy(null);
-    }
+    await appActions.runCoreOperation("hotswap", path);
   };
 
   const handleCompileYaml = async () => {
@@ -1348,123 +1393,18 @@ export function SettingsPage() {
   };
 
   const handleRefreshGeo = async (target: GeoKey | "all") => {
-    setGeoBusy(target);
-    try {
-      const res = await catcloudApi.refreshGeoDb(target === "all" ? null : [target]);
-      try {
-        const latest = await catcloudApi.getGeodataStatus();
-        setGeoStatus(latest);
-      } catch {
-        /* ignore secondary status refresh error */
-      }
-      appActions.showToast(res.message || "地理数据库已更新", res.ok ? "ok" : "warn");
-    } catch (err) {
-      appActions.showToast(`更新地理数据库失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setGeoBusy(null);
-    }
+    if (geoBusy !== null) return;
+    await appActions.runRefreshGeoDb(target);
   };
 
   const handleCheckUpdate = async () => {
-    setCheckingUpdate(true);
-    try {
-      const res = await catcloudApi.checkAppUpdate();
-      setUpdateInfo(res);
-      if (res.error) {
-        setUpdateMsg(`检查失败：${res.error}`);
-        appActions.showToast(`检查更新失败：${res.error}`, "warn");
-      } else if (res.staged_version) {
-        setUpdateMsg(`已下载并校验完成 v${res.staged_version}，下次重启自动生效`);
-        appActions.showToast(
-          `v${res.staged_version} 已准备就绪，下次重启猫猫云梯时自动生效`,
-          "ok"
-        );
-      } else if (res.has_update) {
-        const autoDownloadOn = draft.update.auto_download ?? true;
-        if (res.can_auto_stage && autoDownloadOn && draft.update.mode !== "manual") {
-          setUpdateMsg(
-            `发现新版本 v${res.latest_version}（当前 v${res.current_version}），点击下方即可一键下载预置`
-          );
-          appActions.showToast(
-            `发现新版本 v${res.latest_version}，可一键下载并在下次启动自动应用`,
-            "ok"
-          );
-        } else {
-          setUpdateMsg(`发现新版本 v${res.latest_version}（当前 v${res.current_version}）`);
-          appActions.showToast(`发现新版本 v${res.latest_version}`, "ok");
-        }
-      } else {
-        setUpdateMsg(`当前 v${res.current_version} 已是最新版本`);
-        appActions.showToast("当前已是最新版本", "info");
-      }
-    } catch (err) {
-      const msg = formatErrorMessage(err);
-      setUpdateMsg(`检查更新异常：${msg}`);
-      appActions.showToast(`检查更新失败：${msg}`, "warn");
-    } finally {
-      setCheckingUpdate(false);
-    }
+    if (checkingUpdate) return;
+    await appActions.runCheckAppUpdate();
   };
 
   const handleDownloadAndStageUpdate = async () => {
     if (downloadingUpdate) return;
-    setDownloadingUpdate(true);
-    try {
-      const res = await catcloudApi.downloadAndStageUpdate();
-      if (res.staged) {
-        const targetVersion =
-          res.target_version || updateInfo?.latest_version || runtime.app_version;
-        setUpdateInfo((prev) => ({
-          has_update: true,
-          current_version: prev?.current_version ?? runtime.app_version,
-          latest_version: targetVersion,
-          release_url:
-            res.release_url ||
-            prev?.release_url ||
-            buildReleasesFallbackUrl(draft.update.repo),
-          download_url: res.download_url ?? prev?.download_url ?? null,
-          notes: prev?.notes ?? "",
-          checked_at: prev?.checked_at ?? new Date().toISOString(),
-          platform_key: prev?.platform_key,
-          can_auto_stage: true,
-          staged_version: targetVersion,
-          error: null,
-        }));
-        setUpdateMsg(`已下载并校验完成 v${targetVersion}，下次重启时自动生效`);
-        appActions.showToast(
-          res.message || `已下载并校验完成 v${targetVersion}，下次重启猫猫云梯时自动生效`,
-          "ok"
-        );
-      } else if (res.already_latest) {
-        setUpdateInfo((prev) => (prev ? { ...prev, has_update: false } : prev));
-        setUpdateMsg(res.message || `当前 v${runtime.app_version} 已是最新版本`);
-        appActions.showToast(res.message || "当前已是最新版本", "info");
-      } else {
-        const releaseUrl =
-          res.release_url ||
-          updateInfo?.release_url ||
-          buildReleasesFallbackUrl(draft.update.repo);
-        setUpdateInfo((prev) =>
-          prev
-            ? {
-                ...prev,
-                can_auto_stage: res.can_auto_stage ?? prev.can_auto_stage,
-                release_url: releaseUrl,
-                download_url: res.download_url ?? prev.download_url,
-              }
-            : prev
-        );
-        const hint = res.message || "当前版本形态需通过官方下载页获取对应系统安装包";
-        setUpdateMsg(hint);
-        appActions.showToast(hint, "info");
-      }
-    } catch (err) {
-      const msg = formatErrorMessage(err);
-      setUpdateMsg(`下载更新失败：${msg}`);
-      appActions.showToast(`下载更新失败：${msg}`, "warn");
-    } finally {
-      setDownloadingUpdate(false);
-    }
+    await appActions.runDownloadAppUpdate();
   };
 
   const handleOpenReleasePage = async () => {
@@ -1489,37 +1429,41 @@ export function SettingsPage() {
   };
 
   const handleExportBackup = async () => {
-    if (inTauri) {
-      try {
-        const saved = await catcloudApi.exportBackupBundle(null);
-        appActions.showToast(`已导出脱敏备份：${saved.path} (${saved.bytes} B)`, "ok");
-      } catch (err) {
-        appActions.showToast(`导出备份失败：${formatErrorMessage(err)}`, "warn");
+    if (backupBusy !== null) return;
+    await appActions.runBackupOperation("export", async () => {
+      if (inTauri) {
+        try {
+          const saved = await catcloudApi.exportBackupBundle(null);
+          appActions.showToast(`已导出脱敏备份：${saved.path} (${saved.bytes} B)`, "ok");
+        } catch (err) {
+          appActions.showToast(`导出备份失败：${formatErrorMessage(err)}`, "warn");
+        }
+        return;
       }
-      return;
-    }
 
-    const json = JSON.stringify(
-      {
-        exported_at: new Date().toISOString(),
-        app_version: runtime.app_version,
-        config: draft,
-        extended: ext,
-      },
-      null,
-      2
-    );
-    const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
-    const a = Object.assign(document.createElement("a"), {
-      href: url,
-      download: "catcloud-settings-backup.json",
+      const json = JSON.stringify(
+        {
+          exported_at: new Date().toISOString(),
+          app_version: runtime.app_version,
+          config: draft,
+          extended: ext,
+        },
+        null,
+        2
+      );
+      const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+      const a = Object.assign(document.createElement("a"), {
+        href: url,
+        download: "catcloud-settings-backup.json",
+      });
+      a.click();
+      URL.revokeObjectURL(url);
+      appActions.showToast("已下载配置备份文件", "ok");
     });
-    a.click();
-    URL.revokeObjectURL(url);
-    appActions.showToast("已下载配置备份文件", "ok");
   };
 
   const openImportBackupPicker = () => {
+    if (backupBusy !== null) return;
     const input = Object.assign(document.createElement("input"), {
       type: "file",
       accept: "application/json,.json",
@@ -1527,18 +1471,26 @@ export function SettingsPage() {
     input.onchange = () => {
       const file = input.files?.[0];
       if (!file) return;
-      void file.text().then(async (raw) => {
+      void appActions.runBackupOperation("import", async () => {
+        const raw = await file.text();
         if (inTauri) {
           try {
             const res = await catcloudApi.importBackupBundle(raw);
+            clearSettingsDirtyDraftCache();
+            appActions.patchSessionDraft("settings", { hasDirtyDrafts: false });
             dirtyRef.current = false;
-            setDraftDirty(false);
-            setExtDirty(false);
+            extDirtyRef.current = false;
+            if (mountedRef.current) {
+              setDraftDirty(false);
+              setExtDirty(false);
+            }
             await appActions.refreshAllData();
             const full = await catcloudApi.getFullConfig();
-            setExt(hydrateExtendedFromFullConfig(full));
-            setExtLoaded(true);
-            setExtLoadError(null);
+            if (mountedRef.current) {
+              setExt(hydrateExtendedFromFullConfig(full));
+              setExtLoaded(true);
+              setExtLoadError(null);
+            }
             appActions.showToast(
               res.message || `已恢复备份（分组 ${res.restored_groups} / 中转 ${res.restored_relays}）`,
               "ok"
@@ -1553,11 +1505,11 @@ export function SettingsPage() {
             config?: AppConfig;
             extended?: Partial<ExtendedSettings>;
           };
-          if (parsed.config) {
+          if (parsed.config && mountedRef.current) {
             setDraft(parsed.config);
             setDraftDirty(true);
           }
-          if (parsed.extended) {
+          if (parsed.extended && mountedRef.current) {
             setExt((prev) => ({ ...prev, ...parsed.extended }));
             setExtDirty(true);
           }
@@ -2786,7 +2738,7 @@ export function SettingsPage() {
                   className={BTN_CLS}
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${geoBusy === "all" ? "animate-spin" : ""}`} />
-                  <span>更新全部数据库</span>
+                  <span>{geoBusy === "all" ? "更新中..." : "更新全部数据库"}</span>
                 </button>
               }
             >
@@ -2797,8 +2749,12 @@ export function SettingsPage() {
                   onClick={() => void handleCoreAction("start")}
                   className={BTN_CLS}
                 >
-                  <Play className="h-3.5 w-3.5 text-[var(--green)]" />
-                  <span>启动内核</span>
+                  {coreOpBusy === "start" ? (
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin text-[var(--green)]" />
+                  ) : (
+                    <Play className="h-3.5 w-3.5 text-[var(--green)]" />
+                  )}
+                  <span>{coreOpBusy === "start" ? "启动中..." : "启动内核"}</span>
                 </button>
                 <button
                   type="button"
@@ -2806,8 +2762,12 @@ export function SettingsPage() {
                   onClick={() => void handleCoreAction("stop")}
                   className={BTN_CLS}
                 >
-                  <Square className="h-3.5 w-3.5 text-[var(--red)]" />
-                  <span>停止内核</span>
+                  {coreOpBusy === "stop" ? (
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin text-[var(--red)]" />
+                  ) : (
+                    <Square className="h-3.5 w-3.5 text-[var(--red)]" />
+                  )}
+                  <span>{coreOpBusy === "stop" ? "停止中..." : "停止内核"}</span>
                 </button>
                 <button
                   type="button"
@@ -2818,7 +2778,7 @@ export function SettingsPage() {
                   <RotateCw
                     className={`h-3.5 w-3.5 ${coreOpBusy === "restart" ? "animate-spin" : ""}`}
                   />
-                  <span>重启内核</span>
+                  <span>{coreOpBusy === "restart" ? "重启中..." : "重启内核"}</span>
                 </button>
                 <button
                   type="button"
@@ -2829,7 +2789,7 @@ export function SettingsPage() {
                   <RefreshCw
                     className={`h-3.5 w-3.5 ${coreOpBusy === "reload" ? "animate-spin" : ""}`}
                   />
-                  <span>热重载配置</span>
+                  <span>{coreOpBusy === "reload" ? "重载中..." : "热重载配置"}</span>
                 </button>
               </div>
 
@@ -2839,6 +2799,7 @@ export function SettingsPage() {
                     geoStatus?.[dtoKey],
                     geoStatusLoading
                   );
+                  const itemUpdating = geoBusy === key || geoBusy === "all";
                   return (
                     <div
                       key={key}
@@ -2851,18 +2812,22 @@ export function SettingsPage() {
                           </span>
                           <span
                             className={`shrink-0 rounded px-1 py-0.5 text-[9px] font-medium ${
-                              statusSummary.state === "ready"
-                                ? "bg-[var(--green-soft)] text-[var(--green)]"
-                                : statusSummary.state === "loading"
-                                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
-                                  : "bg-[var(--bg-elevated)] text-[var(--muted)]"
+                              itemUpdating
+                                ? "bg-[var(--amber-soft)] text-[var(--amber)]"
+                                : statusSummary.state === "ready"
+                                  ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                  : statusSummary.state === "loading"
+                                    ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                    : "bg-[var(--bg-elevated)] text-[var(--muted)]"
                             }`}
                           >
-                            {statusSummary.state === "ready"
-                              ? "已就绪"
-                              : statusSummary.state === "loading"
-                                ? "检测中"
-                                : "未下载"}
+                            {itemUpdating
+                              ? "更新中"
+                              : statusSummary.state === "ready"
+                                ? "已就绪"
+                                : statusSummary.state === "loading"
+                                  ? "检测中"
+                                  : "未下载"}
                           </span>
                         </div>
                         <div className="mt-0.5 truncate text-[10px] text-[var(--muted)]">
@@ -2873,10 +2838,14 @@ export function SettingsPage() {
                         type="button"
                         onClick={() => void handleRefreshGeo(key)}
                         disabled={geoBusy !== null}
-                        title={`更新 ${fileName}`}
+                        title={itemUpdating ? `正在更新 ${fileName}` : `更新 ${fileName}`}
                         className="shrink-0 rounded-lg border border-[var(--line)] p-1.5 text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
                       >
-                        <Database className="h-3.5 w-3.5" />
+                        {itemUpdating ? (
+                          <RefreshCw className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />
+                        ) : (
+                          <Database className="h-3.5 w-3.5" />
+                        )}
                       </button>
                     </div>
                   );
@@ -2924,8 +2893,12 @@ export function SettingsPage() {
                     onClick={() => void handleHotSwapCore()}
                     className={BTN_CLS}
                   >
-                    <Cpu className="h-3.5 w-3.5" />
-                    <span>热换内核</span>
+                    {coreOpBusy === "hotswap" ? (
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Cpu className="h-3.5 w-3.5" />
+                    )}
+                    <span>{coreOpBusy === "hotswap" ? "热换中..." : "热换内核"}</span>
                   </button>
                 </div>
               </div>
@@ -2948,17 +2921,31 @@ export function SettingsPage() {
                   <span>{label}</span>
                 </button>
               ))}
-              <button type="button" onClick={() => void handleExportBackup()} className={BTN_CLS}>
-                <Download className="h-3.5 w-3.5" />
-                <span>导出备份</span>
+              <button
+                type="button"
+                disabled={backupBusy !== null}
+                onClick={() => void handleExportBackup()}
+                className={BTN_CLS}
+              >
+                {backupBusy === "export" ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Download className="h-3.5 w-3.5" />
+                )}
+                <span>{backupBusy === "export" ? "导出中..." : "导出备份"}</span>
               </button>
               <button
                 type="button"
+                disabled={backupBusy !== null}
                 onClick={() => setConfirmImportBackupOpen(true)}
                 className={BTN_CLS}
               >
-                <Upload className="h-3.5 w-3.5" />
-                <span>导入备份</span>
+                {backupBusy === "import" ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Upload className="h-3.5 w-3.5" />
+                )}
+                <span>{backupBusy === "import" ? "导入中..." : "导入备份"}</span>
               </button>
             </div>
 
@@ -3068,7 +3055,11 @@ export function SettingsPage() {
                 disabled={checkingUpdate}
                 className={BTN_CLS}
               >
-                <CloudDownload className="h-3.5 w-3.5" />
+                {checkingUpdate ? (
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <CloudDownload className="h-3.5 w-3.5" />
+                )}
                 <span>{checkingUpdate ? "检查中..." : "检查更新"}</span>
               </button>
             }
@@ -3483,11 +3474,12 @@ export function SettingsPage() {
                 </button>
                 <button
                   type="button"
+                  disabled={backupBusy !== null}
                   onClick={() => {
                     setConfirmImportBackupOpen(false);
                     openImportBackupPicker();
                   }}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
                 >
                   <Upload className="h-3.5 w-3.5" />
                   <span>确认覆盖并选择文件</span>

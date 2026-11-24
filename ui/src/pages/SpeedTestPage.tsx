@@ -11,6 +11,7 @@ import {
   Clock,
   Filter,
   Layers,
+  Loader2,
   Play,
   Plus,
   Rocket,
@@ -48,8 +49,14 @@ import {
 } from "../api/tauri";
 import { AppSelect } from "../components/AppSelect";
 import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
+import { GroupMembershipPopover } from "../components/GroupMembershipPopover";
 import { MascotSprite } from "../components/MascotSprite";
-import { appActions, appStore, useAppSelector } from "../store/appStore";
+import {
+  appActions,
+  appStore,
+  selectIsProbeEngineBusy,
+  useAppSelector,
+} from "../store/appStore";
 import {
   type ContinentId,
   buildContinentRegionStats,
@@ -309,57 +316,6 @@ const TIER_LABELS: Record<SpeedTestTier, string> = {
   full: "含上下行完整测速",
 };
 
-function mergeProbeSnapshotsPreserveOld(
-  prevMap: Record<string, ProbeSnapshot>,
-  incomingMap: Record<string, ProbeSnapshot>
-): Record<string, ProbeSnapshot> {
-  const next = { ...prevMap };
-  for (const [nodeId, incoming] of Object.entries(incomingMap)) {
-    const prev = prevMap[nodeId];
-    if (!prev) {
-      next[nodeId] = incoming;
-      continue;
-    }
-    const incomingUnlocked = incoming.unlocked_sites ?? {};
-    const hasIncomingUnlocked = Object.keys(incomingUnlocked).length > 0;
-    next[nodeId] = {
-      ...prev,
-      ...incoming,
-      up_mbps: incoming.up_mbps ?? prev.up_mbps,
-      down_mbps: incoming.down_mbps ?? prev.down_mbps,
-      cf_loc: incoming.cf_loc ?? prev.cf_loc,
-      yt_gl: incoming.yt_gl ?? prev.yt_gl,
-      google_clean: incoming.google_clean ?? prev.google_clean,
-      google_risk_mismatch:
-        incoming.google_clean !== null && incoming.google_clean !== undefined
-          ? incoming.google_risk_mismatch
-          : prev.google_risk_mismatch,
-      keepalive_60s_ok: incoming.keepalive_60s_ok ?? prev.keepalive_60s_ok,
-      unlocked_sites: hasIncomingUnlocked
-        ? { ...(prev.unlocked_sites ?? {}), ...incomingUnlocked }
-        : (prev.unlocked_sites ?? {}),
-      per_probe_ok: { ...(prev.per_probe_ok ?? {}), ...(incoming.per_probe_ok ?? {}) },
-      per_probe_up_mbps: {
-        ...(prev.per_probe_up_mbps ?? {}),
-        ...(incoming.per_probe_up_mbps ?? {}),
-      },
-      per_probe_down_mbps: {
-        ...(prev.per_probe_down_mbps ?? {}),
-        ...(incoming.per_probe_down_mbps ?? {}),
-      },
-      per_probe_ping_ms: {
-        ...(prev.per_probe_ping_ms ?? {}),
-        ...(incoming.per_probe_ping_ms ?? {}),
-      },
-      per_probe_detail: {
-        ...(prev.per_probe_detail ?? {}),
-        ...(incoming.per_probe_detail ?? {}),
-      },
-    };
-  }
-  return next;
-}
-
 const PAGE_SIZE_OPTIONS = [30, 50, 100] as const;
 
 type SortKey =
@@ -566,6 +522,13 @@ export function SpeedTestPage({
   const isSingleMode = runtime.route_mode === "single";
   const probes = useAppSelector((s) => s.probes);
   const probeProgress = useAppSelector((s) => s.probeProgress);
+  const probeLocalStarting = useAppSelector((s) => s.bgTasks.probeLocalStarting);
+  const isPausing = useAppSelector((s) => s.bgTasks.probeIsPausing);
+  const probeLockedOrderIds = useAppSelector((s) => s.bgTasks.probeLockedOrderIds);
+  const probeActiveNodeIds = useAppSelector((s) => s.bgTasks.probeActiveNodeIds);
+  const benchmarkRunning = useAppSelector((s) => s.bgTasks.preaccel.benchmark.running);
+  const isProbeEngineBusy = useAppSelector(selectIsProbeEngineBusy);
+  const speedTestDraft = useAppSelector((s) => s.sessionDrafts.speedTest);
   const initialized = useAppSelector((s) => s.initialized);
   const inTauri = isTauriEnv();
 
@@ -629,26 +592,60 @@ export function SpeedTestPage({
   const [newProbePayloadKb, setNewProbePayloadKb] = useState(512);
   const [newProbeTimeoutMs, setNewProbeTimeoutMs] = useState(10000);
 
-  // Speed test execution options & state
-  const [localStarting, setLocalStarting] = useState(false);
-  const [isPausing, setIsPausing] = useState(false);
+  // Speed test execution options & state (backed by global appStore.bgTasks)
   const [pendingLargeRunTier, setPendingLargeRunTier] = useState<SpeedTestTier | null>(null);
   const [switchingNodeId, setSwitchingNodeId] = useState<string | null>(null);
-  const [addingToGroupNodeId, setAddingToGroupNodeId] = useState<string | null>(null);
-  // Locked row order during streaming speed test so rows never jump mid-test
-  const [lockedOrderMap, setLockedOrderMap] = useState<Map<string, number> | null>(null);
 
-  // Filters, sorting & pagination
-  const [searchQuery, setSearchQuery] = useState("");
-  const [sourceFilter, setSourceFilter] = useState<string>(() => initialSubId || "all");
+  // Filters, sorting & pagination (backed by global appStore.sessionDrafts.speedTest)
+  const searchQuery = speedTestDraft.searchQuery;
+  const sourceFilter = speedTestDraft.sourceFilter;
+  const groupFilter = speedTestDraft.groupFilter;
+  const filterContinent = (speedTestDraft.filterContinent as ContinentId | undefined) ?? "all";
+  const regionFilter = speedTestDraft.regionFilter;
+  const onlyGolden = speedTestDraft.onlyGolden;
+  const onlyTested = speedTestDraft.onlyTested;
+  const onlyGoogleClean = speedTestDraft.onlyGoogleClean;
+  const onlyAiUnlocked = speedTestDraft.onlyAiUnlocked;
+  const page = speedTestDraft.page;
+
+  const setSearchQuery = useCallback((val: string) => {
+    appActions.patchSessionDraft("speedTest", { searchQuery: val });
+  }, []);
+  const setSourceFilter = useCallback((val: string) => {
+    appActions.patchSessionDraft("speedTest", { sourceFilter: val });
+  }, []);
+  const setGroupFilter = useCallback((val: string) => {
+    appActions.patchSessionDraft("speedTest", { groupFilter: val });
+  }, []);
+  const setFilterContinent = useCallback((val: ContinentId) => {
+    appActions.patchSessionDraft("speedTest", { filterContinent: val });
+  }, []);
+  const setRegionFilter = useCallback((val: string) => {
+    appActions.patchSessionDraft("speedTest", { regionFilter: val });
+  }, []);
+  const setOnlyGolden = useCallback((val: boolean) => {
+    appActions.patchSessionDraft("speedTest", { onlyGolden: val });
+  }, []);
+  const setOnlyTested = useCallback((val: boolean | ((prev: boolean) => boolean)) => {
+    const cur = appStore.getState().sessionDrafts.speedTest.onlyTested;
+    const next = typeof val === "function" ? val(cur) : val;
+    appActions.patchSessionDraft("speedTest", { onlyTested: next });
+  }, []);
+  const setOnlyGoogleClean = useCallback((val: boolean | ((prev: boolean) => boolean)) => {
+    const cur = appStore.getState().sessionDrafts.speedTest.onlyGoogleClean;
+    const next = typeof val === "function" ? val(cur) : val;
+    appActions.patchSessionDraft("speedTest", { onlyGoogleClean: next });
+  }, []);
+  const setOnlyAiUnlocked = useCallback((val: boolean | ((prev: boolean) => boolean)) => {
+    const cur = appStore.getState().sessionDrafts.speedTest.onlyAiUnlocked;
+    const next = typeof val === "function" ? val(cur) : val;
+    appActions.patchSessionDraft("speedTest", { onlyAiUnlocked: next });
+  }, []);
+  const setPage = useCallback((val: number) => {
+    appActions.patchSessionDraft("speedTest", { page: val });
+  }, []);
+
   const prevInitialSubIdRef = useRef<string | null | undefined>(initialSubId);
-  const [groupFilter, setGroupFilter] = useState<string>("all");
-  const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
-  const [regionFilter, setRegionFilter] = useState<string>("all");
-  const [onlyGolden, setOnlyGolden] = useState(false);
-  const [onlyTested, setOnlyTested] = useState(false);
-  const [onlyGoogleClean, setOnlyGoogleClean] = useState(false);
-  const [onlyAiUnlocked, setOnlyAiUnlocked] = useState(false);
   const [sortKey, setSortKey] = usePersistedState<SortKey>(
     "speedtest.sortKey",
     "latency",
@@ -659,15 +656,26 @@ export function SpeedTestPage({
     "asc",
     oneOfPref(["asc", "desc"] as const)
   );
-  const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = usePersistedState<number>(
     "speedtest.pageSize",
     50,
     oneOfPref(PAGE_SIZE_OPTIONS)
   );
 
-  // Multi-selection & Ctrl+left-button drag selection
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  // Multi-selection & Ctrl+left-button drag selection (backed by sessionDrafts.speedTest.selectedIds)
+  const selectedIds = useMemo(
+    () => new Set(speedTestDraft.selectedIds),
+    [speedTestDraft.selectedIds]
+  );
+  const setSelectedIds = useCallback(
+    (updater: Set<string> | ((prev: Set<string>) => Set<string>)) => {
+      const prevSet = new Set(appStore.getState().sessionDrafts.speedTest.selectedIds);
+      const nextSet = typeof updater === "function" ? updater(prevSet) : updater;
+      if (nextSet === prevSet) return;
+      appActions.patchSessionDraft("speedTest", { selectedIds: Array.from(nextSet) });
+    },
+    []
+  );
   const [lastAnchorId, setLastAnchorId] = useState<string | null>(null);
   const [ctrlHeld, setCtrlHeld] = useState(false);
   const [modifierHeld, setModifierHeld] = useState(false);
@@ -678,13 +686,7 @@ export function SpeedTestPage({
   const hydratedFlashRef = useRef(false);
   const flashTimersRef = useRef<Map<string, number>>(new Map());
 
-  // Run control refs
-  const mountedRef = useRef(true);
-  const previewTimersRef = useRef<number[]>([]);
-  const previewCancelRef = useRef(false);
-  const runOwnedBySelfRef = useRef(false);
-  const pausingRef = useRef(false);
-  const externalPauseWaitingRef = useRef(false);
+  // Interaction refs
   const suppressClickRef = useRef(false);
   const suppressClickTimerRef = useRef<number | null>(null);
   const latestOrderedIdsRef = useRef<string[]>([]);
@@ -694,7 +696,24 @@ export function SpeedTestPage({
     visitedIds: new Set<string>(),
   });
 
-  const isRunning = probeProgress.running || localStarting;
+  const isRunning = probeProgress.running || probeLocalStarting;
+  const isBlockedByBenchmark = benchmarkRunning && !isRunning;
+  const isProbeActionDisabled = isRunning || isBlockedByBenchmark || isProbeEngineBusy;
+
+  const probeActiveNodeIdSet = useMemo(
+    () => new Set(probeActiveNodeIds),
+    [probeActiveNodeIds]
+  );
+
+  // Global locked row order survives page switches so rows never jump mid-test
+  const lockedOrderMap = useMemo(() => {
+    if (!isRunning || probeLockedOrderIds.length === 0) return null;
+    const map = new Map<string, number>();
+    probeLockedOrderIds.forEach((id, idx) => {
+      if (!map.has(id)) map.set(id, idx);
+    });
+    return map;
+  }, [isRunning, probeLockedOrderIds]);
 
   const persistProbeStates = useCallback((list: ProbeItem[], keepaliveOn: boolean) => {
     const nextMap: Record<string, boolean> = {
@@ -721,76 +740,28 @@ export function SpeedTestPage({
     [persistProbeStates]
   );
 
-  const captureCurrentRowOrder = useCallback(() => {
-    const order = new Map<string, number>();
-    let idx = 0;
+  const captureCurrentRowOrderIds = useCallback((): string[] => {
+    const seen = new Set<string>();
+    const out: string[] = [];
     for (const id of latestOrderedIdsRef.current) {
-      if (!order.has(id)) {
-        order.set(id, idx);
-        idx += 1;
+      if (!seen.has(id)) {
+        seen.add(id);
+        out.push(id);
       }
     }
     for (const node of nodes) {
-      if (!order.has(node.id)) {
-        order.set(node.id, idx);
-        idx += 1;
+      if (!seen.has(node.id)) {
+        seen.add(node.id);
+        out.push(node.id);
       }
     }
-    setLockedOrderMap(order);
+    return out;
   }, [nodes]);
 
-  // Lock row order for externally-started runs and release automatically once finished
+  // Cleanup only local UI highlight timers on unmount — NEVER cancel running background probes
   useEffect(() => {
-    if (isRunning) {
-      setLockedOrderMap((prev) => {
-        if (prev !== null) return prev;
-        const order = new Map<string, number>();
-        let idx = 0;
-        for (const id of latestOrderedIdsRef.current) {
-          if (!order.has(id)) {
-            order.set(id, idx);
-            idx += 1;
-          }
-        }
-        for (const node of nodes) {
-          if (!order.has(node.id)) {
-            order.set(node.id, idx);
-            idx += 1;
-          }
-        }
-        return order;
-      });
-    } else {
-      setLockedOrderMap((prev) => (prev === null ? prev : null));
-    }
-  }, [isRunning, nodes]);
-
-  const clearPreviewTimers = useCallback(() => {
-    for (const id of previewTimersRef.current) {
-      window.clearTimeout(id);
-    }
-    previewTimersRef.current = [];
-  }, []);
-
-  // Cleanup all timers on unmount
-  useEffect(() => {
-    mountedRef.current = true;
     const flashTimers = flashTimersRef.current;
     return () => {
-      mountedRef.current = false;
-      previewCancelRef.current = true;
-      clearPreviewTimers();
-      if (!inTauri && runOwnedBySelfRef.current) {
-        const st = appStore.getState();
-        if (st.probeProgress.running) {
-          appActions.setProbeProgress({
-            running: false,
-            currentNodeName: null,
-            cancelled: true,
-          });
-          appActions.setMascotState("idle");
-        }
-      }
       if (suppressClickTimerRef.current !== null) {
         window.clearTimeout(suppressClickTimerRef.current);
         suppressClickTimerRef.current = null;
@@ -800,7 +771,7 @@ export function SpeedTestPage({
       }
       flashTimers.clear();
     };
-  }, [clearPreviewTimers, inTauri]);
+  }, []);
 
   // Load probe definitions from backend while restoring persisted enabled & keepalive states
   useEffect(() => {
@@ -895,23 +866,6 @@ export function SpeedTestPage({
     }
   }, [probes, initialized]);
 
-  // Reset pausing indicator & emit toast when an externally-started run finishes pausing
-  useEffect(() => {
-    if (!probeProgress.running) {
-      if (isPausing && !runOwnedBySelfRef.current) {
-        setIsPausing(false);
-        pausingRef.current = false;
-      }
-      if (externalPauseWaitingRef.current) {
-        externalPauseWaitingRef.current = false;
-        appActions.showToast(
-          `已暂停测速，已测完的 ${probeProgress.completed} 个节点结果已全部保留`,
-          "info"
-        );
-      }
-    }
-  }, [probeProgress.running, probeProgress.completed, isPausing]);
-
   // Global keyboard & mouse listeners for Ctrl+left-drag and Shift range multi-select
   useEffect(() => {
     const endCtrlDrag = () => {
@@ -1001,13 +955,14 @@ export function SpeedTestPage({
     return Array.from(seen.entries()).map(([id, name]) => ({ id, name }));
   }, [subscriptions, nodes]);
 
+  // Sync explicit subscription jump filter only when initialSubId actually changes
   useEffect(() => {
     if (prevInitialSubIdRef.current !== initialSubId) {
       prevInitialSubIdRef.current = initialSubId;
       setSourceFilter(initialSubId || "all");
       setPage(1);
     }
-  }, [initialSubId]);
+  }, [initialSubId, setSourceFilter, setPage]);
 
   useEffect(() => {
     if (!initialized || sourceFilter === "all") return;
@@ -1094,9 +1049,35 @@ export function SpeedTestPage({
 
   const filteredRows = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
+    const healthHints = runtime.node_health_hints;
     const list = nodes
       .map((node) => {
         const snap = probes[node.id];
+        const healthHint = healthHints?.[node.id];
+        const hasFreshHealthLatency = Boolean(
+          healthHint &&
+            (healthHint.status === "healthy" || healthHint.status === "probation") &&
+            typeof healthHint.latency_ms === "number" &&
+            Number.isFinite(healthHint.latency_ms) &&
+            healthHint.latency_ms > 0
+        );
+        const isCooldown = healthHint?.status === "cooldown";
+        const cooldownRemainingSec = isCooldown
+          ? Math.max(0, Math.ceil(healthHint?.cooldown_remaining_sec ?? 0))
+          : 0;
+        const effectiveLatencyMs = hasFreshHealthLatency
+          ? (healthHint!.latency_ms as number)
+          : !isCooldown &&
+              snap?.ok !== false &&
+              typeof snap?.latency_ms === "number" &&
+              Number.isFinite(snap.latency_ms)
+            ? snap.latency_ms
+            : null;
+        const effectiveLatencyOk: boolean | undefined = hasFreshHealthLatency
+          ? true
+          : isCooldown
+            ? false
+            : snap?.ok;
         const sourceName = subNameById.get(node.sub_id) ?? node.sub_id;
         const regionCode = resolveNodeRegionCode(node);
         const regionLabel = getRegionLabel(regionCode);
@@ -1136,6 +1117,12 @@ export function SpeedTestPage({
         return {
           node,
           snap,
+          healthHint,
+          hasFreshHealthLatency,
+          isCooldown,
+          cooldownRemainingSec,
+          effectiveLatencyMs,
+          effectiveLatencyOk,
           sourceName,
           regionCode,
           regionLabel,
@@ -1192,10 +1179,10 @@ export function SpeedTestPage({
           diff = a.sourceName.localeCompare(b.sourceName);
           break;
         case "latency": {
-          const aVal = a.snap?.latency_ms;
-          const bVal = b.snap?.latency_ms;
-          const aHas = aVal !== null && aVal !== undefined && a.snap?.ok !== false;
-          const bHas = bVal !== null && bVal !== undefined && b.snap?.ok !== false;
+          const aVal = a.effectiveLatencyMs;
+          const bVal = b.effectiveLatencyMs;
+          const aHas = !a.isCooldown && aVal !== null;
+          const bHas = !b.isCooldown && bVal !== null;
           if (aHas !== bHas) return aHas ? -1 : 1;
           if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
           diff = (aVal ?? 99999) - (bVal ?? 99999);
@@ -1244,6 +1231,7 @@ export function SpeedTestPage({
   }, [
     nodes,
     probes,
+    runtime.node_health_hints,
     subNameById,
     searchQuery,
     sourceFilter,
@@ -1510,7 +1498,11 @@ export function SpeedTestPage({
     tier: SpeedTestTier,
     forceSkipKeepalive = false
   ) => {
-    if (isRunning) return;
+    if (isBlockedByBenchmark) {
+      appActions.showToast("国内提速对比测速正在后台进行，完成后即可运行节点测速", "info");
+      return;
+    }
+    if (isRunning || isProbeEngineBusy) return;
     if (targetNodeIds.length === 0) {
       appActions.showToast("请先筛选或勾选至少一个节点后再开始测速", "warn");
       return;
@@ -1520,188 +1512,26 @@ export function SpeedTestPage({
     const probeIds = resolveProbeIdsForRun(tier, effectiveKeepalive);
     if (probeIds === null) return;
 
-    const nodeNameById = new Map(nodes.map((n) => [n.id, n.name]));
-    const firstNodeName = nodeNameById.get(targetNodeIds[0]) ?? null;
-
-    // Lock current visible row order immediately before starting streaming test
-    captureCurrentRowOrder();
-    setPendingLargeRunTier(null);
-    setLocalStarting(true);
-    setIsPausing(false);
-    pausingRef.current = false;
-    runOwnedBySelfRef.current = true;
-    previewCancelRef.current = false;
-    clearPreviewTimers();
-
-    appActions.setMascotState("searching");
-    appActions.setProbeProgress({
-      running: true,
-      completed: 0,
-      total: targetNodeIds.length,
-      currentNodeName: firstNodeName,
-      cancelled: false,
-    });
-
+    const lockedOrderIds = captureCurrentRowOrderIds();
     const effectiveUsePreaccel = usePreaccelForProbe && hasEnabledPreAccelRelay;
+    setPendingLargeRunTier(null);
 
-    if (inTauri) {
-      try {
-        const result = await catcloudApi.runIsolatedProbes(
-          targetNodeIds,
-          probeIds,
-          tier,
-          effectiveKeepalive,
-          effectiveUsePreaccel
-        );
-        if (result.snapshots && Object.keys(result.snapshots).length > 0) {
-          appActions.syncProbes(
-            mergeProbeSnapshotsPreserveOld(appStore.getState().probes, result.snapshots)
-          );
-        }
-
-        const finalCompleted = Math.max(
-          result.probed_count,
-          appStore.getState().probeProgress.completed
-        );
-        const wasCancelled = Boolean(result.cancelled) || pausingRef.current;
-        const preaccelTag = result.used_preaccel
-          ? `（已走 443 提速${result.preaccel_relay_name ? `：${result.preaccel_relay_name}` : ""}）`
-          : "";
-
-        appActions.setProbeProgress({
-          running: false,
-          completed: finalCompleted,
-          total: result.total_count ?? targetNodeIds.length,
-          currentNodeName: null,
-          cancelled: wasCancelled,
-        });
-        appActions.setMascotState("idle");
-
-        if (wasCancelled) {
-          if (mountedRef.current) {
-            appActions.showToast(
-              `已暂停测速，已测完的 ${finalCompleted} 个节点结果已全部保留`,
-              "info"
-            );
-          }
-        } else if (!result.core_available) {
-          appActions.showToast(
-            result.errors[0] ?? "测速引擎尚未就绪，请先检查内核配置",
-            "warn"
-          );
-        } else if (result.errors.length > 0 && result.probed_count === 0) {
-          appActions.showToast(`测速未能完成：${result.errors[0]}`, "warn");
-        } else if (result.errors.length > 0) {
-          appActions.showToast(
-            `${TIER_LABELS[tier]}完成${preaccelTag}：已更新 ${result.probed_count} 个节点（${result.errors.length} 个超时或跳过）`,
-            "info"
-          );
-        } else {
-          appActions.showToast(
-            `${TIER_LABELS[tier]}完成${preaccelTag}，已更新 ${result.probed_count} 个节点结果`,
-            "ok"
-          );
-        }
-      } catch (err) {
-        appActions.setProbeProgress({
-          running: false,
-          currentNodeName: null,
-          cancelled: pausingRef.current,
-        });
-        appActions.setMascotState("idle");
-        appActions.showToast(`测速执行失败：${formatErrorMessage(err)}`, "warn");
-      } finally {
-        runOwnedBySelfRef.current = false;
-        pausingRef.current = false;
-        setLocalStarting(false);
-        setIsPausing(false);
-      }
-      return;
-    }
-
-    // Browser preview streaming simulation (120ms per node, supports pause & full retention)
-    const total = targetNodeIds.length;
-    const stepNext = (index: number) => {
-      if (previewCancelRef.current) return;
-      if (index >= total) {
-        appActions.setProbeProgress({
-          running: false,
-          completed: total,
-          total,
-          currentNodeName: null,
-          cancelled: false,
-        });
-        appActions.setMascotState("idle");
-        runOwnedBySelfRef.current = false;
-        pausingRef.current = false;
-        setLocalStarting(false);
-        setIsPausing(false);
-        appActions.showToast(
-          `预览模式：${TIER_LABELS[tier]}完成，已逐条更新 ${total} 个节点`,
-          "ok"
-        );
-        return;
-      }
-
-      const nodeId = targetNodeIds[index];
-      const nodeName = nodeNameById.get(nodeId) ?? nodeId;
-      appActions.setProbeProgress({
-        running: true,
-        completed: index,
-        total,
-        currentNodeName: nodeName,
-        cancelled: false,
-      });
-
-      const timerId = window.setTimeout(() => {
-        previewTimersRef.current = previewTimersRef.current.filter((id) => id !== timerId);
-        if (previewCancelRef.current) return;
-
-        void catcloudApi
-          .runIsolatedProbes([nodeId], probeIds, tier, effectiveKeepalive, effectiveUsePreaccel)
-          .then((res) => {
-            if (previewCancelRef.current) return;
-            const rawSnap = res.snapshots[nodeId];
-            if (rawSnap) {
-              const jitterDelta = Math.round((Math.random() - 0.5) * 14);
-              const nextLatency =
-                rawSnap.latency_ms !== null
-                  ? Math.max(18, Math.round(rawSnap.latency_ms + jitterDelta))
-                  : 78;
-              const streamedSnap: ProbeSnapshot = {
-                ...rawSnap,
-                tested_at: new Date().toISOString(),
-                latency_ms: nextLatency,
-              };
-              appActions.syncProbes(
-                mergeProbeSnapshotsPreserveOld(appStore.getState().probes, {
-                  [nodeId]: streamedSnap,
-                })
-              );
-            }
-            appActions.setProbeProgress({
-              running: true,
-              completed: index + 1,
-              total,
-              currentNodeName: nodeName,
-              cancelled: false,
-            });
-            stepNext(index + 1);
-          })
-          .catch(() => {
-            if (previewCancelRef.current) return;
-            stepNext(index + 1);
-          });
-      }, 120);
-
-      previewTimersRef.current.push(timerId);
-    };
-
-    stepNext(0);
+    await appActions.runIsolatedProbesBg({
+      nodeIds: targetNodeIds,
+      probeIds,
+      usePreAccel: effectiveUsePreaccel,
+      lockedOrderIds,
+      maxTier: tier,
+      includeKeepalive: effectiveKeepalive,
+    });
   };
 
   const handlePrimaryTestClick = (tier: SpeedTestTier) => {
-    if (isRunning) return;
+    if (isBlockedByBenchmark) {
+      appActions.showToast("国内提速对比测速正在后台进行，完成后即可运行节点测速", "info");
+      return;
+    }
+    if (isRunning || isProbeEngineBusy) return;
     if (nodes.length === 0) {
       appActions.showToast("当前还没有节点，请先在「订阅与导入」中导入", "warn");
       return;
@@ -1738,83 +1568,8 @@ export function SpeedTestPage({
 
   const handlePauseTest = async () => {
     if (!isRunning || isPausing) return;
-    setIsPausing(true);
-    pausingRef.current = true;
-
-    if (!inTauri) {
-      previewCancelRef.current = true;
-      clearPreviewTimers();
-      try {
-        await catcloudApi.cancelIsolatedProbes();
-      } catch {
-        /* ignore mock cancel errors */
-      }
-      const doneCount = appStore.getState().probeProgress.completed;
-      const total = appStore.getState().probeProgress.total;
-      appActions.setProbeProgress({
-        running: false,
-        completed: doneCount,
-        total,
-        currentNodeName: null,
-        cancelled: true,
-      });
-      appActions.setMascotState("idle");
-      runOwnedBySelfRef.current = false;
-      pausingRef.current = false;
-      setLocalStarting(false);
-      setIsPausing(false);
-      appActions.showToast(
-        `已暂停测速，已测完的 ${doneCount} 个节点结果已全部保留`,
-        "info"
-      );
-      return;
-    }
-
-    try {
-      const wasRunning = await catcloudApi.cancelIsolatedProbes();
-      if (!runOwnedBySelfRef.current) {
-        if (wasRunning) {
-          externalPauseWaitingRef.current = true;
-        } else {
-          const doneCount = appStore.getState().probeProgress.completed;
-          appActions.setProbeProgress({
-            running: false,
-            currentNodeName: null,
-            cancelled: true,
-          });
-          appActions.setMascotState("idle");
-          setIsPausing(false);
-          pausingRef.current = false;
-          appActions.showToast(
-            `已暂停测速，已测完的 ${doneCount} 个节点结果已全部保留`,
-            "info"
-          );
-        }
-      }
-    } catch (err) {
-      setIsPausing(false);
-      pausingRef.current = false;
-      appActions.showToast(`暂停测速失败：${formatErrorMessage(err)}`, "warn");
-    }
+    await appActions.pauseIsolatedProbesBg();
   };
-
-  const activeGroupForQuickAdd = useMemo(() => {
-    if (groups.length === 0) return null;
-    if (runtime.active_group_id) {
-      const found = groups.find((g) => g.id === runtime.active_group_id);
-      if (found) return found;
-    }
-    if (groupFilter !== "all") {
-      const filtered = groups.find((g) => g.id === groupFilter);
-      if (filtered) return filtered;
-    }
-    return groups[0] ?? null;
-  }, [groups, runtime.active_group_id, groupFilter]);
-
-  const activeGroupMemberSet = useMemo(
-    () => new Set(activeGroupForQuickAdd?.member_node_ids ?? []),
-    [activeGroupForQuickAdd]
-  );
 
   // Always switch directly in single-node mode without mutating multi-group membership
   const handleSwitchToNode = async (node: ProxyNode) => {
@@ -1824,35 +1579,6 @@ export function SpeedTestPage({
       await appActions.selectSingleNode(node.id);
     } finally {
       setSwitchingNodeId(null);
-    }
-  };
-
-  const handleAddNodeToActiveGroup = async (node: ProxyNode) => {
-    if (!activeGroupForQuickAdd || addingToGroupNodeId) return;
-    if (activeGroupMemberSet.has(node.id)) {
-      appActions.showToast(
-        `「${node.name}」已在「${formatGroupDisplayName(activeGroupForQuickAdd.name)}」中`,
-        "info"
-      );
-      return;
-    }
-    setAddingToGroupNodeId(node.id);
-    try {
-      const updated = await catcloudApi.updateMultiGroupMembers(activeGroupForQuickAdd.id, [
-        ...activeGroupForQuickAdd.member_node_ids,
-        node.id,
-      ]);
-      appActions.syncGroups(
-        appStore.getState().groups.map((g) => (g.id === updated.id ? updated : g))
-      );
-      appActions.showToast(
-        `已将「${node.name}」加入「${formatGroupDisplayName(updated.name)}」`,
-        "ok"
-      );
-    } catch (err) {
-      appActions.showToast(`加入多选组失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setAddingToGroupNodeId(null);
     }
   };
 
@@ -2060,9 +1786,13 @@ export function SpeedTestPage({
         <div className={`${embedded ? "" : "mt-3.5"} flex flex-wrap items-center gap-2`}>
           <button
             type="button"
-            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
+            disabled={isProbeActionDisabled || (selectedCount === 0 && totalFiltered === 0)}
             onClick={() => handlePrimaryTestClick("unlock")}
-            title="主推省流方案：一次测出延迟、谷歌是否送中与 AI 解锁，约 0.2 MB/节点"
+            title={
+              isBlockedByBenchmark
+                ? "国内提速对比测速正在后台进行，完成后可测速"
+                : "主推省流方案：一次测出延迟、谷歌是否送中与 AI 解锁，约 0.2 MB/节点"
+            }
             className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
@@ -2079,9 +1809,13 @@ export function SpeedTestPage({
 
           <button
             type="button"
-            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
+            disabled={isProbeActionDisabled || (selectedCount === 0 && totalFiltered === 0)}
             onClick={() => handlePrimaryTestClick("full")}
-            title="测延迟 + 送中/AI + 真实上传/下载速度，约 3 MB/节点"
+            title={
+              isBlockedByBenchmark
+                ? "国内提速对比测速正在后台进行，完成后可测速"
+                : "测延迟 + 送中/AI + 真实上传/下载速度，约 3 MB/节点"
+            }
             className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--sky)]/60 bg-[var(--sky-soft)] px-3 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <Rocket className="h-3.5 w-3.5 shrink-0" />
@@ -2095,9 +1829,13 @@ export function SpeedTestPage({
 
           <button
             type="button"
-            disabled={isRunning || (selectedCount === 0 && totalFiltered === 0)}
+            disabled={isProbeActionDisabled || (selectedCount === 0 && totalFiltered === 0)}
             onClick={() => handlePrimaryTestClick("latency")}
-            title="只测节点连通与基础延迟，速度最快、保留旧的上下行和解锁记录"
+            title={
+              isBlockedByBenchmark
+                ? "国内提速对比测速正在后台进行，完成后可测速"
+                : "只测节点连通与基础延迟，速度最快、保留旧的上下行和解锁记录"
+            }
             className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-55"
           >
             <Zap className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
@@ -2178,6 +1916,16 @@ export function SpeedTestPage({
             </button>
           )}
         </div>
+
+        {/* Shared Probe Engine Mutex Notice when PreAccel Benchmark is Running */}
+        {isBlockedByBenchmark && (
+          <div className="mt-3 flex items-center gap-2 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)]/55 px-3.5 py-2 text-xs text-[var(--amber)]">
+            <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+            <span>
+              「国内提速」页正在后台运行提速效果对比测速，完成后即可运行节点测速
+            </span>
+          </div>
+        )}
 
         {/* Lightweight Confirmation Bar when Unselected List > 50 Nodes */}
         {pendingLargeRunTier && !isRunning && (
@@ -2842,7 +2590,7 @@ export function SpeedTestPage({
                   [
                     { key: "name", label: "节点名称", cls: "px-2" },
                     { key: "source", label: "来源", cls: "w-[78px] px-1.5" },
-                    { key: "latency", label: "延迟", cls: "w-[60px] px-1.5" },
+                    { key: "latency", label: "延迟", cls: "w-[68px] px-1.5" },
                     { key: "up", label: "上传", cls: "w-[54px] px-1.5" },
                     { key: "down", label: "下载", cls: "w-[58px] px-1.5" },
                     { key: "google", label: "谷歌地区", cls: "w-[80px] px-1.5" },
@@ -2871,6 +2619,12 @@ export function SpeedTestPage({
                 ({
                   node,
                   snap,
+                  healthHint,
+                  hasFreshHealthLatency,
+                  isCooldown,
+                  cooldownRemainingSec,
+                  effectiveLatencyMs,
+                  effectiveLatencyOk,
                   sourceName,
                   regionLabel,
                   unlocks,
@@ -2880,10 +2634,9 @@ export function SpeedTestPage({
                   const isSelected = validSelectedIds.has(node.id);
                   const isActiveNode = runtime.active_node_id === node.id;
                   const isSingleActiveNode = isSingleMode && isActiveNode;
-                  const isInActiveGroup = activeGroupMemberSet.has(node.id);
                   const isFlashing = recentFlashIds.has(node.id);
+                  const isProbingThis = isRunning && probeActiveNodeIdSet.has(node.id);
                   const isSwitchingThis = switchingNodeId === node.id;
-                  const isAddingThis = addingToGroupNodeId === node.id;
 
                   return (
                     <tr
@@ -2894,9 +2647,11 @@ export function SpeedTestPage({
                       className={`cursor-pointer transition-colors duration-500 ${
                         isFlashing
                           ? "bg-[var(--green-soft)]"
-                          : isSelected
-                            ? "bg-[var(--accent-soft)] hover:bg-[var(--accent-soft)]"
-                            : "bg-[var(--card)]/40 hover:bg-[var(--card-hover)]"
+                          : isProbingThis
+                            ? "bg-[var(--amber-soft)]/45 hover:bg-[var(--amber-soft)]/60"
+                            : isSelected
+                              ? "bg-[var(--accent-soft)] hover:bg-[var(--accent-soft)]"
+                              : "bg-[var(--card)]/40 hover:bg-[var(--card-hover)]"
                       }`}
                     >
                       {/* Checkbox with clear accent left indicator when selected */}
@@ -2906,7 +2661,9 @@ export function SpeedTestPage({
                             ? "shadow-[inset_3px_0_0_var(--accent)]"
                             : isFlashing
                               ? "shadow-[inset_3px_0_0_var(--green)]"
-                              : ""
+                              : isProbingThis
+                                ? "shadow-[inset_3px_0_0_var(--amber)]"
+                                : ""
                         }`}
                       >
                         <input
@@ -2940,7 +2697,16 @@ export function SpeedTestPage({
                               {isSingleMode ? "单节点" : "当前"}
                             </span>
                           )}
-                          {isFlashing && (
+                          {isProbingThis && (
+                            <span
+                              className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[9.5px] font-semibold text-[var(--amber)]"
+                              title="正在后台测速此节点"
+                            >
+                              <Loader2 className="h-2.5 w-2.5 animate-spin" />
+                              测速中
+                            </span>
+                          )}
+                          {isFlashing && !isProbingThis && (
                             <span className="cc-pulse-dot shrink-0 rounded-full bg-[var(--green)] px-1.5 py-0.5 text-[9px] font-semibold text-[var(--accent-ink)]">
                               新
                             </span>
@@ -2968,23 +2734,59 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Latency */}
-                      <td className="w-[60px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
-                        {snap ? (
+                      <td className="w-[68px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
+                        {isCooldown ? (
+                          <div>
+                            <span
+                              className="font-semibold text-[var(--amber)]"
+                              title={
+                                cooldownRemainingSec > 0
+                                  ? `节点暂时冷却中，约 ${cooldownRemainingSec} 秒后重试`
+                                  : "节点暂时冷却中"
+                              }
+                            >
+                              {cooldownRemainingSec > 0
+                                ? `冷却 ${cooldownRemainingSec}s`
+                                : "冷却中"}
+                            </span>
+                            {snap?.keepalive_60s_ok !== null &&
+                              snap?.keepalive_60s_ok !== undefined && (
+                                <div
+                                  className={`mt-0.5 whitespace-nowrap text-[10px] font-medium ${
+                                    snap.keepalive_60s_ok
+                                      ? "text-[var(--green)]"
+                                      : "text-[var(--red)]"
+                                  }`}
+                                >
+                                  {snap.keepalive_60s_ok ? "长连接稳" : "长连接断"}
+                                </div>
+                              )}
+                          </div>
+                        ) : hasFreshHealthLatency || snap ? (
                           <div>
                             <span
                               className="font-semibold"
                               style={{
-                                color: getLatencyColor(snap.latency_ms, snap.ok),
+                                color: getLatencyColor(effectiveLatencyMs, effectiveLatencyOk),
                               }}
+                              title={
+                                hasFreshHealthLatency
+                                  ? healthHint?.status === "probation"
+                                    ? "实时探测恢复中延迟"
+                                    : "实时健康池最新延迟"
+                                  : undefined
+                              }
                             >
-                              {snap.ok === false
-                                ? "超时"
-                                : snap.latency_ms !== null && snap.latency_ms !== undefined
-                                  ? `${Math.round(snap.latency_ms)} ms`
-                                  : "--"}
+                              {hasFreshHealthLatency && effectiveLatencyMs !== null
+                                ? `${Math.round(effectiveLatencyMs)} ms`
+                                : snap?.ok === false
+                                  ? "超时"
+                                  : effectiveLatencyMs !== null
+                                    ? `${Math.round(effectiveLatencyMs)} ms`
+                                    : "--"}
                             </span>
-                            {snap.keepalive_60s_ok !== null &&
-                              snap.keepalive_60s_ok !== undefined && (
+                            {snap?.keepalive_60s_ok !== null &&
+                              snap?.keepalive_60s_ok !== undefined && (
                                 <div
                                   className={`mt-0.5 whitespace-nowrap text-[10px] font-medium ${
                                     snap.keepalive_60s_ok
@@ -3131,27 +2933,39 @@ export function SpeedTestPage({
 
                           <button
                             type="button"
-                            disabled={isRunning}
+                            disabled={isProbeActionDisabled}
                             onClick={(e) => {
                               e.stopPropagation();
                               void executeProbes([node.id], "full", true);
                             }}
-                            title="单测此节点的延迟、谷歌送中/AI 解锁与真实上下行速度，保留其它旧结果"
+                            title={
+                              isBlockedByBenchmark
+                                ? "国内提速对比测速正在后台进行，完成后可测速"
+                                : "单测此节点的延迟、谷歌送中/AI 解锁与真实上下行速度，保留其它旧结果"
+                            }
                             aria-label={`测全套：${node.name}`}
                             className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--sky)]/45 bg-[var(--sky-soft)] px-1.5 py-1 text-[11px] font-medium text-[var(--sky)] transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-55"
                           >
-                            <Rocket className="h-3 w-3 shrink-0" />
-                            <span>测全套</span>
+                            {isProbingThis ? (
+                              <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                            ) : (
+                              <Rocket className="h-3 w-3 shrink-0" />
+                            )}
+                            <span>{isProbingThis ? "测速中" : "测全套"}</span>
                           </button>
 
                           <button
                             type="button"
-                            disabled={isRunning}
+                            disabled={isProbeActionDisabled}
                             onClick={(e) => {
                               e.stopPropagation();
                               void executeProbes([node.id], "latency", true);
                             }}
-                            title="只快速复测此节点延迟，不洗掉之前测好的上下行和解锁结果"
+                            title={
+                              isBlockedByBenchmark
+                                ? "国内提速对比测速正在后台进行，完成后可测速"
+                                : "只快速复测此节点延迟，不洗掉之前测好的上下行和解锁结果"
+                            }
                             aria-label={`测延迟：${node.name}`}
                             className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:opacity-65"
                           >
@@ -3159,37 +2973,11 @@ export function SpeedTestPage({
                             <span>测延迟</span>
                           </button>
 
-                          {!isSingleMode && activeGroupForQuickAdd && (
-                            <button
-                              type="button"
-                              disabled={isAddingThis}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                void handleAddNodeToActiveGroup(node);
-                              }}
-                              title={
-                                isInActiveGroup
-                                  ? `已在当前多选组「${formatGroupDisplayName(activeGroupForQuickAdd.name)}」中`
-                                  : `加入当前多选组「${formatGroupDisplayName(activeGroupForQuickAdd.name)}」`
-                              }
-                              aria-label={
-                                isInActiveGroup
-                                  ? `已在当前多选组：${node.name}`
-                                  : `加入当前多选组：${node.name}`
-                              }
-                              className={`inline-flex shrink-0 items-center justify-center rounded-lg border p-1 transition-colors disabled:opacity-50 ${
-                                isInActiveGroup
-                                  ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
-                                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                              }`}
-                            >
-                              {isInActiveGroup ? (
-                                <Check className="h-3 w-3 shrink-0" />
-                              ) : (
-                                <Plus className="h-3 w-3 shrink-0" />
-                              )}
-                            </button>
-                          )}
+                          <GroupMembershipPopover
+                            node={node}
+                            variant="icon"
+                            formatGroupName={formatGroupDisplayName}
+                          />
                         </div>
                       </td>
                     </tr>

@@ -78,6 +78,25 @@ export interface PreAccelConfig {
   windivert_dir?: string | null;
 }
 
+export type PreAccelInstallState =
+  | "idle"
+  | "downloading"
+  | "verifying"
+  | "ready"
+  | "need_elevation"
+  | "failed";
+
+export interface AcceleratedProcessStat {
+  process_name: string;
+  pid: number;
+  detected_by: string;
+  active_connections: number;
+  total_connections: number;
+  tx_bytes: number;
+  rx_bytes: number;
+  last_seen_ms: number;
+}
+
 export interface GlobalPreAccelStatus {
   running: boolean;
   mode: GlobalPreAccelMode;
@@ -92,6 +111,9 @@ export interface GlobalPreAccelStatus {
   accelerated_processes: string[];
   active_relays: string[];
   last_error: string | null;
+  is_windivert_active?: boolean;
+  install_state?: PreAccelInstallState;
+  process_stats?: AcceleratedProcessStat[];
 }
 
 export const DEFAULT_GLOBAL_PREACCEL_STATUS: GlobalPreAccelStatus = {
@@ -108,6 +130,9 @@ export const DEFAULT_GLOBAL_PREACCEL_STATUS: GlobalPreAccelStatus = {
   accelerated_processes: [],
   active_relays: [],
   last_error: null,
+  is_windivert_active: false,
+  install_state: "idle",
+  process_stats: [],
 };
 
 export interface UpdateConfig {
@@ -258,7 +283,6 @@ export interface SubscriptionRecord {
   name: string;
   kind: "url" | "file" | "migrated" | "process_adapter";
   url_or_cmd: string;
-  source?: string;
   refresh_interval_sec: number;
   traffic_used_bytes: number;
   traffic_total_bytes: number;
@@ -402,6 +426,12 @@ export interface SanitizedDiagnosticsDto {
   [key: string]: unknown;
 }
 
+export interface NodeHealthHintDto {
+  latency_ms: number | null;
+  status: "healthy" | "degraded" | "cooldown" | "probation";
+  cooldown_remaining_sec: number;
+}
+
 export interface CoreRuntimeInfo {
   running: boolean;
   status: CoreHealthStatus;
@@ -427,6 +457,9 @@ export interface CoreRuntimeInfo {
   global_preaccel_mode?: GlobalPreAccelMode;
   global_preaccel_socks_port?: number | null;
   global_preaccel_connections?: number;
+  global_windivert_active?: boolean;
+  preaccel_install_state?: string;
+  node_health_hints?: Record<string, NodeHealthHintDto>;
   captive_portal_required: boolean;
   system_proxy_enabled: boolean;
   tun_enabled: boolean;
@@ -439,6 +472,7 @@ export interface CoreRuntimeInfo {
 }
 
 export type CoreRuntimeInfoDto = CoreRuntimeInfo;
+export type RuntimeInfoDto = CoreRuntimeInfo;
 
 export interface ExitIpInfo {
   ip_masked: string;
@@ -727,6 +761,58 @@ export interface ProcessInspectResult {
   [key: string]: unknown;
 }
 
+export interface DesktopAppCandidate {
+  pid: number;
+  window_title: string;
+  friendly_name: string;
+  process_name: string;
+  exe_path: string | null;
+  working_dir: string | null;
+  related_pids: number[];
+  is_newly_opened: boolean;
+  likely_proxy_client: boolean;
+}
+
+export interface LiveCaptureStartDto {
+  session_id: string;
+  target_pid: number;
+  target_name: string;
+  watch_dirs: string[];
+}
+
+export interface LiveCaptureEventItem {
+  timestamp_ms: number;
+  kind: string;
+  message: string;
+}
+
+export interface LiveCaptureStatusDto {
+  session_id: string;
+  active: boolean;
+  step_app_ready: boolean;
+  step_activity_seen: boolean;
+  step_nodes_ready: boolean;
+  elapsed_sec: number;
+  captured_node_count: number;
+  opaque_change_detected: boolean;
+  target_name: string;
+  watch_dirs: string[];
+  events: LiveCaptureEventItem[];
+  preview_nodes: ProxyNode[];
+  unsupported_reason: string | null;
+}
+
+export interface LiveCaptureOutcomeDto {
+  session_id: string;
+  supported: boolean;
+  target_name: string;
+  source_kind: "migrated" | "file" | "process_adapter" | "none";
+  source_path: string | null;
+  is_ephemeral_source: boolean;
+  nodes: ProxyNode[];
+  unsupported_reason: string | null;
+}
+
 export interface RefreshGeoDbResult {
   ok: boolean;
   updated_targets: string[];
@@ -806,17 +892,167 @@ export function isTauriEnv(): boolean {
   );
 }
 
+const FRIENDLY_ERROR_RULES: ReadonlyArray<{ pattern: RegExp; message: string }> = [
+  {
+    pattern:
+      /probe[_\s-]?running|another\s+probe.*running|probe\s+already\s+running|benchmark.*already\s+running/i,
+    message: "已有测速或对比任务正在进行，请稍候完成后再试",
+  },
+  {
+    pattern:
+      /update_staging_lock|update.*already\s+(?:in\s+progress|downloading)|already\s+staging/i,
+    message: "应用更新正在后台下载中，请稍候完成后再试",
+  },
+  {
+    pattern: /address\s+already\s+in\s+use|os\s+error\s+10048\b|eaddrinuse/i,
+    message: "本地端口已被其它程序占用，请在设置中更换端口后重试",
+  },
+  {
+    pattern: /os\s+error\s+10061\b|connection\s+refused|econnrefused/i,
+    message: "本地服务或目标端口拒绝连接，请确认核心已启动或目标地址可用",
+  },
+  {
+    pattern:
+      /os\s+error\s+10054\b|os\s+error\s+10053\b|connection\s+reset|econnreset|broken\s+pipe|connection\s+aborted/i,
+    message: "网络连接被意外中断，请检查网络或切换节点后重试",
+  },
+  {
+    pattern:
+      /os\s+error\s+10060\b|timed\s*out|etimedout|deadline\s+has\s+elapsed|operation\s+timeout|request\s+timeout/i,
+    message: "连接超时，请检查网络状况或切换节点后重试",
+  },
+  {
+    pattern:
+      /dns\s+error|failed\s+to\s+lookup\s+address|no\s+such\s+host|enotfound|name\s+or\s+service\s+not\s+known|could\s+not\s+resolve\s+host|os\s+error\s+11001\b/i,
+    message: "域名解析失败，请检查网络连接或确认网址是否正确",
+  },
+  {
+    pattern:
+      /invalid\s+peer\s+certificate|certificate\s+(?:verify|expired|invalid|unknown)|unknown\s+issuer|tls\s+handshake|ssl\s+handshake|unexpected\s+eof\s+during\s+handshake/i,
+    message: "安全连接（TLS / 证书）握手失败，请检查系统时间或证书配置",
+  },
+  {
+    pattern: /socks[45]?\s+error|proxy\s+connect|http\s+status\s+407|tunnel\s+connection\s+failed/i,
+    message: "代理通道连接失败，请检查核心状态或中转线路配置",
+  },
+  {
+    pattern: /unexpected\s+eof|early\s+eof|incomplete\s+message|channel\s+closed|hyper::error/i,
+    message: "远端提前断开连接，请稍后重试",
+  },
+  {
+    pattern: /\b403\s+forbidden\b|status\s+code\s*403\b|http\s+403\b/i,
+    message: "目标服务器拒绝访问（403），链接可能已失效或受限",
+  },
+  {
+    pattern: /\b404\s+not\s+found\b|status\s+code\s*404\b|http\s+404\b/i,
+    message: "目标地址不存在（404），请检查链接是否填写正确",
+  },
+  {
+    pattern: /\b429\s+too\s+many\s+requests\b|status\s+code\s*429\b|http\s+429\b/i,
+    message: "请求过于频繁（429），请稍后再试",
+  },
+  {
+    pattern:
+      /\b50[0234]\b.*(?:bad\s+gateway|service\s+unavailable|gateway\s+timeout|internal\s+server)|status\s+code\s*50[0234]\b/i,
+    message: "远端服务器暂时繁忙或不可用，请稍后重试",
+  },
+  {
+    pattern:
+      /error\s+sending\s+request\s+for\s+url|client\s+error\s*\(connect\)|tcp\s+connect\s+error|network\s+is\s+unreachable|host\s+is\s+unreachable|os\s+error\s+10051\b|os\s+error\s+10065\b/i,
+    message: "无法连接到目标服务器，请检查网络连接或切换节点后重试",
+  },
+  {
+    pattern: /no\s+such\s+file\s+or\s+directory|cannot\s+find\s+the\s+(?:file|path)|os\s+error\s+[23]\b|enoent/i,
+    message: "找不到指定的文件或目录，请确认路径是否正确",
+  },
+  {
+    pattern:
+      /permission\s+denied|access\s+is\s+denied|os\s+error\s+5\b|eacces|eperm|requires\s+elevation|os\s+error\s+740\b/i,
+    message: "系统权限不足，请检查文件权限或尝试以管理员身份运行",
+  },
+  {
+    pattern:
+      /being\s+used\s+by\s+another\s+process|os\s+error\s+32\b|text\s+file\s+busy|sharing\s+violation/i,
+    message: "目标文件正被其它程序占用，请关闭相关程序后重试",
+  },
+  {
+    pattern: /no\s+space\s+left|disk\s+full|os\s+error\s+112\b/i,
+    message: "磁盘空间不足，请清理空间后重试",
+  },
+  {
+    pattern:
+      /eof\s+while\s+parsing|expected\s+value\s+at\s+line|serde_json|trailing\s+characters|invalid\s+json|unexpected\s+token.*json/i,
+    message: "返回内容或配置文件格式有误，请检查内容是否完整",
+  },
+  {
+    pattern: /serde_yaml|while\s+scanning|mapping\s+values\s+are\s+not\s+allowed|invalid\s+yaml/i,
+    message: "配置文件 YAML 格式有误，请检查缩进与语法",
+  },
+  {
+    pattern: /database\s+is\s+locked|sqlite.*(?:locked|busy)/i,
+    message: "本地数据正在写入，请稍等片刻后重试",
+  },
+  {
+    pattern: /poisonerror|lock\s+poisoned/i,
+    message: "后台任务状态异常，请重试或重启猫猫云梯",
+  },
+];
+
+function matchFriendlyErrorRule(text: string): string | null {
+  for (const rule of FRIENDLY_ERROR_RULES) {
+    if (rule.pattern.test(text)) {
+      return rule.message;
+    }
+  }
+  return null;
+}
+
+function translateRawErrorMessage(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return "操作未完成，请稍后重试";
+  // Preserve structured privilege elevation sentinel consumed by toggleTun / event handlers
+  if (trimmed.includes("NEEDS_ADMIN:")) {
+    return trimmed;
+  }
+
+  const cleaned = trimmed.replace(/^(?:Error|IPC error|invoke error):\s*/i, "").trim();
+  const chinesePrefixMatch = /^([^\n:：]{2,32})[：:]\s*(.+)$/s.exec(cleaned);
+  if (chinesePrefixMatch) {
+    const prefix = chinesePrefixMatch[1].trim();
+    const rest = chinesePrefixMatch[2].trim();
+    const prefixHasChinese = /[\u4e00-\u9fa5]{2,}/.test(prefix);
+    if (prefixHasChinese) {
+      const mappedRest = matchFriendlyErrorRule(rest);
+      if (mappedRest) {
+        return `${prefix}：${mappedRest}`;
+      }
+    }
+  }
+
+  const mappedWhole = matchFriendlyErrorRule(cleaned);
+  if (mappedWhole) {
+    return mappedWhole;
+  }
+
+  return cleaned;
+}
+
 export function formatErrorMessage(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  if (typeof err === "string") return err;
-  if (err && typeof err === "object" && "message" in err && typeof err.message === "string") {
-    return err.message;
+  let raw: string;
+  if (err instanceof Error) {
+    raw = err.message;
+  } else if (typeof err === "string") {
+    raw = err;
+  } else if (err && typeof err === "object" && "message" in err && typeof err.message === "string") {
+    raw = err.message;
+  } else {
+    try {
+      raw = JSON.stringify(err);
+    } catch {
+      raw = String(err);
+    }
   }
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
+  return translateRawErrorMessage(raw);
 }
 
 async function tauriInvokeOrThrow<T>(
@@ -928,7 +1164,6 @@ const MOCK_SUBSCRIPTIONS: SubscriptionRecord[] = [
     name: "Demo Cloud Alpha",
     kind: "url",
     url_or_cmd: "https://example.invalid/sub/alpha.yaml",
-    source: "https://example.invalid/sub/alpha.yaml",
     refresh_interval_sec: 21600,
     traffic_used_bytes: 128 * 1024 * 1024 * 1024,
     traffic_total_bytes: 512 * 1024 * 1024 * 1024,
@@ -942,7 +1177,6 @@ const MOCK_SUBSCRIPTIONS: SubscriptionRecord[] = [
     name: "Demo Native Pool",
     kind: "file",
     url_or_cmd: "data/subs/demo-native.yaml",
-    source: "data/subs/demo-native.yaml",
     refresh_interval_sec: 43200,
     traffic_used_bytes: 24 * 1024 * 1024 * 1024,
     traffic_total_bytes: 200 * 1024 * 1024 * 1024,
@@ -1355,6 +1589,34 @@ let mockQuickSites: SiteCheckItem[] = structuredClone(MOCK_QUICK_SITES);
 let mockActiveNodeIdx = 0;
 let mockUpTotal = 186 * 1024 * 1024;
 let mockDownTotal = 1.42 * 1024 * 1024 * 1024;
+const VALID_PREACCEL_INSTALL_STATES = new Set<PreAccelInstallState>([
+  "idle",
+  "downloading",
+  "verifying",
+  "ready",
+  "need_elevation",
+  "failed",
+]);
+
+function normalizeAcceleratedProcessStats(raw: unknown): AcceleratedProcessStat[] {
+  if (!Array.isArray(raw)) return [];
+  const safeNum = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
+  return raw
+    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
+    .map((item) => ({
+      process_name: typeof item.process_name === "string" ? item.process_name : "",
+      pid: safeNum(item.pid),
+      detected_by: typeof item.detected_by === "string" ? item.detected_by : "runtime",
+      active_connections: safeNum(item.active_connections),
+      total_connections: safeNum(item.total_connections),
+      tx_bytes: safeNum(item.tx_bytes),
+      rx_bytes: safeNum(item.rx_bytes),
+      last_seen_ms: safeNum(item.last_seen_ms),
+    }))
+    .filter((item) => item.process_name.length > 0);
+}
+
 function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
   if (!raw || typeof raw !== "object") {
     return { ...DEFAULT_GLOBAL_PREACCEL_STATUS };
@@ -1366,18 +1628,34 @@ function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
       : r.running
         ? "local_socks5"
         : "off";
+  const running = Boolean(r.running);
+  const windivertAvailable = Boolean(r.windivert_available);
+  const isElevated = Boolean(r.is_elevated);
+  const isWindivertActive =
+    typeof r.is_windivert_active === "boolean"
+      ? r.is_windivert_active && running && mode === "windivert"
+      : running && mode === "windivert";
+  const installState: PreAccelInstallState =
+    typeof r.install_state === "string" &&
+    VALID_PREACCEL_INSTALL_STATES.has(r.install_state as PreAccelInstallState)
+      ? (r.install_state as PreAccelInstallState)
+      : windivertAvailable
+        ? isElevated
+          ? "ready"
+          : "need_elevation"
+        : "idle";
   const safeNum = (v: unknown): number =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
   return {
-    running: Boolean(r.running),
+    running,
     mode,
     socks_port:
       typeof r.socks_port === "number" && Number.isFinite(r.socks_port) && r.socks_port > 0
         ? r.socks_port
         : null,
-    windivert_available: Boolean(r.windivert_available),
+    windivert_available: windivertAvailable,
     windivert_path: typeof r.windivert_path === "string" ? r.windivert_path : null,
-    is_elevated: Boolean(r.is_elevated),
+    is_elevated: isElevated,
     active_connections: safeNum(r.active_connections),
     total_connections: safeNum(r.total_connections),
     up_bytes: safeNum(r.up_bytes),
@@ -1389,6 +1667,9 @@ function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
       ? r.active_relays.filter((x): x is string => typeof x === "string")
       : [],
     last_error: typeof r.last_error === "string" && r.last_error.trim() ? r.last_error : null,
+    is_windivert_active: isWindivertActive,
+    install_state: installState,
+    process_stats: normalizeAcceleratedProcessStats(r.process_stats),
   };
 }
 
@@ -1406,6 +1687,9 @@ let mockGlobalPreAccel: GlobalPreAccelStatus = {
   accelerated_processes: [],
   active_relays: MOCK_PREACCEL_RELAYS.filter((r) => r.enabled).map((r) => r.name),
   last_error: null,
+  is_windivert_active: false,
+  install_state: detectNavigatorOs() === "windows" ? "ready" : "idle",
+  process_stats: [],
 };
 
 let mockRuntime: CoreRuntimeInfo = {
@@ -1433,6 +1717,13 @@ let mockRuntime: CoreRuntimeInfo = {
   global_preaccel_mode: "off",
   global_preaccel_socks_port: null,
   global_preaccel_connections: 0,
+  global_windivert_active: false,
+  preaccel_install_state: detectNavigatorOs() === "windows" ? "ready" : "idle",
+  node_health_hints: {
+    "node-jp-01": { latency_ms: 68, status: "healthy", cooldown_remaining_sec: 0 },
+    "node-sg-02": { latency_ms: 82, status: "healthy", cooldown_remaining_sec: 0 },
+    "node-us-03": { latency_ms: 144, status: "healthy", cooldown_remaining_sec: 0 },
+  },
   captive_portal_required: false,
   system_proxy_enabled: mockConfig.system_proxy_enabled,
   tun_enabled: mockConfig.tun_enabled,
@@ -1449,6 +1740,7 @@ function syncMockPreAccelRuntime(): void {
     mockRuntime.running && (mockRuntime.system_proxy_enabled || mockRuntime.tun_enabled);
   const proxyPreAccelActive = mockRuntime.running && mockConfig.preaccel.enabled;
   const globalActive = mockGlobalPreAccel.running;
+  const isWindivertActive = globalActive && mockGlobalPreAccel.mode === "windivert";
   const preaccelActive = proxyPreAccelActive || globalActive;
   const nextStatus: CoreHealthStatus =
     (proxyActive && mockConfig.preaccel.enabled) || globalActive || proxyPreAccelActive
@@ -1461,6 +1753,7 @@ function syncMockPreAccelRuntime(): void {
   mockGlobalPreAccel = {
     ...mockGlobalPreAccel,
     active_relays: activeRelays,
+    is_windivert_active: isWindivertActive,
   };
   mockRuntime = {
     ...mockRuntime,
@@ -1471,6 +1764,8 @@ function syncMockPreAccelRuntime(): void {
     global_preaccel_mode: mockGlobalPreAccel.mode,
     global_preaccel_socks_port: mockGlobalPreAccel.socks_port,
     global_preaccel_connections: mockGlobalPreAccel.active_connections,
+    global_windivert_active: isWindivertActive,
+    preaccel_install_state: mockGlobalPreAccel.install_state ?? "idle",
     status: nextStatus,
   };
 }
@@ -1483,8 +1778,13 @@ function startMockGlobalPreAccel(): void {
   const os = detectNavigatorOs();
   const useWinDivert =
     os === "windows" && mockGlobalPreAccel.windivert_available && mockGlobalPreAccel.is_elevated;
-  const targetSample = (mockConfig.preaccel.global_target_processes ?? [])
-    .slice(0, 2);
+  const targetSample = (mockConfig.preaccel.global_target_processes ?? []).slice(0, 2);
+  const activeProcs = useWinDivert
+    ? targetSample.length > 0
+      ? targetSample
+      : ["mihomo.exe", "xray.exe"]
+    : [];
+  const nowMs = Date.now();
   mockGlobalPreAccel = {
     ...mockGlobalPreAccel,
     running: true,
@@ -1494,13 +1794,27 @@ function startMockGlobalPreAccel(): void {
     total_connections: Math.max(mockGlobalPreAccel.total_connections, useWinDivert ? 14 : 2),
     up_bytes: Math.max(mockGlobalPreAccel.up_bytes, useWinDivert ? 48 * 1024 * 1024 : 0),
     down_bytes: Math.max(mockGlobalPreAccel.down_bytes, useWinDivert ? 12 * 1024 * 1024 : 0),
-    accelerated_processes: useWinDivert
-      ? targetSample.length > 0
-        ? targetSample
-        : ["verge-mihomo.exe", "FlClashCore.exe"]
-      : [],
+    accelerated_processes: activeProcs,
     active_relays: enabledRelays.map((r) => r.name),
     last_error: null,
+    is_windivert_active: useWinDivert,
+    install_state: mockGlobalPreAccel.windivert_available
+      ? mockGlobalPreAccel.is_elevated
+        ? "ready"
+        : "need_elevation"
+      : "idle",
+    process_stats: useWinDivert
+      ? activeProcs.map((procName, idx) => ({
+          process_name: procName,
+          pid: 14200 + idx * 120,
+          detected_by: "local_proxy_listener",
+          active_connections: idx === 0 ? 2 : 1,
+          total_connections: idx === 0 ? 9 : 5,
+          tx_bytes: (32 - idx * 12) * 1024 * 1024,
+          rx_bytes: (8 - idx * 3) * 1024 * 1024,
+          last_seen_ms: nowMs,
+        }))
+      : [],
   };
 }
 
@@ -1512,7 +1826,104 @@ function stopMockGlobalPreAccel(): void {
     socks_port: null,
     active_connections: 0,
     last_error: null,
+    is_windivert_active: false,
+    process_stats: [],
   };
+}
+
+const MOCK_DESKTOP_APPS: DesktopAppCandidate[] = [
+  {
+    pid: 16420,
+    window_title: "OpenProxy Desktop",
+    friendly_name: "OpenProxy Desktop",
+    process_name: "mihomo-gui.exe",
+    exe_path: "C:\\Users\\<USER>\\Apps\\OpenProxy\\mihomo-gui.exe",
+    working_dir: "C:\\Users\\<USER>\\AppData\\Roaming\\openproxy",
+    related_pids: [16420, 16508],
+    is_newly_opened: false,
+    likely_proxy_client: true,
+  },
+  {
+    pid: 21804,
+    window_title: "Private Tunnel App",
+    friendly_name: "Private Tunnel App",
+    process_name: "opaque-tunnel.exe",
+    exe_path: "C:\\Users\\<USER>\\Apps\\PrivateTunnel\\opaque-tunnel.exe",
+    working_dir: "C:\\Users\\<USER>\\AppData\\Local\\private-tunnel",
+    related_pids: [21804],
+    is_newly_opened: false,
+    likely_proxy_client: true,
+  },
+  {
+    pid: 9312,
+    window_title: "Windows Terminal",
+    friendly_name: "Windows Terminal",
+    process_name: "WindowsTerminal.exe",
+    exe_path: "C:\\Program Files\\WindowsApps\\WindowsTerminal.exe",
+    working_dir: null,
+    related_pids: [9312],
+    is_newly_opened: false,
+    likely_proxy_client: false,
+  },
+];
+
+interface MockLiveCaptureState {
+  sessionId: string;
+  targetPid: number;
+  targetName: string;
+  watchDirs: string[];
+  startedAtMs: number;
+  supportsPlainNodes: boolean;
+}
+
+let mockLiveCapture: MockLiveCaptureState | null = null;
+
+function buildMockCapturedNodes(sessionId: string, targetName: string): ProxyNode[] {
+  const safePrefix = targetName.replace(/\s+/g, "-").slice(0, 18) || "Captured";
+  return [
+    {
+      id: `${sessionId}-jp-01`,
+      sub_id: sessionId,
+      name: `${safePrefix} · JP-Tokyo-01 · 1x`,
+      protocol: "vless",
+      server: "203.0.113.81",
+      port: 443,
+      region_code: "JP",
+      multiplier: 1.0,
+      is_443_native: true,
+      preaccel_override: null,
+      tags: ["captured", "native-443"],
+      enabled: true,
+    },
+    {
+      id: `${sessionId}-sg-02`,
+      sub_id: sessionId,
+      name: `${safePrefix} · SG-Edge-02 · 1x`,
+      protocol: "trojan",
+      server: "198.51.100.82",
+      port: 8443,
+      region_code: "SG",
+      multiplier: 1.0,
+      is_443_native: false,
+      preaccel_override: null,
+      tags: ["captured"],
+      enabled: true,
+    },
+    {
+      id: `${sessionId}-us-03`,
+      sub_id: sessionId,
+      name: `${safePrefix} · US-West-03 · 1.5x`,
+      protocol: "anytls",
+      server: "203.0.113.83",
+      port: 443,
+      region_code: "US",
+      multiplier: 1.5,
+      is_443_native: true,
+      preaccel_override: null,
+      tags: ["captured", "native-443"],
+      enabled: true,
+    },
+  ];
 }
 
 /** Generate deterministic-looking smooth mock traffic history for browser preview */
@@ -1691,6 +2102,32 @@ export const catcloudApi = {
       return tauriInvokeOrThrow<CoreRuntimeInfo>("stop_core");
     }
     mockRuntime = { ...mockRuntime, running: false };
+    syncMockPreAccelRuntime();
+    return { ...mockRuntime };
+  },
+
+  async disableAllProxyAndStopCore(): Promise<RuntimeInfoDto> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<RuntimeInfoDto>("disable_all_proxy_and_stop_core");
+    }
+    mockConfig = {
+      ...mockConfig,
+      system_proxy_enabled: false,
+      tun_enabled: false,
+    };
+    mockRuntime = {
+      ...mockRuntime,
+      running: false,
+      system_proxy_enabled: false,
+      tun_enabled: false,
+    };
+    if (mockConfig.preaccel.enabled && !mockGlobalPreAccel.running) {
+      try {
+        startMockGlobalPreAccel();
+      } catch {
+        /* no enabled relay in preview */
+      }
+    }
     syncMockPreAccelRuntime();
     return { ...mockRuntime };
   },
@@ -2142,18 +2579,22 @@ export const catcloudApi = {
   },
 
   async upsertSubscription(record: SubscriptionRecord): Promise<SubscriptionRecord> {
-    if (isTauriEnv()) {
-      return tauriInvokeOrThrow<SubscriptionRecord>("upsert_subscription", { record });
-    }
-    const normalized: SubscriptionRecord = {
-      ...record,
-      url_or_cmd: record.url_or_cmd || record.source || "",
-      source: record.url_or_cmd || record.source || "",
+    const { source: legacySource, ...cleanRecord } = record as SubscriptionRecord & {
+      source?: string;
     };
-    const idx = mockSubscriptions.findIndex((s) => s.id === normalized.id);
-    if (idx >= 0) mockSubscriptions[idx] = structuredClone(normalized);
-    else mockSubscriptions.push(structuredClone(normalized));
-    return structuredClone(normalized);
+    const payloadRecord: SubscriptionRecord = {
+      ...cleanRecord,
+      url_or_cmd: cleanRecord.url_or_cmd || legacySource || "",
+    };
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SubscriptionRecord>("upsert_subscription", {
+        record: payloadRecord,
+      });
+    }
+    const idx = mockSubscriptions.findIndex((s) => s.id === payloadRecord.id);
+    if (idx >= 0) mockSubscriptions[idx] = structuredClone(payloadRecord);
+    else mockSubscriptions.push(structuredClone(payloadRecord));
+    return structuredClone(payloadRecord);
   },
 
   async deleteSubscription(subId: string): Promise<boolean> {
@@ -2727,6 +3168,191 @@ export const catcloudApi = {
       node_count: 0,
       warnings: [],
     };
+  },
+
+  async listDesktopAppCandidates(baselinePids?: number[]): Promise<DesktopAppCandidate[]> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<DesktopAppCandidate[]>("list_desktop_app_candidates", {
+        baselinePids: baselinePids ?? null,
+      });
+    }
+    const baselineSet =
+      Array.isArray(baselinePids) && baselinePids.length > 0
+        ? new Set(baselinePids)
+        : null;
+    return MOCK_DESKTOP_APPS.map((item) => ({
+      ...item,
+      related_pids: [...item.related_pids],
+      is_newly_opened: baselineSet ? !baselineSet.has(item.pid) : false,
+    }));
+  },
+
+  async startLiveCaptureSession(targetPid: number): Promise<LiveCaptureStartDto> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<LiveCaptureStartDto>("start_live_capture_session", {
+        targetPid,
+      });
+    }
+    const matched =
+      MOCK_DESKTOP_APPS.find((item) => item.pid === targetPid) ?? MOCK_DESKTOP_APPS[0];
+    const sessionId = `mock-capture-${Date.now()}`;
+    const watchDirs = matched.working_dir ? [matched.working_dir] : [];
+    const supportsPlainNodes = matched.process_name !== "opaque-tunnel.exe";
+    mockLiveCapture = {
+      sessionId,
+      targetPid,
+      targetName: matched.friendly_name || matched.process_name,
+      watchDirs,
+      startedAtMs: Date.now(),
+      supportsPlainNodes,
+    };
+    return {
+      session_id: sessionId,
+      target_pid: targetPid,
+      target_name: mockLiveCapture.targetName,
+      watch_dirs: [...watchDirs],
+    };
+  },
+
+  async pollLiveCaptureSession(sessionId: string): Promise<LiveCaptureStatusDto> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<LiveCaptureStatusDto>("poll_live_capture_session", {
+        sessionId,
+      });
+    }
+    const session = mockLiveCapture;
+    if (!session || session.sessionId !== sessionId) {
+      return {
+        session_id: sessionId,
+        active: false,
+        step_app_ready: false,
+        step_activity_seen: false,
+        step_nodes_ready: false,
+        elapsed_sec: 0,
+        captured_node_count: 0,
+        opaque_change_detected: false,
+        target_name: "未知软件",
+        watch_dirs: [],
+        events: [],
+        preview_nodes: [],
+        unsupported_reason: null,
+      };
+    }
+    const elapsedSec = Math.max(0, Math.floor((Date.now() - session.startedAtMs) / 1000));
+    const activitySeen = elapsedSec >= 1;
+    const nodesReady = session.supportsPlainNodes && elapsedSec >= 2;
+    const opaqueDetected = !session.supportsPlainNodes && elapsedSec >= 2;
+    const previewNodes = nodesReady
+      ? buildMockCapturedNodes(session.sessionId, session.targetName)
+      : [];
+    const events: LiveCaptureEventItem[] = [
+      {
+        timestamp_ms: session.startedAtMs,
+        kind: "session",
+        message: `已锁定「${session.targetName}」并开始只读监听配置变化`,
+      },
+    ];
+    if (activitySeen) {
+      events.push({
+        timestamp_ms: session.startedAtMs + 1000,
+        kind: "activity",
+        message: "检测到目标软件正在写入新配置文件…",
+      });
+    }
+    if (nodesReady) {
+      events.push({
+        timestamp_ms: session.startedAtMs + 2000,
+        kind: "nodes",
+        message: `已成功抢读 ${previewNodes.length} 个明文节点（演示预览）`,
+      });
+    } else if (opaqueDetected) {
+      events.push({
+        timestamp_ms: session.startedAtMs + 2000,
+        kind: "opaque",
+        message: "检测到加密或私有格式配置变动，暂未读取到明文节点",
+      });
+    }
+    return {
+      session_id: session.sessionId,
+      active: true,
+      step_app_ready: true,
+      step_activity_seen: activitySeen,
+      step_nodes_ready: nodesReady,
+      elapsed_sec: elapsedSec,
+      captured_node_count: previewNodes.length,
+      opaque_change_detected: opaqueDetected,
+      target_name: session.targetName,
+      watch_dirs: [...session.watchDirs],
+      events,
+      preview_nodes: previewNodes,
+      unsupported_reason: opaqueDetected
+        ? "仅检测到加密/非明文配置变动，无法提取节点"
+        : null,
+    };
+  },
+
+  async finishLiveCaptureSession(sessionId: string): Promise<LiveCaptureOutcomeDto> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<LiveCaptureOutcomeDto>("finish_live_capture_session", {
+        sessionId,
+      });
+    }
+    const session = mockLiveCapture;
+    mockLiveCapture = null;
+    if (!session || session.sessionId !== sessionId || !session.supportsPlainNodes) {
+      return {
+        session_id: sessionId,
+        supported: false,
+        target_name: session?.targetName ?? "目标软件",
+        source_kind: "none",
+        source_path: null,
+        is_ephemeral_source: false,
+        nodes: [],
+        unsupported_reason: "未在目标软件配置变动中检测到可读取的明文节点",
+      };
+    }
+    const nodes = buildMockCapturedNodes(session.sessionId, session.targetName);
+    return {
+      session_id: sessionId,
+      supported: true,
+      target_name: session.targetName,
+      source_kind: "migrated",
+      source_path: session.watchDirs[0] ? `${session.watchDirs[0]}\\runtime.yaml` : null,
+      is_ephemeral_source: true,
+      nodes,
+      unsupported_reason: null,
+    };
+  },
+
+  async cancelLiveCaptureSession(sessionId: string): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("cancel_live_capture_session", { sessionId });
+    }
+    if (mockLiveCapture?.sessionId === sessionId) {
+      mockLiveCapture = null;
+    }
+    return true;
+  },
+
+  async capsuleDragStart(): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("capsule_drag_start");
+    }
+    return true;
+  },
+
+  async capsuleDragStep(): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("capsule_drag_step");
+    }
+    return true;
+  },
+
+  async capsuleDragEnd(): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("capsule_drag_end");
+    }
+    return true;
   },
 
   async exportShellEnv(shell: string): Promise<string> {

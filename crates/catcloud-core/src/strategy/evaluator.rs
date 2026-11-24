@@ -6,9 +6,11 @@ use crate::models::{
     ProxyNode, TriggerRule,
 };
 use crate::strategy::formula::{DEFAULT_MISSING_PING_MS, EvalContext, FormulaExpr};
+use crate::strategy::health_pool::{NodeHealthPool, RuntimeDualHealth, RuntimeNodeHealth};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 /// Build a formula [`EvalContext`] from a node record and its optional latest probe snapshot.
 pub fn build_eval_context(node: &ProxyNode, snapshot: Option<&ProbeSnapshot>) -> EvalContext {
@@ -274,6 +276,22 @@ pub fn evaluate_group_candidates(
     nodes: &[ProxyNode],
     snapshots: &HashMap<String, ProbeSnapshot>,
 ) -> CatResult<GroupEvaluationReport> {
+    evaluate_group_candidates_with_runtime(group, nodes, snapshots, None, Instant::now())
+}
+
+/// Evaluate a [`MultiGroup`] while fusing live runtime health signals from [`NodeHealthPool`]:
+/// - Injects fresh EWMA smoothed latency into `EvalContext.ping_ms`;
+/// - Subtracts `penalty_score` for degraded or probation nodes so recovering nodes do not
+///   immediately steal the #1 slot;
+/// - Ranks actively cooling / unrecovered failed nodes behind healthy candidates while keeping
+///   them at the tail of `gate_passed` as last-resort fallbacks (never permanently banned).
+pub fn evaluate_group_candidates_with_runtime(
+    group: &MultiGroup,
+    nodes: &[ProxyNode],
+    snapshots: &HashMap<String, ProbeSnapshot>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
+) -> CatResult<GroupEvaluationReport> {
     let formula_str = if group.formula_expr.trim().is_empty() {
         DEFAULT_COST_EFFECTIVE_FORMULA
     } else {
@@ -330,7 +348,11 @@ pub fn evaluate_group_candidates(
             continue;
         }
         let snap = snapshots.get(&node.id);
-        let ctx = build_eval_context_for_probe(node, snap, primary_probe);
+        let runtime_health = health_pool.and_then(|pool| pool.get(&node.id));
+        let mut ctx = build_eval_context_for_probe(node, snap, primary_probe);
+        if let Some(rt) = runtime_health {
+            apply_runtime_health_to_context(&mut ctx, snap, rt, now);
+        }
 
         let in_pool = match group.mode {
             MultiGroupMode::ConditionalPool => {
@@ -376,7 +398,8 @@ pub fn evaluate_group_candidates(
 
         let failed_gates = evaluate_hard_gates(&hard_gates, &ctx, snap)?;
         let passed_hard_gates = failed_gates.is_empty();
-        let score = score_formula.eval_f64(&ctx)?;
+        let raw_score = score_formula.eval_f64(&ctx)?;
+        let score = apply_runtime_penalty(raw_score, runtime_health);
 
         let mut triggered_indices = Vec::new();
         for trig in &compiled_triggers {
@@ -410,15 +433,23 @@ pub fn evaluate_group_candidates(
         }
     }
 
-    gate_passed.sort_by(|a, b| compare_candidates_with_snapshots_desc(a, b, snapshots));
-    healthy_candidates.sort_by(|a, b| compare_candidates_with_snapshots_desc(a, b, snapshots));
-    gate_rejected.sort_by(|a, b| compare_candidates_with_snapshots_desc(a, b, snapshots));
+    gate_passed.sort_by(|a, b| {
+        compare_candidates_with_runtime_desc(a, b, snapshots, health_pool, now)
+    });
+    healthy_candidates.sort_by(|a, b| {
+        compare_candidates_with_runtime_desc(a, b, snapshots, health_pool, now)
+    });
+    gate_rejected.sort_by(|a, b| {
+        compare_candidates_with_runtime_desc(a, b, snapshots, health_pool, now)
+    });
 
     let active_assessment = match group.active_node_id.as_deref().map(str::trim) {
         Some(active_id) if !active_id.is_empty() => Some(assess_active_node(
             active_id,
             nodes,
             snapshots,
+            health_pool,
+            now,
             primary_probe,
             pool_node_ids.contains(active_id),
             &hard_gates,
@@ -443,6 +474,41 @@ pub fn evaluate_group_candidates(
         all_failed_hard_gates,
         all_below_threshold,
     })
+}
+
+fn apply_runtime_health_to_context(
+    ctx: &mut EvalContext,
+    snap: Option<&ProbeSnapshot>,
+    rt: &RuntimeNodeHealth,
+    now: Instant,
+) {
+    if let Some(ewma) = rt.ewma_latency_ms.filter(|v| v.is_finite() && *v > 0.0) {
+        ctx.ping_ms = ewma;
+    }
+
+    if rt.is_in_cooldown(now)
+        || rt.backoff_stage > 0
+        || rt.last_health == Some(RuntimeDualHealth::Failed)
+    {
+        ctx.ok = false;
+    } else if rt.last_health == Some(RuntimeDualHealth::FullHealthy) {
+        ctx.ok = true;
+    } else if rt.last_health == Some(RuntimeDualHealth::Degraded) && snap.is_none() {
+        ctx.ok = true;
+    }
+}
+
+fn apply_runtime_penalty(raw_score: f64, runtime_health: Option<&RuntimeNodeHealth>) -> f64 {
+    match runtime_health {
+        Some(rt)
+            if raw_score.is_finite()
+                && rt.penalty_score.is_finite()
+                && rt.penalty_score > 0.0 =>
+        {
+            raw_score - rt.penalty_score
+        }
+        _ => raw_score,
+    }
 }
 
 /// Evaluate a single node's score under a group's scoring formula (using the group's `primary_probe_id`).
@@ -492,6 +558,8 @@ fn assess_active_node(
     active_id: &str,
     nodes: &[ProxyNode],
     snapshots: &HashMap<String, ProbeSnapshot>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
     primary_probe: Option<&str>,
     in_candidate_pool: bool,
     hard_gates: &[(String, FormulaExpr)],
@@ -517,10 +585,15 @@ fn assess_active_node(
     };
 
     let snap = snapshots.get(&node.id);
-    let ctx = build_eval_context_for_probe(node, snap, primary_probe);
+    let runtime_health = health_pool.and_then(|pool| pool.get(&node.id));
+    let mut ctx = build_eval_context_for_probe(node, snap, primary_probe);
+    if let Some(rt) = runtime_health {
+        apply_runtime_health_to_context(&mut ctx, snap, rt, now);
+    }
     let failed_hard_gates = evaluate_hard_gates(hard_gates, &ctx, snap)?;
     let passed_hard_gates = failed_hard_gates.is_empty();
-    let score = score_formula.eval_f64(&ctx)?;
+    let raw_score = score_formula.eval_f64(&ctx)?;
+    let score = apply_runtime_penalty(raw_score, runtime_health);
     let is_disconnected = !ctx.ok;
 
     let mut triggered_rules = Vec::with_capacity(compiled_triggers.len());
@@ -586,13 +659,51 @@ fn has_probe_data(snap: Option<&ProbeSnapshot>) -> bool {
         || !s.unlocked_sites.is_empty()
 }
 
-fn compare_candidates_with_snapshots_desc(
+fn runtime_ranking_tier(rt: Option<&RuntimeNodeHealth>, now: Instant) -> u8 {
+    let Some(h) = rt else {
+        return 0;
+    };
+    if h.is_in_cooldown(now) {
+        2
+    } else if h.backoff_stage > 0 || h.last_health == Some(RuntimeDualHealth::Failed) {
+        1
+    } else {
+        0
+    }
+}
+
+fn compare_candidates_with_runtime_desc(
     a: &EvaluatedCandidate,
     b: &EvaluatedCandidate,
     snapshots: &HashMap<String, ProbeSnapshot>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
 ) -> Ordering {
-    let a_probed = has_probe_data(snapshots.get(&a.node_id));
-    let b_probed = has_probe_data(snapshots.get(&b.node_id));
+    let a_rt = health_pool.and_then(|pool| pool.get(&a.node_id));
+    let b_rt = health_pool.and_then(|pool| pool.get(&b.node_id));
+
+    let a_tier = runtime_ranking_tier(a_rt, now);
+    let b_tier = runtime_ranking_tier(b_rt, now);
+    if a_tier != b_tier {
+        return a_tier.cmp(&b_tier);
+    }
+
+    // When both candidates are in active cooldown (all-failed fallback), prefer whichever
+    // expires sooner before falling back to score ordering.
+    if a_tier == 2 {
+        let a_rem = a_rt.map(|h| h.cooldown_remaining_sec(now)).unwrap_or(0);
+        let b_rem = b_rt.map(|h| h.cooldown_remaining_sec(now)).unwrap_or(0);
+        let rem_ord = a_rem.cmp(&b_rem);
+        if rem_ord != Ordering::Equal {
+            return rem_ord;
+        }
+    }
+
+    let a_probed = has_probe_data(snapshots.get(&a.node_id))
+        || a_rt.is_some_and(|h| h.last_probed_at.is_some());
+    let b_probed = has_probe_data(snapshots.get(&b.node_id))
+        || b_rt.is_some_and(|h| h.last_probed_at.is_some());
+
     b.meets_thresholds
         .cmp(&a.meets_thresholds)
         .then_with(|| b.ok.cmp(&a.ok))
@@ -908,5 +1019,176 @@ mod tests {
         assert_eq!(rep.healthy_candidates.len(), 1);
         assert!(rep.healthy_candidates[0].meets_thresholds);
         assert!(rep.healthy_candidates[0].triggered_rule_indices.is_empty());
+    }
+
+    #[test]
+    fn runtime_health_pool_fuses_ewma_cooldown_probation_and_all_failed_fallback() {
+        use std::time::Duration;
+
+        let nodes = vec![
+            test_node("n-fast", "JP-Fast", "JP"),
+            test_node("n-steady", "SG-Steady", "SG"),
+            test_node("n-backup", "TW-Backup", "TW"),
+        ];
+
+        // `n-fast` has higher static throughput so it leads when healthy.
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "n-fast".to_string(),
+            ProbeSnapshot {
+                node_id: "n-fast".to_string(),
+                tested_at: "2026-11-24T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(40.0),
+                up_mbps: Some(2.0),
+                down_mbps: Some(100.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "n-steady".to_string(),
+            ProbeSnapshot {
+                node_id: "n-steady".to_string(),
+                tested_at: "2026-11-24T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(60.0),
+                up_mbps: Some(1.6),
+                down_mbps: Some(100.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+        snaps.insert(
+            "n-backup".to_string(),
+            ProbeSnapshot {
+                node_id: "n-backup".to_string(),
+                tested_at: "2026-11-24T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(80.0),
+                up_mbps: Some(1.2),
+                down_mbps: Some(80.0),
+                google_clean: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let group = MultiGroup {
+            id: "grp-rt".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec![
+                "n-fast".to_string(),
+                "n-steady".to_string(),
+                "n-backup".to_string(),
+            ],
+            // Simple linear formula where penalty & EWMA ping visibly govern ranking.
+            formula_expr: "up_mbps * 100 - ping_ms * 0.5".to_string(),
+            ..Default::default()
+        };
+
+        let mut pool = NodeHealthPool::new();
+        let t0 = Instant::now();
+
+        // 1. Baseline: `n-fast` (200 - 20 = 180) > `n-steady` (160 - 30 = 130) > `n-backup` (120 - 40 = 80).
+        let rep0 = evaluate_group_candidates_with_runtime(&group, &nodes, &snaps, Some(&pool), t0)
+            .unwrap();
+        assert_eq!(rep0.healthy_candidates[0].node_id, "n-fast");
+
+        // 2. Live EWMA latency spike on `n-fast` + single Degraded does NOT permanently ban it,
+        //    but drops its score below `n-steady` without entering cooldown.
+        pool.record_probe_result("n-fast", RuntimeDualHealth::FullHealthy, Some(200.0), t0);
+        pool.record_probe_result(
+            "n-fast",
+            RuntimeDualHealth::Degraded,
+            Some(220.0),
+            t0 + Duration::from_secs(10),
+        );
+        pool.record_probe_result(
+            "n-steady",
+            RuntimeDualHealth::FullHealthy,
+            Some(40.0),
+            t0 + Duration::from_secs(10),
+        );
+        let t1 = t0 + Duration::from_secs(15);
+        assert!(!pool.is_in_cooldown("n-fast", t1));
+        let rep1 = evaluate_group_candidates_with_runtime(&group, &nodes, &snaps, Some(&pool), t1)
+            .unwrap();
+        assert_eq!(rep1.healthy_candidates[0].node_id, "n-steady");
+        // `n-fast` still present and not permanently banned
+        assert!(rep1.gate_passed.iter().any(|c| c.node_id == "n-fast"));
+
+        // 3. Confirmed Failed on `n-fast`: enters 60s cooldown and drops behind all healthy nodes,
+        //    but remains at tail of `gate_passed`.
+        let t2 = t1 + Duration::from_secs(10);
+        pool.record_probe_result("n-fast", RuntimeDualHealth::Failed, None, t2);
+        assert!(pool.is_in_cooldown("n-fast", t2 + Duration::from_secs(1)));
+        let rep2 = evaluate_group_candidates_with_runtime(
+            &group,
+            &nodes,
+            &snaps,
+            Some(&pool),
+            t2 + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(rep2.healthy_candidates[0].node_id, "n-steady");
+        assert!(!rep2.healthy_candidates.iter().any(|c| c.node_id == "n-fast"));
+        assert_eq!(
+            rep2.gate_passed.last().map(|c| c.node_id.as_str()),
+            Some("n-fast")
+        );
+
+        // 4. Cooldown expires (65s): 1st FullHealthy is NOT enough to reclaim top rank.
+        let t3 = t2 + Duration::from_secs(65);
+        pool.record_probe_result("n-fast", RuntimeDualHealth::FullHealthy, Some(30.0), t3);
+        let rep3 = evaluate_group_candidates_with_runtime(&group, &nodes, &snaps, Some(&pool), t3)
+            .unwrap();
+        assert_eq!(rep3.healthy_candidates[0].node_id, "n-steady");
+        assert!(!rep3.healthy_candidates.iter().any(|c| c.node_id == "n-fast"));
+
+        // 5. 2nd consecutive FullHealthy lifts cooldown into half-penalty probation (penalty = 80.0):
+        //    `n-fast` re-enters healthy_candidates, yet stays behind `n-steady` so it does not flap!
+        let t4 = t3 + Duration::from_secs(65);
+        pool.record_probe_result("n-fast", RuntimeDualHealth::FullHealthy, Some(30.0), t4);
+        assert_eq!(pool.get("n-fast").unwrap().probation_remaining, 1);
+        let rep4 = evaluate_group_candidates_with_runtime(&group, &nodes, &snaps, Some(&pool), t4)
+            .unwrap();
+        assert!(rep4.healthy_candidates.iter().any(|c| c.node_id == "n-fast"));
+        assert_eq!(rep4.healthy_candidates[0].node_id, "n-steady");
+
+        // 6. 3rd FullHealthy clears probation -> `n-fast` recovers full weight and retakes #1.
+        let t5 = t4 + Duration::from_secs(65);
+        pool.record_probe_result("n-fast", RuntimeDualHealth::FullHealthy, Some(30.0), t5);
+        pool.record_probe_result("n-fast", RuntimeDualHealth::FullHealthy, Some(30.0), t5 + Duration::from_secs(20));
+        let rep5 = evaluate_group_candidates_with_runtime(
+            &group,
+            &nodes,
+            &snaps,
+            Some(&pool),
+            t5 + Duration::from_secs(25),
+        )
+        .unwrap();
+        assert_eq!(rep5.healthy_candidates[0].node_id, "n-fast");
+
+        // 7. All nodes fail into cooldown simultaneously -> `gate_passed` MUST still return all 3
+        //    as last-resort fallbacks, ordering the soonest-expiring cooldown first!
+        let t6_pre = t5 + Duration::from_secs(40);
+        pool.record_probe_result("n-fast", RuntimeDualHealth::Failed, None, t6_pre); // stage 1 -> 60s
+        let t6 = t6_pre + Duration::from_secs(65);
+        pool.record_probe_result("n-fast", RuntimeDualHealth::Failed, None, t6); // cooldown expired -> stage 2 -> 180s
+        pool.record_probe_result("n-steady", RuntimeDualHealth::Failed, None, t6); // stage 1 -> 60s
+        pool.record_probe_result("n-backup", RuntimeDualHealth::Failed, None, t6 + Duration::from_secs(5)); // stage 1 -> 60s (expires later than n-steady)
+
+        let rep_all_down = evaluate_group_candidates_with_runtime(
+            &group,
+            &nodes,
+            &snaps,
+            Some(&pool),
+            t6 + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(rep_all_down.healthy_candidates.is_empty());
+        assert_eq!(rep_all_down.gate_passed.len(), 3);
+        assert_eq!(rep_all_down.gate_passed[0].node_id, "n-steady");
+        assert_eq!(rep_all_down.gate_passed[2].node_id, "n-fast");
     }
 }

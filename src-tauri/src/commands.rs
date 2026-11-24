@@ -39,8 +39,11 @@ use catcloud_core::preaccel::campus::{
     CampusBypassTracker, CampusPortalState, probe_campus_portal_with_fallback,
 };
 use catcloud_core::preaccel::global_tunnel::{GlobalPreAccelManager, GlobalPreAccelStatus};
-#[cfg(target_os = "windows")]
-use catcloud_core::preaccel::global_tunnel::download_and_install_windivert;
+#[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+use catcloud_core::preaccel::global_tunnel::{
+    build_default_windivert_proxy_candidates, download_and_install_windivert_with_fallbacks,
+    locate_windivert_files,
+};
 use catcloud_core::probe::{
     DEFAULT_READY_TIMEOUT, FunnelOptions, FunnelTier, IsolatedProbeCore, ProbeRegistry,
     ThroughputProbeConfig, build_isolated_http_client, probe_live_google_cleanliness,
@@ -51,7 +54,12 @@ use catcloud_core::process_guard::JobGuard;
 #[cfg(target_os = "windows")]
 use catcloud_core::process_guard::relaunch_self_as_admin;
 use catcloud_core::storage::Storage;
-use catcloud_core::strategy::evaluator::evaluate_group_candidates;
+use catcloud_core::strategy::evaluator::evaluate_group_candidates_with_runtime;
+use catcloud_core::strategy::health_pool::{NodeHealthHintDto, NodeHealthPool, RuntimeDualHealth};
+use catcloud_core::subscription::live_capture::{
+    DesktopAppCandidate, LiveCaptureManager, LiveCaptureOutcomeDto, LiveCaptureStartDto,
+    LiveCaptureStatusDto, list_desktop_app_candidates as core_list_desktop_app_candidates,
+};
 use catcloud_core::subscription::{
     ADAPTER_REASON_MANUAL, AdapterConfig, AdapterCooldownGuard, AdapterRequest, FetchOptions,
     ParsedSubscription, SubscriptionPayloadFormat, apply_parsed_subscription,
@@ -84,6 +92,18 @@ pub const EVENT_TUN_NEEDS_ADMIN: &str = "catcloud://tun-needs-admin";
 pub const EVENT_STRATEGY_SWITCH: &str = "catcloud://strategy-switch";
 pub const EVENT_CONFIG_UPDATED: &str = "catcloud://config-updated";
 
+/// Physical-pixel anchor tracked during custom Win32 floating capsule dragging (zero HTCAPTION / Aero Snap).
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub struct CapsuleDragAnchor {
+    pub rx: f64,
+    pub ry: f64,
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub width: i32,
+    pub height: i32,
+}
+
 /// Shared backend state managed by Tauri across commands, tray callbacks, streams, and shortcuts.
 pub struct AppState {
     pub paths: AppPaths,
@@ -91,6 +111,11 @@ pub struct AppState {
     pub storage: Mutex<Storage>,
     pub job_guard: Arc<JobGuard>,
     pub global_preaccel: Arc<GlobalPreAccelManager>,
+    pub live_capture: Arc<LiveCaptureManager>,
+    pub refreshing_sub_ids: Mutex<HashSet<String>>,
+    pub capsule_drag: Mutex<Option<CapsuleDragAnchor>>,
+    pub node_health_pool: Arc<RwLock<NodeHealthPool>>,
+    pub windivert_installing: Arc<AtomicBool>,
     pub adapter: Arc<MihomoAdapter>,
     pub hot_reload: Arc<HotReloadCoordinator>,
     pub telemetry: Arc<CoreTelemetryStore>,
@@ -105,6 +130,7 @@ pub struct AppState {
     pub last_hotkey_bindings: Mutex<Option<ShortcutBindings>>,
     pub adapter_cooldown: Arc<AdapterCooldownGuard>,
     pub shutting_down: Arc<AtomicBool>,
+    pub config_transition_lock: Arc<tokio::sync::Mutex<()>>,
     pub core_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub update_staging_lock: Arc<tokio::sync::Mutex<()>>,
     pub system_proxy_lock: Arc<std::sync::Mutex<()>>,
@@ -174,10 +200,11 @@ pub fn summarize_connections(
 impl AppState {
     pub fn new(
         paths: AppPaths,
-        cfg: AppConfig,
+        mut cfg: AppConfig,
         storage: Storage,
         job_guard: Arc<JobGuard>,
     ) -> Self {
+        cfg.preaccel.reconcile_unified_enabled();
         let adapter = Arc::new(
             MihomoAdapter::new(Arc::clone(&job_guard))
                 .expect("failed to initialize MihomoAdapter"),
@@ -186,6 +213,7 @@ impl AppState {
             paths.clone(),
             Arc::clone(&job_guard),
         ));
+        let live_capture = Arc::new(LiveCaptureManager::new());
         let hot_reload = Arc::new(HotReloadCoordinator::new(paths.clone(), Arc::clone(&adapter)));
         let telemetry = Arc::new(CoreTelemetryStore::default());
         let app_logger = Arc::new(RotatingAppLogger::new(paths.logs_dir.clone()));
@@ -196,6 +224,11 @@ impl AppState {
             storage: Mutex::new(storage),
             job_guard,
             global_preaccel,
+            live_capture,
+            refreshing_sub_ids: Mutex::new(HashSet::new()),
+            capsule_drag: Mutex::new(None),
+            node_health_pool: Arc::new(RwLock::new(NodeHealthPool::new())),
+            windivert_installing: Arc::new(AtomicBool::new(false)),
             adapter,
             hot_reload,
             telemetry,
@@ -210,6 +243,7 @@ impl AppState {
             last_hotkey_bindings: Mutex::new(None),
             adapter_cooldown: Arc::new(AdapterCooldownGuard::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            config_transition_lock: Arc::new(tokio::sync::Mutex::new(())),
             core_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             update_staging_lock: Arc::new(tokio::sync::Mutex::new(())),
             system_proxy_lock: Arc::new(std::sync::Mutex::new(())),
@@ -403,6 +437,135 @@ impl AppState {
             }
         }
     }
+
+    pub fn record_node_health_probe(
+        &self,
+        node_id: &str,
+        health: RuntimeDualHealth,
+        raw_latency_ms: Option<f64>,
+    ) {
+        if let Ok(mut pool) = self.node_health_pool.write() {
+            pool.record_probe_result(node_id, health, raw_latency_ms, Instant::now());
+        }
+    }
+
+    pub fn reset_node_health(&self, node_id: &str) {
+        if let Ok(mut pool) = self.node_health_pool.write() {
+            pool.reset_node(node_id);
+        }
+    }
+
+    /// Resolve the freshest latency for `node_id`: prefers live runtime probes in `node_health_pool`
+    /// (while clearing stale DB latency when the latest confirmed runtime check failed), falling back
+    /// to SQLite `ProbeSnapshot.latency_ms` when untracked.
+    pub fn resolve_node_latency_ms(
+        &self,
+        node_id: &str,
+        snap: Option<&ProbeSnapshot>,
+    ) -> Option<f64> {
+        let trimmed = node_id.trim();
+        if !trimmed.is_empty() {
+            if let Ok(pool) = self.node_health_pool.read() {
+                if let Some(entry) = pool.get(trimmed) {
+                    if entry.last_health == Some(RuntimeDualHealth::Failed) {
+                        return None;
+                    }
+                    if let Some(live_ms) = pool.live_latency_ms(trimmed) {
+                        return Some(live_ms);
+                    }
+                }
+            }
+        }
+        snap.and_then(|s| s.latency_ms)
+    }
+
+    pub fn snapshot_node_health_pool(&self) -> NodeHealthPool {
+        self.node_health_pool
+            .read()
+            .map(|pool| pool.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn snapshot_node_health_hints(&self) -> HashMap<String, NodeHealthHintDto> {
+        self.node_health_pool
+            .read()
+            .map(|pool| pool.build_hints_snapshot(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    pub fn clear_node_health_pool(&self) {
+        if let Ok(mut pool) = self.node_health_pool.write() {
+            *pool = NodeHealthPool::new();
+        }
+    }
+
+    pub fn prune_node_health_pool(&self, valid_ids: &HashSet<String>) {
+        if let Ok(mut pool) = self.node_health_pool.write() {
+            pool.prune_missing_nodes(valid_ids);
+        }
+    }
+}
+
+/// RAII guard preventing concurrent duplicate refreshes of the same subscription ID.
+struct SubRefreshGuard<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    sub_id: String,
+}
+
+impl<'a> SubRefreshGuard<'a> {
+    fn try_acquire(set: &'a Mutex<HashSet<String>>, sub_id: String) -> Option<Self> {
+        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.insert(sub_id.clone()) {
+            Some(Self { set, sub_id })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for SubRefreshGuard<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.set.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(&self.sub_id);
+    }
+}
+
+/// RAII guard clearing an `Arc<AtomicBool>` flag on drop (even on early return or panic).
+#[cfg_attr(
+    not(all(target_os = "windows", not(target_arch = "aarch64"))),
+    allow(dead_code)
+)]
+struct AtomicFlagResetGuard(Arc<AtomicBool>);
+
+impl Drop for AtomicFlagResetGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+fn prune_node_health_pool_from_db(state: &AppState) {
+    let valid: Option<(Option<HashSet<String>>, Option<HashSet<String>>)> =
+        state.storage.lock().ok().map(|db| {
+            let node_ids = db
+                .list_nodes()
+                .ok()
+                .map(|nodes| nodes.into_iter().map(|n| n.id).collect());
+            let group_ids = db
+                .list_multi_groups()
+                .ok()
+                .map(|groups| groups.into_iter().map(|g| g.id).collect());
+            (node_ids, group_ids)
+        });
+    if let Some((node_ids, group_ids)) = valid {
+        if let Ok(mut pool) = state.node_health_pool.write() {
+            if let Some(ids) = node_ids {
+                pool.prune_missing_nodes(&ids);
+            }
+            if let Some(gids) = group_ids {
+                pool.prune_missing_groups(&gids);
+            }
+        }
+    }
 }
 
 /// Compact frontend-facing config DTO bidirectionally mapped onto full `AppConfig`.
@@ -510,7 +673,7 @@ impl From<&AppConfig> for UiAppConfigDto {
                 probe_url: cfg.preaccel.probe_url.clone(),
                 fallback_probe_url: cfg.preaccel.fallback_probe_url.clone(),
                 campus_portal_guard: Some(cfg.preaccel.campus_portal_guard),
-                global_bypass_enabled: Some(cfg.preaccel.global_bypass_enabled),
+                global_bypass_enabled: Some(cfg.preaccel.enabled),
                 global_scope: Some(cfg.preaccel.global_scope),
                 global_target_processes: Some(cfg.preaccel.global_target_processes.clone()),
                 windivert_dir: cfg.preaccel.windivert_dir.clone(),
@@ -575,10 +738,7 @@ fn apply_ui_dto(cfg: &mut AppConfig, dto: &UiAppConfigDto) {
             .preaccel
             .campus_portal_guard
             .unwrap_or(cfg.preaccel.campus_portal_guard),
-        global_bypass_enabled: dto
-            .preaccel
-            .global_bypass_enabled
-            .unwrap_or(cfg.preaccel.global_bypass_enabled),
+        global_bypass_enabled: dto.preaccel.enabled,
         global_scope: dto
             .preaccel
             .global_scope
@@ -601,6 +761,7 @@ fn apply_ui_dto(cfg: &mut AppConfig, dto: &UiAppConfigDto) {
         },
         ..cfg.preaccel.clone()
     };
+    cfg.preaccel.sync_unified_enabled(dto.preaccel.enabled);
     cfg.personalization = PersonalizationConfig {
         theme_mode: dto.personalization.theme_mode.clone(),
         day_schedule: ThemeDaySchedule {
@@ -660,6 +821,12 @@ pub struct CoreRuntimeInfoDto {
     pub global_preaccel_socks_port: Option<u16>,
     #[serde(default)]
     pub global_preaccel_connections: u64,
+    #[serde(default)]
+    pub global_windivert_active: bool,
+    #[serde(default)]
+    pub preaccel_install_state: String,
+    #[serde(default)]
+    pub node_health_hints: HashMap<String, NodeHealthHintDto>,
     pub preaccel_relay_name: Option<String>,
     pub captive_portal_required: bool,
     pub system_proxy_enabled: bool,
@@ -865,10 +1032,29 @@ pub fn pick_best_group_candidate(
     snaps: &HashMap<String, ProbeSnapshot>,
     exclude_node_id: Option<&str>,
 ) -> Option<String> {
+    pick_best_group_candidate_with_runtime(
+        group,
+        nodes,
+        snaps,
+        exclude_node_id,
+        None,
+        Instant::now(),
+    )
+}
+
+pub fn pick_best_group_candidate_with_runtime(
+    group: &MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    exclude_node_id: Option<&str>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
+) -> Option<String> {
     let excluded = exclude_node_id.map(str::trim).filter(|s| !s.is_empty());
     let allowed = |id: &str| excluded != Some(id) && is_valid_group_member(group, id, nodes);
 
-    if let Ok(report) = evaluate_group_candidates(group, nodes, snaps) {
+    if let Ok(report) = evaluate_group_candidates_with_runtime(group, nodes, snaps, health_pool, now)
+    {
         if let Some(best) = report
             .healthy_candidates
             .iter()
@@ -883,7 +1069,7 @@ pub fn pick_best_group_candidate(
         {
             return Some(best.node_id.clone());
         }
-        if !group.hard_gates.is_empty() {
+        if !group.hard_gates.is_empty() || health_pool.is_some() {
             if let Some(best) = report.gate_passed.iter().find(|c| allowed(&c.node_id)) {
                 return Some(best.node_id.clone());
             }
@@ -992,6 +1178,9 @@ fn collect_ranked_group_candidates(
     snaps: &HashMap<String, ProbeSnapshot>,
     active_node_id: Option<&str>,
     cooldown_node_ids: &HashSet<String>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
+    exclude_pool_cooldowns: bool,
     max_candidates: usize,
 ) -> Vec<String> {
     if max_candidates == 0 {
@@ -1001,6 +1190,7 @@ fn collect_ranked_group_candidates(
     let allowed = |id: &str| {
         active_trimmed != Some(id)
             && !cooldown_node_ids.contains(id)
+            && !(exclude_pool_cooldowns && health_pool.is_some_and(|p| p.is_in_cooldown(id, now)))
             && is_valid_group_member(group, id, nodes)
     };
 
@@ -1016,7 +1206,8 @@ fn collect_ranked_group_candidates(
         out.len() >= max_candidates
     };
 
-    if let Ok(report) = evaluate_group_candidates(group, nodes, snaps) {
+    if let Ok(report) = evaluate_group_candidates_with_runtime(group, nodes, snaps, health_pool, now)
+    {
         // Tier 1: highest-scoring healthy candidates.
         for c in &report.healthy_candidates {
             if push_if_allowed(&c.node_id) {
@@ -1029,8 +1220,9 @@ fn collect_ranked_group_candidates(
                 return out;
             }
         }
-        // Tier 3: remaining gate-passing candidates when static hard gates are configured.
-        if !group.hard_gates.is_empty() {
+        // Tier 3: remaining gate-passing candidates when static hard gates are configured
+        // or a runtime health pool is active (preserving shortest-cooldown fallback order).
+        if !group.hard_gates.is_empty() || health_pool.is_some() {
             for c in &report.gate_passed {
                 if push_if_allowed(&c.node_id) {
                     return out;
@@ -1108,14 +1300,16 @@ fn collect_ranked_group_candidates(
 
 /// Rank up to `max_candidates` backup nodes for watchdog failover using the same 5-tier priority
 /// order as `pick_best_group_candidate`, excluding both `active_node_id` and nodes currently in
-/// `cooldown_node_ids`. If every non-active member is in cooldown, relaxes the cooldown filter as a
-/// last resort while still excluding `active_node_id`.
-pub(crate) fn pick_group_candidates_with_cooldown(
+/// `cooldown_node_ids` or active runtime cooldown in `health_pool`. If every non-active member is
+/// in cooldown, relaxes the cooldown filter as a last resort while still excluding `active_node_id`.
+pub(crate) fn pick_group_candidates_with_cooldown_and_runtime(
     group: &MultiGroup,
     nodes: &[ProxyNode],
     snaps: &HashMap<String, ProbeSnapshot>,
     active_node_id: Option<&str>,
     cooldown_node_ids: &HashSet<String>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
     max_candidates: usize,
 ) -> Vec<String> {
     let ranked = collect_ranked_group_candidates(
@@ -1124,24 +1318,73 @@ pub(crate) fn pick_group_candidates_with_cooldown(
         snaps,
         active_node_id,
         cooldown_node_ids,
+        health_pool,
+        now,
+        true,
         max_candidates,
     );
-    if !ranked.is_empty() || cooldown_node_ids.is_empty() {
+    if !ranked.is_empty() {
+        return ranked;
+    }
+    let has_any_cooldown = !cooldown_node_ids.is_empty()
+        || health_pool.is_some_and(|p| !p.is_empty());
+    if !has_any_cooldown {
         return ranked;
     }
     let empty = HashSet::new();
-    collect_ranked_group_candidates(group, nodes, snaps, active_node_id, &empty, max_candidates)
+    collect_ranked_group_candidates(
+        group,
+        nodes,
+        snaps,
+        active_node_id,
+        &empty,
+        health_pool,
+        now,
+        false,
+        max_candidates,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn pick_group_candidates_with_cooldown(
+    group: &MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    active_node_id: Option<&str>,
+    cooldown_node_ids: &HashSet<String>,
+    max_candidates: usize,
+) -> Vec<String> {
+    pick_group_candidates_with_cooldown_and_runtime(
+        group,
+        nodes,
+        snaps,
+        active_node_id,
+        cooldown_node_ids,
+        None,
+        Instant::now(),
+        max_candidates,
+    )
 }
 
 /// Sanitize a group's `active_node_id`: when `!group.member_node_ids.is_empty()` and
 /// `group.active_node_id` is missing, removed from `member_node_ids`, or disabled, replace it
-/// with the highest-scoring gate-passing candidate via `evaluate_group_candidates` (falling back
-/// to the first enabled member, or `None` if no enabled member exists).
+/// with the highest-scoring gate-passing candidate via `evaluate_group_candidates_with_runtime`
+/// (falling back to the first enabled member, or `None` if no enabled member exists).
 /// Returns `true` if `group.active_node_id` was modified.
 pub fn sanitize_group_active_node(
     group: &mut MultiGroup,
     nodes: &[ProxyNode],
     snaps: &HashMap<String, ProbeSnapshot>,
+) -> bool {
+    sanitize_group_active_node_with_runtime(group, nodes, snaps, None, Instant::now())
+}
+
+pub fn sanitize_group_active_node_with_runtime(
+    group: &mut MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
 ) -> bool {
     if !group.member_node_ids.is_empty() {
         let current_valid = group
@@ -1151,7 +1394,7 @@ pub fn sanitize_group_active_node(
         if current_valid {
             return false;
         }
-        let next = pick_best_group_candidate(group, nodes, snaps, None);
+        let next = pick_best_group_candidate_with_runtime(group, nodes, snaps, None, health_pool, now);
         if group.active_node_id != next {
             group.active_node_id = next;
             return true;
@@ -1162,7 +1405,8 @@ pub fn sanitize_group_active_node(
     // Even for dynamic/empty-member groups, clear stale references to deleted or disabled nodes.
     if let Some(active_id) = group.active_node_id.as_deref() {
         if !is_valid_group_member(group, active_id, nodes) {
-            let next = pick_best_group_candidate(group, nodes, snaps, None);
+            let next =
+                pick_best_group_candidate_with_runtime(group, nodes, snaps, None, health_pool, now);
             if group.active_node_id != next {
                 group.active_node_id = next;
                 return true;
@@ -1182,16 +1426,27 @@ struct ReconcileSwitchDecision {
 }
 
 /// Pure strategy reconciler for a multi-group:
-/// 1. Always clears ghost/invalid `active_node_id` via `sanitize_group_active_node`.
+/// 1. Always clears ghost/invalid `active_node_id` via `sanitize_group_active_node_with_runtime`.
 /// 2. For `StickyBest` / `ConditionalPool` groups, if the current active node is unprobed,
 ///    failed/disconnected, or violates hard gates while a gate-passing healthy candidate exists,
 ///    switches to the top-ranked candidate.
 /// 3. Respects sticky user choice: if the current active node is already in-group, probed,
 ///    connected, and passes all hard gates, leaves it untouched to prevent IP drift.
+#[cfg_attr(not(test), allow(dead_code))]
 fn reconcile_group_best_node_in_memory(
     group: &mut MultiGroup,
     nodes: &[ProxyNode],
     snaps: &HashMap<String, ProbeSnapshot>,
+) -> Option<ReconcileSwitchDecision> {
+    reconcile_group_best_node_in_memory_with_runtime(group, nodes, snaps, None, Instant::now())
+}
+
+fn reconcile_group_best_node_in_memory_with_runtime(
+    group: &mut MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    health_pool: Option<&NodeHealthPool>,
+    now: Instant,
 ) -> Option<ReconcileSwitchDecision> {
     let prev_id = group.active_node_id.clone();
     let prev_name = prev_id
@@ -1206,7 +1461,7 @@ fn reconcile_group_best_node_in_memory(
         .is_some_and(|id| is_valid_group_member(group, id, nodes));
 
     if !current_valid {
-        sanitize_group_active_node(group, nodes, snaps);
+        sanitize_group_active_node_with_runtime(group, nodes, snaps, health_pool, now);
         if let Some(to_id) = group.active_node_id.clone() {
             if prev_id.as_deref() != Some(to_id.as_str()) {
                 let to_name = nodes
@@ -1234,7 +1489,9 @@ fn reconcile_group_best_node_in_memory(
     }
 
     let cur_id = prev_id.as_deref()?;
-    let Ok(report) = evaluate_group_candidates(group, nodes, snaps) else {
+    let Ok(report) =
+        evaluate_group_candidates_with_runtime(group, nodes, snaps, health_pool, now)
+    else {
         return None;
     };
 
@@ -1260,9 +1517,14 @@ fn reconcile_group_best_node_in_memory(
     }
 
     let cur_snap = snaps.get(cur_id);
+    let cur_runtime_healthy = health_pool
+        .and_then(|p| p.get(cur_id))
+        .is_some_and(|h| {
+            h.last_health == Some(RuntimeDualHealth::FullHealthy) && !h.is_in_cooldown(now)
+        });
     let assessment = report.active_assessment.as_ref();
 
-    let reason = if cur_snap.is_none() {
+    let reason = if cur_snap.is_none() && !cur_runtime_healthy {
         "当前节点尚未测速，已自动选用组内最优合格节点"
     } else if assessment.map_or(cur_snap.is_some_and(|s| !s.ok), |a| a.is_disconnected) {
         "当前节点测速未通过，已自动切换至组内最优健康节点"
@@ -1402,8 +1664,8 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
                     up_mbps_x100: snap
                         .and_then(|s| s.up_mbps)
                         .map(|v| (v.max(0.0) * 100.0).round() as u32),
-                    ping_ms: snap
-                        .and_then(|s| s.latency_ms)
+                    ping_ms: state
+                        .resolve_node_latency_ms(&n.id, snap)
                         .map(|v| v.max(0.0).round() as u32),
                     selected: !in_single_mode && effective_selected_id == Some(n.id.as_str()),
                 }
@@ -1466,13 +1728,26 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
     let rt = state.snapshot_runtime();
     let global_status = state.snapshot_global_preaccel();
     let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
-    let global_mode_label = if global_status.running {
-        if proxy_active && cfg.preaccel.enabled {
+    let global_mode_label = if !cfg.preaccel.enabled && !global_status.running {
+        None
+    } else if proxy_active && cfg.preaccel.enabled {
+        if global_status.is_windivert_active {
             Some("dual".to_string())
         } else {
-            Some(global_status.mode.clone())
+            None
         }
-    } else if cfg.preaccel.enabled && !proxy_active {
+    } else if global_status.is_windivert_active {
+        Some("windivert".to_string())
+    } else if matches!(
+        global_status.install_state.as_str(),
+        "downloading" | "verifying"
+    ) {
+        Some("downloading".to_string())
+    } else if global_status.install_state == "need_elevation" {
+        Some("need_elevation".to_string())
+    } else if global_status.running {
+        Some("local_socks5".to_string())
+    } else if cfg.preaccel.enabled {
         Some("standby".to_string())
     } else {
         None
@@ -1496,8 +1771,8 @@ pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState
             enabled: cfg.preaccel.enabled,
             active_label: active_relay_label,
             relays: tray_relays,
-            global_enabled: cfg.preaccel.global_bypass_enabled,
-            global_running: global_status.running,
+            global_enabled: cfg.preaccel.enabled,
+            global_running: global_status.is_windivert_active,
             global_mode_label,
         },
         subscriptions: TraySubscriptionSummary {
@@ -1532,26 +1807,13 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         TrayIconMode::AlwaysC => tray::TrayIconMode::AlwaysC,
         TrayIconMode::AlwaysPixel => tray::TrayIconMode::AlwaysPixel,
     };
-    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
-    let preaccel_active = (proxy_active && cfg.preaccel.enabled) || global_status.running;
-    let health = if rt.last_error.is_some() {
-        TrayHealthState::Error
-    } else if portal_required {
-        TrayHealthState::Warn
-    } else if preaccel_active {
-        TrayHealthState::PreAccel
-    } else if proxy_active {
-        TrayHealthState::Ok
-    } else {
-        TrayHealthState::Idle
-    };
-
-    let (primary_group_summary, configured_relay_name) = state
+    let (primary_group_summary, configured_relay_name, has_enabled_relays) = state
         .storage
         .lock()
         .ok()
         .map(|db| {
             let relays = db.list_preaccel_relays(true).unwrap_or_default();
+            let has_relays = !relays.is_empty();
             let relay_name = cfg
                 .preaccel
                 .active_relay_id
@@ -1584,9 +1846,24 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
                     .unwrap_or_else(|| "自动择优".to_string());
                 Some(format!("{} -> {}", g.name, node_name))
             })();
-            (group_summary, relay_name)
+            (group_summary, relay_name, has_relays)
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, false));
+
+    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
+    let preaccel_active = (proxy_active && cfg.preaccel.enabled && has_enabled_relays)
+        || global_status.is_windivert_active;
+    let health = if rt.last_error.is_some() {
+        TrayHealthState::Error
+    } else if portal_required {
+        TrayHealthState::Warn
+    } else if preaccel_active {
+        TrayHealthState::PreAccel
+    } else if proxy_active {
+        TrayHealthState::Ok
+    } else {
+        TrayHealthState::Idle
+    };
 
     let active_relay_name = global_status
         .active_relays
@@ -1594,29 +1871,37 @@ pub fn build_tray_visual_state(state: &AppState) -> TrayVisualState {
         .cloned()
         .or(configured_relay_name);
 
-    let preaccel_summary = if global_status.running {
-        if global_status.mode == "windivert" {
-            let prefix = if proxy_active && cfg.preaccel.enabled {
-                "全局+代理提速中"
-            } else {
-                "底层全局提速中"
-            };
-            match active_relay_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(relay) => Some(format!("{prefix} · {relay}")),
-                None => Some(prefix.to_string()),
-            }
-        } else if let Some(port) = global_status.socks_port {
-            Some(format!("本地443通道 (127.0.0.1:{port})"))
+    let preaccel_summary = if proxy_active && cfg.preaccel.enabled && has_enabled_relays {
+        let prefix = if global_status.is_windivert_active {
+            "全局+代理提速中"
         } else {
-            Some("本地443通道就绪".to_string())
-        }
-    } else if proxy_active && cfg.preaccel.enabled {
+            "国内提速中"
+        };
         match active_relay_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            Some(relay) => Some(format!("国内加速中 · {relay}")),
-            None => Some("国内加速入口运行中".to_string()),
+            Some(relay) => Some(format!("{prefix} · {relay}")),
+            None => Some(prefix.to_string()),
+        }
+    } else if global_status.is_windivert_active {
+        match active_relay_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(relay) => Some(format!("全局提速中 · {relay}")),
+            None => Some("全局提速中".to_string()),
+        }
+    } else if cfg.preaccel.enabled
+        && matches!(
+            global_status.install_state.as_str(),
+            "downloading" | "verifying"
+        )
+    {
+        Some("正在准备提速组件…".to_string())
+    } else if cfg.preaccel.enabled && global_status.install_state == "need_elevation" {
+        Some("需管理员权限启用全局提速".to_string())
+    } else if global_status.running {
+        match global_status.socks_port {
+            Some(port) => Some(format!("本地443通道待命 (127.0.0.1:{port})")),
+            None => Some("本地443通道待命".to_string()),
         }
     } else if cfg.preaccel.enabled {
-        Some("国内加速已开启（待启动）".to_string())
+        Some("国内提速已开启（待启动）".to_string())
     } else {
         None
     };
@@ -1778,7 +2063,12 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
 
     let global_status = state.snapshot_global_preaccel();
     let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
-    let preaccel_active = (proxy_active && cfg.preaccel.enabled) || global_status.running;
+    let has_enabled_relays = !relays.is_empty();
+    let preaccel_active = (proxy_active && cfg.preaccel.enabled && has_enabled_relays)
+        || global_status.is_windivert_active;
+    let active_node_latency_ms =
+        state.resolve_node_latency_ms(&active_node_id, active_snap.as_ref());
+    let node_health_hints = state.snapshot_node_health_hints();
 
     let active_relay_name = global_status
         .active_relays
@@ -1841,7 +2131,7 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         active_node_id,
         active_node_name,
         active_node_region,
-        active_node_latency_ms: active_snap.as_ref().and_then(|s| s.latency_ms),
+        active_node_latency_ms,
         active_node_up_mbps: active_snap.as_ref().and_then(|s| s.up_mbps),
         preaccel_active,
         preaccel_enabled: cfg.preaccel.enabled,
@@ -1849,6 +2139,9 @@ pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, St
         global_preaccel_mode: global_status.mode,
         global_preaccel_socks_port: global_status.socks_port,
         global_preaccel_connections: global_status.active_connections,
+        global_windivert_active: global_status.is_windivert_active,
+        preaccel_install_state: global_status.install_state,
+        node_health_hints,
         preaccel_relay_name: active_relay_name,
         captive_portal_required: portal_required,
         system_proxy_enabled: cfg.system_proxy.enabled,
@@ -2470,6 +2763,8 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
                 .and_then(|aid| groups.iter().find(|g| g.id == aid).map(|g| g.id.clone()))
                 .or_else(|| groups.first().map(|g| g.id.clone()));
 
+            let health_pool = state.snapshot_node_health_pool();
+            let now = Instant::now();
             for group in &mut groups {
                 let prev_active = group.active_node_id.clone();
                 let is_target =
@@ -2479,14 +2774,38 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
                         .get_probe_snapshots_batch(&node_ids, Some(probe_id.as_str()))
                         .unwrap_or_else(|_| default_snaps.clone());
                     if is_target {
-                        let _ = reconcile_group_best_node_in_memory(group, &nodes, &group_snaps);
+                        let _ = reconcile_group_best_node_in_memory_with_runtime(
+                            group,
+                            &nodes,
+                            &group_snaps,
+                            Some(&health_pool),
+                            now,
+                        );
                     } else {
-                        let _ = sanitize_group_active_node(group, &nodes, &group_snaps);
+                        let _ = sanitize_group_active_node_with_runtime(
+                            group,
+                            &nodes,
+                            &group_snaps,
+                            Some(&health_pool),
+                            now,
+                        );
                     }
                 } else if is_target {
-                    let _ = reconcile_group_best_node_in_memory(group, &nodes, &default_snaps);
+                    let _ = reconcile_group_best_node_in_memory_with_runtime(
+                        group,
+                        &nodes,
+                        &default_snaps,
+                        Some(&health_pool),
+                        now,
+                    );
                 } else {
-                    let _ = sanitize_group_active_node(group, &nodes, &default_snaps);
+                    let _ = sanitize_group_active_node_with_runtime(
+                        group,
+                        &nodes,
+                        &default_snaps,
+                        Some(&health_pool),
+                        now,
+                    );
                 }
                 if group.active_node_id != prev_active {
                     let _ = db.upsert_multi_group(group);
@@ -2651,25 +2970,43 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         tracing::warn!("核心启动后同步系统代理端口失败：{err}");
     }
 
-    // Coordinate with standalone global pre-acceleration: when CatCloud's primary core takes over
-    // host traffic via system proxy or TUN, suspend the standalone 443 tunnel by default so we do
-    // not run two redundant 443 Mihomo tunnels (preserving `global_bypass_enabled` for clean
-    // hand-back if the primary core is stopped later). Otherwise, if the standalone global engine
-    // remains running alongside an idle/mixed-port-only primary core, synchronize the new main
-    // core PID so WinDivert excludes CatCloud's own `mihomo` process.
+    // Coordinate with standalone global pre-acceleration:
+    // - When TUN is active on the main core, TUN already captures all host traffic into the main
+    //   core's in-core 443 pre-acceleration, so pause the redundant standalone 443 tunnel.
+    // - When running without TUN (system proxy only or idle), WinDivert excludes CatCloud's entire
+    //   PID tree (including the main core) with zero self-loop, so keep the standalone engine
+    //   running (or start it if the unified domestic pre-acceleration switch is enabled) to
+    //   simultaneously accelerate third-party proxy cores and CLI tools.
     let latest_cfg = state.snapshot_config();
-    if is_proxy_takeover_active(status.running, &latest_cfg)
-        && state.global_preaccel.status().running
-    {
+    let tun_active = status.running && latest_cfg.tun.enabled;
+    if tun_active && state.global_preaccel.status().running {
         let _ = state.global_preaccel.stop().await;
         state.log_app_event(
             "info",
             "国内提速",
-            "主代理核心已启动接管流量，已暂挂独立底层 443 隧道以避免重复占用内存，改由主核心统一提供国内提速",
+            "虚拟网卡（TUN）已启动接管全机流量，已暂挂独立底层 443 隧道以避免重复占用内存，改由主核心统一提供国内提速",
         );
-    } else if state.global_preaccel.status().running {
-        let main_pid = status.pid.filter(|&p| p > 0);
+    } else {
+        let main_pid = if status.running {
+            status.pid.filter(|&p| p > 0)
+        } else {
+            None
+        };
         state.global_preaccel.sync_main_core_pid(main_pid);
+        if !state.shutting_down.load(Ordering::SeqCst)
+            && latest_cfg.preaccel.enabled
+            && !tun_active
+            && load_enabled_preaccel_relays(state).is_ok_and(|relays| !relays.is_empty())
+        {
+            if !state.global_preaccel.status().running {
+                if let Err(err) = start_global_preaccel_engine(state, &latest_cfg).await {
+                    tracing::debug!(
+                        "start_core_locked standalone global preaccel sync skipped: {err}"
+                    );
+                }
+            }
+            maybe_spawn_auto_windivert_download(app, state, &latest_cfg);
+        }
     }
 
     sync_app_side_effects(app, state, &latest_cfg);
@@ -2701,6 +3038,7 @@ async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
         .await
         .map_err(|e| format!("停止旧代理核心失败：{e}"))?;
     state.global_preaccel.sync_main_core_pid(None);
+    state.clear_node_health_pool();
     state.bump_core_session_generation();
     state.telemetry.clear_traffic();
     state.set_node_proxy_name_map(HashMap::new());
@@ -2738,8 +3076,22 @@ async fn stop_core_locked(
         }
     }
 
-    if let Err(err) = clear_system_proxy_if_owned_with_hint(state, was_sys_proxy_enabled) {
-        tracing::warn!("停止核心前清除系统代理失败：{err}");
+    let mut clear_proxy_err: Option<String> = None;
+    if let Err(first_err) = clear_system_proxy_if_owned_with_hint(state, was_sys_proxy_enabled) {
+        tracing::warn!("停止核心前首次清除系统代理失败，将在 150ms 后重试：{first_err}");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        if let Err(retry_err) =
+            clear_system_proxy_if_owned_with_hint(state, was_sys_proxy_enabled)
+        {
+            state.log_app_event(
+                "error",
+                "系统代理",
+                &format!(
+                    "停止核心前清除操作系统代理失败（已重试 1 次），请检查系统代理设置：{retry_err}"
+                ),
+            );
+            clear_proxy_err = Some(retry_err);
+        }
     }
 
     let save_err = if flags_changed {
@@ -2759,11 +3111,17 @@ async fn stop_core_locked(
         msg
     })?;
     state.global_preaccel.sync_main_core_pid(None);
+    state.clear_node_health_pool();
     state.bump_core_session_generation();
     state.telemetry.clear_traffic();
     state.set_node_proxy_name_map(HashMap::new());
     state.set_compiled_group_ids(None);
-    let status = state.adapter.status().await;
+    let mut status = state.adapter.status().await;
+    if let Some(ref proxy_err) = clear_proxy_err {
+        if !state.shutting_down.load(Ordering::SeqCst) {
+            status.last_error = Some(format!("停止核心后清除系统代理失败：{proxy_err}"));
+        }
+    }
     state.update_cached_runtime(status);
     if let Ok(mut m) = state.cached_metrics.write() {
         *m = CachedRealtimeMetrics::default();
@@ -2781,34 +3139,44 @@ async fn stop_core_locked(
             timestamp_ms: Utc::now().timestamp_millis(),
         },
     );
-    state.log_app_event("info", "核心", "代理核心已停止，系统代理与虚拟网卡状态已复位");
+    if let Some(ref proxy_err) = clear_proxy_err {
+        state.log_app_event(
+            "warning",
+            "核心",
+            &format!("代理核心已停止，但自动清除系统代理失败，请检查系统代理设置：{proxy_err}"),
+        );
+    } else {
+        state.log_app_event("info", "核心", "代理核心已停止，系统代理与虚拟网卡状态已复位");
+    }
 
-    // If the user kept standalone global pre-acceleration enabled while stopping CatCloud's own
-    // proxy core, seamlessly resume the lightweight standalone 443 tunnel.
+    // If the unified domestic pre-acceleration switch remains enabled while stopping CatCloud's
+    // main proxy core, seamlessly keep or resume the lightweight standalone 443 tunnel.
     if !state.shutting_down.load(Ordering::SeqCst)
         && cfg.preaccel.enabled
-        && cfg.preaccel.global_bypass_enabled
-        && !state.global_preaccel.status().running
+        && load_enabled_preaccel_relays(state).is_ok_and(|relays| !relays.is_empty())
     {
-        match start_global_preaccel_engine(state, &cfg).await {
-            Ok(global_st) => {
-                state.log_app_event(
-                    "info",
-                    "国内提速",
-                    &format!(
-                        "主代理核心已停止，已自动切回独立底层全局国内提速（模式：{}）",
-                        global_st.mode
-                    ),
-                );
-            }
-            Err(err) => {
-                state.log_app_event(
-                    "warning",
-                    "国内提速",
-                    &format!("主核心停止后自动切回独立底层国内提速失败：{err}"),
-                );
+        if !state.global_preaccel.status().running {
+            match start_global_preaccel_engine(state, &cfg).await {
+                Ok(global_st) => {
+                    state.log_app_event(
+                        "info",
+                        "国内提速",
+                        &format!(
+                            "主代理核心已停止，已自动保持独立底层国内提速接棒（模式：{}）",
+                            global_st.mode
+                        ),
+                    );
+                }
+                Err(err) => {
+                    state.log_app_event(
+                        "warning",
+                        "国内提速",
+                        &format!("主核心停止后自动切回独立底层国内提速失败：{err}"),
+                    );
+                }
             }
         }
+        maybe_spawn_auto_windivert_download(app, state, &cfg);
     }
 
     sync_app_side_effects(app, state, &cfg);
@@ -2825,6 +3193,18 @@ pub async fn stop_core_internal(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<CoreRuntimeInfoDto, String> {
+    let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
+    stop_core_locked(app, state).await
+}
+
+/// Atomically disable OS system proxy and TUN virtual NIC, persist both flags as `false`, and
+/// terminate the main `mihomo` core with zero port/memory/connection residue (while keeping the
+/// lightweight standalone 443 pre-acceleration tunnel active if the unified switch is enabled).
+pub async fn disable_all_proxy_and_stop_core_internal(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CoreRuntimeInfoDto, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
     stop_core_locked(app, state).await
 }
@@ -2943,57 +3323,63 @@ pub async fn trigger_reload_if_running(
     Some(outcome)
 }
 
-/// Coordinate standalone global pre-acceleration whenever host traffic takeover (`proxy_active`)
-/// transitions between inactive and active:
-/// - `false -> true`: suspend a running standalone 443 tunnel to prevent running two 443 tunnels
-///   concurrently while preserving `global_bypass_enabled` for later hand-back.
-/// - `true -> false`: seamlessly resume the standalone global pre-acceleration engine when
-///   `cfg.preaccel.global_bypass_enabled` is true and enabled relays exist.
-async fn coordinate_global_preaccel_on_proxy_transition(
+/// Coordinate standalone global pre-acceleration whenever TUN virtual NIC takeover transitions
+/// between inactive and active:
+/// - `false -> true`: suspend a running standalone 443 tunnel because TUN already routes host
+///   traffic through the main core's in-core 443 pre-acceleration (avoiding two 443 tunnels).
+/// - `true -> false`: seamlessly resume the standalone global pre-acceleration engine when the
+///   unified `cfg.preaccel.enabled` switch is true and enabled relays exist.
+/// When only OS system proxy is active (without TUN), standalone WinDivert excludes CatCloud's
+/// full PID tree and stays active to accelerate third-party apps simultaneously.
+async fn coordinate_global_preaccel_on_tun_transition(
+    app: &AppHandle,
     state: &AppState,
     cfg: &AppConfig,
-    was_proxy_active: bool,
-    now_proxy_active: bool,
+    was_tun_active: bool,
+    now_tun_active: bool,
     trigger_label: &str,
 ) {
     if state.shutting_down.load(Ordering::SeqCst) {
         return;
     }
-    if !was_proxy_active && now_proxy_active {
+    if !was_tun_active && now_tun_active {
         if state.global_preaccel.status().running {
             let _ = state.global_preaccel.stop().await;
             state.log_app_event(
                 "info",
                 "国内提速",
                 &format!(
-                    "{trigger_label}已生效接管流量，已暂挂独立底层 443 隧道以避免双跑 443，改由主核心统一提供国内提速"
+                    "{trigger_label}已生效接管全机流量，已暂挂独立底层 443 隧道以避免双跑 443，改由主核心统一提供国内提速"
                 ),
             );
         }
-    } else if was_proxy_active && !now_proxy_active {
-        if cfg.preaccel.global_bypass_enabled
-            && !state.global_preaccel.status().running
-            && load_enabled_preaccel_relays(state).is_ok_and(|relays| !relays.is_empty())
-        {
+    } else if !now_tun_active && cfg.preaccel.enabled {
+        let has_relays = load_enabled_preaccel_relays(state).is_ok_and(|relays| !relays.is_empty());
+        if has_relays && !state.global_preaccel.status().running {
             match start_global_preaccel_engine(state, cfg).await {
                 Ok(global_st) => {
-                    state.log_app_event(
-                        "info",
-                        "国内提速",
-                        &format!(
-                            "{trigger_label}已关闭且主代理不再接管流量，已自动切回独立底层全局国内提速（模式：{}）",
-                            global_st.mode
-                        ),
-                    );
+                    if was_tun_active {
+                        state.log_app_event(
+                            "info",
+                            "国内提速",
+                            &format!(
+                                "{trigger_label}已关闭，已自动恢复独立底层国内提速（模式：{}）",
+                                global_st.mode
+                            ),
+                        );
+                    }
                 }
                 Err(err) => {
                     state.log_app_event(
                         "warning",
                         "国内提速",
-                        &format!("{trigger_label}关闭后自动切回独立底层全局国内提速失败：{err}"),
+                        &format!("{trigger_label}切换后自动恢复独立底层国内提速失败：{err}"),
                     );
                 }
             }
+        }
+        if has_relays {
+            maybe_spawn_auto_windivert_download(app, state, cfg);
         }
     }
 }
@@ -3001,39 +3387,60 @@ async fn coordinate_global_preaccel_on_proxy_transition(
 /// Apply system proxy state safely:
 /// - Turning ON checks for enabled nodes, auto-starts the core when stopped, validates reload,
 ///   and rolls back `config.json` on any failure so Windows is never left with a dead proxy.
-/// - Turning OFF updates in-memory config first, then clears owned OS proxy under `system_proxy_lock`.
+/// - Turning OFF updates in-memory config first, clears owned OS proxy under `system_proxy_lock`,
+///   and stops the main core cleanly when TUN is also disabled (zero port/memory/connection residue).
 pub async fn apply_system_proxy_internal(
     app: &AppHandle,
     state: &AppState,
     enabled: bool,
 ) -> Result<bool, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let old_cfg = state.snapshot_config();
+    let old_sys_proxy_enabled = old_cfg.system_proxy.enabled;
     let was_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let was_proxy_active = is_proxy_takeover_active(was_core_running, &old_cfg);
+    let was_tun_active = was_core_running && old_cfg.tun.enabled;
 
     if !enabled {
-        let was_enabled = old_cfg.system_proxy.enabled;
+        let was_enabled = old_sys_proxy_enabled;
         let mut cfg = old_cfg.clone();
         cfg.system_proxy.enabled = false;
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
         }
         if let Err(err) = clear_system_proxy_if_owned_with_hint(state, was_enabled) {
+            let mut rollback = state.snapshot_config();
+            rollback.system_proxy.enabled = was_enabled;
             if let Ok(mut guard) = state.config.write() {
-                *guard = old_cfg.clone();
+                *guard = rollback;
             }
             return Err(err);
         }
         config::save(&state.paths, &cfg).map_err(|e| format!("保存系统代理状态失败：{e}"))?;
+
+        let latest_before_stop = state.snapshot_config();
         let now_core_running =
             state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-        let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
-        coordinate_global_preaccel_on_proxy_transition(
+        if !latest_before_stop.system_proxy.enabled
+            && !latest_before_stop.tun.enabled
+            && now_core_running
+        {
+            stop_core_internal(app, state).await?;
+            state.log_app_event(
+                "info",
+                "系统代理",
+                "已关闭系统代理并停止主代理核心（已释放监听端口与内存）",
+            );
+            return Ok(false);
+        }
+
+        let now_tun_active = now_core_running && latest_before_stop.tun.enabled;
+        coordinate_global_preaccel_on_tun_transition(
+            app,
             state,
-            &cfg,
-            was_proxy_active,
-            now_proxy_active,
+            &latest_before_stop,
+            was_tun_active,
+            now_tun_active,
             "系统代理",
         )
         .await;
@@ -3050,8 +3457,9 @@ pub async fn apply_system_proxy_internal(
     }
 
     // 2. Re-read disk config so external Agent edits take effect on toggle ON.
-    let disk_cfg = config::load_or_init(&state.paths)
+    let mut disk_cfg = config::load_or_init(&state.paths)
         .map_err(|e| format!("读取配置文件失败：{e}"))?;
+    disk_cfg.preaccel.reconcile_unified_enabled();
 
     let mut cfg = disk_cfg.clone();
     if !state.adapter.has_live_controller().await {
@@ -3062,12 +3470,15 @@ pub async fn apply_system_proxy_internal(
             *guard = boot_cfg;
         }
         if let Err(err) = start_core_internal(app, state).await {
+            let mut rollback = state.snapshot_config();
+            rollback.system_proxy.enabled = old_sys_proxy_enabled;
             if let Ok(mut guard) = state.config.write() {
-                *guard = old_cfg.clone();
+                *guard = rollback.clone();
             }
-            sync_app_side_effects(app, state, &old_cfg);
+            sync_app_side_effects(app, state, &rollback);
             return Err(format!("开启系统代理前启动核心失败：{err}"));
         }
+        cfg = state.snapshot_config();
         cfg.system_proxy.enabled = true;
         config::save(&state.paths, &cfg).map_err(|e| format!("保存系统代理配置失败：{e}"))?;
         if let Ok(mut guard) = state.config.write() {
@@ -3081,11 +3492,13 @@ pub async fn apply_system_proxy_internal(
         }
         if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
             if outcome.rejected {
-                let _ = config::save(&state.paths, &old_cfg);
+                let mut rollback = state.snapshot_config();
+                rollback.system_proxy.enabled = old_sys_proxy_enabled;
+                let _ = config::save(&state.paths, &rollback);
                 if let Ok(mut guard) = state.config.write() {
-                    *guard = old_cfg.clone();
+                    *guard = rollback.clone();
                 }
-                sync_app_side_effects(app, state, &old_cfg);
+                sync_app_side_effects(app, state, &rollback);
                 let raw_err = outcome
                     .error
                     .unwrap_or_else(|| "配置预检未通过，已保持原配置运行".to_string());
@@ -3109,28 +3522,32 @@ pub async fn apply_system_proxy_internal(
             return Ok(false);
         }
         Err(err) => {
-            let _ = config::save(&state.paths, &old_cfg);
+            let mut rollback = state.snapshot_config();
+            rollback.system_proxy.enabled = old_sys_proxy_enabled;
+            let _ = config::save(&state.paths, &rollback);
             if let Ok(mut guard) = state.config.write() {
-                *guard = old_cfg.clone();
+                *guard = rollback.clone();
             }
             state.log_app_event(
                 "error",
                 "系统代理",
                 &format!("写入操作系统代理失败，已回滚配置：{err}"),
             );
-            sync_app_side_effects(app, state, &old_cfg);
+            sync_app_side_effects(app, state, &rollback);
             return Err(err);
         }
     }
 
+    let latest_cfg = state.snapshot_config();
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
-    coordinate_global_preaccel_on_proxy_transition(
+    let now_tun_active = now_core_running && latest_cfg.tun.enabled;
+    coordinate_global_preaccel_on_tun_transition(
+        app,
         state,
-        &cfg,
-        was_proxy_active,
-        now_proxy_active,
+        &latest_cfg,
+        was_tun_active,
+        now_tun_active,
         "系统代理",
     )
     .await;
@@ -3185,8 +3602,24 @@ pub async fn switch_next_best_internal(
                 return Err("暂无已启用的可用节点".to_string());
             }
 
+            let health_pool = state.snapshot_node_health_pool();
+            let now = Instant::now();
             enabled_nodes.sort_by(|(idx_a, a), (idx_b, b)| {
                 let rank = |n: &ProxyNode| -> (u8, f64, f64) {
+                    if let Some(rt) = health_pool.get(&n.id) {
+                        if rt.is_in_cooldown(now) || rt.last_health == Some(RuntimeDualHealth::Failed)
+                        {
+                            return (2, f64::INFINITY, 0.0);
+                        }
+                        if let Some(live_ms) = health_pool.live_latency_ms(&n.id) {
+                            let up = snaps
+                                .get(&n.id)
+                                .and_then(|s| s.up_mbps)
+                                .filter(|v| v.is_finite())
+                                .unwrap_or(0.0);
+                            return (0, live_ms + rt.penalty_score, -up);
+                        }
+                    }
                     match snaps.get(&n.id) {
                         Some(s) if s.ok => (
                             0,
@@ -3217,7 +3650,7 @@ pub async fn switch_next_best_internal(
                 next.id.clone(),
                 next.name.clone(),
                 next.region_code.clone(),
-                next_snap.and_then(|s| s.latency_ms),
+                state.resolve_node_latency_ms(&next.id, next_snap),
                 next_snap.and_then(|s| s.up_mbps),
             )
         };
@@ -3274,9 +3707,17 @@ pub async fn switch_next_best_internal(
         .and_then(|id| nodes.iter().find(|n| n.id == id))
         .map(|n| n.name.clone());
 
-    // Rank candidates using the real strategy formula evaluator; when all members fail hard gates,
-    // keep honoring probed-ok scores in `gate_rejected` before falling back to enabled member order.
-    let ranked_ids: Vec<String> = match evaluate_group_candidates(&group, &nodes, &snaps) {
+    // Rank candidates using the real strategy formula evaluator fused with runtime health pool;
+    // when all members fail hard gates, keep honoring probed-ok scores in `gate_rejected` before
+    // falling back to enabled member order.
+    let health_pool = state.snapshot_node_health_pool();
+    let ranked_ids: Vec<String> = match evaluate_group_candidates_with_runtime(
+        &group,
+        &nodes,
+        &snaps,
+        Some(&health_pool),
+        Instant::now(),
+    ) {
         Ok(report) => {
             if !report.healthy_candidates.is_empty() {
                 report
@@ -3602,13 +4043,14 @@ async fn select_group_node_core(
     }
     sync_app_side_effects(app, state, &cfg);
 
+    let resolved_latency_ms = state.resolve_node_latency_ms(&target_node.id, snap.as_ref());
     Ok(SwitchResultDto {
         group_id: group.id,
         previous_node_id: prev_id,
         active_node_id: target_node.id,
         active_node_name: target_node.name,
         active_node_region: target_node.region_code,
-        latency_ms: snap.as_ref().and_then(|s| s.latency_ms),
+        latency_ms: resolved_latency_ms,
         up_mbps: snap.as_ref().and_then(|s| s.up_mbps),
         closed_connections,
     })
@@ -3724,7 +4166,14 @@ pub async fn reconcile_group_best_node_internal(
             .map_err(|e| e.to_string())?;
 
         let prev_active = group.active_node_id.clone();
-        let decision = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps);
+        let health_pool = state.snapshot_node_health_pool();
+        let decision = reconcile_group_best_node_in_memory_with_runtime(
+            &mut group,
+            &nodes,
+            &snaps,
+            Some(&health_pool),
+            Instant::now(),
+        );
         if group.active_node_id != prev_active {
             db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
         }
@@ -3800,13 +4249,15 @@ pub async fn reconcile_group_best_node_internal(
         );
     }
 
+    let resolved_latency_ms =
+        state.resolve_node_latency_ms(&decision.to_node_id, target_snap.as_ref());
     Ok(Some(SwitchResultDto {
         group_id: group_id.to_string(),
         previous_node_id: decision.from_node_id,
         active_node_id: decision.to_node_id,
         active_node_name: decision.to_node_name,
         active_node_region: target_node_region,
-        latency_ms: target_snap.as_ref().and_then(|s| s.latency_ms),
+        latency_ms: resolved_latency_ms,
         up_mbps: target_snap.as_ref().and_then(|s| s.up_mbps),
         closed_connections,
     }))
@@ -4004,15 +4455,32 @@ pub fn get_app_config(state: State<'_, AppState>) -> Result<UiAppConfigDto, Stri
     Ok(UiAppConfigDto::from(&cfg))
 }
 
-async fn apply_and_save_config_transition(
+fn reconcile_saved_preaccel_switch(old: &AppConfig, next: &mut AppConfig) {
+    if old.preaccel.enabled != next.preaccel.enabled {
+        next.preaccel.sync_unified_enabled(next.preaccel.enabled);
+    } else if old.preaccel.global_bypass_enabled != next.preaccel.global_bypass_enabled {
+        next.preaccel
+            .sync_unified_enabled(next.preaccel.global_bypass_enabled);
+    } else {
+        next.preaccel.reconcile_unified_enabled();
+    }
+}
+
+async fn apply_and_save_config_transition<F>(
     app: &AppHandle,
     state: &AppState,
-    old: &AppConfig,
-    next: &AppConfig,
-) -> Result<(), String> {
+    build_next: F,
+) -> Result<AppConfig, String>
+where
+    F: FnOnce(&AppConfig) -> Result<AppConfig, String>,
+{
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let old = state.snapshot_config();
+    let next = build_next(&old)?;
+
     let was_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let was_proxy_active = is_proxy_takeover_active(was_core_running, old);
+    let was_tun_active = was_core_running && old.tun.enabled;
 
     if !old.tun.enabled && next.tun.enabled && !is_tun_privilege_ready(state) {
         return Err(tun_needs_admin_error_message());
@@ -4026,11 +4494,15 @@ async fn apply_and_save_config_transition(
         }
     }
 
+    let disabling_all_proxy = (old.system_proxy.enabled || old.tun.enabled)
+        && !next.system_proxy.enabled
+        && !next.tun.enabled;
+
     if old.tun.enabled && !next.tun.enabled && state.adapter.has_live_controller().await {
         let _ = state.adapter.disable_tun_gracefully().await;
     }
 
-    config::save(&state.paths, next).map_err(|e| format!("保存配置文件失败：{e}"))?;
+    config::save(&state.paths, &next).map_err(|e| format!("保存配置文件失败：{e}"))?;
     if let Ok(mut guard) = state.config.write() {
         *guard = next.clone();
     }
@@ -4039,23 +4511,45 @@ async fn apply_and_save_config_transition(
         || (!old.tun.enabled && next.tun.enabled))
         && !state.adapter.has_live_controller().await;
 
+    let latest_before_stop = state.snapshot_config();
+    if disabling_all_proxy
+        && was_core_running
+        && !latest_before_stop.system_proxy.enabled
+        && !latest_before_stop.tun.enabled
+    {
+        // Clear OS proxy before stopping main core so host internet is never blackholed.
+        if old.system_proxy.enabled {
+            let _ = clear_system_proxy_if_owned_with_hint(state, true);
+        }
+        stop_core_internal(app, state).await?;
+        if old.preaccel.enabled && !next.preaccel.enabled && state.global_preaccel.status().running
+        {
+            let _ = state.global_preaccel.stop().await;
+        }
+        sync_autostart_if_changed(&old, &next);
+        let latest = state.snapshot_config();
+        sync_app_side_effects(app, state, &latest);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest));
+        return Ok(latest);
+    }
+
     if needs_core_boot {
         if let Err(err) = start_core_internal(app, state).await {
-            let _ = config::save(&state.paths, old);
+            let _ = config::save(&state.paths, &old);
             if let Ok(mut guard) = state.config.write() {
                 *guard = old.clone();
             }
-            sync_app_side_effects(app, state, old);
+            sync_app_side_effects(app, state, &old);
             return Err(format!("保存配置后启动代理核心失败：{err}"));
         }
-    } else if has_core_config_changes(old, next) {
+    } else if has_core_config_changes(&old, &next) {
         if let Some(outcome) = trigger_reload_if_running(app, state, false).await {
             if outcome.rejected {
-                let _ = config::save(&state.paths, old);
+                let _ = config::save(&state.paths, &old);
                 if let Ok(mut guard) = state.config.write() {
                     *guard = old.clone();
                 }
-                sync_app_side_effects(app, state, old);
+                sync_app_side_effects(app, state, &old);
                 let raw_err = outcome
                     .error
                     .unwrap_or_else(|| "配置预检未通过，已恢复原配置运行".to_string());
@@ -4077,33 +4571,36 @@ async fn apply_and_save_config_transition(
             clear_system_proxy_if_owned_with_hint(state, old.system_proxy.enabled).map(|_| ())
         };
         if let Err(err) = apply_res {
-            let _ = config::save(&state.paths, old);
+            let _ = config::save(&state.paths, &old);
             if let Ok(mut guard) = state.config.write() {
                 *guard = old.clone();
             }
-            sync_app_side_effects(app, state, old);
+            sync_app_side_effects(app, state, &old);
             return Err(err);
         }
     }
 
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let now_proxy_active = is_proxy_takeover_active(now_core_running, next);
-    if was_proxy_active != now_proxy_active {
-        coordinate_global_preaccel_on_proxy_transition(
+    let now_tun_active = now_core_running && next.tun.enabled;
+    if !next.preaccel.enabled && state.global_preaccel.status().running {
+        let _ = state.global_preaccel.stop().await;
+    } else if was_tun_active != now_tun_active || (old.preaccel.enabled != next.preaccel.enabled) {
+        coordinate_global_preaccel_on_tun_transition(
+            app,
             state,
-            next,
-            was_proxy_active,
-            now_proxy_active,
+            &next,
+            was_tun_active,
+            now_tun_active,
             "代理配置",
         )
         .await;
     }
 
-    sync_autostart_if_changed(old, next);
-    sync_app_side_effects(app, state, next);
-    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(next));
-    Ok(())
+    sync_autostart_if_changed(&old, &next);
+    sync_app_side_effects(app, state, &next);
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&next));
+    Ok(next)
 }
 
 #[tauri::command]
@@ -4112,10 +4609,13 @@ pub async fn save_app_config(
     state: State<'_, AppState>,
     config: UiAppConfigDto,
 ) -> Result<UiAppConfigDto, String> {
-    let old = state.snapshot_config();
-    let mut cfg = old.clone();
-    apply_ui_dto(&mut cfg, &config);
-    apply_and_save_config_transition(&app, &state, &old, &cfg).await?;
+    let cfg = apply_and_save_config_transition(&app, &state, |old| {
+        let mut cfg = old.clone();
+        apply_ui_dto(&mut cfg, &config);
+        cfg.preaccel.sync_unified_enabled(config.preaccel.enabled);
+        Ok(cfg)
+    })
+    .await?;
     Ok(UiAppConfigDto::from(&cfg))
 }
 
@@ -4128,11 +4628,13 @@ pub fn get_full_config(state: State<'_, AppState>) -> Result<AppConfig, String> 
 pub async fn save_full_config(
     app: AppHandle,
     state: State<'_, AppState>,
-    next: AppConfig,
+    mut next: AppConfig,
 ) -> Result<AppConfig, String> {
-    let old = state.snapshot_config();
-    apply_and_save_config_transition(&app, &state, &old, &next).await?;
-    Ok(next)
+    apply_and_save_config_transition(&app, &state, move |old| {
+        reconcile_saved_preaccel_switch(old, &mut next);
+        Ok(next)
+    })
+    .await
 }
 
 fn is_replace_map_path(path: &str) -> bool {
@@ -4179,13 +4681,15 @@ pub async fn save_extended_settings(
     state: State<'_, AppState>,
     patch: serde_json::Value,
 ) -> Result<AppConfig, String> {
-    let old = state.snapshot_config();
-    let mut base_val = serde_json::to_value(&old).map_err(|e| e.to_string())?;
-    json_deep_merge(&mut base_val, &patch);
-    let next: AppConfig = serde_json::from_value(base_val)
-        .map_err(|e| format!("配置字段格式无效：{e}"))?;
-    apply_and_save_config_transition(&app, &state, &old, &next).await?;
-    Ok(next)
+    apply_and_save_config_transition(&app, &state, |old| {
+        let mut base_val = serde_json::to_value(old).map_err(|e| e.to_string())?;
+        json_deep_merge(&mut base_val, &patch);
+        let mut next: AppConfig = serde_json::from_value(base_val)
+            .map_err(|e| format!("配置字段格式无效：{e}"))?;
+        reconcile_saved_preaccel_switch(old, &mut next);
+        Ok(next)
+    })
+    .await
 }
 
 #[tauri::command]
@@ -4209,6 +4713,14 @@ pub async fn stop_core(
     state: State<'_, AppState>,
 ) -> Result<CoreRuntimeInfoDto, String> {
     stop_core_internal(&app, &state).await
+}
+
+#[tauri::command]
+pub async fn disable_all_proxy_and_stop_core(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreRuntimeInfoDto, String> {
+    disable_all_proxy_and_stop_core_internal(&app, &state).await
 }
 
 #[tauri::command]
@@ -4255,7 +4767,8 @@ pub async fn reload_core_config(
     force_disk_reload: Option<bool>,
 ) -> Result<ReloadOutcome, String> {
     let force = force_disk_reload.unwrap_or(true);
-    let disk_cfg = config::load_or_init(&state.paths).map_err(|e| e.to_string())?;
+    let mut disk_cfg = config::load_or_init(&state.paths).map_err(|e| e.to_string())?;
+    disk_cfg.preaccel.reconcile_unified_enabled();
     if let Ok(mut guard) = state.config.write() {
         *guard = disk_cfg.clone();
     }
@@ -4343,16 +4856,19 @@ pub async fn set_system_proxy(
 /// Enable or disable TUN virtual NIC mode safely:
 /// - Enabling checks administrator elevation first (`NEEDS_ADMIN:...` without dirty writes),
 ///   auto-starts or L3-reloads the core, and rolls back `config.json` on any failure.
-/// - Disabling calls `disable_tun_gracefully()` before saving and reloading.
+/// - Disabling calls `disable_tun_gracefully()` before saving; if system proxy is also disabled,
+///   stops the main core directly with zero port/memory/connection residue instead of reloading.
 pub async fn set_tun_enabled_internal(
     app: &AppHandle,
     state: &AppState,
     enabled: bool,
 ) -> Result<bool, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let old_cfg = state.snapshot_config();
+    let old_tun_enabled = old_cfg.tun.enabled;
     let was_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let was_proxy_active = is_proxy_takeover_active(was_core_running, &old_cfg);
+    let was_tun_active = was_core_running && old_tun_enabled;
 
     if enabled {
         if !is_tun_privilege_ready(state) {
@@ -4383,16 +4899,18 @@ pub async fn set_tun_enabled_internal(
 
         if !state.adapter.has_live_controller().await {
             if let Err(err) = start_core_internal(app, state).await {
-                let _ = config::save(&state.paths, &old_cfg);
+                let mut rollback = state.snapshot_config();
+                rollback.tun.enabled = old_tun_enabled;
+                let _ = config::save(&state.paths, &rollback);
                 if let Ok(mut guard) = state.config.write() {
-                    *guard = old_cfg.clone();
+                    *guard = rollback.clone();
                 }
                 state.log_app_event(
                     "error",
                     "虚拟网卡",
                     &format!("开启虚拟网卡并启动核心失败，已回滚：{err}"),
                 );
-                sync_app_side_effects(app, state, &old_cfg);
+                sync_app_side_effects(app, state, &rollback);
                 return Err(format!("开启虚拟网卡并启动代理核心失败：{err}"));
             }
         } else {
@@ -4415,28 +4933,32 @@ pub async fn set_tun_enabled_internal(
                 }
             };
             if let Some(detail) = failed_detail {
-                let _ = config::save(&state.paths, &old_cfg);
+                let mut rollback = state.snapshot_config();
+                rollback.tun.enabled = old_tun_enabled;
+                let _ = config::save(&state.paths, &rollback);
                 if let Ok(mut guard) = state.config.write() {
-                    *guard = old_cfg.clone();
+                    *guard = rollback.clone();
                 }
                 state.log_app_event(
                     "error",
                     "虚拟网卡",
                     &format!("开启虚拟网卡失败，已回滚配置：{detail}"),
                 );
-                sync_app_side_effects(app, state, &old_cfg);
+                sync_app_side_effects(app, state, &rollback);
                 return Err(detail);
             }
         }
 
+        let latest_cfg = state.snapshot_config();
         let now_core_running =
             state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-        let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
-        coordinate_global_preaccel_on_proxy_transition(
+        let now_tun_active = now_core_running && latest_cfg.tun.enabled;
+        coordinate_global_preaccel_on_tun_transition(
+            app,
             state,
-            &cfg,
-            was_proxy_active,
-            now_proxy_active,
+            &latest_cfg,
+            was_tun_active,
+            now_tun_active,
             "虚拟网卡（TUN）",
         )
         .await;
@@ -4444,7 +4966,10 @@ pub async fn set_tun_enabled_internal(
         state.log_app_event(
             "info",
             "虚拟网卡",
-            &format!("已开启虚拟网卡（TUN 协议栈：{}）", cfg.tun.stack_mode.as_str()),
+            &format!(
+                "已开启虚拟网卡（TUN 协议栈：{}）",
+                latest_cfg.tun.stack_mode.as_str()
+            ),
         );
         let latest_cfg = state.snapshot_config();
         sync_app_side_effects(app, state, &latest_cfg);
@@ -4452,16 +4977,46 @@ pub async fn set_tun_enabled_internal(
         return Ok(true);
     }
 
-    // Disabling TUN: gracefully release Wintun adapter & OS routes first, then save & reload.
+    // Disabling TUN: gracefully release Wintun adapter & OS routes first, then save.
     if state.adapter.has_live_controller().await {
         let _ = state.adapter.disable_tun_gracefully().await;
     }
 
-    let mut cfg = old_cfg.clone();
+    let mut cfg = state.snapshot_config();
     cfg.tun.enabled = false;
     config::save(&state.paths, &cfg).map_err(|e| format!("保存虚拟网卡配置失败：{e}"))?;
     if let Ok(mut guard) = state.config.write() {
         *guard = cfg.clone();
+    }
+
+    // Re-read latest config before deciding whether to stop the main core.
+    let latest_before_stop = state.snapshot_config();
+    if !latest_before_stop.system_proxy.enabled && !latest_before_stop.tun.enabled {
+        let now_core_running =
+            state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+        if now_core_running {
+            stop_core_internal(app, state).await?;
+            state.log_app_event(
+                "info",
+                "虚拟网卡",
+                "已关闭虚拟网卡（TUN）并停止主代理核心（已释放监听端口与内存）",
+            );
+            return Ok(false);
+        }
+        coordinate_global_preaccel_on_tun_transition(
+            app,
+            state,
+            &latest_before_stop,
+            was_tun_active,
+            false,
+            "虚拟网卡（TUN）",
+        )
+        .await;
+        state.log_app_event("info", "虚拟网卡", "已关闭虚拟网卡（TUN）");
+        let latest_cfg = state.snapshot_config();
+        sync_app_side_effects(app, state, &latest_cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
+        return Ok(false);
     }
 
     if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
@@ -4476,14 +5031,16 @@ pub async fn set_tun_enabled_internal(
         }
     }
 
+    let latest_cfg = state.snapshot_config();
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let now_proxy_active = is_proxy_takeover_active(now_core_running, &cfg);
-    coordinate_global_preaccel_on_proxy_transition(
+    let now_tun_active = now_core_running && latest_cfg.tun.enabled;
+    coordinate_global_preaccel_on_tun_transition(
+        app,
         state,
-        &cfg,
-        was_proxy_active,
-        now_proxy_active,
+        &latest_cfg,
+        was_tun_active,
+        now_tun_active,
         "虚拟网卡（TUN）",
     )
     .await;
@@ -4841,8 +5398,173 @@ pub fn enter_windowless_mode(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Begin custom Win32 physical-coordinate dragging of the floating capsule window (no `HTCAPTION`,
+/// zero Windows Aero Snap preview / maximize glitches, smooth across mixed-DPI multi-monitors).
+#[tauri::command]
+pub fn capsule_drag_start(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect, IsWindow};
+
+        let Some(win) = app.get_webview_window(lifecycle::CAPSULE_WINDOW_LABEL) else {
+            return Ok(false);
+        };
+        let Ok(raw_hwnd) = win.hwnd() else {
+            return Ok(false);
+        };
+        let hwnd = raw_hwnd.0 as HWND;
+        if hwnd.is_null() || unsafe { IsWindow(hwnd) == 0 } {
+            return Ok(false);
+        }
+
+        let mut pt = POINT { x: 0, y: 0 };
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: Valid HWND and stack-allocated Win32 structs.
+        let ok = unsafe { GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut rect) != 0 };
+        if !ok {
+            return Ok(false);
+        }
+        let width = rect.right.saturating_sub(rect.left).max(1);
+        let height = rect.bottom.saturating_sub(rect.top).max(1);
+        let offset_x = pt.x.saturating_sub(rect.left);
+        let offset_y = pt.y.saturating_sub(rect.top);
+        let rx = ((offset_x as f64) / (width as f64)).clamp(0.0, 1.0);
+        let ry = ((offset_y as f64) / (height as f64)).clamp(0.0, 1.0);
+
+        let mut guard = state
+            .capsule_drag
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = Some(CapsuleDragAnchor {
+            rx,
+            ry,
+            offset_x,
+            offset_y,
+            width,
+            height,
+        });
+        Ok(true)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&app, &state);
+        Ok(false)
+    }
+}
+
+/// Advance custom Win32 physical-coordinate dragging of the floating capsule window by one frame,
+/// automatically rescaling the anchor offset if `WM_DPICHANGED` alters physical window dimensions
+/// across mixed-DPI monitors.
+#[tauri::command]
+pub fn capsule_drag_step(app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetCursorPos, GetWindowRect, IsWindow, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+            SetWindowPos,
+        };
+
+        let Some(win) = app.get_webview_window(lifecycle::CAPSULE_WINDOW_LABEL) else {
+            return Ok(false);
+        };
+        let Ok(raw_hwnd) = win.hwnd() else {
+            return Ok(false);
+        };
+        let hwnd = raw_hwnd.0 as HWND;
+        if hwnd.is_null() || unsafe { IsWindow(hwnd) == 0 } {
+            return Ok(false);
+        }
+
+        let mut pt = POINT { x: 0, y: 0 };
+        let mut rect = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        // SAFETY: Valid HWND and stack-allocated Win32 structs.
+        let ok = unsafe { GetCursorPos(&mut pt) != 0 && GetWindowRect(hwnd, &mut rect) != 0 };
+        if !ok {
+            return Ok(false);
+        }
+
+        let cur_w = rect.right.saturating_sub(rect.left).max(1);
+        let cur_h = rect.bottom.saturating_sub(rect.top).max(1);
+        let next_pos = {
+            let mut guard = state
+                .capsule_drag
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let Some(anchor) = guard.as_mut() else {
+                return Ok(false);
+            };
+            if cur_w != anchor.width || cur_h != anchor.height {
+                anchor.width = cur_w;
+                anchor.height = cur_h;
+                anchor.offset_x = (anchor.rx * (cur_w as f64)).round() as i32;
+                anchor.offset_y = (anchor.ry * (cur_h as f64)).round() as i32;
+            }
+            (
+                pt.x.saturating_sub(anchor.offset_x),
+                pt.y.saturating_sub(anchor.offset_y),
+            )
+        };
+
+        if next_pos.0 == rect.left && next_pos.1 == rect.top {
+            return Ok(true);
+        }
+
+        // SAFETY: Valid HWND; `SetWindowPos` moves in physical screen coordinates without
+        // resizing, reordering, activating, or entering OS `HTCAPTION` Aero Snap modal loops.
+        let moved = unsafe {
+            SetWindowPos(
+                hwnd,
+                std::ptr::null_mut(),
+                next_pos.0,
+                next_pos.1,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            ) != 0
+        };
+        Ok(moved)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (&app, &state);
+        Ok(false)
+    }
+}
+
+/// Clear active custom floating capsule drag anchor state on pointer release / cancel.
+#[tauri::command]
+pub fn capsule_drag_end(state: State<'_, AppState>) -> Result<bool, String> {
+    let mut guard = state
+        .capsule_drag
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+    #[cfg(target_os = "windows")]
+    {
+        Ok(true)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(false)
+    }
+}
+
 #[tauri::command]
 pub fn list_multi_groups(state: State<'_, AppState>) -> Result<Vec<MultiGroup>, String> {
+    let health_pool = state.snapshot_node_health_pool();
+    let now = Instant::now();
     let db = state.storage.lock().map_err(|e| e.to_string())?;
     let mut groups = db.list_multi_groups().map_err(|e| e.to_string())?;
     if let Ok(nodes) = db.list_nodes() {
@@ -4856,7 +5578,13 @@ pub fn list_multi_groups(state: State<'_, AppState>) -> Result<Vec<MultiGroup>, 
                 let snaps = db
                     .get_probe_snapshots_batch(&node_ids, g.primary_probe_id.as_deref())
                     .unwrap_or_default();
-                let _ = sanitize_group_active_node(g, &nodes, &snaps);
+                let _ = sanitize_group_active_node_with_runtime(
+                    g,
+                    &nodes,
+                    &snaps,
+                    Some(&health_pool),
+                    now,
+                );
             }
         }
     }
@@ -4893,8 +5621,22 @@ pub async fn upsert_multi_group(
 
         // Sanitize ghost active_node_id and re-pick best healthy candidate if current violates
         // updated hard gates/membership while preserving healthy in-group selection.
-        let _ = sanitize_group_active_node(&mut group, &nodes, &snaps);
-        let _ = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps);
+        let health_pool = state.snapshot_node_health_pool();
+        let now = Instant::now();
+        let _ = sanitize_group_active_node_with_runtime(
+            &mut group,
+            &nodes,
+            &snaps,
+            Some(&health_pool),
+            now,
+        );
+        let _ = reconcile_group_best_node_in_memory_with_runtime(
+            &mut group,
+            &nodes,
+            &snaps,
+            Some(&health_pool),
+            now,
+        );
 
         let next_name = group
             .active_node_id
@@ -4982,6 +5724,9 @@ pub async fn delete_multi_group(
         (deleted, next_id)
     };
     if deleted {
+        if let Ok(mut pool) = state.node_health_pool.write() {
+            pool.remove_group_cursor(&group_id);
+        }
         let mut cfg = state.snapshot_config();
         if cfg.active_group_id.as_deref() == Some(group_id.as_str()) {
             cfg.active_group_id = next_fallback_group_id;
@@ -5023,8 +5768,22 @@ pub async fn update_multi_group_members(
             .map(|n| n.name.clone());
 
         group.member_node_ids = member_node_ids;
-        let _ = sanitize_group_active_node(&mut group, &nodes, &snaps);
-        let _ = reconcile_group_best_node_in_memory(&mut group, &nodes, &snaps);
+        let health_pool = state.snapshot_node_health_pool();
+        let now = Instant::now();
+        let _ = sanitize_group_active_node_with_runtime(
+            &mut group,
+            &nodes,
+            &snaps,
+            Some(&health_pool),
+            now,
+        );
+        let _ = reconcile_group_best_node_in_memory_with_runtime(
+            &mut group,
+            &nodes,
+            &snaps,
+            Some(&health_pool),
+            now,
+        );
 
         let next_name = group
             .active_node_id
@@ -5435,6 +6194,18 @@ pub async fn run_isolated_probes(
                     } else {
                         report.snapshot
                     };
+                    if snap.ok {
+                        if let Some(ms) = snap.latency_ms.filter(|v| v.is_finite() && *v > 0.0) {
+                            state.reset_node_health(&nid);
+                            state.record_node_health_probe(
+                                &nid,
+                                RuntimeDualHealth::FullHealthy,
+                                Some(ms),
+                            );
+                        }
+                    } else {
+                        state.reset_node_health(&nid);
+                    }
                     snapshots.insert(nid.clone(), snap.clone());
                     let _ = app.emit(
                         EVENT_PROBE_PROGRESS,
@@ -5847,6 +6618,7 @@ pub async fn delete_subscription(
         db.delete_subscription(&sub_id).map_err(|e| e.to_string())?
     };
     if deleted {
+        prune_node_health_pool_from_db(&state);
         let _ = trigger_reload_if_running(&app, &state, false).await;
         let cfg = state.snapshot_config();
         sync_app_side_effects(&app, &state, &cfg);
@@ -6076,6 +6848,10 @@ pub async fn refresh_subscription(
     state: State<'_, AppState>,
     sub_id: String,
 ) -> Result<serde_json::Value, String> {
+    let Some(_refresh_guard) = SubRefreshGuard::try_acquire(&state.refreshing_sub_ids, sub_id.clone())
+    else {
+        return Err("该订阅正在刷新中，请稍候完成后再试".to_string());
+    };
     let sub = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         db.get_subscription(&sub_id)
@@ -6096,6 +6872,7 @@ pub async fn refresh_subscription(
             );
         }
     } else {
+        prune_node_health_pool_from_db(&state);
         let _ = trigger_reload_if_running(&app, &state, false).await;
         let cfg = state.snapshot_config();
         sync_app_side_effects(&app, &state, &cfg);
@@ -6116,6 +6893,11 @@ pub async fn refresh_all_subscriptions(
     let mut total_nodes = 0usize;
     let mut errors = Vec::new();
     for sub in subs.into_iter().filter(|s| s.enabled) {
+        let Some(_refresh_guard) =
+            SubRefreshGuard::try_acquire(&state.refreshing_sub_ids, sub.id.clone())
+        else {
+            continue;
+        };
         match refresh_single_subscription_inner(&state, &sub).await {
             Ok(v) => {
                 refreshed += 1;
@@ -6127,6 +6909,7 @@ pub async fn refresh_all_subscriptions(
         }
     }
     if refreshed > 0 {
+        prune_node_health_pool_from_db(&state);
         let _ = trigger_reload_if_running(&app, &state, false).await;
         let cfg = state.snapshot_config();
         sync_app_side_effects(&app, &state, &cfg);
@@ -6275,79 +7058,354 @@ pub async fn delete_preaccel_relay(
     Ok(deleted)
 }
 
+/// Spawn an asynchronous background WinDivert v2.2.2 auto-download (3-tier proxy fallback:
+/// CatCloud main core -> active Windows system proxy -> direct) and in-place hot-upgrade whenever
+/// running on non-ARM64 Windows without installed driver files.
+fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &AppConfig) {
+    #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+    {
+        if state.shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+        if locate_windivert_files(&state.paths, cfg.preaccel.windivert_dir.as_deref()).is_some() {
+            return;
+        }
+        if state
+            .windivert_installing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+
+        state.global_preaccel.set_install_state("downloading");
+        sync_app_side_effects(app, state, cfg);
+
+        let app_h = app.clone();
+        let install_flag = Arc::clone(&state.windivert_installing);
+        tauri::async_runtime::spawn(async move {
+            let _flag_guard = AtomicFlagResetGuard(install_flag);
+            let Some(st) = app_h.try_state::<AppState>() else {
+                return;
+            };
+            if st.shutting_down.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let rt = st.snapshot_runtime();
+            let active_mixed_port = if rt.running && rt.mixed_port > 0 {
+                Some(rt.mixed_port)
+            } else {
+                None
+            };
+            let proxy_candidates = build_default_windivert_proxy_candidates(active_mixed_port);
+
+            match download_and_install_windivert_with_fallbacks(&st.paths, &proxy_candidates).await
+            {
+                Ok(installed_dir) => {
+                    st.global_preaccel.set_install_state("verifying");
+                    let latest_cfg = st.snapshot_config();
+                    sync_app_side_effects(&app_h, &st, &latest_cfg);
+                    st.log_app_event(
+                        "info",
+                        "国内提速",
+                        &format!(
+                            "已自动下载并通过 SHA-256 校验安装官方 WinDivert v2.2.2 驱动至 {}",
+                            installed_dir.display()
+                        ),
+                    );
+
+                    if default_platform().capabilities().is_elevated {
+                        if !st.shutting_down.load(Ordering::SeqCst) && latest_cfg.preaccel.enabled {
+                            let cur_global = st.snapshot_global_preaccel();
+                            let latest_rt = st.snapshot_runtime();
+                            let tun_active = latest_rt.running && latest_cfg.tun.enabled;
+                            if cur_global.running && !cur_global.is_windivert_active {
+                                match load_enabled_preaccel_relays(&st) {
+                                    Ok(relays) if !relays.is_empty() => {
+                                        let excluded_pids =
+                                            collect_excluded_pids_for_global_preaccel(&st);
+                                        match st
+                                            .global_preaccel
+                                            .upgrade_to_windivert_in_place(
+                                                &latest_cfg,
+                                                &relays,
+                                                &excluded_pids,
+                                            )
+                                            .await
+                                        {
+                                            Ok(upgraded) if upgraded.is_windivert_active => {
+                                                st.log_app_event(
+                                                    "info",
+                                                    "国内提速",
+                                                    "WinDivert 驱动已自动安装完成，已免重启原地热升格为底层透明提速模式",
+                                                );
+                                            }
+                                            Ok(upgraded) => {
+                                                if upgraded.install_state == "verifying" {
+                                                    st.global_preaccel.set_install_state(
+                                                        if upgraded.windivert_available {
+                                                            "ready"
+                                                        } else {
+                                                            "idle"
+                                                        },
+                                                    );
+                                                }
+                                                let reason = upgraded
+                                                    .last_error
+                                                    .as_deref()
+                                                    .filter(|s| !s.trim().is_empty())
+                                                    .unwrap_or(if !upgraded.running {
+                                                        "独立通道已停止"
+                                                    } else if !upgraded.windivert_available {
+                                                        "未检测到可用驱动文件"
+                                                    } else {
+                                                        "继续保持本地独立 443 通道"
+                                                    });
+                                                st.log_app_event(
+                                                    "warning",
+                                                    "国内提速",
+                                                    &format!(
+                                                        "WinDivert 驱动就绪后未切入底层透明模式（模式：{}，原因：{reason}）",
+                                                        upgraded.mode
+                                                    ),
+                                                );
+                                            }
+                                            Err(err) => {
+                                                if st.snapshot_global_preaccel().install_state
+                                                    == "verifying"
+                                                {
+                                                    st.global_preaccel.set_install_state("failed");
+                                                }
+                                                st.log_app_event(
+                                                    "warning",
+                                                    "国内提速",
+                                                    &format!(
+                                                        "WinDivert 驱动就绪后自动热升格失败：{err}"
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        st.global_preaccel.set_install_state("ready");
+                                    }
+                                }
+                            } else if !cur_global.running && !tun_active {
+                                if load_enabled_preaccel_relays(&st)
+                                    .is_ok_and(|relays| !relays.is_empty())
+                                {
+                                    match start_global_preaccel_engine(&st, &latest_cfg).await {
+                                        Ok(_) => {
+                                            if st.snapshot_global_preaccel().install_state
+                                                == "verifying"
+                                            {
+                                                st.global_preaccel.set_install_state("ready");
+                                            }
+                                        }
+                                        Err(err) => {
+                                            st.global_preaccel.set_install_state("ready");
+                                            st.log_app_event(
+                                                "warning",
+                                                "国内提速",
+                                                &format!(
+                                                    "WinDivert 驱动就绪后自动拉起底层透明提速失败：{err}"
+                                                ),
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    st.global_preaccel.set_install_state("ready");
+                                }
+                            } else {
+                                st.global_preaccel.set_install_state("ready");
+                            }
+                        } else {
+                            st.global_preaccel.set_install_state("ready");
+                        }
+                    } else {
+                        st.global_preaccel.set_install_state("need_elevation");
+                        st.log_app_event(
+                            "info",
+                            "国内提速",
+                            "官方 WinDivert 驱动已自动安装就绪，当前非管理员权限，点击「以管理员重启生效」即可自动加速其它软件",
+                        );
+                    }
+                }
+                Err(err) => {
+                    st.global_preaccel.set_install_state("failed");
+                    st.log_app_event(
+                        "warning",
+                        "国内提速",
+                        &format!("后台自动下载官方 WinDivert 驱动失败（本地 443 通道仍待命）：{err}"),
+                    );
+                }
+            }
+
+            let final_cfg = st.snapshot_config();
+            sync_app_side_effects(&app_h, &st, &final_cfg);
+            let _ = app_h.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&final_cfg));
+        });
+    }
+    #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+    {
+        let _ = (app, state, cfg);
+    }
+}
+
+/// Single authoritative entry point for the app-wide unified "国内提速" master switch.
+/// Keeps `preaccel.enabled` and `preaccel.global_bypass_enabled` strictly synchronized, reloads
+/// the running main core when active, coordinates standalone 443 / WinDivert acceleration, and
+/// automatically downloads + hot-upgrades WinDivert in the background on Windows x64 when missing.
 pub async fn toggle_preaccel_internal(
     app: &AppHandle,
     state: &AppState,
     enabled: bool,
 ) -> Result<bool, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let old_cfg = state.snapshot_config();
+    let old_preaccel_enabled = old_cfg.preaccel.enabled;
+    let old_preaccel_global = old_cfg.preaccel.global_bypass_enabled;
     let mut cfg = old_cfg.clone();
     let core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
     let proxy_active = is_proxy_takeover_active(core_running, &cfg);
+    let tun_active = core_running && cfg.tun.enabled;
 
     if enabled {
-        cfg.preaccel.enabled = true;
-        if proxy_active {
-            config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
-            if let Ok(mut guard) = state.config.write() {
-                *guard = cfg.clone();
-            }
-            state.log_app_event("info", "国内提速", "已开启国内 443 预加速（主代理核心生效）");
+        cfg.preaccel.sync_unified_enabled(true);
+        config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = cfg.clone();
+        }
+
+        let enabled_relays = load_enabled_preaccel_relays(state)?;
+        if enabled_relays.is_empty() {
+            state.log_app_event(
+                "warning",
+                "国内提速",
+                "已打开国内提速开关，但尚未配置可用的国内 443 中转线路",
+            );
+            sync_app_side_effects(app, state, &cfg);
+            let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+            return Ok(true);
+        }
+
+        // 1. If main proxy core is running, reload it to compile in-core 443 pre-acceleration.
+        if core_running {
             let _ = trigger_reload_if_running(app, state, false).await;
-        } else {
-            let enabled_relays = load_enabled_preaccel_relays(state)?;
-            if !enabled_relays.is_empty() {
-                cfg.preaccel.global_bypass_enabled = true;
-                config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
-                if let Ok(mut guard) = state.config.write() {
-                    *guard = cfg.clone();
-                }
-                match start_global_preaccel_engine(state, &cfg).await {
-                    Ok(global_st) => {
-                        let detail = match global_st.mode.as_str() {
-                            "windivert" => "已开启独立底层全局国内提速（WinDivert 透明接管运行中）"
-                                .to_string(),
-                            _ => match global_st.socks_port {
-                                Some(port) => format!(
-                                    "已开启国内提速并启动本地独立 443 通道（127.0.0.1:{port}）"
-                                ),
-                                None => "已开启国内提速并启动本地独立 443 通道".to_string(),
-                            },
-                        };
-                        state.log_app_event("info", "国内提速", &detail);
+        }
+
+        // 2. When TUN is not already taking over all host traffic, ensure the standalone
+        //    lightweight 443 engine is running (WinDivert excludes CatCloud's full PID tree
+        //    so running alongside system-proxy mode has zero self-loop).
+        if !tun_active {
+            #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+            let wd_present =
+                locate_windivert_files(&state.paths, cfg.preaccel.windivert_dir.as_deref())
+                    .is_some();
+            #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+            let is_elevated = default_platform().capabilities().is_elevated;
+
+            let cur_global = state.snapshot_global_preaccel();
+            let engine_res: Result<GlobalPreAccelStatus, String> = if cur_global.running {
+                #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+                {
+                    if wd_present && is_elevated && !cur_global.is_windivert_active {
+                        let excluded_pids = collect_excluded_pids_for_global_preaccel(state);
+                        state
+                            .global_preaccel
+                            .upgrade_to_windivert_in_place(&cfg, &enabled_relays, &excluded_pids)
+                            .await
+                            .map_err(|e| e.to_string())
+                    } else {
+                        if wd_present && !is_elevated {
+                            state.global_preaccel.set_install_state("need_elevation");
+                        }
+                        Ok(state.snapshot_global_preaccel())
                     }
-                    Err(err) => {
-                        cfg.preaccel.global_bypass_enabled = old_cfg.preaccel.global_bypass_enabled;
-                        let _ = config::save(&state.paths, &cfg);
+                }
+                #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+                {
+                    Ok(cur_global)
+                }
+            } else {
+                start_global_preaccel_engine(state, &cfg).await
+            };
+
+            match engine_res {
+                Ok(global_st) => {
+                    let detail = if global_st.is_windivert_active {
+                        if proxy_active {
+                            "已开启国内提速（猫猫代理 + WinDivert 底层透明加速同时运行）".to_string()
+                        } else {
+                            "已开启国内提速（WinDivert 底层透明加速运行中）".to_string()
+                        }
+                    } else if proxy_active {
+                        "已开启国内提速（主代理核心已生效，独立通道待命中）".to_string()
+                    } else if global_st.install_state == "need_elevation" {
+                        "已开启国内提速（本地 443 通道待命，需管理员权限启用底层透明加速）"
+                            .to_string()
+                    } else if matches!(
+                        global_st.install_state.as_str(),
+                        "downloading" | "verifying"
+                    ) {
+                        "已开启国内提速（本地 443 通道已就绪，正在后台自动准备提速组件）"
+                            .to_string()
+                    } else {
+                        match global_st.socks_port {
+                            Some(port) => format!(
+                                "已开启国内提速并启动本地独立 443 通道（127.0.0.1:{port}）"
+                            ),
+                            None => "已开启国内提速并启动本地独立 443 通道".to_string(),
+                        }
+                    };
+                    state.log_app_event("info", "国内提速", &detail);
+                }
+                Err(err) => {
+                    if proxy_active {
+                        state.log_app_event(
+                            "warning",
+                            "国内提速",
+                            &format!(
+                                "猫猫代理内 443 提速已开启，但伴随独立底层通道启动失败：{err}"
+                            ),
+                        );
+                    } else {
+                        let mut rollback = state.snapshot_config();
+                        rollback.preaccel.enabled = old_preaccel_enabled;
+                        rollback.preaccel.global_bypass_enabled = old_preaccel_global;
+                        rollback.preaccel.reconcile_unified_enabled();
+                        let _ = config::save(&state.paths, &rollback);
                         if let Ok(mut guard) = state.config.write() {
-                            *guard = cfg.clone();
+                            *guard = rollback.clone();
                         }
                         state.log_app_event(
                             "error",
                             "国内提速",
-                            &format!("主代理未接管流量时启动独立底层国内提速失败：{err}"),
+                            &format!("启动独立底层国内提速失败：{err}"),
                         );
-                        sync_app_side_effects(app, state, &cfg);
-                        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+                        sync_app_side_effects(app, state, &rollback);
+                        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&rollback));
                         return Err(err);
                     }
                 }
-            } else {
-                config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
-                if let Ok(mut guard) = state.config.write() {
-                    *guard = cfg.clone();
-                }
-                state.log_app_event(
-                    "warning",
-                    "国内提速",
-                    "已打开国内提速开关，但尚未配置可用的国内 443 中转线路",
-                );
             }
+
+            #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+            {
+                if !wd_present {
+                    maybe_spawn_auto_windivert_download(app, state, &cfg);
+                } else if !is_elevated {
+                    state.global_preaccel.set_install_state("need_elevation");
+                }
+            }
+        } else {
+            state.log_app_event("info", "国内提速", "已开启国内 443 提速（虚拟网卡主核心统一生效）");
+            maybe_spawn_auto_windivert_download(app, state, &cfg);
         }
     } else {
-        cfg.preaccel.enabled = false;
-        cfg.preaccel.global_bypass_enabled = false;
+        cfg.preaccel.sync_unified_enabled(false);
         config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
@@ -6358,7 +7416,7 @@ pub async fn toggle_preaccel_internal(
         if core_running {
             let _ = trigger_reload_if_running(app, state, false).await;
         }
-        state.log_app_event("info", "国内提速", "已关闭国内 443 预加速（含独立底层全局提速）");
+        state.log_app_event("info", "国内提速", "已关闭国内 443 提速");
     }
 
     sync_app_side_effects(app, state, &cfg);
@@ -6382,82 +7440,14 @@ pub fn get_global_preaccel_status(
     Ok(state.snapshot_global_preaccel())
 }
 
+/// Compatibility entry point delegating strictly to the single unified `toggle_preaccel_internal`.
 pub async fn toggle_global_preaccel_internal(
     app: &AppHandle,
     state: &AppState,
     enabled: bool,
 ) -> Result<GlobalPreAccelStatus, String> {
-    let old_cfg = state.snapshot_config();
-    let mut cfg = old_cfg.clone();
-
-    if enabled {
-        let relays = load_enabled_preaccel_relays(state)?;
-        if relays.is_empty() {
-            return Err("尚未配置已启用的国内 443 中转线路，请先添加并启用至少一条中转".to_string());
-        }
-        cfg.preaccel.global_bypass_enabled = true;
-        cfg.preaccel.enabled = true;
-
-        let excluded_pids = collect_excluded_pids_for_global_preaccel(state);
-        match state
-            .global_preaccel
-            .start(&cfg, &relays, &excluded_pids)
-            .await
-        {
-            Ok(status) => {
-                if let Err(err) = config::save(&state.paths, &cfg) {
-                    let _ = state.global_preaccel.stop().await;
-                    let msg = format!("保存底层全局提速配置失败：{err}");
-                    state.log_app_event("error", "国内提速", &msg);
-                    sync_app_side_effects(app, state, &old_cfg);
-                    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&old_cfg));
-                    return Err(msg);
-                }
-                if let Ok(mut guard) = state.config.write() {
-                    *guard = cfg.clone();
-                }
-                let msg = match status.mode.as_str() {
-                    "windivert" => "已开启独立底层全局国内提速（WinDivert 透明接管运行中）".to_string(),
-                    _ => match status.socks_port {
-                        Some(port) => format!(
-                            "已开启独立底层国内提速（本地 443 SOCKS5 通道 127.0.0.1:{port}）"
-                        ),
-                        None => "已开启独立底层国内提速（本地 443 通道就绪）".to_string(),
-                    },
-                };
-                state.log_app_event("info", "国内提速", &msg);
-                sync_app_side_effects(app, state, &cfg);
-                let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
-                Ok(status)
-            }
-            Err(err) => {
-                let detail = err.to_string();
-                state.log_app_event(
-                    "error",
-                    "国内提速",
-                    &format!("开启独立底层全局国内提速失败：{detail}"),
-                );
-                sync_app_side_effects(app, state, &old_cfg);
-                let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&old_cfg));
-                Err(detail)
-            }
-        }
-    } else {
-        cfg.preaccel.global_bypass_enabled = false;
-        config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
-        if let Ok(mut guard) = state.config.write() {
-            *guard = cfg.clone();
-        }
-        let status = state
-            .global_preaccel
-            .stop()
-            .await
-            .map_err(|e| e.to_string())?;
-        state.log_app_event("info", "国内提速", "已停止独立底层全局国内提速");
-        sync_app_side_effects(app, state, &cfg);
-        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
-        Ok(status)
-    }
+    toggle_preaccel_internal(app, state, enabled).await?;
+    Ok(state.snapshot_global_preaccel())
 }
 
 #[tauri::command]
@@ -6540,28 +7530,58 @@ pub async fn install_windivert_driver(
         );
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
     {
+        let _ = (&app, &state);
+        return Err(
+            "当前为 Windows ARM64 架构，官方 WinDivert v2.2.2 未提供原生 ARM64 内核驱动；请使用内置的「本地独立 443 通道 (SOCKS5)」为其它软件提速"
+                .to_string(),
+        );
+    }
+
+    #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+    {
+        if state
+            .windivert_installing
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("WinDivert 驱动正在下载安装中，请稍候片刻".to_string());
+        }
+        let _flag_guard = AtomicFlagResetGuard(Arc::clone(&state.windivert_installing));
+
+        let cfg = state.snapshot_config();
+        state.global_preaccel.set_install_state("downloading");
+        sync_app_side_effects(&app, &state, &cfg);
+
         let rt = state.snapshot_runtime();
-        let proxy_url = if rt.running && rt.mixed_port > 0 {
-            Some(format!("http://127.0.0.1:{}", rt.mixed_port))
+        let active_mixed_port = if rt.running && rt.mixed_port > 0 {
+            Some(rt.mixed_port)
         } else {
             None
         };
+        let proxy_candidates = build_default_windivert_proxy_candidates(active_mixed_port);
 
-        let install_res = match proxy_url.as_deref() {
-            Some(proxy) => match download_and_install_windivert(&state.paths, Some(proxy)).await {
-                Ok(dir) => Ok(dir),
-                Err(_) => download_and_install_windivert(&state.paths, None).await,
-            },
-            None => download_and_install_windivert(&state.paths, None).await,
+        let installed_dir = match download_and_install_windivert_with_fallbacks(
+            &state.paths,
+            &proxy_candidates,
+        )
+        .await
+        {
+            Ok(dir) => dir,
+            Err(e) => {
+                let msg = e.to_string();
+                state.global_preaccel.set_install_state("failed");
+                state.log_app_event("error", "国内提速", &format!("安装 WinDivert 驱动失败：{msg}"));
+                let latest_cfg = state.snapshot_config();
+                sync_app_side_effects(&app, &state, &latest_cfg);
+                return Err(msg);
+            }
         };
 
-        let installed_dir = install_res.map_err(|e| {
-            let msg = e.to_string();
-            state.log_app_event("error", "国内提速", &format!("安装 WinDivert 驱动失败：{msg}"));
-            msg
-        })?;
+        state.global_preaccel.set_install_state("verifying");
+        let latest_cfg = state.snapshot_config();
+        sync_app_side_effects(&app, &state, &latest_cfg);
 
         state.log_app_event(
             "info",
@@ -6572,29 +7592,102 @@ pub async fn install_windivert_driver(
             ),
         );
 
-        let cfg = state.snapshot_config();
         let current = state.snapshot_global_preaccel();
-        if current.running
-            && current.mode != "windivert"
-            && default_platform().capabilities().is_elevated
-        {
-            if let Err(err) = start_global_preaccel_engine(&state, &cfg).await {
-                state.log_app_event(
-                    "warning",
-                    "国内提速",
-                    &format!("驱动就绪后自动升级 WinDivert 透明模式失败：{err}"),
-                );
+        let latest_rt = state.snapshot_runtime();
+        let tun_active = latest_rt.running && latest_cfg.tun.enabled;
+
+        if default_platform().capabilities().is_elevated {
+            if current.running && !current.is_windivert_active {
+                match load_enabled_preaccel_relays(&state) {
+                    Ok(relays) if !relays.is_empty() => {
+                        let excluded_pids = collect_excluded_pids_for_global_preaccel(&state);
+                        match state
+                            .global_preaccel
+                            .upgrade_to_windivert_in_place(&latest_cfg, &relays, &excluded_pids)
+                            .await
+                        {
+                            Ok(upgraded) if upgraded.is_windivert_active => {
+                                state.log_app_event(
+                                    "info",
+                                    "国内提速",
+                                    "驱动安装完成，已免重启原地热升格为 WinDivert 最底层透明接管模式",
+                                );
+                            }
+                            Ok(upgraded) => {
+                                if upgraded.install_state == "verifying" {
+                                    state.global_preaccel.set_install_state(
+                                        if upgraded.windivert_available {
+                                            "ready"
+                                        } else {
+                                            "idle"
+                                        },
+                                    );
+                                }
+                                let reason = upgraded
+                                    .last_error
+                                    .as_deref()
+                                    .filter(|s| !s.trim().is_empty())
+                                    .unwrap_or(if !upgraded.running {
+                                        "独立通道已停止"
+                                    } else if !upgraded.windivert_available {
+                                        "未检测到可用驱动文件"
+                                    } else {
+                                        "继续保持本地独立 443 通道"
+                                    });
+                                state.log_app_event(
+                                    "warning",
+                                    "国内提速",
+                                    &format!(
+                                        "WinDivert 驱动安装完成，但未切入底层透明模式（模式：{}，原因：{reason}）",
+                                        upgraded.mode
+                                    ),
+                                );
+                            }
+                            Err(err) => {
+                                if state.snapshot_global_preaccel().install_state == "verifying" {
+                                    state.global_preaccel.set_install_state("failed");
+                                }
+                                state.log_app_event(
+                                    "warning",
+                                    "国内提速",
+                                    &format!("驱动就绪后原地热升格 WinDivert 透明模式失败：{err}"),
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        state.global_preaccel.set_install_state("ready");
+                    }
+                }
+            } else if !current.running && latest_cfg.preaccel.enabled && !tun_active {
+                if load_enabled_preaccel_relays(&state).is_ok_and(|relays| !relays.is_empty()) {
+                    match start_global_preaccel_engine(&state, &latest_cfg).await {
+                        Ok(_) => {
+                            if state.snapshot_global_preaccel().install_state == "verifying" {
+                                state.global_preaccel.set_install_state("ready");
+                            }
+                        }
+                        Err(err) => {
+                            state.global_preaccel.set_install_state("ready");
+                            state.log_app_event(
+                                "warning",
+                                "国内提速",
+                                &format!("驱动就绪后自动启动 WinDivert 透明模式失败：{err}"),
+                            );
+                        }
+                    }
+                } else {
+                    state.global_preaccel.set_install_state("ready");
+                }
             } else {
-                state.log_app_event(
-                    "info",
-                    "国内提速",
-                    "驱动安装完成，已自动升级为 WinDivert 最底层透明接管模式",
-                );
+                state.global_preaccel.set_install_state("ready");
             }
+        } else {
+            state.global_preaccel.set_install_state("need_elevation");
         }
 
-        sync_app_side_effects(&app, &state, &cfg);
-        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+        sync_app_side_effects(&app, &state, &latest_cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
         Ok(state.snapshot_global_preaccel())
     }
 }
@@ -8369,7 +9462,9 @@ pub fn evaluate_multi_group(
     let snaps = db
         .get_probe_snapshots_batch(&ids, group.primary_probe_id.as_deref())
         .map_err(|e| e.to_string())?;
-    evaluate_group_candidates(&group, &nodes, &snaps).map_err(|e| e.to_string())
+    let health_pool = state.snapshot_node_health_pool();
+    evaluate_group_candidates_with_runtime(&group, &nodes, &snaps, Some(&health_pool), Instant::now())
+        .map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8528,6 +9623,7 @@ pub async fn apply_migration_nodes(
         let mut db = state.storage.lock().map_err(|e| e.to_string())?;
         persist_migration_nodes(&mut db, source_name, nodes)?
     };
+    prune_node_health_pool_from_db(&state);
     ensure_default_group_if_empty(&state);
     let _ = trigger_reload_if_running(&app, &state, false).await;
     let cfg = state.snapshot_config();
@@ -8551,6 +9647,67 @@ pub async fn inspect_process_source(pid: u32) -> Result<serde_json::Value, Strin
         .ok_or_else(|| format!("未找到对应进程（PID {pid}）"))?;
     let report = core_inspect_process_source(&candidate).await;
     serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn list_desktop_app_candidates(
+    state: State<'_, AppState>,
+    baseline_pids: Option<Vec<u32>>,
+) -> Result<Vec<DesktopAppCandidate>, String> {
+    let baseline: Option<HashSet<u32>> = baseline_pids.map(|v| v.into_iter().collect());
+    let self_data_dir = state.paths.root_data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        core_list_desktop_app_candidates(baseline.as_ref(), Some(self_data_dir.as_path()))
+    })
+    .await
+    .map_err(|e| format!("枚举桌面软件列表失败：{e}"))
+}
+
+#[tauri::command]
+pub async fn start_live_capture_session(
+    state: State<'_, AppState>,
+    target_pid: u32,
+) -> Result<LiveCaptureStartDto, String> {
+    let mgr = Arc::clone(&state.live_capture);
+    let self_data_dir = state.paths.root_data_dir.clone();
+    tauri::async_runtime::spawn_blocking(move || mgr.start_session(target_pid, Some(self_data_dir)))
+        .await
+        .map_err(|e| format!("启动实时捕捉会话失败：{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn poll_live_capture_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<LiveCaptureStatusDto, String> {
+    state
+        .live_capture
+        .poll_session(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn finish_live_capture_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<LiveCaptureOutcomeDto, String> {
+    let mgr = Arc::clone(&state.live_capture);
+    tauri::async_runtime::spawn_blocking(move || mgr.finish_session(&session_id))
+        .await
+        .map_err(|e| format!("整理实时捕捉结果失败：{e}"))?
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn cancel_live_capture_session(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let mgr = Arc::clone(&state.live_capture);
+    tauri::async_runtime::spawn_blocking(move || mgr.cancel_session(&session_id))
+        .await
+        .map_err(|e| format!("取消实时捕捉失败: {e}"))
 }
 
 #[tauri::command]
@@ -9762,6 +10919,7 @@ pub async fn import_backup_bundle(
         let mut next: AppConfig = serde_json::from_value(cfg_val.clone())
             .map_err(|e| format!("备份中的配置格式无效：{e}"))?;
         preserve_local_secrets_in_config(&old_cfg, &mut next);
+        next.preaccel.reconcile_unified_enabled();
         config::save(&state.paths, &next).map_err(|e| format!("写入恢复配置失败：{e}"))?;
         if let Ok(mut guard) = state.config.write() {
             *guard = next;
@@ -9803,6 +10961,7 @@ pub async fn import_backup_bundle(
         }
     }
 
+    prune_node_health_pool_from_db(&state);
     let _ = trigger_reload_if_running(&app, &state, true).await;
     let cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &cfg);
@@ -11786,10 +12945,33 @@ mod tests {
         assert_eq!(dto_idle_core.status, "idle");
         assert_eq!(build_tray_visual_state(&state).health, TrayHealthState::Idle);
 
-        // 3. Core running with system proxy enabled & preaccel.enabled == true ->
-        //    proxy_active is true, preaccel_active is true, status == "preaccel", tray == PreAccel.
+        // 3a. Core running with system proxy enabled & preaccel.enabled == true,
+        //     but NO enabled preaccel relays exist -> must NOT falsely report preaccel_active.
         if let Ok(mut guard) = state.config.write() {
             guard.system_proxy.enabled = true;
+        }
+        let dto_no_relay = build_runtime_info_dto(&state).expect("build no-relay runtime dto");
+        assert!(dto_no_relay.running);
+        assert!(dto_no_relay.preaccel_enabled);
+        assert!(!dto_no_relay.preaccel_active);
+        assert_eq!(dto_no_relay.status, "ok");
+        assert_eq!(build_tray_visual_state(&state).health, TrayHealthState::Ok);
+
+        // 3b. Once at least one enabled preaccel relay exists ->
+        //     proxy_active is true, preaccel_active is true, status == "preaccel", tray == PreAccel.
+        {
+            let db = state.storage.lock().expect("lock storage");
+            db.upsert_preaccel_relay(&PreAccelRelay {
+                id: "relay-test-1".to_string(),
+                name: "国内测试中转".to_string(),
+                server: "203.0.113.10".to_string(),
+                port: 443,
+                protocol: "trojan".to_string(),
+                password: "secret".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .expect("insert enabled preaccel relay");
         }
         let dto_running = build_runtime_info_dto(&state).expect("build running runtime dto");
         assert!(dto_running.running);
@@ -11863,7 +13045,7 @@ mod tests {
         cfg.preaccel.campus_portal_guard = false;
         cfg.preaccel.global_bypass_enabled = true;
         cfg.preaccel.global_scope = GlobalPreAccelScope::AllNon443Tcp;
-        cfg.preaccel.global_target_processes = vec!["FlClashCore.exe".to_string()];
+        cfg.preaccel.global_target_processes = vec!["xray.exe".to_string()];
         cfg.preaccel.windivert_dir = Some("C:/Custom/WinDivert".to_string());
 
         let dto = UiAppConfigDto::from(&cfg);
@@ -11875,7 +13057,7 @@ mod tests {
         );
         assert_eq!(
             dto.preaccel.global_target_processes,
-            Some(vec!["FlClashCore.exe".to_string()])
+            Some(vec!["xray.exe".to_string()])
         );
         assert_eq!(
             dto.preaccel.windivert_dir.as_deref(),
@@ -11914,7 +13096,7 @@ mod tests {
         );
         assert_eq!(
             target_cfg.preaccel.global_target_processes,
-            vec!["FlClashCore.exe".to_string()]
+            vec!["xray.exe".to_string()]
         );
         assert_eq!(
             target_cfg.preaccel.windivert_dir.as_deref(),
@@ -11929,7 +13111,7 @@ mod tests {
         let sample_nodes = vec![
             ProxyNode {
                 id: "node_duplicate_preview_1".to_string(),
-                sub_id: "preview_clash_verge".to_string(),
+                sub_id: "preview_local_profile".to_string(),
                 name: "HK 01".to_string(),
                 protocol: "trojan".to_string(),
                 server: "203.0.113.10".to_string(),
@@ -11951,7 +13133,7 @@ mod tests {
             },
             ProxyNode {
                 id: "node_duplicate_preview_1".to_string(),
-                sub_id: "preview_clash_verge".to_string(),
+                sub_id: "preview_local_profile".to_string(),
                 name: "HK 01".to_string(),
                 protocol: "trojan".to_string(),
                 server: "203.0.113.10".to_string(),
@@ -11973,7 +13155,7 @@ mod tests {
             },
             ProxyNode {
                 id: "node_duplicate_preview_2".to_string(),
-                sub_id: "preview_clash_verge".to_string(),
+                sub_id: "preview_local_profile".to_string(),
                 name: "JP 01".to_string(),
                 protocol: "vless".to_string(),
                 server: "198.51.100.20".to_string(),
@@ -12282,5 +13464,168 @@ mod tests {
         target.update.auto_download = false;
         apply_ui_dto(&mut target, &legacy_dto);
         assert!(!target.update.auto_download);
+    }
+
+    #[test]
+    fn reconcile_saved_preaccel_switch_keeps_unified_master_switch_aligned() {
+        let mut old = AppConfig::default();
+        old.preaccel.enabled = false;
+        old.preaccel.global_bypass_enabled = false;
+
+        // Flipping `enabled` ON synchronizes `global_bypass_enabled`.
+        let mut next = old.clone();
+        next.preaccel.enabled = true;
+        reconcile_saved_preaccel_switch(&old, &mut next);
+        assert!(next.preaccel.enabled);
+        assert!(next.preaccel.global_bypass_enabled);
+
+        // Flipping legacy `global_bypass_enabled` ON while `enabled` unchanged also aligns both.
+        let mut legacy_next = old.clone();
+        legacy_next.preaccel.global_bypass_enabled = true;
+        reconcile_saved_preaccel_switch(&old, &mut legacy_next);
+        assert!(legacy_next.preaccel.enabled);
+        assert!(legacy_next.preaccel.global_bypass_enabled);
+
+        // Flipping `enabled` OFF from an active state clears both flags together.
+        let mut active_old = AppConfig::default();
+        active_old.preaccel.sync_unified_enabled(true);
+        let mut turned_off = active_old.clone();
+        turned_off.preaccel.enabled = false;
+        reconcile_saved_preaccel_switch(&active_old, &mut turned_off);
+        assert!(!turned_off.preaccel.enabled);
+        assert!(!turned_off.preaccel.global_bypass_enabled);
+    }
+
+    #[test]
+    fn runtime_info_and_health_pool_latency_and_sub_refresh_guard_behave_accurately() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_stage12_runtime_pool_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, AppConfig::default(), storage, job_guard);
+
+        let stale_snap = ProbeSnapshot {
+            node_id: "n-1".to_string(),
+            ok: true,
+            latency_ms: Some(210.0),
+            ..Default::default()
+        };
+        assert_eq!(state.resolve_node_latency_ms("n-1", Some(&stale_snap)), Some(210.0));
+
+        // Live FullHealthy probe overrides stale SQLite latency and populates health hints.
+        state.record_node_health_probe("n-1", RuntimeDualHealth::FullHealthy, Some(68.0));
+        assert_eq!(state.resolve_node_latency_ms("n-1", Some(&stale_snap)), Some(68.0));
+
+        let dto = build_runtime_info_dto(&state).expect("build runtime dto");
+        assert!(!dto.global_windivert_active);
+        assert!(!dto.preaccel_install_state.is_empty());
+        let hint = dto
+            .node_health_hints
+            .get("n-1")
+            .expect("node health hint should be exported");
+        assert_eq!(hint.status, "healthy");
+        assert_eq!(hint.latency_ms, Some(68.0));
+        assert_eq!(hint.cooldown_remaining_sec, 0);
+
+        // Confirmed Failed probe clears stale SQLite latency and marks cooldown in hints.
+        state.record_node_health_probe("n-1", RuntimeDualHealth::Failed, None);
+        assert_eq!(state.resolve_node_latency_ms("n-1", Some(&stale_snap)), None);
+        let failed_hints = state.snapshot_node_health_hints();
+        let failed_hint = failed_hints.get("n-1").expect("failed hint");
+        assert_eq!(failed_hint.status, "cooldown");
+        assert_eq!(failed_hint.latency_ms, None);
+        assert!(failed_hint.cooldown_remaining_sec > 0);
+
+        // SubRefreshGuard prevents concurrent duplicate refreshes for the same subscription ID.
+        {
+            let guard_a = SubRefreshGuard::try_acquire(&state.refreshing_sub_ids, "sub-1".into());
+            assert!(guard_a.is_some());
+            let guard_dup = SubRefreshGuard::try_acquire(&state.refreshing_sub_ids, "sub-1".into());
+            assert!(guard_dup.is_none());
+            let guard_other = SubRefreshGuard::try_acquire(&state.refreshing_sub_ids, "sub-2".into());
+            assert!(guard_other.is_some());
+        }
+        assert!(
+            SubRefreshGuard::try_acquire(&state.refreshing_sub_ids, "sub-1".into()).is_some(),
+            "dropping previous guard must release subscription refresh lock"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn pick_group_candidates_with_runtime_pool_respects_cooldown_and_relaxes_when_all_cooled() {
+        let make_node = |id: &str, name: &str| ProxyNode {
+            id: id.to_string(),
+            sub_id: "sub-1".to_string(),
+            name: name.to_string(),
+            enabled: true,
+            multiplier: 1.0,
+            ..Default::default()
+        };
+        let nodes = vec![
+            make_node("n-a", "节点A"),
+            make_node("n-b", "节点B"),
+            make_node("n-c", "节点C"),
+        ];
+        let mut snaps = HashMap::new();
+        for (id, latency) in [("n-a", 40.0), ("n-b", 45.0), ("n-c", 80.0)] {
+            snaps.insert(
+                id.to_string(),
+                ProbeSnapshot {
+                    node_id: id.to_string(),
+                    ok: true,
+                    latency_ms: Some(latency),
+                    up_mbps: Some(100.0),
+                    down_mbps: Some(200.0),
+                    ..Default::default()
+                },
+            );
+        }
+        let group = MultiGroup {
+            id: "g-pool".to_string(),
+            name: "池化测试组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-a".into(), "n-b".into(), "n-c".into()],
+            active_node_id: Some("n-a".into()),
+            ..Default::default()
+        };
+
+        let now = Instant::now();
+        let mut pool = NodeHealthPool::new();
+        pool.record_probe_result("n-b", RuntimeDualHealth::Failed, None, now);
+
+        let empty_local = HashSet::new();
+        let ranked = pick_group_candidates_with_cooldown_and_runtime(
+            &group,
+            &nodes,
+            &snaps,
+            Some("n-a"),
+            &empty_local,
+            Some(&pool),
+            now,
+            3,
+        );
+        assert_eq!(ranked, vec!["n-c".to_string()]);
+
+        // When all backups are in runtime pool cooldown (with empty hard_gates), fallback honors
+        // shortest remaining cooldown order (n-b failed earlier so expires sooner than n-c).
+        let later = now + Duration::from_secs(20);
+        pool.record_probe_result("n-c", RuntimeDualHealth::Failed, None, later);
+        let fallback = pick_group_candidates_with_cooldown_and_runtime(
+            &group,
+            &nodes,
+            &snaps,
+            Some("n-a"),
+            &empty_local,
+            Some(&pool),
+            later,
+            3,
+        );
+        assert_eq!(fallback, vec!["n-b".to_string(), "n-c".to_string()]);
+        assert!(!fallback.contains(&"n-a".to_string()));
     }
 }

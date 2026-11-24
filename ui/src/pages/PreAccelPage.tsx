@@ -5,6 +5,8 @@ import {
   ArrowUp,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Clock,
   Copy,
   Download,
@@ -34,7 +36,6 @@ import { createPortal } from "react-dom";
 import {
   type AppConfig,
   type GlobalPreAccelScope,
-  type PreAccelComparisonResult,
   type PreAccelRelay,
   catcloudApi,
   formatErrorMessage,
@@ -42,12 +43,32 @@ import {
 } from "../api/tauri";
 import { AppSelect } from "../components/AppSelect";
 import { formatBytes } from "../components/TrafficSparkline";
-import { appActions, useAppSelector } from "../store/appStore";
+import {
+  appActions,
+  appStore,
+  selectIsProbeEngineBusy,
+  useAppSelector,
+} from "../store/appStore";
 import {
   DEFAULT_GLOBAL_TARGET_PROCESSES,
   buildGlobalPreAccelShellSnippet,
   resolvePlatformOs,
 } from "../utils/platform";
+import { resolvePreAccelSummary } from "../utils/preaccelStatus";
+
+const DETECTED_BY_LABELS: Record<string, string> = {
+  system_proxy_host: "系统代理",
+  local_proxy_listener: "本地代理",
+  open_core_name: "代理核心",
+  outbound_proxy_behavior: "自动识别",
+  scope_all: "全局覆盖",
+  manual: "手动列表",
+};
+
+function formatDetectedByLabel(raw: string | undefined): string {
+  if (!raw) return "自动识别";
+  return DETECTED_BY_LABELS[raw] ?? "自动识别";
+}
 
 type AddModalTab = "manual" | "import";
 
@@ -458,14 +479,19 @@ export function PreAccelPage() {
   const groups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const initialized = useAppSelector((s) => s.initialized);
+  const bgPreaccel = useAppSelector((s) => s.bgTasks.preaccel);
+  const preAccelDraft = useAppSelector((s) => s.sessionDrafts.preAccel);
+  const probeRunning = useAppSelector(
+    (s) => s.probeProgress.running || s.bgTasks.probeLocalStarting
+  );
+  const isProbeEngineBusy = useAppSelector(selectIsProbeEngineBusy);
   const inTauri = isTauriEnv();
   const platformOs = resolvePlatformOs(runtime.os_label);
 
-  const [enabled, setEnabled] = useState<boolean>(config.preaccel.enabled);
+  const enabled = config.preaccel.enabled;
   const [togglingEnabled, setTogglingEnabled] = useState(false);
-  const [togglingGlobal, setTogglingGlobal] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [savingGlobalScope, setSavingGlobalScope] = useState(false);
-  const [installingDriver, setInstallingDriver] = useState(false);
   const [elevatingGlobal, setElevatingGlobal] = useState(false);
   const [refreshingGlobal, setRefreshingGlobal] = useState(false);
   const [globalScope, setGlobalScope] = useState<GlobalPreAccelScope>(
@@ -486,8 +512,6 @@ export function PreAccelPage() {
   const [savingCampusGuard, setSavingCampusGuard] = useState(false);
   const [probeUrl, setProbeUrl] = useState<string>(config.preaccel.probe_url);
   const [relays, setRelays] = useState<PreAccelRelay[]>(storeRelays);
-  const [probingIds, setProbingIds] = useState<Record<string, boolean>>({});
-  const [probingAll, setProbingAll] = useState(false);
   const [failoverBusy, setFailoverBusy] = useState(false);
 
   // Add Relay Modal (Manual Form + Paste Import Code / JSON)
@@ -520,22 +544,67 @@ export function PreAccelPage() {
   const [pendingDeleteRelay, setPendingDeleteRelay] = useState<PreAccelRelay | null>(null);
   const [deletingRelay, setDeletingRelay] = useState(false);
 
-  // Real Pre-Accel vs Direct Speed Comparison Card
-  const [benchmarking, setBenchmarking] = useState(false);
-  const [selectedCompareNodeId, setSelectedCompareNodeId] = useState<string>("");
-  const [comparison, setComparison] = useState<PreAccelComparisonResult | null>(null);
-  const [comparisonError, setComparisonError] = useState<string | null>(null);
-  const [comparisonIsDemo, setComparisonIsDemo] = useState(false);
-
-  // Campus Network Auth Check Card
-  const [checkingPortal, setCheckingPortal] = useState(false);
-  const [portalRequired, setPortalRequired] = useState<boolean>(runtime.captive_portal_required);
-  const [portalHttpCode, setPortalHttpCode] = useState<number | null>(
-    inTauri ? null : runtime.captive_portal_required ? 302 : 204
+  // Global background task bindings (survive page switches)
+  const installingDriver = bgPreaccel.installingDriver;
+  const probingAll = bgPreaccel.relaysTestingAll;
+  const probingIdsSet = useMemo(
+    () => new Set(bgPreaccel.relaysTestingIds),
+    [bgPreaccel.relaysTestingIds]
   );
-  const [portalRedirect, setPortalRedirect] = useState<string | null>(null);
-  const [portalBypassHosts, setPortalBypassHosts] = useState<string[]>([]);
-  const [portalLastCheck, setPortalLastCheck] = useState<string>(inTauri ? "尚未检测" : "演示态");
+
+  const benchmarking = bgPreaccel.benchmark.running;
+  const comparison = bgPreaccel.benchmark.result;
+  const comparisonError = bgPreaccel.benchmark.error;
+  const comparisonFinishedAt = bgPreaccel.benchmark.finishedAt;
+  const comparisonIsDemo = Boolean(comparison && !inTauri);
+  const selectedCompareNodeId = preAccelDraft.selectedCompareNodeId;
+  const setSelectedCompareNodeId = (nextNodeId: string) => {
+    appActions.patchSessionDraft("preAccel", { selectedCompareNodeId: nextNodeId });
+  };
+
+  const isOtherProbeRunning = probeRunning && !benchmarking;
+
+  // Soft "刚刚更新" badge expires cleanly 2 minutes after benchmark completion
+  const [recentClockNow, setRecentClockNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!comparisonFinishedAt) return;
+    const now = Date.now();
+    setRecentClockNow(now);
+    const remaining = comparisonFinishedAt + 120_000 - now;
+    if (remaining <= 0) return;
+    const id = window.setTimeout(() => {
+      setRecentClockNow(Date.now());
+    }, remaining + 50);
+    return () => window.clearTimeout(id);
+  }, [comparisonFinishedAt]);
+
+  const isComparisonFresh = Boolean(
+    comparison &&
+      comparisonFinishedAt !== null &&
+      recentClockNow - comparisonFinishedAt < 120_000
+  );
+
+  // Campus Network Auth Check Card (backed by global bgTasks.preaccel)
+  const checkingPortal = bgPreaccel.campusChecking;
+  const campusResult = bgPreaccel.campusResult;
+  const campusError = bgPreaccel.campusError;
+  const portalRequired = campusResult
+    ? campusResult.captive_portal_required
+    : runtime.captive_portal_required;
+  const portalHttpCode: number | null = campusResult
+    ? campusResult.status_code
+    : inTauri
+      ? null
+      : runtime.captive_portal_required
+        ? 302
+        : 204;
+  const portalRedirect = campusResult?.redirect_location ?? null;
+  const portalBypassHosts = campusResult?.bypass_hosts ?? [];
+  const portalLastCheck = campusResult?.checked_at
+    ? formatClockStamp(campusResult.checked_at)
+    : inTauri
+      ? "尚未检测"
+      : "演示态";
 
   const timersRef = useRef<number[]>([]);
 
@@ -556,7 +625,6 @@ export function PreAccelPage() {
 
   useEffect(() => {
     if (initialized) {
-      setEnabled(config.preaccel.enabled);
       setSkip443Native(config.preaccel.skip_443_native);
       if (typeof config.preaccel.campus_portal_guard === "boolean") {
         setCampusPortalGuard(config.preaccel.campus_portal_guard);
@@ -580,14 +648,22 @@ export function PreAccelPage() {
     void appActions.refreshGlobalPreAccelStatus();
   }, []);
 
+  const installBusy =
+    installingDriver ||
+    globalPreAccel.install_state === "downloading" ||
+    globalPreAccel.install_state === "verifying" ||
+    runtime.preaccel_install_state === "downloading" ||
+    runtime.preaccel_install_state === "verifying";
+
   useEffect(() => {
-    if (!globalPreAccel.running) return;
+    if (!enabled && !globalPreAccel.running && !installBusy) return;
+    const intervalMs = installBusy ? 1500 : 5000;
     const timer = window.setInterval(() => {
       if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
       void appActions.refreshGlobalPreAccelStatus();
-    }, 5000);
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [globalPreAccel.running]);
+  }, [enabled, globalPreAccel.running, installBusy]);
 
   useEffect(() => {
     let active = true;
@@ -799,16 +875,19 @@ export function PreAccelPage() {
   };
 
   const persistPreAccelConfig = async (
-    nextEnabled: boolean,
     nextSkip443: boolean,
     nextProbeUrl: string,
-    notice: string
+    notice: string,
+    overrideEnabled?: boolean
   ): Promise<boolean> => {
+    const latestConfig = appStore.getState().config;
+    const authoritativeEnabled =
+      overrideEnabled ?? latestConfig.preaccel.enabled;
     const nextConfig: AppConfig = {
-      ...config,
+      ...latestConfig,
       preaccel: {
-        ...config.preaccel,
-        enabled: nextEnabled,
+        ...latestConfig.preaccel,
+        enabled: authoritativeEnabled,
         skip_443_native: nextSkip443,
         probe_url: nextProbeUrl,
       },
@@ -828,27 +907,12 @@ export function PreAccelPage() {
 
   const handleToggleEnabled = async () => {
     if (togglingEnabled) return;
-    const prev = enabled;
-    const next = !enabled;
-    setEnabled(next);
+    const next = !appStore.getState().config.preaccel.enabled;
     setTogglingEnabled(true);
     try {
-      const ok = await appActions.togglePreAccel(next);
-      if (next && !ok) {
-        setEnabled(prev);
-      }
+      await appActions.togglePreAccel(next);
     } finally {
       setTogglingEnabled(false);
-    }
-  };
-
-  const handleToggleGlobalPreAccel = async () => {
-    if (togglingGlobal) return;
-    setTogglingGlobal(true);
-    try {
-      await appActions.toggleGlobalPreAccel();
-    } finally {
-      setTogglingGlobal(false);
     }
   };
 
@@ -878,7 +942,7 @@ export function PreAccelPage() {
       } else {
         appActions.showToast(
           nextScope === "proxy_apps_only"
-            ? "已切换为：智能识别其它梯子与常用工具"
+            ? "已切换为：智能自动识别代理核心与常用工具"
             : "已切换为：全机非 443 兜底加速",
           "ok"
         );
@@ -971,7 +1035,7 @@ export function PreAccelPage() {
       if (!ok) {
         setTargetProcesses(prev);
       } else {
-        appActions.showToast("已恢复默认其它梯子与传输工具列表", "ok");
+        appActions.showToast("已恢复默认代理核心与传输工具列表", "ok");
       }
     } finally {
       setSavingGlobalScope(false);
@@ -980,12 +1044,7 @@ export function PreAccelPage() {
 
   const handleInstallWinDivert = async () => {
     if (installingDriver) return;
-    setInstallingDriver(true);
-    try {
-      await appActions.installWinDivertDriver();
-    } finally {
-      setInstallingDriver(false);
-    }
+    await appActions.runInstallWinDivertDriver();
   };
 
   const handleRelaunchAdminGlobal = async () => {
@@ -1030,7 +1089,6 @@ export function PreAccelPage() {
     const next = !skip443Native;
     setSkip443Native(next);
     const ok = await persistPreAccelConfig(
-      enabled,
       next,
       probeValidation.ok ? probeUrl : config.preaccel.probe_url,
       next ? "已开启：已是高速通道的线路自动跳过" : "已关闭：所有海外节点均可使用国内提速"
@@ -1071,7 +1129,6 @@ export function PreAccelPage() {
     const prev = probeUrl;
     setProbeUrl(url);
     const ok = await persistPreAccelConfig(
-      enabled,
       skip443Native,
       url,
       `已切换国内连通检测地址：${label}`
@@ -1086,7 +1143,6 @@ export function PreAccelPage() {
       return;
     }
     const ok = await persistPreAccelConfig(
-      enabled,
       skip443Native,
       probeUrl.trim(),
       "国内连通检测地址已保存"
@@ -1344,69 +1400,13 @@ export function PreAccelPage() {
   };
 
   const handleProbeRelay = async (id: string) => {
-    if (probingIds[id]) return;
-    setProbingIds((prev) => ({ ...prev, [id]: true }));
-    try {
-      const results = await catcloudApi.testPreAccelRelays([id]);
-      const item = results.find((r) => r.relay_id === id) ?? results[0];
-      if (inTauri) {
-        const latestRelays = await catcloudApi.listPreAccelRelays();
-        setRelays(latestRelays);
-        appActions.syncPreAccelRelays(latestRelays);
-      } else if (item) {
-        setRelays((prev) => {
-          const next = prev.map((r) =>
-            r.id === id ? { ...r, last_probe_ms: item.latency_ms } : r
-          );
-          appActions.syncPreAccelRelays(next);
-          return next;
-        });
-      }
-      if (item && !item.ok) {
-        appActions.showToast(`测速失败：${item.error ?? "连接超时"}`, "warn");
-      } else {
-        const msText = hasValidLatency(item?.latency_ms)
-          ? `（${formatLatencyDisplay(item.latency_ms)}）`
-          : "";
-        appActions.showToast(`中转线路连通正常${msText}`, "ok");
-      }
-    } catch (err) {
-      appActions.showToast(`中转测速失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setProbingIds((prev) => ({ ...prev, [id]: false }));
-    }
+    if (probingIdsSet.has(id) || probingAll) return;
+    await appActions.runTestPreAccelRelays(id);
   };
 
   const handleProbeAllRelays = async () => {
     if (probingAll || relays.length === 0) return;
-    setProbingAll(true);
-    try {
-      const results = await catcloudApi.testPreAccelRelays(null);
-      if (inTauri) {
-        const latestRelays = await catcloudApi.listPreAccelRelays();
-        setRelays(latestRelays);
-        appActions.syncPreAccelRelays(latestRelays);
-      } else {
-        const resultMap = new Map(results.map((r) => [r.relay_id, r]));
-        setRelays((prev) => {
-          const next = prev.map((r) => {
-            const matched = resultMap.get(r.id);
-            return matched ? { ...r, last_probe_ms: matched.latency_ms } : r;
-          });
-          appActions.syncPreAccelRelays(next);
-          return next;
-        });
-      }
-      const okCount = results.filter((r) => r.ok).length;
-      appActions.showToast(
-        `全部测速完成：${okCount}/${results.length} 条线路可用`,
-        okCount > 0 ? "ok" : "warn"
-      );
-    } catch (err) {
-      appActions.showToast(`全部测速失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setProbingAll(false);
-    }
+    await appActions.runTestPreAccelRelays(null);
   };
 
   const handleConfirmRemoveRelay = async () => {
@@ -1429,6 +1429,10 @@ export function PreAccelPage() {
 
   const handleRunBenchmark = async () => {
     if (benchmarking) return;
+    if (isOtherProbeRunning) {
+      appActions.showToast("节点测速正在后台进行，完成后即可运行提速对比", "info");
+      return;
+    }
     if (inTauri && enabledRelayCount === 0) {
       appActions.showToast("请先添加并启用至少一条国内中转线路，再进行提速对比", "warn");
       return;
@@ -1437,122 +1441,12 @@ export function PreAccelPage() {
       appActions.showToast("还没有可对比的海外节点，请先在「节点与订阅」中导入节点", "warn");
       return;
     }
-
-    setBenchmarking(true);
-    setComparisonError(null);
-
-    try {
-      // 1) Test domestic relay connectivity first so relay cards show fresh latency
-      try {
-        const relayResults = await catcloudApi.testPreAccelRelays(null);
-        if (inTauri) {
-          const latestRelays = await catcloudApi.listPreAccelRelays();
-          setRelays(latestRelays);
-          appActions.syncPreAccelRelays(latestRelays);
-        } else {
-          const resultMap = new Map(relayResults.map((r) => [r.relay_id, r]));
-          setRelays((prev) => {
-            const next = prev.map((r) => {
-              const matched = resultMap.get(r.id);
-              return matched ? { ...r, last_probe_ms: matched.latency_ms } : r;
-            });
-            appActions.syncPreAccelRelays(next);
-            return next;
-          });
-        }
-      } catch {
-        /* continue to real comparison benchmark even if relay pre-check fails */
-      }
-
-      // 2) Run real accelerated vs direct upload/download speed comparison
-      const result = await catcloudApi.benchmarkPreAccelComparison(
-        primaryRelayId ?? null,
-        resolvedCompareNodeId || null
-      );
-      setComparison(result);
-      setComparisonIsDemo(!inTauri);
-      if (inTauri) {
-        try {
-          const latestRelays = await catcloudApi.listPreAccelRelays();
-          setRelays(latestRelays);
-          appActions.syncPreAccelRelays(latestRelays);
-        } catch {
-          /* ignore secondary relay refresh failure */
-        }
-      }
-
-      const accUp = result.accelerated.up_mbps;
-      const dirUp = result.direct.up_mbps;
-      const ratio =
-        result.up_boost_ratio ??
-        (accUp !== null && dirUp !== null && dirUp > 0 ? accUp / dirUp : null);
-
-      if (!inTauri) {
-        appActions.showToast(
-          ratio !== null
-            ? `演示模式：走国内中转上传提速约 ${ratio.toFixed(1)} 倍`
-            : "演示模式：已完成提速效果对比",
-          "info"
-        );
-      } else if (result.ok && result.accelerated.ok && result.direct.ok) {
-        appActions.showToast(
-          ratio !== null && ratio >= 1.1 && accUp !== null
-            ? `实测完成：走国内中转上传 ${accUp.toFixed(1)} Mbps（提速 ${ratio.toFixed(1)} 倍）`
-            : accUp !== null
-              ? `实测对比完成：走国内中转上传 ${accUp.toFixed(1)} Mbps`
-              : "提速效果实测对比完成",
-          "ok"
-        );
-      } else {
-        const errParts: string[] = [];
-        if (!result.accelerated.ok) {
-          const latHint = hasValidLatency(result.accelerated.latency_ms)
-            ? `延迟 ${formatLatencyDisplay(result.accelerated.latency_ms)}，`
-            : "";
-          const reason = result.accelerated.error?.trim() || "连接超时";
-          errParts.push(`走中转（${latHint}${reason}）`);
-        }
-        if (!result.direct.ok) {
-          const latHint = hasValidLatency(result.direct.latency_ms)
-            ? `延迟 ${formatLatencyDisplay(result.direct.latency_ms)}，`
-            : "";
-          const reason = result.direct.error?.trim() || "连接超时";
-          errParts.push(`普通直连（${latHint}${reason}）`);
-        }
-        appActions.showToast(
-          errParts.length > 0 ? errParts.join("；") : "本次对比测速未全部成功，请检查中转与节点状态",
-          "warn"
-        );
-      }
-    } catch (err) {
-      const msg = formatErrorMessage(err);
-      setComparisonError(msg);
-      appActions.showToast(`提速效果对比测速失败：${msg}`, "warn");
-    } finally {
-      setBenchmarking(false);
-    }
+    await appActions.runPreAccelBenchmark(resolvedCompareNodeId || null);
   };
 
   const handleCheckCampusAuth = async () => {
     if (checkingPortal) return;
-    setCheckingPortal(true);
-    try {
-      const status = await catcloudApi.checkCampusPortal();
-      setPortalRequired(status.captive_portal_required);
-      setPortalHttpCode(status.status_code);
-      setPortalRedirect(status.redirect_location);
-      setPortalBypassHosts(status.bypass_hosts);
-      setPortalLastCheck(formatClockStamp(status.checked_at));
-      if (status.captive_portal_required) {
-        appActions.showToast("检测到需要登录校园网，已自动临时放行认证页", "warn");
-      } else {
-        appActions.showToast("当前国内网络连通正常，无需网页认证", "ok");
-      }
-    } catch (err) {
-      appActions.showToast(`校园网认证检测失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setCheckingPortal(false);
-    }
+    await appActions.runCheckCampusPortal();
   };
 
   const guideMarkdown = useMemo(
@@ -1632,85 +1526,46 @@ export function PreAccelPage() {
   const manualShowDomainHint =
     manualServer.trim() !== "" && !looksLikeIpAddress(manualServer);
 
-  const isProxyEnabled =
-    runtime.running && (runtime.system_proxy_enabled || runtime.tun_enabled);
-  const isGlobalRunning = Boolean(
-    globalPreAccel.running || runtime.global_preaccel_active
-  );
-  const effectiveGlobalMode =
-    globalPreAccel.mode !== "off"
-      ? globalPreAccel.mode
-      : runtime.global_preaccel_mode ?? "off";
+  const preaccelSummary = resolvePreAccelSummary(runtime, globalPreAccel, enabled);
   const effectiveGlobalPort =
     globalPreAccel.socks_port ?? runtime.global_preaccel_socks_port ?? null;
   const effectiveGlobalConns =
     globalPreAccel.active_connections || runtime.global_preaccel_connections || 0;
-  const isProxyPreAccelActive = Boolean(isProxyEnabled && (enabled || runtime.preaccel_active));
+  const isWindows = platformOs === "windows";
+  const localSocksAddress = effectiveGlobalPort ? `127.0.0.1:${effectiveGlobalPort}` : null;
+  const processStats = globalPreAccel.process_stats ?? [];
+  const needsWindowsElevation =
+    isWindows &&
+    preaccelSummary.enabled &&
+    !preaccelSummary.realWinDivertActive &&
+    (preaccelSummary.installState === "need_elevation" ||
+      (globalPreAccel.windivert_available && !globalPreAccel.is_elevated));
+  const isPreparingDriver =
+    installingDriver ||
+    preaccelSummary.installState === "downloading" ||
+    preaccelSummary.installState === "verifying";
 
   const topStatusBadge = (() => {
-    if (isGlobalRunning && isProxyPreAccelActive) {
-      return {
-        label: "全局 + 代理提速中",
-        cls: "bg-[var(--green-soft)] text-[var(--green)]",
-      };
-    }
-    if (isGlobalRunning) {
-      return {
-        label: "底层全局提速中",
-        cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
-      };
-    }
-    if (isProxyPreAccelActive) {
-      return {
-        label: "代理提速中",
-        cls: "bg-[var(--green-soft)] text-[var(--green)]",
-      };
-    }
-    if (enabled) {
-      return {
-        label: "已开启 · 待启动",
-        cls: "bg-[var(--accent-soft)] text-[var(--accent)]",
-      };
-    }
-    return {
-      label: "未开启",
-      cls: "bg-[var(--bg-elevated)] text-[var(--muted)]",
-    };
+    const label =
+      preaccelSummary.proxyActive && preaccelSummary.subBadgeText
+        ? `${preaccelSummary.badgeText} · ${preaccelSummary.subBadgeText}`
+        : preaccelSummary.badgeText;
+    const cls =
+      preaccelSummary.tone === "green"
+        ? "bg-[var(--green-soft)] text-[var(--green)]"
+        : preaccelSummary.tone === "accent"
+          ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+          : preaccelSummary.tone === "amber"
+            ? "bg-[var(--amber-soft)] text-[var(--amber)]"
+            : preaccelSummary.tone === "red"
+              ? "bg-[var(--red-soft)] text-[var(--red)]"
+              : "bg-[var(--bg-elevated)] text-[var(--muted)]";
+    return { label, cls };
   })();
-
-  const globalModeBadge = (() => {
-    if (isGlobalRunning && effectiveGlobalMode === "windivert") {
-      return {
-        label: "最底层透明接管中 (WinDivert)",
-        cls: "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]",
-      };
-    }
-    if (isGlobalRunning && effectiveGlobalMode === "local_socks5") {
-      return {
-        label: "本地独立 443 通道运行中",
-        cls: "border-[var(--accent)]/50 bg-[var(--accent-soft)] text-[var(--accent)]",
-      };
-    }
-    if (isProxyPreAccelActive) {
-      return {
-        label: "跟随猫猫代理加速",
-        cls: "border-[var(--green)]/40 bg-[var(--green-soft)]/80 text-[var(--green)]",
-      };
-    }
-    return {
-      label: "未启动",
-      cls: "border-[var(--line)] bg-[var(--card)] text-[var(--muted)]",
-    };
-  })();
-
-  const isWindows = platformOs === "windows";
-  const windowsTransparentReady =
-    isWindows && globalPreAccel.windivert_available && globalPreAccel.is_elevated;
-  const localSocksAddress = effectiveGlobalPort ? `127.0.0.1:${effectiveGlobalPort}` : null;
 
   return (
     <div className="space-y-4">
-      {/* 1. 顶部总控卡片 */}
+      {/* 1. 顶部极简总控卡片：全站唯一「开启国内提速」总开关 + 诚实状态条 + 自动识别进程遥测 */}
       <section className="cc-card cc-glass rounded-2xl p-5">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
@@ -1722,17 +1577,18 @@ export function PreAccelPage() {
                 国内提速
               </h1>
               <span
-                className={`rounded-full px-2.5 py-0.5 text-[11px] font-medium ${topStatusBadge.cls}`}
+                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-[11px] font-medium ${topStatusBadge.cls}`}
               >
-                {topStatusBadge.label}
+                {isPreparingDriver && <Loader2 className="h-3 w-3 animate-spin" />}
+                <span>{topStatusBadge.label}</span>
               </span>
             </div>
             <p className="mt-1.5 text-xs leading-relaxed text-[var(--muted)]">
-              国内高速入口，帮你突破宽带上传限速，让传图、传文件和远程访问更顺畅。
+              国内 443 高速入口，帮你突破宽带上传限速，让传图、传文件和远程访问更顺畅。
             </p>
           </div>
 
-          {/* 折叠进轻按钮的高级项 */}
+          {/* 轻按钮高级入口 */}
           <div className="flex shrink-0 flex-wrap items-center gap-2">
             <button
               type="button"
@@ -1760,469 +1616,236 @@ export function PreAccelPage() {
           </div>
         </div>
 
-        {/* 两个清晰的主开关 */}
-        <div className="mt-4 grid grid-cols-1 gap-3 md:grid-cols-2">
-          <button
-            type="button"
-            role="switch"
-            aria-checked={enabled}
-            disabled={togglingEnabled}
-            onClick={() => void handleToggleEnabled()}
-            className="flex items-center justify-between gap-4 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-4 py-3 text-left transition-colors hover:border-[var(--line-strong)] disabled:opacity-65"
-          >
+        {/* 唯一一个「开启国内提速」总开关 */}
+        <button
+          type="button"
+          role="switch"
+          aria-checked={enabled}
+          disabled={togglingEnabled}
+          onClick={() => void handleToggleEnabled()}
+          className={`mt-4 flex w-full items-center justify-between gap-4 rounded-2xl border px-4 py-3.5 text-left transition-colors disabled:opacity-65 ${
+            enabled
+              ? "border-[var(--accent)]/60 bg-[var(--accent-soft)]/45 hover:border-[var(--accent)]"
+              : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
+          }`}
+        >
+          <div className="flex min-w-0 items-start gap-3">
+            <span
+              className={`mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl transition-colors ${
+                enabled
+                  ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+                  : "border border-[var(--line)] bg-[var(--card)] text-[var(--muted)]"
+              }`}
+            >
+              {togglingEnabled ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <Zap className="h-4 w-4" />
+              )}
+            </span>
             <div className="min-w-0">
-              <div className="text-xs font-semibold text-[var(--text)]">
+              <div className="text-sm font-semibold text-[var(--text)]">
                 {togglingEnabled ? "正在切换国内提速…" : "开启国内提速"}
               </div>
-              <div className="mt-0.5 text-[11px] text-[var(--muted)]">
-                自动通过国内中转线路转发海外流量，关闭代理时也可自动切入底层提速
+              <div className="mt-0.5 text-xs leading-relaxed text-[var(--text-secondary)]">
+                开启后猫猫云梯与电脑上其它代理软件都会一起走国内 443 提速，关闭则全部一起关
               </div>
             </div>
-            <span
-              className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors ${
-                enabled ? "bg-[var(--accent)]" : "bg-[var(--line-strong)]"
-              }`}
-            >
-              <span
-                className={`h-4 w-4 rounded-full bg-[var(--card)] transition-transform ${
-                  enabled ? "translate-x-4" : "translate-x-0"
-                }`}
-              />
-            </span>
-          </button>
+          </div>
 
-          <button
-            type="button"
-            role="switch"
-            aria-checked={skip443Native}
-            onClick={() => void handleToggleSkip443()}
-            className="flex items-center justify-between gap-4 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-4 py-3 text-left transition-colors hover:border-[var(--line-strong)]"
+          <span
+            className={`inline-flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors ${
+              enabled ? "bg-[var(--accent)]" : "bg-[var(--line-strong)]"
+            }`}
           >
-            <div className="min-w-0">
-              <div className="text-xs font-semibold text-[var(--text)]">
-                已是高速通道的线路自动跳过
-              </div>
-              <div className="mt-0.5 text-[11px] text-[var(--muted)]">
-                本身已是高速直连的海外节点直接连接不重复中转，可在节点页单独调整
-              </div>
-            </div>
             <span
-              className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors ${
-                skip443Native ? "bg-[var(--accent)]" : "bg-[var(--line-strong)]"
+              className={`h-5 w-5 rounded-full bg-[var(--card)] transition-transform ${
+                enabled ? "translate-x-5" : "translate-x-0"
+              }`}
+            />
+          </span>
+        </button>
+
+        {/* 诚实状态条：仅在开启或准备中展示 */}
+        {(preaccelSummary.enabled || isPreparingDriver) && (
+          <div className="mt-3 space-y-2.5">
+            <div
+              className={`flex flex-wrap items-center justify-between gap-2.5 rounded-xl border px-3.5 py-2.5 text-xs ${
+                isPreparingDriver ||
+                needsWindowsElevation ||
+                preaccelSummary.installState === "failed" ||
+                preaccelSummary.tone === "amber"
+                  ? "border-[var(--amber)]/45 bg-[var(--amber-soft)]/50"
+                  : preaccelSummary.realWinDivertActive || preaccelSummary.proxyActive
+                    ? "border-[var(--green)]/35 bg-[var(--green-soft)]/45"
+                    : "border-[var(--line)] bg-[var(--bg-elevated)]"
               }`}
             >
-              <span
-                className={`h-4 w-4 rounded-full bg-[var(--card)] transition-transform ${
-                  skip443Native ? "translate-x-4" : "translate-x-0"
-                }`}
-              />
-            </span>
-          </button>
-        </div>
-      </section>
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                {isPreparingDriver ? (
+                  <Loader2 className="h-4 w-4 shrink-0 animate-spin text-[var(--amber)]" />
+                ) : needsWindowsElevation ||
+                  preaccelSummary.installState === "failed" ||
+                  preaccelSummary.tone === "amber" ? (
+                  <ShieldAlert className="h-4 w-4 shrink-0 text-[var(--amber)]" />
+                ) : preaccelSummary.realWinDivertActive || preaccelSummary.proxyActive ? (
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--green)]" />
+                ) : (
+                  <Clock className="h-4 w-4 shrink-0 text-[var(--amber)]" />
+                )}
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium text-[var(--text)]">
+                    {preaccelSummary.detailText}
+                  </div>
+                  {preaccelSummary.realWinDivertActive && (
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-[var(--text-secondary)]">
+                      <span>
+                        当前加速连接{" "}
+                        <strong className="cc-mono cc-tabular text-[var(--text)]">
+                          {effectiveGlobalConns}
+                        </strong>
+                      </span>
+                      <span>
+                        累计{" "}
+                        <strong className="cc-mono cc-tabular text-[var(--text)]">
+                          {globalPreAccel.total_connections}
+                        </strong>{" "}
+                        次
+                      </span>
+                      <span>
+                        ↑{" "}
+                        <strong className="cc-mono cc-tabular text-[var(--coral)]">
+                          {formatBytes(globalPreAccel.up_bytes)}
+                        </strong>
+                      </span>
+                      <span>
+                        ↓{" "}
+                        <strong className="cc-mono cc-tabular text-[var(--sky)]">
+                          {formatBytes(globalPreAccel.down_bytes)}
+                        </strong>
+                      </span>
+                    </div>
+                  )}
+                </div>
+              </div>
 
-      {/* 1.5 全局底层提速（免开猫猫代理给其它软件加速）控制卡 */}
-      <section className="cc-card cc-glass rounded-2xl p-5">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="text-sm font-semibold text-[var(--text)]">
-                全局底层提速（给电脑上其它梯子 / 软件一起加速）
-              </h2>
-              <span
-                className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-medium ${globalModeBadge.cls}`}
-              >
-                {globalModeBadge.label}
-              </span>
-            </div>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--muted)]">
-              不用打开猫猫云梯自己的代理或虚拟网卡，也能从系统底层自动把 Clash Verge、FlClash、v2rayN、SSH/SCP 等其他代理与终端软件的上传流量送进国内 443 通道。
-            </p>
-          </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                {needsWindowsElevation && (
+                  <button
+                    type="button"
+                    disabled={elevatingGlobal}
+                    onClick={() => void handleRelaunchAdminGlobal()}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
+                  >
+                    {elevatingGlobal ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                    )}
+                    <span>{elevatingGlobal ? "正在重启…" : "以管理员重启生效"}</span>
+                  </button>
+                )}
 
-          <div className="flex shrink-0 items-center gap-2">
-            <button
-              type="button"
-              disabled={refreshingGlobal}
-              onClick={() => void handleRefreshGlobalStatus()}
-              className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
-              title="刷新底层提速运行状态与统计"
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${refreshingGlobal ? "animate-spin" : ""}`} />
-              <span>刷新</span>
-            </button>
+                {isWindows &&
+                  preaccelSummary.installState === "failed" &&
+                  !preaccelSummary.realWinDivertActive && (
+                    <button
+                      type="button"
+                      disabled={installBusy}
+                      onClick={() => void handleInstallWinDivert()}
+                      className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
+                    >
+                      {installBusy ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Download className="h-3.5 w-3.5" />
+                      )}
+                      <span>{installBusy ? "正在重试…" : "重试准备组件"}</span>
+                    </button>
+                  )}
 
-            <button
-              type="button"
-              role="switch"
-              aria-checked={isGlobalRunning}
-              aria-label={isGlobalRunning ? "关闭全局底层提速" : "开启全局底层提速"}
-              disabled={togglingGlobal}
-              onClick={() => void handleToggleGlobalPreAccel()}
-              className={`inline-flex items-center gap-2 rounded-xl border px-3 py-1.5 text-xs font-semibold transition-colors disabled:opacity-65 ${
-                isGlobalRunning
-                  ? "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)]"
-              }`}
-            >
-              {togglingGlobal ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Zap className="h-3.5 w-3.5" />
-              )}
-              <span>{togglingGlobal ? "切换中…" : isGlobalRunning ? "底层运行中" : "开启底层提速"}</span>
-            </button>
-          </div>
-        </div>
-
-        {/* 实时状态条 */}
-        <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2.5 text-xs">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
-            <div className="flex items-center gap-1.5">
-              <span className="text-[11px] text-[var(--muted)]">独立入口</span>
-              {localSocksAddress ? (
-                <>
-                  <code className="cc-mono cc-selectable rounded-md border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 text-[11px] font-semibold text-[var(--text)]">
-                    {localSocksAddress}
-                  </code>
+                {!isWindows && localSocksAddress && (
                   <button
                     type="button"
                     onClick={() => void handleCopyGlobalAddress(localSocksAddress)}
-                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                    title="一键复制本地独立 443 SOCKS5 入口地址"
+                    className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    title="复制本地独立 443 SOCKS5 入口地址"
                   >
                     {copiedGlobalAddr ? (
                       <Check className="h-3 w-3 text-[var(--green)]" />
                     ) : (
                       <Copy className="h-3 w-3" />
                     )}
-                    <span>{copiedGlobalAddr ? "已复制" : "复制"}</span>
+                    <span className="cc-mono">{localSocksAddress}</span>
                   </button>
-                </>
-              ) : (
-                <span className="text-[11px] text-[var(--muted)]">开启后自动分配本地 443 通道端口</span>
-              )}
-            </div>
+                )}
 
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--text-secondary)]">
-              <span>
-                当前加速连接{" "}
-                <strong className="cc-mono cc-tabular text-[var(--text)]">
-                  {effectiveGlobalConns}
-                </strong>
-              </span>
-              <span>
-                累计{" "}
-                <strong className="cc-mono cc-tabular text-[var(--text)]">
-                  {globalPreAccel.total_connections}
-                </strong>{" "}
-                次
-              </span>
-              <span>
-                ↑{" "}
-                <strong className="cc-mono cc-tabular text-[var(--coral)]">
-                  {formatBytes(globalPreAccel.up_bytes)}
-                </strong>
-              </span>
-              <span>
-                ↓{" "}
-                <strong className="cc-mono cc-tabular text-[var(--sky)]">
-                  {formatBytes(globalPreAccel.down_bytes)}
-                </strong>
-              </span>
-            </div>
-          </div>
-
-          {globalPreAccel.accelerated_processes.length > 0 && (
-            <div className="flex flex-wrap items-center gap-1 text-[10px]">
-              <span className="text-[var(--muted)]">正在加速：</span>
-              {globalPreAccel.accelerated_processes.slice(0, 5).map((proc) => (
-                <span
-                  key={proc}
-                  className="cc-mono rounded-md border border-[var(--accent)]/35 bg-[var(--accent-soft)]/70 px-1.5 py-0.5 text-[var(--accent)]"
+                <button
+                  type="button"
+                  disabled={refreshingGlobal}
+                  onClick={() => void handleRefreshGlobalStatus()}
+                  className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
+                  title="刷新提速状态与实时统计"
                 >
-                  {proc}
-                </span>
-              ))}
-              {globalPreAccel.accelerated_processes.length > 5 && (
-                <span className="text-[var(--muted)]">
-                  +{globalPreAccel.accelerated_processes.length - 5}
-                </span>
-              )}
-            </div>
-          )}
-        </div>
-
-        {globalPreAccel.last_error && (
-          <div className="mt-2.5 flex items-start gap-2 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)]/70 px-3.5 py-2 text-[11px] leading-relaxed text-[var(--amber)]">
-            <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span>{globalPreAccel.last_error}</span>
-          </div>
-        )}
-
-        {/* Windows 一键就绪引导条（就绪后自动收起为干净绿标） */}
-        {isWindows ? (
-          windowsTransparentReady ? (
-            <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--green)]/35 bg-[var(--green-soft)]/55 px-3.5 py-2 text-[11px] text-[var(--green)]">
-              <span className="inline-flex items-center gap-1.5 font-medium">
-                <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                <span>WinDivert 官方底层驱动与管理员权限已就绪，可直接透明接管其它软件</span>
-              </span>
-              {globalPreAccel.windivert_path && (
-                <span className="cc-mono truncate text-[10px] opacity-80" title={globalPreAccel.windivert_path}>
-                  已加载驱动
-                </span>
-              )}
-            </div>
-          ) : (
-            <div className="mt-3 space-y-2.5 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)]/45 p-3.5">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="min-w-0">
-                  <div className="text-xs font-semibold text-[var(--text)]">
-                    还差一步即可开启 Windows 最底层透明加速
-                  </div>
-                  <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--text-secondary)]">
-                    {!globalPreAccel.windivert_available
-                      ? "下载官方开源 WinDivert v2.2.2 驱动后，其它梯子不用改任何配置也能自动走国内 443 加速。"
-                      : "驱动已就绪，使用管理员身份运行猫猫云梯即可自动拦截加速其它梯子的非 443 连接。"}
-                  </p>
-                </div>
-
-                <div className="flex flex-wrap items-center gap-2">
-                  {!globalPreAccel.windivert_available && (
-                    <button
-                      type="button"
-                      disabled={installingDriver}
-                      onClick={() => void handleInstallWinDivert()}
-                      className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
-                    >
-                      {installingDriver ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Download className="h-3.5 w-3.5" />
-                      )}
-                      <span>
-                        {installingDriver
-                          ? "正在下载并校验驱动…"
-                          : "一键下载并校验官方驱动（WinDivert v2.2.2）"}
-                      </span>
-                    </button>
-                  )}
-
-                  {!globalPreAccel.is_elevated && (
-                    <button
-                      type="button"
-                      disabled={elevatingGlobal}
-                      onClick={() => void handleRelaunchAdminGlobal()}
-                      className={`inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-semibold transition-opacity hover:opacity-90 disabled:opacity-65 ${
-                        globalPreAccel.windivert_available
-                          ? "bg-[var(--accent)] text-[var(--accent-ink)]"
-                          : "border border-[var(--line-strong)] bg-[var(--card)] text-[var(--text)]"
-                      }`}
-                    >
-                      {elevatingGlobal ? (
-                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <ShieldCheck className="h-3.5 w-3.5" />
-                      )}
-                      <span>
-                        {elevatingGlobal
-                          ? "正在拉起管理员实例…"
-                          : "以管理员身份启用最底层透明加速"}
-                      </span>
-                    </button>
-                  )}
-                </div>
+                  <RefreshCw className={`h-3 w-3 ${refreshingGlobal ? "animate-spin" : ""}`} />
+                  <span>刷新</span>
+                </button>
               </div>
-
-              {!globalPreAccel.windivert_available && (
-                <p className="text-[11px] text-[var(--muted)]">
-                  温馨提示：官方开源驱动偶尔可能触发安全软件误报，如被拦截放行即可（下载后会自动校验官方 SHA256 指纹，绝不写入系统目录）。
-                </p>
-              )}
-            </div>
-          )
-        ) : (
-          /* macOS / Linux 友好呈现：直接展示本地独立 443 SOCKS5 入口与一键复制终端加速命令 */
-          <div className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/80 p-3.5">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="min-w-0">
-                <div className="text-xs font-semibold text-[var(--text)]">
-                  {platformOs === "macos" ? "macOS" : "Linux"} 本地独立 443 SOCKS5 入口
-                </div>
-                <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted)]">
-                  {effectiveGlobalPort
-                    ? "把其它代理软件的前置代理或终端环境变量指向此地址，免开猫猫主代理也能直享国内 443 上传加速。"
-                    : "点击右上角「开启底层提速」即可启动本地独立 443 SOCKS5 通道，随后可直接一键复制终端加速命令。"}
-                </p>
-              </div>
-              {effectiveGlobalPort && (
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void handleCopyGlobalShellCmd(
-                        effectiveGlobalPort,
-                        "posix",
-                        platformOs === "macos" ? "Zsh / Bash" : "Bash / Zsh"
-                      )
-                    }
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                  >
-                    {copiedShellKind === "posix" ? (
-                      <Check className="h-3.5 w-3.5 text-[var(--green)]" />
-                    ) : (
-                      <Terminal className="h-3.5 w-3.5" />
-                    )}
-                    <span>
-                      {copiedShellKind === "posix"
-                        ? "已复制命令"
-                        : platformOs === "macos"
-                          ? "复制 Zsh / Bash 加速命令"
-                          : "复制 Bash / Zsh 加速命令"}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void handleCopyGlobalShellCmd(effectiveGlobalPort, "fish", "Fish")
-                    }
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                  >
-                    {copiedShellKind === "fish" ? (
-                      <Check className="h-3.5 w-3.5 text-[var(--green)]" />
-                    ) : (
-                      <Terminal className="h-3.5 w-3.5" />
-                    )}
-                    <span>{copiedShellKind === "fish" ? "已复制 Fish" : "复制 Fish 命令"}</span>
-                  </button>
-                </div>
-              )}
-            </div>
-            {effectiveGlobalPort && (
-              <div className="mt-2 rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 cc-mono cc-selectable text-[11px] text-[var(--text-secondary)]">
-                {buildGlobalPreAccelShellSnippet(effectiveGlobalPort, "posix")}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Windows 拦截范围双选卡片 + 可编辑目标进程标签 */}
-        {isWindows && (
-          <div className="mt-3.5 space-y-3">
-            <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
-              <button
-                type="button"
-                disabled={savingGlobalScope}
-                onClick={() => void handleSelectGlobalScope("proxy_apps_only")}
-                className={`rounded-xl border p-3.5 text-left transition-colors disabled:opacity-70 ${
-                  globalScope === "proxy_apps_only"
-                    ? "border-[var(--accent)] bg-[var(--accent-soft)]/50"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-[var(--text)]">
-                    智能识别其它梯子与常用工具
-                  </span>
-                  <span className="rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
-                    默认推荐
-                  </span>
-                </div>
-                <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
-                  不绕走 QQ、网盘、游戏等国内大文件，只精准加速其它梯子和下方自选传输工具。
-                </p>
-              </button>
-
-              <button
-                type="button"
-                disabled={savingGlobalScope}
-                onClick={() => void handleSelectGlobalScope("all_non_443_tcp")}
-                className={`rounded-xl border p-3.5 text-left transition-colors disabled:opacity-70 ${
-                  globalScope === "all_non_443_tcp"
-                    ? "border-[var(--accent)] bg-[var(--accent-soft)]/50"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                }`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-semibold text-[var(--text)]">
-                    全机非 443 兜底加速
-                  </span>
-                  {globalScope === "all_non_443_tcp" && (
-                    <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--amber)]">
-                      当前生效
-                    </span>
-                  )}
-                </div>
-                <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
-                  除私网、中转机与 443 端口外全部非 443 连接走 443 加速（温和提示：可能带入其它国内非 443 传输）。
-                </p>
-              </button>
             </div>
 
-            {globalScope === "proxy_apps_only" && (
-              <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/75 p-3.5">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <span className="text-xs font-medium text-[var(--text)]">
-                    加速软件进程名单（共 {targetProcesses.length} 个）
+            {/* 已自动识别并加速的进程小胶囊列表（含连接数与流量） */}
+            {(processStats.length > 0 ||
+              (preaccelSummary.realWinDivertActive &&
+                globalPreAccel.accelerated_processes.length > 0)) && (
+              <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/80 px-3.5 py-2.5">
+                <div className="mb-2 flex items-center justify-between gap-2 text-[11px]">
+                  <span className="font-medium text-[var(--text-secondary)]">
+                    已自动识别并加速（
+                    {processStats.length > 0
+                      ? processStats.length
+                      : globalPreAccel.accelerated_processes.length}
+                    ）
                   </span>
-                  <button
-                    type="button"
-                    disabled={savingGlobalScope}
-                    onClick={() => void handleResetTargetProcesses()}
-                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-55"
-                  >
-                    <RotateCcw className="h-3 w-3" />
-                    <span>恢复默认名单</span>
-                  </button>
+                  <span className="text-[10px] text-[var(--muted)]">
+                    自动排除猫猫云梯自身，零手动配置
+                  </span>
                 </div>
-
-                <div className="mt-2.5 flex flex-wrap gap-1.5">
-                  {targetProcesses.map((proc) => (
-                    <span
-                      key={proc}
-                      className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 cc-mono text-[11px] text-[var(--text-secondary)]"
-                    >
-                      <span>{proc}</span>
-                      <button
-                        type="button"
-                        disabled={savingGlobalScope}
-                        onClick={() => void handleRemoveTargetProcess(proc)}
-                        className="rounded p-0.5 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--red)] disabled:opacity-45"
-                        aria-label={`移除 ${proc}`}
-                        title={`移除 ${proc}`}
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    </span>
-                  ))}
-                  {targetProcesses.length === 0 && (
-                    <span className="text-[11px] text-[var(--muted)]">
-                      暂未指定进程，可在下方输入进程名添加或点击右上角恢复默认名单
-                    </span>
-                  )}
+                <div className="flex flex-wrap gap-1.5">
+                  {processStats.length > 0
+                    ? processStats.slice(0, 12).map((stat) => (
+                        <span
+                          key={`${stat.process_name}-${stat.pid}`}
+                          title={`PID ${stat.pid} · 来源：${formatDetectedByLabel(stat.detected_by)} · 累计 ${stat.total_connections} 连接`}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)]/35 bg-[var(--card)] px-2 py-1 text-[11px]"
+                        >
+                          <span className="cc-mono font-semibold text-[var(--text)]">
+                            {stat.process_name}
+                          </span>
+                          <span className="rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9.5px] font-medium text-[var(--accent)]">
+                            {formatDetectedByLabel(stat.detected_by)}
+                          </span>
+                          <span className="cc-mono cc-tabular text-[10px] text-[var(--text-secondary)]">
+                            {stat.active_connections > 0
+                              ? `${stat.active_connections} 连`
+                              : `累计 ${stat.total_connections}`}
+                          </span>
+                          <span className="cc-mono cc-tabular text-[10px] text-[var(--coral)]">
+                            ↑{formatBytes(stat.tx_bytes)}
+                          </span>
+                          <span className="cc-mono cc-tabular text-[10px] text-[var(--sky)]">
+                            ↓{formatBytes(stat.rx_bytes)}
+                          </span>
+                        </span>
+                      ))
+                    : globalPreAccel.accelerated_processes.slice(0, 10).map((proc) => (
+                        <span
+                          key={proc}
+                          className="cc-mono rounded-lg border border-[var(--accent)]/35 bg-[var(--accent-soft)]/60 px-2 py-1 text-[11px] font-medium text-[var(--accent)]"
+                        >
+                          {proc}
+                        </span>
+                      ))}
                 </div>
-
-                <form
-                  onSubmit={(ev) => void handleAddTargetProcess(ev)}
-                  className="mt-2.5 flex flex-wrap items-center gap-2"
-                >
-                  <input
-                    type="text"
-                    value={newProcessInput}
-                    onChange={(e) => setNewProcessInput(e.target.value)}
-                    placeholder="添加其它代理或终端进程名（如 verge-mihomo.exe, xray.exe）"
-                    className="cc-mono min-w-[220px] flex-1 rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  />
-                  <button
-                    type="submit"
-                    disabled={savingGlobalScope || !newProcessInput.trim()}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    <span>添加进程</span>
-                  </button>
-                </form>
               </div>
             )}
           </div>
@@ -2309,7 +1932,7 @@ export function PreAccelPage() {
                 ? "主力线路"
                 : `备用 ${enabledRank ?? 1}`;
             const isActivePrimary = relay.id === primaryRelayId && relay.enabled;
-            const isProbing = Boolean(probingIds[relay.id]) || probingAll;
+            const isProbing = probingIdsSet.has(relay.id) || probingAll;
             const expiry = computeExpiryInfo(relay.expires_at);
             const hasUrgentExpiry = expiry.tone === "warn" || expiry.tone === "expired";
             const safeSni = (relay.sni ?? "").trim();
@@ -2520,14 +2143,24 @@ export function PreAccelPage() {
       {/* 3. 底部两张实用卡片：提速前后测速对比 + 校园网认证检测 */}
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-12">
         {/* 提速效果实测对比 */}
-        <div className="cc-card cc-glass rounded-2xl p-5 lg:col-span-7">
+        <div
+          className={`cc-card cc-glass rounded-2xl p-5 transition-colors lg:col-span-7 ${
+            isComparisonFresh && !benchmarking ? "ring-1 ring-[var(--green)]/35" : ""
+          }`}
+        >
           <div className="mb-4 flex flex-wrap items-start justify-between gap-2.5">
             <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <Gauge className="h-4 w-4 shrink-0 text-[var(--accent)]" />
                 <h2 className="text-sm font-semibold text-[var(--text)]">
                   提速效果实测对比
                 </h2>
+                {isComparisonFresh && !benchmarking && (
+                  <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                    <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                    刚刚更新
+                  </span>
+                )}
               </div>
               <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted)]">
                 默认直接拿首页当前节点对比「走国内中转」和「普通直连」的真实上传、下载速度（也可下拉换测其它节点）
@@ -2535,14 +2168,41 @@ export function PreAccelPage() {
             </div>
             <button
               type="button"
-              disabled={benchmarking}
+              disabled={benchmarking || isOtherProbeRunning || isProbeEngineBusy}
               onClick={() => void handleRunBenchmark()}
-              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
+              title={
+                isOtherProbeRunning
+                  ? "节点测速正在后台进行，完成后可运行提速对比"
+                  : undefined
+              }
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-60"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${benchmarking ? "animate-spin" : ""}`} />
-              <span>{benchmarking ? "正在实测对比（约 5～10 秒）…" : "一键对比提速效果"}</span>
+              <span>
+                {benchmarking
+                  ? "正在实测对比（约 5～10 秒）…"
+                  : isOtherProbeRunning
+                    ? "节点测速进行中…"
+                    : "一键对比提速效果"}
+              </span>
             </button>
           </div>
+
+          {isOtherProbeRunning && (
+            <div className="mb-3 flex items-center gap-2 rounded-xl border border-[var(--amber)]/35 bg-[var(--amber-soft)]/55 px-3.5 py-2 text-[11px] text-[var(--amber)]">
+              <Clock className="h-3.5 w-3.5 shrink-0" />
+              <span>
+                「节点与测速」页正在后台运行节点测速，测速结束后即可一键对比提速效果
+              </span>
+            </div>
+          )}
+
+          {benchmarking && comparison && (
+            <div className="mb-3 flex items-center gap-2 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)]/45 px-3.5 py-2 text-[11px] text-[var(--accent)]">
+              <RefreshCw className="h-3.5 w-3.5 shrink-0 animate-spin" />
+              <span>正在后台执行新一轮实测对比（约 5～10 秒），完成后自动刷新下方数据…</span>
+            </div>
+          )}
 
           {/* 中转连通概况 + 对照海外节点选择器 */}
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-[11px]">
@@ -3014,6 +2674,12 @@ export function PreAccelPage() {
                       已临时放行：{portalBypassHosts.join("、")}
                     </div>
                   )}
+                  {campusError && (
+                    <div className="mt-1 flex items-center gap-1 text-[11px] text-[var(--red)]">
+                      <AlertTriangle className="h-3 w-3 shrink-0" />
+                      <span className="truncate">上次检测失败：{campusError}</span>
+                    </div>
+                  )}
                 </div>
               </div>
             </div>
@@ -3076,6 +2742,375 @@ export function PreAccelPage() {
             </div>
           </div>
         </div>
+      </section>
+
+      {/* 4. 底部折叠区：高级选项（通常无需调整），默认收起 */}
+      <section className="cc-card cc-glass rounded-2xl">
+        <button
+          type="button"
+          aria-expanded={advancedOpen}
+          onClick={() => setAdvancedOpen((v) => !v)}
+          className="flex w-full items-center justify-between gap-3 rounded-2xl px-5 py-3.5 text-left transition-colors hover:bg-[var(--bg-elevated)]/45"
+        >
+          <div className="flex min-w-0 items-center gap-2.5">
+            {advancedOpen ? (
+              <ChevronDown className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+            ) : (
+              <ChevronRight className="h-4 w-4 shrink-0 text-[var(--muted)]" />
+            )}
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-[var(--text)]">
+                高级选项（通常无需调整）
+              </div>
+              <div className="mt-0.5 truncate text-[11px] text-[var(--muted)]">
+                高速直连自动跳过 · 驱动状态与重装诊断 · 加速范围及自定义额外/排除进程名
+              </div>
+            </div>
+          </div>
+          <span className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[10px] font-medium text-[var(--muted)]">
+            {advancedOpen ? "收起" : "展开"}
+          </span>
+        </button>
+
+        {advancedOpen && (
+          <div className="space-y-4 border-t border-[var(--line)]/70 px-5 pb-5 pt-4">
+            {/* 4.1 路由优化开关：已是高速通道的线路自动跳过 */}
+            <button
+              type="button"
+              role="switch"
+              aria-checked={skip443Native}
+              onClick={() => void handleToggleSkip443()}
+              className="flex w-full items-center justify-between gap-4 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-4 py-3 text-left transition-colors hover:border-[var(--line-strong)]"
+            >
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-[var(--text)]">
+                  已是高速通道的线路自动跳过
+                </div>
+                <div className="mt-0.5 text-[11px] text-[var(--muted)]">
+                  本身已是 443 直连高速通道的海外节点直接连接不重复中转，可在节点页按单个节点覆盖
+                </div>
+              </div>
+              <span
+                className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors ${
+                  skip443Native ? "bg-[var(--accent)]" : "bg-[var(--line-strong)]"
+                }`}
+              >
+                <span
+                  className={`h-4 w-4 rounded-full bg-[var(--card)] transition-transform ${
+                    skip443Native ? "translate-x-4" : "translate-x-0"
+                  }`}
+                />
+              </span>
+            </button>
+
+            {/* 4.2 驱动状态 / 重装诊断（Windows）或 本地独立通道终端命令（macOS / Linux） */}
+            {isWindows ? (
+              <div className="space-y-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/75 p-4">
+                <div className="flex flex-wrap items-start justify-between gap-2.5">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-[var(--text)]">
+                        提速组件与权限诊断（WinDivert）
+                      </span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                          preaccelSummary.realWinDivertActive
+                            ? "bg-[var(--green-soft)] text-[var(--green)]"
+                            : globalPreAccel.windivert_available
+                              ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                              : "bg-[var(--amber-soft)] text-[var(--amber)]"
+                        }`}
+                      >
+                        {preaccelSummary.realWinDivertActive
+                          ? "运行中"
+                          : globalPreAccel.windivert_available
+                            ? "组件已就绪"
+                            : "尚未下载"}
+                      </span>
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                          globalPreAccel.is_elevated
+                            ? "bg-[var(--green-soft)] text-[var(--green)]"
+                            : "bg-[var(--amber-soft)] text-[var(--amber)]"
+                        }`}
+                      >
+                        {globalPreAccel.is_elevated ? "已获管理员权限" : "普通权限运行"}
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
+                      开启顶部总开关时会自动下载并校验官方开源 WinDivert v2.2.2（SHA-256 指纹校验，仅存于应用目录）；如被安全软件误拦可在此手动重试安装。
+                    </p>
+                    {globalPreAccel.windivert_path && (
+                      <div
+                        className="mt-1 truncate cc-mono text-[10px] text-[var(--muted)]"
+                        title={globalPreAccel.windivert_path}
+                      >
+                        组件路径：{globalPreAccel.windivert_path}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                    <button
+                      type="button"
+                      disabled={installBusy}
+                      onClick={() => void handleInstallWinDivert()}
+                      className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
+                    >
+                      {installBusy ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Download className="h-3.5 w-3.5" />
+                      )}
+                      <span>
+                        {installBusy
+                          ? "正在下载并校验…"
+                          : globalPreAccel.windivert_available
+                            ? "重新下载并校验组件"
+                            : "下载并校验官方组件"}
+                      </span>
+                    </button>
+
+                    {!globalPreAccel.is_elevated && (
+                      <button
+                        type="button"
+                        disabled={elevatingGlobal}
+                        onClick={() => void handleRelaunchAdminGlobal()}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+                      >
+                        {elevatingGlobal ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <ShieldCheck className="h-3.5 w-3.5" />
+                        )}
+                        <span>{elevatingGlobal ? "正在重启…" : "以管理员重启生效"}</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {localSocksAddress && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-[11px]">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[var(--muted)]">本地独立 443 通道入口</span>
+                      <code className="cc-mono cc-selectable font-semibold text-[var(--text)]">
+                        {localSocksAddress}
+                      </code>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleCopyGlobalAddress(localSocksAddress)}
+                      className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    >
+                      {copiedGlobalAddr ? (
+                        <Check className="h-3 w-3 text-[var(--green)]" />
+                      ) : (
+                        <Copy className="h-3 w-3" />
+                      )}
+                      <span>{copiedGlobalAddr ? "已复制" : "复制地址"}</span>
+                    </button>
+                  </div>
+                )}
+
+                {globalPreAccel.last_error && (
+                  <div className="flex items-start gap-2 rounded-lg border border-[var(--amber)]/45 bg-[var(--amber-soft)]/60 px-3 py-2 text-[11px] leading-relaxed text-[var(--amber)]">
+                    <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                    <span>{globalPreAccel.last_error}</span>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/75 p-4">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold text-[var(--text)]">
+                      {platformOs === "macos" ? "macOS" : "Linux"} 本地独立 443 SOCKS5 入口
+                    </div>
+                    <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted)]">
+                      {effectiveGlobalPort
+                        ? "把其它代理软件的前置代理或终端环境变量指向此地址，免开猫猫主代理也能直享国内 443 上传加速。"
+                        : "开启顶部「开启国内提速」总开关后会自动分配本地独立 443 SOCKS5 通道端口。"}
+                    </p>
+                  </div>
+                  {effectiveGlobalPort && (
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void handleCopyGlobalShellCmd(
+                            effectiveGlobalPort,
+                            "posix",
+                            platformOs === "macos" ? "Zsh / Bash" : "Bash / Zsh"
+                          )
+                        }
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                      >
+                        {copiedShellKind === "posix" ? (
+                          <Check className="h-3.5 w-3.5 text-[var(--green)]" />
+                        ) : (
+                          <Terminal className="h-3.5 w-3.5" />
+                        )}
+                        <span>
+                          {copiedShellKind === "posix"
+                            ? "已复制命令"
+                            : platformOs === "macos"
+                              ? "复制 Zsh / Bash 加速命令"
+                              : "复制 Bash / Zsh 加速命令"}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void handleCopyGlobalShellCmd(effectiveGlobalPort, "fish", "Fish")
+                        }
+                        className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                      >
+                        {copiedShellKind === "fish" ? (
+                          <Check className="h-3.5 w-3.5 text-[var(--green)]" />
+                        ) : (
+                          <Terminal className="h-3.5 w-3.5" />
+                        )}
+                        <span>{copiedShellKind === "fish" ? "已复制 Fish" : "复制 Fish 命令"}</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+                {effectiveGlobalPort && (
+                  <div className="mt-2 rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 cc-mono cc-selectable text-[11px] text-[var(--text-secondary)]">
+                    {buildGlobalPreAccelShellSnippet(effectiveGlobalPort, "posix")}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 4.3 Windows 加速范围与自定义额外/排除进程名 */}
+            {isWindows && (
+              <div className="space-y-3">
+                <div className="text-xs font-semibold text-[var(--text)]">加速范围</div>
+                <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                  <button
+                    type="button"
+                    disabled={savingGlobalScope}
+                    onClick={() => void handleSelectGlobalScope("proxy_apps_only")}
+                    className={`rounded-xl border p-3.5 text-left transition-colors disabled:opacity-70 ${
+                      globalScope === "proxy_apps_only"
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)]/50"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-[var(--text)]">
+                        智能自动识别代理核心
+                      </span>
+                      <span className="rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
+                        默认推荐
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
+                      实时识别本机运行的其它代理核心与远程命令行工具，不绕走日常国内大文件与普通软件。
+                    </p>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={savingGlobalScope}
+                    onClick={() => void handleSelectGlobalScope("all_non_443_tcp")}
+                    className={`rounded-xl border p-3.5 text-left transition-colors disabled:opacity-70 ${
+                      globalScope === "all_non_443_tcp"
+                        ? "border-[var(--accent)] bg-[var(--accent-soft)]/50"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-[var(--text)]">
+                        全机非 443 兜底加速
+                      </span>
+                      {globalScope === "all_non_443_tcp" && (
+                        <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                          当前生效
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
+                      除私网、中转机与 443 端口外全部非 443 TCP 连接走 443 加速（可能带入其它国内非 443 传输）。
+                    </p>
+                  </button>
+                </div>
+
+                {globalScope === "proxy_apps_only" && (
+                  <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/75 p-3.5">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-medium text-[var(--text)]">
+                          自定义额外 / 排除进程名（当前 {targetProcesses.length} 项）
+                        </span>
+                        <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                          运行时会自动识别代理核心；如需额外补充指定程序或点 × 移除不想包含的进程，可在此调整。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={savingGlobalScope}
+                        onClick={() => void handleResetTargetProcesses()}
+                        className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-55"
+                      >
+                        <RotateCcw className="h-3 w-3" />
+                        <span>恢复默认</span>
+                      </button>
+                    </div>
+
+                    <div className="mt-2.5 flex flex-wrap gap-1.5">
+                      {targetProcesses.map((proc) => (
+                        <span
+                          key={proc}
+                          className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 cc-mono text-[11px] text-[var(--text-secondary)]"
+                        >
+                          <span>{proc}</span>
+                          <button
+                            type="button"
+                            disabled={savingGlobalScope}
+                            onClick={() => void handleRemoveTargetProcess(proc)}
+                            className="rounded p-0.5 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--red)] disabled:opacity-45"
+                            aria-label={`移除 ${proc}`}
+                            title={`移除 ${proc}`}
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        </span>
+                      ))}
+                      {targetProcesses.length === 0 && (
+                        <span className="text-[11px] text-[var(--muted)]">
+                          当前完全依赖自动识别，也可在下方手动补充进程名
+                        </span>
+                      )}
+                    </div>
+
+                    <form
+                      onSubmit={(ev) => void handleAddTargetProcess(ev)}
+                      className="mt-2.5 flex flex-wrap items-center gap-2"
+                    >
+                      <input
+                        type="text"
+                        value={newProcessInput}
+                        onChange={(e) => setNewProcessInput(e.target.value)}
+                        placeholder="输入额外进程名（如 mihomo.exe, sing-box.exe, ssh.exe）"
+                        className="cc-mono min-w-[220px] flex-1 rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                      />
+                      <button
+                        type="submit"
+                        disabled={savingGlobalScope || !newProcessInput.trim()}
+                        className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                      >
+                        <Plus className="h-3.5 w-3.5" />
+                        <span>添加进程</span>
+                      </button>
+                    </form>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
       </section>
 
       {/* ====================================================================
@@ -3308,7 +3343,7 @@ export function PreAccelPage() {
                       type="text"
                       value={manualNote}
                       onChange={(e) => setManualNote(e.target.value)}
-                      placeholder="例如：腾讯云轻量、月付"
+                      placeholder="例如：轻量云服务器、月付"
                       className={INPUT_CLS}
                     />
                   </div>

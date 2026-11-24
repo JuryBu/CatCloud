@@ -1,11 +1,12 @@
 import { X } from "lucide-react";
-import { Suspense, lazy, useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { type AppConfig, catcloudApi, isTauriEnv } from "./api/tauri";
 import { Sidebar } from "./components/Sidebar";
 import { TitleBar } from "./components/TitleBar";
 import {
   type NavRouteId,
   appActions,
+  appStore,
   useAppSelector,
 } from "./store/appStore";
 
@@ -82,8 +83,63 @@ export function App() {
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
   const toast = useAppSelector((s) => s.toast);
   const [dismissedToastId, setDismissedToastId] = useState<number | null>(null);
+  const mainScrollRef = useRef<HTMLDivElement | null>(null);
+  const scrollRouteKey: NavRouteId = activeNav === "speedtest" ? "nodes" : activeNav;
+  const prevRouteRef = useRef<NavRouteId>(scrollRouteKey);
+  const routeScrollTopRef = useRef<number>(0);
+  const restoringScrollRef = useRef<boolean>(false);
 
   const visibleToast = toast && toast.id !== dismissedToastId ? toast : null;
+
+  // Save outgoing route's scroll position and restore incoming route's scroll position smoothly.
+  useLayoutEffect(() => {
+    if (windowMode !== "main") return;
+    const el = mainScrollRef.current;
+    if (!el) return;
+
+    const prevRoute = prevRouteRef.current;
+    if (prevRoute !== scrollRouteKey) {
+      appActions.setScrollPosition(prevRoute, routeScrollTopRef.current);
+      prevRouteRef.current = scrollRouteKey;
+    }
+
+    const savedTop = appStore.getState().sessionDrafts.scrollPositions[scrollRouteKey] ?? 0;
+    routeScrollTopRef.current = savedTop;
+    restoringScrollRef.current = true;
+
+    let raf2 = 0;
+    const raf1 = window.requestAnimationFrame(() => {
+      const node = mainScrollRef.current;
+      if (!node) {
+        restoringScrollRef.current = false;
+        return;
+      }
+      node.scrollTop = savedTop;
+      if (savedTop > 0 && node.scrollTop < savedTop - 2) {
+        raf2 = window.requestAnimationFrame(() => {
+          const retryNode = mainScrollRef.current;
+          if (retryNode) {
+            retryNode.scrollTop = savedTop;
+          }
+          restoringScrollRef.current = false;
+        });
+      } else {
+        restoringScrollRef.current = false;
+      }
+    });
+
+    return () => {
+      window.cancelAnimationFrame(raf1);
+      if (raf2) window.cancelAnimationFrame(raf2);
+      restoringScrollRef.current = false;
+    };
+  }, [scrollRouteKey, windowMode]);
+
+  useEffect(() => {
+    return () => {
+      appActions.setScrollPosition(prevRouteRef.current, routeScrollTopRef.current);
+    };
+  }, []);
 
   // Pause all CSS animations/transitions whenever the window is hidden or minimized.
   useEffect(() => {
@@ -113,6 +169,23 @@ export function App() {
     let lastPersonalizationSig = "";
     let debounceTimer: number | null = null;
 
+    const applyCapsuleConfig = (latestCfg: AppConfig, force = false) => {
+      const sanitizedPersonalization: AppConfig["personalization"] = {
+        ...latestCfg.personalization,
+        wallpaper_path: null,
+        glass_blur_px: 0,
+      };
+      const sig = JSON.stringify(sanitizedPersonalization);
+      if (force || sig !== lastPersonalizationSig) {
+        lastPersonalizationSig = sig;
+        appActions.syncConfig({
+          ...latestCfg,
+          personalization: sanitizedPersonalization,
+        });
+      }
+      enforceCapsuleNoWallpaper();
+    };
+
     const syncCapsuleAppearance = async (force = false) => {
       if (disposed) return;
       if (inFlight) {
@@ -123,20 +196,7 @@ export function App() {
       try {
         const latestCfg = await catcloudApi.getConfig();
         if (disposed) return;
-        const sanitizedPersonalization: AppConfig["personalization"] = {
-          ...latestCfg.personalization,
-          wallpaper_path: null,
-          glass_blur_px: 0,
-        };
-        const sig = JSON.stringify(sanitizedPersonalization);
-        if (force || sig !== lastPersonalizationSig) {
-          lastPersonalizationSig = sig;
-          appActions.syncConfig({
-            ...latestCfg,
-            personalization: sanitizedPersonalization,
-          });
-          enforceCapsuleNoWallpaper();
-        }
+        applyCapsuleConfig(latestCfg, force);
       } catch {
         /* ignore transient IPC sync failures */
       } finally {
@@ -180,25 +240,14 @@ export function App() {
       }
     };
 
-    const onFocus = () => {
-      scheduleSync();
-    };
-
-    const onVisibility = () => {
-      if (document.visibilityState === "visible") {
-        scheduleSync();
-      }
-    };
-
     void syncCapsuleAppearance(true);
     window.addEventListener("storage", onStorage);
-    window.addEventListener("focus", onFocus);
-    document.addEventListener("visibilitychange", onVisibility);
 
-    // Backend broadcasts `catcloud://runtime` whenever config or theme is saved.
-    const unsubRuntime = isTauriEnv()
-      ? catcloudApi.subscribeRuntimeUpdate(() => {
-          scheduleSync();
+    // Backend broadcasts `catcloud://config-updated` whenever config or theme is saved.
+    const unsubConfig = isTauriEnv()
+      ? catcloudApi.subscribeConfigUpdate((incomingCfg) => {
+          if (disposed) return;
+          applyCapsuleConfig(incomingCfg, false);
         })
       : null;
 
@@ -209,9 +258,7 @@ export function App() {
         debounceTimer = null;
       }
       window.removeEventListener("storage", onStorage);
-      window.removeEventListener("focus", onFocus);
-      document.removeEventListener("visibilitychange", onVisibility);
-      unsubRuntime?.();
+      unsubConfig?.();
     };
   }, [windowMode]);
 
@@ -261,7 +308,15 @@ export function App() {
         <Sidebar />
 
         <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
-          <div className="flex-1 overflow-y-auto px-5 py-4">
+          <div
+            ref={mainScrollRef}
+            onScroll={(ev) => {
+              if (!restoringScrollRef.current && prevRouteRef.current === scrollRouteKey) {
+                routeScrollTopRef.current = ev.currentTarget.scrollTop;
+              }
+            }}
+            className="flex-1 overflow-y-auto px-5 py-4"
+          >
             <Suspense fallback={<PageLoadingFallback />}>
               {renderActivePage(activeNav)}
             </Suspense>

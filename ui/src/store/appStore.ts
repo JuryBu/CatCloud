@@ -1,13 +1,21 @@
 import { useSyncExternalStore } from "react";
 import {
   type AppConfig,
+  type AppUpdateCheckResult,
+  type CampusPortalStatus,
   type CoreRuntimeInfo,
   DEFAULT_APP_CONFIG,
   DEFAULT_GLOBAL_PREACCEL_STATUS,
   type ExitIpInfo,
+  type GeoDataStatusDto,
   type GlobalPreAccelScope,
   type GlobalPreAccelStatus,
+  type GroupEvaluationReport,
+  type LiveCaptureOutcomeDto,
+  type LiveCaptureStartDto,
+  type LiveCaptureStatusDto,
   type MultiGroup,
+  type PreAccelComparisonResult,
   type PreAccelRelay,
   type ProbeSnapshot,
   type ProxyMode,
@@ -24,6 +32,11 @@ import {
   isTauriEnv,
 } from "../api/tauri";
 import { detectNavigatorOs, resolvePlatformOs } from "../utils/platform";
+import {
+  isRealWinDivertActive,
+  normalizePreAccelInstallState,
+  resolvePreAccelSummary,
+} from "../utils/preaccelStatus";
 
 export type {
   AppConfig,
@@ -450,6 +463,101 @@ export interface ProbeRunProgressState {
   cancelled: boolean;
 }
 
+export interface BgTasksState {
+  preaccel: {
+    benchmark: {
+      running: boolean;
+      nodeId: string | null;
+      result: PreAccelComparisonResult | null;
+      error: string | null;
+      finishedAt: number | null;
+    };
+    relaysTestingAll: boolean;
+    relaysTestingIds: string[];
+    campusChecking: boolean;
+    campusResult: CampusPortalStatus | null;
+    campusError: string | null;
+    installingDriver: boolean;
+  };
+  subs: {
+    refreshingAll: boolean;
+    refreshingIds: string[];
+    importing: boolean;
+  };
+  home: {
+    checkingQuickSites: boolean;
+    refreshingExitIp: boolean;
+  };
+  groups: {
+    probingNodeIds: string[];
+    evaluatingGroupId: string | null;
+    evalReports: Record<string, GroupEvaluationReport>;
+  };
+  settings: {
+    geoStatus: GeoDataStatusDto | null;
+    geoLoading: boolean;
+    geoBusy: string | null;
+    checkingUpdate: boolean;
+    downloadingUpdate: boolean;
+    updateInfo: AppUpdateCheckResult | null;
+    updateMessage: string | null;
+    coreOpBusy: "start" | "stop" | "restart" | "reload" | "hotswap" | null;
+    backupBusy: "export" | "import" | null;
+  };
+  capture: {
+    sessionId: string | null;
+    active: boolean;
+    finishing: boolean;
+    targetName: string | null;
+    status: LiveCaptureStatusDto | null;
+    outcome: LiveCaptureOutcomeDto | null;
+  };
+  probeActiveNodeIds: string[];
+  probeLockedOrderIds: string[];
+  probeIsPausing: boolean;
+  probeLocalStarting: boolean;
+}
+
+export interface SessionDraftsState {
+  scrollPositions: Record<string, number>;
+  nodesWorkspace: {
+    tab: "nodes" | "subs";
+    filterSubId: string;
+  };
+  preAccel: {
+    selectedCompareNodeId: string;
+  };
+  speedTest: {
+    searchQuery: string;
+    sourceFilter: string;
+    groupFilter: string;
+    filterContinent?: string;
+    regionFilter: string;
+    onlyGolden: boolean;
+    onlyTested: boolean;
+    onlyGoogleClean: boolean;
+    onlyAiUnlocked: boolean;
+    page: number;
+    selectedIds: string[];
+  };
+  multiGroup: {
+    selectedId: string;
+    hasDirtyDrafts: boolean;
+  };
+  settings: {
+    tab: string;
+    hasDirtyDrafts: boolean;
+  };
+  rulesConns: {
+    connPaused: boolean;
+    connSearch: string;
+    ruleSearch: string;
+  };
+  home: {
+    ipMasked: boolean;
+  };
+}
+
 export interface AppState {
   initialized: boolean;
   isTauri: boolean;
@@ -479,6 +587,80 @@ export interface AppState {
   tunAdminPromptOpen: boolean;
   tunAdminPromptBusy: boolean;
   tunAdminPromptReason: string | null;
+  bgTasks: BgTasksState;
+  sessionDrafts: SessionDraftsState;
+}
+
+export function selectIsProbeEngineBusy(s: AppState): boolean {
+  return Boolean(
+    s.probeProgress.running ||
+      s.bgTasks.probeLocalStarting ||
+      s.bgTasks.preaccel.benchmark.running
+  );
+}
+
+let cachedBgActivity: {
+  preaccel: boolean;
+  nodes: boolean;
+  groups: boolean;
+  home: boolean;
+  settings: boolean;
+} = {
+  preaccel: false,
+  nodes: false,
+  groups: false,
+  home: false,
+  settings: false,
+};
+
+export function selectHasBackgroundActivity(s: AppState): {
+  preaccel: boolean;
+  nodes: boolean;
+  groups: boolean;
+  home: boolean;
+  settings: boolean;
+} {
+  const preaccel = Boolean(
+    s.bgTasks.preaccel.benchmark.running ||
+      s.bgTasks.preaccel.relaysTestingAll ||
+      s.bgTasks.preaccel.relaysTestingIds.length > 0 ||
+      s.bgTasks.preaccel.campusChecking ||
+      s.bgTasks.preaccel.installingDriver
+  );
+  const nodes = Boolean(
+    s.probeProgress.running ||
+      s.bgTasks.probeLocalStarting ||
+      s.bgTasks.subs.refreshingAll ||
+      s.bgTasks.subs.refreshingIds.length > 0 ||
+      s.bgTasks.subs.importing ||
+      s.bgTasks.capture.active ||
+      s.bgTasks.capture.finishing
+  );
+  const groups = Boolean(
+    s.bgTasks.groups.probingNodeIds.length > 0 ||
+      s.bgTasks.groups.evaluatingGroupId !== null
+  );
+  const home = Boolean(
+    s.bgTasks.home.checkingQuickSites || s.bgTasks.home.refreshingExitIp
+  );
+  const settings = Boolean(
+    s.bgTasks.settings.geoBusy !== null ||
+      s.bgTasks.settings.checkingUpdate ||
+      s.bgTasks.settings.downloadingUpdate ||
+      s.bgTasks.settings.coreOpBusy !== null ||
+      s.bgTasks.settings.backupBusy !== null
+  );
+  if (
+    cachedBgActivity.preaccel === preaccel &&
+    cachedBgActivity.nodes === nodes &&
+    cachedBgActivity.groups === groups &&
+    cachedBgActivity.home === home &&
+    cachedBgActivity.settings === settings
+  ) {
+    return cachedBgActivity;
+  }
+  cachedBgActivity = { preaccel, nodes, groups, home, settings };
+  return cachedBgActivity;
 }
 
 const runningInTauri = isTauriEnv();
@@ -567,9 +749,12 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       preaccel_enabled: false,
       preaccel_relay_name: null,
       global_preaccel_active: false,
+      global_windivert_active: false,
       global_preaccel_mode: "off",
       global_preaccel_socks_port: null,
       global_preaccel_connections: 0,
+      preaccel_install_state: "idle",
+      node_health_hints: {},
       captive_portal_required: false,
       system_proxy_enabled: false,
       tun_enabled: false,
@@ -602,9 +787,12 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       preaccel_enabled: initialConfig.preaccel.enabled,
       preaccel_relay_name: "CN-East-443 Primary",
       global_preaccel_active: false,
+      global_windivert_active: false,
       global_preaccel_mode: "off",
       global_preaccel_socks_port: null,
       global_preaccel_connections: 0,
+      preaccel_install_state: "idle",
+      node_health_hints: {},
       captive_portal_required: false,
       system_proxy_enabled: initialConfig.system_proxy_enabled,
       tun_enabled: initialConfig.tun_enabled,
@@ -691,6 +879,105 @@ function mergeProbeSnapshotSafe(
   };
 }
 
+function createInitialBgTasks(): BgTasksState {
+  return {
+    preaccel: {
+      benchmark: {
+        running: false,
+        nodeId: null,
+        result: null,
+        error: null,
+        finishedAt: null,
+      },
+      relaysTestingAll: false,
+      relaysTestingIds: [],
+      campusChecking: false,
+      campusResult: null,
+      campusError: null,
+      installingDriver: false,
+    },
+    subs: {
+      refreshingAll: false,
+      refreshingIds: [],
+      importing: false,
+    },
+    home: {
+      checkingQuickSites: false,
+      refreshingExitIp: false,
+    },
+    groups: {
+      probingNodeIds: [],
+      evaluatingGroupId: null,
+      evalReports: {},
+    },
+    settings: {
+      geoStatus: null,
+      geoLoading: false,
+      geoBusy: null,
+      checkingUpdate: false,
+      downloadingUpdate: false,
+      updateInfo: null,
+      updateMessage: null,
+      coreOpBusy: null,
+      backupBusy: null,
+    },
+    capture: {
+      sessionId: null,
+      active: false,
+      finishing: false,
+      targetName: null,
+      status: null,
+      outcome: null,
+    },
+    probeActiveNodeIds: [],
+    probeLockedOrderIds: [],
+    probeIsPausing: false,
+    probeLocalStarting: false,
+  };
+}
+
+function createInitialSessionDrafts(): SessionDraftsState {
+  return {
+    scrollPositions: {},
+    nodesWorkspace: {
+      tab: "nodes",
+      filterSubId: "",
+    },
+    preAccel: {
+      selectedCompareNodeId: "",
+    },
+    speedTest: {
+      searchQuery: "",
+      sourceFilter: "all",
+      groupFilter: "all",
+      filterContinent: "all",
+      regionFilter: "all",
+      onlyGolden: false,
+      onlyTested: false,
+      onlyGoogleClean: false,
+      onlyAiUnlocked: false,
+      page: 1,
+      selectedIds: [],
+    },
+    multiGroup: {
+      selectedId: "",
+      hasDirtyDrafts: false,
+    },
+    settings: {
+      tab: "system",
+      hasDirtyDrafts: false,
+    },
+    rulesConns: {
+      connPaused: false,
+      connSearch: "",
+      ruleSearch: "",
+    },
+    home: {
+      ipMasked: true,
+    },
+  };
+}
+
 let state: AppState = {
   initialized: false,
   isTauri: runningInTauri,
@@ -726,6 +1013,8 @@ let state: AppState = {
   tunAdminPromptOpen: false,
   tunAdminPromptBusy: false,
   tunAdminPromptReason: null,
+  bgTasks: createInitialBgTasks(),
+  sessionDrafts: createInitialSessionDrafts(),
 };
 
 const listeners = new Set<() => void>();
@@ -746,26 +1035,261 @@ function setState(updater: (prev: AppState) => AppState): void {
   emitState();
 }
 
+function updateBgTasks(updater: (prev: BgTasksState) => BgTasksState): void {
+  setState((prev) => {
+    const nextBg = updater(prev.bgTasks);
+    if (nextBg === prev.bgTasks) return prev;
+    return { ...prev, bgTasks: nextBg };
+  });
+}
+
+interface QueuedToastItem {
+  text: string;
+  tone: ToastNotice["tone"];
+  durationMs: number;
+}
+
 let toastTimer: number | null = null;
 let mascotResetTimer: number | null = null;
 let toastSeq = 0;
+let toastShownAt = 0;
+let toastQueue: QueuedToastItem[] = [];
+
+function showToastNow(item: QueuedToastItem): void {
+  toastSeq += 1;
+  const id = toastSeq;
+  toastShownAt = Date.now();
+  setState((prev) => ({ ...prev, toast: { id, text: item.text, tone: item.tone } }));
+  if (toastTimer !== null) {
+    window.clearTimeout(toastTimer);
+  }
+  toastTimer = window.setTimeout(() => {
+    toastTimer = null;
+    const nextQueued = toastQueue.shift();
+    if (nextQueued) {
+      showToastNow(nextQueued);
+      return;
+    }
+    setState((prev) => (prev.toast?.id === id ? { ...prev, toast: null } : prev));
+  }, item.durationMs);
+}
 
 function pushToast(
   text: string,
   tone: ToastNotice["tone"] = "info",
   durationMs = 3000
 ): void {
-  toastSeq += 1;
-  const id = toastSeq;
-  setState((prev) => ({ ...prev, toast: { id, text, tone } }));
-  if (toastTimer !== null) {
-    window.clearTimeout(toastTimer);
+  const normalized = text.trim();
+  if (!normalized) return;
+
+  if (!state.toast || toastTimer === null) {
+    showToastNow({ text: normalized, tone, durationMs });
+    return;
   }
+
+  // Deduplicate identical consecutive toast text
+  if (
+    state.toast.text === normalized ||
+    (toastQueue.length > 0 && toastQueue[toastQueue.length - 1].text === normalized)
+  ) {
+    return;
+  }
+
+  const elapsed = Date.now() - toastShownAt;
+  if (elapsed >= 1500) {
+    // Current toast has already been readable long enough; show the new one right away
+    toastQueue = [];
+    showToastNow({ text: normalized, tone, durationMs });
+    return;
+  }
+
+  // Brief anti-clobber queue when multiple background tasks finish almost simultaneously
+  if (toastQueue.length >= 3) {
+    const dropIdx = toastQueue.findIndex((item) => item.tone !== "warn");
+    if (dropIdx >= 0) {
+      toastQueue.splice(dropIdx, 1);
+    } else {
+      toastQueue.shift();
+    }
+  }
+  toastQueue.push({ text: normalized, tone, durationMs });
+
+  const remaining = Math.max(450, 1600 - elapsed);
+  window.clearTimeout(toastTimer);
+  const currentId = state.toast.id;
   toastTimer = window.setTimeout(() => {
     toastTimer = null;
-    setState((prev) => (prev.toast?.id === id ? { ...prev, toast: null } : prev));
-  }, durationMs);
+    const nextQueued = toastQueue.shift();
+    if (nextQueued) {
+      showToastNow(nextQueued);
+      return;
+    }
+    setState((prev) => (prev.toast?.id === currentId ? { ...prev, toast: null } : prev));
+  }, remaining);
 }
+
+/* ============================================================================
+ * Global Background Task Coordinator (In-Flight Dedupe, Mascot Ref-Count, Poll)
+ * ============================================================================ */
+
+const inFlightTasks = new Map<string, Promise<unknown>>();
+let activeMascotTaskCount = 0;
+
+function beginMascotBusy(mode: MascotState = "searching"): void {
+  activeMascotTaskCount += 1;
+  if (mascotResetTimer !== null) {
+    window.clearTimeout(mascotResetTimer);
+    mascotResetTimer = null;
+  }
+  setState((prev) => (prev.mascotState === mode ? prev : { ...prev, mascotState: mode }));
+}
+
+function endMascotBusy(): void {
+  activeMascotTaskCount = Math.max(0, activeMascotTaskCount - 1);
+  if (activeMascotTaskCount === 0 && !state.probeProgress.running) {
+    setState((prev) =>
+      prev.mascotState === "searching" || prev.mascotState === "thinking"
+        ? { ...prev, mascotState: "idle" }
+        : prev
+    );
+  }
+}
+
+function runInFlight<T>(
+  taskKey: string,
+  runner: () => Promise<T>,
+  options?: { mascot?: boolean }
+): Promise<T> {
+  const existing = inFlightTasks.get(taskKey);
+  if (existing) {
+    return existing as Promise<T>;
+  }
+  const useMascot = options?.mascot ?? false;
+  if (useMascot) {
+    beginMascotBusy("searching");
+  }
+  const promise = Promise.resolve()
+    .then(runner)
+    .finally(() => {
+      if (inFlightTasks.get(taskKey) === promise) {
+        inFlightTasks.delete(taskKey);
+      }
+      if (useMascot) {
+        endMascotBusy();
+      }
+    });
+  inFlightTasks.set(taskKey, promise);
+  return promise;
+}
+
+let probePauseRequested = false;
+let probePendingQueue: string[] = [];
+let previewProbeTimer: number | null = null;
+let previewProbeCancelled = false;
+let previewProbeFinishResolve: (() => void) | null = null;
+
+function clearPreviewProbeTimer(): void {
+  if (previewProbeTimer !== null) {
+    window.clearTimeout(previewProbeTimer);
+    previewProbeTimer = null;
+  }
+}
+
+let liveCapturePollTimer: number | null = null;
+let liveCapturePollInFlight = false;
+let captureGen = 0;
+
+function stopLiveCapturePolling(): void {
+  if (liveCapturePollTimer !== null) {
+    window.clearInterval(liveCapturePollTimer);
+    liveCapturePollTimer = null;
+  }
+  liveCapturePollInFlight = false;
+}
+
+function startLiveCapturePolling(sessionId: string, expectedGen: number): void {
+  stopLiveCapturePolling();
+  const pollOnce = () => {
+    if (liveCapturePollInFlight) return;
+    const currentCapture = state.bgTasks.capture;
+    if (
+      expectedGen !== captureGen ||
+      !currentCapture.active ||
+      currentCapture.sessionId !== sessionId
+    ) {
+      stopLiveCapturePolling();
+      return;
+    }
+    liveCapturePollInFlight = true;
+    void catcloudApi
+      .pollLiveCaptureSession(sessionId)
+      .then((latestStatus) => {
+        const latestCapture = state.bgTasks.capture;
+        if (
+          expectedGen !== captureGen ||
+          !latestCapture.active ||
+          latestCapture.sessionId !== sessionId
+        ) {
+          return;
+        }
+        updateBgTasks((bg) => ({
+          ...bg,
+          capture: {
+            ...bg.capture,
+            active: latestStatus.active,
+            targetName: latestStatus.target_name || bg.capture.targetName,
+            status: latestStatus,
+          },
+        }));
+        if (!latestStatus.active) {
+          stopLiveCapturePolling();
+        }
+      })
+      .catch(() => {
+        /* tolerate transient poll hiccup while session remains open */
+      })
+      .finally(() => {
+        liveCapturePollInFlight = false;
+      });
+  };
+  pollOnce();
+  liveCapturePollTimer = window.setInterval(pollOnce, 600);
+}
+
+function hasRealExitIpInfo(info: ExitIpInfo): boolean {
+  const masked = info.ip_masked?.trim() ?? "";
+  return Boolean(masked && !masked.includes("--") && masked !== "待检测");
+}
+
+function isUdpOnlyProtocol(proto: string): boolean {
+  const p = proto.trim().toLowerCase();
+  return (
+    p === "hysteria2" ||
+    p === "hy2" ||
+    p === "hysteria" ||
+    p === "tuic" ||
+    p === "wireguard"
+  );
+}
+
+function hasValidPositiveLatency(ms: number | null | undefined): ms is number {
+  return ms !== null && ms !== undefined && Number.isFinite(ms) && ms > 0;
+}
+
+function formatMsShort(ms: number): string {
+  return ms < 0.5 ? "<1 ms" : `${Math.round(ms)} ms`;
+}
+
+function buildReleasesFallbackUrl(repo: string): string {
+  const cleanRepo = repo.trim().replace(/^\/+|\/+$/g, "");
+  return `https://github.com/${cleanRepo || "JuryBu/CatCloud"}/releases`;
+}
+
+const PROBE_TIER_LABELS: Record<"latency" | "unlock" | "full", string> = {
+  latency: "仅快测延迟",
+  unlock: "测延迟 + 送中/AI",
+  full: "含上下行完整测速",
+};
 
 let bootStarted = false;
 let startupPageApplied = false;
@@ -780,6 +1304,7 @@ let disposeTunNeedsAdmin: (() => void) | null = null;
 let themeClockTimer: number | null = null;
 let trafficBackfillInFlight = false;
 let globalPreAccelRefreshInFlight = false;
+let globalPreAccelRefreshPending = false;
 
 function syncResolvedThemeFromClock(): void {
   const p = state.config.personalization;
@@ -1192,35 +1717,70 @@ export const appStore = {
       }
       const globalStateChanged =
         info.global_preaccel_active !== state.runtime.global_preaccel_active ||
+        info.global_windivert_active !== state.runtime.global_windivert_active ||
         info.global_preaccel_mode !== state.runtime.global_preaccel_mode ||
-        info.global_preaccel_socks_port !== state.runtime.global_preaccel_socks_port;
-      setState((prev) => ({
-        ...prev,
-        runtime: info,
-        globalPreAccel:
-          info.global_preaccel_active !== undefined ||
-          info.global_preaccel_mode !== undefined ||
-          info.global_preaccel_socks_port !== undefined ||
-          info.global_preaccel_connections !== undefined
+        info.global_preaccel_socks_port !== state.runtime.global_preaccel_socks_port ||
+        info.preaccel_install_state !== state.runtime.preaccel_install_state;
+      const hasGlobalRuntimePatch =
+        info.global_preaccel_active !== undefined ||
+        info.global_windivert_active !== undefined ||
+        info.global_preaccel_mode !== undefined ||
+        info.global_preaccel_socks_port !== undefined ||
+        info.global_preaccel_connections !== undefined ||
+        info.preaccel_install_state !== undefined;
+      setState((prev) => {
+        const nextRunning = info.global_preaccel_active ?? prev.globalPreAccel.running;
+        const nextMode = info.global_preaccel_mode ?? prev.globalPreAccel.mode;
+        const nextWinDivertActive =
+          info.global_windivert_active !== undefined
+            ? Boolean(info.global_windivert_active)
+            : Boolean(nextRunning && nextMode === "windivert");
+        const nextInstallState =
+          info.preaccel_install_state !== undefined
+            ? normalizePreAccelInstallState(info.preaccel_install_state)
+            : prev.globalPreAccel.install_state;
+        return {
+          ...prev,
+          runtime: {
+            ...info,
+            global_windivert_active: nextWinDivertActive,
+            preaccel_install_state:
+              info.preaccel_install_state ?? prev.runtime.preaccel_install_state,
+            node_health_hints: info.node_health_hints ?? prev.runtime.node_health_hints,
+          },
+          globalPreAccel: hasGlobalRuntimePatch
             ? {
                 ...prev.globalPreAccel,
-                running: info.global_preaccel_active ?? prev.globalPreAccel.running,
-                mode: info.global_preaccel_mode ?? prev.globalPreAccel.mode,
+                running: nextRunning,
+                mode: nextMode,
+                is_windivert_active: nextWinDivertActive,
+                install_state: nextInstallState,
                 socks_port:
                   info.global_preaccel_socks_port !== undefined
                     ? info.global_preaccel_socks_port
                     : prev.globalPreAccel.socks_port,
                 active_connections:
                   info.global_preaccel_connections ?? prev.globalPreAccel.active_connections,
+                process_stats: nextRunning ? prev.globalPreAccel.process_stats : [],
+                accelerated_processes: nextRunning
+                  ? prev.globalPreAccel.accelerated_processes
+                  : [],
               }
             : prev.globalPreAccel,
-      }));
+        };
+      });
       if (globalStateChanged && isTauriEnv() && state.windowMode === "main") {
         void appActions.refreshGlobalPreAccelStatus();
       }
     });
 
     disposeProbeProgress = catcloudApi.subscribeProbeProgress((ev) => {
+      if (ev.done) {
+        probePendingQueue = [];
+      } else if (ev.node_id && (ev.snapshot || ev.error)) {
+        probePendingQueue = probePendingQueue.filter((id) => id !== ev.node_id);
+      }
+
       setState((prev) => {
         const nextProbes =
           ev.node_id && ev.snapshot
@@ -1229,16 +1789,41 @@ export const appStore = {
                 [ev.node_id]: mergeProbeSnapshotSafe(prev.probes[ev.node_id], ev.snapshot),
               }
             : prev.probes;
+
+        let nextActiveNodeIds: string[];
+        if (ev.done) {
+          nextActiveNodeIds = [];
+        } else if (probePendingQueue.length > 0) {
+          nextActiveNodeIds = probePendingQueue.slice(0, 4);
+        } else if (ev.node_id) {
+          nextActiveNodeIds = ev.snapshot || ev.error ? [] : [ev.node_id];
+        } else {
+          nextActiveNodeIds = prev.bgTasks.probeActiveNodeIds;
+        }
+
+        const nextMascot: MascotState = ev.done
+          ? activeMascotTaskCount > 0
+            ? prev.mascotState
+            : "idle"
+          : "searching";
+
         return {
           ...prev,
           probes: nextProbes,
-          mascotState: ev.done ? "idle" : "searching",
+          mascotState: nextMascot,
           probeProgress: {
             running: !ev.done,
             completed: ev.completed,
             total: ev.total,
             currentNodeName: ev.done ? null : ev.node_name,
             cancelled: ev.cancelled,
+          },
+          bgTasks: {
+            ...prev.bgTasks,
+            probeLocalStarting: false,
+            probeActiveNodeIds: nextActiveNodeIds,
+            probeLockedOrderIds: ev.done ? [] : prev.bgTasks.probeLockedOrderIds,
+            probeIsPausing: ev.done ? false : prev.bgTasks.probeIsPausing,
           },
         };
       });
@@ -1399,6 +1984,18 @@ export const appStore = {
       window.clearTimeout(mascotResetTimer);
       mascotResetTimer = null;
     }
+    clearPreviewProbeTimer();
+    previewProbeCancelled = true;
+    previewProbeFinishResolve?.();
+    previewProbeFinishResolve = null;
+    captureGen += 1;
+    stopLiveCapturePolling();
+    globalPreAccelRefreshPending = false;
+    toastQueue = [];
+    inFlightTasks.clear();
+    probePendingQueue = [];
+    probePauseRequested = false;
+    activeMascotTaskCount = 0;
     bootStarted = false;
     startupPageApplied = false;
     userNavigatedManually = false;
@@ -1422,6 +2019,13 @@ export const appActions = {
     setState((prev) => ({
       ...prev,
       nodesTabHint: { tab, subId: subId ?? null },
+      sessionDrafts: {
+        ...prev.sessionDrafts,
+        nodesWorkspace: {
+          tab,
+          filterSubId: subId ?? "",
+        },
+      },
     }));
     appActions.setNav("nodes");
   },
@@ -1545,6 +2149,9 @@ export const appActions = {
   },
 
   setMascotState(next: MascotState): void {
+    if (next === "idle" && (activeMascotTaskCount > 0 || state.probeProgress.running)) {
+      return;
+    }
     setState((prev) => (prev.mascotState === next ? prev : { ...prev, mascotState: next }));
   },
 
@@ -1591,26 +2198,33 @@ export const appActions = {
 
   async refreshGlobalPreAccelStatus(): Promise<GlobalPreAccelStatus> {
     if (globalPreAccelRefreshInFlight) {
+      globalPreAccelRefreshPending = true;
       return state.globalPreAccel;
     }
     globalPreAccelRefreshInFlight = true;
+    let latestStatus = state.globalPreAccel;
     try {
-      const status = await catcloudApi.getGlobalPreAccelStatus();
-      setState((prev) => ({ ...prev, globalPreAccel: status }));
-      return status;
-    } catch {
-      return state.globalPreAccel;
+      do {
+        globalPreAccelRefreshPending = false;
+        try {
+          const status = await catcloudApi.getGlobalPreAccelStatus();
+          latestStatus = status;
+          setState((prev) => ({ ...prev, globalPreAccel: status }));
+        } catch {
+          latestStatus = state.globalPreAccel;
+        }
+      } while (globalPreAccelRefreshPending);
+      return latestStatus;
     } finally {
       globalPreAccelRefreshInFlight = false;
+      globalPreAccelRefreshPending = false;
     }
   },
 
   async togglePreAccel(next?: boolean): Promise<boolean> {
     const currentlyOn = Boolean(
-      state.runtime.preaccel_active ||
-        state.runtime.global_preaccel_active ||
-        state.globalPreAccel.running ||
-        state.config.preaccel.enabled
+      (state.runtime.preaccel_enabled ?? state.config.preaccel.enabled) ||
+        isRealWinDivertActive(state.runtime, state.globalPreAccel)
     );
     const target = next ?? !currentlyOn;
 
@@ -1654,17 +2268,8 @@ export const appActions = {
               preaccel: {
                 ...state.config.preaccel,
                 enabled: applied,
+                global_bypass_enabled: applied,
               },
-            };
-
-      const nextRt: CoreRuntimeInfo =
-        rtRes.status === "fulfilled"
-          ? rtRes.value
-          : {
-              ...state.runtime,
-              preaccel_enabled: applied,
-              preaccel_active:
-                applied && (state.runtime.running || state.globalPreAccel.running),
             };
 
       const nextGlobal: GlobalPreAccelStatus =
@@ -1676,9 +2281,34 @@ export const appActions = {
                 ...state.globalPreAccel,
                 running: false,
                 mode: "off",
+                is_windivert_active: false,
+                install_state: "idle",
                 socks_port: null,
                 active_connections: 0,
+                accelerated_processes: [],
+                process_stats: [],
               };
+
+      const nextWinDivertActive = Boolean(
+        (rtRes.status === "fulfilled" && rtRes.value.global_windivert_active) ||
+          (nextGlobal.running && nextGlobal.mode === "windivert")
+      );
+
+      const nextRt: CoreRuntimeInfo =
+        rtRes.status === "fulfilled"
+          ? rtRes.value
+          : {
+              ...state.runtime,
+              preaccel_enabled: applied,
+              preaccel_active:
+                applied && (state.runtime.running || nextWinDivertActive),
+              global_preaccel_active: nextGlobal.running,
+              global_windivert_active: nextWinDivertActive,
+              global_preaccel_mode: nextGlobal.mode,
+              global_preaccel_socks_port: nextGlobal.socks_port,
+              global_preaccel_connections: nextGlobal.active_connections,
+              preaccel_install_state: nextGlobal.install_state ?? "idle",
+            };
 
       setState((prev) => ({
         ...prev,
@@ -1688,40 +2318,57 @@ export const appActions = {
       }));
 
       if (!applied) {
-        pushToast("已关闭国内提速", "info");
+        pushToast("已关闭国内提速（猫猫代理与其它软件已一并关闭）", "info");
         return false;
       }
 
+      const summary = resolvePreAccelSummary(nextRt, nextGlobal, nextCfg.preaccel.enabled);
       const os = resolvePlatformOs(nextRt.os_label);
-      const proxyActive =
-        nextRt.running && (nextRt.system_proxy_enabled || nextRt.tun_enabled);
 
-      if (!proxyActive && nextGlobal.running) {
-        if (nextGlobal.mode === "windivert") {
-          pushToast("已开启底层全局国内提速，正在为本机其它软件加速", "ok", 4000);
-        } else if (os === "windows") {
+      if (summary.proxyActive) {
+        if (summary.realWinDivertActive) {
+          pushToast("已开启国内提速（猫猫代理与其它代理软件均已走 443 加速）", "ok", 4200);
+        } else if (
+          summary.installState === "downloading" ||
+          summary.installState === "verifying"
+        ) {
           pushToast(
-            "已开启国内提速（已启动本地 443 通道，可一键提权接管其它梯子）",
+            "已开启国内提速（猫猫代理已加速，正在后台准备其它软件提速组件…）",
+            "ok",
+            4400
+          );
+        } else if (summary.installState === "need_elevation") {
+          pushToast(
+            "已开启国内提速（猫猫代理已加速；加速其它代理软件需管理员权限）",
             "ok",
             4600
           );
-        } else {
-          const portLabel = nextGlobal.socks_port
-            ? `127.0.0.1:${nextGlobal.socks_port}`
-            : "本地 443 通道";
-          pushToast(`已开启国内提速（独立入口 ${portLabel} 已就绪）`, "ok", 4200);
-        }
-      } else if (nextRt.running) {
-        if (nextGlobal.running && nextGlobal.mode === "windivert") {
-          pushToast("已开启国内提速，代理与底层全局加速已同时运行", "ok", 4000);
         } else {
           const relayHint = nextRt.preaccel_relay_name
             ? `（当前主力：${nextRt.preaccel_relay_name}）`
             : "";
           pushToast(`已开启国内提速${relayHint}`, "ok");
         }
+      } else if (summary.realWinDivertActive) {
+        pushToast("已开启国内提速，正在自动加速电脑上其它代理软件", "ok", 4200);
+      } else if (
+        summary.installState === "downloading" ||
+        summary.installState === "verifying"
+      ) {
+        pushToast("已开启国内提速，正在后台自动准备官方提速组件…", "info", 4400);
+      } else if (summary.installState === "need_elevation") {
+        pushToast(
+          "已开启国内提速（提速组件已就绪，需以管理员身份重启以加速其它代理软件）",
+          "warn",
+          4800
+        );
+      } else if (os === "windows") {
+        pushToast("已开启国内提速（当前本地通道待命）", "info", 4200);
       } else {
-        pushToast("已开启国内提速，启动代理或底层全局提速后即刻生效", "ok");
+        const portLabel = nextGlobal.socks_port
+          ? `127.0.0.1:${nextGlobal.socks_port}`
+          : "本地 443 通道";
+        pushToast(`已开启国内提速（本地独立入口 ${portLabel} 已就绪）`, "ok", 4200);
       }
 
       return true;
@@ -1732,97 +2379,7 @@ export const appActions = {
   },
 
   async toggleGlobalPreAccel(next?: boolean): Promise<boolean> {
-    const currentlyRunning = Boolean(
-      state.globalPreAccel.running || state.runtime.global_preaccel_active
-    );
-    const target = next ?? !currentlyRunning;
-
-    if (target) {
-      let relays = state.preAccelRelays;
-      if (!relays.some((r) => r.enabled) && isTauriEnv()) {
-        try {
-          relays = await catcloudApi.listPreAccelRelays();
-          setState((prev) => ({ ...prev, preAccelRelays: relays }));
-        } catch {
-          /* fall through */
-        }
-      }
-      if (!relays.some((r) => r.enabled)) {
-        pushToast(
-          "还没有可用的国内中转线路，请先添加并启用至少一条中转后再开启底层提速",
-          "warn",
-          4200
-        );
-        return false;
-      }
-    }
-
-    try {
-      const nextGlobal = await catcloudApi.toggleGlobalPreAccel(target);
-      const [cfgRes, rtRes] = await Promise.allSettled([
-        catcloudApi.getConfig(),
-        catcloudApi.getRuntimeInfo(),
-      ]);
-
-      const nextCfg: AppConfig =
-        cfgRes.status === "fulfilled"
-          ? mergeIncomingAppConfig(cfgRes.value, state.config)
-          : {
-              ...state.config,
-              preaccel: {
-                ...state.config.preaccel,
-                global_bypass_enabled: target,
-                enabled: target ? true : state.config.preaccel.enabled,
-              },
-            };
-
-      const nextRt: CoreRuntimeInfo =
-        rtRes.status === "fulfilled"
-          ? rtRes.value
-          : {
-              ...state.runtime,
-              global_preaccel_active: nextGlobal.running,
-              global_preaccel_mode: nextGlobal.mode,
-              global_preaccel_socks_port: nextGlobal.socks_port,
-              global_preaccel_connections: nextGlobal.active_connections,
-              preaccel_active:
-                nextGlobal.running || (state.runtime.running && nextCfg.preaccel.enabled),
-            };
-
-      setState((prev) => ({
-        ...prev,
-        config: nextCfg,
-        runtime: nextRt,
-        globalPreAccel: nextGlobal,
-      }));
-
-      if (!target || !nextGlobal.running) {
-        if (target && nextGlobal.last_error) {
-          pushToast(`底层全局提速启动受阻：${nextGlobal.last_error}`, "warn", 4600);
-          return false;
-        }
-        pushToast("已关闭底层全局国内提速", "info");
-        return false;
-      }
-
-      const os = resolvePlatformOs(nextRt.os_label);
-      if (nextGlobal.mode === "windivert") {
-        pushToast("已开启底层全局国内提速，正在为本机其它软件加速", "ok", 4000);
-      } else if (os === "windows") {
-        pushToast(
-          "已启动本地独立 443 通道，完成驱动与管理员授权后即可自动接管其它梯子",
-          "ok",
-          4600
-        );
-      } else {
-        const portHint = nextGlobal.socks_port ? `127.0.0.1:${nextGlobal.socks_port}` : "本地入口";
-        pushToast(`已启动本地独立 443 通道（${portHint}），可供终端与其它软件使用`, "ok", 4200);
-      }
-      return true;
-    } catch (err) {
-      pushToast(`切换底层全局提速失败：${formatErrorMessage(err)}`, "warn", 4200);
-      return false;
-    }
+    return appActions.togglePreAccel(next);
   },
 
   async updateGlobalPreAccelSettings(
@@ -1859,40 +2416,55 @@ export const appActions = {
       }));
       return true;
     } catch (err) {
-      pushToast(`保存底层提速范围失败：${formatErrorMessage(err)}`, "warn", 4000);
+      pushToast(`保存国内提速范围失败：${formatErrorMessage(err)}`, "warn", 4000);
       return false;
     }
   },
 
   async installWinDivertDriver(): Promise<boolean> {
-    try {
-      const nextGlobal = await catcloudApi.installWinDivertDriver();
-      const rt = await catcloudApi.getRuntimeInfo().catch(() => null);
-      setState((prev) => ({
-        ...prev,
-        globalPreAccel: nextGlobal,
-        runtime: rt ?? prev.runtime,
-      }));
-      if (nextGlobal.windivert_available) {
-        pushToast(
-          nextGlobal.is_elevated
-            ? "官方驱动（WinDivert v2.2.2）已校验安装就绪，可以启用最底层透明加速"
-            : "官方驱动已校验安装，点击下方以管理员身份启动即可接管其它梯子",
-          "ok",
-          4600
-        );
-        return true;
-      }
-      pushToast(
-        nextGlobal.last_error || "驱动下载未完成，如被安全软件拦截请放行后重试",
-        "warn",
-        4600
-      );
-      return false;
-    } catch (err) {
-      pushToast(`下载校验 WinDivert 驱动失败：${formatErrorMessage(err)}`, "warn", 5000);
-      return false;
-    }
+    return runInFlight(
+      "preaccel:installDriver",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          preaccel: { ...bg.preaccel, installingDriver: true },
+        }));
+        try {
+          const nextGlobal = await catcloudApi.installWinDivertDriver();
+          const rt = await catcloudApi.getRuntimeInfo().catch(() => null);
+          setState((prev) => ({
+            ...prev,
+            globalPreAccel: nextGlobal,
+            runtime: rt ?? prev.runtime,
+          }));
+          if (nextGlobal.windivert_available) {
+            pushToast(
+              nextGlobal.is_elevated
+                ? "官方提速组件（WinDivert v2.2.2）已校验就绪，可自动加速其它代理软件"
+                : "官方提速组件已校验就绪，以管理员身份重启即可自动加速其它代理软件",
+              "ok",
+              4600
+            );
+            return true;
+          }
+          pushToast(
+            nextGlobal.last_error || "提速组件准备未完成，如被安全软件拦截请放行后重试",
+            "warn",
+            4600
+          );
+          return false;
+        } catch (err) {
+          pushToast(`下载校验 WinDivert 驱动失败：${formatErrorMessage(err)}`, "warn", 5000);
+          return false;
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: { ...bg.preaccel, installingDriver: false },
+          }));
+        }
+      },
+      { mascot: true }
+    );
   },
 
   async relaunchAsAdminForGlobalPreAccel(): Promise<boolean> {
@@ -1911,13 +2483,13 @@ export const appActions = {
             runtime: rt,
             globalPreAccel: globalStatus,
           }));
-          pushToast("演示模式：已模拟管理员提权并开启最底层透明加速", "ok");
+          pushToast("演示模式：已模拟管理员提权并开启全局国内提速", "ok");
         } else {
-          pushToast("已拉起管理员实例，正在启用最底层透明加速…", "ok", 4200);
+          pushToast("已拉起管理员实例，正在启用全局国内提速…", "ok", 4200);
         }
         return true;
       }
-      pushToast("已取消管理员授权，当前继续保持本地独立 443 通道", "info");
+      pushToast("已取消管理员授权，当前继续保持本地通道待命", "info");
       return false;
     } catch (err) {
       pushToast(`以管理员身份启动失败：${formatErrorMessage(err)}`, "warn", 4600);
@@ -2350,6 +2922,55 @@ export const appActions = {
     }
   },
 
+  async disableAllProxyAndStopCore(): Promise<boolean> {
+    try {
+      const nextRt = await catcloudApi.disableAllProxyAndStopCore();
+      const stopTs = Date.now();
+      if (trafficBuffer.length > 0) {
+        trafficBuffer.push(0, 0, stopTs);
+      }
+      state = {
+        ...state,
+        latestTraffic: {
+          ...state.latestTraffic,
+          up_bps: 0,
+          down_bps: 0,
+          connections: 0,
+          tunnel_connections: 0,
+          memory_mb: 0,
+          timestamp_ms: stopTs,
+        },
+        trafficVersion: state.trafficVersion + 1,
+      };
+      emitTraffic();
+
+      const nextGlobal = await catcloudApi.getGlobalPreAccelStatus().catch(() => null);
+      setState((prev) => ({
+        ...prev,
+        config: {
+          ...prev.config,
+          system_proxy_enabled: nextRt.system_proxy_enabled,
+          tun_enabled: nextRt.tun_enabled,
+        },
+        runtime: nextRt,
+        globalPreAccel: nextGlobal ?? prev.globalPreAccel,
+        exitIp: buildPendingExitIp(nextRt.running),
+      }));
+
+      const realWinDivert = isRealWinDivertActive(nextRt, nextGlobal ?? state.globalPreAccel);
+      pushToast(
+        realWinDivert
+          ? "已关闭猫猫代理并停止主核（全局国内提速继续运行中）"
+          : "已关闭代理并停止核心，释放内存与本地端口",
+        "info"
+      );
+      return true;
+    } catch (err) {
+      pushToast(`关闭代理并停止核心失败：${formatErrorMessage(err)}`, "warn", 4200);
+      return false;
+    }
+  },
+
   async switchNextBestNode(): Promise<void> {
     const isSingleMode = state.runtime.route_mode === "single";
     const targetId = isSingleMode
@@ -2433,15 +3054,1650 @@ export const appActions = {
   },
 
   async refreshQuickSites(): Promise<void> {
-    setState((prev) => ({ ...prev, mascotState: "searching" }));
-    try {
-      const quickSites = await catcloudApi.checkQuickSites();
-      setState((prev) => ({ ...prev, quickSites, mascotState: "idle" }));
-      pushToast("快捷站点连通性已刷新", "ok");
-    } catch (err) {
-      setState((prev) => ({ ...prev, mascotState: "idle" }));
-      pushToast(`刷新快捷站点失败：${formatErrorMessage(err)}`, "warn");
+    await appActions.runQuickSitesCheck();
+  },
+
+  /* ==========================================================================
+   * Global Background Task Actions (Survive Route Unmount + In-Flight Dedupe)
+   * ========================================================================== */
+
+  async runPreAccelBenchmark(
+    nodeId?: string | null
+  ): Promise<PreAccelComparisonResult | null> {
+    const existing = inFlightTasks.get("preaccel:benchmark");
+    if (existing) {
+      return existing as Promise<PreAccelComparisonResult | null>;
     }
+    if (selectIsProbeEngineBusy(state)) {
+      pushToast("节点测速正在后台进行，完成后即可运行提速对比", "info");
+      return null;
+    }
+
+    const inDesktop = isTauriEnv();
+    const currentRelays = state.preAccelRelays;
+    const enabledRelays = [...currentRelays]
+      .filter((r) => r.enabled)
+      .sort((a, b) => (a.priority !== b.priority ? a.priority - b.priority : a.id.localeCompare(b.id)));
+    if (inDesktop && enabledRelays.length === 0) {
+      pushToast("请先添加并启用至少一条国内中转线路，再进行提速对比", "warn");
+      return null;
+    }
+
+    const hasComparableNode = state.nodes.some((n) => !isUdpOnlyProtocol(n.protocol));
+    if (inDesktop && !hasComparableNode) {
+      pushToast("还没有可对比的海外节点，请先在「节点与订阅」中导入节点", "warn");
+      return null;
+    }
+
+    const primaryRelayId = (() => {
+      const rtName = state.runtime.preaccel_relay_name;
+      if (rtName) {
+        const matched = enabledRelays.find((r) => r.name === rtName || r.id === rtName);
+        if (matched) return matched.id;
+      }
+      return enabledRelays[0]?.id ?? null;
+    })();
+    const requestedNodeId = nodeId?.trim() || null;
+
+    return runInFlight(
+      "preaccel:benchmark",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          preaccel: {
+            ...bg.preaccel,
+            benchmark: {
+              ...bg.preaccel.benchmark,
+              running: true,
+              nodeId: requestedNodeId,
+              error: null,
+            },
+          },
+        }));
+
+        try {
+          // 1) Pre-probe domestic relays so relay latency cards refresh alongside benchmark
+          try {
+            const relayResults = await catcloudApi.testPreAccelRelays(null);
+            if (inDesktop) {
+              const latestRelays = await catcloudApi.listPreAccelRelays();
+              setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+            } else {
+              const resultMap = new Map(relayResults.map((r) => [r.relay_id, r]));
+              setState((prev) => ({
+                ...prev,
+                preAccelRelays: prev.preAccelRelays.map((r) => {
+                  const matched = resultMap.get(r.id);
+                  return matched ? { ...r, last_probe_ms: matched.latency_ms } : r;
+                }),
+              }));
+            }
+          } catch {
+            /* continue to speed comparison even if relay pre-check fails */
+          }
+
+          // 2) Run accelerated vs direct speed comparison
+          const result = await catcloudApi.benchmarkPreAccelComparison(
+            primaryRelayId,
+            requestedNodeId
+          );
+
+          if (inDesktop) {
+            try {
+              const latestRelays = await catcloudApi.listPreAccelRelays();
+              setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+            } catch {
+              /* ignore secondary relay refresh failure */
+            }
+          }
+
+          const finishedAt = Date.now();
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: {
+              ...bg.preaccel,
+              benchmark: {
+                running: false,
+                nodeId: result.node_id || requestedNodeId,
+                result,
+                error: null,
+                finishedAt,
+              },
+            },
+          }));
+
+          const accUp = result.accelerated.up_mbps;
+          const dirUp = result.direct.up_mbps;
+          const ratio =
+            result.up_boost_ratio ??
+            (accUp !== null && dirUp !== null && dirUp > 0 ? accUp / dirUp : null);
+
+          if (!inDesktop) {
+            pushToast(
+              ratio !== null
+                ? `提速效果对比完成（演示）：走国内中转上传提速约 ${ratio.toFixed(1)} 倍`
+                : "提速效果对比完成（演示）",
+              "info",
+              4000
+            );
+          } else if (result.ok && result.accelerated.ok && result.direct.ok) {
+            pushToast(
+              ratio !== null && ratio >= 1.1 && accUp !== null
+                ? `提速效果对比完成：走国内中转上传 ${accUp.toFixed(1)} Mbps（提速 ${ratio.toFixed(1)} 倍）`
+                : accUp !== null
+                  ? `提速效果对比完成：走国内中转上传 ${accUp.toFixed(1)} Mbps`
+                  : "提速效果对比完成",
+              "ok",
+              4200
+            );
+          } else {
+            const errParts: string[] = [];
+            if (!result.accelerated.ok) {
+              const latHint = hasValidPositiveLatency(result.accelerated.latency_ms)
+                ? `延迟 ${formatMsShort(result.accelerated.latency_ms)}，`
+                : "";
+              errParts.push(
+                `走中转（${latHint}${result.accelerated.error?.trim() || "连接超时"}）`
+              );
+            }
+            if (!result.direct.ok) {
+              const latHint = hasValidPositiveLatency(result.direct.latency_ms)
+                ? `延迟 ${formatMsShort(result.direct.latency_ms)}，`
+                : "";
+              errParts.push(
+                `普通直连（${latHint}${result.direct.error?.trim() || "连接超时"}）`
+              );
+            }
+            pushToast(
+              errParts.length > 0
+                ? `提速效果对比完成：${errParts.join("；")}`
+                : "提速效果对比未全部成功，请检查中转与节点状态",
+              "warn",
+              4600
+            );
+          }
+          return result;
+        } catch (err) {
+          const msg = formatErrorMessage(err);
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: {
+              ...bg.preaccel,
+              benchmark: {
+                ...bg.preaccel.benchmark,
+                running: false,
+                error: msg,
+              },
+            },
+          }));
+          pushToast(`提速效果对比失败：${msg}`, "warn", 4400);
+          return null;
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runTestPreAccelRelays(relayId?: string | null): Promise<void> {
+    const targetId = relayId?.trim() || null;
+    const inDesktop = isTauriEnv();
+
+    if (!targetId) {
+      if (state.preAccelRelays.length === 0) return;
+      return runInFlight(
+        "preaccel:relays:all",
+        async () => {
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: { ...bg.preaccel, relaysTestingAll: true },
+          }));
+          try {
+            const results = await catcloudApi.testPreAccelRelays(null);
+            if (inDesktop) {
+              const latestRelays = await catcloudApi.listPreAccelRelays();
+              setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+            } else {
+              const resultMap = new Map(results.map((r) => [r.relay_id, r]));
+              setState((prev) => ({
+                ...prev,
+                preAccelRelays: prev.preAccelRelays.map((r) => {
+                  const matched = resultMap.get(r.id);
+                  return matched ? { ...r, last_probe_ms: matched.latency_ms } : r;
+                }),
+              }));
+            }
+            const okCount = results.filter((r) => r.ok).length;
+            pushToast(
+              `全部中转测速完成：${okCount}/${results.length} 条线路可用`,
+              okCount > 0 ? "ok" : "warn"
+            );
+          } catch (err) {
+            pushToast(`全部中转测速失败：${formatErrorMessage(err)}`, "warn");
+          } finally {
+            updateBgTasks((bg) => ({
+              ...bg,
+              preaccel: { ...bg.preaccel, relaysTestingAll: false },
+            }));
+          }
+        },
+        { mascot: true }
+      );
+    }
+
+    if (state.bgTasks.preaccel.relaysTestingAll) return;
+
+    return runInFlight(
+      `preaccel:relay:${targetId}`,
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          preaccel: {
+            ...bg.preaccel,
+            relaysTestingIds: bg.preaccel.relaysTestingIds.includes(targetId)
+              ? bg.preaccel.relaysTestingIds
+              : [...bg.preaccel.relaysTestingIds, targetId],
+          },
+        }));
+        try {
+          const results = await catcloudApi.testPreAccelRelays([targetId]);
+          const item = results.find((r) => r.relay_id === targetId) ?? results[0];
+          if (inDesktop) {
+            const latestRelays = await catcloudApi.listPreAccelRelays();
+            setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+          } else if (item) {
+            setState((prev) => ({
+              ...prev,
+              preAccelRelays: prev.preAccelRelays.map((r) =>
+                r.id === targetId ? { ...r, last_probe_ms: item.latency_ms } : r
+              ),
+            }));
+          }
+          if (item && !item.ok) {
+            pushToast(`中转测速失败：${item.error ?? "连接超时"}`, "warn");
+          } else {
+            const msText = hasValidPositiveLatency(item?.latency_ms)
+              ? `（${formatMsShort(item.latency_ms)}）`
+              : "";
+            pushToast(`中转线路连通正常${msText}`, "ok");
+          }
+        } catch (err) {
+          pushToast(`中转测速失败：${formatErrorMessage(err)}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: {
+              ...bg.preaccel,
+              relaysTestingIds: bg.preaccel.relaysTestingIds.filter((id) => id !== targetId),
+            },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runCheckCampusPortal(): Promise<void> {
+    return runInFlight(
+      "preaccel:campusPortal",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          preaccel: {
+            ...bg.preaccel,
+            campusChecking: true,
+            campusError: null,
+          },
+        }));
+        try {
+          const status = await catcloudApi.checkCampusPortal();
+          setState((prev) => ({
+            ...prev,
+            runtime: {
+              ...prev.runtime,
+              captive_portal_required: status.captive_portal_required,
+            },
+            bgTasks: {
+              ...prev.bgTasks,
+              preaccel: {
+                ...prev.bgTasks.preaccel,
+                campusChecking: false,
+                campusResult: status,
+                campusError: null,
+              },
+            },
+          }));
+          if (status.captive_portal_required) {
+            pushToast("检测到需要登录校园网，已自动临时放行认证页", "warn");
+          } else {
+            pushToast("当前国内网络连通正常，无需网页认证", "ok");
+          }
+        } catch (err) {
+          const msg = formatErrorMessage(err);
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: {
+              ...bg.preaccel,
+              campusChecking: false,
+              campusError: msg,
+            },
+          }));
+          pushToast(`校园网认证检测失败：${msg}`, "warn");
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runInstallWinDivertDriver(): Promise<void> {
+    await appActions.installWinDivertDriver();
+  },
+
+  async runIsolatedProbesBg(params: {
+    nodeIds: string[];
+    probeIds: string[];
+    usePreAccel?: boolean;
+    lockedOrderIds?: string[];
+    maxTier?: "latency" | "unlock" | "full";
+    includeKeepalive?: boolean;
+  }): Promise<void> {
+    const existing = inFlightTasks.get("probes:isolated");
+    if (existing) {
+      return existing as Promise<void>;
+    }
+    if (state.bgTasks.preaccel.benchmark.running) {
+      pushToast("国内提速对比测速正在后台进行，完成后即可运行节点测速", "info");
+      return;
+    }
+    if (state.probeProgress.running || state.bgTasks.probeLocalStarting) {
+      pushToast("已有节点测速正在进行中，请稍候", "info");
+      return;
+    }
+
+    const targetNodeIds = params.nodeIds.filter((id) => id.trim().length > 0);
+    if (targetNodeIds.length === 0) {
+      pushToast("请先筛选或勾选至少一个节点后再开始测速", "warn");
+      return;
+    }
+
+    const tier = params.maxTier ?? "full";
+    const includeKeepalive = params.includeKeepalive ?? false;
+    const nodeNameById = new Map(state.nodes.map((n) => [n.id, n.name]));
+    const firstNodeName = nodeNameById.get(targetNodeIds[0]) ?? null;
+    const lockedOrder =
+      params.lockedOrderIds && params.lockedOrderIds.length > 0
+        ? [...params.lockedOrderIds]
+        : state.nodes.map((n) => n.id);
+
+    return runInFlight(
+      "probes:isolated",
+      async () => {
+        probePauseRequested = false;
+        previewProbeCancelled = false;
+        clearPreviewProbeTimer();
+        probePendingQueue = [...targetNodeIds];
+
+        setState((prev) => ({
+          ...prev,
+          probeProgress: {
+            running: true,
+            completed: 0,
+            total: targetNodeIds.length,
+            currentNodeName: firstNodeName,
+            cancelled: false,
+          },
+          bgTasks: {
+            ...prev.bgTasks,
+            probeLocalStarting: true,
+            probeIsPausing: false,
+            probeActiveNodeIds: targetNodeIds.slice(0, Math.min(4, targetNodeIds.length)),
+            probeLockedOrderIds: lockedOrder,
+          },
+        }));
+
+        if (isTauriEnv()) {
+          try {
+            const result = await catcloudApi.runIsolatedProbes(
+              targetNodeIds,
+              params.probeIds,
+              tier,
+              includeKeepalive,
+              params.usePreAccel
+            );
+
+            const wasCancelled = Boolean(result.cancelled) || probePauseRequested;
+            const finalCompleted = Math.max(
+              result.probed_count,
+              state.probeProgress.completed
+            );
+            const preaccelTag = result.used_preaccel
+              ? `（已走 443 提速${result.preaccel_relay_name ? `：${result.preaccel_relay_name}` : ""}）`
+              : "";
+
+            setState((prev) => {
+              let nextProbes = prev.probes;
+              if (result.snapshots && Object.keys(result.snapshots).length > 0) {
+                nextProbes = { ...prev.probes };
+                for (const [nid, incoming] of Object.entries(result.snapshots)) {
+                  nextProbes[nid] = mergeProbeSnapshotSafe(prev.probes[nid], incoming);
+                }
+              }
+              return {
+                ...prev,
+                probes: nextProbes,
+                probeProgress: {
+                  running: false,
+                  completed: finalCompleted,
+                  total: result.total_count ?? targetNodeIds.length,
+                  currentNodeName: null,
+                  cancelled: wasCancelled,
+                },
+                bgTasks: {
+                  ...prev.bgTasks,
+                  probeLocalStarting: false,
+                  probeIsPausing: false,
+                  probeActiveNodeIds: [],
+                  probeLockedOrderIds: [],
+                },
+              };
+            });
+
+            if (wasCancelled) {
+              pushToast(
+                `已暂停测速，已测完的 ${finalCompleted} 个节点结果已全部保留`,
+                "info"
+              );
+            } else if (!result.core_available) {
+              pushToast(
+                result.errors[0] ?? "测速引擎尚未就绪，请先检查内核配置",
+                "warn"
+              );
+            } else if (result.errors.length > 0 && result.probed_count === 0) {
+              pushToast(`测速未能完成：${result.errors[0]}`, "warn");
+            } else if (result.errors.length > 0) {
+              pushToast(
+                `${PROBE_TIER_LABELS[tier]}完成${preaccelTag}：已更新 ${result.probed_count} 个节点（${result.errors.length} 个超时或跳过）`,
+                "info"
+              );
+            } else {
+              pushToast(
+                `${PROBE_TIER_LABELS[tier]}完成${preaccelTag}，已更新 ${result.probed_count} 个节点结果`,
+                "ok"
+              );
+            }
+          } catch (err) {
+            setState((prev) => ({
+              ...prev,
+              probeProgress: {
+                ...prev.probeProgress,
+                running: false,
+                currentNodeName: null,
+                cancelled: probePauseRequested,
+              },
+              bgTasks: {
+                ...prev.bgTasks,
+                probeLocalStarting: false,
+                probeIsPausing: false,
+                probeActiveNodeIds: [],
+                probeLockedOrderIds: [],
+              },
+            }));
+            pushToast(`测速执行失败：${formatErrorMessage(err)}`, "warn");
+          } finally {
+            probePendingQueue = [];
+            probePauseRequested = false;
+          }
+          return;
+        }
+
+        // Browser preview streaming simulation hosted globally (survives page switches)
+        await new Promise<void>((resolve) => {
+          previewProbeFinishResolve = resolve;
+          const total = targetNodeIds.length;
+          const finishPreview = (cancelled: boolean, completed: number) => {
+            clearPreviewProbeTimer();
+            previewProbeFinishResolve = null;
+            probePendingQueue = [];
+            probePauseRequested = false;
+            setState((prev) => ({
+              ...prev,
+              probeProgress: {
+                running: false,
+                completed,
+                total,
+                currentNodeName: null,
+                cancelled,
+              },
+              bgTasks: {
+                ...prev.bgTasks,
+                probeLocalStarting: false,
+                probeIsPausing: false,
+                probeActiveNodeIds: [],
+                probeLockedOrderIds: [],
+              },
+            }));
+            if (!cancelled) {
+              pushToast(
+                `预览模式：${PROBE_TIER_LABELS[tier]}完成，已逐条更新 ${total} 个节点`,
+                "ok"
+              );
+            }
+            resolve();
+          };
+
+          const stepNext = (index: number) => {
+            if (previewProbeCancelled) {
+              finishPreview(true, state.probeProgress.completed);
+              return;
+            }
+            if (index >= total) {
+              finishPreview(false, total);
+              return;
+            }
+
+            const nodeId = targetNodeIds[index];
+            const nodeName = nodeNameById.get(nodeId) ?? nodeId;
+            setState((prev) => ({
+              ...prev,
+              probeProgress: {
+                running: true,
+                completed: index,
+                total,
+                currentNodeName: nodeName,
+                cancelled: false,
+              },
+              bgTasks: {
+                ...prev.bgTasks,
+                probeLocalStarting: false,
+                probeActiveNodeIds: [nodeId],
+              },
+            }));
+
+            previewProbeTimer = window.setTimeout(() => {
+              previewProbeTimer = null;
+              if (previewProbeCancelled) {
+                finishPreview(true, state.probeProgress.completed);
+                return;
+              }
+              void catcloudApi
+                .runIsolatedProbes(
+                  [nodeId],
+                  params.probeIds,
+                  tier,
+                  includeKeepalive,
+                  params.usePreAccel
+                )
+                .then((res) => {
+                  if (previewProbeCancelled) {
+                    finishPreview(true, state.probeProgress.completed);
+                    return;
+                  }
+                  const rawSnap = res.snapshots[nodeId];
+                  if (rawSnap) {
+                    const jitterDelta = Math.round((Math.random() - 0.5) * 14);
+                    const nextLatency =
+                      rawSnap.latency_ms !== null
+                        ? Math.max(18, Math.round(rawSnap.latency_ms + jitterDelta))
+                        : 78;
+                    const streamedSnap: ProbeSnapshot = {
+                      ...rawSnap,
+                      tested_at: new Date().toISOString(),
+                      latency_ms: nextLatency,
+                    };
+                    setState((prev) => ({
+                      ...prev,
+                      probes: {
+                        ...prev.probes,
+                        [nodeId]: mergeProbeSnapshotSafe(prev.probes[nodeId], streamedSnap),
+                      },
+                      probeProgress: {
+                        running: true,
+                        completed: index + 1,
+                        total,
+                        currentNodeName: nodeName,
+                        cancelled: false,
+                      },
+                    }));
+                  }
+                  stepNext(index + 1);
+                })
+                .catch(() => {
+                  if (previewProbeCancelled) {
+                    finishPreview(true, state.probeProgress.completed);
+                    return;
+                  }
+                  stepNext(index + 1);
+                });
+            }, 120);
+          };
+
+          stepNext(0);
+        });
+      },
+      { mascot: true }
+    );
+  },
+
+  async pauseIsolatedProbesBg(): Promise<void> {
+    if (!state.probeProgress.running && !state.bgTasks.probeLocalStarting) return;
+    if (state.bgTasks.probeIsPausing) return;
+
+    probePauseRequested = true;
+    updateBgTasks((bg) => ({ ...bg, probeIsPausing: true }));
+
+    if (!isTauriEnv()) {
+      previewProbeCancelled = true;
+      clearPreviewProbeTimer();
+      try {
+        await catcloudApi.cancelIsolatedProbes();
+      } catch {
+        /* ignore mock cancel errors */
+      }
+      const doneCount = state.probeProgress.completed;
+      const total = state.probeProgress.total;
+      const pendingResolve = previewProbeFinishResolve;
+      previewProbeFinishResolve = null;
+      probePendingQueue = [];
+      probePauseRequested = false;
+      setState((prev) => ({
+        ...prev,
+        probeProgress: {
+          running: false,
+          completed: doneCount,
+          total,
+          currentNodeName: null,
+          cancelled: true,
+        },
+        bgTasks: {
+          ...prev.bgTasks,
+          probeLocalStarting: false,
+          probeIsPausing: false,
+          probeActiveNodeIds: [],
+          probeLockedOrderIds: [],
+        },
+      }));
+      pendingResolve?.();
+      pushToast(`已暂停测速，已测完的 ${doneCount} 个节点结果已全部保留`, "info");
+      return;
+    }
+
+    try {
+      const wasRunning = await catcloudApi.cancelIsolatedProbes();
+      const ownedByStore = inFlightTasks.has("probes:isolated");
+      if (!ownedByStore && !wasRunning) {
+        const doneCount = state.probeProgress.completed;
+        probePendingQueue = [];
+        probePauseRequested = false;
+        setState((prev) => ({
+          ...prev,
+          probeProgress: {
+            ...prev.probeProgress,
+            running: false,
+            currentNodeName: null,
+            cancelled: true,
+          },
+          bgTasks: {
+            ...prev.bgTasks,
+            probeLocalStarting: false,
+            probeIsPausing: false,
+            probeActiveNodeIds: [],
+            probeLockedOrderIds: [],
+          },
+        }));
+        pushToast(`已暂停测速，已测完的 ${doneCount} 个节点结果已全部保留`, "info");
+      }
+    } catch (err) {
+      probePauseRequested = false;
+      updateBgTasks((bg) => ({ ...bg, probeIsPausing: false }));
+      pushToast(`暂停测速失败：${formatErrorMessage(err)}`, "warn");
+    }
+  },
+
+  setSubsImporting(importing: boolean): void {
+    updateBgTasks((bg) =>
+      bg.subs.importing === importing
+        ? bg
+        : { ...bg, subs: { ...bg.subs, importing } }
+    );
+  },
+
+  async runRefreshAllSubscriptions(): Promise<void> {
+    if (state.subscriptions.length === 0) return;
+    return runInFlight(
+      "subs:refreshAll",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          subs: { ...bg.subs, refreshingAll: true },
+        }));
+        try {
+          if (isTauriEnv()) {
+            const res = await catcloudApi.refreshAllSubscriptions();
+            const [latestSubs, latestNodes, latestGroups] = await Promise.all([
+              catcloudApi.listSubscriptions(),
+              catcloudApi.listNodes(),
+              catcloudApi.listGroups(),
+            ]);
+            setState((prev) => ({
+              ...prev,
+              subscriptions: latestSubs,
+              nodes: latestNodes,
+              groups: latestGroups,
+            }));
+            if (res.errors.length > 0) {
+              pushToast(
+                `已刷新 ${res.refreshed} 个订阅（共 ${res.total_nodes} 节点），${res.errors.length} 个失败：${res.errors[0]}`,
+                "warn"
+              );
+            } else {
+              pushToast(
+                `已刷新 ${res.refreshed} 个启用订阅，共 ${res.total_nodes} 个节点`,
+                "ok"
+              );
+            }
+          } else {
+            await new Promise<void>((r) => window.setTimeout(r, 260));
+            const nowIso = new Date().toISOString();
+            let refreshedCount = 0;
+            setState((prev) => {
+              const nextSubs = prev.subscriptions.map((item) => {
+                if (!item.enabled) return item;
+                refreshedCount += 1;
+                return { ...item, last_ok_at: nowIso, last_error: null };
+              });
+              return { ...prev, subscriptions: nextSubs };
+            });
+            pushToast(`已刷新 ${refreshedCount} 个已启用的订阅`, "ok");
+          }
+        } catch (err) {
+          pushToast(`批量刷新订阅失败：${formatErrorMessage(err)}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            subs: { ...bg.subs, refreshingAll: false },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runRefreshSingleSubscription(
+    subId: string,
+    options?: { simulateFault?: boolean }
+  ): Promise<void> {
+    if (state.bgTasks.subs.refreshingAll) {
+      pushToast("正在批量刷新全部订阅，请稍候", "info");
+      return;
+    }
+    const simulateFault = Boolean(options?.simulateFault);
+
+    return runInFlight(
+      `subs:refresh:${subId}`,
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          subs: {
+            ...bg.subs,
+            refreshingIds: bg.subs.refreshingIds.includes(subId)
+              ? bg.subs.refreshingIds
+              : [...bg.subs.refreshingIds, subId],
+          },
+        }));
+
+        const resolveSubName = () =>
+          state.subscriptions.find((item) => item.id === subId)?.name ?? "当前订阅";
+
+        try {
+          if (isTauriEnv() && !simulateFault) {
+            const res = await catcloudApi.refreshSubscription(subId);
+            const [latestSubs, latestNodes, latestGroups] = await Promise.all([
+              catcloudApi.listSubscriptions(),
+              catcloudApi.listNodes(),
+              catcloudApi.listGroups(),
+            ]);
+            setState((prev) => ({
+              ...prev,
+              subscriptions: latestSubs,
+              nodes: latestNodes,
+              groups: latestGroups,
+            }));
+            const warnNote = res.warnings.length > 0 ? `（提醒：${res.warnings[0]}）` : "";
+            pushToast(
+              `${resolveSubName()} 已刷新，当前 ${res.node_count} 个节点${warnNote}`,
+              res.warnings.length > 0 ? "warn" : "ok"
+            );
+            return;
+          }
+
+          await new Promise<void>((r) => window.setTimeout(r, 240));
+          const nowIso = new Date().toISOString();
+          if (simulateFault) {
+            const errMsg =
+              "远端返回异常或 0 个节点，已自动中止覆盖并保留现有老节点与自建规则";
+            setState((prev) => ({
+              ...prev,
+              subscriptions: prev.subscriptions.map((item) =>
+                item.id === subId ? { ...item, last_error: errMsg } : item
+              ),
+            }));
+            pushToast(
+              `${resolveSubName()} 刷新异常（预览演练）：已自动保护老节点与自建规则`,
+              "warn"
+            );
+          } else {
+            setState((prev) => ({
+              ...prev,
+              subscriptions: prev.subscriptions.map((item) =>
+                item.id === subId
+                  ? { ...item, last_ok_at: nowIso, last_error: null }
+                  : item
+              ),
+            }));
+            pushToast(`${resolveSubName()} 已安全刷新`, "ok");
+          }
+        } catch (err) {
+          const errMsg = formatErrorMessage(err);
+          // Functional update against latest store state: never overwrite newer subscriptions!
+          setState((prev) => ({
+            ...prev,
+            subscriptions: prev.subscriptions.map((item) =>
+              item.id === subId ? { ...item, last_error: errMsg } : item
+            ),
+          }));
+          pushToast(
+            `${resolveSubName()} 刷新失败（已保留现有节点）：${errMsg}`,
+            "warn"
+          );
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            subs: {
+              ...bg.subs,
+              refreshingIds: bg.subs.refreshingIds.filter((id) => id !== subId),
+            },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runQuickSitesCheck(): Promise<void> {
+    return runInFlight(
+      "home:quickSites",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          home: { ...bg.home, checkingQuickSites: true },
+        }));
+        try {
+          const freshSites = await catcloudApi.checkQuickSites();
+          if (isTauriEnv()) {
+            setState((prev) => ({ ...prev, quickSites: freshSites }));
+          } else {
+            const freshById = new Map(freshSites.map((item) => [item.id, item]));
+            setState((prev) => {
+              const baseList = prev.quickSites.length > 0 ? prev.quickSites : freshSites;
+              return {
+                ...prev,
+                quickSites: baseList.map((site) => {
+                  const updated = freshById.get(site.id);
+                  return updated ?? { ...site, latency_ms: 88, ok: true };
+                }),
+              };
+            });
+          }
+          pushToast("网站连通检测完成", "ok");
+        } catch (err) {
+          pushToast(`网站检测失败：${formatErrorMessage(err)}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            home: { ...bg.home, checkingQuickSites: false },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runRefreshExitIp(): Promise<void> {
+    return runInFlight(
+      "home:exitIp",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          home: { ...bg.home, refreshingExitIp: true },
+        }));
+        try {
+          const info = await catcloudApi.getExitIpInfo();
+          setState((prev) => ({ ...prev, exitIp: info }));
+          if (hasRealExitIpInfo(info)) {
+            pushToast("出口信息已更新", "ok");
+          } else {
+            const detailParts = [info.isp, info.location]
+              .map((s) => s?.trim() ?? "")
+              .filter(
+                (s) =>
+                  s.length > 0 &&
+                  s !== "未连接" &&
+                  s !== "待检测" &&
+                  s !== "待核心启动探测"
+              );
+            const detail = Array.from(new Set(detailParts)).join(" · ");
+            pushToast(
+              detail
+                ? `未获取到出口 IP：${detail}`
+                : "未获取到出口 IP，请确认核心已启动且节点连通",
+              "warn"
+            );
+          }
+        } catch (err) {
+          pushToast(`检测出口信息失败：${formatErrorMessage(err)}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            home: { ...bg.home, refreshingExitIp: false },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runMultiGroupNodeProbe(nodeId: string): Promise<void> {
+    const taskKey = `groups:probe:${nodeId}`;
+    const existing = inFlightTasks.get(taskKey);
+    if (existing) {
+      return existing as Promise<void>;
+    }
+    if (selectIsProbeEngineBusy(state)) {
+      pushToast("当前已有测速或对比任务正在进行，请稍候完成后再试", "info");
+      return;
+    }
+
+    return runInFlight(
+      taskKey,
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          probeLocalStarting: true,
+          probeActiveNodeIds: bg.probeActiveNodeIds.includes(nodeId)
+            ? bg.probeActiveNodeIds
+            : [...bg.probeActiveNodeIds, nodeId],
+          groups: {
+            ...bg.groups,
+            probingNodeIds: bg.groups.probingNodeIds.includes(nodeId)
+              ? bg.groups.probingNodeIds
+              : [...bg.groups.probingNodeIds, nodeId],
+          },
+        }));
+        try {
+          const res = await catcloudApi.runIsolatedProbes([nodeId], [], "unlock", false);
+          if (res.snapshots && Object.keys(res.snapshots).length > 0) {
+            setState((prev) => {
+              const nextProbes = { ...prev.probes };
+              for (const [nid, incoming] of Object.entries(res.snapshots)) {
+                nextProbes[nid] = mergeProbeSnapshotSafe(prev.probes[nid], incoming);
+              }
+              return { ...prev, probes: nextProbes };
+            });
+          }
+          const nodeName = state.nodes.find((n) => n.id === nodeId)?.name ?? nodeId;
+          const snap = res.snapshots?.[nodeId];
+          if (snap && snap.ok && snap.latency_ms !== null) {
+            pushToast(`测速完成：${nodeName} · ${Math.round(snap.latency_ms)} ms`, "ok");
+          } else if (res.errors.length > 0) {
+            pushToast(`测速提示：${res.errors[0]}`, "warn");
+          } else {
+            pushToast(`${nodeName} 暂时连接超时，可稍后再试`, "warn");
+          }
+        } catch (err) {
+          pushToast(`测速失败：${formatErrorMessage(err)}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            probeLocalStarting: false,
+            probeActiveNodeIds: bg.probeActiveNodeIds.filter((id) => id !== nodeId),
+            groups: {
+              ...bg.groups,
+              probingNodeIds: bg.groups.probingNodeIds.filter((id) => id !== nodeId),
+            },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runEvaluateMultiGroup(groupId: string): Promise<void> {
+    return runInFlight(
+      "groups:eval",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          groups: { ...bg.groups, evaluatingGroupId: groupId },
+        }));
+        try {
+          const report = await catcloudApi.evaluateMultiGroup(groupId);
+          updateBgTasks((bg) => ({
+            ...bg,
+            groups: {
+              ...bg.groups,
+              evalReports: {
+                ...bg.groups.evalReports,
+                [groupId]: report,
+              },
+            },
+          }));
+          const latestProbes = state.probes;
+          const targetGroup = state.groups.find((g) => g.id === groupId);
+          const evalIds = new Set<string>();
+          for (const c of report.gate_passed) evalIds.add(c.node_id);
+          for (const c of report.gate_rejected) evalIds.add(c.node_id);
+          if (evalIds.size === 0 && targetGroup) {
+            for (const id of targetGroup.member_node_ids) evalIds.add(id);
+          }
+          let untestedCnt = 0;
+          for (const id of evalIds) {
+            if (!latestProbes[id]) untestedCnt += 1;
+          }
+          pushToast(
+            untestedCnt > 0
+              ? `评估完成：候选 ${report.pool_size} 个 · 达标 ${report.healthy_candidates.length} 个（其中 ${untestedCnt} 个尚未测速）`
+              : `评估完成：候选 ${report.pool_size} 个 · 达标 ${report.healthy_candidates.length} 个`,
+            "ok"
+          );
+        } catch (err) {
+          pushToast(`后端评估失败：${formatErrorMessage(err)}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            groups: {
+              ...bg.groups,
+              evaluatingGroupId:
+                bg.groups.evaluatingGroupId === groupId ? null : bg.groups.evaluatingGroupId,
+            },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async loadGeodataStatus(force = false): Promise<void> {
+    if (!force && state.bgTasks.settings.geoStatus !== null) {
+      return;
+    }
+    return runInFlight("settings:geoStatus", async () => {
+      updateBgTasks((bg) => ({
+        ...bg,
+        settings: { ...bg.settings, geoLoading: true },
+      }));
+      try {
+        const status = await catcloudApi.getGeodataStatus();
+        updateBgTasks((bg) => ({
+          ...bg,
+          settings: { ...bg.settings, geoStatus: status },
+        }));
+      } catch {
+        /* preserve previous geodata status on transient failure */
+      } finally {
+        updateBgTasks((bg) => ({
+          ...bg,
+          settings: { ...bg.settings, geoLoading: false },
+        }));
+      }
+    });
+  },
+
+  async runRefreshGeoDb(target: string): Promise<void> {
+    const existing = inFlightTasks.get("settings:geoRefresh");
+    if (existing) {
+      if (state.bgTasks.settings.geoBusy !== target) {
+        pushToast("地理数据库正在更新中，请稍候完成后再试", "info");
+      }
+      return existing as Promise<void>;
+    }
+    return runInFlight(
+      "settings:geoRefresh",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          settings: { ...bg.settings, geoBusy: target },
+        }));
+        try {
+          const res = await catcloudApi.refreshGeoDb(target === "all" ? null : [target]);
+          try {
+            const latest = await catcloudApi.getGeodataStatus();
+            updateBgTasks((bg) => ({
+              ...bg,
+              settings: { ...bg.settings, geoStatus: latest },
+            }));
+          } catch {
+            /* ignore secondary status refresh error */
+          }
+          pushToast(res.message || "地理数据库已更新", res.ok ? "ok" : "warn");
+        } catch (err) {
+          pushToast(`更新地理数据库失败：${formatErrorMessage(err)}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: { ...bg.settings, geoBusy: null },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runCheckAppUpdate(): Promise<void> {
+    return runInFlight(
+      "settings:checkUpdate",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          settings: { ...bg.settings, checkingUpdate: true },
+        }));
+        try {
+          const res = await catcloudApi.checkAppUpdate();
+          const autoDownloadOn = state.config.update.auto_download ?? true;
+          let message: string;
+          if (res.error) {
+            message = `检查失败：${res.error}`;
+            pushToast(`检查更新失败：${res.error}`, "warn");
+          } else if (res.staged_version) {
+            message = `已下载并校验完成 v${res.staged_version}，下次重启自动生效`;
+            pushToast(
+              `v${res.staged_version} 已准备就绪，下次重启猫猫云梯时自动生效`,
+              "ok"
+            );
+          } else if (res.has_update) {
+            if (res.can_auto_stage && autoDownloadOn && state.config.update.mode !== "manual") {
+              message = `发现新版本 v${res.latest_version}（当前 v${res.current_version}），点击下方即可一键下载预置`;
+              pushToast(
+                `发现新版本 v${res.latest_version}，可一键下载并在下次启动自动应用`,
+                "ok"
+              );
+            } else {
+              message = `发现新版本 v${res.latest_version}（当前 v${res.current_version}）`;
+              pushToast(`发现新版本 v${res.latest_version}`, "ok");
+            }
+          } else {
+            message = `当前 v${res.current_version} 已是最新版本`;
+            pushToast("当前已是最新版本", "info");
+          }
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: {
+              ...bg.settings,
+              updateInfo: res,
+              updateMessage: message,
+            },
+          }));
+        } catch (err) {
+          const msg = formatErrorMessage(err);
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: { ...bg.settings, updateMessage: `检查更新异常：${msg}` },
+          }));
+          pushToast(`检查更新失败：${msg}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: { ...bg.settings, checkingUpdate: false },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runDownloadAppUpdate(): Promise<void> {
+    return runInFlight(
+      "settings:downloadUpdate",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          settings: { ...bg.settings, downloadingUpdate: true },
+        }));
+        try {
+          const res = await catcloudApi.downloadAndStageUpdate();
+          if (res.staged) {
+            const prevInfo = state.bgTasks.settings.updateInfo;
+            const targetVersion =
+              res.target_version || prevInfo?.latest_version || state.runtime.app_version;
+            const nextInfo: AppUpdateCheckResult = {
+              has_update: true,
+              current_version: prevInfo?.current_version ?? state.runtime.app_version,
+              latest_version: targetVersion,
+              release_url:
+                res.release_url ||
+                prevInfo?.release_url ||
+                buildReleasesFallbackUrl(state.config.update.repo),
+              download_url: res.download_url ?? prevInfo?.download_url ?? null,
+              notes: prevInfo?.notes ?? "",
+              checked_at: prevInfo?.checked_at ?? new Date().toISOString(),
+              platform_key: prevInfo?.platform_key,
+              can_auto_stage: true,
+              staged_version: targetVersion,
+              error: null,
+            };
+            updateBgTasks((bg) => ({
+              ...bg,
+              settings: {
+                ...bg.settings,
+                updateInfo: nextInfo,
+                updateMessage: `已下载并校验完成 v${targetVersion}，下次重启时自动生效`,
+              },
+            }));
+            pushToast(
+              res.message ||
+                `已下载并校验完成 v${targetVersion}，下次重启猫猫云梯时自动生效`,
+              "ok",
+              4200
+            );
+          } else if (res.already_latest) {
+            updateBgTasks((bg) => ({
+              ...bg,
+              settings: {
+                ...bg.settings,
+                updateInfo: bg.settings.updateInfo
+                  ? { ...bg.settings.updateInfo, has_update: false }
+                  : bg.settings.updateInfo,
+                updateMessage: res.message || `当前 v${state.runtime.app_version} 已是最新版本`,
+              },
+            }));
+            pushToast(res.message || "当前已是最新版本", "info");
+          } else {
+            const prevInfo = state.bgTasks.settings.updateInfo;
+            const releaseUrl =
+              res.release_url ||
+              prevInfo?.release_url ||
+              buildReleasesFallbackUrl(state.config.update.repo);
+            const hint = res.message || "当前版本形态需通过官方下载页获取对应系统安装包";
+            updateBgTasks((bg) => ({
+              ...bg,
+              settings: {
+                ...bg.settings,
+                updateInfo: bg.settings.updateInfo
+                  ? {
+                      ...bg.settings.updateInfo,
+                      can_auto_stage:
+                        res.can_auto_stage ?? bg.settings.updateInfo.can_auto_stage,
+                      release_url: releaseUrl,
+                      download_url: res.download_url ?? bg.settings.updateInfo.download_url,
+                    }
+                  : bg.settings.updateInfo,
+                updateMessage: hint,
+              },
+            }));
+            pushToast(hint, "info");
+          }
+        } catch (err) {
+          const msg = formatErrorMessage(err);
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: { ...bg.settings, updateMessage: `下载更新失败：${msg}` },
+          }));
+          pushToast(`下载更新失败：${msg}`, "warn");
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: { ...bg.settings, downloadingUpdate: false },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runCoreOperation(
+    op: "start" | "stop" | "restart" | "reload" | "hotswap",
+    binaryPath?: string
+  ): Promise<boolean> {
+    if (op === "hotswap" && !binaryPath?.trim()) {
+      pushToast("请先输入内核程序的完整路径", "warn");
+      return false;
+    }
+    const existing = inFlightTasks.get("settings:coreOp");
+    if (existing) {
+      if (state.bgTasks.settings.coreOpBusy !== op) {
+        pushToast("已有内核操作正在执行，请稍候", "info");
+      }
+      return existing as Promise<boolean>;
+    }
+    return runInFlight(
+      "settings:coreOp",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          settings: { ...bg.settings, coreOpBusy: op },
+        }));
+        try {
+          if (op === "reload") {
+            const outcome = await catcloudApi.reloadCoreConfig(false);
+            const rt = await catcloudApi.getRuntimeInfo();
+            setState((prev) => ({ ...prev, runtime: rt }));
+            if (outcome.rejected || outcome.error) {
+              pushToast(
+                `热重载未生效：${outcome.error ?? "配置校验未通过"}`,
+                "warn"
+              );
+              return false;
+            }
+            pushToast("配置已热重载", "ok");
+            return true;
+          }
+          if (op === "hotswap") {
+            const res = await catcloudApi.hotSwapCore(binaryPath!.trim());
+            const rt = await catcloudApi.getRuntimeInfo();
+            setState((prev) => ({ ...prev, runtime: rt }));
+            pushToast(
+              res.ok
+                ? `内核热换成功：${res.version ?? res.binary_path}`
+                : `内核热换失败：${res.message}`,
+              res.ok ? "ok" : "warn"
+            );
+            return Boolean(res.ok);
+          }
+          const rt =
+            op === "start"
+              ? await catcloudApi.startCore()
+              : op === "stop"
+                ? await catcloudApi.stopCore()
+                : await catcloudApi.restartCore();
+          setState((prev) => ({ ...prev, runtime: rt }));
+          const labels = {
+            start: "内核已启动",
+            stop: "内核已停止",
+            restart: "内核已重启",
+          };
+          pushToast(labels[op], "ok");
+          return true;
+        } catch (err) {
+          pushToast(
+            op === "hotswap"
+              ? `内核热换失败：${formatErrorMessage(err)}`
+              : `内核操作失败：${formatErrorMessage(err)}`,
+            "warn"
+          );
+          return false;
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: { ...bg.settings, coreOpBusy: null },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async runBackupOperation(
+    op: "export" | "import",
+    fn: () => Promise<void>
+  ): Promise<void> {
+    const existing = inFlightTasks.get("settings:backupOp");
+    if (existing) {
+      pushToast("正在处理备份导入/导出，请稍候", "info");
+      return existing as Promise<void>;
+    }
+    return runInFlight(
+      "settings:backupOp",
+      async () => {
+        updateBgTasks((bg) => ({
+          ...bg,
+          settings: { ...bg.settings, backupBusy: op },
+        }));
+        try {
+          await fn();
+        } finally {
+          updateBgTasks((bg) => ({
+            ...bg,
+            settings: { ...bg.settings, backupBusy: null },
+          }));
+        }
+      },
+      { mascot: true }
+    );
+  },
+
+  async startLiveCaptureBg(targetPid: number): Promise<LiveCaptureStartDto | null> {
+    captureGen += 1;
+    const myGen = captureGen;
+    const prevSid = state.bgTasks.capture.sessionId;
+    stopLiveCapturePolling();
+    updateBgTasks((bg) => ({
+      ...bg,
+      capture: {
+        sessionId: null,
+        active: false,
+        finishing: false,
+        targetName: null,
+        status: null,
+        outcome: null,
+      },
+    }));
+    if (prevSid) {
+      void catcloudApi.cancelLiveCaptureSession(prevSid).catch(() => {
+        /* ignore cleanup error of superseded capture session */
+      });
+    }
+    try {
+      const started = await catcloudApi.startLiveCaptureSession(targetPid);
+      if (myGen !== captureGen) {
+        void catcloudApi.cancelLiveCaptureSession(started.session_id).catch(() => {
+          /* ignore cleanup error of stale capture session */
+        });
+        return null;
+      }
+      const targetName = started.target_name?.trim() || "目标软件";
+      const initialStatus: LiveCaptureStatusDto = {
+        session_id: started.session_id,
+        active: true,
+        step_app_ready: true,
+        step_activity_seen: false,
+        step_nodes_ready: false,
+        elapsed_sec: 0,
+        captured_node_count: 0,
+        opaque_change_detected: false,
+        target_name: targetName,
+        watch_dirs: Array.isArray(started.watch_dirs) ? started.watch_dirs : [],
+        events: [
+          {
+            timestamp_ms: Date.now(),
+            kind: "session",
+            message: "已锁定目标软件，等待你在该软件内点击「更新订阅」或「连接」…",
+          },
+        ],
+        preview_nodes: [],
+        unsupported_reason: null,
+      };
+      updateBgTasks((bg) => ({
+        ...bg,
+        capture: {
+          sessionId: started.session_id,
+          active: true,
+          finishing: false,
+          targetName,
+          status: initialStatus,
+          outcome: null,
+        },
+      }));
+      startLiveCapturePolling(started.session_id, myGen);
+      return started;
+    } catch (err) {
+      if (myGen !== captureGen) {
+        return null;
+      }
+      updateBgTasks((bg) => ({
+        ...bg,
+        capture: {
+          sessionId: null,
+          active: false,
+          finishing: false,
+          targetName: null,
+          status: null,
+          outcome: null,
+        },
+      }));
+      pushToast(`启动实时捕捉失败：${formatErrorMessage(err)}`, "warn");
+      return null;
+    }
+  },
+
+  async finishLiveCaptureBg(): Promise<LiveCaptureOutcomeDto | null> {
+    return runInFlight("capture:finish", async () => {
+      const sid =
+        state.bgTasks.capture.sessionId ??
+        state.bgTasks.capture.status?.session_id ??
+        null;
+      stopLiveCapturePolling();
+      if (!sid) {
+        updateBgTasks((bg) => ({
+          ...bg,
+          capture: {
+            sessionId: null,
+            active: false,
+            finishing: false,
+            targetName: bg.capture.outcome ? bg.capture.targetName : null,
+            status: null,
+            outcome: bg.capture.outcome,
+          },
+        }));
+        return state.bgTasks.capture.outcome;
+      }
+      const myGen = captureGen;
+      updateBgTasks((bg) => ({
+        ...bg,
+        capture: {
+          ...bg.capture,
+          finishing: true,
+        },
+      }));
+      try {
+        const outcome = await catcloudApi.finishLiveCaptureSession(sid);
+        if (myGen !== captureGen) {
+          return null;
+        }
+        updateBgTasks((bg) => ({
+          ...bg,
+          capture: {
+            sessionId: null,
+            active: false,
+            finishing: false,
+            targetName: outcome.target_name || bg.capture.targetName,
+            status: null,
+            outcome,
+          },
+        }));
+        return outcome;
+      } catch (err) {
+        if (myGen !== captureGen) {
+          return null;
+        }
+        updateBgTasks((bg) => ({
+          ...bg,
+          capture: {
+            sessionId: null,
+            active: false,
+            finishing: false,
+            targetName: null,
+            status: null,
+            outcome: null,
+          },
+        }));
+        pushToast(`结束捕捉并整理失败：${formatErrorMessage(err)}`, "warn");
+        return null;
+      }
+    });
+  },
+
+  async cancelLiveCaptureBg(): Promise<void> {
+    captureGen += 1;
+    const sid =
+      state.bgTasks.capture.sessionId ??
+      state.bgTasks.capture.status?.session_id ??
+      null;
+    stopLiveCapturePolling();
+    updateBgTasks((bg) => ({
+      ...bg,
+      capture: {
+        sessionId: null,
+        active: false,
+        finishing: false,
+        targetName: null,
+        status: null,
+        outcome: null,
+      },
+    }));
+    if (sid) {
+      try {
+        await catcloudApi.cancelLiveCaptureSession(sid);
+      } catch {
+        /* ignore backend cancel cleanup failure */
+      }
+    }
+  },
+
+  clearLiveCaptureOutcome(): void {
+    updateBgTasks((bg) => {
+      if (bg.capture.outcome === null && !bg.capture.finishing) return bg;
+      return {
+        ...bg,
+        capture: {
+          ...bg.capture,
+          finishing: false,
+          outcome: null,
+        },
+      };
+    });
+  },
+
+  setScrollPosition(route: string, top: number): void {
+    const normalizedTop = Math.max(0, Math.round(top));
+    if (state.sessionDrafts.scrollPositions[route] === normalizedTop) {
+      return;
+    }
+    setState((prev) => ({
+      ...prev,
+      sessionDrafts: {
+        ...prev.sessionDrafts,
+        scrollPositions: {
+          ...prev.sessionDrafts.scrollPositions,
+          [route]: normalizedTop,
+        },
+      },
+    }));
+  },
+
+  patchSessionDraft<K extends keyof SessionDraftsState>(
+    key: K,
+    patch: Partial<SessionDraftsState[K]>
+  ): void {
+    setState((prev) => {
+      const currentSlice = prev.sessionDrafts[key];
+      const entries = Object.entries(patch) as Array<[string, unknown]>;
+      let changed = false;
+      for (const [field, val] of entries) {
+        if ((currentSlice as Record<string, unknown>)[field] !== val) {
+          changed = true;
+          break;
+        }
+      }
+      if (!changed) return prev;
+      return {
+        ...prev,
+        sessionDrafts: {
+          ...prev.sessionDrafts,
+          [key]: {
+            ...currentSlice,
+            ...patch,
+          },
+        },
+      };
+    });
   },
 
   showToast: pushToast,

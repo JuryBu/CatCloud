@@ -27,7 +27,7 @@
         "title": "CatCloud Capsule",
         "url": "index.html#capsule",
         "create": false,
-        "width": 344,
+        "width": 364,
         "height": 64,
         "minWidth": 280,
         "minHeight": 56,
@@ -37,6 +37,7 @@
         "transparent": true,
         "shadow": false,
         "resizable": true,
+        "maximizable": false,
         "skipTaskbar": true,
         "alwaysOnTop": true,
         "visible": false
