@@ -2409,7 +2409,7 @@ mod tests {
 
         let (payload_after, _) =
             build_global_preaccel_status_payload(&paths).expect("status after windivert");
-        if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        if !cfg!(all(target_os = "windows", not(target_arch = "aarch64"))) {
             assert_eq!(payload_after["windivert_available"], json!(false));
             assert!(payload_after["windivert_dll"].is_null());
             assert!(payload_after["windivert_sys"].is_null());
