@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unified four-way real-time toggle sync across Overview, Floating Capsule, Domestic Pre-Acceleration page, and System Tray (icon state + tooltip + context menu).
 
 ### Smart Watchdog, Routing & Performance
-- Hardened smart multi-group background watchdog against false failovers under heavy uploads: reads 10s rolling throughput window unaffected by window minimization, enforces 5-minute anti-flapping cooldown on failed nodes, and live-probes top-3 replacement candidates before switching.
+- Hardened smart multi-group background watchdog against both false failovers and half-broken (partial packet-loss) node ping-pong: uses concurrent dual-origin probing (`gstatic` + `Cloudflare`), 10s rolling throughput window unaffected by window minimization, 5-minute anti-flapping cooldown on failed/degraded nodes, top-4 candidate dual-origin admission (requiring 2/2 healthy backups to replace a sustained degraded node), and smooth non-disruptive migration on partial degradation while respecting each group's `switch_mode` on total outage.
 - Expanded conservative domestic direct routing (including Windows/Apple push notification endpoints and domestic CDNs) while keeping overseas & hybrid services strictly proxied.
 - Applied active-node YAML pruning (`>90%` config size reduction in rule mode), `geodata-loader: memconservative`, rolling sanitized file logging, AI diagnostic quick-copy entry, custom frameless titlebar + Portal dropdowns/modals, resizable day/night-synced floating capsule, and ~48% steady-state Mihomo memory reduction.
 

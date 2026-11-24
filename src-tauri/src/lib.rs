@@ -834,17 +834,94 @@ fn spawn_proxy_guard(app: &tauri::AppHandle) {
     });
 }
 
-async fn probe_compiled_proxy_delay(
+const WATCHDOG_PROBE_PRIMARY_URL: &str = "https://www.gstatic.com/generate_204";
+const WATCHDOG_PROBE_SECONDARY_URL: &str = "https://cp.cloudflare.com/generate_204";
+const WATCHDOG_DEGRADED_THRESHOLD_ROUNDS: u32 = 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DualProbeHealth {
+    /// Both independent origins (Google + Cloudflare) succeeded.
+    FullHealthy(u64),
+    /// Exactly one origin succeeded while the other timed out / errored (partial outage or
+    /// probabilistic packet loss such as 50% broken new-connection routing).
+    Degraded {
+        passed_delay_ms: u64,
+        failed_source: &'static str,
+    },
+    /// Both independent origins failed — confirmed true outage.
+    TotalFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogFailoverTrigger {
+    TotalOutage {
+        fail_count: u32,
+    },
+    SustainedDegraded {
+        degraded_rounds: u32,
+        failed_source: &'static str,
+    },
+}
+
+fn classify_dual_probe_health(
+    primary_google_ms: Option<u64>,
+    secondary_cf_ms: Option<u64>,
+) -> DualProbeHealth {
+    match (primary_google_ms, secondary_cf_ms) {
+        (Some(g), Some(c)) => DualProbeHealth::FullHealthy((g.saturating_add(c)) / 2),
+        (Some(g), None) => DualProbeHealth::Degraded {
+            passed_delay_ms: g,
+            failed_source: "Cloudflare",
+        },
+        (None, Some(c)) => DualProbeHealth::Degraded {
+            passed_delay_ms: c,
+            failed_source: "Google",
+        },
+        (None, None) => DualProbeHealth::TotalFailure,
+    }
+}
+
+/// Decide whether a probed backup candidate should be accepted for the given trigger.
+/// - For `SustainedDegraded`, ONLY a `FullHealthy` (2/2) candidate may replace a degraded node
+///   so two half-broken nodes never ping-pong into each other.
+/// - For `TotalOutage`, a `FullHealthy` candidate always wins immediately; a `Degraded` (1/2)
+///   candidate is only kept as last-resort fallback if no `FullHealthy` backup exists.
+fn choose_verified_candidate_from_probes<T: Clone>(
+    trigger: WatchdogFailoverTrigger,
+    probed: &[(T, DualProbeHealth)],
+) -> Option<(T, u64, bool)> {
+    let mut degraded_fallback: Option<(T, u64)> = None;
+    for (cand, health) in probed {
+        match *health {
+            DualProbeHealth::FullHealthy(avg_ms) => {
+                return Some((cand.clone(), avg_ms, true));
+            }
+            DualProbeHealth::Degraded { passed_delay_ms, .. } => {
+                if matches!(trigger, WatchdogFailoverTrigger::TotalOutage { .. })
+                    && degraded_fallback.is_none()
+                {
+                    degraded_fallback = Some((cand.clone(), passed_delay_ms));
+                }
+            }
+            DualProbeHealth::TotalFailure => {}
+        }
+    }
+    degraded_fallback.map(|(cand, ms)| (cand, ms, false))
+}
+
+async fn probe_compiled_proxy_delay_url(
     http_client: &reqwest::Client,
     ctrl_host: &str,
     port: u16,
     secret: &str,
     compiled_proxy: &str,
+    probe_url: &str,
     timeout_ms: u64,
 ) -> Option<u64> {
     let encoded_proxy = commands::percent_encode_path_segment(compiled_proxy);
+    let encoded_url = commands::percent_encode_path_segment(probe_url);
     let delay_url = format!(
-        "http://{ctrl_host}:{port}/proxies/{encoded_proxy}/delay?url=https%3A%2F%2Fcp.cloudflare.com%2Fgenerate_204&timeout={timeout_ms}"
+        "http://{ctrl_host}:{port}/proxies/{encoded_proxy}/delay?url={encoded_url}&timeout={timeout_ms}"
     );
     let mut req = http_client.get(&delay_url);
     if !secret.trim().is_empty() {
@@ -859,6 +936,37 @@ async fn probe_compiled_proxy_delay(
             .filter(|&delay| delay > 0),
         _ => None,
     }
+}
+
+async fn probe_compiled_proxy_dual_health(
+    http_client: &reqwest::Client,
+    ctrl_host: &str,
+    port: u16,
+    secret: &str,
+    compiled_proxy: &str,
+    timeout_ms: u64,
+) -> DualProbeHealth {
+    let (primary_ms, secondary_ms) = tokio::join!(
+        probe_compiled_proxy_delay_url(
+            http_client,
+            ctrl_host,
+            port,
+            secret,
+            compiled_proxy,
+            WATCHDOG_PROBE_PRIMARY_URL,
+            timeout_ms,
+        ),
+        probe_compiled_proxy_delay_url(
+            http_client,
+            ctrl_host,
+            port,
+            secret,
+            compiled_proxy,
+            WATCHDOG_PROBE_SECONDARY_URL,
+            timeout_ms,
+        ),
+    );
+    classify_dual_probe_health(primary_ms, secondary_ms)
 }
 
 fn is_watchdog_high_throughput(st: &AppState) -> bool {
@@ -893,10 +1001,11 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
 
         const FAILED_NODE_COOLDOWN: Duration = Duration::from_secs(300);
         const ALL_CANDIDATES_FAILED_BACKOFF: Duration = Duration::from_secs(180);
-        const MAX_FAILOVER_CANDIDATES: usize = 3;
+        const MAX_FAILOVER_CANDIDATES: usize = 4;
         const CANDIDATE_PROBE_TIMEOUT_MS: u64 = 3500;
 
         let mut consecutive_fail_counts: HashMap<String, u32> = HashMap::new();
+        let mut consecutive_degraded_counts: HashMap<String, u32> = HashMap::new();
         let mut last_auto_switch_at: HashMap<String, Instant> = HashMap::new();
         let mut failed_group_backoff_until: HashMap<String, Instant> = HashMap::new();
         let mut last_checked_node: HashMap<String, String> = HashMap::new();
@@ -922,16 +1031,19 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
             let cfg = st.snapshot_config();
             if cfg.route_mode != RouteTargetMode::Group || cfg.proxy_mode == ProxyMode::Direct {
                 consecutive_fail_counts.clear();
+                consecutive_degraded_counts.clear();
                 continue;
             }
 
             if !st.adapter.has_live_controller().await {
                 consecutive_fail_counts.clear();
+                consecutive_degraded_counts.clear();
                 continue;
             }
             let rt = st.adapter.runtime_status().await;
             if !rt.running {
                 consecutive_fail_counts.clear();
+                consecutive_degraded_counts.clear();
                 continue;
             }
 
@@ -940,6 +1052,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
             // uploads/downloads from spurious mid-transfer failover even while minimized.
             if is_watchdog_high_throughput(&st) {
                 consecutive_fail_counts.clear();
+                consecutive_degraded_counts.clear();
                 tracing::debug!(
                     "group strategy watchdog skipped round: active high-throughput transfer detected"
                 );
@@ -992,6 +1105,8 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
 
             consecutive_fail_counts
                 .retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
+            consecutive_degraded_counts
+                .retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
             last_auto_switch_at.retain(|gid, _| target_groups.iter().any(|(g, _)| &g.id == gid));
             failed_group_backoff_until
                 .retain(|gid, until| Instant::now() < *until && target_groups.iter().any(|(g, _)| &g.id == gid));
@@ -1013,6 +1128,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                 }
                 if is_watchdog_high_throughput(&st) {
                     consecutive_fail_counts.clear();
+                    consecutive_degraded_counts.clear();
                     break;
                 }
                 let Some(active_node) = commands::resolve_valid_group_active_node(&group, &nodes)
@@ -1023,6 +1139,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     != Some(active_node.id.as_str())
                 {
                     consecutive_fail_counts.remove(&group.id);
+                    consecutive_degraded_counts.remove(&group.id);
                     failed_group_backoff_until.remove(&group.id);
                     last_checked_node.insert(group.id.clone(), active_node.id.clone());
                 }
@@ -1036,7 +1153,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
 
                 let compiled_proxy =
                     st.resolve_compiled_proxy_name(&active_node.id, &active_node.name);
-                let healthy = probe_compiled_proxy_delay(
+                let health = probe_compiled_proxy_dual_health(
                     &http_client,
                     &ctrl_host,
                     rt.controller_port,
@@ -1044,41 +1161,77 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     &compiled_proxy,
                     4500,
                 )
-                .await
-                .is_some();
+                .await;
 
-                if healthy {
-                    // Healthy active node: reset failure counter and stay sticky (zero IP drift).
-                    consecutive_fail_counts.remove(&group.id);
-                    continue;
-                }
-
-                let fail_count = {
-                    let entry = consecutive_fail_counts.entry(group.id.clone()).or_insert(0);
-                    *entry = entry.saturating_add(1);
-                    *entry
-                };
-                let required_failures = commands::group_watchdog_failure_threshold(&group);
                 let cooldown = Duration::from_secs(group.cooldown_sec.max(45));
                 let cooldown_elapsed = last_auto_switch_at
                     .get(&group.id)
                     .is_none_or(|last| last.elapsed() >= cooldown);
+                let required_failures = commands::group_watchdog_failure_threshold(&group);
 
-                if fail_count < required_failures || !cooldown_elapsed {
-                    tracing::debug!(
-                        group = %group.name,
-                        node = %active_node.name,
-                        fail_count,
-                        required_failures,
-                        cooldown_elapsed,
-                        "group strategy watchdog recorded probe failure (holding)"
-                    );
-                    continue;
-                }
+                let trigger = match health {
+                    DualProbeHealth::FullHealthy(_) => {
+                        // Both Google & Cloudflare succeeded: clear counters and stay sticky.
+                        consecutive_fail_counts.remove(&group.id);
+                        consecutive_degraded_counts.remove(&group.id);
+                        continue;
+                    }
+                    DualProbeHealth::TotalFailure => {
+                        consecutive_degraded_counts.remove(&group.id);
+                        let fail_count = {
+                            let entry =
+                                consecutive_fail_counts.entry(group.id.clone()).or_insert(0);
+                            *entry = entry.saturating_add(1);
+                            *entry
+                        };
+                        if fail_count < required_failures || !cooldown_elapsed {
+                            tracing::debug!(
+                                group = %group.name,
+                                node = %active_node.name,
+                                fail_count,
+                                required_failures,
+                                cooldown_elapsed,
+                                "group strategy watchdog recorded dual-origin outage (holding)"
+                            );
+                            continue;
+                        }
+                        WatchdogFailoverTrigger::TotalOutage { fail_count }
+                    }
+                    DualProbeHealth::Degraded { failed_source, .. } => {
+                        // Single-origin timeout does NOT count as total outage (prevents single-CDN
+                        // blip false failovers), but sustained partial failure across 4 rounds (2 min)
+                        // will smoothly migrate to a verified 2/2 healthy backup if one exists.
+                        consecutive_fail_counts.remove(&group.id);
+                        let degraded_rounds = {
+                            let entry = consecutive_degraded_counts
+                                .entry(group.id.clone())
+                                .or_insert(0);
+                            *entry = entry.saturating_add(1);
+                            *entry
+                        };
+                        if degraded_rounds < WATCHDOG_DEGRADED_THRESHOLD_ROUNDS
+                            || !cooldown_elapsed
+                        {
+                            tracing::debug!(
+                                group = %group.name,
+                                node = %active_node.name,
+                                degraded_rounds,
+                                failed_source,
+                                "group strategy watchdog observed partial single-origin timeout (holding)"
+                            );
+                            continue;
+                        }
+                        WatchdogFailoverTrigger::SustainedDegraded {
+                            degraded_rounds,
+                            failed_source,
+                        }
+                    }
+                };
 
                 // Guard #1 (re-check): abort failover if high-throughput transfer started during probe.
                 if is_watchdog_high_throughput(&st) {
                     consecutive_fail_counts.clear();
+                    consecutive_degraded_counts.clear();
                     tracing::debug!(
                         group = %group.name,
                         "group strategy watchdog aborted failover: high-throughput transfer active"
@@ -1086,14 +1239,14 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     continue;
                 }
 
-                // Guard #2: record the just-failed active node into 5-minute bounce-back cooldown.
+                // Guard #2: record the just-failed/degraded active node into 5-minute bounce-back cooldown.
                 failed_node_cooldowns.retain(|_, t| t.elapsed() < FAILED_NODE_COOLDOWN);
                 failed_node_cooldowns.insert(active_node.id.clone(), Instant::now());
                 let cooldown_ids: HashSet<String> =
                     failed_node_cooldowns.keys().cloned().collect();
 
                 // Re-read latest group, nodes, and probe snapshots under a brief sync lock before
-                // ranking up to 3 backup candidates (excluding active & 5-minute cooldown nodes).
+                // ranking up to 4 backup candidates (excluding active & 5-minute cooldown nodes).
                 let candidate_plan = st.storage.lock().ok().and_then(|db| {
                     let latest_group = db.get_multi_group(&group.id).ok().flatten()?;
                     let latest_nodes = db.list_nodes().ok()?;
@@ -1140,15 +1293,17 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     continue;
                 };
 
-                // Guard #3: sequentially live-probe top 3 candidates outside sync locks (`timeout=3500ms`),
-                // placing any failed candidate immediately into 5-minute cooldown and refusing blind switches.
-                let mut verified_candidate: Option<(String, String, u64)> = None;
+                // Guard #3: sequentially dual-probe top 4 candidates outside sync locks (`timeout=3500ms`).
+                // Prefer verified 2/2 (Google + Cloudflare) healthy backups; never migrate a half-broken
+                // node onto another half-broken node; cool down any failed/degraded candidate immediately.
                 let probed_total = candidates.len();
+                let mut probed_results: Vec<((String, String), DualProbeHealth)> =
+                    Vec::with_capacity(probed_total);
                 for (cand_id, cand_name, cand_compiled) in candidates {
                     if st.shutting_down.load(Ordering::SeqCst) {
                         break;
                     }
-                    if let Some(delay_ms) = probe_compiled_proxy_delay(
+                    let cand_health = probe_compiled_proxy_dual_health(
                         &http_client,
                         &ctrl_host,
                         rt.controller_port,
@@ -1156,28 +1311,40 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                         &cand_compiled,
                         CANDIDATE_PROBE_TIMEOUT_MS,
                     )
-                    .await
-                    {
-                        verified_candidate = Some((cand_id, cand_name, delay_ms));
+                    .await;
+                    let is_full = matches!(cand_health, DualProbeHealth::FullHealthy(_));
+                    if !is_full {
+                        failed_node_cooldowns.insert(cand_id.clone(), Instant::now());
+                    }
+                    probed_results.push(((cand_id, cand_name), cand_health));
+                    if is_full {
                         break;
                     }
-                    failed_node_cooldowns.insert(cand_id, Instant::now());
                 }
 
-                let Some((next_id, next_name, verified_delay_ms)) = verified_candidate else {
+                let Some(((next_id, next_name), verified_delay_ms, is_full_healthy)) =
+                    choose_verified_candidate_from_probes(trigger, &probed_results)
+                else {
                     consecutive_fail_counts.remove(&gid);
+                    consecutive_degraded_counts.remove(&gid);
                     let now = Instant::now();
                     last_auto_switch_at.insert(gid.clone(), now);
                     failed_group_backoff_until
                         .insert(gid.clone(), now + ALL_CANDIDATES_FAILED_BACKOFF);
-                    st.log_app_event(
-                        "warning",
-                        "自动切优",
-                        &format!(
-                            "分组「{gname}」原节点「{}」连续 {fail_count} 次健康探活失败，但顺位前 {probed_total} 个备用候选实测探活均未通过，已记入 5 分钟冷却并进入 180 秒分组退避，放弃盲切",
+                    let log_msg = match trigger {
+                        WatchdogFailoverTrigger::TotalOutage { fail_count } => format!(
+                            "分组「{gname}」原节点「{}」连续 {fail_count} 次双源探活失败，但顺位前 {probed_total} 个备用候选均未通过实测，已记入 5 分钟冷却并进入 180 秒退避，放弃盲切",
                             active_node.name
                         ),
-                    );
+                        WatchdogFailoverTrigger::SustainedDegraded {
+                            degraded_rounds,
+                            failed_source,
+                        } => format!(
+                            "分组「{gname}」原节点「{}」连续 {degraded_rounds} 轮对 {failed_source} 单源超时（半残），但顺位前 {probed_total} 个备用候选无双源全绿节点，保持当前节点避免无效互切并进入 180 秒退避",
+                            active_node.name
+                        ),
+                    };
+                    st.log_app_event("warning", "自动切优", &log_msg);
                     continue;
                 };
 
@@ -1192,6 +1359,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                 }
                 if is_watchdog_high_throughput(&st) {
                     consecutive_fail_counts.clear();
+                    consecutive_degraded_counts.clear();
                     continue;
                 }
                 // Guard #4: briefly re-verify DB `active_node_id` right before switching so we
@@ -1211,6 +1379,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     .unwrap_or(false);
                 if !still_same_active {
                     consecutive_fail_counts.remove(&gid);
+                    consecutive_degraded_counts.remove(&gid);
                     failed_group_backoff_until.remove(&gid);
                     st.log_app_event(
                         "info",
@@ -1223,12 +1392,18 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     continue;
                 }
                 let _ = is_primary;
+                // Guard #5: smooth migration on partial degradation never force-kills live streams;
+                // total outage respects the group's own configured `switch_mode` (`None`).
+                let close_old_override = match trigger {
+                    WatchdogFailoverTrigger::SustainedDegraded { .. } => Some(false),
+                    WatchdogFailoverTrigger::TotalOutage { .. } => None,
+                };
                 let switch_res = commands::select_group_node_in_place_internal(
                     &app_h,
                     &st,
                     gid.clone(),
                     next_id.clone(),
-                    Some(true),
+                    close_old_override,
                     Some(active_node.name.clone()),
                 )
                 .await;
@@ -1236,11 +1411,25 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                 match switch_res {
                     Ok(_) => {
                         consecutive_fail_counts.remove(&gid);
+                        consecutive_degraded_counts.remove(&gid);
                         last_auto_switch_at.insert(gid.clone(), Instant::now());
                         last_checked_node.insert(gid.clone(), next_id.clone());
-                        let reason = format!(
-                            "原节点连续 {fail_count} 次健康探活失败，已验证并自动切换至可用备用节点（{verified_delay_ms} ms）"
-                        );
+                        let health_tag = if is_full_healthy {
+                            "双源全绿"
+                        } else {
+                            "单源兜底"
+                        };
+                        let reason = match trigger {
+                            WatchdogFailoverTrigger::TotalOutage { fail_count } => format!(
+                                "原节点连续 {fail_count} 次双源健康探活失败，已自动切换至{health_tag}备用节点（{verified_delay_ms} ms）"
+                            ),
+                            WatchdogFailoverTrigger::SustainedDegraded {
+                                degraded_rounds,
+                                failed_source,
+                            } => format!(
+                                "原节点连续 {degraded_rounds} 轮对 {failed_source} 单源超时（部分丢包），已平滑切换至{health_tag}节点（{verified_delay_ms} ms，不断开存量连接）"
+                            ),
+                        };
                         st.log_app_event(
                             "warning",
                             "自动切优",
@@ -1667,5 +1856,79 @@ mod tests {
         assert!(!should_run_auto_update_check(&cfg, now));
         cfg.last_checked_at = Some("not-a-timestamp".to_string());
         assert!(should_run_auto_update_check(&cfg, now));
+    }
+
+    #[test]
+    fn dual_probe_watchdog_classifies_health_and_blocks_half_broken_ping_pong() {
+        assert_eq!(
+            classify_dual_probe_health(Some(60), Some(80)),
+            DualProbeHealth::FullHealthy(70)
+        );
+        assert_eq!(
+            classify_dual_probe_health(Some(64), None),
+            DualProbeHealth::Degraded {
+                passed_delay_ms: 64,
+                failed_source: "Cloudflare",
+            }
+        );
+        assert_eq!(
+            classify_dual_probe_health(None, Some(65)),
+            DualProbeHealth::Degraded {
+                passed_delay_ms: 65,
+                failed_source: "Google",
+            }
+        );
+        assert_eq!(
+            classify_dual_probe_health(None, None),
+            DualProbeHealth::TotalFailure
+        );
+
+        let degraded_trigger = WatchdogFailoverTrigger::SustainedDegraded {
+            degraded_rounds: WATCHDOG_DEGRADED_THRESHOLD_ROUNDS,
+            failed_source: "Cloudflare",
+        };
+        let outage_trigger = WatchdogFailoverTrigger::TotalOutage { fail_count: 2 };
+
+        // Sustained degraded node must SKIP another degraded candidate and pick the verified 2/2 node.
+        let mixed_candidates = vec![
+            (
+                "tw-02",
+                DualProbeHealth::Degraded {
+                    passed_delay_ms: 64,
+                    failed_source: "Google",
+                },
+            ),
+            ("tw-05", DualProbeHealth::FullHealthy(108)),
+        ];
+        assert_eq!(
+            choose_verified_candidate_from_probes(degraded_trigger, &mixed_candidates),
+            Some(("tw-05", 108, true))
+        );
+
+        // If NO 2/2 healthy candidate exists, a degraded node must NOT ping-pong into another degraded node.
+        let only_degraded = vec![
+            (
+                "tw-02",
+                DualProbeHealth::Degraded {
+                    passed_delay_ms: 64,
+                    failed_source: "Google",
+                },
+            ),
+            ("tw-04", DualProbeHealth::TotalFailure),
+        ];
+        assert_eq!(
+            choose_verified_candidate_from_probes(degraded_trigger, &only_degraded),
+            None
+        );
+
+        // On total outage (0/2), a full-healthy backup still wins, and degraded is only last-resort fallback.
+        assert_eq!(
+            choose_verified_candidate_from_probes(outage_trigger, &mixed_candidates),
+            Some(("tw-05", 108, true))
+        );
+        assert_eq!(
+            choose_verified_candidate_from_probes(outage_trigger, &only_degraded),
+            Some(("tw-02", 64, false))
+        );
     }
 }
