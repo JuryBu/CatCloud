@@ -1,6 +1,5 @@
 package io.github.jurybu.catcloud
 
-import com.sun.net.httpserver.HttpServer
 import io.github.jurybu.catcloud.data.LogRingStore
 import io.github.jurybu.catcloud.data.ProxyNodeRecord
 import io.github.jurybu.catcloud.engine.SpeedTester
@@ -22,12 +21,14 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.io.BufferedInputStream
 import java.io.IOException
 import java.net.InetAddress
-import java.net.InetSocketAddress
+import java.net.ServerSocket
 import java.nio.file.Files
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class LanSyncClientSecurityTest {
@@ -129,8 +130,8 @@ class LanSyncClientSecurityTest {
         val postCount = AtomicInteger(0)
         val infoCount = AtomicInteger(0)
 
-        val (serverFast, execFast) = startMockLanPushServer(sid = sid, delayInfoMs = 0L, infoCount = infoCount, postCount = postCount)
-        val (serverSlow, execSlow) = startMockLanPushServer(sid = sid, delayInfoMs = 180L, infoCount = infoCount, postCount = postCount)
+        val serverFast = startMockLanPushServer(sid = sid, delayInfoMs = 0L, infoCount = infoCount, postCount = postCount)
+        val serverSlow = startMockLanPushServer(sid = sid, delayInfoMs = 180L, infoCount = infoCount, postCount = postCount)
         try {
             val client = LanSyncClient()
             val parsed = ParsedSyncUri(
@@ -138,18 +139,16 @@ class LanSyncClientSecurityTest {
                 keyBytes = key,
                 sid = sid,
                 hosts = listOf("127.0.0.1"),
-                port = serverSlow.address.port,
-                customEndpoint = "http://127.0.0.1:${serverFast.address.port}",
+                port = serverSlow.port,
+                customEndpoint = "http://127.0.0.1:${serverFast.port}",
             )
             val winner = client.pushBySyncUri(parsed, "demo-zip-payload".toByteArray())
             assertTrue(winner.startsWith("http://127.0.0.1:"))
             assertEquals("POST /sync/v1/bundle must be delivered exactly once", 1, postCount.get())
             assertTrue(infoCount.get() >= 1)
         } finally {
-            serverFast.stop(0)
-            serverSlow.stop(0)
-            execFast.shutdownNow()
-            execSlow.shutdownNow()
+            serverFast.close()
+            serverSlow.close()
         }
     }
 
@@ -161,8 +160,8 @@ class LanSyncClientSecurityTest {
         val rightPostCount = AtomicInteger(0)
         val dummyInfo = AtomicInteger(0)
 
-        val (wrongServer, wrongExec) = startMockLanPushServer(sid = "fedcba9876543210", delayInfoMs = 0L, infoCount = dummyInfo, postCount = wrongPostCount)
-        val (rightServer, rightExec) = startMockLanPushServer(sid = expectedSid, delayInfoMs = 40L, infoCount = dummyInfo, postCount = rightPostCount)
+        val wrongServer = startMockLanPushServer(sid = "fedcba9876543210", delayInfoMs = 0L, infoCount = dummyInfo, postCount = wrongPostCount)
+        val rightServer = startMockLanPushServer(sid = expectedSid, delayInfoMs = 40L, infoCount = dummyInfo, postCount = rightPostCount)
         try {
             val client = LanSyncClient()
             val parsed = ParsedSyncUri(
@@ -170,18 +169,16 @@ class LanSyncClientSecurityTest {
                 keyBytes = key,
                 sid = expectedSid,
                 hosts = listOf("127.0.0.1"),
-                port = rightServer.address.port,
-                customEndpoint = "http://127.0.0.1:${wrongServer.address.port}",
+                port = rightServer.port,
+                customEndpoint = "http://127.0.0.1:${wrongServer.port}",
             )
             val winner = client.pushBySyncUri(parsed, "demo-zip-payload".toByteArray())
-            assertEquals("http://127.0.0.1:${rightServer.address.port}", winner)
+            assertEquals("http://127.0.0.1:${rightServer.port}", winner)
             assertEquals(0, wrongPostCount.get())
             assertEquals(1, rightPostCount.get())
         } finally {
-            wrongServer.stop(0)
-            rightServer.stop(0)
-            wrongExec.shutdownNow()
-            rightExec.shutdownNow()
+            wrongServer.close()
+            rightServer.close()
         }
     }
 
@@ -260,39 +257,98 @@ class LanSyncClientSecurityTest {
             }
             .build()
 
+    private class TinyLanPushServer(
+        private val socket: ServerSocket,
+        private val exec: ExecutorService,
+        private val running: AtomicBoolean,
+    ) : AutoCloseable {
+        val port: Int get() = socket.localPort
+        override fun close() {
+            running.set(false)
+            runCatching { socket.close() }
+            exec.shutdownNow()
+        }
+    }
+
     private fun startMockLanPushServer(
         sid: String,
         delayInfoMs: Long,
         infoCount: AtomicInteger,
         postCount: AtomicInteger,
-    ): Pair<HttpServer, ExecutorService> {
-        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+    ): TinyLanPushServer {
+        val ss = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
         val exec = Executors.newCachedThreadPool()
-        server.executor = exec
-        server.createContext("/sync/v1/info") { ex ->
-            infoCount.incrementAndGet()
-            if (delayInfoMs > 0) {
-                try {
-                    Thread.sleep(delayInfoMs)
-                } catch (_: InterruptedException) {
-                    return@createContext
+        val running = AtomicBoolean(true)
+        exec.submit {
+            while (running.get()) {
+                val client = try {
+                    ss.accept()
+                } catch (_: IOException) {
+                    break
+                }
+                exec.submit {
+                    client.use { sock ->
+                        sock.soTimeout = 5000
+                        val input = BufferedInputStream(sock.getInputStream())
+                        val headerBuf = StringBuilder()
+                        var prev = -1
+                        var cur: Int
+                        while (true) {
+                            cur = input.read()
+                            if (cur == -1) break
+                            headerBuf.append(cur.toChar())
+                            if (headerBuf.length >= 4 && headerBuf.endsWith("\r\n\r\n")) break
+                            prev = cur
+                        }
+                        val headerLines = headerBuf.toString().split("\r\n")
+                        val requestLine = headerLines.firstOrNull().orEmpty()
+                        val contentLength = headerLines
+                            .firstOrNull { it.lowercase().startsWith("content-length:") }
+                            ?.substringAfter(':')
+                            ?.trim()
+                            ?.toIntOrNull()
+                            ?: 0
+                        if (contentLength > 0) {
+                            var remaining = contentLength
+                            val skipBuf = ByteArray(4096)
+                            while (remaining > 0) {
+                                val r = input.read(skipBuf, 0, minOf(skipBuf.size, remaining))
+                                if (r <= 0) break
+                                remaining -= r
+                            }
+                        }
+                        val payloadBytes = when {
+                            requestLine.contains("/sync/v1/info") -> {
+                                infoCount.incrementAndGet()
+                                if (delayInfoMs > 0) {
+                                    try {
+                                        Thread.sleep(delayInfoMs)
+                                    } catch (_: InterruptedException) {
+                                        return@submit
+                                    }
+                                }
+                                """{"sid":"$sid","role":"push"}""".toByteArray(Charsets.UTF_8)
+                            }
+                            requestLine.contains("/sync/v1/bundle") -> {
+                                postCount.incrementAndGet()
+                                """{"ok":true}""".toByteArray(Charsets.UTF_8)
+                            }
+                            else -> """{"error":"not_found"}""".toByteArray(Charsets.UTF_8)
+                        }
+                        val status = if (requestLine.contains("/sync/v1/")) "200 OK" else "404 Not Found"
+                        val respHead = ("HTTP/1.1 $status\r\n" +
+                            "Content-Type: application/json\r\n" +
+                            "Content-Length: ${payloadBytes.size}\r\n" +
+                            "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII)
+                        val out = sock.getOutputStream()
+                        out.write(respHead)
+                        out.write(payloadBytes)
+                        out.flush()
+                    }
                 }
             }
-            val payload = """{"sid":"$sid","role":"push"}""".toByteArray(Charsets.UTF_8)
-            ex.responseHeaders.add("Content-Type", "application/json")
-            ex.sendResponseHeaders(200, payload.size.toLong())
-            ex.responseBody.use { it.write(payload) }
         }
-        server.createContext("/sync/v1/bundle") { ex ->
-            postCount.incrementAndGet()
-            ex.requestBody.use { it.readBytes() }
-            val payload = """{"ok":true}""".toByteArray(Charsets.UTF_8)
-            ex.responseHeaders.add("Content-Type", "application/json")
-            ex.sendResponseHeaders(200, payload.size.toLong())
-            ex.responseBody.use { it.write(payload) }
-        }
-        server.start()
-        return server to exec
+        return TinyLanPushServer(ss, exec, running)
     }
 
     private inline fun <reified T : Throwable> assertThrows(msg: String, block: () -> Unit) {

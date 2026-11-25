@@ -102,7 +102,17 @@ jobs:
             exit 1
           fi
           echo "go.sum verified; enforcing reproducible -mod=readonly download."
-          go mod download -x >/dev/null
+          for attempt in 1 2 3; do
+            if go mod download; then
+              break
+            fi
+            if [[ "$attempt" -eq 3 ]]; then
+              echo "ERROR: go mod download failed after 3 attempts." >&2
+              exit 1
+            fi
+            echo "go mod download transient error (attempt $attempt); retrying in 5s..."
+            sleep 5
+          done
           go list -mod=readonly -m all >/dev/null
 
           echo "=== mihomo v1.19.16 API diagnostic (go doc, GOOS=android GOARCH=arm64 GOFLAGS=-tags=cmfa) ==="
