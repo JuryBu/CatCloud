@@ -33,7 +33,12 @@ pub use hot_reload::{
     DiskReloadSnapshot, HotReloadCoordinator, HotReloadDebouncer, classify_config_diff,
     has_core_config_changes,
 };
-pub use mihomo::{MihomoAdapter, generate_controller_secret, verify_config_with_binary};
+pub use mihomo::{
+    MihomoAdapter, RUNTIME_CONTROLLER_META_FILENAME, ResolvedControllerEndpoint,
+    generate_controller_secret, remove_runtime_controller_meta,
+    resolve_effective_controller_endpoint, resolve_effective_controller_endpoint_info,
+    verify_config_with_binary,
+};
 pub use port_guard::{
     AllocatedPorts as CoreAllocatedPorts, PortShiftNotice as CorePortShiftNotice,
     allocate_safe_ports, allocate_safe_ports_for_hosts, is_port_available_tcp_udp,
@@ -335,7 +340,7 @@ pub(crate) fn format_http_base_url(host: &str, port: u16) -> String {
 }
 
 /// Format a `host:port` socket bind address with bracketed IPv6 support.
-pub(crate) fn format_host_port(host: &str, port: u16) -> String {
+pub fn format_host_port(host: &str, port: u16) -> String {
     let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
     if trimmed.contains(':') {
         format!("[{trimmed}]:{port}")

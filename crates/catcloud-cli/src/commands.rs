@@ -10,7 +10,8 @@ use catcloud_core::core_adapter::port_guard::{
 };
 use catcloud_core::core_adapter::{
     ActiveConnection, BinaryResolution, DiskReloadOptions, DownloadGuidance, HotReloadCoordinator,
-    MihomoAdapter, ReloadOutcome, compute_file_sha256, generate_controller_secret,
+    MihomoAdapter, ReloadOutcome, ResolvedControllerEndpoint, compute_file_sha256,
+    format_host_port, generate_controller_secret, resolve_effective_controller_endpoint_info,
     resolve_mihomo_binary, verify_config_with_binary,
 };
 use catcloud_core::models::{
@@ -2041,18 +2042,16 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let bin_res = resolve_mihomo_binary(&cfg, paths, &[], false)?;
                 let job_guard = Arc::new(JobGuard::new()?);
 
-                let configured_secret = cfg
-                    .controller_secret
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(ToString::to_string);
+                let ep = resolve_effective_controller_endpoint_info(paths, &cfg);
+                let ctrl_addr = format_host_port(&ep.host, ep.port);
+                let configured_secret =
+                    (!ep.secret.trim().is_empty()).then_some(ep.secret.clone());
 
                 let probe_adapter = MihomoAdapter::with_controller_endpoint(
                     Arc::clone(&job_guard),
-                    &cfg.controller_host,
-                    cfg.controller_port,
-                    configured_secret.clone().unwrap_or_default(),
+                    &ep.host,
+                    ep.port,
+                    ep.secret.clone(),
                 )?;
 
                 let mut live_controller_version: Option<String> = None;
@@ -2095,9 +2094,9 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     };
                     let ports = AllocatedPorts {
                         bind_host,
-                        mixed_port: effective_cfg.mixed_port,
-                        controller_port: effective_cfg.controller_port,
-                        dns_port: effective_cfg.dns_listen_port,
+                        mixed_port: ep.mixed_port.unwrap_or(effective_cfg.mixed_port),
+                        controller_port: ep.port,
+                        dns_port: ep.dns_port.unwrap_or(effective_cfg.dns_listen_port),
                         shifted: Vec::new(),
                     };
                     let secret = configured_secret
@@ -2217,8 +2216,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
 
                 if let Some(auth_err) = controller_auth_error {
                     let msg = sanitize_log_line(&format!(
-                        "running Mihomo controller at {} rejected authentication ({auth_err}); configure matching `controller_secret` in config.json",
-                        cfg.controller_addr()
+                        "running Mihomo controller at {} rejected authentication ({auth_err}); ensure config.json controller_secret matches the active core or restart core",
+                        ctrl_addr
                     ));
                     let out = json!({
                         "ok": false,
@@ -2242,6 +2241,31 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     Arc::new(MihomoAdapter::new(Arc::clone(&job_guard))?)
                 };
                 let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+                if core_running {
+                    let mut seeded_cfg = cfg.clone();
+                    if !allow_tun && seeded_cfg.tun.enabled {
+                        seeded_cfg.tun.enabled = false;
+                    }
+                    let seeded_ports = AllocatedPorts {
+                        bind_host: if seeded_cfg.allow_lan {
+                            seeded_cfg.bind_address.clone()
+                        } else {
+                            "127.0.0.1".to_string()
+                        },
+                        mixed_port: ep.mixed_port.unwrap_or(seeded_cfg.mixed_port),
+                        controller_port: ep.port,
+                        dns_port: ep.dns_port.unwrap_or(seeded_cfg.dns_listen_port),
+                        shifted: Vec::new(),
+                    };
+                    coordinator
+                        .seed_active_state(
+                            seeded_cfg,
+                            String::new(),
+                            seeded_ports,
+                            ep.secret.clone(),
+                        )
+                        .await;
+                }
                 let runtime_yaml_path = coordinator.runtime_yaml_path();
                 let redacted_runtime_yaml =
                     redact_path_for_display(&runtime_yaml_path.to_string_lossy());
@@ -2310,7 +2334,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let human = if core_running {
                     format!(
                         "Hot-reloaded runtime.yaml via controller ({}) and replayed {} group(s) (sha256={sha_preview}).",
-                        cfg.controller_addr(),
+                        ctrl_addr,
                         outcome.replayed_groups
                     )
                 } else {
@@ -4210,47 +4234,41 @@ fn build_logs_tail_payload(
     Ok((out, human))
 }
 
-async fn probe_live_controller(cfg: &AppConfig) -> (Option<String>, Option<String>) {
+async fn probe_live_controller(
+    paths: &AppPaths,
+    cfg: &AppConfig,
+) -> (Option<String>, Option<String>, ResolvedControllerEndpoint) {
+    let ep = resolve_effective_controller_endpoint_info(paths, cfg);
     let Ok(job_guard) = JobGuard::new() else {
-        return (None, None);
+        return (None, None, ep);
     };
-    let secret = cfg
-        .controller_secret
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
     let Ok(adapter) = MihomoAdapter::with_controller_endpoint(
         Arc::new(job_guard),
-        &cfg.controller_host,
-        cfg.controller_port,
-        secret,
+        &ep.host,
+        ep.port,
+        ep.secret.clone(),
     ) else {
-        return (None, None);
+        return (None, None, ep);
     };
     match tokio::time::timeout(Duration::from_secs(2), adapter.fetch_version()).await {
-        Ok(Ok(ver)) => (Some(ver), None),
+        Ok(Ok(ver)) => (Some(ver), None, ep),
         Ok(Err(CatError::Core(msg))) if msg.contains("HTTP 401") || msg.contains("HTTP 403") => {
-            (None, Some(sanitize_log_line(&msg)))
+            (None, Some(sanitize_log_line(&msg)), ep)
         }
-        _ => (None, None),
+        _ => (None, None, ep),
     }
 }
 
 async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result<(Value, String)> {
     let cfg = config::load_or_init(paths)?;
     let job_guard = Arc::new(JobGuard::new()?);
-    let secret = cfg
-        .controller_secret
-        .as_deref()
-        .map(str::trim)
-        .unwrap_or_default()
-        .to_string();
+    let ep = resolve_effective_controller_endpoint_info(paths, &cfg);
+    let controller_addr = format_host_port(&ep.host, ep.port);
     let adapter = MihomoAdapter::with_controller_endpoint(
         job_guard,
-        &cfg.controller_host,
-        cfg.controller_port,
-        secret,
+        &ep.host,
+        ep.port,
+        ep.secret,
     )?;
 
     match tokio::time::timeout(Duration::from_secs(2), adapter.list_connections()).await {
@@ -4267,7 +4285,7 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
                 "sanitized": true,
                 "core_running": true,
                 "auth_error": false,
-                "controller_addr": cfg.controller_addr(),
+                "controller_addr": controller_addr,
                 "download_total": snapshot.download_total,
                 "upload_total": snapshot.upload_total,
                 "memory": snapshot.memory,
@@ -4288,7 +4306,7 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
                 "sanitized": true,
                 "core_running": true,
                 "auth_error": true,
-                "controller_addr": cfg.controller_addr(),
+                "controller_addr": controller_addr,
                 "download_total": 0u64,
                 "upload_total": 0u64,
                 "memory": 0u64,
@@ -4309,7 +4327,7 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
                 "sanitized": true,
                 "core_running": false,
                 "auth_error": false,
-                "controller_addr": cfg.controller_addr(),
+                "controller_addr": controller_addr,
                 "download_total": 0u64,
                 "upload_total": 0u64,
                 "memory": 0u64,
@@ -4480,13 +4498,28 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         }
     }));
 
-    // Check 3: Core binary, live controller & configured ports
+    // Check 3: Core binary, live controller & configured/active ports
     let bin_res = resolve_mihomo_binary(&cfg, paths, &[], false)?;
-    let (live_version, controller_auth_err) = probe_live_controller(&cfg).await;
+    let (live_version, controller_auth_err, ctrl_ep) = probe_live_controller(paths, &cfg).await;
     let core_running = live_version.is_some();
-    let mixed_free = is_port_available_tcp_udp(&cfg.bind_address, cfg.mixed_port);
-    let ctrl_free = is_port_available_tcp_udp(&cfg.controller_host, cfg.controller_port);
-    let dns_free = is_port_available_tcp_udp(&cfg.dns_listen_host, cfg.dns_listen_port);
+    let effective_mixed_port = if core_running {
+        ctrl_ep.mixed_port.unwrap_or(cfg.mixed_port)
+    } else {
+        cfg.mixed_port
+    };
+    let effective_ctrl_port = if core_running || controller_auth_err.is_some() {
+        ctrl_ep.port
+    } else {
+        cfg.controller_port
+    };
+    let effective_dns_port = if core_running {
+        ctrl_ep.dns_port.unwrap_or(cfg.dns_listen_port)
+    } else {
+        cfg.dns_listen_port
+    };
+    let mixed_free = is_port_available_tcp_udp(&cfg.bind_address, effective_mixed_port);
+    let ctrl_free = is_port_available_tcp_udp(&ctrl_ep.host, effective_ctrl_port);
+    let dns_free = is_port_available_tcp_udp(&cfg.dns_listen_host, effective_dns_port);
 
     let core_status = if !bin_res.found {
         recommendations.push(
@@ -4496,7 +4529,7 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         "fail"
     } else if controller_auth_err.is_some() {
         recommendations.push(
-            "Running controller rejected authentication; ensure config.json controller_secret matches the active core."
+            "Running controller rejected authentication; ensure config.json controller_secret matches the active core or restart core to refresh runtime metadata."
                 .to_string(),
         );
         "warn"
@@ -4522,11 +4555,11 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             "binary_found={}, core_running={}, ports(mixed={}:free={}, ctrl={}:free={}, dns={}:free={})",
             bin_res.found,
             core_running,
-            cfg.mixed_port,
+            effective_mixed_port,
             mixed_free,
-            cfg.controller_port,
+            effective_ctrl_port,
             ctrl_free,
-            cfg.dns_listen_port,
+            effective_dns_port,
             dns_free
         ),
         "data": {
@@ -4538,11 +4571,11 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             "controller_auth_error": controller_auth_err,
             "port_guard_auto_shift": cfg.port_guard_auto_shift,
             "ports": {
-                "mixed_port": cfg.mixed_port,
+                "mixed_port": effective_mixed_port,
                 "mixed_available": mixed_free,
-                "controller_port": cfg.controller_port,
+                "controller_port": effective_ctrl_port,
                 "controller_available": ctrl_free,
-                "dns_listen_port": cfg.dns_listen_port,
+                "dns_listen_port": effective_dns_port,
                 "dns_available": dns_free,
             }
         }
@@ -4552,8 +4585,8 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     let os_proxy_res = plat.read_system_proxy();
     let (os_proxy_val, os_proxy_mismatch, os_proxy_dangling) = match os_proxy_res {
         Ok(spec) => {
-            let mismatch = spec.enabled && spec.port != cfg.mixed_port;
-            let dangling = spec.enabled && !core_running && spec.port == cfg.mixed_port;
+            let mismatch = spec.enabled && spec.port != effective_mixed_port;
+            let dangling = spec.enabled && !core_running && spec.port == effective_mixed_port;
             (
                 json!({
                     "readable": true,
@@ -5229,7 +5262,7 @@ async fn build_net_match_payload(
     let nodes = db.list_nodes()?;
     let groups = db.list_multi_groups()?;
     let relays = db.list_preaccel_relays(false)?;
-    let (live_version, _) = probe_live_controller(&cfg).await;
+    let (live_version, _, _) = probe_live_controller(paths, &cfg).await;
 
     let offline_ports = AllocatedPorts {
         bind_host: if cfg.allow_lan {

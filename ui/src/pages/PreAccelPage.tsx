@@ -1556,9 +1556,14 @@ export function PreAccelPage() {
   const detectedSecurityProducts = globalPreAccel.detected_security_products ?? [];
   const securityGuidanceText = globalPreAccel.security_guidance?.trim() || null;
   const verifyMessageText = globalPreAccel.verify_message?.trim() || null;
+  const isAbnormalVerifyState = isDegradedVerify || preaccelSummary.verifyState === "failed";
+  const hasDistinctVerifyDetail =
+    isAbnormalVerifyState &&
+    Boolean(verifyMessageText) &&
+    verifyMessageText !== preaccelSummary.detailText.trim();
   const showSecurityGuidanceBox =
-    globalPreAccel.verify_state === "degraded" ||
-    (Boolean(securityGuidanceText) && !preaccelSummary.realWinDivertActive);
+    !preaccelSummary.realWinDivertActive &&
+    (Boolean(securityGuidanceText) || hasDistinctVerifyDetail);
   const verifyCheckedClock =
     typeof globalPreAccel.verify_checked_at_ms === "number" &&
     globalPreAccel.verify_checked_at_ms > 0
@@ -1877,7 +1882,7 @@ export function PreAccelPage() {
               </div>
             </div>
 
-            {/* 琥珀色环境指引提示框：仅在熔断降级或存在放行指引且底层拦截未运行时展示 */}
+            {/* 琥珀色环境指引提示框：仅在存在额外放行指引或与上方不重复的诊断明细，且底层拦截未运行时展示 */}
             {showSecurityGuidanceBox && (
               <div className="flex flex-wrap items-start justify-between gap-3 rounded-xl border border-[var(--amber)]/50 bg-[var(--amber-soft)]/55 px-3.5 py-2.5 text-xs">
                 <div className="flex min-w-0 flex-1 items-start gap-2">
@@ -1894,7 +1899,7 @@ export function PreAccelPage() {
                         </span>
                       ))}
                     </div>
-                    {verifyMessageText && (
+                    {hasDistinctVerifyDetail && verifyMessageText && (
                       <p className="text-[11px] leading-relaxed text-[var(--text)]">
                         {verifyMessageText}
                       </p>
@@ -1906,20 +1911,6 @@ export function PreAccelPage() {
                     )}
                   </div>
                 </div>
-
-                {showReprobeButton && (
-                  <button
-                    type="button"
-                    disabled={isProbingVerify}
-                    onClick={() => void handleVerifyGlobalPreAccel()}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-xl border border-[var(--amber)]/60 bg-[var(--card)] px-2.5 py-1 text-[11px] font-semibold text-[var(--amber)] transition-colors hover:border-[var(--amber)] hover:bg-[var(--amber-soft)]/70 disabled:opacity-60"
-                  >
-                    <RefreshCw
-                      className={`h-3 w-3 ${isProbingVerify ? "animate-spin" : ""}`}
-                    />
-                    <span>{isProbingVerify ? "探测中…" : "重新探测"}</span>
-                  </button>
-                )}
               </div>
             )}
 

@@ -3154,6 +3154,7 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
     if let Err(err) = clear_system_proxy_if_owned(state) {
         tracing::warn!("退出时清除系统代理失败：{err}");
     }
+    catcloud_core::core_adapter::remove_runtime_controller_meta(&state.paths.runtime_dir);
 }
 
 fn refresh_node_proxy_name_map(state: &AppState) {

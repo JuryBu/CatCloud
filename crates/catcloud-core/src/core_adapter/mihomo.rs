@@ -5,10 +5,11 @@ use crate::core_adapter::{
     format_http_base_url, percent_encode_path_segment,
 };
 use crate::error::{CatError, CatResult};
-use crate::models::{CoreKind, ProxyMode};
+use crate::models::{AppConfig, CoreKind, ProxyMode};
+use crate::paths::AppPaths;
 use crate::process_guard::JobGuard;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -32,6 +33,381 @@ const MAX_STARTUP_STDERR_TAIL_BYTES: usize = 4 * 1024;
 
 /// Filename under `working_dir` capturing Mihomo stderr without blocking pipes.
 const MIHOMO_STDERR_LOG_FILENAME: &str = "mihomo-stderr.log";
+
+/// Ephemeral runtime controller metadata written under `data/run/` while the managed core
+/// is active so sibling local CLI commands (`catcloud net doctor`, `net connections`,
+/// `config reload`) can authenticate against the running core without persisting ephemeral
+/// secrets into user `config.json`.
+pub const RUNTIME_CONTROLLER_META_FILENAME: &str = "runtime-controller.json";
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimeControllerMetadata {
+    host: String,
+    port: u16,
+    secret: String,
+    pid: Option<u32>,
+    #[serde(default)]
+    mixed_port: Option<u16>,
+    #[serde(default)]
+    dns_port: Option<u16>,
+    updated_at: String,
+}
+
+impl std::fmt::Debug for RuntimeControllerMetadata {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeControllerMetadata")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("secret", &"<REDACTED>")
+            .field("pid", &self.pid)
+            .field("mixed_port", &self.mixed_port)
+            .field("dns_port", &self.dns_port)
+            .field("updated_at", &self.updated_at)
+            .finish()
+    }
+}
+
+/// Resolved local controller endpoint and optional active shifted ports discovered from
+/// runtime metadata or `runtime.yaml`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ResolvedControllerEndpoint {
+    pub host: String,
+    pub port: u16,
+    pub secret: String,
+    pub mixed_port: Option<u16>,
+    pub dns_port: Option<u16>,
+}
+
+impl std::fmt::Debug for ResolvedControllerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedControllerEndpoint")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("secret", &"<REDACTED>")
+            .field("mixed_port", &self.mixed_port)
+            .field("dns_port", &self.dns_port)
+            .finish()
+    }
+}
+
+fn normalize_loopback_controller_host(host: &str) -> Option<&'static str> {
+    if host.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let unwrapped = if let Some(rest) = trimmed.strip_prefix('[') {
+        rest.strip_suffix(']')?
+    } else if trimmed.contains('[') || trimmed.contains(']') {
+        return None;
+    } else {
+        trimmed
+    };
+    match unwrapped.to_ascii_lowercase().as_str() {
+        "127.0.0.1" => Some("127.0.0.1"),
+        "localhost" => Some("localhost"),
+        "::1" => Some("::1"),
+        _ => None,
+    }
+}
+
+fn sanitize_runtime_secret(raw: &str) -> Option<String> {
+    if raw.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn is_runtime_controller_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+    let target = Pid::from_u32(pid);
+    let mut system = System::new_with_specifics(RefreshKind::nothing());
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[target]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
+    );
+    let Some(proc_info) = system.process(target) else {
+        return false;
+    };
+    let name = proc_info.name().to_string_lossy();
+    let cmdline: Vec<String> = proc_info
+        .cmd()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    if name.trim().is_empty() && proc_info.exe().is_none() && cmdline.is_empty() {
+        // Process exists (e.g. elevated Windows process queried from standard integrity)
+        // even if full metadata is restricted.
+        return true;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    crate::process_guard::is_managed_stale_process(&name, proc_info.exe(), &cmdline)
+}
+
+fn write_restricted_atomic_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(RUNTIME_CONTROLLER_META_FILENAME);
+        let tmp = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        if let Err(err) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+        drop(f);
+        if let Err(err) = std::fs::rename(&tmp, target) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        AppPaths::atomic_write(target, bytes).map_err(std::io::Error::other)
+    }
+}
+
+fn write_runtime_controller_meta(
+    working_dir: &Path,
+    host: &str,
+    port: u16,
+    secret: &str,
+    pid: Option<u32>,
+    mixed_port: Option<u16>,
+    dns_port: Option<u16>,
+) {
+    let Some(norm_host) = normalize_loopback_controller_host(host) else {
+        return;
+    };
+    let Some(clean_secret) = sanitize_runtime_secret(secret) else {
+        return;
+    };
+    if port == 0 {
+        return;
+    }
+    let meta = RuntimeControllerMetadata {
+        host: norm_host.to_string(),
+        port,
+        secret: clean_secret,
+        pid,
+        mixed_port: mixed_port.filter(|&p| p > 0),
+        dns_port: dns_port.filter(|&p| p > 0),
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    let Ok(bytes) = serde_json::to_vec(&meta) else {
+        return;
+    };
+    let target = working_dir.join(RUNTIME_CONTROLLER_META_FILENAME);
+    let _ = write_restricted_atomic_file(&target, &bytes);
+}
+
+/// Remove ephemeral `data/run/runtime-controller.json` when the core stops or exits.
+pub fn remove_runtime_controller_meta(working_dir: &Path) {
+    let target = working_dir.join(RUNTIME_CONTROLLER_META_FILENAME);
+    let _ = std::fs::remove_file(target);
+}
+
+fn parse_yaml_scalar_string(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(trimmed).ok()?;
+    match parsed {
+        serde_yaml_ng::Value::String(s) => sanitize_runtime_secret(&s),
+        serde_yaml_ng::Value::Number(n) => sanitize_runtime_secret(&n.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_yaml_port_u16(raw: &str) -> Option<u16> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(trimmed).ok()?;
+    parsed
+        .as_u64()
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|&p| p > 0)
+}
+
+fn parse_controller_host_port(addr: &str) -> Option<(String, u16)> {
+    let trimmed = addr.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_control()) {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, port_part) = rest.split_once("]:")?;
+        let norm_host = normalize_loopback_controller_host(host)?;
+        let port = port_part.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
+        return Some((norm_host.to_string(), port));
+    }
+    let (host, port_part) = trimmed.rsplit_once(':')?;
+    let norm_host = normalize_loopback_controller_host(host)?;
+    let port = port_part.trim().parse::<u16>().ok().filter(|&p| p > 0)?;
+    Some((norm_host.to_string(), port))
+}
+
+fn read_controller_endpoint_from_runtime_yaml(
+    runtime_yaml: &Path,
+) -> Option<ResolvedControllerEndpoint> {
+    let raw_text = std::fs::read_to_string(runtime_yaml).ok()?;
+    let text = raw_text.strip_prefix('\u{feff}').unwrap_or(&raw_text);
+    let mut host_port: Option<(String, u16)> = None;
+    let mut secret: Option<String> = None;
+    let mut mixed_port: Option<u16> = None;
+
+    for line in text.lines().take(512) {
+        if line.starts_with(' ') || line.starts_with('\t') || line.starts_with('#') {
+            continue;
+        }
+        let trimmed_key = line.trim_start();
+        if trimmed_key.starts_with("proxies:")
+            || trimmed_key.starts_with("proxy-groups:")
+            || trimmed_key.starts_with("rules:")
+        {
+            break;
+        }
+        if let Some(val) = line
+            .strip_prefix("external-controller:")
+            .or_else(|| line.strip_prefix("\"external-controller\":"))
+            .or_else(|| line.strip_prefix("'external-controller':"))
+        {
+            if let Some(scalar) = parse_yaml_scalar_string(val) {
+                host_port = parse_controller_host_port(&scalar);
+            }
+        } else if let Some(val) = line
+            .strip_prefix("secret:")
+            .or_else(|| line.strip_prefix("\"secret\":"))
+            .or_else(|| line.strip_prefix("'secret':"))
+        {
+            secret = parse_yaml_scalar_string(val);
+        } else if let Some(val) = line
+            .strip_prefix("mixed-port:")
+            .or_else(|| line.strip_prefix("\"mixed-port\":"))
+        {
+            mixed_port = parse_yaml_port_u16(val);
+        }
+    }
+
+    let (host, port) = host_port?;
+    let secret = secret?;
+    Some(ResolvedControllerEndpoint {
+        host,
+        port,
+        secret,
+        mixed_port,
+        dns_port: None,
+    })
+}
+
+/// Resolve the effective local Mihomo controller endpoint and shifted ports for local
+/// CLI/agent diagnostics and hot-reload.
+///
+/// Priority:
+/// 1. Live ephemeral `data/run/runtime-controller.json` written by the active managed core
+///    (verified loopback host, control-char-free secret, and PID alive when recorded; also
+///    tracks auto-shifted controller/mixed/DNS ports and live secret even if `config.json`
+///    was just edited prior to `catcloud config reload`).
+/// 2. Explicit non-empty `cfg.controller_secret` from `config.json` (preserving loopback
+///    host/port if static or external).
+/// 3. Fallback to top-level `external-controller` / `secret` in `data/run/runtime.yaml`
+///    (parsed via `serde_yaml_ng` for strict comment/quoting/escaping fidelity) for backward
+///    compatibility with already-running cores.
+/// 4. Configured `(cfg.controller_host, cfg.controller_port, "")`.
+///
+/// Only loopback hosts (`127.0.0.1`, `localhost`, `::1`) are accepted from runtime files,
+/// and callers must never echo the returned secret into redacted outputs or logs.
+pub fn resolve_effective_controller_endpoint_info(
+    paths: &AppPaths,
+    cfg: &AppConfig,
+) -> ResolvedControllerEndpoint {
+    let meta_path = paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME);
+    if let Ok(raw) = std::fs::read_to_string(&meta_path)
+        && let Ok(meta) = serde_json::from_str::<RuntimeControllerMetadata>(&raw)
+        && let Some(norm_host) = normalize_loopback_controller_host(&meta.host)
+        && meta.port > 0
+        && let Some(clean_secret) = sanitize_runtime_secret(&meta.secret)
+        && meta.pid.is_none_or(is_runtime_controller_pid_alive)
+    {
+        return ResolvedControllerEndpoint {
+            host: norm_host.to_string(),
+            port: meta.port,
+            secret: clean_secret,
+            mixed_port: meta.mixed_port.filter(|&p| p > 0),
+            dns_port: meta.dns_port.filter(|&p| p > 0),
+        };
+    }
+
+    if let Some(explicit) = cfg
+        .controller_secret
+        .as_deref()
+        .and_then(sanitize_runtime_secret)
+    {
+        return ResolvedControllerEndpoint {
+            host: cfg.controller_host.clone(),
+            port: cfg.controller_port,
+            secret: explicit,
+            mixed_port: None,
+            dns_port: None,
+        };
+    }
+
+    let runtime_yaml = paths.runtime_dir.join("runtime.yaml");
+    if let Some(from_yaml) = read_controller_endpoint_from_runtime_yaml(&runtime_yaml) {
+        return from_yaml;
+    }
+
+    ResolvedControllerEndpoint {
+        host: cfg.controller_host.clone(),
+        port: cfg.controller_port,
+        secret: String::new(),
+        mixed_port: None,
+        dns_port: None,
+    }
+}
+
+/// Convenience tuple wrapper around [`resolve_effective_controller_endpoint_info`].
+pub fn resolve_effective_controller_endpoint(
+    paths: &AppPaths,
+    cfg: &AppConfig,
+) -> (String, u16, String) {
+    let ep = resolve_effective_controller_endpoint_info(paths, cfg);
+    (ep.host, ep.port, ep.secret)
+}
 
 /// Generate a cryptographically secure 32-byte controller secret encoded as 64 lowercase hex chars.
 pub fn generate_controller_secret() -> String {
@@ -157,17 +533,25 @@ impl MihomoAdapter {
 
     /// Return whether either a managed child is alive or an external controller endpoint is bound.
     pub async fn has_live_controller(&self) -> bool {
-        let mut guard = self.state.lock().await;
-        if let Some(child) = guard.child.as_mut() {
-            match child.try_wait() {
-                Ok(None) => return true,
-                Ok(Some(_)) | Err(_) => {
-                    guard.child = None;
-                    guard.pid = None;
+        let mut stale_working_dir: Option<PathBuf> = None;
+        let alive = {
+            let mut guard = self.state.lock().await;
+            if let Some(child) = guard.child.as_mut() {
+                match child.try_wait() {
+                    Ok(None) => return true,
+                    Ok(Some(_)) | Err(_) => {
+                        guard.child = None;
+                        guard.pid = None;
+                        stale_working_dir = guard.working_dir.clone();
+                    }
                 }
             }
+            guard.external_endpoint_configured
+        };
+        if let Some(dir) = stale_working_dir.as_deref() {
+            remove_runtime_controller_meta(dir);
         }
-        guard.external_endpoint_configured
+        alive
     }
 
     /// Build a matching `MihomoStreamClient` targeting the active controller endpoint and secret.
@@ -200,8 +584,10 @@ impl MihomoAdapter {
         }
         std::fs::create_dir_all(&req.working_dir)?;
 
-        // Ensure any previous child process is cleanly terminated before spawning a new one.
+        // Ensure any previous child process and stale runtime metadata are cleanly cleared
+        // before spawning a new core instance.
         self.stop_process_unlocked().await?;
+        remove_runtime_controller_meta(&req.working_dir);
 
         let gomemlimit = req.config.resolve_gomemlimit(req.node_count, req.rule_count);
         let gogc = req.config.core_runtime.gogc.to_string();
@@ -299,6 +685,7 @@ impl MihomoAdapter {
                         if let Some(p) = exited_pid {
                             self.job_guard.unregister_pid(p);
                         }
+                        remove_runtime_controller_meta(&req.working_dir);
                         let stderr_tail = read_captured_stderr_tail(
                             &stderr_log_path,
                             stderr_captured,
@@ -360,6 +747,17 @@ impl MihomoAdapter {
             guard.version = Some(version);
         }
 
+        // Persist ephemeral loopback controller metadata for local CLI/agent diagnostics.
+        write_runtime_controller_meta(
+            &req.working_dir,
+            &req.controller_host,
+            req.allocated_ports.controller_port,
+            &req.controller_secret,
+            pid,
+            Some(req.allocated_ports.mixed_port),
+            Some(req.allocated_ports.dns_port),
+        );
+
         // Replay persisted `select` group selections immediately after startup.
         let base_url =
             format_http_base_url(&req.controller_host, req.allocated_ports.controller_port);
@@ -379,12 +777,13 @@ impl MihomoAdapter {
     }
 
     async fn stop_process_unlocked(&self) -> CatResult<()> {
-        let (maybe_child, old_pid) = {
+        let (maybe_child, old_pid, working_dir) = {
             let mut guard = self.state.lock().await;
             let pid = guard.pid.take();
+            let working_dir = guard.working_dir.clone();
             guard.started_at = None;
             guard.started_instant = None;
-            (guard.child.take(), pid)
+            (guard.child.take(), pid, working_dir)
         };
 
         if let Some(mut child) = maybe_child {
@@ -394,12 +793,16 @@ impl MihomoAdapter {
         if let Some(p) = old_pid {
             self.job_guard.unregister_pid(p);
         }
+        if let Some(dir) = working_dir.as_deref() {
+            remove_runtime_controller_meta(dir);
+        }
         Ok(())
     }
 
     /// Build a thread-safe runtime status snapshot.
     pub async fn runtime_status(&self) -> CoreRuntimeStatus {
         let mut guard = self.state.lock().await;
+        let mut stale_working_dir: Option<PathBuf> = None;
         let running = if let Some(child) = guard.child.as_mut() {
             match child.try_wait() {
                 Ok(None) => true,
@@ -407,12 +810,16 @@ impl MihomoAdapter {
                     guard.child = None;
                     guard.pid = None;
                     guard.started_instant = None;
+                    stale_working_dir = guard.working_dir.clone();
                     false
                 }
             }
         } else {
             guard.external_endpoint_configured
         };
+        if let Some(dir) = stale_working_dir.as_deref() {
+            remove_runtime_controller_meta(dir);
+        }
 
         let uptime_sec = if running {
             guard
@@ -509,8 +916,35 @@ impl MihomoAdapter {
             .unwrap_or(current_secret.as_str())
             .to_string();
         if effective_secret != current_secret {
-            let mut guard = self.state.lock().await;
-            guard.controller_secret = effective_secret.clone();
+            let meta_refresh = {
+                let mut guard = self.state.lock().await;
+                guard.controller_secret = effective_secret.clone();
+                if guard.child.is_some() {
+                    guard.working_dir.clone().map(|dir| {
+                        (
+                            dir,
+                            guard.controller_host.clone(),
+                            guard.controller_port,
+                            guard.pid,
+                            guard.mixed_port,
+                            guard.dns_listen_port,
+                        )
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some((dir, host, port, pid, mixed_port, dns_port)) = meta_refresh {
+                write_runtime_controller_meta(
+                    &dir,
+                    &host,
+                    port,
+                    &effective_secret,
+                    pid,
+                    Some(mixed_port),
+                    Some(dns_port),
+                );
+            }
         }
 
         let selections_to_replay = if active_selections.is_empty() {
@@ -611,11 +1045,18 @@ impl MihomoAdapter {
 
         let status = resp.status();
         if !status.is_success() {
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(CatError::Core(format!(
+                    "GET /connections failed with HTTP {}: Unauthorized",
+                    status.as_u16()
+                )));
+            }
             let body = resp.text().await.unwrap_or_default();
+            let capped: String = body.trim().chars().take(512).collect();
             return Err(CatError::Core(format!(
                 "GET /connections failed with HTTP {}: {}",
                 status.as_u16(),
-                body.trim()
+                capped
             )));
         }
 
@@ -763,11 +1204,18 @@ impl MihomoAdapter {
 
         let status = resp.status();
         if !status.is_success() {
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(CatError::Core(format!(
+                    "GET /version failed with HTTP {}: Unauthorized",
+                    status.as_u16()
+                )));
+            }
             let body = resp.text().await.unwrap_or_default();
+            let capped: String = body.trim().chars().take(512).collect();
             return Err(CatError::Core(format!(
                 "GET /version failed with HTTP {}: {}",
                 status.as_u16(),
-                body.trim()
+                capped
             )));
         }
 
@@ -1462,5 +1910,127 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_effective_controller_endpoint_prefers_live_meta_then_explicit_then_runtime_yaml() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-ctrl-meta-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.clone(), true).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.controller_host = "127.0.0.1".to_string();
+        cfg.controller_port = 29090;
+        cfg.controller_secret = None;
+
+        // 1. No runtime files -> configured host/port with empty secret.
+        assert_eq!(
+            resolve_effective_controller_endpoint(&paths, &cfg),
+            ("127.0.0.1".to_string(), 29090, String::new())
+        );
+
+        // 2. Fallback to runtime.yaml with BOM, inline `#` comments, quoted escapes, and IPv6.
+        let yaml = "\u{feff}mixed-port: 27891 # shifted mixed\nexternal-controller: \"[::1]:29091\" # local api\nsecret: \"yaml_sec\\\"ret_123\" # comment\nproxies:\n  - name: demo\n";
+        std::fs::write(paths.runtime_dir.join("runtime.yaml"), yaml).unwrap();
+        let from_yaml = resolve_effective_controller_endpoint_info(&paths, &cfg);
+        assert_eq!(from_yaml.host, "::1");
+        assert_eq!(from_yaml.port, 29091);
+        assert_eq!(from_yaml.secret, "yaml_sec\"ret_123");
+        assert_eq!(from_yaml.mixed_port, Some(27891));
+
+        // 3. Explicit config.json secret takes precedence over runtime.yaml when no live meta exists.
+        cfg.controller_secret = Some("explicit_secret_789".to_string());
+        assert_eq!(
+            resolve_effective_controller_endpoint(&paths, &cfg),
+            ("127.0.0.1".to_string(), 29090, "explicit_secret_789".to_string())
+        );
+
+        // 4. Live runtime-controller.json (current alive PID) takes highest priority,
+        //    preserving shifted ports and live secret even when config.json was just edited.
+        write_runtime_controller_meta(
+            &paths.runtime_dir,
+            "127.0.0.1",
+            29092,
+            "meta_secret_456",
+            Some(std::process::id()),
+            Some(27892),
+            Some(21054),
+        );
+        let live = resolve_effective_controller_endpoint_info(&paths, &cfg);
+        assert_eq!(live.host, "127.0.0.1");
+        assert_eq!(live.port, 29092);
+        assert_eq!(live.secret, "meta_secret_456");
+        assert_eq!(live.mixed_port, Some(27892));
+        assert_eq!(live.dns_port, Some(21054));
+        // Redacted Debug output must never leak plaintext secret.
+        assert!(!format!("{live:?}").contains("meta_secret_456"));
+
+        // 5. Dead/non-existent PID in runtime-controller.json is ignored as stale.
+        write_runtime_controller_meta(
+            &paths.runtime_dir,
+            "127.0.0.1",
+            29099,
+            "stale_dead_secret",
+            Some(u32::MAX - 3),
+            Some(27899),
+            None,
+        );
+        assert_eq!(
+            resolve_effective_controller_endpoint(&paths, &cfg),
+            ("127.0.0.1".to_string(), 29090, "explicit_secret_789".to_string())
+        );
+
+        // 6. Removing runtime-controller.json falls back cleanly to runtime.yaml when explicit is None.
+        cfg.controller_secret = None;
+        remove_runtime_controller_meta(&paths.runtime_dir);
+        assert!(!paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME).exists());
+        assert_eq!(
+            resolve_effective_controller_endpoint(&paths, &cfg),
+            ("::1".to_string(), 29091, "yaml_sec\"ret_123".to_string())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolve_effective_controller_endpoint_rejects_non_loopback_and_control_chars() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-ctrl-loopback-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.clone(), true).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.controller_host = "127.0.0.1".to_string();
+        cfg.controller_port = 29090;
+        cfg.controller_secret = None;
+
+        // Non-loopback and control-char inputs must never be written or trusted.
+        write_runtime_controller_meta(
+            &paths.runtime_dir,
+            "0.0.0.0",
+            29090,
+            "bad_secret",
+            None,
+            None,
+            None,
+        );
+        assert!(!paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME).exists());
+        std::fs::write(
+            paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME),
+            r#"{"host":"\n127.0.0.1","port":29090,"secret":"bad\r\nsecret","pid":null,"updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.runtime_dir.join("runtime.yaml"),
+            "external-controller: 0.0.0.0:29090\nsecret: evil_yaml\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_effective_controller_endpoint(&paths, &cfg),
+            ("127.0.0.1".to_string(), 29090, String::new())
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
