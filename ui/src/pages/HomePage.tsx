@@ -20,6 +20,7 @@ import {
   PictureInPicture2,
   Plus,
   Power,
+  QrCode,
   RefreshCw,
   RotateCcw,
   Search,
@@ -45,6 +46,7 @@ import {
   formatErrorMessage,
 } from "../api/tauri";
 import { type MascotState, MascotSprite } from "../components/MascotSprite";
+import { ShareBundleModal } from "../components/ShareBundleModal";
 import { TrafficSparkline, formatBytes, formatRate } from "../components/TrafficSparkline";
 import { normalizeUiLanguage, useUiDict } from "../i18n";
 import {
@@ -510,6 +512,7 @@ export function HomePage() {
   const [newSiteUrl, setNewSiteUrl] = useState("");
   const [pendingRemoveSite, setPendingRemoveSite] = useState<SiteCheckItem | null>(null);
   const [removingSite, setRemovingSite] = useState(false);
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
 
   const nodeDropdownRef = useRef<HTMLDivElement | null>(null);
   const nodeSearchInputRef = useRef<HTMLInputElement | null>(null);
@@ -1155,6 +1158,15 @@ export function HomePage() {
               >
                 <Link2 className="h-3.5 w-3.5 shrink-0" />
                 <span>{dict.home.emptyStepImport}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setSyncModalOpen(true)}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+              >
+                <QrCode className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                <span>{dict.sync.emptyCardStep}</span>
               </button>
 
               <button
@@ -2319,6 +2331,14 @@ export function HomePage() {
           </div>,
           document.body
         )}
+
+      <ShareBundleModal
+        open={syncModalOpen}
+        mode="import"
+        initialTransport="listen_qr"
+        allowModeSwitch
+        onClose={() => setSyncModalOpen(false)}
+      />
     </div>
   );
 }

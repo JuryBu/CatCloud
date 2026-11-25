@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">猫猫云梯</string>
+    <string name="vpn_notification_channel_name">猫猫云梯连接状态</string>
+    <string name="vpn_notification_channel_desc">用于保持代理隧道在后台稳定运行</string>
+    <string name="vpn_notification_title_running">猫猫云梯已连接</string>
+    <string name="vpn_notification_title_starting">正在启动猫猫云梯…</string>
+    <string name="vpn_notification_action_stop">断开连接</string>
+</resources>

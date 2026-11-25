@@ -13,6 +13,7 @@ pub mod share_bundle;
 pub mod storage;
 pub mod strategy;
 pub mod subscription;
+pub mod sync;
 pub mod updater;
 
 pub use error::{CatError, CatResult};

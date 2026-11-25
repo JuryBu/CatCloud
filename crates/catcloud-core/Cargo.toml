@@ -17,6 +17,7 @@ rusqlite.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
 sha2.workspace = true
+ring.workspace = true
 hex.workspace = true
 zip.workspace = true
 notify.workspace = true

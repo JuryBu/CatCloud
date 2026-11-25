@@ -40,7 +40,18 @@ use catcloud_core::sanitize::{
     redact_relay_for_readonly, sanitize_log_line,
 };
 use catcloud_core::share_bundle::{
-    ShareBundleExportRequest, export_share_bundle_zip_file, preview_share_bundle_zip_file,
+    ShareBundleExportRequest, ShareBundlePreview, ShareGroupsBundle, build_share_groups_bundle,
+    export_share_bundle_zip_bytes_with_groups, export_share_bundle_zip_file,
+    merge_imported_groups_into_storage, preview_share_bundle_zip_bytes,
+    preview_share_bundle_zip_file,
+};
+use catcloud_core::sync::{
+    KDF_MODE_PBKDF2_SHA256, KDF_MODE_RAW_KEY, KEY_LEN, LanSyncReceiveServer, LanSyncSendServer,
+    LanSyncServerOptions, MAX_SYNC_ENVELOPE_BYTES, SyncRole, SyncUri, decode_base64_flex,
+    fetch_relay_url_bundle, fetch_sync_bundle_via_pin, fetch_sync_bundle_via_uri, format_sync_uri,
+    generate_random_key, generate_session_id, inspect_envelope_header, open_with_key,
+    open_with_password, parse_sync_uri, plaintext_fingerprint, push_sync_bundle_via_pin,
+    push_sync_bundle_via_uri, render_qr_terminal, seal_with_key,
 };
 use catcloud_core::storage::{Storage, SubscriptionUpdateMode};
 use catcloud_core::strategy::arbiter::{ArbiterGroupMemory, decide_group_action};
@@ -235,9 +246,138 @@ pub enum ShareCommand {
         /// Path to .zip share bundle (flag form)
         #[arg(long = "file", conflicts_with = "file_pos")]
         file: Option<PathBuf>,
+        /// Output compact summary (counts, top regions, protocols, and up to 5 sanitized samples)
+        #[arg(long)]
+        summary: bool,
     },
     /// Preview (default --dry-run) or apply import of a catcloud-share/v1 .zip share bundle
     Import(ShareImportArgs),
+    /// Start an E2EE LAN sync sender, push to a receiver, or export an encrypted .ccsync file
+    Send(ShareSendArgs),
+    /// Receive an E2EE sync bundle via URI, LAN PIN, .ccsync file, or LAN listener (default --dry-run)
+    Receive(ShareReceiveArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ShareSendArgs {
+    #[arg(long, default_value = "CatCloud Share Bundle")]
+    pub name: String,
+    #[arg(long)]
+    pub description: Option<String>,
+    /// Comma-separated proxy node IDs to sync
+    #[arg(long = "node-ids", alias = "nodes")]
+    pub node_ids: Option<String>,
+    /// Sync all nodes belonging to this subscription ID
+    #[arg(long = "sub-id", alias = "sub")]
+    pub sub_id: Option<String>,
+    /// Sync all configured proxy nodes
+    #[arg(long)]
+    pub all_nodes: bool,
+    /// Comma-separated domestic pre-acceleration relay IDs to sync
+    #[arg(long = "relay-ids", alias = "relays")]
+    pub relay_ids: Option<String>,
+    /// Sync all configured domestic pre-acceleration relays
+    #[arg(long)]
+    pub all_relays: bool,
+    /// Exclude portable smart multi-groups (groups.json) from the sync bundle
+    #[arg(long)]
+    pub no_groups: bool,
+    /// Optional custom reachable endpoint URL (e.g. Tailscale/FRP/reverse proxy)
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    /// Bind host for LAN send listener
+    #[arg(long, default_value = "0.0.0.0")]
+    pub bind: String,
+    /// Bind port for LAN send listener (0 = OS ephemeral port)
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Session TTL in seconds (clamped to 30..=900)
+    #[arg(long, default_value_t = 180)]
+    pub ttl: u64,
+    /// Keep listener alive across multiple transfers instead of one-shot auto-destruct
+    #[arg(long)]
+    pub allow_multiple: bool,
+    /// Push directly to a receiver's catcloud://sync/v1?role=push...#k=... URI
+    #[arg(long)]
+    pub push_uri: Option<String>,
+    /// Push directly to a receiver's LAN address (host:port or http://...) paired with --pin
+    #[arg(long)]
+    pub push_addr: Option<String>,
+    /// 6-digit PIN code paired with --push-addr
+    #[arg(long)]
+    pub pin: Option<String>,
+    /// Export an offline E2EE .ccsync file and emit its file_key URI instead of starting LAN HTTP
+    #[arg(long = "ccsync-output", alias = "output")]
+    pub ccsync_output: Option<PathBuf>,
+    /// Suppress ASCII QR rendering in human-readable mode
+    #[arg(long)]
+    pub no_qr: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ShareReceiveArgs {
+    /// Positional sync URI (catcloud://sync/v1?...#k=...) or LAN address
+    pub source: Option<String>,
+    /// Explicit sync URI (role=pull or role=relay_url)
+    #[arg(long, conflicts_with = "source")]
+    pub uri: Option<String>,
+    /// Sender LAN address (ip:port or http://...) paired with --pin
+    #[arg(long)]
+    pub addr: Option<String>,
+    /// 6-digit PIN code paired with --addr
+    #[arg(long)]
+    pub pin: Option<String>,
+    /// Path to an offline E2EE .ccsync file
+    #[arg(long)]
+    pub ccsync: Option<PathBuf>,
+    /// Decryption key (catcloud://sync/v1?role=file_key...#k=... or 32-byte Base64) for --ccsync
+    #[arg(long)]
+    pub key: Option<String>,
+    /// Password for PBKDF2-encrypted --ccsync files
+    #[arg(long)]
+    pub password: Option<String>,
+    /// Start a local LAN receiver listener and wait for one incoming encrypted push
+    #[arg(long)]
+    pub listen: bool,
+    /// Bind host when --listen is enabled
+    #[arg(long, default_value = "0.0.0.0")]
+    pub bind: String,
+    /// Bind port when --listen is enabled (0 = OS ephemeral port)
+    #[arg(long, default_value_t = 0)]
+    pub port: u16,
+    /// Optional custom reachable endpoint URL embedded in listener QR URI
+    #[arg(long)]
+    pub endpoint: Option<String>,
+    /// Listener TTL in seconds when --listen is enabled (clamped to 30..=900)
+    #[arg(long, default_value_t = 180)]
+    pub ttl: u64,
+    /// Suppress ASCII QR rendering when --listen is enabled
+    #[arg(long)]
+    pub no_qr: bool,
+    /// Safe sanitized preview without mutating storage (default unless --apply is set)
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Persist received nodes, relays, and groups into local CatCloud storage
+    #[arg(long)]
+    pub apply: bool,
+    /// Update an existing subscription group instead of creating a new one
+    #[arg(long)]
+    pub target_sub: Option<String>,
+    /// Custom subscription group name
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Update strategy for --target-sub: replace|merge (aliases: replace_latest|merge_dedup)
+    #[arg(long, default_value = "merge")]
+    pub mode: String,
+    /// Skip importing proxy nodes
+    #[arg(long)]
+    pub no_nodes: bool,
+    /// Skip importing domestic pre-acceleration relays
+    #[arg(long)]
+    pub no_relays: bool,
+    /// Skip merging portable smart multi-groups (groups.json)
+    #[arg(long)]
+    pub no_groups: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1372,6 +1512,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "dry_run": false,
                     "executed": true,
                     "tier": &args.tier,
+                    "speed_unit": "Mbps",
                     "binary_path": &display_binary_path,
                     "used_preaccel": active_relay.is_some(),
                     "preaccel_relay_name": active_relay.as_ref().map(|r| &r.name),
@@ -1387,7 +1528,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     as_json,
                     &out,
                     &format!(
-                        "Executed isolated probe funnel ({} tier): {}/{} node(s) healthy, {} result(s) saved to SQLite.",
+                        "Executed isolated probe funnel ({} tier, speed unit: Mbps): {}/{} node(s) healthy, {} result(s) saved to SQLite.",
                         args.tier,
                         passed_nodes,
                         nodes.len(),
@@ -1598,18 +1739,30 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let out = json!({
                     "ok": true,
                     "sanitized": !reveal_secrets,
+                    "speed_unit": "Mbps",
                     "count": items.len(),
                     "relays": items
                 });
-                emit_output(
-                    as_json,
-                    &out,
-                    &format!(
-                        "Domestic pre-acceleration pool has {} relay(s) (sanitized={}).",
-                        items.len(),
-                        !reveal_secrets
-                    ),
-                )
+                let mut lines = vec![format!(
+                    "Domestic pre-acceleration pool has {} relay(s) (sanitized={}, speed unit: Mbps).",
+                    items.len(),
+                    !reveal_secrets
+                )];
+                for r in &relays {
+                    if r.last_up_mbps.is_some() || r.last_down_mbps.is_some() || r.last_mbps.is_some() {
+                        let up = r
+                            .last_up_mbps
+                            .map(|v| format!("{v:.2} Mbps"))
+                            .unwrap_or_else(|| "--".to_string());
+                        let down = r
+                            .last_down_mbps
+                            .or(r.last_mbps)
+                            .map(|v| format!("{v:.2} Mbps"))
+                            .unwrap_or_else(|| "--".to_string());
+                        lines.push(format!("- {} ({}): up={up} | down={down}", r.name, r.id));
+                    }
+                }
+                emit_output(as_json, &out, &lines.join("\n"))
             }
 
             PreaccelCommand::Bind {
@@ -1894,6 +2047,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let speed_test = json!({
                     "executed": true,
                     "mode": mode_label,
+                    "speed_unit": "Mbps",
                     "binary_path": redact_path_for_display(&mihomo_bin.to_string_lossy()),
                     "reference_node": reference_node.as_ref().map(|n| json!({
                         "id": n.id,
@@ -1909,6 +2063,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let out = json!({
                     "ok": true,
                     "sanitized": true,
+                    "speed_unit": "Mbps",
                     "active": plan.active,
                     "relay_count": plan.ordered_relay_ids.len(),
                     "dialer_wrapped_nodes": plan.dialer_node_ids.len(),
@@ -1921,12 +2076,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 });
                 let header = match &reference_node {
                     Some(n) => format!(
-                        "Pre-acceleration speed test ({mode_label} via `{}`): {passed_count}/{} relay(s) passed.",
+                        "Pre-acceleration speed test ({mode_label} via `{}`, unit: Mbps): {passed_count}/{} relay(s) passed.",
                         n.name,
                         speed_results.len()
                     ),
                     None => format!(
-                        "Pre-acceleration speed test ({mode_label}): {passed_count}/{} relay(s) passed.",
+                        "Pre-acceleration speed test ({mode_label}, unit: Mbps): {passed_count}/{} relay(s) passed.",
                         speed_results.len()
                     ),
                 };
@@ -2583,13 +2738,19 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
 
         Commands::Share { action } => match action {
             ShareCommand::Export(args) => handle_share_export(paths, as_json, args),
-            ShareCommand::Inspect { file_pos, file } => {
+            ShareCommand::Inspect {
+                file_pos,
+                file,
+                summary,
+            } => {
                 let target = file_pos
                     .or(file)
                     .context("please provide a .zip share bundle path")?;
-                handle_share_inspect(as_json, &target)
+                handle_share_inspect(as_json, &target, summary)
             }
             ShareCommand::Import(args) => handle_share_import(paths, as_json, args),
+            ShareCommand::Send(args) => handle_share_send(paths, as_json, args).await,
+            ShareCommand::Receive(args) => handle_share_receive(paths, as_json, args).await,
         },
 
         Commands::Update { action } => match action {
@@ -3241,8 +3402,157 @@ fn handle_share_export(paths: &AppPaths, as_json: bool, args: ShareExportArgs) -
     )
 }
 
-fn handle_share_inspect(as_json: bool, file: &Path) -> Result<()> {
+fn build_share_inspect_payload(file: &Path, summary: bool) -> Result<(Value, String)> {
     let preview = preview_share_bundle_zip_file(file)?;
+    let warnings: Vec<String> = preview
+        .warnings
+        .iter()
+        .map(|w| sanitize_log_line(w))
+        .collect();
+    let display_file = redact_path_for_display(&file.to_string_lossy());
+    let group_count = preview
+        .groups_bundle
+        .as_ref()
+        .map_or(0, |gb| gb.groups.len());
+
+    if summary {
+        let mut region_counts: HashMap<String, usize> = HashMap::new();
+        let mut protocol_counts: HashMap<String, usize> = HashMap::new();
+        for node in &preview.nodes {
+            let region = {
+                let trimmed = node.region_code.trim();
+                if trimmed.is_empty() {
+                    "UNKNOWN".to_string()
+                } else {
+                    trimmed.to_ascii_uppercase()
+                }
+            };
+            *region_counts.entry(region).or_insert(0) += 1;
+            let proto = {
+                let trimmed = node.protocol.trim();
+                if trimmed.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    trimmed.to_ascii_lowercase()
+                }
+            };
+            *protocol_counts.entry(proto).or_insert(0) += 1;
+        }
+
+        let mut top_regions: Vec<(String, usize)> = region_counts.into_iter().collect();
+        top_regions.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        top_regions.truncate(12);
+
+        let mut protocols: Vec<(String, usize)> = protocol_counts.into_iter().collect();
+        protocols.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let sample_nodes: Vec<Value> = preview
+            .nodes
+            .iter()
+            .take(5)
+            .map(|n| {
+                let safe = redact_node_for_readonly(n);
+                json!({
+                    "name": safe.name,
+                    "protocol": safe.protocol,
+                    "region_code": safe.region_code,
+                    "server": safe.server,
+                    "port": safe.port,
+                    "multiplier": safe.multiplier,
+                    "is_443_native": safe.is_443_native,
+                })
+            })
+            .collect();
+        let sample_relays: Vec<Value> = preview
+            .relays
+            .iter()
+            .take(5)
+            .map(|r| {
+                let safe = redact_relay_for_readonly(r);
+                json!({
+                    "id": safe.id,
+                    "name": safe.name,
+                    "provider": safe.provider,
+                    "region": safe.region,
+                    "protocol": safe.protocol,
+                    "server": safe.server,
+                    "port": safe.port,
+                    "enabled": safe.enabled,
+                })
+            })
+            .collect();
+        let group_summaries: Vec<Value> = preview
+            .groups_bundle
+            .as_ref()
+            .map(|gb| {
+                gb.groups
+                    .iter()
+                    .take(20)
+                    .map(|g| {
+                        json!({
+                            "name": g.name,
+                            "mode": g.mode,
+                            "member_count": g.member_fingerprints.len(),
+                            "has_dynamic_filter": g.dynamic_filter.is_some(),
+                            "independent_routing": g.independent_routing,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let warnings_total = warnings.len();
+        let truncated_warnings: Vec<String> = warnings.into_iter().take(20).collect();
+
+        let out = json!({
+            "ok": true,
+            "sanitized": true,
+            "summary_mode": true,
+            "file": &display_file,
+            "manifest": &preview.manifest,
+            "has_readme": preview.has_readme,
+            "node_count": preview.nodes.len(),
+            "relay_count": preview.relays.len(),
+            "group_count": group_count,
+            "region_distribution": top_regions
+                .iter()
+                .map(|(region, count)| json!({ "region": region, "count": count }))
+                .collect::<Vec<_>>(),
+            "protocol_distribution": protocols
+                .iter()
+                .map(|(protocol, count)| json!({ "protocol": protocol, "count": count }))
+                .collect::<Vec<_>>(),
+            "sample_nodes": sample_nodes,
+            "sample_relays": sample_relays,
+            "groups": group_summaries,
+            "warnings_total": warnings_total,
+            "warnings": truncated_warnings,
+        });
+        let region_brief = top_regions
+            .iter()
+            .take(5)
+            .map(|(r, c)| format!("{r}:{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let proto_brief = protocols
+            .iter()
+            .take(5)
+            .map(|(p, c)| format!("{p}:{c}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let human = format!(
+            "Share bundle summary `{}` ({}): {} node(s), {} relay(s), {} group(s) | top_regions=[{}] | protocols=[{}] (sanitized, <=5 samples).",
+            preview.manifest.name,
+            preview.manifest.schema,
+            preview.nodes.len(),
+            preview.relays.len(),
+            group_count,
+            region_brief,
+            proto_brief,
+        );
+        return Ok((out, human));
+    }
+
     let redacted_nodes: Vec<ProxyNode> = preview
         .nodes
         .iter()
@@ -3253,35 +3563,35 @@ fn handle_share_inspect(as_json: bool, file: &Path) -> Result<()> {
         .iter()
         .map(redact_relay_for_readonly)
         .collect();
-    let warnings: Vec<String> = preview
-        .warnings
-        .iter()
-        .map(|w| sanitize_log_line(w))
-        .collect();
-    let display_file = redact_path_for_display(&file.to_string_lossy());
     let out = json!({
         "ok": true,
         "sanitized": true,
+        "summary_mode": false,
         "file": &display_file,
         "manifest": &preview.manifest,
         "has_readme": preview.has_readme,
         "node_count": redacted_nodes.len(),
         "relay_count": redacted_relays.len(),
+        "group_count": group_count,
         "nodes": redacted_nodes,
         "relays": redacted_relays,
+        "groups_bundle": &preview.groups_bundle,
         "warnings": warnings,
     });
-    emit_output(
-        as_json,
-        &out,
-        &format!(
-            "Inspected share bundle `{}` ({}): {} node(s), {} relay(s) (sanitized).",
-            preview.manifest.name,
-            preview.manifest.schema,
-            preview.nodes.len(),
-            preview.relays.len()
-        ),
-    )
+    let human = format!(
+        "Inspected share bundle `{}` ({}): {} node(s), {} relay(s), {} group(s) (sanitized).",
+        preview.manifest.name,
+        preview.manifest.schema,
+        preview.nodes.len(),
+        preview.relays.len(),
+        group_count,
+    );
+    Ok((out, human))
+}
+
+fn handle_share_inspect(as_json: bool, file: &Path, summary: bool) -> Result<()> {
+    let (out, human) = build_share_inspect_payload(file, summary)?;
+    emit_output(as_json, &out, &human)
 }
 
 fn execute_share_import(paths: &AppPaths, args: ShareImportArgs) -> Result<(Value, String)> {
@@ -3322,6 +3632,14 @@ fn execute_share_import(paths: &AppPaths, args: ShareImportArgs) -> Result<(Valu
             .iter()
             .map(redact_relay_for_readonly)
             .collect();
+        let would_import_groups = if args.no_nodes {
+            0
+        } else {
+            preview
+                .groups_bundle
+                .as_ref()
+                .map_or(0, |gb| gb.groups.len())
+        };
         let out = json!({
             "ok": true,
             "sanitized": true,
@@ -3333,6 +3651,7 @@ fn execute_share_import(paths: &AppPaths, args: ShareImportArgs) -> Result<(Valu
             "mode": update_mode,
             "would_import_nodes": redacted_nodes.len(),
             "would_import_relays": redacted_relays.len(),
+            "would_import_groups": would_import_groups,
             "nodes": redacted_nodes,
             "relays": redacted_relays,
             "warnings": warnings,
@@ -3416,6 +3735,22 @@ fn execute_share_import(paths: &AppPaths, args: ShareImportArgs) -> Result<(Valu
         0
     };
 
+    let imported_groups_count = if !args.no_nodes {
+        if let Some(ref gb) = preview.groups_bundle {
+            let (count, group_warnings) = merge_imported_groups_into_storage(&db, gb)?;
+            warnings.extend(
+                group_warnings
+                    .into_iter()
+                    .map(|w| sanitize_multiline_text(&w)),
+            );
+            count
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
     let out = json!({
         "ok": true,
         "sanitized": true,
@@ -3428,18 +3763,704 @@ fn execute_share_import(paths: &AppPaths, args: ShareImportArgs) -> Result<(Valu
         "imported_nodes": imported_nodes_count,
         "target_sub_total_nodes": target_sub_total_nodes,
         "imported_relays": imported_relays_count,
+        "imported_groups": imported_groups_count,
         "node_update": node_update_result,
         "warnings": warnings,
     });
     let human = format!(
-        "Imported share bundle `{}`: {} node(s), {} relay(s).",
-        preview.manifest.name, imported_nodes_count, imported_relays_count
+        "Imported share bundle `{}`: {} node(s), {} relay(s), {} group(s).",
+        preview.manifest.name, imported_nodes_count, imported_relays_count, imported_groups_count
     );
     Ok((out, human))
 }
 
 fn handle_share_import(paths: &AppPaths, as_json: bool, args: ShareImportArgs) -> Result<()> {
     let (out, human) = execute_share_import(paths, args)?;
+    emit_output(as_json, &out, &human)
+}
+
+fn build_cli_sync_export_zip(
+    paths: &AppPaths,
+    args: &ShareSendArgs,
+) -> Result<(Vec<u8>, catcloud_core::share_bundle::ShareBundleManifest, usize)> {
+    let db = open_storage(paths)?;
+    let explicit_node_ids = parse_csv_ids(args.node_ids.as_deref());
+    let explicit_relay_ids = parse_csv_ids(args.relay_ids.as_deref());
+
+    let selected_nodes: Vec<ProxyNode> = if args.all_nodes {
+        db.list_nodes()?
+    } else if let Some(ref sub_id) = args.sub_id {
+        let sub_nodes = db.query_nodes(&NodeFilter {
+            sub_ids: Some(vec![sub_id.clone()]),
+            ..NodeFilter::default()
+        })?;
+        if explicit_node_ids.is_empty() {
+            sub_nodes
+        } else {
+            let wanted: HashSet<&str> = explicit_node_ids.iter().map(String::as_str).collect();
+            sub_nodes
+                .into_iter()
+                .filter(|n| wanted.contains(n.id.as_str()))
+                .collect()
+        }
+    } else if !explicit_node_ids.is_empty() {
+        let all_nodes = db.list_nodes()?;
+        let by_id: HashMap<&str, &ProxyNode> =
+            all_nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+        let mut missing = Vec::new();
+        let mut chosen = Vec::with_capacity(explicit_node_ids.len());
+        for nid in &explicit_node_ids {
+            if let Some(node) = by_id.get(nid.as_str()) {
+                chosen.push((*node).clone());
+            } else {
+                missing.push(nid.clone());
+            }
+        }
+        if !missing.is_empty() {
+            anyhow::bail!("node ID(s) not found: {}", missing.join(", "));
+        }
+        chosen
+    } else {
+        Vec::new()
+    };
+
+    let selected_relays: Vec<PreAccelRelay> = if args.all_relays {
+        db.list_preaccel_relays(false)?
+    } else if !explicit_relay_ids.is_empty() {
+        let all_relays = db.list_preaccel_relays(false)?;
+        let by_id: HashMap<&str, &PreAccelRelay> =
+            all_relays.iter().map(|r| (r.id.as_str(), r)).collect();
+        let mut missing = Vec::new();
+        let mut chosen = Vec::with_capacity(explicit_relay_ids.len());
+        for rid in &explicit_relay_ids {
+            if let Some(relay) = by_id.get(rid.as_str()) {
+                chosen.push((*relay).clone());
+            } else {
+                missing.push(rid.clone());
+            }
+        }
+        if !missing.is_empty() {
+            anyhow::bail!("relay ID(s) not found: {}", missing.join(", "));
+        }
+        chosen
+    } else {
+        Vec::new()
+    };
+
+    if selected_nodes.is_empty() && selected_relays.is_empty() {
+        anyhow::bail!(
+            "please select at least 1 node or relay via --all-nodes, --sub-id, --node-ids, --all-relays, or --relay-ids"
+        );
+    }
+
+    let groups_bundle: Option<ShareGroupsBundle> = if args.no_groups {
+        None
+    } else {
+        let all_groups = db.list_multi_groups()?;
+        if all_groups.is_empty() {
+            None
+        } else {
+            let cfg = config::load_or_default(paths).unwrap_or_default();
+            let built = build_share_groups_bundle(
+                &all_groups,
+                &selected_nodes,
+                cfg.active_group_id.as_deref(),
+                Some(cfg.route_mode.as_str()),
+            );
+            if built.groups.is_empty() {
+                None
+            } else {
+                Some(built)
+            }
+        }
+    };
+    let group_count = groups_bundle.as_ref().map_or(0, |g| g.groups.len());
+
+    let req = ShareBundleExportRequest {
+        name: args.name.clone(),
+        description: args.description.clone(),
+        nodes: selected_nodes,
+        relays: selected_relays,
+    };
+    let (zip_bytes, manifest) =
+        export_share_bundle_zip_bytes_with_groups(&req, groups_bundle.as_ref())?;
+    Ok((zip_bytes, manifest, group_count))
+}
+
+fn write_sync_bytes_atomic(target_path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write as _;
+
+    if let Some(parent) = target_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let parent_dir = target_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let tmp_name = format!(
+        ".catcloud-sync-{}-{}.tmp",
+        std::process::id(),
+        generate_session_id()?
+    );
+    let tmp_path = parent_dir.join(tmp_name);
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(bytes)?;
+        f.flush()?;
+        let _ = f.sync_all();
+        Ok(())
+    })();
+    if let Err(err) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+
+    if let Err(_err) = std::fs::rename(&tmp_path, target_path) {
+        let _ = std::fs::remove_file(target_path);
+        if let Err(err2) = std::fs::rename(&tmp_path, target_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(err2.into());
+        }
+    }
+    Ok(())
+}
+
+fn parse_cli_ccsync_key(raw: &str) -> Result<([u8; KEY_LEN], Option<String>)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--key must not be empty");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("catcloud://") || lower.starts_with("catcloud-sync://") {
+        let parsed = parse_sync_uri(trimmed)?;
+        if parsed.role != SyncRole::FileKey {
+            anyhow::bail!(
+                "expected role=file_key sync URI for --key, got role={}",
+                parsed.role.as_str()
+            );
+        }
+        return Ok((parsed.key, parsed.fingerprint));
+    }
+    let decoded = decode_base64_flex(trimmed)?;
+    if decoded.len() != KEY_LEN {
+        anyhow::bail!(
+            "--key must decode to exactly {KEY_LEN} bytes, got {}",
+            decoded.len()
+        );
+    }
+    let mut key = [0u8; KEY_LEN];
+    key.copy_from_slice(&decoded);
+    Ok((key, None))
+}
+
+fn open_cli_ccsync_file(
+    path: &Path,
+    key_input: Option<&str>,
+    password_input: Option<&str>,
+) -> Result<Vec<u8>> {
+    let raw = read_file_with_limit(path, MAX_SYNC_ENVELOPE_BYTES, "ccsync envelope")?;
+    let header = inspect_envelope_header(&raw)?;
+    match header.kdf_mode {
+        KDF_MODE_RAW_KEY => {
+            let key_str = key_input
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .context("this .ccsync file requires --key (file_key URI or 32-byte Base64)")?;
+            let (key, expected_fp) = parse_cli_ccsync_key(key_str)?;
+            let zip_bytes = open_with_key(&raw, &key)?;
+            if let Some(fp) = expected_fp {
+                let actual_fp = plaintext_fingerprint(&zip_bytes);
+                if actual_fp != fp {
+                    anyhow::bail!(
+                        "ccsync fingerprint mismatch (expected {fp}, got {actual_fp})"
+                    );
+                }
+            }
+            Ok(zip_bytes)
+        }
+        KDF_MODE_PBKDF2_SHA256 => {
+            let pass = password_input
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .context("this .ccsync file is password-encrypted; pass --password")?;
+            Ok(open_with_password(&raw, pass)?)
+        }
+        other => anyhow::bail!("unsupported .ccsync kdf_mode 0x{other:02x}"),
+    }
+}
+
+fn execute_share_send_ccsync(
+    paths: &AppPaths,
+    args: &ShareSendArgs,
+    output_path: &Path,
+) -> Result<(Value, String)> {
+    let (zip_bytes, manifest, group_count) = build_cli_sync_export_zip(paths, args)?;
+    let fingerprint = plaintext_fingerprint(&zip_bytes);
+    let key = generate_random_key()?;
+    let envelope = seal_with_key(&zip_bytes, &key, "")?;
+    write_sync_bytes_atomic(output_path, &envelope)?;
+
+    let key_uri = format_sync_uri(&SyncUri {
+        role: SyncRole::FileKey,
+        endpoint: None,
+        hosts: Vec::new(),
+        port: None,
+        sid: None,
+        url: None,
+        fingerprint: Some(fingerprint.clone()),
+        key,
+    })?;
+    let display_output = redact_path_for_display(&output_path.to_string_lossy());
+    let out = json!({
+        "ok": true,
+        "sanitized": true,
+        "mode": "ccsync_file",
+        "output": &display_output,
+        "fingerprint": &fingerprint,
+        "key_uri": &key_uri,
+        "payload_bytes": envelope.len(),
+        "node_count": manifest.node_count,
+        "relay_count": manifest.relay_count,
+        "group_count": group_count,
+        "manifest": &manifest,
+    });
+    let mut human = format!(
+        "Exported encrypted .ccsync bundle `{}` to {} ({} node(s), {} relay(s), {} group(s), {} bytes, fp={}).\nKey URI: {}",
+        manifest.name,
+        display_output,
+        manifest.node_count,
+        manifest.relay_count,
+        group_count,
+        envelope.len(),
+        fingerprint,
+        key_uri,
+    );
+    if !args.no_qr {
+        if let Ok(qr_ascii) = render_qr_terminal(&key_uri) {
+            human.push('\n');
+            human.push_str(&qr_ascii);
+        }
+    }
+    Ok((out, human))
+}
+
+async fn handle_share_send(paths: &AppPaths, as_json: bool, args: ShareSendArgs) -> Result<()> {
+    if let Some(ref output_path) = args.ccsync_output {
+        let (out, human) = execute_share_send_ccsync(paths, &args, output_path)?;
+        return emit_output(as_json, &out, &human);
+    }
+
+    let (zip_bytes, manifest, group_count) = build_cli_sync_export_zip(paths, &args)?;
+    let fingerprint = plaintext_fingerprint(&zip_bytes);
+    let payload_bytes = zip_bytes.len();
+
+    if let Some(ref push_uri) = args.push_uri {
+        push_sync_bundle_via_uri(push_uri, &zip_bytes).await?;
+        let out = json!({
+            "ok": true,
+            "sanitized": true,
+            "mode": "lan_push_uri",
+            "fingerprint": &fingerprint,
+            "payload_bytes": payload_bytes,
+            "node_count": manifest.node_count,
+            "relay_count": manifest.relay_count,
+            "group_count": group_count,
+        });
+        let human = format!(
+            "Pushed encrypted sync bundle `{}` ({} node(s), {} relay(s), {} group(s), fp={}).",
+            manifest.name, manifest.node_count, manifest.relay_count, group_count, fingerprint
+        );
+        return emit_output(as_json, &out, &human);
+    }
+
+    if let Some(ref push_addr) = args.push_addr {
+        let pin = args
+            .pin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("--push-addr requires --pin <6-digit-code>")?;
+        push_sync_bundle_via_pin(push_addr, pin, &zip_bytes).await?;
+        let out = json!({
+            "ok": true,
+            "sanitized": true,
+            "mode": "lan_push_pin",
+            "fingerprint": &fingerprint,
+            "payload_bytes": payload_bytes,
+            "node_count": manifest.node_count,
+            "relay_count": manifest.relay_count,
+            "group_count": group_count,
+        });
+        let human = format!(
+            "Pushed encrypted sync bundle `{}` via PIN ({} node(s), {} relay(s), {} group(s), fp={}).",
+            manifest.name, manifest.node_count, manifest.relay_count, group_count, fingerprint
+        );
+        return emit_output(as_json, &out, &human);
+    }
+
+    let opts = LanSyncServerOptions {
+        bind_host: args.bind.clone(),
+        bind_port: args.port,
+        custom_endpoint: args.endpoint.clone().filter(|s| !s.trim().is_empty()),
+        ttl_secs: args.ttl.clamp(30, 900),
+        allow_multiple: args.allow_multiple,
+    };
+    let mut server = LanSyncSendServer::start(zip_bytes, opts).await?;
+    let info = server.info().clone();
+    let lan_urls: Vec<String> = info
+        .hosts
+        .iter()
+        .map(|h| format!("http://{h}:{}", info.port))
+        .collect();
+
+    if as_json {
+        let out = json!({
+            "ok": true,
+            "sanitized": true,
+            "mode": "lan_send_server",
+            "session_id": &info.sid,
+            "pin_code": &info.pin,
+            "port": info.port,
+            "lan_urls": &lan_urls,
+            "custom_endpoint": &info.custom_endpoint,
+            "fingerprint": &info.fingerprint,
+            "qr_uri": &info.uri,
+            "expires_at_unix": info.expires_at_unix,
+            "allow_multiple": info.allow_multiple,
+            "payload_bytes": payload_bytes,
+            "node_count": manifest.node_count,
+            "relay_count": manifest.relay_count,
+            "group_count": group_count,
+        });
+        use std::io::Write as _;
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        let _ = std::io::stdout().flush();
+    } else {
+        println!(
+            "LAN sync sender ready for `{}` ({} node(s), {} relay(s), {} group(s), fp={}).",
+            manifest.name, manifest.node_count, manifest.relay_count, group_count, info.fingerprint
+        );
+        println!("PIN: {} | URLs: {}", info.pin, lan_urls.join(", "));
+        if let Some(ref ep) = info.custom_endpoint {
+            println!("Endpoint: {ep}");
+        }
+        println!("URI: {}", info.uri);
+        if !args.no_qr {
+            if let Ok(qr_ascii) = render_qr_terminal(&info.uri) {
+                println!("{qr_ascii}");
+            }
+        }
+        println!("Waiting for receiver (press Ctrl+C to cancel)...");
+    }
+
+    while server.is_running() {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    server.cancel().await;
+    Ok(())
+}
+
+fn execute_share_receive_from_zip_bytes(
+    paths: &AppPaths,
+    args: &ShareReceiveArgs,
+    zip_bytes: &[u8],
+    source_label: &str,
+) -> Result<(Value, String)> {
+    if args.dry_run && args.apply {
+        anyhow::bail!("--dry-run and --apply cannot be specified together");
+    }
+    let update_mode = parse_subscription_update_mode(&args.mode)?;
+    let effective_dry_run = args.dry_run || !args.apply;
+
+    let fingerprint = plaintext_fingerprint(zip_bytes);
+    let preview: ShareBundlePreview = preview_share_bundle_zip_bytes(zip_bytes)?;
+    let selected_nodes = if args.no_nodes {
+        Vec::new()
+    } else {
+        preview.nodes.clone()
+    };
+    let selected_relays = if args.no_relays {
+        Vec::new()
+    } else {
+        preview.relays.clone()
+    };
+    let mut warnings: Vec<String> = preview
+        .warnings
+        .iter()
+        .map(|w| sanitize_log_line(w))
+        .collect();
+    let group_names: Vec<String> = if args.no_groups || args.no_nodes {
+        Vec::new()
+    } else {
+        preview
+            .groups_bundle
+            .as_ref()
+            .map(|gb| gb.groups.iter().map(|g| g.name.clone()).collect())
+            .unwrap_or_default()
+    };
+
+    if effective_dry_run {
+        let redacted_nodes: Vec<ProxyNode> = selected_nodes
+            .iter()
+            .map(redact_node_for_readonly)
+            .collect();
+        let redacted_relays: Vec<PreAccelRelay> = selected_relays
+            .iter()
+            .map(redact_relay_for_readonly)
+            .collect();
+        let out = json!({
+            "ok": true,
+            "sanitized": true,
+            "dry_run": true,
+            "applied": false,
+            "source": source_label,
+            "fingerprint": &fingerprint,
+            "manifest": &preview.manifest,
+            "target_sub": &args.target_sub,
+            "mode": update_mode,
+            "would_import_nodes": redacted_nodes.len(),
+            "would_import_relays": redacted_relays.len(),
+            "would_import_groups": group_names.len(),
+            "group_names": &group_names,
+            "nodes": redacted_nodes,
+            "relays": redacted_relays,
+            "warnings": warnings,
+        });
+        let human = format!(
+            "Sync receive dry-run preview `{}` (fp={}): {} node(s), {} relay(s), {} group(s) ready to import (pass --apply to persist).",
+            preview.manifest.name,
+            fingerprint,
+            selected_nodes.len(),
+            selected_relays.len(),
+            group_names.len(),
+        );
+        return Ok((out, human));
+    }
+
+    if selected_nodes.is_empty() && selected_relays.is_empty() {
+        anyhow::bail!("nothing to import after applying --no-nodes / --no-relays filters");
+    }
+
+    let db = open_storage(paths)?;
+    let mut imported_sub_id: Option<String> = None;
+    let mut node_update_result = None;
+    let mut imported_nodes_count = 0usize;
+    let mut target_sub_total_nodes: Option<usize> = None;
+
+    if !selected_nodes.is_empty() {
+        let id_remap = if let Some(ref target_sub) = args.target_sub {
+            let res =
+                db.update_subscription_nodes_with_mode(target_sub, &selected_nodes, update_mode)?;
+            if let Some(ref custom_name) = args.name {
+                let trimmed = custom_name.trim();
+                if !trimmed.is_empty() {
+                    let _ = db.rename_subscription(target_sub, trimmed)?;
+                }
+            }
+            imported_nodes_count = selected_nodes.len();
+            target_sub_total_nodes = Some(res.total_count);
+            imported_sub_id = Some(target_sub.clone());
+            let remap = res.id_remap.clone();
+            node_update_result = Some(res);
+            remap
+        } else {
+            let new_sub_id = generate_migration_subscription_id().replacen("migrated-", "sync-", 1);
+            let sub_name = args
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| preview.manifest.name.clone());
+            let sub_rec = SubscriptionRecord {
+                id: new_sub_id.clone(),
+                name: sub_name,
+                kind: SubscriptionKind::File,
+                url_or_cmd: source_label.to_string(),
+                ..Default::default()
+            };
+            db.upsert_subscription(&sub_rec)?;
+            let res = db.update_subscription_nodes_with_mode(
+                &new_sub_id,
+                &selected_nodes,
+                SubscriptionUpdateMode::ReplaceLatest,
+            )?;
+            imported_nodes_count = res.total_count;
+            imported_sub_id = Some(new_sub_id);
+            let remap = res.id_remap.clone();
+            node_update_result = Some(res);
+            remap
+        };
+        let _ = sync_active_single_node_after_mutation(paths, &db, &id_remap)?;
+    }
+
+    let imported_relays_count = if !selected_relays.is_empty() {
+        let (count, relay_warnings) =
+            catcloud_core::preaccel::import_relays_dedup_into_storage(&db, selected_relays)?;
+        warnings.extend(
+            relay_warnings
+                .into_iter()
+                .map(|w| sanitize_multiline_text(&w)),
+        );
+        count
+    } else {
+        0
+    };
+
+    let imported_groups_count = if !args.no_groups && !args.no_nodes {
+        if let Some(ref gb) = preview.groups_bundle {
+            let (count, group_warnings) = merge_imported_groups_into_storage(&db, gb)?;
+            warnings.extend(
+                group_warnings
+                    .into_iter()
+                    .map(|w| sanitize_multiline_text(&w)),
+            );
+            count
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let out = json!({
+        "ok": true,
+        "sanitized": true,
+        "dry_run": false,
+        "applied": true,
+        "source": source_label,
+        "fingerprint": &fingerprint,
+        "manifest": &preview.manifest,
+        "subscription_id": &imported_sub_id,
+        "mode": update_mode,
+        "imported_nodes": imported_nodes_count,
+        "target_sub_total_nodes": target_sub_total_nodes,
+        "imported_relays": imported_relays_count,
+        "imported_groups": imported_groups_count,
+        "node_update": node_update_result,
+        "warnings": warnings,
+    });
+    let human = format!(
+        "Imported sync bundle `{}` (fp={}): {} node(s), {} relay(s), {} group(s).",
+        preview.manifest.name,
+        fingerprint,
+        imported_nodes_count,
+        imported_relays_count,
+        imported_groups_count
+    );
+    Ok((out, human))
+}
+
+async fn handle_share_receive(
+    paths: &AppPaths,
+    as_json: bool,
+    args: ShareReceiveArgs,
+) -> Result<()> {
+    if args.dry_run && args.apply {
+        anyhow::bail!("--dry-run and --apply cannot be specified together");
+    }
+
+    let (zip_bytes, source_label) = if let Some(ref ccsync_path) = args.ccsync {
+        let bytes = open_cli_ccsync_file(
+            ccsync_path,
+            args.key.as_deref(),
+            args.password.as_deref(),
+        )?;
+        let label = redact_path_for_display(&ccsync_path.to_string_lossy());
+        (bytes, label)
+    } else if args.listen {
+        let opts = LanSyncServerOptions {
+            bind_host: args.bind.clone(),
+            bind_port: args.port,
+            custom_endpoint: args.endpoint.clone().filter(|s| !s.trim().is_empty()),
+            ttl_secs: args.ttl.clamp(30, 900),
+            allow_multiple: false,
+        };
+        let mut server = LanSyncReceiveServer::start(opts).await?;
+        let info = server.info().clone();
+        let lan_urls: Vec<String> = info
+            .hosts
+            .iter()
+            .map(|h| format!("http://{h}:{}", info.port))
+            .collect();
+
+        // Emit listener details to stderr in --json mode so stdout remains a single valid JSON document.
+        if as_json {
+            eprintln!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "event": "listening",
+                    "session_id": &info.sid,
+                    "pin_code": &info.pin,
+                    "port": info.port,
+                    "lan_urls": &lan_urls,
+                    "custom_endpoint": &info.custom_endpoint,
+                    "qr_uri": &info.uri,
+                    "expires_at_unix": info.expires_at_unix,
+                }))?
+            );
+        } else {
+            println!("LAN sync receiver listening on {}", lan_urls.join(", "));
+            println!("PIN: {}", info.pin);
+            if let Some(ref ep) = info.custom_endpoint {
+                println!("Endpoint: {ep}");
+            }
+            println!("URI: {}", info.uri);
+            if !args.no_qr {
+                if let Ok(qr_ascii) = render_qr_terminal(&info.uri) {
+                    println!("{qr_ascii}");
+                }
+            }
+            println!("Waiting for sender push (press Ctrl+C to cancel)...");
+        }
+
+        let received = server.recv_bundle().await;
+        server.cancel().await;
+        let bundle = received.context("receiver closed before receiving a sync bundle")?;
+        (bundle.zip_bytes, "sync://listen".to_string())
+    } else if let Some(ref addr) = args.addr {
+        let pin = args
+            .pin
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .context("--addr requires --pin <6-digit-code>")?;
+        let bytes = fetch_sync_bundle_via_pin(addr, pin).await?;
+        (bytes, "sync://pin".to_string())
+    } else if let Some(raw_source) = args.uri.as_deref().or(args.source.as_deref()) {
+        let trimmed = raw_source.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("catcloud://") || lower.starts_with("catcloud-sync://") {
+            let parsed = parse_sync_uri(trimmed)?;
+            match parsed.role {
+                SyncRole::Pull => (fetch_sync_bundle_via_uri(trimmed).await?, "sync://pull".to_string()),
+                SyncRole::RelayUrl => (fetch_relay_url_bundle(trimmed).await?, "sync://relay_url".to_string()),
+                SyncRole::Push => {
+                    anyhow::bail!("received role=push URI; use `catcloud share send --push-uri` on the sender instead");
+                }
+                SyncRole::FileKey => {
+                    anyhow::bail!("received role=file_key URI; pass `--ccsync <FILE> --key <URI>` instead");
+                }
+            }
+        } else if let Some(pin) = args.pin.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let bytes = fetch_sync_bundle_via_pin(trimmed, pin).await?;
+            (bytes, "sync://pin".to_string())
+        } else {
+            anyhow::bail!(
+                "source `{}` is not a catcloud://sync/v1 URI; pass --pin for LAN address or --ccsync for encrypted files",
+                sanitize_log_line(trimmed)
+            );
+        }
+    } else {
+        anyhow::bail!(
+            "please specify a sync source: <URI>, --uri, --addr + --pin, --ccsync + --key/--password, or --listen"
+        );
+    };
+
+    let (out, human) = execute_share_receive_from_zip_bytes(paths, &args, &zip_bytes, &source_label)?;
     emit_output(as_json, &out, &human)
 }
 
@@ -4360,6 +5381,236 @@ fn is_path_writable_probe(dir: &Path) -> bool {
     }
 }
 
+/// Evaluate effective TUN status for `net doctor`.
+///
+/// When a managed core is already running (e.g. launched elevated by CatCloud Desktop while
+/// `catcloud net doctor` runs in a standard-privilege shell), live `Tun` inbound connections
+/// or a running controller with `tun.enabled == true` must not be misreported as
+/// `tun_needs_elevation = true / tun_enabled = false`.
+fn evaluate_doctor_tun_state(
+    tun_configured: bool,
+    tun_privilege_ready: bool,
+    core_running: bool,
+    has_live_tun_connections: bool,
+) -> (bool, bool, &'static str) {
+    if has_live_tun_connections {
+        return (true, false, "live_tun_connections");
+    }
+    if !tun_configured {
+        return (false, false, "disabled");
+    }
+    if core_running {
+        return (true, false, "live_core_with_tun_config");
+    }
+    if tun_privilege_ready {
+        return (true, false, "process_privilege");
+    }
+    (false, true, "privilege_required")
+}
+
+async fn probe_live_tun_connections(ep: &ResolvedControllerEndpoint) -> bool {
+    let Ok(job_guard) = JobGuard::new() else {
+        return false;
+    };
+    let Ok(adapter) = MihomoAdapter::with_controller_endpoint(
+        Arc::new(job_guard),
+        &ep.host,
+        ep.port,
+        ep.secret.clone(),
+    ) else {
+        return false;
+    };
+    match tokio::time::timeout(Duration::from_millis(1500), adapter.list_connections()).await {
+        Ok(Ok(snapshot)) => snapshot.connections.iter().any(|conn| {
+            let ct = conn.conn_type.trim().to_ascii_lowercase();
+            ct == "tun" || ct.contains("tun")
+        }),
+        _ => false,
+    }
+}
+
+fn read_runtime_controller_pid(paths: &AppPaths) -> Option<u32> {
+    let meta_path = paths.runtime_dir.join("runtime-controller.json");
+    let raw = std::fs::read_to_string(&meta_path).ok()?;
+    let val: Value = serde_json::from_str(&raw).ok()?;
+    val.get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|p| u32::try_from(p).ok())
+        .filter(|&p| p > 0)
+}
+
+#[derive(Debug, Default)]
+struct CatCloudManagedProcessFilter {
+    managed_pid: Option<u32>,
+    mihomo_binary_path: Option<PathBuf>,
+    owned_dirs: Vec<PathBuf>,
+    live_controller_port: Option<u16>,
+}
+
+fn normalize_path_for_compare(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let raw = resolved.to_string_lossy();
+    let trimmed = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    let unified = trimmed.replace('\\', "/").trim_end_matches('/').to_string();
+    if cfg!(target_os = "windows") {
+        unified.to_ascii_lowercase()
+    } else {
+        unified
+    }
+}
+
+fn path_matches_or_within_dir(candidate: &Path, dir: &Path) -> bool {
+    let cand = normalize_path_for_compare(candidate);
+    let base = normalize_path_for_compare(dir);
+    if cand.is_empty() || base.is_empty() {
+        return false;
+    }
+    cand == base || cand.strip_prefix(&base).is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn extract_port_from_addr(addr: &str) -> Option<u16> {
+    let trimmed = addr.trim();
+    let (_, port_part) = trimmed.rsplit_once(':')?;
+    port_part.trim().parse::<u16>().ok().filter(|&p| p > 0)
+}
+
+fn is_mihomo_like_process_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    stem == "mihomo"
+        || stem.starts_with("mihomo-")
+        || stem.starts_with("mihomo_")
+        || stem == "clash-meta"
+        || stem == "catcloud"
+}
+
+fn is_catcloud_managed_proxy_process(
+    candidate: &ProcessCandidate,
+    filter: &CatCloudManagedProcessFilter,
+) -> bool {
+    // 1. Exact runtime PID recorded in `data/run/runtime-controller.json` (works even when an
+    //    elevated Windows `mihomo.exe` hides its exe_path/cmdline from a standard CLI).
+    if filter
+        .managed_pid
+        .is_some_and(|mpid| mpid > 0 && candidate.pid == mpid)
+    {
+        return true;
+    }
+
+    if !is_mihomo_like_process_name(&candidate.name) {
+        return false;
+    }
+
+    // 2. Executable path matches resolved CatCloud mihomo binary or resides inside CatCloud's
+    //    bin/data/install directories.
+    if let Some(ref exe) = candidate.exe_path {
+        if let Some(ref resolved_bin) = filter.mihomo_binary_path {
+            if normalize_path_for_compare(exe) == normalize_path_for_compare(resolved_bin) {
+                return true;
+            }
+        }
+        if filter
+            .owned_dirs
+            .iter()
+            .any(|dir| path_matches_or_within_dir(exe, dir))
+        {
+            return true;
+        }
+    }
+
+    // 3. Config dir / config file / command line arguments reference CatCloud's runtime/data dir.
+    for detected in [
+        candidate.detected_config_dir.as_deref(),
+        candidate.detected_config_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if filter
+            .owned_dirs
+            .iter()
+            .any(|dir| path_matches_or_within_dir(detected, dir))
+        {
+            return true;
+        }
+    }
+
+    if !candidate.cmdline.is_empty() && !filter.owned_dirs.is_empty() {
+        let norm_dirs: Vec<String> = filter
+            .owned_dirs
+            .iter()
+            .map(|d| normalize_path_for_compare(d))
+            .filter(|s| !s.is_empty())
+            .collect();
+        for arg in &candidate.cmdline {
+            let norm_arg = arg.trim().trim_matches('"').replace('\\', "/");
+            let cmp_arg = if cfg!(target_os = "windows") {
+                norm_arg.to_ascii_lowercase()
+            } else {
+                norm_arg
+            };
+            if norm_dirs.iter().any(|dir| {
+                cmp_arg == *dir
+                    || cmp_arg
+                        .strip_prefix(dir.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            }) {
+                return true;
+            }
+        }
+    }
+
+    // 4. Live controller port matches CatCloud's active controller port.
+    if let (Some(live_port), Some(ref detected_ctrl)) = (
+        filter.live_controller_port,
+        candidate.detected_controller_addr.as_ref(),
+    ) {
+        if extract_port_from_addr(detected_ctrl) == Some(live_port) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn build_catcloud_managed_process_filter(
+    paths: &AppPaths,
+    mihomo_binary: Option<&Path>,
+    core_running: bool,
+    effective_ctrl_port: u16,
+) -> CatCloudManagedProcessFilter {
+    let mut owned_dirs: Vec<PathBuf> = vec![
+        paths.bin_dir.clone(),
+        paths.runtime_dir.clone(),
+        paths.root_data_dir.clone(),
+    ];
+    if let Ok(cur_exe) = std::env::current_exe() {
+        if let Some(exe_dir) = cur_exe.parent() {
+            owned_dirs.push(exe_dir.to_path_buf());
+            // Portable layout: `<InstallRoot>/cli/catcloud.exe` sibling of `<InstallRoot>/bin/mihomo.exe`.
+            if exe_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("cli"))
+            {
+                if let Some(install_root) = exe_dir.parent() {
+                    owned_dirs.push(install_root.to_path_buf());
+                }
+            }
+        }
+    }
+    CatCloudManagedProcessFilter {
+        managed_pid: read_runtime_controller_pid(paths),
+        mihomo_binary_path: mihomo_binary.map(Path::to_path_buf),
+        owned_dirs,
+        live_controller_port: if core_running {
+            Some(effective_ctrl_port)
+        } else {
+            None
+        },
+    }
+}
+
 async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     let cfg = config::load_or_init(paths)?;
     let db = open_storage(paths)?;
@@ -4611,8 +5862,17 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     };
     let tun_privilege_ready = is_cli_tun_privilege_ready(&caps, bin_res.path.as_deref());
     let tun_configured = cfg.tun.enabled;
-    let tun_effective_enabled = tun_configured && tun_privilege_ready;
-    let tun_needs_admin = tun_configured && !tun_privilege_ready;
+    let has_live_tun_connections = if core_running {
+        probe_live_tun_connections(&ctrl_ep).await
+    } else {
+        false
+    };
+    let (tun_effective_enabled, tun_needs_admin, tun_runtime_source) = evaluate_doctor_tun_state(
+        tun_configured,
+        tun_privilege_ready,
+        core_running,
+        has_live_tun_connections,
+    );
     let proxy_tun_status = if os_proxy_dangling || os_proxy_mismatch || tun_needs_admin {
         if os_proxy_dangling {
             recommendations.push(
@@ -4642,11 +5902,12 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         "name": "System Proxy & Virtual NIC (TUN)",
         "status": proxy_tun_status,
         "detail": format!(
-            "cfg_sys_proxy={}, tun_configured={}, tun_enabled={}, tun_needs_elevation={}, tun_stack={}, elevated={}, os_proxy_mismatch={}, os_proxy_dangling={}",
+            "cfg_sys_proxy={}, tun_configured={}, tun_enabled={}, tun_needs_elevation={}, tun_source={}, tun_stack={}, elevated={}, os_proxy_mismatch={}, os_proxy_dangling={}",
             cfg.system_proxy.enabled,
             tun_configured,
             tun_effective_enabled,
             tun_needs_admin,
+            tun_runtime_source,
             cfg.tun.stack_mode.as_str(),
             caps.is_elevated,
             os_proxy_mismatch,
@@ -4660,6 +5921,8 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             "tun_enabled": tun_effective_enabled,
             "tun_needs_elevation": tun_needs_admin,
             "tun_privilege_ready": tun_privilege_ready,
+            "live_tun_connections_detected": has_live_tun_connections,
+            "tun_runtime_source": tun_runtime_source,
             "tun_stack": cfg.tun.stack_mode,
             "is_elevated": caps.is_elevated,
             "os_system_proxy": os_proxy_val,
@@ -4757,8 +6020,15 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             }
         }
     }
+    let managed_proc_filter = build_catcloud_managed_process_filter(
+        paths,
+        bin_res.path.as_deref(),
+        core_running,
+        effective_ctrl_port,
+    );
     let other_proxy_procs: Vec<Value> = list_process_candidates(true)
         .into_iter()
+        .filter(|p| !is_catcloud_managed_proxy_process(p, &managed_proc_filter))
         .map(|p| {
             let r = redact_process_candidate(&p);
             json!({
@@ -4771,7 +6041,12 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     const COMMON_PROXY_PORTS: &[u16] = &[7890, 7897, 10808, 10809, 2080, 1080];
     let mut occupied_other_ports: Vec<u16> = Vec::new();
     for &p in COMMON_PROXY_PORTS {
-        if core_running && (p == cfg.mixed_port || p == cfg.controller_port) {
+        if core_running
+            && (p == cfg.mixed_port
+                || p == cfg.controller_port
+                || p == effective_mixed_port
+                || p == effective_ctrl_port)
+        {
             continue;
         }
         if !is_port_available_tcp_udp("127.0.0.1", p) {
@@ -5967,7 +7242,8 @@ mod tests {
         assert!(zip_path.is_file());
 
         // Inspect must succeed and preview in a separate fresh data dir must not persist on dry-run.
-        handle_share_inspect(true, &zip_path).expect("inspect share zip");
+        handle_share_inspect(true, &zip_path, false).expect("inspect share zip");
+        handle_share_inspect(true, &zip_path, true).expect("inspect share zip summary");
 
         let dst_paths =
             AppPaths::from_data_dir(temp_root.join("dst-data"), true).expect("init dst paths");
@@ -6642,5 +7918,472 @@ mod tests {
                 .expect("fallback to single-hop");
         assert!(single_hop.is_none());
         assert!(single_note.unwrap().contains("single-hop"));
+    }
+
+    #[test]
+    fn share_inspect_summary_returns_compact_distributions_and_masks_sni_and_host_fields() {
+        use catcloud_core::share_bundle::{
+            SHARE_GROUPS_SCHEMA, ShareGroupRecord, ShareGroupsBundle,
+            export_share_bundle_zip_file_with_groups,
+        };
+        use catcloud_core::subscription::parser::node_dedup_fingerprint;
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-share-summary-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let mut nodes = Vec::new();
+        for i in 0..12usize {
+            let (region, proto, label) = match i % 3 {
+                0 => ("JP", "vless", format!("🇯🇵 东京 0.5x #{i}")),
+                1 => ("SG", "trojan", format!("🇸🇬 新加坡 1x #{i}")),
+                _ => ("US", "vless", format!("🇺🇸 美国 1x #{i}")),
+            };
+            nodes.push(ProxyNode {
+                id: format!("n-sum-{i}"),
+                sub_id: "sub-demo".to_string(),
+                name: label.clone(),
+                protocol: proto.to_string(),
+                server: format!("edge{i}.demo-upstream.com"),
+                port: 443,
+                raw_config: json!({
+                    "name": label,
+                    "type": proto,
+                    "server": format!("edge{i}.demo-upstream.com"),
+                    "port": 443,
+                    "uuid": format!("00000000-0000-4000-8000-{i:012}"),
+                    "password": format!("demo_pass_{i}"),
+                    "sni": format!("sni{i}.demo-secret.net"),
+                    "servername": format!("tls{i}.demo-secret.org"),
+                    "plugin-opts": {
+                        "mode": "websocket",
+                        "host": format!("plug{i}.demo-cdn.io")
+                    },
+                    "ws-opts": {
+                        "path": "/ws",
+                        "headers": {
+                            "Host": format!("ws{i}.demo-edge.com")
+                        }
+                    }
+                }),
+                region_code: region.to_string(),
+                ..ProxyNode::default()
+            });
+        }
+        let fp0 = node_dedup_fingerprint(&nodes[0]);
+        let groups_bundle = ShareGroupsBundle {
+            schema: SHARE_GROUPS_SCHEMA.to_string(),
+            active_group_name: Some("AI Pool".to_string()),
+            route_mode: Some("group".to_string()),
+            groups: vec![ShareGroupRecord {
+                name: "AI Pool".to_string(),
+                member_fingerprints: vec![fp0],
+                ..ShareGroupRecord::default()
+            }],
+        };
+
+        let zip_path = temp_root.join("summary-pack.zip");
+        let req = ShareBundleExportRequest {
+            name: "Summary Demo Pack".to_string(),
+            description: Some("12 nodes + 1 group".to_string()),
+            nodes,
+            relays: Vec::new(),
+        };
+        export_share_bundle_zip_file_with_groups(&req, Some(&groups_bundle), &zip_path)
+            .expect("export summary pack");
+
+        // 1. Summary mode: compact JSON with <= 5 samples, counts, top regions, protocols.
+        let (summary_out, summary_human) =
+            build_share_inspect_payload(&zip_path, true).expect("inspect --summary");
+        assert_eq!(summary_out["summary_mode"], json!(true));
+        assert_eq!(summary_out["node_count"], json!(12));
+        assert_eq!(summary_out["relay_count"], json!(0));
+        assert_eq!(summary_out["group_count"], json!(1));
+        assert_eq!(summary_out["sample_nodes"].as_array().unwrap().len(), 5);
+        assert!(summary_out.get("nodes").is_none());
+        assert!(summary_human.contains("12 node(s)"));
+        assert!(summary_human.contains("1 group(s)"));
+        let summary_json = serde_json::to_string(&summary_out).unwrap();
+        assert!(!summary_json.contains("demo-upstream"));
+        assert!(!summary_json.contains("demo-secret"));
+        assert!(!summary_json.contains("demo-cdn"));
+        assert!(!summary_json.contains("demo-edge"));
+
+        // 2. Full inspect mode: raw_config must mask sni, servername, plugin-opts.host, ws-opts.headers.Host.
+        let (full_out, _) =
+            build_share_inspect_payload(&zip_path, false).expect("inspect full");
+        assert_eq!(full_out["summary_mode"], json!(false));
+        assert_eq!(full_out["group_count"], json!(1));
+        let first_node = &full_out["nodes"][0];
+        assert_eq!(first_node["raw_config"]["sni"], json!("***.net"));
+        assert_eq!(first_node["raw_config"]["servername"], json!("***.org"));
+        assert_eq!(
+            first_node["raw_config"]["plugin-opts"]["host"],
+            json!("***.io")
+        );
+        assert_eq!(
+            first_node["raw_config"]["ws-opts"]["headers"]["Host"],
+            json!("***.com")
+        );
+        let full_json = serde_json::to_string(&full_out).unwrap();
+        for leaked in ["demo-upstream", "demo-secret", "demo-cdn", "demo-edge"] {
+            assert!(!full_json.contains(leaked), "full inspect leaked `{leaked}`");
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn net_doctor_tun_state_and_managed_mihomo_filter_prevent_false_positives() {
+        // 1. Live Tun inbound connections or running core with tun_configured=true must not
+        //    falsely claim tun_needs_elevation=true / tun_enabled=false on standard CLI.
+        assert_eq!(
+            evaluate_doctor_tun_state(true, false, true, true),
+            (true, false, "live_tun_connections")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(true, false, true, false),
+            (true, false, "live_core_with_tun_config")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(false, false, true, true),
+            (true, false, "live_tun_connections")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(true, false, false, false),
+            (false, true, "privilege_required")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(true, true, false, false),
+            (true, false, "process_privilege")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(false, false, false, false),
+            (false, false, "disabled")
+        );
+
+        // 2. Managed CatCloud mihomo.exe must be excluded by PID, binary path, or data dir,
+        //    while genuine third-party proxy clients remain flagged as conflicts.
+        let data_dir = PathBuf::from(r"C:\CatCloudPortable\data");
+        let bin_dir = PathBuf::from(r"C:\CatCloudPortable\bin");
+        let runtime_dir = data_dir.join("run");
+        let filter = CatCloudManagedProcessFilter {
+            managed_pid: Some(42420),
+            mihomo_binary_path: Some(bin_dir.join("mihomo.exe")),
+            owned_dirs: vec![bin_dir.clone(), runtime_dir.clone(), data_dir.clone()],
+            live_controller_port: Some(19090),
+        };
+
+        // Case A: Elevated mihomo.exe with inaccessible exe_path/cmdline matched via runtime PID.
+        let by_pid = ProcessCandidate {
+            pid: 42420,
+            name: "mihomo.exe".to_string(),
+            exe_path: None,
+            cmdline: Vec::new(),
+            detected_config_dir: None,
+            detected_config_file: None,
+            detected_controller_addr: None,
+            likely_proxy_client: true,
+        };
+        assert!(is_catcloud_managed_proxy_process(&by_pid, &filter));
+
+        // Case B: Managed mihomo.exe matched via binary path in CatCloud bin dir.
+        let by_exe = ProcessCandidate {
+            pid: 55111,
+            name: "mihomo.exe".to_string(),
+            exe_path: Some(bin_dir.join("mihomo.exe")),
+            cmdline: vec!["mihomo.exe".to_string()],
+            detected_config_dir: None,
+            detected_config_file: None,
+            detected_controller_addr: None,
+            likely_proxy_client: true,
+        };
+        assert!(is_catcloud_managed_proxy_process(&by_exe, &filter));
+
+        // Case C: Managed mihomo.exe matched via `-d <data_dir>/run` config dir.
+        let by_data_dir = ProcessCandidate {
+            pid: 55112,
+            name: "mihomo.exe".to_string(),
+            exe_path: Some(PathBuf::from(r"C:\Tools\mihomo.exe")),
+            cmdline: vec![
+                "mihomo.exe".to_string(),
+                "-d".to_string(),
+                runtime_dir.to_string_lossy().to_string(),
+            ],
+            detected_config_dir: Some(runtime_dir.clone()),
+            detected_config_file: Some(runtime_dir.join("runtime.yaml")),
+            detected_controller_addr: None,
+            likely_proxy_client: true,
+        };
+        assert!(is_catcloud_managed_proxy_process(&by_data_dir, &filter));
+
+        // Case D: Unrelated third-party proxy client must NOT be excluded.
+        let third_party = ProcessCandidate {
+            pid: 66222,
+            name: "clash-verge.exe".to_string(),
+            exe_path: Some(PathBuf::from(r"C:\Program Files\Clash Verge\clash-verge.exe")),
+            cmdline: vec!["clash-verge.exe".to_string()],
+            detected_config_dir: Some(PathBuf::from(r"C:\ProgramData\ClashVerge")),
+            detected_config_file: None,
+            detected_controller_addr: Some("127.0.0.1:9097".to_string()),
+            likely_proxy_client: true,
+        };
+        assert!(!is_catcloud_managed_proxy_process(&third_party, &filter));
+
+        // Case E: Separate third-party mihomo.exe in another folder and controller port must stay flagged.
+        let other_mihomo = ProcessCandidate {
+            pid: 66223,
+            name: "mihomo.exe".to_string(),
+            exe_path: Some(PathBuf::from(r"C:\OtherClient\mihomo.exe")),
+            cmdline: vec!["mihomo.exe".to_string(), "-d".to_string(), r"C:\OtherClient\cfg".to_string()],
+            detected_config_dir: Some(PathBuf::from(r"C:\OtherClient\cfg")),
+            detected_config_file: None,
+            detected_controller_addr: Some("127.0.0.1:9099".to_string()),
+            likely_proxy_client: true,
+        };
+        assert!(!is_catcloud_managed_proxy_process(&other_mihomo, &filter));
+    }
+
+    #[test]
+    fn net_connections_and_logs_tail_sanitize_numeric_account_dirs_and_dial_domains() {
+        let raw_conn = ActiveConnection {
+            id: "c-1".to_string(),
+            host: "api.demo-service.com".to_string(),
+            source_ip: "192.168.1.50".to_string(),
+            destination_ip: "203.0.113.44".to_string(),
+            process: "QQ.exe".to_string(),
+            process_path: concat!(
+                r"C:\",
+                r"Users\Administrator\Documents\Tencent Files\0000008899\nt_qq\QQ.exe"
+            )
+            .to_string(),
+            ..ActiveConnection::default()
+        };
+        let safe_conn = redact_connection_for_readonly(&raw_conn);
+        assert_eq!(
+            safe_conn.process_path,
+            r"C:\Users\<USER>\Documents\Tencent Files\***\nt_qq\QQ.exe"
+        );
+        assert!(!safe_conn.process_path.contains("0000008899"));
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-logs-dial-mask-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+        std::fs::write(
+            paths.logs_dir.join("catcloud.log"),
+            "2026-11-26T01:05:00Z WARN dial tcp hk01.demo-vendor.com:443: i/o timeout\n\
+             2026-11-26T01:05:01Z ERROR connect error: sg02.demo-node.net:8443: EOF\n",
+        )
+        .unwrap();
+
+        let (tail_out, _) = build_logs_tail_payload(&paths, 10, "all").expect("logs tail");
+        let lines = tail_out["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].as_str().unwrap(),
+            "2026-11-26T01:05:00Z WARN dial tcp ***.com:443: i/o timeout"
+        );
+        assert_eq!(
+            lines[1].as_str().unwrap(),
+            "2026-11-26T01:05:01Z ERROR connect error: ***.net:8443: EOF"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn share_send_ccsync_and_receive_dry_run_then_apply_merges_groups() {
+        let sender_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-sync-sender-{}",
+            std::process::id()
+        ));
+        let receiver_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-sync-receiver-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&sender_root);
+        let _ = std::fs::remove_dir_all(&receiver_root);
+
+        let sender_paths = AppPaths::from_data_dir(sender_root.clone(), true).expect("sender paths");
+        let receiver_paths =
+            AppPaths::from_data_dir(receiver_root.clone(), true).expect("receiver paths");
+
+        {
+            let mut db = open_storage(&sender_paths).expect("sender db");
+            let sub = SubscriptionRecord {
+                id: "sub-sync-src".to_string(),
+                name: "Sync Source".to_string(),
+                kind: SubscriptionKind::File,
+                url_or_cmd: "local://demo".to_string(),
+                ..Default::default()
+            };
+            db.upsert_subscription(&sub).unwrap();
+            let node = ProxyNode {
+                id: "node-sync-jp".to_string(),
+                sub_id: sub.id.clone(),
+                name: "JP-Sync-01".to_string(),
+                protocol: "vless".to_string(),
+                region_code: "JP".to_string(),
+                server: "jp-sync.example.invalid".to_string(),
+                port: 443,
+                raw_config: serde_json::json!({
+                    "name": "JP-Sync-01",
+                    "type": "vless",
+                    "server": "jp-sync.example.invalid",
+                    "port": 443,
+                    "uuid": "00000000-0000-4000-8000-000000000011",
+                    "password": "node_sync_secret_pw"
+                }),
+                ..ProxyNode::default()
+            };
+            db.upsert_nodes_batch(&[node]).unwrap();
+            let relay = PreAccelRelay {
+                id: "relay-sync-cn".to_string(),
+                name: "CN-Sync-443".to_string(),
+                server: "198.51.100.77".to_string(),
+                port: 443,
+                protocol: "anytls".to_string(),
+                password: "relay_sync_secret_pw".to_string(),
+                ..PreAccelRelay::default()
+            };
+            db.upsert_preaccel_relay(&relay).unwrap();
+            let mut grp = MultiGroup::default();
+            grp.id = "grp-sync-ai".to_string();
+            grp.name = "AI Sync Group".to_string();
+            grp.member_node_ids = vec!["node-sync-jp".to_string()];
+            grp.active_node_id = Some("node-sync-jp".to_string());
+            db.upsert_multi_group(&grp).unwrap();
+        }
+
+        let ccsync_path = sender_root.join("export.ccsync");
+        let send_args = ShareSendArgs {
+            name: "Device Sync Pack".to_string(),
+            description: Some("CLI roundtrip".to_string()),
+            node_ids: None,
+            sub_id: Some("sub-sync-src".to_string()),
+            all_nodes: false,
+            relay_ids: None,
+            all_relays: true,
+            no_groups: false,
+            endpoint: None,
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+            ttl: 60,
+            allow_multiple: false,
+            push_uri: None,
+            push_addr: None,
+            pin: None,
+            ccsync_output: Some(ccsync_path.clone()),
+            no_qr: true,
+        };
+        let (send_out, _) =
+            execute_share_send_ccsync(&sender_paths, &send_args, &ccsync_path).expect("ccsync send");
+        assert_eq!(send_out["ok"], json!(true));
+        assert_eq!(send_out["node_count"], json!(1));
+        assert_eq!(send_out["relay_count"], json!(1));
+        assert_eq!(send_out["group_count"], json!(1));
+        let key_uri = send_out["key_uri"].as_str().expect("key_uri").to_string();
+        assert!(key_uri.starts_with("catcloud://sync/v1?role=file_key"));
+
+        // 1. Default dry-run receive must redact secrets and NOT mutate receiver storage.
+        let dry_args = ShareReceiveArgs {
+            source: None,
+            uri: None,
+            addr: None,
+            pin: None,
+            ccsync: Some(ccsync_path.clone()),
+            key: Some(key_uri.clone()),
+            password: None,
+            listen: false,
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+            endpoint: None,
+            ttl: 60,
+            no_qr: true,
+            dry_run: false,
+            apply: false,
+            target_sub: None,
+            name: None,
+            mode: "merge".to_string(),
+            no_nodes: false,
+            no_relays: false,
+            no_groups: false,
+        };
+        let zip_bytes =
+            open_cli_ccsync_file(&ccsync_path, Some(&key_uri), None).expect("open ccsync");
+        let (dry_out, _) = execute_share_receive_from_zip_bytes(
+            &receiver_paths,
+            &dry_args,
+            &zip_bytes,
+            "export.ccsync",
+        )
+        .expect("dry-run receive");
+        assert_eq!(dry_out["dry_run"], json!(true));
+        assert_eq!(dry_out["applied"], json!(false));
+        assert_eq!(dry_out["would_import_nodes"], json!(1));
+        assert_eq!(dry_out["would_import_relays"], json!(1));
+        assert_eq!(dry_out["would_import_groups"], json!(1));
+        assert_eq!(dry_out["nodes"][0]["raw_config"]["password"], json!("<REDACTED>"));
+        assert_eq!(dry_out["relays"][0]["password"], json!("<REDACTED>"));
+        {
+            let rx_db = open_storage(&receiver_paths).expect("rx db");
+            assert_eq!(rx_db.list_nodes().unwrap().len(), 0);
+            assert_eq!(rx_db.list_preaccel_relays(false).unwrap().len(), 0);
+            assert_eq!(rx_db.list_multi_groups().unwrap().len(), 0);
+        }
+
+        // 2. Apply receive persists nodes, relays, and smart multi-groups.
+        let mut apply_args = dry_args;
+        apply_args.apply = true;
+        let (apply_out, _) = execute_share_receive_from_zip_bytes(
+            &receiver_paths,
+            &apply_args,
+            &zip_bytes,
+            "export.ccsync",
+        )
+        .expect("apply receive");
+        assert_eq!(apply_out["applied"], json!(true));
+        assert_eq!(apply_out["imported_nodes"], json!(1));
+        assert_eq!(apply_out["imported_relays"], json!(1));
+        assert_eq!(apply_out["imported_groups"], json!(1));
+        {
+            let rx_db = open_storage(&receiver_paths).expect("rx db");
+            assert_eq!(rx_db.list_nodes().unwrap().len(), 1);
+            assert_eq!(rx_db.list_preaccel_relays(false).unwrap().len(), 1);
+            let groups = rx_db.list_multi_groups().unwrap();
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].name, "AI Sync Group");
+            assert_eq!(groups[0].member_node_ids.len(), 1);
+        }
+
+        // 3. LAN HTTP pull roundtrip via LanSyncSendServer + fetch_sync_bundle_via_uri
+        let (built_zip, _, _) =
+            build_cli_sync_export_zip(&sender_paths, &send_args).expect("build zip");
+        let mut srv = LanSyncSendServer::start(
+            built_zip.clone(),
+            LanSyncServerOptions {
+                bind_host: "127.0.0.1".to_string(),
+                bind_port: 0,
+                custom_endpoint: None,
+                ttl_secs: 60,
+                allow_multiple: false,
+            },
+        )
+        .await
+        .expect("start lan send");
+        let fetched = fetch_sync_bundle_via_uri(&srv.info().uri)
+            .await
+            .expect("fetch via uri");
+        assert_eq!(fetched, built_zip);
+        srv.cancel().await;
+
+        let _ = std::fs::remove_dir_all(&sender_root);
+        let _ = std::fs::remove_dir_all(&receiver_root);
     }
 }

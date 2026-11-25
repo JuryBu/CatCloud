@@ -746,6 +746,70 @@ export interface ShareBundleImportOutcome {
   warnings: string[];
 }
 
+export interface SyncSendSessionDto {
+  session_id: string;
+  pin_code: string;
+  lan_urls: string[];
+  custom_endpoint: string | null;
+  port: number;
+  fingerprint: string;
+  qr_uri: string;
+  qr_svg: string;
+  expires_at_unix: number;
+  payload_bytes: number;
+  allow_multiple: boolean;
+}
+
+export interface SyncReceiveSessionDto {
+  session_id: string;
+  pin_code: string;
+  lan_urls: string[];
+  custom_endpoint: string | null;
+  port: number;
+  qr_uri: string;
+  qr_svg: string;
+  expires_at_unix: number;
+  allow_multiple: boolean;
+}
+
+export interface SyncEncryptedFileExportDto {
+  cancelled: boolean;
+  path: string | null;
+  fingerprint: string;
+  key_uri: string;
+  qr_svg: string;
+  payload_bytes: number;
+  node_count: number;
+  relay_count: number;
+  group_count: number;
+}
+
+export interface SyncPreviewDto {
+  pending_token: string;
+  fingerprint: string;
+  group_count: number;
+  group_names: string[];
+  preview: ShareBundlePreview;
+}
+
+export interface SyncReceivedEvent {
+  session_id: string;
+  pending_token: string;
+  fingerprint: string;
+  via_pin: boolean;
+  node_count: number;
+  relay_count: number;
+  group_count: number;
+  pack_name: string;
+}
+
+export interface SyncSessionUpdatedEvent {
+  session_id: string;
+  role: string;
+  status: string;
+  message: string;
+}
+
 export interface ExportAgentDocOutcome {
   cancelled: boolean;
   path: string | null;
@@ -1266,6 +1330,26 @@ async function tauriListen<T>(
   } catch {
     return null;
   }
+}
+
+const MOCK_SYNC_QR_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" fill="#fff"/><path fill="#111" d="M2 2h7v7H2zm2 2v3h3V4zm11-2h7v7h-7zm2 2v3h3V4zM2 15h7v7H2zm2 2v3h3v-3zm8-5h4v4h-4zm5 5h5v5h-5z"/></svg>';
+
+function subscribeTauriEvent<T>(event: string, onEvent: (payload: T) => void): () => void {
+  let disposed = false;
+  let unlisten: (() => void) | null = null;
+  if (isTauriEnv()) {
+    void tauriListen<T>(event, (payload) => {
+      if (!disposed && payload) onEvent(payload);
+    }).then((fn) => {
+      if (disposed) fn?.();
+      else unlisten = fn;
+    });
+  }
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
 }
 
 /* ============================================================================
@@ -3222,6 +3306,189 @@ export const catcloudApi = {
     };
   },
 
+  async startSyncSendSession(params: {
+    name?: string | null;
+    description?: string | null;
+    nodeIds: string[];
+    relayIds: string[];
+    includeGroups?: boolean;
+    customEndpoint?: string | null;
+    ttlSec?: number | null;
+    allowMultiple?: boolean;
+  }): Promise<SyncSendSessionDto> {
+    const customEndpoint = params.customEndpoint?.trim() || null;
+    const ttlSec = params.ttlSec ?? 180;
+    const allowMultiple = params.allowMultiple ?? false;
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SyncSendSessionDto>("start_sync_send_session", {
+        name: params.name?.trim() || "CatCloud Sync",
+        description: params.description?.trim() || null,
+        nodeIds: params.nodeIds,
+        relayIds: params.relayIds,
+        includeGroups: params.includeGroups ?? true,
+        customEndpoint,
+        ttlSec,
+        allowMultiple,
+      });
+    }
+    const lanUrl = "http://198.51.100.12:38192";
+    return {
+      session_id: `mock-send-${Date.now()}`,
+      pin_code: "482916",
+      lan_urls: [lanUrl],
+      custom_endpoint: customEndpoint,
+      port: 38192,
+      fingerprint: "a1b2c3d4e5f60718293a",
+      qr_uri: `catcloud://sync/v1?role=send&u=${encodeURIComponent(customEndpoint || lanUrl)}&pin=482916`,
+      qr_svg: MOCK_SYNC_QR_SVG,
+      expires_at_unix: Math.floor(Date.now() / 1000) + Math.max(30, ttlSec),
+      payload_bytes: 2048 + params.nodeIds.length * 320 + params.relayIds.length * 240,
+      allow_multiple: allowMultiple,
+    };
+  },
+
+  async cancelSyncSendSession(sessionId: string): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("cancel_sync_send_session", { sessionId });
+    }
+    return Boolean(sessionId);
+  },
+
+  async exportEncryptedSyncFile(params: {
+    name?: string | null;
+    description?: string | null;
+    nodeIds: string[];
+    relayIds: string[];
+    includeGroups?: boolean;
+  }): Promise<SyncEncryptedFileExportDto> {
+    const name = params.name?.trim() || "CatCloud Sync";
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SyncEncryptedFileExportDto>("export_encrypted_sync_file", {
+        name,
+        description: params.description?.trim() || null,
+        nodeIds: params.nodeIds,
+        relayIds: params.relayIds,
+        includeGroups: params.includeGroups ?? true,
+      });
+    }
+    return {
+      cancelled: false,
+      path: `${name}.ccsync`,
+      fingerprint: "f0e1d2c3b4a596877869",
+      key_uri: "catcloud://sync-key/v1?fp=f0e1d2c3b4a5&k=MOCK_PREVIEW",
+      qr_svg: MOCK_SYNC_QR_SVG,
+      payload_bytes: 2304 + params.nodeIds.length * 320 + params.relayIds.length * 240,
+      node_count: params.nodeIds.length,
+      relay_count: params.relayIds.length,
+      group_count: params.includeGroups === false ? 0 : mockGroups.length,
+    };
+  },
+
+  async startSyncReceiveListener(params?: {
+    customEndpoint?: string | null;
+    ttlSec?: number | null;
+    allowMultiple?: boolean;
+  }): Promise<SyncReceiveSessionDto> {
+    const customEndpoint = params?.customEndpoint?.trim() || null;
+    const ttlSec = params?.ttlSec ?? 180;
+    const allowMultiple = params?.allowMultiple ?? false;
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SyncReceiveSessionDto>("start_sync_receive_listener", {
+        customEndpoint,
+        ttlSec,
+        allowMultiple,
+      });
+    }
+    const lanUrl = "http://198.51.100.12:38193";
+    return {
+      session_id: `mock-recv-${Date.now()}`,
+      pin_code: "739154",
+      lan_urls: [lanUrl],
+      custom_endpoint: customEndpoint,
+      port: 38193,
+      qr_uri: `catcloud://sync/v1?role=recv&u=${encodeURIComponent(customEndpoint || lanUrl)}&pin=739154`,
+      qr_svg: MOCK_SYNC_QR_SVG,
+      expires_at_unix: Math.floor(Date.now() / 1000) + Math.max(30, ttlSec),
+      allow_multiple: allowMultiple,
+    };
+  },
+
+  async cancelSyncReceiveSession(sessionId: string): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("cancel_sync_receive_session", { sessionId });
+    }
+    return Boolean(sessionId);
+  },
+
+  async previewSyncSource(params: {
+    sourceInput?: string | null;
+    pin?: string | null;
+    pendingToken?: string | null;
+    pickCcsyncFile?: boolean;
+  }): Promise<SyncPreviewDto | null> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SyncPreviewDto | null>("preview_sync_source", {
+        sourceInput: params.sourceInput?.trim() || null,
+        pin: params.pin?.trim() || null,
+        pendingToken: params.pendingToken?.trim() || null,
+        pickCcsyncFile: params.pickCcsyncFile ?? false,
+      });
+    }
+    const nodes = structuredClone(MOCK_NODES.slice(0, 2));
+    const relays = structuredClone(MOCK_PREACCEL_RELAYS.slice(0, 1));
+    return {
+      pending_token: params.pendingToken?.trim() || `mock-pending-${Date.now()}`,
+      fingerprint: "a1b2c3d4e5f60718293a",
+      group_count: mockGroups.length > 0 ? 1 : 0,
+      group_names: mockGroups.length > 0 ? [mockGroups[0].name] : [],
+      preview: {
+        zip_path: params.pickCcsyncFile ? "demo-sync.ccsync" : params.sourceInput || "lan-sync",
+        manifest: {
+          schema: "catcloud-share/v1",
+          name: "CatCloud Sync",
+          created_at: new Date().toISOString(),
+          node_count: nodes.length,
+          relay_count: relays.length,
+          description: null,
+          sanitized_notice: "",
+        },
+        nodes,
+        relays,
+        warnings: [],
+        has_readme: false,
+      },
+    };
+  },
+
+  async applySyncImport(params: {
+    pendingToken: string;
+    selectedNodeIds: string[];
+    selectedRelayIds: string[];
+    importGroups?: boolean;
+    targetSubId?: string | null;
+    newSubName?: string | null;
+    updateMode?: SubscriptionUpdateMode;
+  }): Promise<ShareBundleImportOutcome> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<ShareBundleImportOutcome>("apply_sync_import", {
+        pendingToken: params.pendingToken,
+        selectedNodeIds: params.selectedNodeIds,
+        selectedRelayIds: params.selectedRelayIds,
+        importGroups: params.importGroups ?? true,
+        targetSubId: params.targetSubId ?? null,
+        newSubName: params.newSubName?.trim() || null,
+        updateMode: params.updateMode ?? "merge_dedup",
+      });
+    }
+    return {
+      imported_nodes: params.selectedNodeIds.length,
+      imported_relays: params.selectedRelayIds.length,
+      target_sub_id: params.targetSubId ?? "sub-sync-preview",
+      target_sub_name: params.newSubName?.trim() || "CatCloud Sync",
+      warnings: [],
+    };
+  },
+
   async refreshSubscription(
     subId: string,
     options?: { bearerSecret?: string | null; endpointUrl?: string | null }
@@ -4653,82 +4920,26 @@ export const catcloudApi = {
   },
 
   subscribeRuntimeUpdate(onUpdate: (info: CoreRuntimeInfo) => void): () => void {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    if (isTauriEnv()) {
-      void tauriListen<CoreRuntimeInfo>("catcloud://runtime", (payload) => {
-        if (!disposed) onUpdate(payload);
-      }).then((fn) => {
-        if (disposed) {
-          fn?.();
-        } else {
-          unlisten = fn;
-        }
-      });
-    }
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
+    return subscribeTauriEvent("catcloud://runtime", onUpdate);
   },
 
   subscribeProbeProgress(onProgress: (ev: ProbeProgressEvent) => void): () => void {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    if (isTauriEnv()) {
-      void tauriListen<ProbeProgressEvent>("catcloud://probe-progress", (payload) => {
-        if (!disposed && payload) onProgress(payload);
-      }).then((fn) => {
-        if (disposed) {
-          fn?.();
-        } else {
-          unlisten = fn;
-        }
-      });
-    }
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
+    return subscribeTauriEvent("catcloud://probe-progress", onProgress);
   },
 
   subscribeStrategySwitch(onSwitch: (ev: StrategySwitchEvent) => void): () => void {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    if (isTauriEnv()) {
-      void tauriListen<StrategySwitchEvent>("catcloud://strategy-switch", (payload) => {
-        if (!disposed && payload) onSwitch(payload);
-      }).then((fn) => {
-        if (disposed) {
-          fn?.();
-        } else {
-          unlisten = fn;
-        }
-      });
-    }
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
+    return subscribeTauriEvent("catcloud://strategy-switch", onSwitch);
   },
 
   subscribeConfigUpdate(onUpdate: (cfg: AppConfig) => void): () => void {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    if (isTauriEnv()) {
-      void tauriListen<AppConfig>("catcloud://config-updated", (payload) => {
-        if (!disposed && payload) onUpdate(payload);
-      }).then((fn) => {
-        if (disposed) {
-          fn?.();
-        } else {
-          unlisten = fn;
-        }
-      });
-    }
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
+    return subscribeTauriEvent("catcloud://config-updated", onUpdate);
+  },
+
+  subscribeSyncReceived(onReceived: (ev: SyncReceivedEvent) => void): () => void {
+    return subscribeTauriEvent("catcloud://sync-received", onReceived);
+  },
+
+  subscribeSyncSessionUpdated(onUpdate: (ev: SyncSessionUpdatedEvent) => void): () => void {
+    return subscribeTauriEvent("catcloud://sync-session-updated", onUpdate);
   },
 };

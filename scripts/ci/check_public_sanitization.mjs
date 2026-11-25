@@ -18,6 +18,8 @@ const TEXT_EXTS = new Set([
   ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".toml",
   ".yaml", ".yml", ".md", ".txt", ".html", ".css", ".ps1", ".sh", ".py",
   ".cfg", ".ini", ".env", ".gitignore", ".gitattributes",
+  ".kt", ".kts", ".java", ".go", ".c", ".h", ".aidl", ".xml", ".pro", ".properties", ".gradle", ".mod",
+  ".nsi", ".nsh",
 ]);
 
 const SKIP_FILES = new Set([
@@ -25,6 +27,7 @@ const SKIP_FILES = new Set([
   "pnpm-lock.yaml",
   "package-lock.json",
   "Cargo.lock",
+  "android/mihomo-bridge/go.sum",
 ]);
 
 const FORBIDDEN_PATTERNS = [

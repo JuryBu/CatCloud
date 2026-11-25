@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Cleartext HTTP is permitted at the platform layer solely for RFC1918 LAN sync & loopback
+         controller calls; SyncCrypto/LanSyncClient strictly enforces HTTPS for all public URLs. -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

@@ -47,6 +47,19 @@ node_modules/
 .vite/
 .pnpm-store/
 
+# Android / Gradle / Go bridge build outputs & signing secrets
+/android/.gradle/
+/android/build/
+/android/app/build/
+/android/local.properties
+/android/app/src/main/jniLibs/**/*.so
+/android/mihomo-bridge/build/
+*.apk
+*.aab
+*.keystore
+*.jks
+*.ccsync
+
 # OS & IDE junk
 .DS_Store
 Thumbs.db

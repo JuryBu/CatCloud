@@ -69,6 +69,8 @@ pub fn is_safe_dns_or_local_ipv4(octets: [u8; 4]) -> bool {
 /// - Masks private, CGNAT, link-local, ULA, and public IPv4/IPv6 addresses, only exempting
 ///   `127.0.0.1`, `0.0.0.0`, `198.18.0.0/15`, `::1`, `::`, and `SAFE_PUBLIC_DNS_IPV4S`
 ///   without touching timestamps (`HH:MM:SS`)
+/// - Masks non-allowlisted upstream proxy domains appearing in dial/connect error messages
+///   (e.g. `dial tcp/udp ...` or `connect error ...`) to `***.<tld>`
 pub fn sanitize_log_line(raw: &str) -> String {
     let step1 = redact_url_userinfo(raw);
     let step2 = redact_bearer_tokens(&step1);
@@ -76,7 +78,8 @@ pub fn sanitize_log_line(raw: &str) -> String {
     let step4 = redact_user_home_paths(&step3);
     let step5 = redact_non_system_drive_paths(&step4);
     let step6 = redact_public_ipv4(&step5);
-    redact_public_ipv6(&step6)
+    let step7 = redact_public_ipv6(&step6);
+    redact_dial_error_domains(&step7)
 }
 
 /// Redact a single server IP or hostname (optionally with `:port` or `[ipv6]:port`)
@@ -200,6 +203,8 @@ fn redact_bare_host_or_ipv4(host_part: &str) -> String {
 /// Redact a single filesystem path for read-only CLI/UI/AI display:
 /// - Strips local user home usernames (`C:\Users\<USER>\...`, `/Users/<USER>/...`, `/home/<USER>/...`)
 /// - Replaces non-system Windows drive paths (`D:\Private\CatCloud\bin` -> `<LOCAL_PATH>/bin`)
+/// - Masks long numeric account directory segments (>= 6 consecutive digits, e.g. IM/game user IDs)
+///   with `***`
 pub fn redact_path_for_display(path: &str) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -224,28 +229,179 @@ pub fn redact_path_for_display(path: &str) -> String {
         if !after.is_empty() && !after.starts_with("<USER>") {
             let next_sep = after.find(['\\', '/']);
             let rest_after_user = next_sep.map(|idx| &after[idx..]).unwrap_or("");
-            return format!(
+            let base = format!(
                 "{verbatim_prefix}{}<USER>{rest_after_user}",
                 &body[..plen]
             );
+            return redact_numeric_account_path_segments(&base);
         }
     }
 
     let step1 = redact_user_home_paths(body);
     let step2 = redact_non_system_drive_paths(&step1);
-    if verbatim_prefix.is_empty() || step2.starts_with("<LOCAL_PATH>") {
+    let assembled = if verbatim_prefix.is_empty() || step2.starts_with("<LOCAL_PATH>") {
         step2
     } else {
         format!("{verbatim_prefix}{step2}")
+    };
+    redact_numeric_account_path_segments(&assembled)
+}
+
+fn is_uuid_segment(seg: &str) -> bool {
+    let b = seg.as_bytes();
+    if b.len() != 36 {
+        return false;
     }
+    for (idx, &ch) in b.iter().enumerate() {
+        if matches!(idx, 8 | 13 | 18 | 23) {
+            if ch != b'-' {
+                return false;
+            }
+        } else if !ch.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_long_hex_hash_segment(seg: &str) -> bool {
+    seg.len() >= 16
+        && seg.bytes().all(|b| b.is_ascii_hexdigit())
+        && seg.bytes().any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))
+}
+
+fn redact_long_digits_in_dir_segment(seg: &str) -> String {
+    if seg.is_empty()
+        || seg == "<USER>"
+        || seg == "<LOCAL_PATH>"
+        || seg == "***"
+        || is_uuid_segment(seg)
+        || is_long_hex_hash_segment(seg)
+    {
+        return seg.to_string();
+    }
+    if seg.len() >= 6 && seg.bytes().all(|b| b.is_ascii_digit()) {
+        return "***".to_string();
+    }
+
+    let bytes = seg.as_bytes();
+    let mut out = String::with_capacity(seg.len());
+    let mut i = 0usize;
+    let mut changed = false;
+
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let mut end = i;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            let run_len = end - i;
+            let prev_is_hex_alpha =
+                i > 0 && matches!(bytes[i - 1], b'a'..=b'f' | b'A'..=b'F');
+            let next_is_hex_alpha =
+                end < bytes.len() && matches!(bytes[end], b'a'..=b'f' | b'A'..=b'F');
+            if run_len >= 6 && !prev_is_hex_alpha && !next_is_hex_alpha {
+                out.push_str("***");
+                changed = true;
+            } else {
+                out.push_str(&seg[i..end]);
+            }
+            i = end;
+            continue;
+        }
+        if let Some(ch) = seg[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    if changed { out } else { seg.to_string() }
+}
+
+/// Mask directory segments containing >= 6 consecutive ASCII digits (such as QQ, WeChat, or game
+/// numeric account folders) with `***`, while preserving path separators and executable filenames.
+pub fn redact_numeric_account_path_segments(path: &str) -> String {
+    if path.is_empty() || path.starts_with("<LOCAL_PATH>") {
+        return path.to_string();
+    }
+
+    let (prefix, rest) = if let Some(after) = path.strip_prefix(r"\\?\") {
+        (r"\\?\", after)
+    } else {
+        ("", path)
+    };
+
+    // Tokenize into alternating `(is_sep, slice)` preserving exact separators (`\` or `/`).
+    let mut tokens: Vec<(bool, &str)> = Vec::new();
+    let mut start = 0usize;
+    let bytes = rest.as_bytes();
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if matches!(bytes[idx], b'\\' | b'/') {
+            if idx > start {
+                tokens.push((false, &rest[start..idx]));
+            }
+            let sep_start = idx;
+            while idx < bytes.len() && matches!(bytes[idx], b'\\' | b'/') {
+                idx += 1;
+            }
+            tokens.push((true, &rest[sep_start..idx]));
+            start = idx;
+        } else {
+            idx += 1;
+        }
+    }
+    if start < bytes.len() {
+        tokens.push((false, &rest[start..]));
+    }
+
+    let trailing_sep = tokens.last().is_some_and(|(is_sep, _)| *is_sep);
+    let last_non_sep_idx = tokens.iter().rposition(|(is_sep, _)| !*is_sep);
+
+    let mut out = String::with_capacity(path.len());
+    out.push_str(prefix);
+    for (ti, &(is_sep, seg)) in tokens.iter().enumerate() {
+        if is_sep {
+            out.push_str(seg);
+            continue;
+        }
+        // Preserve Windows drive letter segment (`C:`).
+        if ti == 0 && seg.len() == 2 && seg.as_bytes()[0].is_ascii_alphabetic() && seg.as_bytes()[1] == b':' {
+            out.push_str(seg);
+            continue;
+        }
+        let is_last_segment = Some(ti) == last_non_sep_idx;
+        let is_likely_filename = is_last_segment && !trailing_sep && seg.contains('.');
+        if is_likely_filename {
+            out.push_str(seg);
+        } else if is_last_segment && !trailing_sep {
+            // Only mask trailing extensionless segment when it is a pure >=6-digit directory ID.
+            if seg.len() >= 6 && seg.bytes().all(|b| b.is_ascii_digit()) {
+                out.push_str("***");
+            } else {
+                out.push_str(seg);
+            }
+        } else {
+            out.push_str(&redact_long_digits_in_dir_segment(seg));
+        }
+    }
+
+    out
 }
 
 /// Return a sanitized read-only clone of `PreAccelRelay`:
 /// preserves id, name, provider, region, protocol, port, priority, expires_at, enabled, metrics,
-/// while masking `server` (via `redact_ip_or_host`) and `password` (`<REDACTED>`).
+/// while masking `server` (and non-empty `sni`) via `redact_ip_or_host` and `password` (`<REDACTED>`).
 pub fn redact_relay_for_readonly(relay: &PreAccelRelay) -> PreAccelRelay {
     let mut out = relay.clone();
     out.server = redact_ip_or_host(&relay.server);
+    if let Some(ref sni) = out.sni {
+        if !sni.trim().is_empty() {
+            out.sni = Some(redact_ip_or_host(sni));
+        }
+    }
     if !out.password.is_empty() {
         out.password = "<REDACTED>".to_string();
     }
@@ -301,13 +457,47 @@ fn is_node_raw_credential_key(key: &str) -> bool {
         || lower.ends_with("-private-key")
 }
 
+/// Host/SNI keys masked via `redact_ip_or_host` inside `ProxyNode.raw_config` during read-only
+/// redaction (covers `server`, `sni`, `servername`, `plugin-opts.host`, `ws-opts.headers.Host`,
+/// `h2-opts.host`, and `http-opts.headers.Host`).
+fn is_node_raw_host_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "server"
+            | "sni"
+            | "servername"
+            | "server-name"
+            | "server_name"
+            | "host"
+            | "obfs-host"
+            | "obfs_host"
+    )
+}
+
 fn redact_json_node_value(val: &mut serde_json::Value) {
     match val {
         serde_json::Value::Object(map) => {
             for (k, v) in map.iter_mut() {
-                if k.eq_ignore_ascii_case("server") {
-                    if let serde_json::Value::String(s) = v {
-                        *s = redact_ip_or_host(s);
+                if is_node_raw_host_key(k) {
+                    match v {
+                        serde_json::Value::String(s) => {
+                            if !s.trim().is_empty() {
+                                *s = redact_ip_or_host(s);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for item in arr.iter_mut() {
+                                if let serde_json::Value::String(s) = item {
+                                    if !s.trim().is_empty() {
+                                        *s = redact_ip_or_host(s);
+                                    }
+                                } else {
+                                    redact_json_node_value(item);
+                                }
+                            }
+                        }
+                        _ => redact_json_node_value(v),
                     }
                     continue;
                 }
@@ -340,9 +530,9 @@ fn redact_json_node_value(val: &mut serde_json::Value) {
 }
 
 /// Return a sanitized read-only clone of `ProxyNode`:
-/// masks `server` and recursively redacts all credential keys (`password`, `uuid`, `token`,
-/// `private-key`, `auth-str`, `obfs-password`, `psk`, `pbk`, `sid`, `secret`, `username`, etc.)
-/// and `server` inside `raw_config`.
+/// masks `server`, `sni`, `servername`, `host` (`plugin-opts.host`, `ws-opts.headers.Host`, etc.)
+/// and recursively redacts all credential keys (`password`, `uuid`, `token`, `private-key`,
+/// `auth-str`, `obfs-password`, `psk`, `pbk`, `sid`, `secret`, `username`, etc.) inside `raw_config`.
 pub fn redact_node_for_readonly(node: &ProxyNode) -> ProxyNode {
     let mut out = node.clone();
     out.server = redact_ip_or_host(&node.server);
@@ -1279,6 +1469,221 @@ fn redact_public_ipv6(input: &str) -> String {
     out
 }
 
+/// Public connectivity, DoH, and well-known service domain suffixes preserved verbatim in dial/connect
+/// error logs so diagnostic clues stay useful without exposing private upstream proxy domains.
+const SAFE_PUBLIC_LOG_DOMAIN_SUFFIXES: &[&str] = &[
+    "localhost",
+    "local",
+    "gstatic.com",
+    "cloudflare.com",
+    "cloudflare-dns.com",
+    "dns.google",
+    "google.com",
+    "googleapis.com",
+    "alidns.com",
+    "doh.pub",
+    "dns.pub",
+    "hicloud.com",
+    "miui.com",
+    "github.com",
+    "githubusercontent.com",
+    "openai.com",
+    "chatgpt.com",
+    "anthropic.com",
+    "claude.ai",
+    "apple.com",
+    "microsoft.com",
+    "msftconnecttest.com",
+];
+
+/// File extensions excluded from domain detection in dial/connect error fragments.
+const NON_DOMAIN_FILE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "mjs", "cjs", "json", "yaml", "yml", "toml", "log", "txt", "md",
+    "exe", "dll", "sys", "so", "dylib", "zip", "gz", "tar", "db", "sqlite", "mmdb", "dat",
+    "conf", "cfg", "ini", "env", "pem", "crt", "key", "pid", "lock", "tmp", "bak", "nsh", "nsi",
+    "kt", "go", "py", "sh", "ps1",
+];
+
+const DIAL_ERROR_TRIGGERS: &[&str] = &[
+    "dial tcp4",
+    "dial tcp6",
+    "dial udp4",
+    "dial udp6",
+    "dial tcp",
+    "dial udp",
+    "connect error",
+    "connect failed",
+    "dial error",
+    "dial failed",
+];
+
+fn is_safe_public_log_domain(domain: &str) -> bool {
+    let lower = domain.to_ascii_lowercase();
+    SAFE_PUBLIC_LOG_DOMAIN_SUFFIXES.iter().any(|suffix| {
+        lower == *suffix
+            || (lower.len() > suffix.len()
+                && lower.ends_with(suffix)
+                && lower.as_bytes()[lower.len() - suffix.len() - 1] == b'.')
+    })
+}
+
+fn is_redactable_upstream_domain(candidate: &str) -> bool {
+    if candidate.len() < 4
+        || candidate.len() > 253
+        || candidate.starts_with('.')
+        || candidate.ends_with('.')
+        || candidate.contains("..")
+    {
+        return false;
+    }
+    let Some((prefix, tld)) = candidate.rsplit_once('.') else {
+        return false;
+    };
+    if tld.len() < 2
+        || tld.len() > 12
+        || !tld.bytes().all(|b| b.is_ascii_alphabetic())
+    {
+        return false;
+    }
+    let tld_lower = tld.to_ascii_lowercase();
+    if NON_DOMAIN_FILE_EXTENSIONS.contains(&tld_lower.as_str()) {
+        return false;
+    }
+    let mut has_alpha_in_prefix = false;
+    for label in prefix.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            return false;
+        }
+        if label.bytes().any(|b| b.is_ascii_alphabetic()) {
+            has_alpha_in_prefix = true;
+        }
+    }
+    if !has_alpha_in_prefix {
+        return false;
+    }
+    !is_safe_public_log_domain(candidate)
+}
+
+fn match_dial_error_trigger(bytes: &[u8], i: usize) -> Option<usize> {
+    let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+    if !prev_ok {
+        return None;
+    }
+    for &trigger in DIAL_ERROR_TRIGGERS {
+        let tlen = trigger.len();
+        if i + tlen < bytes.len()
+            && bytes[i..i + tlen].eq_ignore_ascii_case(trigger.as_bytes())
+        {
+            let next = bytes[i + tlen];
+            if matches!(next, b' ' | b'\t' | b':' | b'=' | b'(') {
+                return Some(tlen);
+            }
+        }
+    }
+    None
+}
+
+fn redact_domains_in_dial_fragment(fragment: &str) -> String {
+    let bytes = fragment.as_bytes();
+    let mut out = String::with_capacity(fragment.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let prev_ok = i == 0
+            || !(bytes[i - 1].is_ascii_alphanumeric()
+                || matches!(bytes[i - 1], b'.' | b'_' | b'-' | b'*' | b'/'))
+            || (i >= 3 && &bytes[i - 3..i] == b"://");
+
+        if prev_ok && bytes[i].is_ascii_alphanumeric() {
+            let mut end = i;
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || matches!(bytes[end], b'.' | b'-'))
+            {
+                end += 1;
+            }
+            let next_ok = end == bytes.len()
+                || !(bytes[end].is_ascii_alphanumeric()
+                    || matches!(bytes[end], b'.' | b'_' | b'-' | b'*'));
+            if next_ok {
+                let candidate = &fragment[i..end];
+                if is_redactable_upstream_domain(candidate) {
+                    out.push_str(&redact_bare_host_or_ipv4(candidate));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+
+        if let Some(ch) = fragment[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
+/// Mask non-allowlisted upstream proxy domains exposed inside dial/connect error logs
+/// (e.g. `dial tcp hk01.demo-vendor.com:443: i/o timeout` -> `dial tcp ***.com:443: i/o timeout`)
+/// while preserving safe public connectivity/DoH domains, JSON syntax, and filenames.
+fn redact_dial_error_domains(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if let Some(tlen) = match_dial_error_trigger(bytes, i) {
+            out.push_str(&input[i..i + tlen]);
+            let frag_start = i + tlen;
+            let mut frag_end = frag_start;
+            while frag_end < bytes.len() {
+                let b = bytes[frag_end];
+                if matches!(b, b'\r' | b'\n') {
+                    break;
+                }
+                if b == b'\\' && frag_end + 1 < bytes.len() {
+                    frag_end += 2;
+                    continue;
+                }
+                if b == b'"' {
+                    // Stop before closing quote of a JSON string value so sibling JSON keys stay untouched.
+                    let after_q = frag_end + 1;
+                    let mut ws = after_q;
+                    while ws < bytes.len() && bytes[ws] == b' ' {
+                        ws += 1;
+                    }
+                    if ws == bytes.len() || matches!(bytes[ws], b',' | b'}' | b']' | b':') {
+                        break;
+                    }
+                }
+                frag_end += 1;
+            }
+            let fragment = &input[frag_start..frag_end];
+            out.push_str(&redact_domains_in_dial_fragment(fragment));
+            i = frag_end;
+            continue;
+        }
+
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1588,5 +1993,143 @@ rules:
         let parsed: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&clean).expect("redacted YAML must remain valid YAML");
         assert_eq!(parsed["secret"], serde_yaml_ng::Value::String("<REDACTED>".into()));
+    }
+
+    #[test]
+    fn sanitize_log_line_masks_dial_and_connect_error_upstream_domains_only() {
+        let raw_dial = "2026-11-26T01:00:00Z WARN [proxy] dial tcp hk01.demo-vendor.com:443: i/o timeout";
+        let clean_dial = sanitize_log_line(raw_dial);
+        assert_eq!(
+            clean_dial,
+            "2026-11-26T01:00:00Z WARN [proxy] dial tcp ***.com:443: i/o timeout"
+        );
+        assert_eq!(sanitize_log_line(&clean_dial), clean_dial);
+
+        let raw_udp = "ERROR dial udp [sg-edge.test-relay.net]:8443: connect: connection refused";
+        let clean_udp = sanitize_log_line(raw_udp);
+        assert_eq!(
+            clean_udp,
+            "ERROR dial udp [***.net]:8443: connect: connection refused"
+        );
+
+        let raw_lookup =
+            "WARN dial tcp: lookup jp-02.demo-cloud.org on 223.5.5.5:53: no such host";
+        let clean_lookup = sanitize_log_line(raw_lookup);
+        assert_eq!(
+            clean_lookup,
+            "WARN dial tcp: lookup ***.org on 223.5.5.5:53: no such host"
+        );
+
+        let raw_conn_err = "ERROR connect error: us-west.demo-node.io:443: EOF";
+        let clean_conn_err = sanitize_log_line(raw_conn_err);
+        assert_eq!(clean_conn_err, "ERROR connect error: ***.io:443: EOF");
+
+        // Allowlisted public connectivity/DoH domains and file extensions must stay intact.
+        let raw_allowlisted =
+            "WARN connect error: dial tcp cp.cloudflare.com:443: timeout (see config.json)";
+        let clean_allowlisted = sanitize_log_line(raw_allowlisted);
+        assert!(clean_allowlisted.contains("cp.cloudflare.com:443"));
+        assert!(clean_allowlisted.contains("config.json"));
+
+        // JSON structure must remain valid when a dial error appears inside a JSON string field.
+        let raw_json = r#"{"msg":"dial tcp node.demo-vendor.com:443: timeout","ok":false}"#;
+        let clean_json = sanitize_log_line(raw_json);
+        let parsed: serde_json::Value = serde_json::from_str(&clean_json).expect("valid JSON");
+        assert_eq!(parsed["msg"], "dial tcp ***.com:443: timeout");
+        assert_eq!(parsed["ok"], false);
+    }
+
+    #[test]
+    fn redact_node_for_readonly_masks_sni_servername_plugin_host_and_ws_host() {
+        let node = ProxyNode {
+            id: "node-sni-1".into(),
+            sub_id: "sub-demo".into(),
+            name: "Demo-SNI".into(),
+            protocol: "vless".into(),
+            server: "edge01.demo-provider.net".into(),
+            port: 443,
+            raw_config: json!({
+                "name": "Demo-SNI",
+                "type": "vless",
+                "server": "edge01.demo-provider.net",
+                "port": 443,
+                "uuid": "00000000-0000-4000-8000-000000000001",
+                "sni": "sni.demo-upstream.com",
+                "servername": "tls.demo-upstream.org",
+                "plugin-opts": {
+                    "mode": "websocket",
+                    "host": "cdn.demo-plugin.io"
+                },
+                "ws-opts": {
+                    "path": "/ws",
+                    "headers": {
+                        "Host": "ws.demo-front.net"
+                    }
+                },
+                "h2-opts": {
+                    "host": ["h2a.demo-front.com", "h2b.demo-front.org"]
+                }
+            }),
+            ..ProxyNode::default()
+        };
+
+        let safe = redact_node_for_readonly(&node);
+        assert_eq!(safe.server, "***.net");
+        assert_eq!(safe.raw_config["server"], "***.net");
+        assert_eq!(safe.raw_config["sni"], "***.com");
+        assert_eq!(safe.raw_config["servername"], "***.org");
+        assert_eq!(safe.raw_config["plugin-opts"]["host"], "***.io");
+        assert_eq!(safe.raw_config["plugin-opts"]["mode"], "websocket");
+        assert_eq!(safe.raw_config["ws-opts"]["headers"]["Host"], "***.net");
+        assert_eq!(safe.raw_config["ws-opts"]["path"], "/ws");
+        assert_eq!(
+            safe.raw_config["h2-opts"]["host"],
+            json!(["***.com", "***.org"])
+        );
+
+        let serialized = serde_json::to_string(&safe).unwrap();
+        for leaked in [
+            "demo-provider",
+            "demo-upstream",
+            "demo-plugin",
+            "demo-front",
+        ] {
+            assert!(!serialized.contains(leaked), "leaked `{leaked}` in {serialized}");
+        }
+    }
+
+    #[test]
+    fn redact_path_for_display_masks_long_numeric_account_directories() {
+        let qq_path = concat!(
+            r"C:\",
+            r"Users\Administrator\Documents\Tencent Files\0000001234\nt_qq\QQ.exe"
+        );
+        assert_eq!(
+            redact_path_for_display(qq_path),
+            r"C:\Users\<USER>\Documents\Tencent Files\***\nt_qq\QQ.exe"
+        );
+
+        let prefixed_acct = concat!(
+            r"C:\",
+            r"Users\Administrator\AppData\Roaming\DemoGame\uid_0000998877\bin\launcher.exe"
+        );
+        assert_eq!(
+            redact_path_for_display(prefixed_acct),
+            r"C:\Users\<USER>\AppData\Roaming\DemoGame\uid_***\bin\launcher.exe"
+        );
+
+        let unix_acct = concat!("/", "Users/catcloud/Library/Containers/0000123456/Data/app");
+        assert_eq!(
+            redact_path_for_display(unix_acct),
+            "/Users/<USER>/Library/Containers/***/Data/app"
+        );
+
+        // Short numeric segments (< 6 digits) and filenames with version numbers must be preserved.
+        let normal_path = r"C:\Program Files\CatCloud\v12345\bin\catcloud-20261126.exe";
+        assert_eq!(redact_path_for_display(normal_path), normal_path);
+
+        // Idempotent when called twice.
+        let once = redact_path_for_display(qq_path);
+        assert_eq!(redact_path_for_display(&once), once);
     }
 }

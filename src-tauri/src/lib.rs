@@ -1,5 +1,6 @@
 pub mod app_log;
 pub mod commands;
+pub mod lan_sync;
 pub mod lifecycle;
 pub mod shortcuts;
 pub mod tray;
@@ -255,6 +256,13 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::export_share_bundle_dialog,
             commands::pick_and_preview_share_bundle,
             commands::import_share_bundle,
+            commands::start_sync_send_session,
+            commands::cancel_sync_send_session,
+            commands::export_encrypted_sync_file,
+            commands::start_sync_receive_listener,
+            commands::cancel_sync_receive_session,
+            commands::preview_sync_source,
+            commands::apply_sync_import,
             commands::refresh_subscription,
             commands::refresh_all_subscriptions,
             commands::list_preaccel_relays,

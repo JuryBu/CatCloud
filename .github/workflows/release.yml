@@ -209,6 +209,11 @@ jobs:
             version = "${{ needs.preflight.outputs.version }}"
             bundle = @{
               createUpdaterArtifacts = $enableUpdater
+              windows = @{
+                nsis = @{
+                  installerHooks = "./windows/hooks-${{ matrix.arch }}.nsh"
+                }
+              }
               resources = @{
                 "resources/bin/mihomo.exe" = "resources/bin/mihomo.exe"
                 "resources/cli/catcloud.exe" = "resources/cli/catcloud.exe"

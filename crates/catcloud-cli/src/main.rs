@@ -431,6 +431,23 @@ mod tests {
                 "catcloud",
                 "share",
                 "inspect",
+                "friend.zip",
+                "--summary",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "inspect",
+                "--file",
+                "friend.zip",
+                "--summary",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "inspect",
                 "--file",
                 "friend.zip",
                 "--json",
@@ -688,5 +705,134 @@ mod tests {
         let leftover = std::fs::read_dir(&dir).unwrap().count();
         assert_eq!(leftover, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_parses_share_send_and_receive_subcommands_with_safe_defaults() {
+        let cases: &[&[&str]] = &[
+            &[
+                "catcloud",
+                "share",
+                "send",
+                "--all-nodes",
+                "--all-relays",
+                "--ttl",
+                "300",
+                "--allow-multiple",
+                "--endpoint",
+                "http://100.64.0.2:18080",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "send",
+                "--sub-id",
+                "sub-a",
+                "--node-ids",
+                "n1,n2",
+                "--relay-ids",
+                "r1",
+                "--no-groups",
+                "--ccsync-output",
+                "backup.ccsync",
+                "--no-qr",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "send",
+                "--all-nodes",
+                "--push-uri",
+                "catcloud://sync/v1?role=push&hosts=127.0.0.1&port=18080&sid=0123456789abcdef#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "send",
+                "--all-nodes",
+                "--push-addr",
+                "127.0.0.1:18080",
+                "--pin",
+                "123456",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "receive",
+                "catcloud://sync/v1?role=pull&hosts=127.0.0.1&port=18080&sid=0123456789abcdef#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "receive",
+                "--addr",
+                "127.0.0.1:18080",
+                "--pin",
+                "654321",
+                "--dry-run",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "receive",
+                "--ccsync",
+                "pack.ccsync",
+                "--key",
+                "catcloud://sync/v1?role=file_key#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "--apply",
+                "--target-sub",
+                "sub-main",
+                "--mode",
+                "merge",
+                "--no-groups",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "share",
+                "receive",
+                "--listen",
+                "--bind",
+                "127.0.0.1",
+                "--port",
+                "0",
+                "--ttl",
+                "120",
+                "--no-qr",
+                "--json",
+            ],
+        ];
+        for argv in cases {
+            let parsed = Cli::try_parse_from(*argv);
+            assert!(parsed.is_ok(), "failed to parse {argv:?}: {parsed:?}");
+        }
+
+        // Verify `share receive` defaults to read-only dry-run (apply == false).
+        let default_recv = Cli::try_parse_from([
+            "catcloud",
+            "share",
+            "receive",
+            "--addr",
+            "127.0.0.1:18080",
+            "--pin",
+            "123456",
+        ])
+        .expect("default receive");
+        let Commands::Share {
+            action: commands::ShareCommand::Receive(recv_args),
+        } = default_recv.command
+        else {
+            panic!("expected Share::Receive");
+        };
+        assert!(!recv_args.apply);
+        assert!(!recv_args.no_groups);
+        assert!(!recv_args.no_nodes);
+        assert!(!recv_args.no_relays);
     }
 }

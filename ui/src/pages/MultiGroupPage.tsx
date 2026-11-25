@@ -3155,17 +3155,23 @@ export function MultiGroupPage() {
                               {Math.round(liveHintLatencyMs)} ms
                             </span>
                             {snap?.up_mbps !== null && snap?.up_mbps !== undefined && (
-                              <span className="cc-mono cc-tabular text-[10px] text-[var(--coral)]">
-                                ↑{snap.up_mbps.toFixed(1)}M
+                              <span
+                                title="实测上传速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                                className="cc-mono cc-tabular text-[10px] text-[var(--coral)]"
+                              >
+                                ↑{snap.up_mbps.toFixed(1)} Mbps
                               </span>
                             )}
                             {snap?.down_mbps !== null && snap?.down_mbps !== undefined && (
-                              <span className="cc-mono cc-tabular text-[10px] text-[var(--sky)]">
+                              <span
+                                title="实测下载速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                                className="cc-mono cc-tabular text-[10px] text-[var(--sky)]"
+                              >
                                 ↓
                                 {snap.down_mbps >= 100
                                   ? Math.round(snap.down_mbps)
-                                  : snap.down_mbps.toFixed(1)}
-                                M
+                                  : snap.down_mbps.toFixed(1)}{" "}
+                                Mbps
                               </span>
                             )}
                             {gateEval.hasMeasuredFailure && (
@@ -3199,13 +3205,19 @@ export function MultiGroupPage() {
                               </span>
                             )}
                             {snap.up_mbps !== null && (
-                              <span className="cc-mono cc-tabular text-[10px] text-[var(--coral)]">
-                                ↑{snap.up_mbps.toFixed(1)}M
+                              <span
+                                title="实测上传速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                                className="cc-mono cc-tabular text-[10px] text-[var(--coral)]"
+                              >
+                                ↑{snap.up_mbps.toFixed(1)} Mbps
                               </span>
                             )}
                             {snap.down_mbps !== null && (
-                              <span className="cc-mono cc-tabular text-[10px] text-[var(--sky)]">
-                                ↓{snap.down_mbps >= 100 ? Math.round(snap.down_mbps) : snap.down_mbps.toFixed(1)}M
+                              <span
+                                title="实测下载速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                                className="cc-mono cc-tabular text-[10px] text-[var(--sky)]"
+                              >
+                                ↓{snap.down_mbps >= 100 ? Math.round(snap.down_mbps) : snap.down_mbps.toFixed(1)} Mbps
                               </span>
                             )}
                             {gateEval.hasMeasuredFailure && (

@@ -582,6 +582,14 @@ catcloud probe remove --id custom_api --json
 ```
 
 > 若缺失本机 Mihomo 核心，CLI 会诚实返回 `executed: false` 与官方校验下载指引；所有临时测速核心结束后立即回收，零僵尸残留。
+
+## 四、专用客户端实时捕捉结果为空：4 条高频排查
+
+当通过「节点与测速 → 订阅与导入」或 `catcloud node attach-process` 从运行中的专用客户端实时捕捉节点却返回 0 节点时，按以下 4 点逐一核查：
+1. **仅点了「更新订阅」未点「连接/开启代理」**：多数专用客户端只在真正开启连接时才会把运行时明文配置落盘或启动本地控制口，请先在原客户端点击一次连接再执行捕捉。
+2. **选错了前端外壳进程而非底层代理内核进程**：桌面客户端常拆分为 Electron/UI 外壳进程与底层 `mihomo` / `sing-box` / `xray` 代理内核进程，请在进程列表中选择实际携带配置参数或监听本地端口的底层代理内核进程。
+3. **目标客户端以管理员权限运行导致普通权限跨权读取受限**：在 Windows 上，普通权限的猫猫云梯无法读取高完整性（管理员权限）进程的完整命令行与工作目录；请以同级权限运行（或在普通权限下启动目标客户端）后重试。
+4. **遇到双层加密闭源客户端时的兜底路径**：若原客户端全程内存/本地双层加密且未暴露明文配置或标准控制口，可先借原软件保持联网，直接打开对应服务商官网用户中心复制通用订阅链接，再粘贴到猫猫云梯「节点与测速 → 订阅与导入」导入。
 "###;
 
 const ZH_DOC_05_ROUTING_CONNS: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
@@ -938,6 +946,13 @@ catcloud probe run --tier l1 --json
 catcloud probe add --id custom_api --name "Custom API Upload" --kind upload --url https://example.com/up --json
 catcloud probe remove --id custom_api --json
 ```
+
+## 4. Live Capture Returned 0 Nodes: 4 High-Frequency Checks
+When live capture from a dedicated third-party client under `Nodes & Speed → Subs & Import` (or `catcloud node attach-process`) returns empty results, check these 4 causes first:
+1. **Updated subscription without clicking Connect**: Many dedicated clients only materialize their runtime config file or local controller when you actually toggle Connect/Start Proxy—click Connect once before capturing.
+2. **Selected the UI shell process instead of the underlying proxy core**: Desktop apps often split into a frontend Electron/GUI shell and a child proxy core (`mihomo` / `sing-box` / `xray`); attach to the core process carrying config flags or listening on local ports.
+3. **Cross-privilege block when the target client runs as Administrator**: On Windows, a standard-privilege CatCloud process cannot read full command lines or working directories of an elevated target process; match privilege levels (or run the target client without elevation) and retry.
+4. **Fallback for double-encrypted closed clients**: If the vendor app encrypts both disk and memory payloads without exposing plaintext YAML or a standard controller API, stay connected with that app briefly, open your provider's web dashboard to copy the standard subscription URL, and import it directly in `Nodes & Speed → Subs & Import`.
 "###;
 
 const EN_DOC_05_ROUTING_CONNS: &str = r###"> [LANGUAGE LOCK] Reply strictly in English throughout this conversation and use CatCloud's exact UI page/button names.
@@ -1078,7 +1093,12 @@ fn ja_chapter_intro(canonical_id: &str) -> &'static str {
         }
         NODES_PROBES_DOC_ID => {
             "# 04 · ノードと速度・購読・1→2→3 捕捉 & 3 段階速度テスト\n\n\
-             省通信 L1・完全 L2・60 秒キープアライブの 3 段階分離テスト、既存グループ更新/名前変更/統合マージ、`sub list/refresh/rename/merge/remove`、`probe add --name` 必須引数を解説します。"
+             省通信 L1・完全 L2・60 秒キープアライブの 3 段階分離テスト、既存グループ更新/名前変更/統合マージ、`sub list/refresh/rename/merge/remove`、`probe add --name` 必須引数を解説します。\n\n\
+             ## 専用クライアントのリアルタイム捕捉が空になる場合の 4 つの頻出確認点\n\
+             1. **購読更新のみで「接続」を押していない**：多くの専用クライアントは実際に接続開始するまで実行時設定をディスクへ書き出しません。一度接続してから捕捉してください。\n\
+             2. **フロントエンド UI プロセスではなく基盤プロキシコアを選択する**：デスクトップアプリは GUI 外殻プロセスと基盤コア（`mihomo` / `sing-box` / `xray`）が分離しているため、設定引数を持つコア側を選んでください。\n\
+             3. **管理者権限で起動された対象クライアントによるクロス権限制限**：通常権限の CatCloud は昇格済みプロセスのコマンドラインを読み取れません。権限レベルを揃えて再試行してください。\n\
+             4. **二重暗号化クライアント時のフォールバック経路**：平文設定や標準コントローラを公開しない専用アプリの場合は、元のソフトで接続したまま公式サイトのマイページを開き、標準購読リンクをコピーして「ノードと速度 → 購読とインポート」へ直接取り込んでください。"
         }
         ROUTING_CONNS_DOC_ID => {
             "# 05 · ルールと接続・QUIC 制御 & リアルタイム接続診断\n\n\
@@ -1115,7 +1135,12 @@ fn ru_chapter_intro(canonical_id: &str) -> &'static str {
         }
         NODES_PROBES_DOC_ID => {
             "# 04 · «Узлы и тест», подписки, захват 1→2→3 и 3-уровневый тест скорости\n\n\
-             Изолированные тесты L1/L2/60s Keep-Alive, обновление/переименование/слияние групп подписок, `sub list/refresh/rename/merge/remove` и обязательный параметр `--name` у `probe add`."
+             Изолированные тесты L1/L2/60s Keep-Alive, обновление/переименование/слияние групп подписок, `sub list/refresh/rename/merge/remove` и обязательный параметр `--name` у `probe add`.\n\n\
+             ## 4 частые причины пустого захвата (0 узлов) из стороннего клиента\n\
+             1. **Нажали только «Обновить подписку», но не «Подключиться»**: многие клиенты записывают рабочий конфиг на диск или открывают локальный контроллер только после фактического подключения — сначала нажмите подключение.\n\
+             2. **Выбрана оболочка GUI вместо процесса ядра прокси**: настольные клиенты часто разделены на фронтенд-оболочку и дочернее ядро (`mihomo` / `sing-box` / `xray`) — выбирайте именно процесс ядра с параметрами конфигурации.\n\
+             3. **Целевой клиент запущен от имени администратора**: при обычных правах Windows ограничивает чтение командной строки и каталога повышенного процесса — уравняйте права и повторите попытку.\n\
+             4. **Резервный путь для клиентов с двойным шифрованием**: если приложение шифрует конфиг без открытого YAML и стандартного контроллера, оставайтесь в сети через него, откройте личный кабинет провайдера на сайте, скопируйте обычную ссылку подписки и импортируйте её в «Узлы и тест → Подписки и импорт»."
         }
         ROUTING_CONNS_DOC_ID => {
             "# 05 · «Правила и сети», политика QUIC и диагностика соединений\n\n\
@@ -1360,6 +1385,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
             ]),
             rollback_and_troubleshooting: svec(&[
                 "订阅拉取异常或解析出 0 节点时原子拒载，原节点与分组保持不变；1→2→3 捕捉更新已有组支持保留最新、整合去重或取消。",
+                "专用客户端实时捕捉为空时重点排查：① 是否仅更新订阅未点击连接；② 是否误选前端外壳而非底层代理内核进程；③ 目标客户端是否以管理员权限运行致跨权读取受限；④ 双层加密客户端可借原软件联网去官网复制订阅链接导入。",
                 "要清理某个订阅来源，直接在「订阅与导入」删除对应组或运行 `catcloud sub remove <sub_id> --json`。",
             ]),
             contract_example: r#"{"schema":"catcloud-adapter/v1","nodes":[{"name":"Example-SG-01 1x","type":"trojan","server":"198.51.100.20","port":443,"password":"<PLACEHOLDER>"}]}"#.into(),
@@ -1531,6 +1557,7 @@ fn build_en_docs() -> Vec<AgentModuleDoc> {
             ]),
             rollback_and_troubleshooting: svec(&[
                 "Failed refreshes or 0-node payloads are atomically rejected without touching existing nodes.",
+                "If live capture from a dedicated client returns 0 nodes: (1) click Connect, not just Update Subscription; (2) pick the underlying proxy core process rather than the UI shell; (3) match elevation if the target client runs as Administrator; (4) for double-encrypted closed clients, stay connected via that app to copy the subscription URL from the provider dashboard.",
             ]),
             contract_example: r#"{"schema":"catcloud-adapter/v1","nodes":[{"name":"Example-SG-01 1x","type":"trojan","server":"198.51.100.20","port":443,"password":"<PLACEHOLDER>"}]}"#.into(),
         },
@@ -2178,6 +2205,20 @@ mod tests {
         assert!(nodes_md.contains("catcloud sub list --json"));
         assert!(nodes_md.contains("catcloud sub rename <id> --name <new_name> --json"));
         assert!(nodes_md.contains("catcloud sub merge --source <src_id> --target <dst_id> --json"));
+        assert!(nodes_md.contains("专用客户端实时捕捉结果为空：4 条高频排查"));
+        assert!(nodes_md.contains("双层加密"));
+
+        let en_nodes = export_agent_docs_with_lang(NODES_PROBES_DOC_ID, false, "en").unwrap();
+        assert!(en_nodes.contains("Live Capture Returned 0 Nodes: 4 High-Frequency Checks"));
+        assert!(en_nodes.contains("double-encrypted"));
+
+        let ja_nodes = export_agent_docs_with_lang(NODES_PROBES_DOC_ID, false, "ja").unwrap();
+        assert!(ja_nodes.contains("専用クライアントのリアルタイム捕捉が空になる場合の 4 つの頻出確認点"));
+        assert!(ja_nodes.contains("二重暗号化"));
+
+        let ru_nodes = export_agent_docs_with_lang(NODES_PROBES_DOC_ID, false, "ru").unwrap();
+        assert!(ru_nodes.contains("4 частые причины пустого захвата (0 узлов) из стороннего клиента"));
+        assert!(ru_nodes.contains("двойным шифрованием"));
 
         let net_md = export_agent_docs(NETWORK_LIFECYCLE_DOC_ID, false).unwrap();
         assert!(net_md.contains("catcloud config backup"));

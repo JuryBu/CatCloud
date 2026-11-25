@@ -2201,21 +2201,27 @@ export function PreAccelPage() {
                         : "待测速"}
                     </div>
                     {hasUpSpeed || hasDownSpeed ? (
-                      <div className="mt-0.5 flex items-center justify-end gap-1.5 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold">
+                      <div
+                        title="实测中转速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                        className="mt-0.5 flex items-center justify-end gap-1.5 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold"
+                      >
                         {hasUpSpeed && (
                           <span className="text-[var(--coral)]">
-                            ↑{relay.last_up_mbps!.toFixed(1)} M
+                            ↑{relay.last_up_mbps!.toFixed(1)} Mbps
                           </span>
                         )}
                         {hasDownSpeed && (
                           <span className="text-[var(--sky)]">
-                            ↓{relay.last_down_mbps!.toFixed(1)} M
+                            ↓{relay.last_down_mbps!.toFixed(1)} Mbps
                           </span>
                         )}
                       </div>
                     ) : hasLegacySpeed ? (
-                      <div className="mt-0.5 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold text-[var(--coral)]">
-                        ↑{relay.last_mbps!.toFixed(1)} M
+                      <div
+                        title="实测中转上传速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                        className="mt-0.5 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold text-[var(--coral)]"
+                      >
+                        ↑{relay.last_mbps!.toFixed(1)} Mbps
                       </div>
                     ) : (
                       <div className="mt-0.5 text-[10px] text-[var(--muted)]">

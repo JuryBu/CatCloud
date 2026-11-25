@@ -22,6 +22,7 @@ import {
   Pencil,
   Play,
   Plus,
+  QrCode,
   RefreshCw,
   RotateCcw,
   Search,
@@ -58,7 +59,7 @@ import {
   PaginationBar,
 } from "../components/ContinentRegionFilter";
 import { GroupMembershipPopover } from "../components/GroupMembershipPopover";
-import { ShareBundleModal } from "../components/ShareBundleModal";
+import { ShareBundleModal, type ShareBundleTransport } from "../components/ShareBundleModal";
 import { normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
 import {
@@ -3312,6 +3313,7 @@ export function NodesSubsPage({
     defaultTab: "nodes" | "relays";
     initialNodeIds?: string[];
     defaultPackName?: string;
+    initialTransport?: ShareBundleTransport;
   }>({
     open: false,
     mode: "export",
@@ -3331,13 +3333,18 @@ export function NodesSubsPage({
   const [mergeError, setMergeError] = useState<string | null>(null);
 
   const openShareExport = useCallback(
-    (initialNodeIds?: string[], defaultPackName?: string) => {
+    (
+      initialNodeIds?: string[],
+      defaultPackName?: string,
+      initialTransport: ShareBundleTransport = "zip"
+    ) => {
       setShareModalState({
         open: true,
         mode: "export",
         defaultTab: "nodes",
         initialNodeIds,
         defaultPackName,
+        initialTransport,
       });
     },
     []
@@ -3348,6 +3355,7 @@ export function NodesSubsPage({
       open: true,
       mode: "import",
       defaultTab: "nodes",
+      initialTransport: "zip",
     });
   }, []);
 
@@ -5228,6 +5236,16 @@ export function NodesSubsPage({
 
             <button
               type="button"
+              onClick={() => openShareExport(undefined, undefined, "lan_send")}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+              title={dict.sync.entryBtn}
+            >
+              <QrCode className="h-3.5 w-3.5" />
+              <span>{dict.sync.entryBtn}</span>
+            </button>
+
+            <button
+              type="button"
               disabled={subscriptions.length < 2}
               onClick={openMergeModal}
               title={
@@ -6332,6 +6350,7 @@ export function NodesSubsPage({
         defaultTab={shareModalState.defaultTab}
         initialNodeIds={shareModalState.initialNodeIds}
         defaultPackName={shareModalState.defaultPackName}
+        initialTransport={shareModalState.initialTransport}
         allowModeSwitch
         onClose={() =>
           setShareModalState((prev) => ({

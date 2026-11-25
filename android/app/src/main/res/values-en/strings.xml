@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">CatCloud</string>
+    <string name="vpn_notification_channel_name">CatCloud Tunnel</string>
+    <string name="vpn_notification_channel_desc">Keeps the CatCloud VPN tunnel active in the background</string>
+    <string name="vpn_notification_title_running">CatCloud Connected</string>
+    <string name="vpn_notification_title_starting">Starting CatCloud…</string>
+    <string name="vpn_notification_action_stop">Disconnect</string>
+</resources>

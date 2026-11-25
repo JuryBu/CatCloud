@@ -1,0 +1,379 @@
+name: Android CI
+
+on:
+  push:
+    paths:
+      - "android/**"
+      - ".github/workflows/android-ci.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - ".github/workflows/android-ci.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: android-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-android:
+    name: Android arm64-v8a Build, Unit Tests & Size Gate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Gate 1 - Run public repository sanitization gate
+        run: node scripts/ci/check_public_sanitization.mjs
+
+      - name: Setup Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Go 1.25.x
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: android/mihomo-bridge/go.mod
+
+      - name: Setup Gradle 8.11.1 (wrapper-free)
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+
+      - name: Gate 2 - Locate Android NDK and verify arm64 clang/readelf
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_DIR="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-}}}"
+          if [[ -z "$NDK_DIR" || ! -d "$NDK_DIR" ]]; then
+            SDK_BASE="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+            if [[ -d "$SDK_BASE/ndk" ]]; then
+              NDK_DIR="$(find "$SDK_BASE/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+            fi
+          fi
+          if [[ -z "$NDK_DIR" || ! -d "$NDK_DIR" ]]; then
+            echo "ERROR: Could not locate Android NDK directory on runner." >&2
+            exit 1
+          fi
+
+          TOOLCHAIN_BIN="$NDK_DIR/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC_BIN="$TOOLCHAIN_BIN/aarch64-linux-android26-clang"
+          READELF_BIN="$TOOLCHAIN_BIN/llvm-readelf"
+          NM_BIN="$TOOLCHAIN_BIN/llvm-nm"
+
+          for bin in "$CC_BIN" "$READELF_BIN" "$NM_BIN"; do
+            if [[ ! -x "$bin" ]]; then
+              echo "ERROR: Required NDK tool missing or not executable: $bin" >&2
+              exit 1
+            fi
+          done
+
+          echo "Resolved NDK_DIR=$NDK_DIR"
+          "$CC_BIN" --version | head -n 2
+          "$READELF_BIN" --version | head -n 2
+
+          {
+            echo "NDK_DIR=$NDK_DIR"
+            echo "ANDROID_ARM64_CC=$CC_BIN"
+            echo "ANDROID_LLVM_READELF=$READELF_BIN"
+            echo "ANDROID_LLVM_NM=$NM_BIN"
+          } >> "$GITHUB_ENV"
+
+      - name: Gate 3 - Resolve Go dependencies and verify mihomo v1.19.16 API signatures
+        id: go_deps
+        working-directory: android/mihomo-bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          go version
+          if [[ ! -f go.sum ]]; then
+            echo "go.sum not found; running go mod tidy to bootstrap reproducible lockfile."
+            go mod tidy
+            echo "generated_go_sum=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "go.sum found; enforcing -mod=readonly."
+            go mod download
+            echo "generated_go_sum=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "=== mihomo v1.19.16 API diagnostic (go doc, GOOS=android GOARCH=arm64 -tags cmfa) ==="
+          export GOOS=android
+          export GOARCH=arm64
+          export CGO_ENABLED=1
+          export CC="$ANDROID_ARM64_CC"
+          for sym in \
+            github.com/metacubex/mihomo/component/dialer.DefaultSocketHook \
+            github.com/metacubex/mihomo/listener/config.Tun \
+            github.com/metacubex/mihomo/listener/sing_tun.New \
+            github.com/metacubex/mihomo/hub/executor.ApplyConfig \
+            github.com/metacubex/mihomo/hub/route.ReCreateServer \
+            github.com/metacubex/mihomo/dns.UpdateSystemDNS \
+            github.com/metacubex/mihomo/dns.FlushCacheWithDefaultResolver \
+            github.com/metacubex/mihomo/component/iface.FlushCache
+          do
+            echo "--- go doc $sym ---"
+            go doc -tags "cmfa" "$sym"
+          done
+
+      - name: Upload generated go.sum (and tidied go.mod) artifact for lockfile backfill
+        if: steps.go_deps.outputs.generated_go_sum == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-mihomo-bridge-go-sum
+          path: |
+            android/mihomo-bridge/go.mod
+            android/mihomo-bridge/go.sum
+          retention-days: 7
+
+      - name: Gate 4 - Build libmihomo.so (arm64-v8a, cmfa) and enforce 16KB ELF alignment + JNI symbols
+        working-directory: android/mihomo-bridge
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT_DIR="../app/src/main/jniLibs/arm64-v8a"
+          OUT_SO="$OUT_DIR/libmihomo.so"
+          mkdir -p "$OUT_DIR"
+
+          export GOOS=android
+          export GOARCH=arm64
+          export CGO_ENABLED=1
+          export CC="$ANDROID_ARM64_CC"
+          export CGO_CFLAGS="-O2"
+          export CGO_LDFLAGS="-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
+
+          go build -v -mod=readonly -trimpath -tags "cmfa" -buildmode=c-shared \
+            -ldflags="-s -w -buildid= -extldflags '-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'" \
+            -o "$OUT_SO" \
+            .
+
+          # Remove cgo-generated companion header so Gradle does not package it into jniLibs
+          rm -f "$OUT_DIR/libmihomo.h"
+
+          if [[ ! -f "$OUT_SO" ]]; then
+            echo "ERROR: Expected shared library not produced at $OUT_SO" >&2
+            exit 1
+          fi
+
+          ls -lh "$OUT_SO"
+
+          echo "=== ELF Header Check (AArch64) ==="
+          HDR="$("$ANDROID_LLVM_READELF" -h "$OUT_SO")"
+          echo "$HDR"
+          if ! grep -q "AArch64" <<< "$HDR"; then
+            echo "ERROR: libmihomo.so is not an AArch64 ELF binary." >&2
+            exit 1
+          fi
+
+          echo "=== ELF LOAD Segment 16KB (0x4000) Alignment Check ==="
+          SEGS="$("$ANDROID_LLVM_READELF" --segments -W "$OUT_SO")"
+          echo "$SEGS"
+          python3 - "$SEGS" <<'PY'
+          import sys
+          segs = sys.argv[1].splitlines()
+          load_aligns = []
+          for line in segs:
+              parts = line.split()
+              if parts and parts[0] == "LOAD":
+                  load_aligns.append(parts[-1])
+          if not load_aligns:
+              sys.exit("ERROR: No LOAD segments found in libmihomo.so")
+          bad = [a for a in load_aligns if int(a, 16) < 0x4000 or int(a, 16) % 0x4000 != 0]
+          print(f"Found {len(load_aligns)} LOAD segments with alignments: {load_aligns}")
+          if bad:
+              sys.exit(f"ERROR: Non-16KB-multiple LOAD segment alignment detected: {bad}")
+          print("PASS: All LOAD segments aligned to a multiple of 0x4000 (16 KiB).")
+          PY
+
+          echo "=== Exported JNI Symbol Verification ==="
+          DYNSYMS="$("$ANDROID_LLVM_NM" -D --defined-only "$OUT_SO")"
+          REQUIRED_SYMS=(
+            JNI_OnLoad
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeInit
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeSetMemoryLimit
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativePrepareConfig
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeAttachTun
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeReloadConfig
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeStopTun
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeUpdateSystemDns
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeResetNetwork
+            Java_io_github_jurybu_catcloud_core_MihomoBridge_nativeForceGc
+          )
+          for sym in "${REQUIRED_SYMS[@]}"; do
+            if ! grep -Eq "[[:space:]]${sym}$" <<< "$DYNSYMS"; then
+              echo "ERROR: Missing exported JNI symbol in libmihomo.so: $sym" >&2
+              exit 1
+            fi
+          done
+          echo "PASS: All ${#REQUIRED_SYMS[@]} required JNI symbols exported."
+
+      - name: Gate 5 - Run Android Kotlin JVM unit tests
+        working-directory: android
+        run: gradle :app:testReleaseUnitTest --stacktrace
+
+      - name: Prepare APK signing keystore (Secrets or ephemeral debug fallback)
+        id: signing
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${ANDROID_KEYSTORE_BASE64}" && -n "${ANDROID_KEYSTORE_PASSWORD}" && -n "${ANDROID_KEY_ALIAS}" && -n "${ANDROID_KEY_PASSWORD}" ]]; then
+            KS_FILE="${RUNNER_TEMP}/catcloud-release.keystore"
+            printf '%s' "${ANDROID_KEYSTORE_BASE64}" | base64 -d > "$KS_FILE"
+            chmod 600 "$KS_FILE"
+            {
+              echo "KEYSTORE_PATH=$KS_FILE"
+              echo "KEYSTORE_PASSWORD=${ANDROID_KEYSTORE_PASSWORD}"
+              echo "KEY_ALIAS=${ANDROID_KEY_ALIAS}"
+              echo "KEY_PASSWORD=${ANDROID_KEY_PASSWORD}"
+              echo "SIGNING_MODE=release-secrets"
+            } >> "$GITHUB_ENV"
+            echo "Configured release signing from repository Secrets."
+          else
+            KS_FILE="${RUNNER_TEMP}/catcloud-ephemeral-debug.keystore"
+            keytool -genkeypair -noprompt -v \
+              -keystore "$KS_FILE" \
+              -storepass "android" \
+              -alias "androiddebugkey" \
+              -keypass "android" \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 365 \
+              -dname "CN=CatCloud Ephemeral CI,O=CatCloud,C=CN" >/dev/null 2>&1
+            chmod 600 "$KS_FILE"
+            {
+              echo "KEYSTORE_PATH=$KS_FILE"
+              echo "KEYSTORE_PASSWORD=android"
+              echo "KEY_ALIAS=androiddebugkey"
+              echo "KEY_PASSWORD=android"
+              echo "SIGNING_MODE=ephemeral-debug"
+            } >> "$GITHUB_ENV"
+            echo "Secrets not configured; generated one-shot temporary debug keystore for installable CI APK."
+            {
+              echo "### Signing Notice"
+              echo ""
+              echo "> **Temporary Debug Keystore Used**: Repository secrets (\`ANDROID_KEYSTORE_BASE64\`, \`ANDROID_KEYSTORE_PASSWORD\`, \`ANDROID_KEY_ALIAS\`, \`ANDROID_KEY_PASSWORD\`) are not configured, so this APK was signed with a single-run temporary debug keystore. It is directly installable for testing, but subsequent CI builds will require uninstalling first until a persistent release keystore secret is configured."
+              echo ""
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Gate 6 - Build signed Release APK (arm64-v8a)
+        working-directory: android
+        run: gradle :app:assembleRelease --stacktrace
+
+      - name: Gate 7 - Verify APK signature, enforce <= 20 MiB limit and print breakdown report
+        id: apk_report
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK_DIR="android/app/build/outputs/apk/release"
+          if [[ -f "$APK_DIR/app-release.apk" ]]; then
+            APK_PATH="$APK_DIR/app-release.apk"
+          else
+            APK_PATH="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*-unsigned.apk' | head -n 1)"
+          fi
+          if [[ -z "${APK_PATH:-}" || ! -f "$APK_PATH" ]]; then
+            echo "ERROR: No signed release APK found in $APK_DIR" >&2
+            ls -la "$APK_DIR" || true
+            exit 1
+          fi
+
+          # Verify APK signature with Android build-tools apksigner when present
+          SDK_BASE="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          APKSIGNER="$(find "$SDK_BASE/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -n 1 || true)"
+          if [[ -n "$APKSIGNER" && -x "$APKSIGNER" ]]; then
+            echo "=== apksigner verify ==="
+            "$APKSIGNER" verify --print-certs "$APK_PATH"
+          fi
+
+          echo "=== unzip -l (raw listing) ==="
+          unzip -l "$APK_PATH"
+
+          python3 - "$APK_PATH" "${SIGNING_MODE:-unknown}" "${GITHUB_STEP_SUMMARY:-}" <<'PY'
+          import os
+          import sys
+          import zipfile
+
+          apk_path, signing_mode, summary_path = sys.argv[1], sys.argv[2], sys.argv[3]
+          max_bytes = 20 * 1024 * 1024
+          apk_bytes = os.path.getsize(apk_path)
+
+          buckets = {
+              "lib/": [0, 0, 0],
+              "dex": [0, 0, 0],
+              "res/": [0, 0, 0],
+              "arsc": [0, 0, 0],
+              "other": [0, 0, 0],
+          }
+          with zipfile.ZipFile(apk_path, "r") as zf:
+              for info in zf.infolist():
+                  name = info.filename
+                  if name.startswith("lib/"):
+                      key = "lib/"
+                  elif name.endswith(".dex"):
+                      key = "dex"
+                  elif name.startswith("res/"):
+                      key = "res/"
+                  elif name == "resources.arsc":
+                      key = "arsc"
+                  else:
+                      key = "other"
+                  buckets[key][0] += info.compress_size
+                  buckets[key][1] += info.file_size
+                  buckets[key][2] += 1
+
+          lines = [
+              "### CatCloud Android Release APK Report (`arm64-v8a`)",
+              "",
+              f"- **APK**: `{os.path.basename(apk_path)}`",
+              f"- **Signing Mode**: `{signing_mode}`",
+              f"- **Total APK Size**: **{apk_bytes / (1024 * 1024):.2f} MiB** ({apk_bytes:,} bytes; hard limit `20.00 MiB`)",
+              "",
+              "| Component | Files | Compressed (MiB) | Uncompressed (MiB) | Share of APK |",
+              "|---|---:|---:|---:|---:|",
+          ]
+          for label in ["lib/", "dex", "res/", "arsc", "other"]:
+              comp, uncomp, count = buckets[label]
+              pct = (comp / apk_bytes * 100.0) if apk_bytes > 0 else 0.0
+              lines.append(
+                  f"| `{label}` | {count} | {comp / (1024 * 1024):.2f} | {uncomp / (1024 * 1024):.2f} | {pct:.1f}% |"
+              )
+          report = "\n".join(lines) + "\n"
+          print(report)
+
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as fh:
+                  fh.write(report)
+
+          if apk_bytes > max_bytes:
+              sys.exit(
+                  f"ERROR: Release APK exceeds 20 MiB hard budget: {apk_bytes / (1024 * 1024):.2f} MiB > 20.00 MiB"
+              )
+          print("PASS: Release APK is within the 20 MiB budget.")
+          PY
+
+          STAGE_DIR="${RUNNER_TEMP}/android-apk-artifact"
+          mkdir -p "$STAGE_DIR"
+          cp "$APK_PATH" "$STAGE_DIR/catcloud-android-arm64-v8a-release.apk"
+          echo "artifact_dir=$STAGE_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload installable Release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: catcloud-android-arm64-v8a-release-apk
+          path: ${{ steps.apk_report.outputs.artifact_dir }}/catcloud-android-arm64-v8a-release.apk
+          retention-days: 14

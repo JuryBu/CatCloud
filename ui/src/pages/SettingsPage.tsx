@@ -24,6 +24,7 @@ import {
   Palette,
   Play,
   Plus,
+  QrCode,
   RefreshCw,
   RotateCcw,
   RotateCw,
@@ -52,6 +53,7 @@ import {
   isTauriEnv,
 } from "../api/tauri";
 import { AppSelect } from "../components/AppSelect";
+import { ShareBundleModal } from "../components/ShareBundleModal";
 import {
   UI_LANGUAGE_OPTIONS,
   type UiLanguage,
@@ -975,6 +977,7 @@ export function SettingsPage() {
   const [yamlSha, setYamlSha] = useState<string | null>(() => settingsDraftCache.yamlSha);
   const [yamlLoading, setYamlLoading] = useState(false);
   const [confirmImportBackupOpen, setConfirmImportBackupOpen] = useState(false);
+  const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [openingIssue, setOpeningIssue] = useState(false);
 
   const dirty = draftDirty || extDirty;
@@ -2971,6 +2974,14 @@ export function SettingsPage() {
                 )}
                 <span>{backupBusy === "import" ? "导入中..." : "导入备份"}</span>
               </button>
+              <button
+                type="button"
+                onClick={() => setSyncModalOpen(true)}
+                className={BTN_CLS}
+              >
+                <QrCode className="h-3.5 w-3.5 text-[var(--accent)]" />
+                <span>{dict.sync.entryBtn}</span>
+              </button>
             </div>
 
             <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 p-2.5">
@@ -3401,6 +3412,14 @@ export function SettingsPage() {
           </div>,
           document.body
         )}
+
+      <ShareBundleModal
+        open={syncModalOpen}
+        mode="export"
+        initialTransport="lan_send"
+        allowModeSwitch
+        onClose={() => setSyncModalOpen(false)}
+      />
     </div>
   );
 }

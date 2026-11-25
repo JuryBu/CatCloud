@@ -1,11 +1,17 @@
 use crate::error::{CatError, CatResult};
-use crate::models::{PreAccelRelay, ProxyNode};
+use crate::models::{
+    DEFAULT_COST_EFFECTIVE_FORMULA, DynamicFilterSpec, FallbackPolicy, MultiGroup, MultiGroupMode,
+    MultiGroupState, PreAccelRelay, ProxyNode, SwitchMode, TriggerRule,
+};
 use crate::preaccel::{bundle_from_relays, parse_mmrelay_json, serialize_mmrelay_json};
-use crate::subscription::parser::{normalize_protocol, parse_subscription_payload};
+use crate::storage::Storage;
+use crate::subscription::parser::{
+    node_dedup_fingerprint, normalize_protocol, parse_subscription_payload,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Number, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path};
@@ -15,6 +21,9 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 /// Standard schema identifier for CatCloud `.zip` share bundles.
 pub const SHARE_BUNDLE_SCHEMA: &str = "catcloud-share/v1";
+
+/// Standard schema identifier for optional `groups.json` inside `catcloud-share/v1` ZIP archives.
+pub const SHARE_GROUPS_SCHEMA: &str = "catcloud-groups/v1";
 
 /// Maximum total uncompressed payload bytes allowed across all entries in a share ZIP (16 MiB).
 pub const MAX_SHARE_ZIP_UNCOMPRESSED_BYTES: usize = 16 * 1024 * 1024;
@@ -53,6 +62,151 @@ pub struct ShareBundleExportRequest {
     pub relays: Vec<PreAccelRelay>,
 }
 
+/// Portable multi-group record stored inside optional `groups.json` (`catcloud-groups/v1`).
+/// Member and active node references use `node_dedup_fingerprint` (`catcloud-node-fp-v1`)
+/// instead of machine-local node IDs so groups merge cleanly across devices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ShareGroupRecord {
+    pub name: String,
+    pub mode: MultiGroupMode,
+    pub match_rules: Vec<String>,
+    pub member_fingerprints: Vec<String>,
+    pub dynamic_filter: Option<DynamicFilterSpec>,
+    pub primary_probe_id: Option<String>,
+    pub hard_gates: Vec<String>,
+    pub trigger_rules: Vec<TriggerRule>,
+    pub formula_expr: String,
+    pub fallback_policy: FallbackPolicy,
+    pub fallback_pool_name: Option<String>,
+    pub recover_probe_interval_sec: u64,
+    pub switch_mode: SwitchMode,
+    pub cooldown_sec: u64,
+    pub hysteresis_pct: f64,
+    pub active_node_fingerprint: Option<String>,
+    pub independent_routing: bool,
+}
+
+impl Default for ShareGroupRecord {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            mode: MultiGroupMode::StickyBest,
+            match_rules: Vec::new(),
+            member_fingerprints: Vec::new(),
+            dynamic_filter: None,
+            primary_probe_id: None,
+            hard_gates: Vec::new(),
+            trigger_rules: Vec::new(),
+            formula_expr: DEFAULT_COST_EFFECTIVE_FORMULA.to_string(),
+            fallback_policy: FallbackPolicy::DegradeBestWarn,
+            fallback_pool_name: None,
+            recover_probe_interval_sec: 120,
+            switch_mode: SwitchMode::ForceCloseOld,
+            cooldown_sec: 60,
+            hysteresis_pct: 20.0,
+            active_node_fingerprint: None,
+            independent_routing: false,
+        }
+    }
+}
+
+/// Optional `groups.json` payload inside a `catcloud-share/v1` ZIP archive (`catcloud-groups/v1`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ShareGroupsBundle {
+    pub schema: String,
+    pub active_group_name: Option<String>,
+    pub route_mode: Option<String>,
+    pub groups: Vec<ShareGroupRecord>,
+}
+
+impl Default for ShareGroupsBundle {
+    fn default() -> Self {
+        Self {
+            schema: SHARE_GROUPS_SCHEMA.to_string(),
+            active_group_name: None,
+            route_mode: None,
+            groups: Vec::new(),
+        }
+    }
+}
+
+/// Build a portable `ShareGroupsBundle` from local `MultiGroup` records and their backing `ProxyNode`s.
+pub fn build_share_groups_bundle(
+    groups: &[MultiGroup],
+    nodes: &[ProxyNode],
+    active_group_id: Option<&str>,
+    route_mode: Option<&str>,
+) -> ShareGroupsBundle {
+    let node_id_to_fp: HashMap<&str, String> = nodes
+        .iter()
+        .map(|n| (n.id.as_str(), node_dedup_fingerprint(n)))
+        .collect();
+    let group_id_to_name: HashMap<&str, &str> = groups
+        .iter()
+        .map(|g| (g.id.as_str(), g.name.trim()))
+        .filter(|(_, name)| !name.is_empty())
+        .collect();
+
+    let active_group_name = active_group_id
+        .and_then(|gid| group_id_to_name.get(gid.trim()).copied())
+        .map(ToOwned::to_owned);
+
+    let records = groups
+        .iter()
+        .filter(|g| !g.name.trim().is_empty())
+        .map(|g| {
+            let mut seen_fps = HashSet::new();
+            let member_fingerprints: Vec<String> = g
+                .member_node_ids
+                .iter()
+                .filter_map(|nid| node_id_to_fp.get(nid.as_str()).cloned())
+                .filter(|fp| seen_fps.insert(fp.clone()))
+                .collect();
+            let active_node_fingerprint = g
+                .active_node_id
+                .as_deref()
+                .and_then(|nid| node_id_to_fp.get(nid).cloned());
+            let fallback_pool_name = g
+                .fallback_pool_id
+                .as_deref()
+                .and_then(|pid| group_id_to_name.get(pid).copied())
+                .map(ToOwned::to_owned);
+
+            ShareGroupRecord {
+                name: g.name.trim().to_string(),
+                mode: g.mode.clone(),
+                match_rules: g.match_rules.clone(),
+                member_fingerprints,
+                dynamic_filter: g.dynamic_filter.clone(),
+                primary_probe_id: g.primary_probe_id.clone(),
+                hard_gates: g.hard_gates.clone(),
+                trigger_rules: g.trigger_rules.clone(),
+                formula_expr: g.formula_expr.clone(),
+                fallback_policy: g.fallback_policy.clone(),
+                fallback_pool_name,
+                recover_probe_interval_sec: g.recover_probe_interval_sec,
+                switch_mode: g.switch_mode.clone(),
+                cooldown_sec: g.cooldown_sec,
+                hysteresis_pct: g.hysteresis_pct,
+                active_node_fingerprint,
+                independent_routing: g.independent_routing,
+            }
+        })
+        .collect();
+
+    ShareGroupsBundle {
+        schema: SHARE_GROUPS_SCHEMA.to_string(),
+        active_group_name,
+        route_mode: route_mode
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned),
+        groups: records,
+    }
+}
+
 /// In-memory preview returned by parsing a `catcloud-share/v1` ZIP bundle without touching disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShareBundlePreview {
@@ -61,6 +215,8 @@ pub struct ShareBundlePreview {
     pub relays: Vec<PreAccelRelay>,
     pub warnings: Vec<String>,
     pub has_readme: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub groups_bundle: Option<ShareGroupsBundle>,
 }
 
 /// Export selected proxy nodes and/or domestic pre-acceleration relays into an in-memory
@@ -73,6 +229,15 @@ pub struct ShareBundlePreview {
 /// - Local probe caches (`last_probe_ms`, `last_mbps`, `last_up_mbps`, `last_down_mbps`) are cleared on every exported relay.
 pub fn export_share_bundle_zip_bytes(
     req: &ShareBundleExportRequest,
+) -> CatResult<(Vec<u8>, ShareBundleManifest)> {
+    export_share_bundle_zip_bytes_with_groups(req, None)
+}
+
+/// Export selected proxy nodes, domestic pre-acceleration relays, and an optional
+/// `catcloud-groups/v1` (`groups.json`) payload into an in-memory `catcloud-share/v1` ZIP archive.
+pub fn export_share_bundle_zip_bytes_with_groups(
+    req: &ShareBundleExportRequest,
+    groups_bundle: Option<&ShareGroupsBundle>,
 ) -> CatResult<(Vec<u8>, ShareBundleManifest)> {
     if req.nodes.is_empty() && req.relays.is_empty() {
         return Err(CatError::Validation(
@@ -136,11 +301,31 @@ pub fn export_share_bundle_zip_bytes(
         let mm_bundle = bundle_from_relays(cleaned_relays);
         Some(serialize_mmrelay_json(&mm_bundle)?)
     };
+    let groups_json = match groups_bundle {
+        Some(gb)
+            if !gb.groups.is_empty()
+                || gb.active_group_name.is_some()
+                || gb.route_mode.is_some() =>
+        {
+            let mut normalized = gb.clone();
+            if normalized.schema.trim().is_empty() {
+                normalized.schema = SHARE_GROUPS_SCHEMA.to_string();
+            } else if normalized.schema.trim() != SHARE_GROUPS_SCHEMA {
+                return Err(CatError::Validation(format!(
+                    "不支持的多选组 schema「{}」，仅支持「{SHARE_GROUPS_SCHEMA}」",
+                    normalized.schema
+                )));
+            }
+            Some(serde_json::to_string_pretty(&normalized)?)
+        }
+        _ => None,
+    };
 
     let total_uncompressed = manifest_json.len()
         + readme_md.len()
         + nodes_yaml.as_ref().map_or(0, String::len)
-        + relays_json.as_ref().map_or(0, String::len);
+        + relays_json.as_ref().map_or(0, String::len)
+        + groups_json.as_ref().map_or(0, String::len);
     if total_uncompressed > MAX_SHARE_ZIP_UNCOMPRESSED_BYTES {
         return Err(CatError::Validation(format!(
             "分享包内容总大小超过 16 MiB 上限（{total_uncompressed} 字节）"
@@ -178,6 +363,13 @@ pub fn export_share_bundle_zip_bytes(
             writer.write_all(relays.as_bytes())?;
         }
 
+        if let Some(ref groups) = groups_json {
+            writer
+                .start_file("groups.json", opts)
+                .map_err(|e| CatError::Validation(format!("写入 groups.json 失败：{e}")))?;
+            writer.write_all(groups.as_bytes())?;
+        }
+
         writer
             .finish()
             .map_err(|e| CatError::Validation(format!("封装分享包 ZIP 失败：{e}")))?;
@@ -191,7 +383,16 @@ pub fn export_share_bundle_zip_file(
     req: &ShareBundleExportRequest,
     target_path: &Path,
 ) -> CatResult<ShareBundleManifest> {
-    let (bytes, manifest) = export_share_bundle_zip_bytes(req)?;
+    export_share_bundle_zip_file_with_groups(req, None, target_path)
+}
+
+/// Atomically write a `catcloud-share/v1` ZIP archive (with optional `groups.json`) to `target_path`.
+pub fn export_share_bundle_zip_file_with_groups(
+    req: &ShareBundleExportRequest,
+    groups_bundle: Option<&ShareGroupsBundle>,
+    target_path: &Path,
+) -> CatResult<ShareBundleManifest> {
+    let (bytes, manifest) = export_share_bundle_zip_bytes_with_groups(req, groups_bundle)?;
 
     if let Some(parent) = target_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -292,6 +493,7 @@ pub fn preview_share_bundle_zip_bytes(bytes: &[u8]) -> CatResult<ShareBundlePrev
     let mut manifest_bytes: Option<Vec<u8>> = None;
     let mut nodes_bytes: Option<Vec<u8>> = None;
     let mut relays_bytes: Option<Vec<u8>> = None;
+    let mut groups_bytes: Option<Vec<u8>> = None;
     let mut has_readme = false;
     let mut warnings: Vec<String> = Vec::new();
     let mut seen_top_dirs: HashSet<String> = HashSet::new();
@@ -382,6 +584,14 @@ pub fn preview_share_bundle_zip_bytes(bytes: &[u8]) -> CatResult<ShareBundlePrev
                 }
                 relays_bytes = Some(buf);
             }
+            "groups.json" => {
+                if groups_bytes.is_some() {
+                    return Err(CatError::Security(
+                        "分享包包含重复的 groups.json 条目".into(),
+                    ));
+                }
+                groups_bytes = Some(buf);
+            }
             "readme.md" => {
                 has_readme = true;
             }
@@ -436,6 +646,28 @@ pub fn preview_share_bundle_zip_bytes(bytes: &[u8]) -> CatResult<ShareBundlePrev
         }
     }
 
+    let mut groups_bundle: Option<ShareGroupsBundle> = None;
+    if let Some(raw_groups) = groups_bytes {
+        let trimmed = std::str::from_utf8(&raw_groups)
+            .map_err(|_| CatError::Validation("groups.json 不是有效的 UTF-8 文本".into()))?
+            .trim();
+        if !trimmed.is_empty() {
+            let mut parsed_groups: ShareGroupsBundle =
+                serde_json::from_str(trimmed).map_err(|e| {
+                    CatError::Validation(format!("groups.json 格式无效：{e}"))
+                })?;
+            if parsed_groups.schema.trim().is_empty() {
+                parsed_groups.schema = SHARE_GROUPS_SCHEMA.to_string();
+            } else if parsed_groups.schema.trim() != SHARE_GROUPS_SCHEMA {
+                return Err(CatError::Validation(format!(
+                    "不支持的多选组 schema「{}」，仅支持「{SHARE_GROUPS_SCHEMA}」",
+                    parsed_groups.schema
+                )));
+            }
+            groups_bundle = Some(parsed_groups);
+        }
+    }
+
     if nodes.is_empty() && relays.is_empty() {
         return Err(CatError::Validation(
             "分享包中未包含任何可用节点或国内中转线路".into(),
@@ -463,7 +695,218 @@ pub fn preview_share_bundle_zip_bytes(bytes: &[u8]) -> CatResult<ShareBundlePrev
         relays,
         warnings,
         has_readme,
+        groups_bundle,
     })
+}
+
+/// Merge imported `catcloud-groups/v1` smart multi-groups into local SQLite storage:
+/// - Maps `member_fingerprints` and `active_node_fingerprint` to persisted local node IDs via
+///   `node_dedup_fingerprint`, silently dropping fingerprints that were not imported.
+/// - Skips groups that end up with zero resolved members and no `dynamic_filter`, recording a warning.
+/// - For same-name existing groups, performs an additive union of member node IDs while preserving
+///   local group mode, scoring policy, and valid local `active_node_id`.
+/// - Resolves `fallback_pool_name` against existing and newly imported groups by name (falls back
+///   to `None` when unresolved or self-referential).
+pub fn merge_imported_groups_into_storage(
+    db: &Storage,
+    groups_bundle: &ShareGroupsBundle,
+) -> CatResult<(usize, Vec<String>)> {
+    let mut warnings = Vec::new();
+    if groups_bundle.groups.is_empty() {
+        return Ok((0, warnings));
+    }
+
+    let nodes = db.list_nodes()?;
+    let mut fp_to_node_id: HashMap<String, String> = HashMap::with_capacity(nodes.len());
+    let mut fp_enabled: HashMap<String, bool> = HashMap::with_capacity(nodes.len());
+    let mut existing_node_ids: HashSet<String> = HashSet::with_capacity(nodes.len());
+    for node in &nodes {
+        existing_node_ids.insert(node.id.clone());
+        let fp = node_dedup_fingerprint(node);
+        let replace = match fp_enabled.get(&fp) {
+            None => true,
+            Some(&prev_enabled) => !prev_enabled && node.enabled,
+        };
+        if replace {
+            fp_enabled.insert(fp.clone(), node.enabled);
+            fp_to_node_id.insert(fp, node.id.clone());
+        }
+    }
+
+    let existing_groups = db.list_multi_groups()?;
+    let mut working_by_name: HashMap<String, MultiGroup> =
+        HashMap::with_capacity(existing_groups.len() + groups_bundle.groups.len());
+    let mut group_name_to_id: HashMap<String, String> =
+        HashMap::with_capacity(existing_groups.len() + groups_bundle.groups.len());
+    let mut used_ids: HashSet<String> = HashSet::with_capacity(existing_groups.len());
+    let mut existed_in_db: HashSet<String> = HashSet::with_capacity(existing_groups.len());
+
+    for grp in existing_groups {
+        let key = grp.name.trim().to_string();
+        used_ids.insert(grp.id.clone());
+        if !key.is_empty() {
+            group_name_to_id.entry(key.clone()).or_insert_with(|| grp.id.clone());
+            existed_in_db.insert(key.clone());
+            working_by_name.entry(key).or_insert(grp);
+        }
+    }
+
+    struct PreparedGroup<'a> {
+        name: String,
+        target_id: String,
+        record: &'a ShareGroupRecord,
+        mapped_member_ids: Vec<String>,
+        mapped_active_node_id: Option<String>,
+    }
+
+    let mut prepared: Vec<PreparedGroup<'_>> = Vec::with_capacity(groups_bundle.groups.len());
+    for rec in &groups_bundle.groups {
+        let trimmed_name = rec.name.trim();
+        if trimmed_name.is_empty() {
+            warnings.push("已跳过未命名的多选组记录".to_string());
+            continue;
+        }
+
+        let mut seen_members = HashSet::new();
+        let mapped_member_ids: Vec<String> = rec
+            .member_fingerprints
+            .iter()
+            .filter_map(|fp| fp_to_node_id.get(fp.trim()).cloned())
+            .filter(|nid| seen_members.insert(nid.clone()))
+            .collect();
+
+        if mapped_member_ids.is_empty() && rec.dynamic_filter.is_none() {
+            warnings.push(format!(
+                "已跳过多选组「{trimmed_name}」：无已入库成员节点且未配置动态筛选规则"
+            ));
+            continue;
+        }
+
+        let mapped_active_node_id = rec
+            .active_node_fingerprint
+            .as_deref()
+            .and_then(|fp| fp_to_node_id.get(fp.trim()).cloned())
+            .filter(|nid| rec.dynamic_filter.is_some() || mapped_member_ids.contains(nid));
+
+        let target_id = if let Some(existing_id) = group_name_to_id.get(trimmed_name) {
+            existing_id.clone()
+        } else {
+            let mut candidate = format!(
+                "grp-sync-{}",
+                &Uuid::new_v4().simple().to_string()[..12]
+            );
+            while !used_ids.insert(candidate.clone()) {
+                candidate = format!(
+                    "grp-sync-{}",
+                    &Uuid::new_v4().simple().to_string()[..12]
+                );
+            }
+            group_name_to_id.insert(trimmed_name.to_string(), candidate.clone());
+            candidate
+        };
+
+        prepared.push(PreparedGroup {
+            name: trimmed_name.to_string(),
+            target_id,
+            record: rec,
+            mapped_member_ids,
+            mapped_active_node_id,
+        });
+    }
+
+    let mut dirty_order: Vec<String> = Vec::new();
+    let mut dirty_seen: HashSet<String> = HashSet::new();
+
+    for item in prepared {
+        if let Some(existing) = working_by_name.get_mut(&item.name) {
+            // Same-name group: union member node IDs while preserving local mode, policy,
+            // and valid local active_node_id.
+            let mut member_set: HashSet<String> = existing.member_node_ids.iter().cloned().collect();
+            for nid in item.mapped_member_ids {
+                if member_set.insert(nid.clone()) {
+                    existing.member_node_ids.push(nid);
+                }
+            }
+            let local_active_valid = existing.active_node_id.as_deref().is_some_and(|aid| {
+                existing_node_ids.contains(aid)
+                    && (existing.dynamic_filter.is_some()
+                        || existing.member_node_ids.is_empty()
+                        || existing.member_node_ids.iter().any(|m| m == aid))
+            });
+            if !local_active_valid {
+                existing.active_node_id = item.mapped_active_node_id;
+            }
+            // Only fill fallback_pool_id on a freshly-created same-turn duplicate; never overwrite
+            // an already-persisted local group's customized settings.
+            if !existed_in_db.contains(&item.name) && existing.fallback_pool_id.is_none() {
+                existing.fallback_pool_id = item
+                    .record
+                    .fallback_pool_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|pname| group_name_to_id.get(pname).cloned())
+                    .filter(|pid| pid != &existing.id);
+            }
+        } else {
+            let fallback_pool_id = item
+                .record
+                .fallback_pool_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|pname| group_name_to_id.get(pname).cloned())
+                .filter(|pid| pid != &item.target_id);
+            let formula_expr = if item.record.formula_expr.trim().is_empty() {
+                DEFAULT_COST_EFFECTIVE_FORMULA.to_string()
+            } else {
+                item.record.formula_expr.clone()
+            };
+            let recover_probe_interval_sec = if item.record.recover_probe_interval_sec == 0 {
+                120
+            } else {
+                item.record.recover_probe_interval_sec
+            };
+
+            let new_group = MultiGroup {
+                id: item.target_id,
+                name: item.name.clone(),
+                mode: item.record.mode.clone(),
+                match_rules: item.record.match_rules.clone(),
+                member_node_ids: item.mapped_member_ids,
+                dynamic_filter: item.record.dynamic_filter.clone(),
+                primary_probe_id: item.record.primary_probe_id.clone(),
+                hard_gates: item.record.hard_gates.clone(),
+                trigger_rules: item.record.trigger_rules.clone(),
+                formula_expr,
+                fallback_policy: item.record.fallback_policy.clone(),
+                fallback_pool_id,
+                escalated_since: None,
+                recover_probe_interval_sec,
+                switch_mode: item.record.switch_mode.clone(),
+                cooldown_sec: item.record.cooldown_sec,
+                hysteresis_pct: item.record.hysteresis_pct,
+                active_node_id: item.mapped_active_node_id,
+                state: MultiGroupState::Idle,
+                independent_routing: item.record.independent_routing,
+            };
+            working_by_name.insert(item.name.clone(), new_group);
+        }
+
+        if dirty_seen.insert(item.name.clone()) {
+            dirty_order.push(item.name);
+        }
+    }
+
+    let mut saved_count = 0usize;
+    for name in &dirty_order {
+        if let Some(grp) = working_by_name.get(name) {
+            db.upsert_multi_group(grp)?;
+            saved_count += 1;
+        }
+    }
+
+    Ok((saved_count, warnings))
 }
 
 fn validate_safe_zip_entry_path(
@@ -1015,5 +1458,265 @@ mod tests {
             "unexpected warnings: {:?}",
             preview.warnings
         );
+        assert!(preview.groups_bundle.is_none());
+    }
+
+    #[test]
+    fn groups_json_roundtrip_duplicate_rejection_and_uncompressed_limit() {
+        let n1 = sample_node_with_dialer(
+            "n-grp-1",
+            "JP-01",
+            "203.0.113.21",
+            "00000000-0000-4000-8000-000000000021",
+        );
+        let n2 = sample_node_with_dialer(
+            "n-grp-2",
+            "SG-01",
+            "203.0.113.22",
+            "00000000-0000-4000-8000-000000000022",
+        );
+        let fp1 = node_dedup_fingerprint(&n1);
+        let fp2 = node_dedup_fingerprint(&n2);
+
+        let groups_bundle = ShareGroupsBundle {
+            schema: SHARE_GROUPS_SCHEMA.to_string(),
+            active_group_name: Some("AI Sticky".to_string()),
+            route_mode: Some("group".to_string()),
+            groups: vec![ShareGroupRecord {
+                name: "AI Sticky".to_string(),
+                mode: MultiGroupMode::StickyBest,
+                match_rules: vec!["DOMAIN-SUFFIX,openai.com".to_string()],
+                member_fingerprints: vec![fp1.clone(), fp2.clone()],
+                fallback_policy: FallbackPolicy::CrossPoolEscalate,
+                fallback_pool_name: Some("Backup Pool".to_string()),
+                active_node_fingerprint: Some(fp1.clone()),
+                independent_routing: true,
+                ..ShareGroupRecord::default()
+            }],
+        };
+
+        let req = ShareBundleExportRequest {
+            name: "With Groups".to_string(),
+            description: Some("Nodes + Groups".to_string()),
+            nodes: vec![n1, n2],
+            relays: Vec::new(),
+        };
+        let (zip_bytes, _) =
+            export_share_bundle_zip_bytes_with_groups(&req, Some(&groups_bundle))
+                .expect("export with groups");
+        let preview =
+            preview_share_bundle_zip_bytes(&zip_bytes).expect("preview with groups");
+        let parsed_groups = preview
+            .groups_bundle
+            .expect("groups_bundle must be parsed");
+        assert_eq!(parsed_groups.schema, SHARE_GROUPS_SCHEMA);
+        assert_eq!(parsed_groups.active_group_name.as_deref(), Some("AI Sticky"));
+        assert_eq!(parsed_groups.route_mode.as_deref(), Some("group"));
+        assert_eq!(parsed_groups.groups.len(), 1);
+        assert_eq!(parsed_groups.groups[0].member_fingerprints, vec![fp1, fp2]);
+        assert!(parsed_groups.groups[0].independent_routing);
+
+        // Duplicate `groups.json` must be rejected with CatError::Security.
+        let dup_zip = {
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let mut zw = ZipWriter::new(&mut cursor);
+                let opts = SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Deflated);
+                zw.start_file("manifest.json", opts).unwrap();
+                zw.write_all(
+                    br#"{"schema":"catcloud-share/v1","name":"dup","created_at":"2026-11-25T00:00:00Z","node_count":0,"relay_count":0,"description":null,"sanitized_notice":""}"#,
+                )
+                .unwrap();
+                zw.start_file("groups.json", opts).unwrap();
+                zw.write_all(br#"{"schema":"catcloud-groups/v1","groups":[]}"#)
+                    .unwrap();
+                zw.start_file("wrap/groups.json", opts).unwrap();
+                zw.write_all(br#"{"schema":"catcloud-groups/v1","groups":[]}"#)
+                    .unwrap();
+                zw.finish().unwrap();
+            }
+            cursor.into_inner()
+        };
+        let dup_err =
+            preview_share_bundle_zip_bytes(&dup_zip).expect_err("duplicate groups.json must fail");
+        assert!(matches!(dup_err, CatError::Security(_)));
+
+        // Oversized `groups.json` exceeding 16 MiB uncompressed limit must be rejected with Security.
+        let huge_groups_zip = {
+            let mut cursor = Cursor::new(Vec::new());
+            {
+                let mut zw = ZipWriter::new(&mut cursor);
+                let opts = SimpleFileOptions::default()
+                    .compression_method(CompressionMethod::Deflated);
+                zw.start_file("manifest.json", opts).unwrap();
+                zw.write_all(
+                    br#"{"schema":"catcloud-share/v1","name":"huge","created_at":"2026-11-25T00:00:00Z","node_count":0,"relay_count":0,"description":null,"sanitized_notice":""}"#,
+                )
+                .unwrap();
+                zw.start_file("groups.json", opts).unwrap();
+                let chunk = vec![b' '; 64 * 1024];
+                let mut written = 0usize;
+                while written <= MAX_SHARE_ZIP_UNCOMPRESSED_BYTES {
+                    zw.write_all(&chunk).unwrap();
+                    written += chunk.len();
+                }
+                zw.finish().unwrap();
+            }
+            cursor.into_inner()
+        };
+        let huge_err = preview_share_bundle_zip_bytes(&huge_groups_zip)
+            .expect_err("oversized groups.json must fail");
+        assert!(matches!(huge_err, CatError::Security(_)));
+    }
+
+    #[test]
+    fn merge_imported_groups_handles_union_local_preservation_dynamic_filter_and_fallback_pool() {
+        use crate::models::{SubscriptionKind, SubscriptionRecord};
+
+        let db = Storage::open_in_memory().expect("in-memory db");
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-local".to_string(),
+            name: "Local".to_string(),
+            kind: SubscriptionKind::File,
+            url_or_cmd: "local.yaml".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut n1 = sample_node_with_dialer(
+            "local-n1",
+            "JP-01",
+            "203.0.113.31",
+            "00000000-0000-4000-8000-000000000031",
+        );
+        n1.sub_id = "sub-local".to_string();
+        let mut n2 = sample_node_with_dialer(
+            "local-n2",
+            "SG-01",
+            "203.0.113.32",
+            "00000000-0000-4000-8000-000000000032",
+        );
+        n2.sub_id = "sub-local".to_string();
+        let mut n3 = sample_node_with_dialer(
+            "local-n3",
+            "TW-01",
+            "203.0.113.33",
+            "00000000-0000-4000-8000-000000000033",
+        );
+        n3.sub_id = "sub-local".to_string();
+
+        db.upsert_node(&n1).unwrap();
+        db.upsert_node(&n2).unwrap();
+        db.upsert_node(&n3).unwrap();
+
+        let fp1 = node_dedup_fingerprint(&n1);
+        let fp2 = node_dedup_fingerprint(&n2);
+        let fp3 = node_dedup_fingerprint(&n3);
+
+        // Pre-existing local group with customized mode & active_node_id that must be preserved.
+        db.upsert_multi_group(&MultiGroup {
+            id: "grp-local-ai".to_string(),
+            name: "AI Sticky".to_string(),
+            mode: MultiGroupMode::LoadBalanceConsistentHash,
+            member_node_ids: vec!["local-n1".to_string()],
+            formula_expr: "up_mbps * 50".to_string(),
+            active_node_id: Some("local-n1".to_string()),
+            ..MultiGroup::default()
+        })
+        .unwrap();
+
+        let incoming = ShareGroupsBundle {
+            schema: SHARE_GROUPS_SCHEMA.to_string(),
+            active_group_name: Some("AI Sticky".to_string()),
+            route_mode: Some("group".to_string()),
+            groups: vec![
+                // 1. Same-name existing group: should union local-n2, silently drop unknown fp,
+                //    keep local-n1 active and keep local mode/formula.
+                ShareGroupRecord {
+                    name: "AI Sticky".to_string(),
+                    mode: MultiGroupMode::StickyBest,
+                    member_fingerprints: vec![
+                        fp1.clone(),
+                        fp2.clone(),
+                        "unknown-unimported-fingerprint".to_string(),
+                    ],
+                    formula_expr: "up_mbps * 10".to_string(),
+                    active_node_fingerprint: Some(fp2.clone()),
+                    ..ShareGroupRecord::default()
+                },
+                // 2. New group referencing a fallback pool defined later in the same bundle.
+                ShareGroupRecord {
+                    name: "Cost Saver".to_string(),
+                    mode: MultiGroupMode::StickyBest,
+                    member_fingerprints: vec![fp2.clone()],
+                    fallback_policy: FallbackPolicy::CrossPoolEscalate,
+                    fallback_pool_name: Some("Backup High Speed".to_string()),
+                    active_node_fingerprint: Some(fp2.clone()),
+                    independent_routing: true,
+                    ..ShareGroupRecord::default()
+                },
+                // 3. New fallback pool referencing a missing fallback pool -> fallback_pool_id None.
+                ShareGroupRecord {
+                    name: "Backup High Speed".to_string(),
+                    mode: MultiGroupMode::StickyBest,
+                    member_fingerprints: vec![fp3.clone()],
+                    fallback_policy: FallbackPolicy::CrossPoolEscalate,
+                    fallback_pool_name: Some("Nonexistent Pool".to_string()),
+                    ..ShareGroupRecord::default()
+                },
+                // 4. Dynamic filter group with zero explicit members -> allowed and persisted.
+                ShareGroupRecord {
+                    name: "Dynamic JP".to_string(),
+                    mode: MultiGroupMode::ConditionalPool,
+                    member_fingerprints: Vec::new(),
+                    dynamic_filter: Some(DynamicFilterSpec {
+                        region_codes: vec!["JP".to_string()],
+                        ..DynamicFilterSpec::default()
+                    }),
+                    ..ShareGroupRecord::default()
+                },
+                // 5. Zero resolved members and no dynamic_filter -> skipped with warning.
+                ShareGroupRecord {
+                    name: "Ghost Group".to_string(),
+                    mode: MultiGroupMode::StickyBest,
+                    member_fingerprints: vec!["missing-fp-only".to_string()],
+                    dynamic_filter: None,
+                    ..ShareGroupRecord::default()
+                },
+            ],
+        };
+
+        let (count, warnings) =
+            merge_imported_groups_into_storage(&db, &incoming).expect("merge groups");
+        assert_eq!(count, 4);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Ghost Group"));
+
+        let all = db.list_multi_groups().unwrap();
+        assert_eq!(all.len(), 4);
+
+        let ai = all.iter().find(|g| g.name == "AI Sticky").unwrap();
+        assert_eq!(ai.id, "grp-local-ai");
+        assert_eq!(ai.mode, MultiGroupMode::LoadBalanceConsistentHash);
+        assert_eq!(ai.formula_expr, "up_mbps * 50");
+        assert_eq!(ai.active_node_id.as_deref(), Some("local-n1"));
+        assert_eq!(
+            ai.member_node_ids,
+            vec!["local-n1".to_string(), "local-n2".to_string()]
+        );
+
+        let backup = all.iter().find(|g| g.name == "Backup High Speed").unwrap();
+        assert_eq!(backup.fallback_pool_id, None);
+        assert_eq!(backup.member_node_ids, vec!["local-n3".to_string()]);
+
+        let cost = all.iter().find(|g| g.name == "Cost Saver").unwrap();
+        assert_eq!(cost.fallback_pool_id.as_deref(), Some(backup.id.as_str()));
+        assert_eq!(cost.active_node_id.as_deref(), Some("local-n2"));
+        assert!(cost.independent_routing);
+
+        let dyn_jp = all.iter().find(|g| g.name == "Dynamic JP").unwrap();
+        assert!(dyn_jp.member_node_ids.is_empty());
+        assert!(dyn_jp.dynamic_filter.is_some());
     }
 }
