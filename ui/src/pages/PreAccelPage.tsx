@@ -16,6 +16,7 @@ import {
   Gauge,
   Globe,
   Loader2,
+  Package,
   Plus,
   RefreshCw,
   RotateCcw,
@@ -34,6 +35,7 @@ import {
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
+  type AcceleratedProcessStat,
   type AppConfig,
   type GlobalPreAccelScope,
   type PreAccelRelay,
@@ -42,7 +44,9 @@ import {
   isTauriEnv,
 } from "../api/tauri";
 import { AppSelect } from "../components/AppSelect";
+import { ShareBundleModal } from "../components/ShareBundleModal";
 import { formatBytes } from "../components/TrafficSparkline";
+import { normalizeUiLanguage, useUiDict } from "../i18n";
 import {
   appActions,
   appStore,
@@ -245,6 +249,10 @@ function hasValidLatency(ms: number | null | undefined): ms is number {
   return ms !== null && ms !== undefined && Number.isFinite(ms) && ms > 0;
 }
 
+function hasValidSpeed(mbps: number | null | undefined): mbps is number {
+  return mbps !== null && mbps !== undefined && Number.isFinite(mbps) && mbps > 0;
+}
+
 interface RawRelayInput {
   id?: string;
   name?: string;
@@ -367,64 +375,35 @@ function parseRelayImportInput(rawInput: string): {
       enabled: item.enabled ?? true,
       last_probe_ms: null,
       last_mbps: null,
+      last_up_mbps: null,
+      last_down_mbps: null,
     });
   }
 
   return { relays, warnings, error: null };
 }
 
-function buildAiDeployGuide(probeUrl: string, skip443: boolean): string {
-  return [
-    "# 猫猫云梯 · 国内提速中转部署说明（给 AI 助手）",
-    "",
-    "请协助我在国内轻量云服务器上部署一套纯 IP 443 中转服务，用于提升非 443 海外线路的上传与连接稳定性。",
-    "",
-    "## 1. 适用情况",
-    "- 普通海外节点上传被宽带限制在 2～4 Mbps，而标准 443 端口可跑满 50～250+ Mbps。",
-    "- 传图、AI 编程或远程访问频繁卡顿，但下载速度正常。",
-    "- 校园网或公司内网对非常用端口限速明显，或需要网页登录认证。",
-    "",
-    "## 2. 服务器部署要求",
-    "- 准备 1～2 台国内轻量云服务器，监听 TCP 443 端口，协议优先 AnyTLS，也支持 Trojan / VLESS / Hysteria2 / TUIC。",
-    "- 使用自签 IP 证书；TLS 域名字段（sni / servername）请严格留空，并开启跳过证书校验（skip_cert_verify: true），不要填写未备案域名。",
-    `- 当前国内连通检测地址：${probeUrl}（必须保持国内直连地址，不要改为海外网址）。`,
-    `- 已是高速通道的线路自动跳过：${skip443 ? "已开启" : "未开启"}。`,
-    "",
-    "## 3. 导入方式与常用命令",
-    "- 图形界面：打开「国内提速」→ 点击右上角「+ 添加中转」→ 手动填表或直接粘贴下方格式的 JSON / 导入码。",
-    "- 查看中转列表：`catcloud preaccel pool --json`",
-    "- 查看运行状态：`catcloud status --json`",
-    "- 重载当前配置：`catcloud config reload --json`",
-    "",
-    "## 4. 交付配置模板（请替换为真实参数）",
-    "```json",
-    JSON.stringify(
-      {
-        schema: IMPORT_SCHEMA_TAG,
-        role: "domestic_pre_accel",
-        relays: [
-          {
-            id: "relay-cn-east-1",
-            name: "上海轻量 1 号",
-            provider: "轻量云服务器",
-            region: "华东",
-            server: "203.0.113.10",
-            port: 443,
-            protocol: "anytls",
-            password: "<YOUR_GENERATED_SECRET>",
-            sni: "",
-            skip_cert_verify: true,
-            priority: 1,
-            expires_at: "2027-08-12",
-            enabled: true,
-          },
-        ],
-      },
-      null,
-      2
-    ),
-    "```",
-  ].join("\n");
+function dedupeProcessStats(list: AcceleratedProcessStat[]): AcceleratedProcessStat[] {
+  const map = new Map<string, AcceleratedProcessStat>();
+  for (const stat of list) {
+    const key = stat.process_name.trim().toLowerCase();
+    if (!key) continue;
+    const prev = map.get(key);
+    if (!prev) {
+      map.set(key, { ...stat });
+    } else {
+      prev.active_connections += stat.active_connections;
+      prev.total_connections += stat.total_connections;
+      prev.tx_bytes += stat.tx_bytes;
+      prev.rx_bytes += stat.rx_bytes;
+      if (stat.last_seen_ms > prev.last_seen_ms) {
+        prev.last_seen_ms = stat.last_seen_ms;
+        prev.pid = stat.pid;
+        if (stat.detected_by) prev.detected_by = stat.detected_by;
+      }
+    }
+  }
+  return Array.from(map.values());
 }
 
 async function copyText(text: string): Promise<boolean> {
@@ -476,6 +455,7 @@ const INPUT_CLS =
 
 export function PreAccelPage() {
   const config = useAppSelector((s) => s.config);
+  const dict = useUiDict(normalizeUiLanguage(config.personalization.ui_language));
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const storeRelays = useAppSelector((s) => s.preAccelRelays);
@@ -540,10 +520,9 @@ export function PreAccelPage() {
   const [importError, setImportError] = useState<string | null>(null);
   const [importWarnings, setImportWarnings] = useState<string[]>([]);
 
-  // Lightweight Advanced Modals (Probe URL & AI Deploy Guide)
+  // Lightweight Advanced Modals (Probe URL & Share Bundle)
   const [showProbeModal, setShowProbeModal] = useState(false);
-  const [showGuideModal, setShowGuideModal] = useState(false);
-  const [copiedGuide, setCopiedGuide] = useState(false);
+  const [shareModalOpen, setShareModalOpen] = useState(false);
   const [pendingDeleteRelay, setPendingDeleteRelay] = useState<PreAccelRelay | null>(null);
   const [deletingRelay, setDeletingRelay] = useState(false);
 
@@ -555,6 +534,12 @@ export function PreAccelPage() {
     () => new Set(bgPreaccel.relaysTestingIds),
     [bgPreaccel.relaysTestingIds]
   );
+  const speedTestingAll = bgPreaccel.relaysSpeedTestingAll;
+  const speedTestingIdsSet = useMemo(
+    () => new Set(bgPreaccel.relaysSpeedTestingIds),
+    [bgPreaccel.relaysSpeedTestingIds]
+  );
+  const speedTestingAny = speedTestingAll || bgPreaccel.relaysSpeedTestingIds.length > 0;
 
   const benchmarking = bgPreaccel.benchmark.running;
   const comparison = bgPreaccel.benchmark.result;
@@ -712,7 +697,7 @@ export function PreAccelPage() {
   }, []);
 
   useEffect(() => {
-    if (!showAddModal && !showProbeModal && !showGuideModal && !pendingDeleteRelay) return;
+    if (!showAddModal && !showProbeModal && !pendingDeleteRelay) return;
     const handleKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") {
         if (!savingManual && !importing) {
@@ -722,7 +707,6 @@ export function PreAccelPage() {
           setPendingDeleteRelay(null);
         }
         setShowProbeModal(false);
-        setShowGuideModal(false);
       }
     };
     document.addEventListener("keydown", handleKeyDown);
@@ -730,7 +714,6 @@ export function PreAccelPage() {
   }, [
     showAddModal,
     showProbeModal,
-    showGuideModal,
     pendingDeleteRelay,
     savingManual,
     importing,
@@ -906,6 +889,7 @@ export function PreAccelPage() {
       appActions.syncConfig(saved);
       const rt = await catcloudApi.getRuntimeInfo();
       appActions.syncRuntime(rt);
+      await appActions.refreshGlobalPreAccelStatus();
       appActions.showToast(notice, "ok");
       return true;
     } catch (err) {
@@ -1105,7 +1089,9 @@ export function PreAccelPage() {
     const ok = await persistPreAccelConfig(
       next,
       probeValidation.ok ? probeUrl : config.preaccel.probe_url,
-      next ? "已开启：已是高速通道的线路自动跳过" : "已关闭：所有海外节点均可使用国内提速"
+      next
+        ? "已开启：已是高速通道的线路自动跳过"
+        : "已关闭：猫云及第三方代理软件的 443 海外节点均将走国内提速"
     );
     if (!ok) setSkip443Native(prev);
   };
@@ -1220,6 +1206,8 @@ export function PreAccelPage() {
       enabled: true,
       last_probe_ms: null,
       last_mbps: null,
+      last_up_mbps: null,
+      last_down_mbps: null,
     };
 
     setSavingManual(true);
@@ -1423,6 +1411,16 @@ export function PreAccelPage() {
     await appActions.runTestPreAccelRelays(null);
   };
 
+  const handleSpeedTestRelay = async (id: string) => {
+    if (speedTestingIdsSet.has(id) || speedTestingAll || isProbeEngineBusy) return;
+    await appActions.runTestPreAccelRelaySpeeds(id, resolvedCompareNodeId || null);
+  };
+
+  const handleSpeedTestAllRelays = async () => {
+    if (speedTestingAll || speedTestingAny || isProbeEngineBusy || relays.length === 0) return;
+    await appActions.runTestPreAccelRelaySpeeds(null, resolvedCompareNodeId || null);
+  };
+
   const handleConfirmRemoveRelay = async () => {
     if (!pendingDeleteRelay || deletingRelay) return;
     const target = pendingDeleteRelay;
@@ -1461,22 +1459,6 @@ export function PreAccelPage() {
   const handleCheckCampusAuth = async () => {
     if (checkingPortal) return;
     await appActions.runCheckCampusPortal();
-  };
-
-  const guideMarkdown = useMemo(
-    () => buildAiDeployGuide(probeUrl, skip443Native),
-    [probeUrl, skip443Native]
-  );
-
-  const handleCopyGuide = async () => {
-    const ok = await copyText(guideMarkdown);
-    if (ok) {
-      setCopiedGuide(true);
-      appActions.showToast("已复制给 AI 助手的中文部署说明", "ok");
-      scheduleTimer(() => setCopiedGuide(false), 2200);
-    } else {
-      appActions.showToast("复制失败，请手动选中文本复制", "warn");
-    }
   };
 
   const effectiveUpRatio = useMemo(() => {
@@ -1536,7 +1518,25 @@ export function PreAccelPage() {
     globalPreAccel.active_connections || runtime.global_preaccel_connections || 0;
   const isWindows = platformOs === "windows";
   const localSocksAddress = effectiveGlobalPort ? `127.0.0.1:${effectiveGlobalPort}` : null;
-  const processStats = globalPreAccel.process_stats ?? [];
+  const processStats = useMemo(
+    () => dedupeProcessStats(globalPreAccel.process_stats ?? []),
+    [globalPreAccel.process_stats]
+  );
+  const acceleratedProcesses = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const proc of globalPreAccel.accelerated_processes ?? []) {
+      const key = proc.trim().toLowerCase();
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(proc);
+    }
+    return out;
+  }, [globalPreAccel.accelerated_processes]);
+  const enabledRelayIds = useMemo(
+    () => sortedRelays.filter((r) => r.enabled).map((r) => r.id),
+    [sortedRelays]
+  );
   const needsWindowsElevation =
     isWindows &&
     preaccelSummary.enabled &&
@@ -1645,7 +1645,7 @@ export function PreAccelPage() {
 
             <button
               type="button"
-              onClick={() => setShowGuideModal(true)}
+              onClick={() => appActions.openAiAssistant("preaccel", "web")}
               className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
             >
               <FileText className="h-3.5 w-3.5 text-[var(--accent)]" />
@@ -1926,14 +1926,14 @@ export function PreAccelPage() {
             {/* 已自动识别并加速的进程小胶囊列表（含连接数与流量） */}
             {(processStats.length > 0 ||
               (preaccelSummary.realWinDivertActive &&
-                globalPreAccel.accelerated_processes.length > 0)) && (
+                acceleratedProcesses.length > 0)) && (
               <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/80 px-3.5 py-2.5">
                 <div className="mb-2 flex items-center justify-between gap-2 text-[11px]">
                   <span className="font-medium text-[var(--text-secondary)]">
                     已自动识别并加速（
                     {processStats.length > 0
                       ? processStats.length
-                      : globalPreAccel.accelerated_processes.length}
+                      : acceleratedProcesses.length}
                     ）
                   </span>
                   <span className="text-[10px] text-[var(--muted)]">
@@ -1944,7 +1944,7 @@ export function PreAccelPage() {
                   {processStats.length > 0
                     ? processStats.slice(0, 12).map((stat) => (
                         <span
-                          key={`${stat.process_name}-${stat.pid}`}
+                          key={stat.process_name.toLowerCase()}
                           title={`PID ${stat.pid} · 来源：${formatDetectedByLabel(stat.detected_by)} · 累计 ${stat.total_connections} 连接`}
                           className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)]/35 bg-[var(--card)] px-2 py-1 text-[11px]"
                         >
@@ -1967,9 +1967,9 @@ export function PreAccelPage() {
                           </span>
                         </span>
                       ))
-                    : globalPreAccel.accelerated_processes.slice(0, 10).map((proc) => (
+                    : acceleratedProcesses.slice(0, 10).map((proc) => (
                         <span
-                          key={proc}
+                          key={proc.toLowerCase()}
                           className="cc-mono rounded-lg border border-[var(--accent)]/35 bg-[var(--accent-soft)]/60 px-2 py-1 text-[11px] font-medium text-[var(--accent)]"
                         >
                           {proc}
@@ -2000,12 +2000,38 @@ export function PreAccelPage() {
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
+              onClick={() => setShareModalOpen(true)}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              title="一键导出或导入国内提速中转与节点 .zip 分享包"
+            >
+              <Package className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <span>{dict.common.shareBundle}</span>
+            </button>
+
+            <button
+              type="button"
               disabled={probingAll || relays.length === 0}
               onClick={() => void handleProbeAllRelays()}
+              title="快速检测所有中转线路的连通性与实时延迟"
               className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-65"
             >
               <RefreshCw className={`h-3.5 w-3.5 ${probingAll ? "animate-spin" : ""}`} />
-              <span>{probingAll ? "检测中..." : "全部测速"}</span>
+              <span>{probingAll ? "检测中..." : "测延迟"}</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={speedTestingAll || speedTestingAny || isProbeEngineBusy || relays.length === 0}
+              onClick={() => void handleSpeedTestAllRelays()}
+              title="逐条实测所有中转线路的实际上传与下载速率（切页不中断）"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-65"
+            >
+              {speedTestingAll ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />
+              ) : (
+                <Gauge className="h-3.5 w-3.5 text-[var(--accent)]" />
+              )}
+              <span>{speedTestingAll ? "测速中..." : "测上下行"}</span>
             </button>
 
             <button
@@ -2063,6 +2089,10 @@ export function PreAccelPage() {
                 : `备用 ${enabledRank ?? 1}`;
             const isActivePrimary = relay.id === primaryRelayId && relay.enabled;
             const isProbing = probingIdsSet.has(relay.id) || probingAll;
+            const isSpeedTesting = speedTestingIdsSet.has(relay.id) || speedTestingAll;
+            const hasUpSpeed = hasValidSpeed(relay.last_up_mbps);
+            const hasDownSpeed = hasValidSpeed(relay.last_down_mbps);
+            const hasLegacySpeed = !hasUpSpeed && !hasDownSpeed && hasValidSpeed(relay.last_mbps);
             const expiry = computeExpiryInfo(relay.expires_at);
             const hasUrgentExpiry = expiry.tone === "warn" || expiry.tone === "expired";
             const safeSni = (relay.sni ?? "").trim();
@@ -2169,7 +2199,7 @@ export function PreAccelPage() {
                     </div>
                   </div>
 
-                  {/* 实时延迟 */}
+                  {/* 实时延迟 + 真实上下行 */}
                   <div className="shrink-0 text-right">
                     <div
                       className="cc-mono cc-tabular text-base font-bold leading-tight"
@@ -2179,11 +2209,28 @@ export function PreAccelPage() {
                         ? formatLatencyDisplay(relay.last_probe_ms, "--")
                         : "待测速"}
                     </div>
-                    <div className="mt-0.5 text-[10px] text-[var(--muted)]">
-                      {relay.last_mbps !== null
-                        ? `${relay.last_mbps.toFixed(0)} Mbps`
-                        : "实时延迟"}
-                    </div>
+                    {hasUpSpeed || hasDownSpeed ? (
+                      <div className="mt-0.5 flex items-center justify-end gap-1.5 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold">
+                        {hasUpSpeed && (
+                          <span className="text-[var(--coral)]">
+                            ↑{relay.last_up_mbps!.toFixed(1)} M
+                          </span>
+                        )}
+                        {hasDownSpeed && (
+                          <span className="text-[var(--sky)]">
+                            ↓{relay.last_down_mbps!.toFixed(1)} M
+                          </span>
+                        )}
+                      </div>
+                    ) : hasLegacySpeed ? (
+                      <div className="mt-0.5 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold text-[var(--coral)]">
+                        ↑{relay.last_mbps!.toFixed(1)} M
+                      </div>
+                    ) : (
+                      <div className="mt-0.5 text-[10px] text-[var(--muted)]">
+                        {relay.last_probe_ms !== null ? "未测上下行" : "实时延迟"}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -2212,12 +2259,12 @@ export function PreAccelPage() {
                     </button>
                   </div>
 
-                  <div className="flex items-center gap-3">
+                  <div className="flex items-center gap-2.5">
                     {canSetPrimary && (
                       <button
                         type="button"
                         onClick={() => void handleSelectRelay(relay)}
-                        className="inline-flex items-center gap-1 font-medium text-[var(--accent)] transition-opacity hover:opacity-80"
+                        className="inline-flex items-center gap-1 whitespace-nowrap font-medium text-[var(--accent)] transition-opacity hover:opacity-80"
                       >
                         <Star className="h-3.5 w-3.5" />
                         <span>设为主力</span>
@@ -2228,16 +2275,32 @@ export function PreAccelPage() {
                       type="button"
                       disabled={isProbing}
                       onClick={() => void handleProbeRelay(relay.id)}
-                      className="inline-flex items-center gap-1 text-[var(--text-secondary)] transition-colors hover:text-[var(--accent)] disabled:opacity-50"
+                      title="快速检测该中转线路的连通延迟"
+                      className="inline-flex items-center gap-1 whitespace-nowrap text-[var(--text-secondary)] transition-colors hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       <RefreshCw className={`h-3.5 w-3.5 ${isProbing ? "animate-spin" : ""}`} />
-                      <span>{isProbing ? "测速中" : "测速"}</span>
+                      <span>{isProbing ? "测延迟中" : "测延迟"}</span>
+                    </button>
+
+                    <button
+                      type="button"
+                      disabled={isSpeedTesting || isProbeEngineBusy}
+                      onClick={() => void handleSpeedTestRelay(relay.id)}
+                      title="实测该中转线路的实际上传与下载速率（切页不中断）"
+                      className="inline-flex items-center gap-1 whitespace-nowrap text-[var(--text-secondary)] transition-colors hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      {isSpeedTesting ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--accent)]" />
+                      ) : (
+                        <Gauge className="h-3.5 w-3.5" />
+                      )}
+                      <span>{isSpeedTesting ? "测速中" : "测上下行"}</span>
                     </button>
 
                     <button
                       type="button"
                       onClick={() => setPendingDeleteRelay(relay)}
-                      className="inline-flex items-center gap-1 text-[var(--muted)] transition-colors hover:text-[var(--red)]"
+                      className="inline-flex items-center gap-1 whitespace-nowrap text-[var(--muted)] transition-colors hover:text-[var(--red)]"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                       <span>删除</span>
@@ -2301,9 +2364,11 @@ export function PreAccelPage() {
               disabled={benchmarking || isOtherProbeRunning || isProbeEngineBusy}
               onClick={() => void handleRunBenchmark()}
               title={
-                isOtherProbeRunning
-                  ? "节点测速正在后台进行，完成后可运行提速对比"
-                  : undefined
+                speedTestingAny
+                  ? "中转上下行测速正在后台进行，完成后可运行提速对比"
+                  : isOtherProbeRunning
+                    ? "节点测速正在后台进行，完成后可运行提速对比"
+                    : undefined
               }
               className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-60"
             >
@@ -2311,9 +2376,11 @@ export function PreAccelPage() {
               <span>
                 {benchmarking
                   ? "正在实测对比（约 5～10 秒）…"
-                  : isOtherProbeRunning
-                    ? "节点测速进行中…"
-                    : "一键对比提速效果"}
+                  : speedTestingAny
+                    ? "中转测速进行中…"
+                    : isOtherProbeRunning
+                      ? "节点测速进行中…"
+                      : "一键对比提速效果"}
               </span>
             </button>
           </div>
@@ -2916,8 +2983,8 @@ export function PreAccelPage() {
                 <div className="text-xs font-semibold text-[var(--text)]">
                   已是高速通道的线路自动跳过
                 </div>
-                <div className="mt-0.5 text-[11px] text-[var(--muted)]">
-                  本身已是 443 直连高速通道的海外节点直接连接不重复中转，可在节点页按单个节点覆盖
+                <div className="mt-0.5 text-[11px] leading-relaxed text-[var(--muted)]">
+                  {dict.preaccel.skip443Hint}
                 </div>
               </div>
               <span
@@ -3763,66 +3830,17 @@ export function PreAccelPage() {
         )}
 
       {/* ====================================================================
-       * 弹窗 3：给 AI 助手的部署说明
+       * 弹窗 3：猫云分享包（导出 / 导入国内提速中转与节点 .zip）
        * ==================================================================== */}
-      {showGuideModal &&
-        typeof document !== "undefined" &&
-        createPortal(
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-            onClick={() => setShowGuideModal(false)}
-          >
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="给 AI 助手的部署说明"
-            onClick={(e) => e.stopPropagation()}
-            className="cc-surface w-full max-w-2xl rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
-          >
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <h3 className="text-sm font-semibold text-[var(--text)]">
-                  给 AI 助手的部署说明
-                </h3>
-                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                  复制下方说明发给你的 AI 助手，即可让它帮你快速搭建中转并生成导入配置
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setShowGuideModal(false)}
-                className="rounded-lg p-1.5 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
-                aria-label="关闭弹窗"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <pre className="cc-mono cc-selectable mt-4 max-h-80 overflow-auto whitespace-pre-wrap rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5 text-[11px] leading-relaxed text-[var(--text-secondary)]">
-              {guideMarkdown}
-            </pre>
-
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setShowGuideModal(false)}
-                className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--muted)] hover:text-[var(--text)]"
-              >
-                关闭
-              </button>
-              <button
-                type="button"
-                onClick={() => void handleCopyGuide()}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-              >
-                {copiedGuide ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-                <span>{copiedGuide ? "已复制到剪贴板" : "一键复制说明"}</span>
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
+      <ShareBundleModal
+        open={shareModalOpen}
+        mode={relays.length > 0 ? "export" : "import"}
+        allowModeSwitch
+        defaultTab="relays"
+        defaultPackName="国内提速中转分享包"
+        initialRelayIds={enabledRelayIds}
+        onClose={() => setShareModalOpen(false)}
+      />
 
       {/* ====================================================================
        * 弹窗 4：删除中转线路二次确认

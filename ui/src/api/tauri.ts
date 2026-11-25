@@ -13,6 +13,9 @@ import {
   detectNavigatorOs,
   type ShellEnvKind,
 } from "../utils/platform";
+import { normalizeUiLanguage, type UiLanguage } from "../i18n";
+
+export type { UiLanguage };
 
 export type ThemeMode = "auto_time" | "light" | "warm_dark" | "midnight_blue";
 export type ResolvedTheme = "light" | "warm-dark" | "midnight-blue";
@@ -55,6 +58,7 @@ export interface ThemeSchedule {
 }
 
 export interface PersonalizationConfig {
+  ui_language?: UiLanguage;
   theme_mode: ThemeMode;
   theme_schedule: ThemeSchedule;
   wallpaper_path: string | null;
@@ -429,6 +433,8 @@ export interface PreAccelRelay {
   enabled: boolean;
   last_probe_ms: number | null;
   last_mbps: number | null;
+  last_up_mbps?: number | null;
+  last_down_mbps?: number | null;
 }
 
 export interface TrafficSample {
@@ -483,6 +489,10 @@ export interface CoreRuntimeInfo {
   global_preaccel_verify_state?: PreAccelVerifyState;
   global_preaccel_verify_ms?: number | null;
   node_health_hints?: Record<string, NodeHealthHintDto>;
+  probing_active?: boolean;
+  switching_active?: boolean;
+  active_group_circuit_open?: boolean;
+  active_group_state?: string | null;
   captive_portal_required: boolean;
   system_proxy_enabled: boolean;
   tun_enabled: boolean;
@@ -593,6 +603,18 @@ export interface PreAccelTestResult {
   error: string | null;
 }
 
+export interface PreAccelSpeedTestResult {
+  relay_id: string;
+  relay_name: string;
+  ok: boolean;
+  latency_ms: number | null;
+  up_mbps: number | null;
+  down_mbps: number | null;
+  mode: "via_node" | "relay_direct";
+  reference_node_name: string | null;
+  error: string | null;
+}
+
 export interface PreAccelSideSpeed {
   ok: boolean;
   latency_ms: number | null;
@@ -657,9 +679,89 @@ export interface CoreLogLineDto {
 
 export interface AgentModuleDoc {
   id: string;
+  module_id: string;
+  file_name: string;
+  lang: string;
   title: string;
-  summary?: string;
-  [key: string]: unknown;
+  summary: string;
+  when_to_use_and_signals: string[];
+  external_prereqs_and_schema: string[];
+  gui_and_cli_verification: string[];
+  rollback_and_troubleshooting: string[];
+  contract_example: string;
+}
+
+export type SubscriptionUpdateMode = "replace_latest" | "merge_dedup";
+
+export interface SubscriptionNodesUpdateResult {
+  sub_id: string;
+  kept_count: number;
+  added_count: number;
+  replaced_count: number;
+  total_count: number;
+  id_remap: Record<string, string>;
+}
+
+export interface MergeSubscriptionsResult {
+  target_sub_id: string;
+  source_sub_id: string;
+  moved_count: number;
+  deduplicated_count: number;
+  total_count: number;
+  id_remap: Record<string, string>;
+}
+
+export interface ShareBundleManifest {
+  schema: string;
+  name: string;
+  created_at: string;
+  node_count: number;
+  relay_count: number;
+  description: string | null;
+  sanitized_notice: string;
+}
+
+export interface ShareBundlePreview {
+  zip_path: string;
+  manifest: ShareBundleManifest;
+  nodes: ProxyNode[];
+  relays: PreAccelRelay[];
+  warnings: string[];
+  has_readme: boolean;
+}
+
+export interface ShareBundleExportOutcome {
+  cancelled: boolean;
+  path: string | null;
+  manifest: ShareBundleManifest | null;
+}
+
+export interface ShareBundleImportOutcome {
+  imported_nodes: number;
+  imported_relays: number;
+  target_sub_id: string | null;
+  target_sub_name: string | null;
+  warnings: string[];
+}
+
+export interface ExportAgentDocOutcome {
+  cancelled: boolean;
+  path: string | null;
+  bytes: number;
+}
+
+export interface AgentBootstrapPromptDto {
+  prompt: string;
+  cli_path: string;
+  data_dir: string;
+  docs_index_path: string;
+  lang: string;
+}
+
+export interface GithubIssueDraftDto {
+  issue_url: string;
+  clipboard_markdown: string;
+  title: string;
 }
 
 export interface EvaluatedCandidate {
@@ -1200,6 +1302,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     windivert_dir: null,
   },
   personalization: {
+    ui_language: "zh-CN",
     theme_mode: "auto_time",
     theme_schedule: {
       light_start: "07:00",
@@ -1560,7 +1663,9 @@ const MOCK_PREACCEL_RELAYS: PreAccelRelay[] = [
     expires_at: "2027-05-01",
     enabled: true,
     last_probe_ms: 19,
-    last_mbps: 192.5,
+    last_mbps: 18.6,
+    last_up_mbps: 18.6,
+    last_down_mbps: 94.2,
   },
   {
     id: "relay-cn-south",
@@ -1576,7 +1681,9 @@ const MOCK_PREACCEL_RELAYS: PreAccelRelay[] = [
     expires_at: "2027-08-12",
     enabled: true,
     last_probe_ms: 28,
-    last_mbps: 158.0,
+    last_mbps: null,
+    last_up_mbps: null,
+    last_down_mbps: null,
   },
 ];
 
@@ -1671,23 +1778,71 @@ const VALID_PREACCEL_VERIFY_STATES = new Set<PreAccelVerifyState>([
   "failed",
 ]);
 
+const DETECTED_BY_PRIORITY: Record<string, number> = {
+  system_proxy_host: 5,
+  open_core_name: 4,
+  local_proxy_listener: 3,
+  manual: 2,
+  scope_all: 1,
+  runtime: 0,
+};
+
+function detectedByRank(kind: string): number {
+  return DETECTED_BY_PRIORITY[kind.trim().toLowerCase()] ?? 0;
+}
+
 function normalizeAcceleratedProcessStats(raw: unknown): AcceleratedProcessStat[] {
   if (!Array.isArray(raw)) return [];
   const safeNum = (v: unknown): number =>
     typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0;
-  return raw
-    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === "object"))
-    .map((item) => ({
-      process_name: typeof item.process_name === "string" ? item.process_name : "",
-      pid: safeNum(item.pid),
-      detected_by: typeof item.detected_by === "string" ? item.detected_by : "runtime",
-      active_connections: safeNum(item.active_connections),
-      total_connections: safeNum(item.total_connections),
-      tx_bytes: safeNum(item.tx_bytes),
-      rx_bytes: safeNum(item.rx_bytes),
-      last_seen_ms: safeNum(item.last_seen_ms),
-    }))
-    .filter((item) => item.process_name.length > 0);
+  const merged = new Map<string, AcceleratedProcessStat>();
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const processName = typeof rec.process_name === "string" ? rec.process_name.trim() : "";
+    if (!processName) continue;
+    const key = processName.toLowerCase();
+    const detectedBy = typeof rec.detected_by === "string" ? rec.detected_by.trim() || "runtime" : "runtime";
+    const pid = safeNum(rec.pid);
+    const activeConnections = safeNum(rec.active_connections);
+    const totalConnections = safeNum(rec.total_connections);
+    const txBytes = safeNum(rec.tx_bytes);
+    const rxBytes = safeNum(rec.rx_bytes);
+    const lastSeenMs = safeNum(rec.last_seen_ms);
+
+    const existing = merged.get(key);
+    if (!existing) {
+      merged.set(key, {
+        process_name: processName,
+        pid,
+        detected_by: detectedBy,
+        active_connections: activeConnections,
+        total_connections: totalConnections,
+        tx_bytes: txBytes,
+        rx_bytes: rxBytes,
+        last_seen_ms: lastSeenMs,
+      });
+    } else {
+      const preferNewSource = detectedByRank(detectedBy) > detectedByRank(existing.detected_by);
+      const preferNewPid = lastSeenMs >= existing.last_seen_ms && pid > 0;
+      merged.set(key, {
+        process_name: existing.process_name,
+        pid: preferNewPid ? pid : existing.pid,
+        detected_by: preferNewSource ? detectedBy : existing.detected_by,
+        active_connections: existing.active_connections + activeConnections,
+        total_connections: existing.total_connections + totalConnections,
+        tx_bytes: existing.tx_bytes + txBytes,
+        rx_bytes: existing.rx_bytes + rxBytes,
+        last_seen_ms: Math.max(existing.last_seen_ms, lastSeenMs),
+      });
+    }
+  }
+  return Array.from(merged.values()).sort((a, b) => {
+    if (b.active_connections !== a.active_connections) {
+      return b.active_connections - a.active_connections;
+    }
+    return b.last_seen_ms - a.last_seen_ms;
+  });
 }
 
 function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
@@ -2814,6 +2969,202 @@ export const catcloudApi = {
     return mockSubscriptions.length < before;
   },
 
+  async renameSubscription(subId: string, newName: string): Promise<SubscriptionRecord> {
+    const trimmed = newName.trim();
+    if (!trimmed) {
+      throw new Error("订阅组名称不能为空");
+    }
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SubscriptionRecord>("rename_subscription", {
+        subId,
+        newName: trimmed,
+      });
+    }
+    const target = mockSubscriptions.find((s) => s.id === subId);
+    if (!target) throw new Error(`未找到订阅组：${subId}`);
+    target.name = trimmed;
+    return structuredClone(target);
+  },
+
+  async applyNodesToExistingSubscription(
+    targetSubId: string,
+    nodes: ProxyNode[],
+    mode: SubscriptionUpdateMode
+  ): Promise<SubscriptionNodesUpdateResult> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SubscriptionNodesUpdateResult>(
+        "apply_nodes_to_existing_subscription",
+        {
+          targetSubId,
+          nodes,
+          mode,
+        }
+      );
+    }
+    const existing = mockNodes.filter((n) => n.sub_id === targetSubId);
+    const incomingWithSub = nodes.map((n) => ({ ...n, sub_id: targetSubId }));
+    if (mode === "replace_latest") {
+      mockNodes = [
+        ...mockNodes.filter((n) => n.sub_id !== targetSubId),
+        ...incomingWithSub,
+      ];
+      return {
+        sub_id: targetSubId,
+        kept_count: 0,
+        added_count: incomingWithSub.length,
+        replaced_count: existing.length,
+        total_count: incomingWithSub.length,
+        id_remap: {},
+      };
+    }
+    const existingKeys = new Set(
+      existing.map((n) => `${n.protocol}|${n.server.toLowerCase()}|${n.port}`)
+    );
+    const dedupNew = incomingWithSub.filter(
+      (n) => !existingKeys.has(`${n.protocol}|${n.server.toLowerCase()}|${n.port}`)
+    );
+    mockNodes = [...mockNodes, ...dedupNew];
+    return {
+      sub_id: targetSubId,
+      kept_count: existing.length,
+      added_count: dedupNew.length,
+      replaced_count: 0,
+      total_count: existing.length + dedupNew.length,
+      id_remap: {},
+    };
+  },
+
+  async mergeSubscriptions(params: {
+    sourceSubId: string;
+    targetSubId: string;
+    newTargetName?: string | null;
+    deduplicate?: boolean;
+    convertTargetToMigrated?: boolean;
+  }): Promise<MergeSubscriptionsResult> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<MergeSubscriptionsResult>("merge_subscriptions", {
+        sourceSubId: params.sourceSubId,
+        targetSubId: params.targetSubId,
+        newTargetName: params.newTargetName?.trim() || null,
+        deduplicate: params.deduplicate ?? true,
+        convertTargetToMigrated: params.convertTargetToMigrated ?? false,
+      });
+    }
+    const target = mockSubscriptions.find((s) => s.id === params.targetSubId);
+    if (!target) throw new Error("未找到目标组");
+    if (params.newTargetName?.trim()) {
+      target.name = params.newTargetName.trim();
+    }
+    const targetNodes = mockNodes.filter((n) => n.sub_id === params.targetSubId);
+    const sourceNodes = mockNodes.filter((n) => n.sub_id === params.sourceSubId);
+    const seen = new Set(
+      targetNodes.map((n) => `${n.protocol}|${n.server.toLowerCase()}|${n.port}`)
+    );
+    let moved = 0;
+    let deduped = 0;
+    const nextNodes: ProxyNode[] = mockNodes.filter((n) => n.sub_id !== params.sourceSubId);
+    for (const node of sourceNodes) {
+      const fp = `${node.protocol}|${node.server.toLowerCase()}|${node.port}`;
+      if ((params.deduplicate ?? true) && seen.has(fp)) {
+        deduped += 1;
+      } else {
+        seen.add(fp);
+        moved += 1;
+        nextNodes.push({ ...node, sub_id: params.targetSubId });
+      }
+    }
+    mockNodes = nextNodes;
+    mockSubscriptions = mockSubscriptions.filter((s) => s.id !== params.sourceSubId);
+    return {
+      target_sub_id: params.targetSubId,
+      source_sub_id: params.sourceSubId,
+      moved_count: moved,
+      deduplicated_count: deduped,
+      total_count: targetNodes.length + moved,
+      id_remap: {},
+    };
+  },
+
+  async exportShareBundleDialog(params: {
+    name: string;
+    description?: string | null;
+    nodeIds: string[];
+    relayIds: string[];
+  }): Promise<ShareBundleExportOutcome> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<ShareBundleExportOutcome>("export_share_bundle_dialog", {
+        name: params.name.trim() || "猫猫云梯分享包",
+        description: params.description?.trim() || null,
+        nodeIds: params.nodeIds,
+        relayIds: params.relayIds,
+      });
+    }
+    return {
+      cancelled: false,
+      path: `${params.name.trim() || "catcloud-share"}.zip`,
+      manifest: {
+        schema: "catcloud-share/v1",
+        name: params.name.trim() || "猫猫云梯分享包",
+        created_at: new Date().toISOString(),
+        node_count: params.nodeIds.length,
+        relay_count: params.relayIds.length,
+        description: params.description?.trim() || null,
+        sanitized_notice:
+          "该分享包仅包含选中的节点与中转连接配置，不含本机日志或订阅原链接；请仅私发给信任的朋友。",
+      },
+    };
+  },
+
+  async pickAndPreviewShareBundle(): Promise<ShareBundlePreview | null> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<ShareBundlePreview | null>("pick_and_preview_share_bundle");
+    }
+    return {
+      zip_path: "demo-friend-share.zip",
+      manifest: {
+        schema: "catcloud-share/v1",
+        name: "朋友分享包（演示预览）",
+        created_at: new Date().toISOString(),
+        node_count: 2,
+        relay_count: 1,
+        description: "含 2 个示例节点与 1 条国内 443 中转线路",
+        sanitized_notice:
+          "该分享包采用 catcloud-share/v1 标准格式，请仅导入来自信任朋友的分享包。",
+      },
+      nodes: structuredClone(MOCK_NODES.slice(0, 2)),
+      relays: structuredClone(MOCK_PREACCEL_RELAYS.slice(0, 1)),
+      warnings: ["浏览器预览模式：展示模拟 .zip 分享包解析结果"],
+      has_readme: true,
+    };
+  },
+
+  async importShareBundle(params: {
+    zipPath: string;
+    selectedNodeIds: string[];
+    selectedRelayIds: string[];
+    targetSubId?: string | null;
+    newSubName?: string | null;
+    updateMode?: SubscriptionUpdateMode;
+  }): Promise<ShareBundleImportOutcome> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<ShareBundleImportOutcome>("import_share_bundle", {
+        zipPath: params.zipPath,
+        selectedNodeIds: params.selectedNodeIds,
+        selectedRelayIds: params.selectedRelayIds,
+        targetSubId: params.targetSubId ?? null,
+        newSubName: params.newSubName?.trim() || null,
+        updateMode: params.updateMode ?? "merge_dedup",
+      });
+    }
+    return {
+      imported_nodes: params.selectedNodeIds.length,
+      imported_relays: params.selectedRelayIds.length,
+      target_sub_id: params.targetSubId ?? "sub-share-preview",
+      target_sub_name: params.newSubName?.trim() || "朋友分享包",
+      warnings: [],
+    };
+  },
+
   async refreshSubscription(
     subId: string,
     options?: { bearerSecret?: string | null; endpointUrl?: string | null }
@@ -3078,6 +3429,50 @@ export const catcloudApi = {
     }));
   },
 
+  async testPreAccelRelaySpeeds(
+    relayIds: string[] | null = null,
+    nodeId: string | null = null
+  ): Promise<PreAccelSpeedTestResult[]> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<PreAccelSpeedTestResult[]>("test_preaccel_relay_speeds", {
+        relayIds,
+        nodeId,
+      });
+    }
+    const targets = relayIds
+      ? mockRelays.filter((r) => relayIds.includes(r.id))
+      : mockRelays;
+    const chosenNode =
+      (nodeId ? mockNodes.find((n) => n.id === nodeId) : null) ??
+      (mockRuntime.active_node_id
+        ? mockNodes.find((n) => n.id === mockRuntime.active_node_id)
+        : null) ??
+      mockNodes.find((n) => n.enabled) ??
+      mockNodes[0] ??
+      null;
+    return targets.map((r, idx) => {
+      const isPrimary = r.id === "relay-cn-east" || idx === 0;
+      const latencyMs = Math.max(12, Math.round(r.last_probe_ms ?? (isPrimary ? 19 : 28)));
+      const upMbps = isPrimary ? 18.6 : 12.4;
+      const downMbps = isPrimary ? 94.2 : 76.8;
+      r.last_probe_ms = latencyMs;
+      r.last_up_mbps = upMbps;
+      r.last_down_mbps = downMbps;
+      r.last_mbps = upMbps;
+      return {
+        relay_id: r.id,
+        relay_name: r.name,
+        ok: true,
+        latency_ms: latencyMs,
+        up_mbps: upMbps,
+        down_mbps: downMbps,
+        mode: chosenNode ? "via_node" : "relay_direct",
+        reference_node_name: chosenNode ? chosenNode.name : null,
+        error: null,
+      };
+    });
+  },
+
   async benchmarkPreAccelComparison(
     relayId?: string | null,
     nodeId?: string | null
@@ -3216,18 +3611,200 @@ export const catcloudApi = {
     return [];
   },
 
-  async listAgentDocs(): Promise<AgentModuleDoc[]> {
+  async listAgentDocs(lang?: UiLanguage): Promise<AgentModuleDoc[]> {
+    const normalizedLang = lang ? normalizeUiLanguage(lang) : null;
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<AgentModuleDoc[]>("list_agent_docs");
+      return tauriInvokeOrThrow<AgentModuleDoc[]>("list_agent_docs", {
+        lang: normalizedLang,
+      });
     }
-    return [];
+    const isEn = normalizedLang === "en";
+    const docLang = normalizedLang ?? "zh-CN";
+    const makePreviewDoc = (
+      id: string,
+      file_name: string,
+      title: string,
+      summary: string
+    ): AgentModuleDoc => ({
+      id,
+      module_id: id,
+      file_name,
+      lang: docLang,
+      title,
+      summary,
+      when_to_use_and_signals: [],
+      external_prereqs_and_schema: [],
+      gui_and_cli_verification: [],
+      rollback_and_troubleshooting: [],
+      contract_example: "",
+    });
+    return [
+      makePreviewDoc(
+        "troubleshooting",
+        "00-general-troubleshooting.md",
+        isEn ? "00 · General Troubleshooting & Issue Guide" : "00 · 通用排障总纲与问题反馈",
+        isEn
+          ? "6-layer read-only diagnostic checklist, competitor conflict checks, and GitHub Issue workflow."
+          : "六层只读听诊顺序、竞品残留与端口冲突定位，以及一键向官方仓库反馈 Issue 指引。"
+      ),
+      makePreviewDoc(
+        "onboarding",
+        "01-onboarding.md",
+        isEn ? "01 · First-Time Setup & Core Concepts" : "01 · 新手从零上手总纲",
+        isEn
+          ? "Car vs. Fuel analogy, 5 startup states, importing subscriptions/share bundles, and going online."
+          : "「猫云是车、订阅是油」核心心智、5 种常见开局状态判断、节点导入与开启代理指南。"
+      ),
+      makePreviewDoc(
+        "preaccel",
+        "02-domestic-preaccel.md",
+        isEn ? "02 · Domestic 443 Acceleration (0 to 1)" : "02 · 国内提速从 0 到 1 指南",
+        isEn
+          ? "Self-hosted 443 relay deployment, empty SNI rule, one-click mmrelay://v1 import, and WinDivert verification."
+          : "买机选区、放行 443 端口、纯 IP 留空 SNI、服务端一键部署与第三方代理穿透实测。"
+      ),
+      makePreviewDoc(
+        "multigroup",
+        "03-multigroup.md",
+        isEn ? "03 · Smart Multi-Groups & Failover" : "03 · 智能多选组与自动切线",
+        isEn
+          ? "Sticky-best anti-IP-hopping for AI tools, plain-language scoring rules, and fallback pools."
+          : "粘性最优防 AI 频繁换 IP、大白话规则与公式对照、备用池兜底与健康池冷却机制。"
+      ),
+      makePreviewDoc(
+        "nodes_probes",
+        "04-nodes-and-probes.md",
+        isEn ? "04 · Nodes, Subscriptions & Background Probes" : "04 · 节点管理与后台测速",
+        isEn
+          ? "Three probe tiers, Google CN detection, AI unlock checks, and safe subscription update/merge."
+          : "三档后台测速（延迟 / 送中+AI / 上下行）、订阅刷新保护、更新已有组与合并去重。"
+      ),
+      makePreviewDoc(
+        "routing_conns",
+        "05-routing-and-connections.md",
+        isEn ? "05 · Routing Rules, DNS & Live Connections" : "05 · 分流规则、DNS 与实时连接",
+        isEn
+          ? "Rule vs. Global vs. Direct modes, domestic direct rules, QUIC/DNS guardrails, and connection audit."
+          : "规则/全局/直连模式选择、国内软件直连与防漏、实时连接筛选与断开旧连接操作。"
+      ),
+      makePreviewDoc(
+        "network_lifecycle",
+        "06-network-and-lifecycle.md",
+        isEn ? "06 · Network Stack, Backup & Updates" : "06 · 网络接管、备份与安全更新",
+        isEn
+          ? "System proxy vs. TUN, memory optimization, sanitized backup/restore, and portable updates."
+          : "系统代理与虚拟网卡协同、内核内存优化、一键备份还原与便携版安全升级说明。"
+      ),
+      makePreviewDoc(
+        "share_bundle",
+        "07-share-bundle.md",
+        isEn ? "07 · Share Bundle (.zip) Spec" : "07 · 好友分享包（.zip）格式与导入",
+        isEn
+          ? "Human & Agent friendly catcloud-share/v1 zip bundle export, selective import, and privacy rules."
+          : "勾选节点与国内中转打包成 .zip 分享给朋友、一键预览导入与隐私安全红线。"
+      ),
+    ];
   },
 
-  async exportAgentDocs(moduleId: string, asJson = false): Promise<string> {
+  async exportAgentDocs(
+    moduleId: string,
+    asJson = false,
+    lang?: UiLanguage
+  ): Promise<string> {
+    const normalizedLang = lang ? normalizeUiLanguage(lang) : null;
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<string>("export_agent_docs", { moduleId, asJson });
+      return tauriInvokeOrThrow<string>("export_agent_docs", {
+        moduleId,
+        asJson,
+        lang: normalizedLang,
+      });
     }
-    return "";
+    return `# CatCloud Guide (${moduleId} · ${normalizedLang ?? "zh-CN"})\n\n浏览器预览模式示例文档内容。`;
+  },
+
+  async buildAgentBootstrapPrompt(
+    lang?: UiLanguage,
+    currentPage?: string
+  ): Promise<AgentBootstrapPromptDto> {
+    const normalizedLang = normalizeUiLanguage(lang ?? mockConfig.personalization.ui_language);
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<AgentBootstrapPromptDto>("build_agent_bootstrap_prompt", {
+        lang: normalizedLang,
+        currentPage: currentPage ?? null,
+      });
+    }
+    const cliPath = "C:\\Users\\<USER>\\Apps\\CatCloud\\cli\\catcloud.exe";
+    const dataDir = "C:\\Users\\<USER>\\Apps\\CatCloud\\data";
+    const docsIndex = `${dataDir}\\agent_docs\\${normalizedLang}\\INDEX.md`;
+    const prompt = [
+      `请全程使用「${normalizedLang === "en" ? "English" : normalizedLang === "ja" ? "日本語" : normalizedLang === "ru" ? "Русский" : "简体中文"}」向我解释，并主动帮我使用本机工具检查猫猫云梯（CatCloud）。`,
+      "",
+      `- 可执行 CLI：\`${cliPath}\``,
+      `- 数据目录：\`${dataDir}\``,
+      `- 随装手册索引：\`${docsIndex}\``,
+      `- 当前所在界面：${currentPage || "overview"}`,
+      "",
+      "## 协作约定",
+      "1. 先只读自查：优先阅读随装手册索引并运行 `catcloud status --json`、`catcloud net doctor --json` 摸清现状。",
+      "2. 改动前先确认：涉及修改配置、节点、分流或中转前，先用大白话告诉我方案并征得我同意，你可以直接帮我用 CLI 执行。",
+      "3. 隐私红线：严禁在回复中复述明文密码、UUID、订阅完整 URL 或真实公网中转 IP。",
+    ].join("\n");
+    return {
+      prompt,
+      cli_path: cliPath,
+      data_dir: dataDir,
+      docs_index_path: docsIndex,
+      lang: normalizedLang,
+    };
+  },
+
+  async exportAgentDocFileDialog(
+    moduleId: string,
+    lang?: UiLanguage
+  ): Promise<ExportAgentDocOutcome> {
+    const normalizedLang = normalizeUiLanguage(lang ?? mockConfig.personalization.ui_language);
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<ExportAgentDocOutcome>("export_agent_doc_file_dialog", {
+        moduleId,
+        lang: normalizedLang,
+      });
+    }
+    return {
+      cancelled: false,
+      path: `catcloud-guide-${moduleId}-${normalizedLang}.md`,
+      bytes: 2048,
+    };
+  },
+
+  async buildGithubIssueUrl(
+    summary?: string | null,
+    lang?: UiLanguage
+  ): Promise<GithubIssueDraftDto> {
+    const normalizedLang = normalizeUiLanguage(lang ?? mockConfig.personalization.ui_language);
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<GithubIssueDraftDto>("build_github_issue_url", {
+        summary: summary?.trim() || null,
+        lang: normalizedLang,
+      });
+    }
+    const title = summary?.trim()
+      ? `[反馈] ${summary.trim().slice(0, 60)}`
+      : "[反馈] 猫猫云梯使用问题反馈";
+    const body = [
+      "### 问题描述",
+      summary?.trim() || "（请简述遇到的问题及复现步骤）",
+      "",
+      "### 自动脱敏诊断摘要",
+      "（已自动复制到剪贴板，请直接在此处按 Ctrl+V 粘贴）",
+    ].join("\n");
+    const issueUrl = `https://github.com/JuryBu/CatCloud/issues/new?title=${encodeURIComponent(
+      title
+    )}&body=${encodeURIComponent(body)}`;
+    return {
+      issue_url: issueUrl,
+      clipboard_markdown: `# CatCloud 脱敏环境摘要\n- 版本：v${mockRuntime.app_version}\n- 系统：${mockRuntime.os_label}\n- 模式：${mockRuntime.proxy_mode}\n`,
+      title,
+    };
   },
 
   async validateFormulaExpr(expr: string): Promise<boolean> {
@@ -3616,9 +4193,16 @@ export const catcloudApi = {
     return buildShellEnvFallback(kind, mockConfig.mixed_port);
   },
 
-  async buildAiOnboardingPrompt(): Promise<string> {
+  async buildAiOnboardingPrompt(
+    lang?: UiLanguage,
+    moduleId?: string | null
+  ): Promise<string> {
+    const normalizedLang = lang ? normalizeUiLanguage(lang) : null;
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<string>("build_ai_onboarding_prompt");
+      return tauriInvokeOrThrow<string>("build_ai_onboarding_prompt", {
+        lang: normalizedLang,
+        moduleId: moduleId ?? null,
+      });
     }
     const modeLabel =
       mockRuntime.proxy_mode === "rule"

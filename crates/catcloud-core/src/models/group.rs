@@ -258,6 +258,8 @@ pub struct PreAccelRelay {
     pub enabled: bool,
     pub last_probe_ms: Option<f64>,
     pub last_mbps: Option<f64>,
+    pub last_up_mbps: Option<f64>,
+    pub last_down_mbps: Option<f64>,
 }
 
 impl Default for PreAccelRelay {
@@ -278,6 +280,8 @@ impl Default for PreAccelRelay {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         }
     }
 }

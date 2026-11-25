@@ -15,6 +15,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "windows")]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,6 +39,50 @@ const MAX_EVENTS_RETAINED: usize = 80;
 const MAX_PREVIEW_NODES: usize = 20;
 const MAX_CONTROLLER_HTTP_BYTES: usize = 8 * 1024 * 1024;
 const CONTROLLER_PROBE_COOLDOWN: Duration = Duration::from_secs(3);
+#[cfg(target_os = "windows")]
+const MAX_PE_VERSION_INFO_BYTES: usize = 4 * 1024 * 1024;
+#[cfg(any(target_os = "windows", test))]
+const MAX_PE_NAME_CACHE_ENTRIES: usize = 128;
+
+/// Generic shell/runtime/placeholder window titles and tokens that should yield to a real
+/// PE FileDescription/ProductName when available. Contains zero proprietary vendor names.
+const GENERIC_SHELL_OR_RUNTIME_TITLES: &[&str] = &[
+    "electron",
+    "tauri",
+    "webview2",
+    "webview",
+    "flclash",
+    "clash",
+    "mihomo",
+    "sing-box",
+    "singbox",
+    "mainwindow",
+    "main",
+    "home",
+    "index",
+    "index.html",
+    "client",
+    "desktop",
+    "app",
+    "application",
+    "window",
+    "untitled",
+    "about:blank",
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "0.0.0.0",
+    "flutter",
+    "chromium",
+    "msedgewebview2",
+    "nwjs",
+    "launcher",
+    "helper",
+    "service",
+    "tray",
+    "gui",
+    "ui",
+];
 
 /// Known non-proxy database / OS service TCP ports excluded when inferring background proxy listeners.
 #[cfg(any(target_os = "windows", test))]
@@ -466,21 +512,371 @@ fn collect_related_pids(
     out
 }
 
+#[cfg(any(target_os = "windows", test))]
+type PeNameCacheKey = (String, u64, u128);
+
+#[cfg(any(target_os = "windows", test))]
+#[derive(Debug, Default)]
+struct PeNameCache {
+    entries: HashMap<PeNameCacheKey, Option<String>>,
+    order: VecDeque<PeNameCacheKey>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl PeNameCache {
+    fn get(&self, key: &PeNameCacheKey) -> Option<Option<String>> {
+        self.entries.get(key).cloned()
+    }
+
+    fn insert(&mut self, key: PeNameCacheKey, value: Option<String>) {
+        if self.entries.contains_key(&key) {
+            self.entries.insert(key, value);
+            return;
+        }
+        while self.entries.len() >= MAX_PE_NAME_CACHE_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, value);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// Returns `true` when `raw` is empty, a blank/loopback URL, or solely composed of generic
+/// cross-platform runtime/shell/placeholder tokens (e.g., `Electron`, `Tauri`, `WebView2`,
+/// `FlClash`, `MainWindow`, `Untitled`, `about:blank`, `localhost`, `127.0.0.1`).
+pub fn is_generic_shell_or_runtime_title(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if GENERIC_SHELL_OR_RUNTIME_TITLES.contains(&lower.as_str()) {
+        return true;
+    }
+    if lower.starts_with("about:")
+        || lower.starts_with("file://")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("https://localhost")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("https://127.0.0.1")
+        || lower.starts_with("localhost:")
+        || lower.starts_with("127.0.0.1:")
+    {
+        return true;
+    }
+
+    // Check normalized whitespace/punctuation-separated tokens (keeping `sing-box` intact).
+    let collapsed = lower.replace("sing-box", "singbox");
+    let tokens: Vec<&str> = collapsed
+        .split(|c: char| !c.is_alphanumeric() && c != '.' && c != ':')
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    tokens.iter().all(|tok| {
+        GENERIC_SHELL_OR_RUNTIME_TITLES.contains(tok)
+            || tok
+                .strip_prefix('v')
+                .unwrap_or(tok)
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.')
+    })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn select_best_pe_name_from_pairs(pairs: &[(Option<String>, Option<String>)]) -> Option<String> {
+    let mut non_generic_product: Option<String> = None;
+    let mut fallback_any: Option<String> = None;
+
+    for (desc, prod) in pairs {
+        if let Some(d) = desc.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !is_generic_shell_or_runtime_title(d) {
+                return Some(d.to_string());
+            }
+            if fallback_any.is_none() {
+                fallback_any = Some(d.to_string());
+            }
+        }
+        if let Some(p) = prod.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if !is_generic_shell_or_runtime_title(p) && non_generic_product.is_none() {
+                non_generic_product = Some(p.to_string());
+            }
+            if fallback_any.is_none() {
+                fallback_any = Some(p.to_string());
+            }
+        }
+    }
+
+    non_generic_product.or(fallback_any)
+}
+
+#[cfg(target_os = "windows")]
+fn pe_name_cache() -> &'static Mutex<PeNameCache> {
+    static CACHE: OnceLock<Mutex<PeNameCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(PeNameCache::default()))
+}
+
+#[cfg(target_os = "windows")]
+fn encode_wide_nul(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(target_os = "windows")]
+fn query_pe_version_string(buf: &[u8], subblock: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::VerQueryValueW;
+
+    let sub_w = encode_wide_nul(subblock);
+    let mut val_ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut val_len: u32 = 0;
+
+    // SAFETY: `buf` is a version-info resource block populated by `GetFileVersionInfoW`;
+    // `sub_w` is NUL-terminated UTF-16. Returned pointer and length are bounds-checked below.
+    let ok = unsafe {
+        VerQueryValueW(
+            buf.as_ptr().cast(),
+            sub_w.as_ptr(),
+            &mut val_ptr,
+            &mut val_len,
+        )
+    };
+    if ok == 0 || val_ptr.is_null() || val_len == 0 {
+        return None;
+    }
+
+    let base = buf.as_ptr() as usize;
+    let end = base.saturating_add(buf.len());
+    let ptr_addr = val_ptr as usize;
+    if ptr_addr < base || ptr_addr >= end {
+        return None;
+    }
+    let avail_u16 = (end - ptr_addr) / 2;
+    let count = (val_len as usize).min(avail_u16);
+    if count == 0 {
+        return None;
+    }
+
+    let mut units = Vec::with_capacity(count);
+    let u16_ptr = val_ptr as *const u16;
+    for idx in 0..count {
+        // SAFETY: `ptr_addr + (idx + 1) * 2 <= end`, verified above; `read_unaligned` tolerates any alignment.
+        let unit = unsafe { std::ptr::read_unaligned(u16_ptr.add(idx)) };
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+
+    let decoded = String::from_utf16_lossy(&units);
+    let cleaned: String = decoded.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn read_pe_translation_pairs(buf: &[u8]) -> Vec<(u16, u16)> {
+    use windows_sys::Win32::Storage::FileSystem::VerQueryValueW;
+
+    let mut pairs: Vec<(u16, u16)> = Vec::new();
+    let sub_w = encode_wide_nul("\\VarFileInfo\\Translation");
+    let mut ptr: *mut core::ffi::c_void = std::ptr::null_mut();
+    let mut byte_len: u32 = 0;
+
+    // SAFETY: `buf` is a version-info resource block populated by `GetFileVersionInfoW`;
+    // pointer and byte length are validated against `buf` bounds before reading.
+    let ok = unsafe {
+        VerQueryValueW(
+            buf.as_ptr().cast(),
+            sub_w.as_ptr(),
+            &mut ptr,
+            &mut byte_len,
+        )
+    };
+    if ok != 0 && !ptr.is_null() && byte_len >= 4 {
+        let base = buf.as_ptr() as usize;
+        let end = base.saturating_add(buf.len());
+        let ptr_addr = ptr as usize;
+        if ptr_addr >= base && ptr_addr < end {
+            let avail_bytes = (end - ptr_addr).min(byte_len as usize);
+            let pair_count = (avail_bytes / 4).min(32);
+            let raw_u16 = ptr as *const u16;
+            for idx in 0..pair_count {
+                // SAFETY: `(idx + 1) * 4 <= avail_bytes <= end - ptr_addr`.
+                let lang = unsafe { std::ptr::read_unaligned(raw_u16.add(idx * 2)) };
+                let cp = unsafe { std::ptr::read_unaligned(raw_u16.add(idx * 2 + 1)) };
+                if !pairs.contains(&(lang, cp)) {
+                    pairs.push((lang, cp));
+                }
+            }
+        }
+    }
+
+    for fallback in [
+        (0x0804u16, 0x04B0u16),
+        (0x0409u16, 0x04B0u16),
+        (0x0409u16, 0x04E4u16),
+        (0x0000u16, 0x04B0u16),
+    ] {
+        if !pairs.contains(&fallback) {
+            pairs.push(fallback);
+        }
+    }
+    pairs
+}
+
+/// Extract a human-friendly application name (`FileDescription` / `ProductName`) from a Windows
+/// PE executable's `VS_VERSION_INFO` resource block, using dynamic `\VarFileInfo\Translation`
+/// discovery with common locale fallbacks and a bounded 128-entry `(path, len, mtime_ms)` cache.
+///
+/// The 4 MiB anti-malformed guard applies strictly to the version-info buffer size returned by
+/// `GetFileVersionInfoSizeW`, never to the `.exe` file size itself.
+#[cfg(target_os = "windows")]
+pub fn extract_pe_app_friendly_name(exe_path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW};
+
+    let meta = std::fs::metadata(exe_path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let file_len = meta.len();
+    let mtime_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis());
+    let cache_key: PeNameCacheKey = (norm_path_key(exe_path), file_len, mtime_ms);
+
+    if let Ok(guard) = pe_name_cache().lock() {
+        if let Some(cached) = guard.get(&cache_key) {
+            return cached;
+        }
+    }
+
+    let path_w: Vec<u16> = exe_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut handle: u32 = 0;
+    // SAFETY: `path_w` is a valid NUL-terminated UTF-16 path string.
+    let ver_size = unsafe { GetFileVersionInfoSizeW(path_w.as_ptr(), &mut handle) };
+    let extracted = if ver_size == 0 || (ver_size as usize) > MAX_PE_VERSION_INFO_BYTES {
+        None
+    } else {
+        let mut buf = vec![0u8; ver_size as usize];
+        // SAFETY: `buf` is allocated with `ver_size` bytes matching `dwlen`.
+        let ok = unsafe {
+            GetFileVersionInfoW(
+                path_w.as_ptr(),
+                handle,
+                ver_size,
+                buf.as_mut_ptr().cast(),
+            )
+        };
+        if ok == 0 {
+            None
+        } else {
+            let pairs = read_pe_translation_pairs(&buf);
+            let mut candidates: Vec<(Option<String>, Option<String>)> =
+                Vec::with_capacity(pairs.len());
+            for (lang, cp) in pairs {
+                let desc = query_pe_version_string(
+                    &buf,
+                    &format!("\\StringFileInfo\\{lang:04X}{cp:04X}\\FileDescription"),
+                );
+                let prod = query_pe_version_string(
+                    &buf,
+                    &format!("\\StringFileInfo\\{lang:04X}{cp:04X}\\ProductName"),
+                );
+                if desc.is_some() || prod.is_some() {
+                    candidates.push((desc, prod));
+                }
+            }
+            select_best_pe_name_from_pairs(&candidates)
+        }
+    };
+
+    if let Ok(mut guard) = pe_name_cache().lock() {
+        guard.insert(cache_key, extracted.clone());
+    }
+    extracted
+}
+
+fn lookup_pe_app_friendly_name(exe_path: Option<&Path>) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        exe_path.and_then(extract_pe_app_friendly_name)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = exe_path;
+        None
+    }
+}
+
+fn strip_exe_stem(process_name: &str) -> &str {
+    process_name
+        .strip_suffix(".exe")
+        .or_else(|| process_name.strip_suffix(".EXE"))
+        .unwrap_or(process_name)
+        .trim()
+}
+
 fn derive_friendly_name(window_title: &str, process_name: &str) -> String {
     let trimmed = window_title.trim();
     if !trimmed.is_empty() {
         return trimmed.to_string();
     }
-    let stem = process_name
-        .strip_suffix(".exe")
-        .or_else(|| process_name.strip_suffix(".EXE"))
-        .unwrap_or(process_name)
-        .trim();
+    let stem = strip_exe_stem(process_name);
     if stem.is_empty() {
         process_name.to_string()
     } else {
         stem.to_string()
     }
+}
+
+/// Derive a user-facing application display name preferring a non-generic PE `FileDescription` /
+/// `ProductName` whenever `window_title` is empty or matches a generic shell/runtime title.
+fn derive_friendly_name_with_pe(
+    window_title: &str,
+    process_name: &str,
+    pe_name: Option<&str>,
+) -> String {
+    let title = window_title.trim();
+    let pe = pe_name.map(str::trim).filter(|s| !s.is_empty());
+    let pe_non_generic = pe.filter(|p| !is_generic_shell_or_runtime_title(p));
+
+    if title.is_empty() {
+        if let Some(p) = pe_non_generic {
+            return p.to_string();
+        }
+        let stem = strip_exe_stem(process_name);
+        if !stem.is_empty() && !is_generic_shell_or_runtime_title(stem) {
+            return stem.to_string();
+        }
+        if let Some(p) = pe {
+            return p.to_string();
+        }
+        return derive_friendly_name("", process_name);
+    }
+
+    if is_generic_shell_or_runtime_title(title) {
+        if let Some(p) = pe_non_generic {
+            return p.to_string();
+        }
+    }
+
+    title.to_string()
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -533,8 +929,17 @@ fn matches_generic_proxy_keyword(text: &str) -> bool {
     GENERIC_PROXY_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
-fn check_group_likely_proxy(system: &System, related_pids: &[u32], title: &str) -> bool {
-    if matches_generic_proxy_keyword(title) {
+fn check_group_likely_proxy(
+    system: &System,
+    related_pids: &[u32],
+    friendly_name: &str,
+    window_title: &str,
+    pe_name: Option<&str>,
+) -> bool {
+    if matches_generic_proxy_keyword(friendly_name)
+        || matches_generic_proxy_keyword(window_title)
+        || pe_name.is_some_and(matches_generic_proxy_keyword)
+    {
         return true;
     }
     related_pids.iter().any(|&pid| {
@@ -579,9 +984,17 @@ fn build_desktop_candidate(
         self_exe,
         self_data_dir,
     );
-    let friendly_name = derive_friendly_name(&window_title, &process_name);
-    let likely_proxy_client = check_group_likely_proxy(system, &related_pids, &friendly_name);
-    let display_title = if window_title.is_empty() {
+    let pe_name = lookup_pe_app_friendly_name(proc_info.exe());
+    let friendly_name =
+        derive_friendly_name_with_pe(&window_title, &process_name, pe_name.as_deref());
+    let likely_proxy_client = check_group_likely_proxy(
+        system,
+        &related_pids,
+        &friendly_name,
+        &window_title,
+        pe_name.as_deref(),
+    );
+    let display_title = if window_title.trim().is_empty() {
         friendly_name.clone()
     } else {
         window_title
@@ -992,7 +1405,8 @@ pub fn list_desktop_app_candidates(
             }
             ports.sort_unstable();
 
-            let base_name = derive_friendly_name("", &pname);
+            let pe_name = lookup_pe_app_friendly_name(p.exe());
+            let base_name = derive_friendly_name_with_pe("", &pname, pe_name.as_deref());
             let (friendly_name, window_title) = format_tray_background_labels(&base_name, &ports);
             let cand = DesktopAppCandidate {
                 pid,
@@ -1297,7 +1711,9 @@ impl LiveCaptureManager {
             .unwrap_or_default();
         #[cfg(not(target_os = "windows"))]
         let window_title = String::new();
-        let target_name = derive_friendly_name(&window_title, &proc_name);
+        let pe_name = lookup_pe_app_friendly_name(p.exe());
+        let target_name =
+            derive_friendly_name_with_pe(&window_title, &proc_name, pe_name.as_deref());
         let related = collect_related_pids(
             &system,
             target_pid,
@@ -4210,6 +4626,167 @@ mod tests {
                 .get("http://127.0.0.1:19095")
                 .and_then(|s| s.as_deref()),
             Some("real-clash-api-secret")
+        );
+    }
+
+    #[test]
+    fn pe_friendly_name_generic_shell_filtering_and_cache_eviction() {
+        // Generic shell/runtime/placeholder titles must be filtered out.
+        for generic in [
+            "",
+            "   ",
+            "Electron",
+            "tauri",
+            "WebView2",
+            "FlClash",
+            "clash",
+            "mihomo",
+            "sing-box",
+            "MainWindow",
+            "Main Window",
+            "main",
+            "home",
+            "index",
+            "client",
+            "desktop",
+            "app",
+            "window",
+            "Untitled",
+            "about:blank",
+            "localhost",
+            "127.0.0.1",
+            "http://127.0.0.1:8080/index.html",
+            "Electron App",
+            "Tauri Desktop v2.0",
+        ] {
+            assert!(
+                is_generic_shell_or_runtime_title(generic),
+                "expected `{generic}` to be treated as generic shell/runtime title"
+            );
+        }
+
+        // Genuine application titles must NOT be misclassified as generic.
+        for genuine in [
+            "Clash Verge Rev",
+            "NekoBox for Windows",
+            "Hiddify Next",
+            "Sparkle Proxy",
+            "Acme VPN Client",
+            "V2RayN",
+        ] {
+            assert!(
+                !is_generic_shell_or_runtime_title(genuine),
+                "expected `{genuine}` to be preserved as non-generic app title"
+            );
+        }
+
+        // Backward-compatible 2-arg signature remains unchanged.
+        assert_eq!(derive_friendly_name("FlClash", "app.exe"), "FlClash");
+        assert_eq!(derive_friendly_name("", "myclient.exe"), "myclient");
+
+        // PE name wins when window_title is empty or generic and PE name is non-generic.
+        assert_eq!(
+            derive_friendly_name_with_pe("FlClash", "app.exe", Some("Acme Network Client")),
+            "Acme Network Client"
+        );
+        assert_eq!(
+            derive_friendly_name_with_pe("Electron", "client.exe", Some("Sample Proxy Studio")),
+            "Sample Proxy Studio"
+        );
+        assert_eq!(
+            derive_friendly_name_with_pe("", "client.exe", Some("Sample Tray VPN")),
+            "Sample Tray VPN"
+        );
+
+        // Non-generic window_title takes precedence over PE name.
+        assert_eq!(
+            derive_friendly_name_with_pe("Clash Verge Rev", "clash-verge.exe", Some("Verge")),
+            "Clash Verge Rev"
+        );
+
+        // When PE name is itself generic or missing, fall back cleanly to window_title or process stem.
+        assert_eq!(
+            derive_friendly_name_with_pe("FlClash", "FlClash.exe", Some("Electron")),
+            "FlClash"
+        );
+        assert_eq!(
+            derive_friendly_name_with_pe("", "nekobox.exe", Some("WebView2")),
+            "nekobox"
+        );
+        assert_eq!(
+            derive_friendly_name_with_pe("", "client.exe", Some("FlClash")),
+            "FlClash"
+        );
+
+        // Translation candidate selector prefers non-generic FileDescription, then ProductName.
+        let pairs = vec![
+            (Some("Electron".to_string()), Some("Acme Proxy".to_string())),
+            (
+                Some("Acme Proxy Desktop".to_string()),
+                Some("Acme".to_string()),
+            ),
+        ];
+        assert_eq!(
+            select_best_pe_name_from_pairs(&pairs).as_deref(),
+            Some("Acme Proxy Desktop")
+        );
+        let fallback_prod = vec![(Some("MainWindow".to_string()), Some("Nimbus VPN".to_string()))];
+        assert_eq!(
+            select_best_pe_name_from_pairs(&fallback_prod).as_deref(),
+            Some("Nimbus VPN")
+        );
+
+        // check_group_likely_proxy incorporates friendly_name, window_title subtitle, and pe_name.
+        let empty_sys = System::new();
+        assert!(check_group_likely_proxy(
+            &empty_sys,
+            &[],
+            "Acme Client",
+            "FlClash",
+            Some("Acme Client")
+        ));
+        assert!(check_group_likely_proxy(
+            &empty_sys,
+            &[],
+            "Acme Client",
+            "MainWindow",
+            Some("Acme VPN Helper")
+        ));
+        assert!(!check_group_likely_proxy(
+            &empty_sys,
+            &[],
+            "Notes Editor",
+            "Untitled",
+            Some("Notes Editor")
+        ));
+
+        // Bounded 128-entry PE cache evicts oldest entries and keys by (path, len, mtime).
+        let mut cache = PeNameCache::default();
+        for i in 0..(MAX_PE_NAME_CACHE_ENTRIES + 10) {
+            let key = (format!("app_{i}.exe"), 1024 + i as u64, 1_700_000_000u128);
+            cache.insert(key, Some(format!("App {i}")));
+        }
+        assert_eq!(cache.len(), MAX_PE_NAME_CACHE_ENTRIES);
+        assert_eq!(
+            cache.get(&("app_0.exe".to_string(), 1024, 1_700_000_000u128)),
+            None
+        );
+        assert_eq!(
+            cache.get(&(
+                format!("app_{}.exe", MAX_PE_NAME_CACHE_ENTRIES + 9),
+                1024 + (MAX_PE_NAME_CACHE_ENTRIES + 9) as u64,
+                1_700_000_000u128
+            )),
+            Some(Some(format!("App {}", MAX_PE_NAME_CACHE_ENTRIES + 9)))
+        );
+        // Same path with updated mtime is a distinct cache key.
+        assert_eq!(
+            cache.get(&(
+                format!("app_{}.exe", MAX_PE_NAME_CACHE_ENTRIES + 9),
+                1024 + (MAX_PE_NAME_CACHE_ENTRIES + 9) as u64,
+                1_700_000_999u128
+            )),
+            None
         );
     }
 }

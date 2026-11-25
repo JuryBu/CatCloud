@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import {
   AlertTriangle,
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -18,6 +19,8 @@ import {
   Globe,
   Image,
   Keyboard,
+  Languages,
+  MessageSquareWarning,
   Palette,
   Play,
   Plus,
@@ -50,6 +53,12 @@ import {
 } from "../api/tauri";
 import { AppSelect } from "../components/AppSelect";
 import {
+  UI_LANGUAGE_OPTIONS,
+  type UiLanguage,
+  normalizeUiLanguage,
+  useUiDict,
+} from "../i18n";
+import {
   BUILTIN_WALLPAPER_PRESETS,
   appActions,
   appStore,
@@ -68,7 +77,6 @@ import {
   oneOfPref,
   readUiPref,
   usePersistedState,
-  writeUiPref,
 } from "../utils/uiPrefs";
 
 type SettingsTabId = "system" | "appearance" | "dns" | "core" | "updates";
@@ -254,16 +262,6 @@ const HOTKEY_LABELS: Record<string, string> = {
   toggleTun: "切换虚拟网卡",
 };
 
-const STARTUP_PAGE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
-  { value: "overview", label: "总览" },
-  { value: "groups", label: "智能多选组" },
-  { value: "nodes", label: "节点与测速" },
-  { value: "preaccel", label: "国内提速" },
-  { value: "rules", label: "分流与连接" },
-  { value: "logs", label: "运行日志" },
-  { value: "settings", label: "设置" },
-];
-
 const TRAY_CLICK_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
   { value: "toggle_main_window", label: "显示 / 隐藏主窗口" },
   { value: "open_main_window", label: "始终展开主窗口" },
@@ -329,81 +327,9 @@ function renderGeoStatusSummary(
   return { state: "ready", text: `${sizeLabel} · ${timeLabel}` };
 }
 
-const AGENT_DOCS = [
-  {
-    id: "onboarding",
-    title: "0. 新手上手总纲",
-    goal: "给任意 AI 助手一份零门槛纯中文猫猫云梯全功能导览，让 AI 结合你的当前进度一步步带你完成导入、测速、开代理与提速。",
-    keys: "总览、节点与测速（订阅与导入 / 1→2→3 实时抓节点）、智能多选组、国内提速、悬浮小窗与托盘省内存",
-    workflow: "点击侧栏「🤖 AI 带我上手」或上方按钮一键复制上手指南 + 当前进度快照，直接粘贴给任意 AI 即可开始手把手教学。",
-    guardrails: "全程使用界面准确中文按钮名称、零源码/终端黑话，自动隐私脱敏不含真实订阅链接、密码或公网 IP。",
-  },
-  {
-    id: "preaccel",
-    title: "1. 国内提速",
-    goal: "为非原生 443 节点提供国内中转加速，自动豁免原生 443 并防校园网门户误判。",
-    keys: "preaccel.enabled, preaccel.skip_443_native, preaccel.probe_url, preaccel.fallback_probe_url, relays[]",
-    workflow: "先测通国内中转节点并按优先级启用，故障时自动切换备线或回落直连。",
-    guardrails: "导出备份与诊断快照会自动脱敏，绝不泄露真实中转地址、端口与密码。",
-  },
-  {
-    id: "multigroup",
-    title: "2. 智能多选组",
-    goal: "配置粘性最优、条件池与负载均衡策略，支持自定义权重公式与跨池兜底。",
-    keys: "mode, hard_gates, trigger_rules, formula_expr, fallback_policy, cooldown_sec, hysteresis_pct",
-    workflow: "先执行隔离测速获取节点指标，再调整评分权重、冷却时间与切换门槛。",
-    guardrails: "保持合理的冷却秒数与切换迟滞门槛，避免短时网络抖动导致反复切节点。",
-  },
-  {
-    id: "probes",
-    title: "3. 隔离探针测速",
-    goal: "基于零干扰隔离注册表运行延迟、上下行速率、AI 解锁与 60 秒长连接稳定性探针。",
-    keys: "probes[], probe_kind (latency/upload/download/unlock_regex/keepalive/google_cn/external_cmd)",
-    workflow: "优先跑延迟或解锁档快速筛选，需要选路对比时再跑完整上下行与保活探针。",
-    guardrails: "外部脚本探针严禁携带明文密钥，所有测速均在独立隔离通道执行不影响主流量。",
-  },
-  {
-    id: "nodes_ingest",
-    title: "4. 节点导入与抓取",
-    goal: "支持多源订阅聚合、本地配置导入、已有代理软件迁移及 1→2→3 实时抓取运行软件节点。",
-    keys: "subscriptions[], nodes[], multiplier, is_443_native, preaccel_override",
-    workflow: "在「节点与测速 → 订阅与导入」导入节点后，按大洲/地区、协议和原生 443 标签筛选，单节点直用或批量加入智能多选组。",
-    guardrails: "拉取失败或内容为空时自动保留旧节点；所有导入凭据仅保存在本机隔离配置。",
-  },
-  {
-    id: "network_reload",
-    title: "5. 网络、DNS 与热重载",
-    goal: "管理系统代理、防篡改守护、虚拟网卡 TUN、独立 IPv6/Fake-IP 策略与三级热重载。",
-    keys: "mixed_port, controller_port, dns_listen_port, ipv6_core_enabled, ipv6_dns_enabled, tun_stack_mode, append_rules",
-    workflow: "改动规则或 DNS 后先预览最终编译 YAML，确认无误再触发内核热重载。",
-    guardrails: "启用 TUN 虚拟网卡需系统网络权限（Windows 为 UAC 管理员，Linux 仅给核心授予 cap_net_admin，macOS 需系统安全授权）；遇到 IPv6 异常时先关闭 DNS 返回 IPv6 再排查。",
-  },
-  {
-    id: "updater_lifecycle",
-    title: "6. 无窗省内存与自动更新",
-    goal: "支持关闭进无窗省内存驻留、流式 GeoData 内存档位、下次启动自动更新及无头 CLI。",
-    keys: "gomemlimit_mb (auto/48/64/96), close_to_windowless, update.mode, update.repo, catcloud --json",
-    workflow: "日常建议开启关闭进无窗与自动省内存档；排障和 AI 协作统一用只读 CLI 与脱敏诊断包。",
-    guardrails: "自动更新仅在下次启动安全替换，不会在后台传输或代理高峰期强行打断网络连接。",
-  },
-] as const;
-
-type AgentDocId = (typeof AGENT_DOCS)[number]["id"];
 const SHELL_ENV_VALIDATOR = oneOfPref(["powershell", "cmd", "bash", "zsh", "fish"] as const);
 const WEB_UI_IDX_VALIDATOR = (raw: unknown): number | undefined =>
   typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : undefined;
-const AGENT_DOC_ID_VALIDATOR = oneOfPref(AGENT_DOCS.map((d) => d.id) as readonly AgentDocId[]);
-
-const CLI_SNIPPETS = [
-  { cmd: "catcloud status --json", desc: "查看核心运行状态、当前节点与端口" },
-  { cmd: "catcloud config reload --json", desc: "校验并热重载当前配置" },
-  { cmd: "catcloud group list --json", desc: "列出所有智能多选组及活跃节点" },
-  { cmd: "catcloud group switch <group_id> --json", desc: "一键切换分组至下一优节点" },
-  { cmd: "catcloud preaccel pool --json", desc: "查看国内提速中转池状态" },
-  { cmd: "catcloud probe list --json", desc: "查看已注册的测速探针列表" },
-  { cmd: "catcloud config diag --json", desc: "导出完整脱敏诊断信息" },
-  { cmd: "catcloud docs export all --json", desc: "导出全套 AI 协作文档（含上手总纲）" },
-] as const;
 
 const INPUT_CLS =
   "w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]";
@@ -935,12 +861,14 @@ function clearSettingsDirtyDraftCache(): void {
 
 export function SettingsPage() {
   const storeConfig = useAppSelector((s) => s.config);
+  const uiLang = normalizeUiLanguage(storeConfig.personalization.ui_language);
+  const dict = useUiDict(uiLang);
+  const isZh = uiLang === "zh-CN";
   const runtime = useAppSelector((s) => s.runtime);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const wallpaperPreviewUrl = useAppSelector((s) => s.wallpaperPreviewUrl);
   const wallpaperError = useAppSelector((s) => s.wallpaperError);
   const settingsTabHint = useAppSelector((s) => s.settingsTabHint);
-  const settingsOpenAgentDocs = useAppSelector((s) => s.settingsOpenAgentDocs);
   const savedSettingsTab = useAppSelector((s) => s.sessionDrafts.settings.tab);
   const geoStatus = useAppSelector((s) => s.bgTasks.settings.geoStatus);
   const geoStatusLoading = useAppSelector((s) => s.bgTasks.settings.geoLoading);
@@ -977,12 +905,10 @@ export function SettingsPage() {
   }, [platformOs, setSelectedShell]);
 
   const [tab, setTab] = useState<SettingsTabId>(() => {
-    if (settingsOpenAgentDocs) return "updates";
     if (settingsTabHint) return settingsTabHint;
     if (isValidSettingsTab(savedSettingsTab)) return savedSettingsTab;
     return "system";
   });
-  const devToolsSectionRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     if (settingsTabHint) {
@@ -1042,43 +968,13 @@ export function SettingsPage() {
     false,
     isBoolPref
   );
-  const [showDevTools, setShowDevTools] = useState(
-    () => settingsOpenAgentDocs || readUiPref("settings.showDevTools", false, isBoolPref)
-  );
-  const [pendingScrollToDevTools, setPendingScrollToDevTools] = useState(
-    () => settingsOpenAgentDocs
-  );
-
-  useEffect(() => {
-    if (!settingsOpenAgentDocs) return;
-    setTab("updates");
-    setShowDevTools(true);
-    setPendingScrollToDevTools(true);
-    appActions.consumeSettingsOpenAgentDocs();
-  }, [settingsOpenAgentDocs]);
-
-  useEffect(() => {
-    if (!pendingScrollToDevTools || tab !== "updates" || !showDevTools) return;
-    const timerId = window.setTimeout(() => {
-      devToolsSectionRef.current?.scrollIntoView({
-        behavior: "smooth",
-        block: "start",
-      });
-      setPendingScrollToDevTools(false);
-    }, 80);
-    return () => window.clearTimeout(timerId);
-  }, [tab, showDevTools, pendingScrollToDevTools]);
   const [yamlPreview, setYamlPreview] = useState<string | null>(
     () => settingsDraftCache.yamlPreview
   );
   const [yamlSha, setYamlSha] = useState<string | null>(() => settingsDraftCache.yamlSha);
   const [yamlLoading, setYamlLoading] = useState(false);
   const [confirmImportBackupOpen, setConfirmImportBackupOpen] = useState(false);
-  const [activeDocId, setActiveDocId] = usePersistedState<AgentDocId>(
-    "settings.activeDocId",
-    AGENT_DOCS[0].id,
-    AGENT_DOC_ID_VALIDATOR
-  );
+  const [openingIssue, setOpeningIssue] = useState(false);
 
   const dirty = draftDirty || extDirty;
   const dirtyRef = useRef(dirty);
@@ -1619,54 +1515,71 @@ export function SettingsPage() {
     await copyText(text, `${labelMap[sh]} 代理命令`);
   };
 
-  const handleCopyAiOnboarding = async () => {
-    await appActions.copyAiOnboardingForUser();
-  };
-
   const handleCopyDiagnostics = async () => {
     await appActions.copySanitizedDiagnosticsForAi();
   };
 
-  const handleCopyAgentDoc = async (
-    moduleId: string,
-    label: string,
-    chineseMd: string,
-    asJson = false
-  ) => {
-    if (!asJson) {
-      await copyText(chineseMd, label);
-      return;
-    }
-    const fallbackJsonObj =
-      moduleId === "all"
-        ? AGENT_DOCS
-        : AGENT_DOCS.find((d) => d.id === moduleId) ?? AGENT_DOCS[0];
-    let text = JSON.stringify(fallbackJsonObj, null, 2);
-    if (inTauri) {
-      try {
-        const res = await catcloudApi.exportAgentDocs(moduleId, true);
-        if (res && res.trim()) text = res;
-      } catch {
-        /* fallback to structured JSON built from local docs */
-      }
-    }
-    await copyText(text, label);
+  const tabLabelsByLang: Record<UiLanguage, Record<SettingsTabId, string>> = {
+    "zh-CN": {
+      system: "常规与代理",
+      appearance: "外观与壁纸",
+      dns: "网络与 DNS",
+      core: "进阶与维护",
+      updates: "关于与更新",
+    },
+    en: {
+      system: "General & Proxy",
+      appearance: "Appearance & Language",
+      dns: "Network & DNS",
+      core: "Core & Tools",
+      updates: "About & Updates",
+    },
+    ja: {
+      system: "一般・プロキシ",
+      appearance: "外観と言語",
+      dns: "ネットワーク・DNS",
+      core: "コアと保守",
+      updates: "情報と更新",
+    },
+    ru: {
+      system: "Общие и прокси",
+      appearance: "Внешний вид и язык",
+      dns: "Сеть и DNS",
+      core: "Ядро и утилиты",
+      updates: "О программе",
+    },
   };
 
-  const activeDoc = useMemo(
-    () => AGENT_DOCS.find((d) => d.id === activeDocId) ?? AGENT_DOCS[0],
-    [activeDocId]
-  );
-  const docMd = (d: (typeof AGENT_DOCS)[number]) =>
-    `### ${d.title}\n- **目标能力**：${d.goal}\n- **关键配置项**：\`${d.keys}\`\n- **推荐操作路径**：${d.workflow}\n- **排障与边界**：${d.guardrails}`;
-
   const tabs: ReadonlyArray<{ id: SettingsTabId; label: string; icon: LucideIcon }> = [
-    { id: "system", label: "常规与代理", icon: SlidersHorizontal },
-    { id: "appearance", label: "外观与壁纸", icon: Palette },
-    { id: "dns", label: "网络与 DNS", icon: Globe },
-    { id: "core", label: "进阶与维护", icon: Cpu },
-    { id: "updates", label: "关于与更新", icon: CloudDownload },
+    { id: "system", label: tabLabelsByLang[uiLang].system, icon: SlidersHorizontal },
+    { id: "appearance", label: tabLabelsByLang[uiLang].appearance, icon: Palette },
+    { id: "dns", label: tabLabelsByLang[uiLang].dns, icon: Globe },
+    { id: "core", label: tabLabelsByLang[uiLang].core, icon: Cpu },
+    { id: "updates", label: tabLabelsByLang[uiLang].updates, icon: CloudDownload },
   ];
+
+  const startupPageOptions = useMemo(
+    () => [
+      { value: "overview", label: dict.nav.overview },
+      { value: "groups", label: dict.nav.groups },
+      { value: "nodes", label: dict.nav.nodes },
+      { value: "preaccel", label: dict.nav.preaccel },
+      { value: "rules", label: dict.nav.rules },
+      { value: "logs", label: dict.nav.logs },
+      { value: "ai", label: dict.nav.ai },
+      { value: "settings", label: dict.nav.settings },
+    ],
+    [dict.nav]
+  );
+
+  const uiLanguageSelectOptions = useMemo(
+    () =>
+      UI_LANGUAGE_OPTIONS.map((item) => ({
+        value: item.value,
+        label: item.optionLabel,
+      })),
+    []
+  );
 
   const p = storeConfig.personalization;
   const rawWallpaper = p.wallpaper_path?.trim() ?? "";
@@ -1687,28 +1600,33 @@ export function SettingsPage() {
 
   return (
     <div className="space-y-4">
-      {/* Top 5-Tab Bar + Save Button */}
+      {/* Top Title + 5-Tab Bar + Save Button */}
       <div className="cc-card cc-glass flex flex-wrap items-center justify-between gap-2 rounded-2xl px-4 py-2.5">
-        <div className="flex flex-wrap items-center gap-1.5">
-          {tabs.map(({ id, label, icon: Icon }) => {
-            const on = tab === id;
-            return (
-              <button
-                key={id}
-                type="button"
-                onClick={() => setTab(id)}
-                className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition-colors"
-                style={{
-                  backgroundColor: on ? "var(--accent-soft)" : "transparent",
-                  color: on ? "var(--accent)" : "var(--muted)",
-                  border: on ? "1px solid var(--accent)" : "1px solid transparent",
-                }}
-              >
-                <Icon className="h-3.5 w-3.5" />
-                <span>{label}</span>
-              </button>
-            );
-          })}
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="mr-1 text-sm font-semibold text-[var(--text)]">
+            {dict.settings.title}
+          </h1>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {tabs.map(({ id, label, icon: Icon }) => {
+              const on = tab === id;
+              return (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => setTab(id)}
+                  className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition-colors"
+                  style={{
+                    backgroundColor: on ? "var(--accent-soft)" : "transparent",
+                    color: on ? "var(--accent)" : "var(--muted)",
+                    border: on ? "1px solid var(--accent)" : "1px solid transparent",
+                  }}
+                >
+                  <Icon className="h-3.5 w-3.5" />
+                  <span>{label}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
         <button
           type="button"
@@ -1724,12 +1642,20 @@ export function SettingsPage() {
           {dirty ? <Save className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
           <span>
             {saving
-              ? "保存中..."
+              ? isZh
+                ? "保存中..."
+                : dict.common.loading
               : extDirty && !extLoaded
-                ? "等待配置加载..."
+                ? isZh
+                  ? "等待配置加载..."
+                  : dict.common.loading
                 : dirty
-                  ? "保存更改"
-                  : "已保存"}
+                  ? isZh
+                    ? "保存更改"
+                    : dict.common.save
+                  : isZh
+                    ? "已保存"
+                    : dict.common.save}
           </span>
         </button>
       </div>
@@ -2014,10 +1940,7 @@ export function SettingsPage() {
                     size="sm"
                     value={ext.startupPage}
                     onChange={(v) => patchExt("startupPage", v)}
-                    options={STARTUP_PAGE_OPTIONS.map((opt) => ({
-                      value: opt.value,
-                      label: opt.label,
-                    }))}
+                    options={startupPageOptions}
                     className="mt-1 w-full"
                   />
                 </div>
@@ -2068,6 +1991,34 @@ export function SettingsPage() {
       {/* Tab 2: 外观与壁纸 */}
       {tab === "appearance" && (
         <div className="space-y-4">
+          {/* Interface Language Selector Row */}
+          <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl px-4 py-3">
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--accent-soft)] text-[var(--accent)]">
+                <Languages className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-[var(--text)]">
+                  {dict.settings.languageLabel}
+                  {uiLang !== "en" && (
+                    <span className="ml-1.5 font-normal text-[var(--muted)]">/ Language</span>
+                  )}
+                </div>
+                <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                  {dict.settings.languageDesc}
+                </p>
+              </div>
+            </div>
+            <AppSelect
+              aria-label={`${dict.settings.languageLabel} / Language`}
+              size="sm"
+              value={uiLang}
+              onChange={(v) => void appActions.setUiLanguage(v as UiLanguage)}
+              options={uiLanguageSelectOptions}
+              className="min-w-[220px]"
+            />
+          </section>
+
           <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
             {/* Theme Palette 4 Visual Cards */}
             <Card
@@ -3295,193 +3246,50 @@ export function SettingsPage() {
             </div>
           </Card>
 
-          {/* Collapsible Developer & AI Assistant Integration Tools */}
-          <section
-            ref={devToolsSectionRef}
-            className="cc-card cc-glass overflow-hidden rounded-2xl"
-          >
-            <button
-              type="button"
-              onClick={() =>
-                setShowDevTools((open) => {
-                  const next = !open;
-                  writeUiPref("settings.showDevTools", next);
-                  return next;
-                })
-              }
-              className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left transition-colors hover:bg-[var(--surface)]/60"
-            >
-              <div>
-                <div className="text-sm font-semibold text-[var(--text)]">
-                  开发者与 AI 助手集成工具
+          {/* Compact AI Assistant & GitHub Issue Entry Card */}
+          <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl px-4 py-3.5">
+            <div className="flex min-w-0 items-center gap-3">
+              <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--accent-soft)] text-[var(--accent)]">
+                <Bot className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-[var(--text)]">
+                  {dict.aiHub.title}
                 </div>
                 <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-                  包含一键脱敏诊断包、AI 协作说明文档与只读命令行速查，普通使用无需展开
+                  {isZh
+                    ? "新手上手指南、脱敏排障诊断包、8 篇本地详尽手册与本机 Agent 只读命令已统一迁移至侧边栏「AI 助手」。"
+                    : dict.aiHub.subtitle}
                 </p>
               </div>
-              <span className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
-                {showDevTools ? "收起" : "展开"}
-                {showDevTools ? (
-                  <ChevronDown className="h-3.5 w-3.5" />
-                ) : (
-                  <ChevronRight className="h-3.5 w-3.5" />
-                )}
-              </span>
-            </button>
+            </div>
 
-            {showDevTools && (
-              <div className="space-y-4 border-t border-[var(--line)] p-4">
-                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--accent)]/30 bg-[var(--accent-soft)]/35 px-3.5 py-2.5">
-                  <div className="text-xs text-[var(--text-secondary)]">
-                    <strong className="text-[var(--text)]">需要 AI 教你上手、排障或调分流？</strong>
-                    一键复制新手上手指南或脱敏诊断包，直接粘贴给任意 AI（如 ChatGPT / 豆包 / DeepSeek）。
-                  </div>
-                  <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyAiOnboarding()}
-                      className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                      <span>🤖 复制上手指南给 AI</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyDiagnostics()}
-                      className={BTN_CLS}
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                      <span>🩺 复制排障诊断给 AI</span>
-                    </button>
-                  </div>
-                </div>
-                <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-                <Card
-                  title="AI 协作说明文档"
-                  sub="点选模块预览，所见即所得复制中文指南，或复制 JSON 规格给 AI"
-                  action={
-                    <div className="flex flex-wrap gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void handleCopyAgentDoc(
-                            activeDoc.id,
-                            `${activeDoc.title}中文指南`,
-                            docMd(activeDoc),
-                            false
-                          )
-                        }
-                        className={BTN_CLS}
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                        <span>复制中文</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void handleCopyAgentDoc(
-                            activeDoc.id,
-                            `${activeDoc.title} JSON 规格`,
-                            docMd(activeDoc),
-                            true
-                          )
-                        }
-                        className={BTN_CLS}
-                      >
-                        <Code2 className="h-3.5 w-3.5" />
-                        <span>复制 JSON</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void handleCopyAgentDoc(
-                            "all",
-                            "全套中文说明文档",
-                            AGENT_DOCS.map(docMd).join("\n\n"),
-                            false
-                          )
-                        }
-                        className={BTN_CLS}
-                      >
-                        <Copy className="h-3.5 w-3.5" />
-                        <span>复制全部</span>
-                      </button>
-                    </div>
-                  }
-                >
-                  <SegButtons<AgentDocId>
-                    value={activeDoc.id}
-                    onChange={setActiveDocId}
-                    options={AGENT_DOCS.map((d) => [d.id, d.title] as const)}
-                  />
-                  <div className="cc-selectable space-y-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 p-3 text-xs">
-                    <div>
-                      <span className="font-semibold text-[var(--accent)]">目标能力：</span>
-                      {activeDoc.goal}
-                    </div>
-                    <div>
-                      <span className="font-semibold text-[var(--accent)]">关键配置项：</span>
-                      <code className="cc-mono text-[11px] text-[var(--text-secondary)]">
-                        {activeDoc.keys}
-                      </code>
-                    </div>
-                    <div>
-                      <span className="font-semibold text-[var(--accent)]">推荐操作路径：</span>
-                      {activeDoc.workflow}
-                    </div>
-                    <div>
-                      <span className="font-semibold text-[var(--accent)]">排障与边界：</span>
-                      {activeDoc.guardrails}
-                    </div>
-                  </div>
-                </Card>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => appActions.openAiAssistant()}
+                className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+              >
+                <Bot className="h-3.5 w-3.5" />
+                <span>{dict.settings.goToAiHub}</span>
+              </button>
 
-                <Card
-                  title="命令行速查（CLI）"
-                  sub="适合脚本与 AI 助手直接调用的无界面命令"
-                  action={
-                    <button
-                      type="button"
-                      onClick={() =>
-                        void copyText(
-                          CLI_SNIPPETS.map((s) => `${s.cmd}  # ${s.desc}`).join("\n"),
-                          "全套命令行速查"
-                        )
-                      }
-                      className={BTN_CLS}
-                    >
-                      <Terminal className="h-3.5 w-3.5" />
-                      <span>复制全套</span>
-                    </button>
-                  }
-                >
-                  <div className="space-y-1.5">
-                    {CLI_SNIPPETS.map((item) => (
-                      <div
-                        key={item.cmd}
-                        className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-1.5"
-                      >
-                        <div className="min-w-0">
-                          <div className="truncate cc-mono cc-selectable text-xs text-[var(--text)]">
-                            {item.cmd}
-                          </div>
-                          <div className="text-[11px] text-[var(--muted)]">{item.desc}</div>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => void copyText(item.cmd, "命令")}
-                          title="复制命令"
-                          className="shrink-0 rounded-lg border border-[var(--line)] p-1.5 text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                        >
-                          <Copy className="h-3.5 w-3.5" />
-                        </button>
-                      </div>
-                    ))}
-                  </div>
-                </Card>
-                </div>
-              </div>
-            )}
+              <button
+                type="button"
+                disabled={openingIssue}
+                onClick={() => {
+                  if (openingIssue) return;
+                  setOpeningIssue(true);
+                  void appActions.openGithubIssueFeedback().finally(() => {
+                    setOpeningIssue(false);
+                  });
+                }}
+                className={BTN_CLS}
+              >
+                <MessageSquareWarning className="h-3.5 w-3.5 text-[var(--amber)]" />
+                <span>{dict.common.openIssue}</span>
+              </button>
+            </div>
           </section>
         </div>
       )}

@@ -8,6 +8,8 @@ pub mod platform;
 pub mod preaccel;
 pub mod probe;
 pub mod process_guard;
+pub mod sanitize;
+pub mod share_bundle;
 pub mod storage;
 pub mod strategy;
 pub mod subscription;

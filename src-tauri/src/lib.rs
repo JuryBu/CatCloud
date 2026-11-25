@@ -249,6 +249,12 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::list_subscriptions,
             commands::upsert_subscription,
             commands::delete_subscription,
+            commands::rename_subscription,
+            commands::apply_nodes_to_existing_subscription,
+            commands::merge_subscriptions,
+            commands::export_share_bundle_dialog,
+            commands::pick_and_preview_share_bundle,
+            commands::import_share_bundle,
             commands::refresh_subscription,
             commands::refresh_all_subscriptions,
             commands::list_preaccel_relays,
@@ -264,6 +270,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::select_preaccel_relay,
             commands::failover_preaccel,
             commands::test_preaccel_relays,
+            commands::test_preaccel_relay_speeds,
             commands::benchmark_preaccel_comparison,
             commands::check_campus_portal,
             commands::get_exit_ip_info,
@@ -276,6 +283,9 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::get_traffic_history,
             commands::list_agent_docs,
             commands::export_agent_docs,
+            commands::build_agent_bootstrap_prompt,
+            commands::export_agent_doc_file_dialog,
+            commands::build_github_issue_url,
             commands::validate_formula_expr,
             commands::evaluate_multi_group,
             commands::compile_preview_yaml,
@@ -318,6 +328,28 @@ pub fn run_with_paths(paths: AppPaths) {
             // Inject Tauri bundle resource_dir into AppState for cross-platform bundled Mihomo lookup.
             let state = handle.state::<AppState>();
             state.set_resource_dir(app.path().resource_dir().ok());
+
+            // Asynchronously synchronize multi-language authoritative Agent manuals into
+            // `<data_dir>/agent_docs/` with `.manifest_hash` idempotent short-circuiting
+            // so desktop cold startup is never blocked by disk I/O.
+            {
+                let docs_root_data_dir = state.paths.root_data_dir.clone();
+                tauri::async_runtime::spawn(async move {
+                    let res = tokio::task::spawn_blocking(move || {
+                        catcloud_core::agent_docs::sync_agent_docs_to_disk(&docs_root_data_dir)
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            tracing::debug!("background agent_docs sync skipped/failed: {err}");
+                        }
+                        Err(err) => {
+                            tracing::debug!("background agent_docs sync task join failed: {err}");
+                        }
+                    }
+                });
+            }
 
             // Wakeup listener: when a secondary launch targets the same data_dir,
             // rebuild or focus the primary main window.
@@ -1390,6 +1422,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                     consecutive_fail_counts.remove(&group.id);
                     consecutive_degraded_counts.remove(&group.id);
                     failed_group_backoff_until.remove(&group.id);
+                    st.set_group_backoff_until(&group.id, None);
                     last_checked_node.insert(group.id.clone(), active_node.id.clone());
                 }
 
@@ -1637,6 +1670,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                         consecutive_fail_counts.remove(&gid);
                                         consecutive_degraded_counts.remove(&gid);
                                         failed_group_backoff_until.remove(&gid);
+                                        st.set_group_backoff_until(&gid, None);
                                         st.log_app_event(
                                             "info",
                                             "自动切优",
@@ -1670,6 +1704,8 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                             Ok(_) => {
                                                 consecutive_fail_counts.remove(&gid);
                                                 consecutive_degraded_counts.remove(&gid);
+                                                failed_group_backoff_until.remove(&gid);
+                                                st.set_group_backoff_until(&gid, None);
                                                 last_auto_switch_at
                                                     .insert(gid.clone(), Instant::now());
                                                 last_checked_node
@@ -1729,9 +1765,12 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                 consecutive_fail_counts.remove(&gid);
                                 consecutive_degraded_counts.remove(&gid);
                                 let now = Instant::now();
+                                let backoff_until = now + ALL_CANDIDATES_FAILED_BACKOFF;
                                 last_auto_switch_at.insert(gid.clone(), now);
-                                failed_group_backoff_until
-                                    .insert(gid.clone(), now + ALL_CANDIDATES_FAILED_BACKOFF);
+                                failed_group_backoff_until.insert(gid.clone(), backoff_until);
+                                st.set_group_backoff_until(&gid, Some(backoff_until));
+                                should_emit_runtime = true;
+                                commands::refresh_tray(&app_h, &st);
                                 let log_msg = match trigger {
                                     WatchdogFailoverTrigger::TotalOutage { fail_count } => format!(
                                         "分组「{gname}」原节点「{}」连续 {fail_count} 次双源探活失败，但顺位前 {probed_total} 个备用候选均未通过实测，已记入退避冷却并进入 180 秒退避，放弃盲切",

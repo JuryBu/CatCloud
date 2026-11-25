@@ -3,7 +3,39 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Current configuration schema version.
-pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+
+/// Supported UI localization codes (Simplified Chinese authoritative default).
+pub const SUPPORTED_UI_LANGUAGES: &[&str] = &["zh-CN", "en", "ja", "ru"];
+
+/// Normalize a raw UI language code (including regional aliases such as `en-US`, `ja-JP`, `ru-RU`,
+/// or `zh_CN`) to one of the four supported canonical codes (`"zh-CN" | "en" | "ja" | "ru"`),
+/// falling back to `"zh-CN"` for blank or unrecognized inputs.
+pub fn normalize_ui_language(raw: &str) -> &'static str {
+    let lower = raw.trim().replace('_', "-").to_ascii_lowercase();
+    if lower == "en" || lower.starts_with("en-") {
+        "en"
+    } else if lower == "ja" || lower.starts_with("ja-") || lower == "jp" {
+        "ja"
+    } else if lower == "ru" || lower.starts_with("ru-") {
+        "ru"
+    } else {
+        "zh-CN"
+    }
+}
+
+/// Return `true` when `raw` matches a supported UI language code or standard regional variant.
+pub fn is_supported_ui_language(raw: &str) -> bool {
+    let lower = raw.trim().replace('_', "-").to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "zh" | "zh-cn" | "zh-hans" | "en" | "en-us" | "en-gb" | "ja" | "ja-jp" | "ru" | "ru-ru"
+    )
+}
+
+fn default_legacy_schema_version() -> u32 {
+    1
+}
 
 /// Default domestic 204 connectivity probe URL (never use overseas domains).
 pub const DEFAULT_PREACCEL_PROBE_URL: &str =
@@ -882,8 +914,17 @@ pub struct PersonalizationConfig {
     pub mascot_enabled: bool,
     pub sparkline_enabled: bool,
     pub tray_icon_mode: TrayIconMode,
+    #[serde(alias = "ui_language")]
     pub language: String,
     pub capsule_enabled: bool,
+}
+
+impl PersonalizationConfig {
+    /// Return the normalized canonical UI language (`"zh-CN" | "en" | "ja" | "ru"`),
+    /// falling back to `"zh-CN"` when empty or unrecognized.
+    pub fn normalized_ui_language(&self) -> &'static str {
+        normalize_ui_language(&self.language)
+    }
 }
 
 impl Default for PersonalizationConfig {
@@ -952,6 +993,7 @@ pub struct WebDavReserveConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct AppConfig {
+    #[serde(default = "default_legacy_schema_version")]
     pub schema_version: u32,
     pub proxy_mode: ProxyMode,
     #[serde(default)]
@@ -1212,5 +1254,45 @@ mod tests {
             legacy.behavior.hotkeys.toggle_capsule.as_deref(),
             Some("Alt+Shift+C")
         );
+
+        // Schema v2 default vs legacy missing schema_version field deserializing as v1.
+        assert_eq!(CONFIG_SCHEMA_VERSION, 2);
+        assert_eq!(cfg.schema_version, 2);
+        assert_eq!(legacy.schema_version, 1);
+    }
+
+    #[test]
+    fn personalization_language_preserves_wire_key_accepts_ui_language_alias_and_normalizes() {
+        let mut p = PersonalizationConfig::default();
+        assert_eq!(p.language, "zh-CN");
+        assert_eq!(p.normalized_ui_language(), "zh-CN");
+
+        // Serialization MUST keep field name `"language"` to preserve legacy backup SHA-256 hashes.
+        let serialized = serde_json::to_value(&p).expect("serialize PersonalizationConfig");
+        assert_eq!(serialized.get("language").and_then(|v| v.as_str()), Some("zh-CN"));
+        assert!(serialized.get("ui_language").is_none());
+
+        // Deserialization accepts `"ui_language"` alias transparently.
+        let from_alias: PersonalizationConfig =
+            serde_json::from_str(r#"{"ui_language":"en-US"}"#).expect("deserialize ui_language alias");
+        assert_eq!(from_alias.language, "en-US");
+        assert_eq!(from_alias.normalized_ui_language(), "en");
+
+        let from_ja: PersonalizationConfig =
+            serde_json::from_str(r#"{"language":"ja-JP"}"#).expect("deserialize ja-JP");
+        assert_eq!(from_ja.normalized_ui_language(), "ja");
+
+        let from_ru: PersonalizationConfig =
+            serde_json::from_str(r#"{"ui_language":"ru_RU"}"#).expect("deserialize ru_RU");
+        assert_eq!(from_ru.normalized_ui_language(), "ru");
+
+        // Unknown / empty language falls back to `"zh-CN"`.
+        p.language = "fr-FR".to_string();
+        assert_eq!(p.normalized_ui_language(), "zh-CN");
+        assert!(!is_supported_ui_language("fr-FR"));
+        assert!(is_supported_ui_language("zh-CN"));
+        assert!(is_supported_ui_language("en"));
+        assert!(is_supported_ui_language("ja"));
+        assert!(is_supported_ui_language("ru"));
     }
 }

@@ -17,6 +17,7 @@ import {
   type MultiGroup,
   type PreAccelComparisonResult,
   type PreAccelRelay,
+  type PreAccelSpeedTestResult,
   type ProbeSnapshot,
   type ProxyMode,
   type ProxyNode,
@@ -33,11 +34,18 @@ import {
 } from "../api/tauri";
 import { detectNavigatorOs, resolvePlatformOs } from "../utils/platform";
 import {
+  ensureUiLocaleLoaded,
+  normalizeUiLanguage,
+  type UiLanguage,
+} from "../i18n";
+import {
   isRealWinDivertActive,
   normalizePreAccelInstallState,
   normalizePreAccelVerifyState,
   resolvePreAccelSummary,
 } from "../utils/preaccelStatus";
+
+export type { UiLanguage };
 
 export type {
   AppConfig,
@@ -69,6 +77,7 @@ export type NavRouteId =
   | "nodes"
   | "rules"
   | "logs"
+  | "ai"
   | "settings";
 
 export type WindowMode = "main" | "capsule";
@@ -215,6 +224,7 @@ const VALID_ROUTES = new Set<NavRouteId>([
   "nodes",
   "rules",
   "logs",
+  "ai",
   "settings",
 ]);
 
@@ -222,6 +232,7 @@ function detectNavFromHash(): NavRouteId {
   if (typeof window === "undefined") return "overview";
   const raw = window.location.hash.replace(/^#\/?/, "").toLowerCase();
   if (raw === "speedtest") return "nodes";
+  if (raw === "home") return "overview";
   return VALID_ROUTES.has(raw as NavRouteId) ? (raw as NavRouteId) : "overview";
 }
 
@@ -249,6 +260,7 @@ function saveCachedUiPrefs(p: AppConfig["personalization"]): void {
     window.localStorage.setItem(
       UI_PREFS_STORAGE_KEY,
       JSON.stringify({
+        ui_language: normalizeUiLanguage(p.ui_language),
         theme_mode: p.theme_mode,
         theme_schedule: p.theme_schedule,
         tray_icon_mode: p.tray_icon_mode,
@@ -337,6 +349,11 @@ function applyPersonalizationToDom(
 ): void {
   if (typeof document === "undefined") return;
   const root = document.documentElement;
+  const lang = normalizeUiLanguage(p.ui_language);
+  root.setAttribute("lang", lang);
+  if (lang !== "zh-CN") {
+    void ensureUiLocaleLoaded(lang);
+  }
   root.setAttribute("data-theme", resolvedTheme);
   root.setAttribute("data-animations", p.animations_enabled ? "on" : "off");
   if (windowMode === "capsule") {
@@ -476,6 +493,8 @@ export interface BgTasksState {
     };
     relaysTestingAll: boolean;
     relaysTestingIds: string[];
+    relaysSpeedTestingAll: boolean;
+    relaysSpeedTestingIds: string[];
     campusChecking: boolean;
     campusResult: CampusPortalStatus | null;
     campusError: string | null;
@@ -567,9 +586,14 @@ export interface AppState {
   isTauri: boolean;
   windowMode: WindowMode;
   activeNav: NavRouteId;
+  aiRouteHint: { moduleId?: string; tab?: "web" | "agent" } | null;
   settingsTabHint: "system" | "appearance" | "dns" | "core" | "updates" | null;
   settingsOpenAgentDocs: boolean;
-  nodesTabHint: { tab: "nodes" | "subs"; subId?: string | null } | null;
+  nodesTabHint: {
+    tab: "nodes" | "subs";
+    subId?: string | null;
+    action?: "migration" | null;
+  } | null;
   config: AppConfig;
   resolvedTheme: ResolvedTheme;
   wallpaperPreviewUrl: string | null;
@@ -599,7 +623,9 @@ export function selectIsProbeEngineBusy(s: AppState): boolean {
   return Boolean(
     s.probeProgress.running ||
       s.bgTasks.probeLocalStarting ||
-      s.bgTasks.preaccel.benchmark.running
+      s.bgTasks.preaccel.benchmark.running ||
+      s.bgTasks.preaccel.relaysSpeedTestingAll ||
+      s.bgTasks.preaccel.relaysSpeedTestingIds.length > 0
   );
 }
 
@@ -628,6 +654,8 @@ export function selectHasBackgroundActivity(s: AppState): {
     s.bgTasks.preaccel.benchmark.running ||
       s.bgTasks.preaccel.relaysTestingAll ||
       s.bgTasks.preaccel.relaysTestingIds.length > 0 ||
+      s.bgTasks.preaccel.relaysSpeedTestingAll ||
+      s.bgTasks.preaccel.relaysSpeedTestingIds.length > 0 ||
       s.bgTasks.preaccel.campusChecking ||
       s.bgTasks.preaccel.installingDriver ||
       s.bgTasks.preaccel.verifyingGlobal
@@ -900,6 +928,8 @@ function createInitialBgTasks(): BgTasksState {
       },
       relaysTestingAll: false,
       relaysTestingIds: [],
+      relaysSpeedTestingAll: false,
+      relaysSpeedTestingIds: [],
       campusChecking: false,
       campusResult: null,
       campusError: null,
@@ -994,6 +1024,7 @@ let state: AppState = {
   isTauri: runningInTauri,
   windowMode: initialWindowMode,
   activeNav: detectNavFromHash(),
+  aiRouteHint: null,
   settingsTabHint: null,
   settingsOpenAgentDocs: false,
   nodesTabHint: null,
@@ -1155,11 +1186,40 @@ function beginMascotBusy(mode: MascotState = "searching"): void {
   setState((prev) => (prev.mascotState === mode ? prev : { ...prev, mascotState: mode }));
 }
 
-function endMascotBusy(): void {
+function celebrateMascotComplete(durationMs = 4000): void {
+  if (activeMascotTaskCount > 0 || state.probeProgress.running) {
+    return;
+  }
+  if (mascotResetTimer !== null) {
+    window.clearTimeout(mascotResetTimer);
+    mascotResetTimer = null;
+  }
+  setState((prev) =>
+    prev.mascotState === "complete" ? prev : { ...prev, mascotState: "complete" }
+  );
+  if (typeof window !== "undefined") {
+    mascotResetTimer = window.setTimeout(() => {
+      mascotResetTimer = null;
+      if (activeMascotTaskCount === 0 && !state.probeProgress.running) {
+        setState((prev) =>
+          prev.mascotState === "complete" ? { ...prev, mascotState: "idle" } : prev
+        );
+      }
+    }, durationMs);
+  }
+}
+
+function endMascotBusy(celebrate = false): void {
   activeMascotTaskCount = Math.max(0, activeMascotTaskCount - 1);
   if (activeMascotTaskCount === 0 && !state.probeProgress.running) {
+    if (celebrate) {
+      celebrateMascotComplete(4000);
+      return;
+    }
     setState((prev) =>
-      prev.mascotState === "searching" || prev.mascotState === "thinking"
+      prev.mascotState === "searching" ||
+      prev.mascotState === "thinking" ||
+      prev.mascotState === "typing"
         ? { ...prev, mascotState: "idle" }
         : prev
     );
@@ -1169,24 +1229,31 @@ function endMascotBusy(): void {
 function runInFlight<T>(
   taskKey: string,
   runner: () => Promise<T>,
-  options?: { mascot?: boolean }
+  options?: { mascot?: boolean | MascotState; celebrate?: boolean }
 ): Promise<T> {
   const existing = inFlightTasks.get(taskKey);
   if (existing) {
     return existing as Promise<T>;
   }
-  const useMascot = options?.mascot ?? false;
-  if (useMascot) {
-    beginMascotBusy("searching");
+  const mascotOpt = options?.mascot ?? false;
+  const mascotMode: MascotState | null =
+    mascotOpt === true ? "searching" : mascotOpt === false ? null : mascotOpt;
+  if (mascotMode) {
+    beginMascotBusy(mascotMode);
   }
+  let succeeded = false;
   const promise = Promise.resolve()
-    .then(runner)
+    .then(async () => {
+      const res = await runner();
+      succeeded = true;
+      return res;
+    })
     .finally(() => {
       if (inFlightTasks.get(taskKey) === promise) {
         inFlightTasks.delete(taskKey);
       }
-      if (useMascot) {
-        endMascotBusy();
+      if (mascotMode) {
+        endMascotBusy(Boolean(options?.celebrate && succeeded));
       }
     });
   inFlightTasks.set(taskKey, promise);
@@ -1875,7 +1942,9 @@ export const appStore = {
         const nextMascot: MascotState = ev.done
           ? activeMascotTaskCount > 0
             ? prev.mascotState
-            : "idle"
+            : ev.cancelled
+              ? "idle"
+              : "complete"
           : "searching";
 
         return {
@@ -1898,6 +1967,9 @@ export const appStore = {
           },
         };
       });
+      if (ev.done && !ev.cancelled && activeMascotTaskCount === 0) {
+        celebrateMascotComplete(4000);
+      }
     });
 
     disposeStrategySwitch = catcloudApi.subscribeStrategySwitch((ev) => {
@@ -2086,10 +2158,14 @@ export const appActions = {
     setState((prev) => (prev.activeNav === normalized ? prev : { ...prev, activeNav: normalized }));
   },
 
-  openNodesWorkspace(tab: "nodes" | "subs" = "nodes", subId?: string | null): void {
+  openNodesWorkspace(
+    tab: "nodes" | "subs" = "nodes",
+    subId?: string | null,
+    action?: "migration" | null
+  ): void {
     setState((prev) => ({
       ...prev,
-      nodesTabHint: { tab, subId: subId ?? null },
+      nodesTabHint: { tab, subId: subId ?? null, action: action ?? null },
       sessionDrafts: {
         ...prev.sessionDrafts,
         nodesWorkspace: {
@@ -2114,13 +2190,20 @@ export const appActions = {
     setState((prev) => (prev.settingsTabHint === null ? prev : { ...prev, settingsTabHint: null }));
   },
 
-  openSettingsAgentDocs(): void {
+  openSettingsAgentDocs(moduleId?: string): void {
+    appActions.openAiAssistant(moduleId, "web");
+  },
+
+  openAiAssistant(moduleId?: string, tab?: "web" | "agent"): void {
     setState((prev) => ({
       ...prev,
-      settingsTabHint: "updates",
-      settingsOpenAgentDocs: true,
+      aiRouteHint: moduleId || tab ? { moduleId, tab } : prev.aiRouteHint,
     }));
-    appActions.setNav("settings");
+    appActions.setNav("ai");
+  },
+
+  consumeAiRouteHint(): void {
+    setState((prev) => (prev.aiRouteHint === null ? prev : { ...prev, aiRouteHint: null }));
   },
 
   consumeSettingsOpenAgentDocs(): void {
@@ -2129,7 +2212,22 @@ export const appActions = {
     );
   },
 
-  async copyAiOnboardingForUser(): Promise<boolean> {
+  async setUiLanguage(lang: UiLanguage): Promise<void> {
+    const normalized = normalizeUiLanguage(lang);
+    await ensureUiLocaleLoaded(normalized);
+    const labelMap: Record<UiLanguage, string> = {
+      "zh-CN": "简体中文",
+      en: "English",
+      ja: "日本語",
+      ru: "Русский",
+    };
+    await appActions.updatePersonalization(
+      { ui_language: normalized },
+      `界面语言已切换为 ${labelMap[normalized]}`
+    );
+  },
+
+  async copyAiOnboardingForUser(lang?: UiLanguage, moduleId?: string | null): Promise<boolean> {
     const writeClipboard = async (text: string): Promise<boolean> => {
       try {
         if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
@@ -2157,7 +2255,8 @@ export const appActions = {
     };
 
     try {
-      const prompt = await catcloudApi.buildAiOnboardingPrompt();
+      const targetLang = normalizeUiLanguage(lang ?? state.config.personalization.ui_language);
+      const prompt = await catcloudApi.buildAiOnboardingPrompt(targetLang, moduleId ?? null);
       const text = prompt.trim();
       if (!text) {
         pushToast("新手上手指南生成为空，请稍后重试", "warn");
@@ -2166,9 +2265,9 @@ export const appActions = {
       const copied = await writeClipboard(text);
       if (copied) {
         pushToast(
-          "已复制「AI 新手上手指南 + 当前进度」，直接粘贴给任意 AI（如 ChatGPT / 豆包 / DeepSeek）就能带你一步步操作",
+          "已复制网页 AI 指南与当前脱敏进度，直接粘贴给 DeepSeek / 豆包 / ChatGPT 就能一步步带你操作",
           "ok",
-          5200
+          5000
         );
         return true;
       }
@@ -2176,6 +2275,103 @@ export const appActions = {
       return false;
     } catch (err) {
       pushToast(`生成 AI 上手指南失败：${formatErrorMessage(err)}`, "warn");
+      return false;
+    }
+  },
+
+  async copyAgentBootstrapPrompt(lang?: UiLanguage): Promise<boolean> {
+    const writeClipboard = async (text: string): Promise<boolean> => {
+      try {
+        if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {
+        /* fallback */
+      }
+      if (typeof document === "undefined") return false;
+      try {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.style.position = "fixed";
+        el.style.left = "-9999px";
+        el.style.opacity = "0";
+        document.body.appendChild(el);
+        el.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(el);
+        return ok;
+      } catch {
+        return false;
+      }
+    };
+
+    try {
+      const targetLang = normalizeUiLanguage(lang ?? state.config.personalization.ui_language);
+      const dto = await catcloudApi.buildAgentBootstrapPrompt(targetLang, state.activeNav);
+      const text = dto.prompt.trim();
+      if (!text) {
+        pushToast("本机 Agent 引导语生成为空，请稍后重试", "warn");
+        return false;
+      }
+      const copied = await writeClipboard(text);
+      if (copied) {
+        pushToast(
+          "已复制本机 Agent 引导指令（含精确 CLI 路径与手册索引），粘贴给 Antigravity / Codex / Claude Code 即可协助排查",
+          "ok",
+          5200
+        );
+        return true;
+      }
+      pushToast("无法写入剪贴板，请检查剪贴板权限后重试", "warn");
+      return false;
+    } catch (err) {
+      pushToast(`生成本机 Agent 引导指令失败：${formatErrorMessage(err)}`, "warn");
+      return false;
+    }
+  },
+
+  async openGithubIssueFeedback(summary?: string | null): Promise<boolean> {
+    try {
+      const targetLang = normalizeUiLanguage(state.config.personalization.ui_language);
+      const draft = await catcloudApi.buildGithubIssueUrl(summary ?? null, targetLang);
+      let copied = false;
+      if (draft.clipboard_markdown.trim()) {
+        try {
+          if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+            await navigator.clipboard.writeText(draft.clipboard_markdown);
+            copied = true;
+          }
+        } catch {
+          copied = false;
+        }
+        if (!copied && typeof document !== "undefined") {
+          try {
+            const el = document.createElement("textarea");
+            el.value = draft.clipboard_markdown;
+            el.style.position = "fixed";
+            el.style.left = "-9999px";
+            el.style.opacity = "0";
+            document.body.appendChild(el);
+            el.select();
+            copied = document.execCommand("copy");
+            document.body.removeChild(el);
+          } catch {
+            copied = false;
+          }
+        }
+      }
+      await catcloudApi.openExternalUrl(draft.issue_url);
+      pushToast(
+        copied
+          ? "已打开 GitHub 反馈页，并自动复制了脱敏环境摘要（到页面内按 Ctrl+V 粘贴即可）"
+          : "已打开 GitHub 反馈页，请按模板填写遇到的问题",
+        "ok",
+        5200
+      );
+      return true;
+    } catch (err) {
+      pushToast(`打开 GitHub 反馈页失败：${formatErrorMessage(err)}`, "warn");
       return false;
     }
   },
@@ -2664,7 +2860,7 @@ export const appActions = {
           }));
         }
       },
-      { mascot: true }
+      { mascot: "thinking", celebrate: true }
     );
   },
 
@@ -3206,15 +3402,7 @@ export const appActions = {
             ),
       }));
       pushToast(`已秒切至 ${res.active_node_name}（清理 ${res.closed_connections} 条旧连接）`, "ok");
-      if (mascotResetTimer !== null) {
-        window.clearTimeout(mascotResetTimer);
-      }
-      mascotResetTimer = window.setTimeout(() => {
-        mascotResetTimer = null;
-        setState((prev) =>
-          prev.mascotState === "complete" ? { ...prev, mascotState: "idle" } : prev
-        );
-      }, 1800);
+      celebrateMascotComplete(4000);
     } catch (err) {
       setState((prev) => ({ ...prev, mascotState: "idle" }));
       pushToast(`切换次优节点失败：${formatErrorMessage(err)}`, "warn");
@@ -3270,7 +3458,15 @@ export const appActions = {
       return existing as Promise<PreAccelComparisonResult | null>;
     }
     if (selectIsProbeEngineBusy(state)) {
-      pushToast("节点测速正在后台进行，完成后即可运行提速对比", "info");
+      const relaySpeedBusy =
+        state.bgTasks.preaccel.relaysSpeedTestingAll ||
+        state.bgTasks.preaccel.relaysSpeedTestingIds.length > 0;
+      pushToast(
+        relaySpeedBusy
+          ? "中转上下行测速正在后台进行，完成后即可运行提速对比"
+          : "节点测速正在后台进行，完成后即可运行提速对比",
+        "info"
+      );
       return null;
     }
 
@@ -3435,7 +3631,7 @@ export const appActions = {
           return null;
         }
       },
-      { mascot: true }
+      { mascot: "searching", celebrate: true }
     );
   },
 
@@ -3534,6 +3730,159 @@ export const appActions = {
         }
       },
       { mascot: true }
+    );
+  },
+
+  async runTestPreAccelRelaySpeeds(
+    relayId?: string | null,
+    nodeId?: string | null
+  ): Promise<PreAccelSpeedTestResult[]> {
+    const targetId = relayId?.trim() || null;
+    const targetNodeId = nodeId?.trim() || null;
+    const inDesktop = isTauriEnv();
+    const taskKey = targetId ? `preaccel:relay-speed:${targetId}` : "preaccel:relay-speed:all";
+    const existing = inFlightTasks.get(taskKey);
+    if (existing) {
+      return existing as Promise<PreAccelSpeedTestResult[]>;
+    }
+    if (!targetId && state.preAccelRelays.length === 0) {
+      return [];
+    }
+    if (selectIsProbeEngineBusy(state)) {
+      pushToast("当前已有测速或提速对比正在后台进行，请稍候完成后再试", "info");
+      return [];
+    }
+
+    const hasValidSpeed = (v: number | null | undefined): v is number =>
+      v !== null && v !== undefined && Number.isFinite(v) && v > 0;
+
+    return runInFlight(
+      taskKey,
+      async () => {
+        if (!targetId) {
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: { ...bg.preaccel, relaysSpeedTestingAll: true },
+          }));
+        } else {
+          updateBgTasks((bg) => ({
+            ...bg,
+            preaccel: {
+              ...bg.preaccel,
+              relaysSpeedTestingIds: bg.preaccel.relaysSpeedTestingIds.includes(targetId)
+                ? bg.preaccel.relaysSpeedTestingIds
+                : [...bg.preaccel.relaysSpeedTestingIds, targetId],
+            },
+          }));
+        }
+
+        try {
+          const results = await catcloudApi.testPreAccelRelaySpeeds(
+            targetId ? [targetId] : null,
+            targetNodeId
+          );
+
+          if (inDesktop) {
+            const latestRelays = await catcloudApi.listPreAccelRelays();
+            setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+          } else {
+            const resultMap = new Map(results.map((r) => [r.relay_id, r]));
+            setState((prev) => ({
+              ...prev,
+              preAccelRelays: prev.preAccelRelays.map((r) => {
+                const matched = resultMap.get(r.id);
+                if (!matched) return r;
+                return {
+                  ...r,
+                  last_probe_ms:
+                    matched.latency_ms !== null ? matched.latency_ms : r.last_probe_ms,
+                  last_up_mbps:
+                    matched.up_mbps !== null ? matched.up_mbps : r.last_up_mbps ?? null,
+                  last_down_mbps:
+                    matched.down_mbps !== null ? matched.down_mbps : r.last_down_mbps ?? null,
+                  last_mbps:
+                    matched.up_mbps !== null
+                      ? matched.up_mbps
+                      : matched.down_mbps !== null
+                        ? matched.down_mbps
+                        : r.last_mbps,
+                };
+              }),
+            }));
+          }
+
+          if (targetId) {
+            const item = results.find((r) => r.relay_id === targetId) ?? results[0];
+            const relayName =
+              item?.relay_name ||
+              state.preAccelRelays.find((r) => r.id === targetId)?.name ||
+              "中转线路";
+            if (!item || !item.ok) {
+              pushToast(
+                `「${relayName}」测速失败：${item?.error ?? "连接超时"}`,
+                "warn",
+                4600
+              );
+            } else {
+              const speedParts: string[] = [];
+              if (hasValidSpeed(item.up_mbps)) {
+                speedParts.push(`↑${item.up_mbps.toFixed(1)} M`);
+              }
+              if (hasValidSpeed(item.down_mbps)) {
+                speedParts.push(`↓${item.down_mbps.toFixed(1)} M`);
+              }
+              const msText = hasValidPositiveLatency(item.latency_ms)
+                ? `（${formatMsShort(item.latency_ms)}）`
+                : "";
+              if (speedParts.length > 0) {
+                pushToast(
+                  `「${relayName}」测速完成：${speedParts.join(" · ")}${msText}`,
+                  "ok",
+                  4600
+                );
+              } else {
+                pushToast(
+                  `「${relayName}」连通正常${msText}，暂未测出上下行速率`,
+                  "warn",
+                  4600
+                );
+              }
+            }
+          } else {
+            const measuredCount = results.filter(
+              (r) => r.ok && (hasValidSpeed(r.up_mbps) || hasValidSpeed(r.down_mbps))
+            ).length;
+            pushToast(
+              `中转上下行测速完成：${measuredCount}/${results.length} 条已测出速率`,
+              measuredCount > 0 ? "ok" : "warn",
+              4600
+            );
+          }
+
+          return results;
+        } catch (err) {
+          pushToast(`中转上下行测速失败：${formatErrorMessage(err)}`, "warn", 4600);
+          return [];
+        } finally {
+          if (!targetId) {
+            updateBgTasks((bg) => ({
+              ...bg,
+              preaccel: { ...bg.preaccel, relaysSpeedTestingAll: false },
+            }));
+          } else {
+            updateBgTasks((bg) => ({
+              ...bg,
+              preaccel: {
+                ...bg.preaccel,
+                relaysSpeedTestingIds: bg.preaccel.relaysSpeedTestingIds.filter(
+                  (id) => id !== targetId
+                ),
+              },
+            }));
+          }
+        }
+      },
+      { mascot: "searching", celebrate: true }
     );
   },
 
@@ -4100,7 +4449,7 @@ export const appActions = {
           }));
         }
       },
-      { mascot: true }
+      { mascot: "typing", celebrate: true }
     );
   },
 
@@ -4213,7 +4562,7 @@ export const appActions = {
           }));
         }
       },
-      { mascot: true }
+      { mascot: "typing", celebrate: true }
     );
   },
 
@@ -4416,7 +4765,7 @@ export const appActions = {
           }));
         }
       },
-      { mascot: true }
+      { mascot: "thinking", celebrate: true }
     );
   },
 
@@ -4725,7 +5074,7 @@ export const appActions = {
           }));
         }
       },
-      { mascot: true }
+      { mascot: "thinking", celebrate: true }
     );
   },
 
@@ -4754,7 +5103,7 @@ export const appActions = {
           }));
         }
       },
-      { mascot: true }
+      { mascot: "typing", celebrate: true }
     );
   },
 

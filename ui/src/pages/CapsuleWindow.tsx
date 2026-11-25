@@ -22,9 +22,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   catcloudApi,
   formatErrorMessage,
+  type CoreRuntimeInfo,
   type ThemeMode,
 } from "../api/tauri";
-import { MascotSprite } from "../components/MascotSprite";
+import { type MascotState, MascotSprite } from "../components/MascotSprite";
+import { normalizeUiLanguage, useUiDict, type UiLanguage } from "../i18n";
 import {
   appActions,
   appStore,
@@ -353,86 +355,292 @@ function saveCapsuleSize(w: number, h: number): void {
   }
 }
 
-function resolveStatusAccent(
-  status: string,
+type CapsulePulseMode = "none" | "work" | "alert";
+type CapsuleBadgeTone = "red" | "amber" | "sky" | "green" | "accent";
+type CapsuleHealthState = "idle" | "ok" | "preaccel" | "warn" | "error";
+
+interface CapsuleStatusMeta {
+  color: string;
+  label: string;
+  pulse: CapsulePulseMode;
+  badge?: {
+    label: string;
+    tone: CapsuleBadgeTone;
+  };
+}
+
+interface CapsuleDictSlice {
+  common: { appName: string; on: string; off: string };
+  nav: {
+    preaccelActiveBadge: string;
+    preaccelVerifiedBadge: string;
+    preaccelProbingBadge: string;
+    preaccelDegradedBadge: string;
+  };
+  titleBar: {
+    modeRule: string;
+    modeGlobal: string;
+    modeDirect: string;
+    standby: string;
+  };
+  capsule: {
+    directMode: string;
+    probingNow: string;
+    circuitOpen: string;
+    preaccelVerified: string;
+    preaccelDegraded: string;
+  };
+}
+
+function isActiveGroupCircuitOpen(runtime: CoreRuntimeInfo): boolean {
+  if (runtime.active_group_circuit_open) return true;
+  const st = runtime.active_group_state?.trim().toLowerCase() ?? "";
+  return st.includes("circuit");
+}
+
+/**
+ * Align strictly with `src-tauri/src/tray.rs::TrayIconMode::AutoAc` and `commands.rs::build_tray_visual_state`:
+ * - Idle | Ok => Pack A (cream cloud cat)
+ * - PreAccel | Warn | Error => Pack C (starry neko)
+ */
+function resolveCapsuleHealthState(
+  runtime: CoreRuntimeInfo,
   preaccel: PreAccelSummary
-): { color: string; label: string } {
-  if (status === "error") {
-    return { color: "var(--red)", label: "核心异常" };
+): CapsuleHealthState {
+  if (runtime.status === "error") {
+    return "error";
   }
-  if (status === "warn") {
-    return { color: "var(--amber)", label: "路线存在波动" };
+  const verifyDegraded =
+    preaccel.enabled && (preaccel.verifyState === "degraded" || preaccel.verifyState === "failed");
+  const verifyProbing = preaccel.enabled && preaccel.verifyState === "probing";
+  if (
+    runtime.status === "warn" ||
+    runtime.captive_portal_required ||
+    isActiveGroupCircuitOpen(runtime) ||
+    verifyDegraded
+  ) {
+    return "warn";
+  }
+  const isDirectMode = runtime.proxy_mode === "direct";
+  if (isDirectMode) {
+    if (!verifyProbing && preaccel.realWinDivertActive) {
+      return "preaccel";
+    }
+    return "idle";
+  }
+  if (
+    !verifyProbing &&
+    ((preaccel.proxyActive && runtime.preaccel_active) ||
+      preaccel.realWinDivertActive ||
+      runtime.status === "preaccel")
+  ) {
+    return "preaccel";
+  }
+  if (preaccel.proxyActive || runtime.status === "ok") {
+    return "ok";
+  }
+  return "idle";
+}
+
+function resolveStatusAccent(
+  runtime: CoreRuntimeInfo,
+  preaccel: PreAccelSummary,
+  mascotState: MascotState,
+  isLocalBusy: boolean,
+  dict: CapsuleDictSlice,
+  uiLang: UiLanguage
+): CapsuleStatusMeta {
+  const isZh = uiLang === "zh-CN";
+  const circuitOpen = isActiveGroupCircuitOpen(runtime);
+  const verifyDegraded =
+    preaccel.enabled && (preaccel.verifyState === "degraded" || preaccel.verifyState === "failed");
+  const verifyProbing = preaccel.enabled && preaccel.verifyState === "probing";
+  const isInstalling =
+    preaccel.enabled &&
+    (preaccel.installState === "downloading" || preaccel.installState === "verifying");
+  const isWorking =
+    isLocalBusy ||
+    Boolean(runtime.probing_active) ||
+    Boolean(runtime.switching_active) ||
+    verifyProbing ||
+    mascotState === "searching" ||
+    mascotState === "thinking" ||
+    mascotState === "typing";
+
+  if (runtime.status === "error") {
+    return {
+      color: "var(--red)",
+      label: isZh ? "核心异常" : "Core Error",
+      pulse: "alert",
+      badge: { label: isZh ? "异常" : "Err", tone: "red" },
+    };
+  }
+  if (circuitOpen) {
+    return {
+      color: "var(--red)",
+      label: dict.capsule.circuitOpen,
+      pulse: "alert",
+      badge: { label: isZh ? "熔断" : "Open", tone: "red" },
+    };
+  }
+  if (runtime.status === "warn" || runtime.captive_portal_required) {
+    return {
+      color: "var(--amber)",
+      label: runtime.captive_portal_required
+        ? isZh
+          ? "校园网需认证"
+          : "Portal Auth"
+        : isZh
+          ? "路线存在波动"
+          : "Route Warning",
+      pulse: "alert",
+      badge: { label: isZh ? "告警" : "Warn", tone: "amber" },
+    };
+  }
+  if (verifyDegraded) {
+    return {
+      color: "var(--amber)",
+      label: dict.capsule.preaccelDegraded,
+      pulse: "alert",
+      badge: { label: dict.nav.preaccelDegradedBadge, tone: "amber" },
+    };
+  }
+  if (isWorking) {
+    return {
+      color: "var(--amber)",
+      label: verifyProbing
+        ? isZh
+          ? "国内提速（探测中）"
+          : `${dict.nav.preaccelProbingBadge}…`
+        : dict.capsule.probingNow,
+      pulse: "work",
+      badge: {
+        label: verifyProbing
+          ? dict.nav.preaccelProbingBadge
+          : isZh
+            ? "处理中"
+            : "Busy",
+        tone: "amber",
+      },
+    };
+  }
+  if (isInstalling) {
+    return {
+      color: "var(--amber)",
+      label: isZh ? "准备提速组件…" : "Preparing Boost…",
+      pulse: "work",
+    };
+  }
+  if (runtime.proxy_mode === "direct") {
+    if (preaccel.realWinDivertActive && preaccel.verifyState === "verified") {
+      return {
+        color: "var(--green)",
+        label: preaccel.verifyLatencyMs
+          ? `${dict.capsule.preaccelVerified} ${preaccel.verifyLatencyMs}ms · ${dict.capsule.directMode}`
+          : `${dict.capsule.preaccelVerified} · ${dict.capsule.directMode}`,
+        pulse: "none",
+        badge: { label: dict.titleBar.modeDirect, tone: "sky" },
+      };
+    }
+    return {
+      color: "var(--sky)",
+      label: dict.capsule.directMode,
+      pulse: "none",
+      badge: { label: dict.titleBar.modeDirect, tone: "sky" },
+    };
   }
   if (preaccel.proxyActive) {
     if (preaccel.enabled) {
       if (preaccel.realWinDivertActive) {
-        if (preaccel.verifyState === "probing") {
-          return { color: "var(--amber)", label: "国内提速（探测中）" };
-        }
         if (preaccel.verifyState === "verified") {
           return {
             color: "var(--green)",
             label: preaccel.verifyLatencyMs
-              ? `国内提速（已畅通 ${preaccel.verifyLatencyMs}ms）`
-              : "国内提速（已畅通）",
+              ? `${dict.capsule.preaccelVerified} (${preaccel.verifyLatencyMs}ms)`
+              : dict.capsule.preaccelVerified,
+            pulse: "none",
+            badge: { label: dict.nav.preaccelVerifiedBadge, tone: "green" },
           };
         }
-        return { color: "var(--accent)", label: "国内提速中（全局）" };
+        return {
+          color: "var(--accent)",
+          label: isZh ? "国内提速中（全局）" : dict.nav.preaccelActiveBadge,
+          pulse: "none",
+        };
       }
-      if (preaccel.verifyState === "probing") {
-        return { color: "var(--amber)", label: "国内提速（探测中）" };
-      }
-      if (preaccel.verifyState === "degraded") {
-        return { color: "var(--amber)", label: "国内提速（其它已回退）" };
-      }
-      return { color: "var(--accent)", label: "国内提速运行中" };
+      return {
+        color: "var(--accent)",
+        label: isZh ? "国内提速运行中" : dict.nav.preaccelActiveBadge,
+        pulse: "none",
+      };
     }
-    return { color: "var(--green)", label: "代理运行正常" };
+    return {
+      color: "var(--green)",
+      label: isZh ? "代理运行正常" : "Proxy Active",
+      pulse: "none",
+    };
   }
   if (preaccel.realWinDivertActive) {
-    if (preaccel.verifyState === "probing") {
-      return { color: "var(--amber)", label: "正在探测链路…" };
-    }
     if (preaccel.verifyState === "verified") {
       return {
         color: "var(--green)",
         label: preaccel.verifyLatencyMs
-          ? `已探测畅通 ${preaccel.verifyLatencyMs}ms`
-          : "已探测畅通",
+          ? `${dict.capsule.preaccelVerified} ${preaccel.verifyLatencyMs}ms`
+          : dict.capsule.preaccelVerified,
+        pulse: "none",
+        badge: { label: dict.nav.preaccelVerifiedBadge, tone: "green" },
       };
     }
-    return { color: "var(--accent)", label: "全局提速中" };
+    return {
+      color: "var(--accent)",
+      label: isZh ? "全局提速中" : dict.nav.preaccelActiveBadge,
+      pulse: "none",
+    };
   }
   if (preaccel.enabled) {
-    if (preaccel.installState === "downloading" || preaccel.installState === "verifying") {
-      return { color: "var(--amber)", label: "准备提速组件…" };
-    }
     if (preaccel.installState === "need_elevation") {
-      return { color: "var(--amber)", label: "提速需管理员" };
+      return {
+        color: "var(--amber)",
+        label: isZh ? "提速需管理员" : "Admin Required",
+        pulse: "none",
+      };
     }
-    if (preaccel.verifyState === "probing") {
-      return { color: "var(--amber)", label: "正在探测链路…" };
-    }
-    if (preaccel.verifyState === "degraded") {
-      return { color: "var(--amber)", label: "已自动保护回退" };
-    }
-    return { color: "var(--amber)", label: "本地通道待命" };
+    return {
+      color: "var(--amber)",
+      label: isZh ? "本地通道待命" : dict.titleBar.standby,
+      pulse: "none",
+    };
   }
-  return { color: "var(--muted)", label: "待机中" };
+  return { color: "var(--muted)", label: dict.titleBar.standby, pulse: "none" };
 }
 
 function resolveThemeDisplay(
   resolvedTheme: ResolvedTheme,
-  themeMode: ThemeMode
+  themeMode: ThemeMode,
+  uiLang: UiLanguage
 ): { label: string; shortLabel: string; autoSuffix: string } {
-  const autoSuffix = themeMode === "auto_time" ? " · 按时间自动" : "";
+  const isZh = uiLang === "zh-CN";
+  const autoSuffix =
+    themeMode === "auto_time" ? (isZh ? " · 按时间自动" : " · Auto") : "";
   switch (resolvedTheme) {
     case "light":
-      return { label: "晨曦浅色", shortLabel: "晨曦", autoSuffix };
+      return {
+        label: isZh ? "晨曦浅色" : "Warm Light",
+        shortLabel: isZh ? "晨曦" : "Light",
+        autoSuffix,
+      };
     case "warm-dark":
-      return { label: "深苔暖金", shortLabel: "暖金", autoSuffix };
+      return {
+        label: isZh ? "深苔暖金" : "Warm Dark",
+        shortLabel: isZh ? "暖金" : "Moss",
+        autoSuffix,
+      };
     default:
-      return { label: "午夜星蓝", shortLabel: "星蓝", autoSuffix };
+      return {
+        label: isZh ? "午夜星蓝" : "Midnight Blue",
+        shortLabel: isZh ? "星蓝" : "Night",
+        autoSuffix,
+      };
   }
 }
 
@@ -460,7 +668,13 @@ export function CapsuleWindow() {
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const themeMode = useAppSelector((s) => s.config.personalization.theme_mode);
   const trayIconMode = useAppSelector((s) => s.config.personalization.tray_icon_mode);
+  const uiLang = useAppSelector((s) =>
+    normalizeUiLanguage(s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
+  const mascotState = useAppSelector((s) => s.mascotState);
   const traffic = useLatestTraffic();
+  const isZh = uiLang === "zh-CN";
 
   const isWindows = resolvePlatformOs(runtime.os_label) === "windows";
   const isWindowsRef = useRef<boolean>(isWindows);
@@ -1469,12 +1683,24 @@ export function CapsuleWindow() {
     globalPreAccel,
     preAccelEnabledConfig
   );
-  const statusMeta = resolveStatusAccent(runtime.status, preaccelSummary);
-  const themeMeta = resolveThemeDisplay(resolvedTheme, themeMode);
+  const isLocalBusy = switching || togglingPreAccel;
+  const statusMeta = resolveStatusAccent(
+    runtime,
+    preaccelSummary,
+    mascotState,
+    isLocalBusy,
+    dict,
+    uiLang
+  );
+  const capsuleHealthState = resolveCapsuleHealthState(runtime, preaccelSummary);
+  const themeMeta = resolveThemeDisplay(resolvedTheme, themeMode, uiLang);
   const isSingleMode = runtime.route_mode === "single";
   const displayNodeName =
-    runtime.active_node_name?.trim() || runtime.active_group_name?.trim() || "待选节点";
-  const displayGroupName = runtime.active_group_name?.trim() || "默认分组";
+    runtime.active_node_name?.trim() ||
+    runtime.active_group_name?.trim() ||
+    (isZh ? "待选节点" : "No Node");
+  const displayGroupName =
+    runtime.active_group_name?.trim() || (isZh ? "默认分组" : "Default Group");
 
   const liveLatencyMs =
     typeof runtime.active_node_latency_ms === "number" &&
@@ -1488,19 +1714,74 @@ export function CapsuleWindow() {
   const showLatencyChip = boxSize.w >= 332;
   const isTallLayout = boxSize.h >= 82;
 
+  // Strictly match `src-tauri/src/tray.rs::TrayIconMode::AutoAc`:
+  // - idle | ok => Pack A (cream cloud cat)
+  // - preaccel | warn | error => Pack C (starry neko)
+  // Never force Pack C based on theme (`midnight-blue`).
   const useStarryIcon =
     trayIconMode === "always_c" ||
     (trayIconMode === "auto_ac" &&
-      (preaccelSummary.realWinDivertActive ||
-        runtime.status === "preaccel" ||
-        runtime.status === "warn" ||
-        runtime.status === "error" ||
-        resolvedTheme === "midnight-blue"));
+      (capsuleHealthState === "preaccel" ||
+        capsuleHealthState === "warn" ||
+        capsuleHealthState === "error"));
 
   const usePixelIcon = trayIconMode === "always_pixel";
   const iconSrc = useStarryIcon
     ? "./icons/icon_c_starry_neko.png"
     : "./icons/icon_a_cream_cat.png";
+
+  const capsuleMascotState: MascotState = (() => {
+    if (capsuleHealthState === "error" || capsuleHealthState === "warn") {
+      return "approval";
+    }
+    if (
+      runtime.probing_active ||
+      preaccelSummary.verifyState === "probing" ||
+      mascotState === "searching"
+    ) {
+      return "searching";
+    }
+    if (
+      switching ||
+      togglingPreAccel ||
+      runtime.switching_active ||
+      mascotState === "thinking"
+    ) {
+      return "thinking";
+    }
+    if (
+      mascotState === "typing" ||
+      (runtime.running && traffic.up_bps + traffic.down_bps > 512 * 1024)
+    ) {
+      return "typing";
+    }
+    if (justSwitched || mascotState === "complete") {
+      return "complete";
+    }
+    return "idle";
+  })();
+
+  const dotPulseClass =
+    statusMeta.pulse === "alert"
+      ? "cc-capsule-dot-alert"
+      : statusMeta.pulse === "work"
+        ? "cc-capsule-dot-work"
+        : "";
+
+  const statusBadgeClass = (tone: CapsuleBadgeTone): string => {
+    switch (tone) {
+      case "red":
+        return "border-[var(--red)]/55 bg-[var(--red-soft)] text-[var(--red)]";
+      case "amber":
+        return "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)]";
+      case "sky":
+        return "border-[var(--sky)]/50 bg-[var(--sky-soft)] text-[var(--sky)]";
+      case "green":
+        return "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]";
+      default:
+        return "border-[var(--accent)]/50 bg-[var(--accent-soft)] text-[var(--accent)]";
+    }
+  };
 
   const handleSwitchNextBest = async () => {
     if (switching) return;
@@ -1594,72 +1875,88 @@ export function CapsuleWindow() {
 
   // Source-aware hover hints (never overlap the hovered element itself)
   const avatarHint: CapsuleHoverHint = {
-    title: `${statusMeta.label} · ${themeMeta.label}`,
+    title: `${dict.common.appName} · ${statusMeta.label}`,
     desc: dockEdge
-      ? `${DOCK_EDGE_LABELS[dockEdge]}中 · 拖离边缘或点解除钮取消贴边`
+      ? isZh
+        ? `${DOCK_EDGE_LABELS[dockEdge]}中 · 拖离边缘或点解除钮取消贴边`
+        : `Docked (${dockEdge}) · Drag away or click undock`
       : preaccelSummary.enabled
-        ? `${preaccelSummary.detailText}${themeMeta.autoSuffix}`
-        : `拖动可移动，拖出屏幕边缘松手自动收起${themeMeta.autoSuffix}`,
+        ? `${isZh ? preaccelSummary.detailText : statusMeta.label}${themeMeta.autoSuffix}`
+        : isZh
+          ? `拖动可移动，拖出屏幕边缘松手自动收起 · ${themeMeta.label}${themeMeta.autoSuffix}`
+          : `Drag to move; drop past edge to dock · ${themeMeta.label}${themeMeta.autoSuffix}`,
     placement: "full",
   };
 
   const modeHint: CapsuleHoverHint = {
-    title: isSingleMode ? "单节点直选" : "智能多选组",
+    title: isSingleMode
+      ? isZh
+        ? "单节点直选"
+        : "Single Node"
+      : dict.nav.groups,
     desc: isSingleMode ? displayNodeName : displayGroupName,
     placement: "row2",
   };
 
   const proxyHint: CapsuleHoverHint = {
-    title: runtime.system_proxy_enabled ? "系统代理已开" : "系统代理未开",
-    desc: "接管浏览器等常用软件",
+    title: `${dict.home.systemProxy}: ${runtime.system_proxy_enabled ? dict.common.on : dict.common.off}`,
+    desc: isZh ? "接管浏览器等常用软件" : "Routes browser & desktop apps",
     placement: "row1",
   };
 
   const tunHint: CapsuleHoverHint = {
-    title: runtime.tun_enabled ? "虚拟网卡已开" : "虚拟网卡未开",
-    desc: "接管桌面与终端全部流量",
+    title: `${dict.home.tunMode}: ${runtime.tun_enabled ? dict.common.on : dict.common.off}`,
+    desc: isZh ? "接管桌面与终端全部流量" : "Routes all system & CLI traffic",
     placement: "row1",
   };
 
   const preAccelHint: CapsuleHoverHint = togglingPreAccel
     ? {
-        title: "正在切换国内提速…",
-        desc: "正在同步中转与全机加速状态",
+        title: isZh ? "正在切换国内提速…" : `Switching ${dict.home.preaccel}…`,
+        desc: isZh ? "正在同步中转与全机加速状态" : "Syncing relay & global tunnel state",
         placement: "full",
       }
     : preaccelSummary.enabled
       ? {
-          title: `${preaccelSummary.badgeText} · 点击关闭`,
-          desc: preaccelSummary.detailText,
+          title: `${dict.home.preaccel} (${statusMeta.label})`,
+          desc: isZh ? preaccelSummary.detailText : "Click to disable domestic boost",
           placement: "full",
         }
       : {
-          title: "国内提速已关闭 · 点击一键开启",
-          desc: "猫云与其它代理软件一起走国内 443 提速",
+          title: `${dict.home.preaccel}: ${dict.common.off}`,
+          desc: isZh
+            ? "点击开启：猫云与其它代理软件一起走国内 443 提速"
+            : "Click to enable domestic 443 boost",
           placement: "full",
         };
 
   const switchHint: CapsuleHoverHint = {
-    title: switching ? "正在切换更优节点…" : "切换下一个更优节点",
-    desc: "自动切优并断开旧卡死连接",
+    title: switching
+      ? isZh
+        ? "正在切换更优节点…"
+        : dict.capsule.probingNow
+      : dict.home.switchNextNode,
+    desc: isZh ? "自动切优并断开旧卡死连接" : "Switch to next best node & close stale conns",
     placement: "full",
   };
 
   const expandHint: CapsuleHoverHint = {
-    title: "展开主窗口",
-    desc: "回到猫猫云梯完整控制台",
+    title: isZh ? "展开主窗口" : dict.titleBar.restore,
+    desc: isZh ? `回到${dict.common.appName}完整控制台` : `Return to ${dict.common.appName}`,
     placement: "full",
   };
 
   const closeHint: CapsuleHoverHint = {
-    title: "隐藏悬浮小窗",
-    desc: "代理继续在后台稳定运行",
+    title: isZh ? "隐藏悬浮小窗" : `Hide ${dict.home.openCapsule}`,
+    desc: isZh ? "代理继续在后台稳定运行" : "Proxy continues running in background",
     placement: "full",
   };
 
   const undockHint: CapsuleHoverHint = {
-    title: `取消${dockEdge ? DOCK_EDGE_LABELS[dockEdge] : "贴边"}`,
-    desc: "点击恢复自由悬浮，也可拖离边缘解除",
+    title: isZh
+      ? `取消${dockEdge ? DOCK_EDGE_LABELS[dockEdge] : "贴边"}`
+      : "Undock Capsule",
+    desc: isZh ? "点击恢复自由悬浮，也可拖离边缘解除" : "Restore floating position",
     placement: "full",
   };
 
@@ -1683,6 +1980,13 @@ export function CapsuleWindow() {
   const isFullHintActive = hoveredHint?.placement === "full";
   const isRow1HintActive = hoveredHint?.placement === "row1";
   const isRow2HintActive = hoveredHint?.placement === "row2";
+  const showPriorityStatusBadge = Boolean(
+    statusMeta.badge && (statusMeta.pulse !== "none" || runtime.proxy_mode === "direct" || boxSize.w >= 344)
+  );
+  const showLatencyAlongside =
+    showLatencyChip &&
+    liveLatencyMs !== null &&
+    (!showPriorityStatusBadge || boxSize.w >= 400);
 
   const capsulePill = (
     <div
@@ -1760,7 +2064,7 @@ export function CapsuleWindow() {
         </>
       )}
 
-      {/* A / C / Pixel status badge with semantic status dot */}
+      {/* A / C / Live Pixel Mascot avatar with controlled working/alert pulse dot */}
       <div
         className={`relative flex shrink-0 items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] ${avatarDimClass}`}
         onMouseEnter={() => setHoveredHint(avatarHint)}
@@ -1769,29 +2073,29 @@ export function CapsuleWindow() {
       >
         {usePixelIcon ? (
           <MascotSprite
-            state="idle"
+            state={capsuleMascotState}
             scale={1}
-            animationsEnabled={false}
+            maxSize={isTallLayout ? 34 : 26}
             className="pointer-events-none"
             title={statusMeta.label}
           />
         ) : (
           <img
             src={iconSrc}
-            alt={useStarryIcon ? "CatCloud 午夜星云状态" : "CatCloud 奶油云朵状态"}
+            alt={`${dict.common.appName} · ${statusMeta.label}`}
             className={`pointer-events-none rounded-full object-cover ${avatarDimClass}`}
             draggable={false}
           />
         )}
         <span
-          className="pointer-events-none absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[var(--surface)]"
-          style={{ backgroundColor: statusMeta.color }}
+          className={`pointer-events-none absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full border-2 border-[var(--surface)] ${dotPulseClass}`}
+          style={{ backgroundColor: statusMeta.color, color: statusMeta.color }}
         />
       </div>
 
       {/* Center info column with clean non-overlapping 100% opaque hover hint replacement */}
       <div className="relative flex min-w-0 flex-1 flex-col justify-center">
-        {/* Row 1: Mode badge + Active Node Name + Live Color-Coded Latency */}
+        {/* Row 1: Mode badge + Active Node Name + Concise Status Badge / Live Latency */}
         <div className="relative flex min-w-0 items-center gap-1">
           <div
             className={`flex min-w-0 flex-1 items-center gap-1 ${
@@ -1811,7 +2115,7 @@ export function CapsuleWindow() {
               }`}
               aria-label={`${modeHint.title}：${modeHint.desc}`}
             >
-              {isSingleMode ? "单节点" : "组"}
+              {isSingleMode ? (isZh ? "单节点" : "1x") : isZh ? "组" : "Grp"}
             </span>
             <span
               className={`truncate font-semibold leading-tight text-[var(--text)] ${
@@ -1820,7 +2124,16 @@ export function CapsuleWindow() {
             >
               {displayNodeName}
             </span>
-            {showLatencyChip && liveLatencyMs !== null && (
+            {showPriorityStatusBadge && statusMeta.badge && (
+              <span
+                className={`pointer-events-none shrink-0 rounded border px-1 py-[1px] text-[8.5px] font-semibold leading-none ${statusBadgeClass(
+                  statusMeta.badge.tone
+                )}`}
+              >
+                {statusMeta.badge.label}
+              </span>
+            )}
+            {showLatencyAlongside && liveLatencyMs !== null && (
               <span
                 className={`cc-mono cc-tabular pointer-events-none shrink-0 rounded bg-[var(--card)] px-1 py-[1px] text-[9px] font-semibold ${resolveLatencyToneClass(
                   liveLatencyMs
@@ -1892,7 +2205,7 @@ export function CapsuleWindow() {
                 }`}
                 aria-label={`${proxyHint.title}：${proxyHint.desc}`}
               >
-                {isCompactWidth ? "代" : "代理"}
+                {isZh ? (isCompactWidth ? "代" : "代理") : isCompactWidth ? "P" : "Proxy"}
               </span>
               <span
                 data-capsule-no-drag="true"
@@ -1911,7 +2224,7 @@ export function CapsuleWindow() {
                 }`}
                 aria-label={`${tunHint.title}：${tunHint.desc}`}
               >
-                {isCompactWidth ? "卡" : "网卡"}
+                {isZh ? (isCompactWidth ? "卡" : "网卡") : "TUN"}
               </span>
             </div>
           </div>
@@ -1939,7 +2252,8 @@ export function CapsuleWindow() {
             }`}
           >
             <span className="pointer-events-none truncate">
-              {isSingleMode ? "单节点模式" : displayGroupName} · {traffic.connections} 连接
+              {isSingleMode ? (isZh ? "单节点模式" : "Single Node") : displayGroupName} ·{" "}
+              {traffic.connections} {isZh ? "连接" : "conns"}
             </span>
             <span className="pointer-events-none inline-flex shrink-0 items-center gap-0.5 text-[9.5px] text-[var(--accent)]">
               <ThemeGlyph className="h-2.5 w-2.5" />
@@ -2037,7 +2351,7 @@ export function CapsuleWindow() {
               ? "border-[var(--green)] bg-[var(--green-soft)] text-[var(--green)]"
               : "border-[var(--line)] bg-[var(--card)] text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
           }`}
-          aria-label="切换下一个更优节点"
+          aria-label={switchHint.title}
         >
           {switching ? (
             <Loader2 className="h-3 w-3 animate-spin" />
@@ -2059,7 +2373,7 @@ export function CapsuleWindow() {
           onFocus={() => setHoveredHint(expandHint)}
           onBlur={clearHint}
           className={`inline-flex cursor-pointer items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)] ${btnDimClass}`}
-          aria-label="展开主窗口"
+          aria-label={expandHint.title}
         >
           <Maximize2 className="h-3 w-3" />
         </button>
@@ -2075,7 +2389,7 @@ export function CapsuleWindow() {
           onFocus={() => setHoveredHint(closeHint)}
           onBlur={clearHint}
           className={`inline-flex cursor-pointer items-center justify-center rounded-full border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] transition-colors hover:border-[var(--red)] hover:bg-[var(--red-soft)] hover:text-[var(--red)] ${btnDimClass}`}
-          aria-label="隐藏悬浮小窗"
+          aria-label={closeHint.title}
         >
           <X className="h-3 w-3" />
         </button>
@@ -2091,24 +2405,27 @@ export function CapsuleWindow() {
         ? `↓${formatCompactRate(peakDown).replace("/s", "")}`
         : `↑${formatCompactRate(peakUp).replace("/s", "")}`;
     }
-    if (preaccelSummary.proxyActive && preaccelSummary.enabled) return "提速中";
+    if (statusMeta.badge) return statusMeta.badge.label;
+    if (preaccelSummary.proxyActive && preaccelSummary.enabled) return dict.nav.preaccelActiveBadge;
     if (!preaccelSummary.proxyActive && preaccelSummary.realWinDivertActive) {
-      return preaccelSummary.verifyState === "probing" ? "探测中" : "全局提速";
+      return preaccelSummary.verifyState === "probing"
+        ? dict.nav.preaccelProbingBadge
+        : dict.nav.preaccelActiveBadge;
     }
     if (!preaccelSummary.proxyActive && preaccelSummary.enabled) {
       if (
         preaccelSummary.installState === "downloading" ||
         preaccelSummary.installState === "verifying"
       ) {
-        return "准备中";
+        return isZh ? "准备中" : "Setup";
       }
-      if (preaccelSummary.installState === "need_elevation") return "需提权";
-      if (preaccelSummary.verifyState === "probing") return "探测中";
-      if (preaccelSummary.verifyState === "degraded") return "已回退";
-      return "待命中";
+      if (preaccelSummary.installState === "need_elevation") return isZh ? "需提权" : "Admin";
+      if (preaccelSummary.verifyState === "probing") return dict.nav.preaccelProbingBadge;
+      if (preaccelSummary.verifyState === "degraded") return dict.nav.preaccelDegradedBadge;
+      return dict.titleBar.standby;
     }
-    if (runtime.running) return "运行中";
-    return "猫猫";
+    if (runtime.running) return isZh ? "运行中" : "Active";
+    return dict.common.appName;
   })();
 
   const collapsedDockBar = dockEdge ? (
@@ -2147,15 +2464,19 @@ export function CapsuleWindow() {
             ev.preventDefault();
             void undockCapsule(true);
           }}
-          title={`悬停或点击展开悬浮小窗 · 双击/右键或拖离边缘取消贴边（${statusMeta.label}）`}
-          aria-label={`展开悬浮小窗（${DOCK_EDGE_LABELS[dockEdge]} · ${statusMeta.label}）`}
+          title={
+            isZh
+              ? `悬停或点击展开悬浮小窗 · 双击/右键或拖离边缘取消贴边（${statusMeta.label}）`
+              : `Hover or click to expand ${dict.home.openCapsule} · Double-click/Right-click to undock (${statusMeta.label})`
+          }
+          aria-label={`${dict.home.openCapsule} (${statusMeta.label})`}
           className={`cc-capsule-shell flex h-full w-full cursor-pointer select-none items-center justify-center border text-[var(--text)] transition-colors hover:border-[var(--accent)] ${edgeRadiusClass} ${
             isHorizontalDock ? "flex-row gap-1.5 px-2.5" : "flex-col gap-1.5 py-2.5"
           }`}
         >
           <span
-            className="h-2 w-2 shrink-0 rounded-full"
-            style={{ backgroundColor: statusMeta.color }}
+            className={`relative h-2 w-2 shrink-0 rounded-full ${dotPulseClass}`}
+            style={{ backgroundColor: statusMeta.color, color: statusMeta.color }}
             aria-hidden="true"
           />
           {isHorizontalDock ? (
@@ -2198,18 +2519,18 @@ export function CapsuleWindow() {
     <div className="flex h-full w-full flex-col items-center justify-center gap-4 bg-[var(--bg)] p-6">
       <div className="text-center">
         <div className="text-xs font-semibold text-[var(--text)]">
-          悬浮小窗预览（{previewDockBox.w} × {previewDockBox.h} · {themeMeta.label}
+          {dict.home.openCapsule} ({previewDockBox.w} × {previewDockBox.h} · {themeMeta.label}
           {themeMeta.autoSuffix}
           {dockEdge
             ? ` · ${DOCK_EDGE_LABELS[dockEdge]}${dockCollapsed ? "已收起" : "展开中"}`
             : ""}
-          ）
+          )
         </div>
         <div className="mt-1 text-[11px] text-[var(--muted)]">
-          状态：{statusMeta.label} · 模式：
-          {isSingleMode ? "单节点" : `多选组（${displayGroupName}）`} · 系统代理：
-          {runtime.system_proxy_enabled ? "开" : "关"} · 虚拟网卡：
-          {runtime.tun_enabled ? "开" : "关"} · 国内提速：{preaccelSummary.badgeText}
+          {statusMeta.label} · {isSingleMode ? (isZh ? "单节点" : "Single") : displayGroupName} ·{" "}
+          {dict.home.systemProxy}: {runtime.system_proxy_enabled ? dict.common.on : dict.common.off}{" "}
+          · {dict.home.tunMode}: {runtime.tun_enabled ? dict.common.on : dict.common.off} ·{" "}
+          {dict.home.preaccel}: {preaccelSummary.enabled ? dict.common.on : dict.common.off}
         </div>
       </div>
 

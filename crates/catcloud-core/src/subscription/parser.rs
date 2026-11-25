@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -533,6 +533,410 @@ pub fn normalize_protocol(proto: &str) -> String {
         "shadowsocks" | "ss" => "ss".to_string(),
         "socks" | "socks5" => "socks5".to_string(),
         other => other.to_string(),
+    }
+}
+
+/// Compute a stable physical deduplication fingerprint for a `ProxyNode`.
+///
+/// Combines normalized `(protocol, server, port)` with core authentication and transport
+/// parameters from `raw_config` (`uuid`, `password`/`auth-str`, `username`, `token`, `cipher`,
+/// `alterId`, `tls`, `sni`/`servername`, `network`, `ws-opts`, `grpc-opts`, `h2-opts`,
+/// `http-opts`, `reality-opts`, `alpn`, `flow`, `obfs`, `obfs-password`, `plugin`,
+/// `plugin-opts`, `ports`, `congestion-controller`, `udp-relay-mode`).
+///
+/// Display metadata (`name`, `sub_id`, `tags`, `dialer-proxy`, `skip-cert-verify`, `udp`) is
+/// intentionally excluded so renamed nodes match reliably while distinct accounts sharing the
+/// same IP and port never collide.
+pub fn node_dedup_fingerprint(node: &ProxyNode) -> String {
+    let raw_obj = node.raw_config.as_object();
+
+    let raw_proto = if !node.protocol.trim().is_empty() {
+        node.protocol.as_str()
+    } else {
+        raw_obj
+            .and_then(|o| o.get("type").or_else(|| o.get("protocol")))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let protocol = normalize_protocol(raw_proto);
+
+    let raw_server = if !node.server.trim().is_empty() {
+        node.server.as_str()
+    } else {
+        raw_obj
+            .and_then(|o| o.get("server"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let server = raw_server
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+
+    let port = if node.port > 0 {
+        node.port
+    } else {
+        raw_obj
+            .and_then(|o| o.get("port"))
+            .and_then(json_to_u16)
+            .unwrap_or(0)
+    };
+
+    let mut core_fields: BTreeMap<&'static str, serde_json::Value> = BTreeMap::new();
+    if let Some(obj) = raw_obj {
+        if let Some(uuid) = non_empty_str(obj.get("uuid").or_else(|| obj.get("id"))) {
+            core_fields.insert("uuid", serde_json::Value::String(uuid.to_ascii_lowercase()));
+        }
+        if let Some(pw) = non_empty_str(
+            obj.get("password")
+                .or_else(|| obj.get("auth-str"))
+                .or_else(|| obj.get("auth_str")),
+        ) {
+            core_fields.insert("password", serde_json::Value::String(pw.to_string()));
+        }
+        if let Some(user) = non_empty_str(obj.get("username")) {
+            core_fields.insert("username", serde_json::Value::String(user.to_string()));
+        }
+        if let Some(token) = non_empty_str(obj.get("token")) {
+            core_fields.insert("token", serde_json::Value::String(token.to_string()));
+        }
+        if let Some(cipher) = non_empty_str(
+            obj.get("cipher")
+                .or_else(|| obj.get("method"))
+                .or_else(|| obj.get("security")),
+        ) {
+            core_fields.insert(
+                "cipher",
+                serde_json::Value::String(cipher.to_ascii_lowercase()),
+            );
+        }
+        if let Some(aid) = obj
+            .get("alterId")
+            .or_else(|| obj.get("alter-id"))
+            .or_else(|| obj.get("alter_id"))
+            .and_then(json_to_u64)
+            .filter(|&v| v > 0)
+        {
+            core_fields.insert("alter_id", serde_json::Value::Number(aid.into()));
+        }
+
+        let implicit_tls = matches!(
+            protocol.as_str(),
+            "trojan" | "anytls" | "hysteria2" | "hysteria" | "tuic"
+        );
+        if !implicit_tls {
+            if let Some(true) = json_bool_flexible(obj.get("tls")) {
+                core_fields.insert("tls", serde_json::Value::Bool(true));
+            }
+        }
+
+        if let Some(sni) = non_empty_str(
+            obj.get("sni")
+                .or_else(|| obj.get("servername"))
+                .or_else(|| obj.get("server_name")),
+        ) {
+            core_fields.insert("sni", serde_json::Value::String(sni.to_ascii_lowercase()));
+        }
+
+        if let Some(network) = non_empty_str(obj.get("network")) {
+            let net_lower = network.to_ascii_lowercase();
+            if net_lower != "tcp" {
+                core_fields.insert("network", serde_json::Value::String(net_lower));
+            }
+        }
+
+        if let Some(ws) = obj.get("ws-opts").and_then(canonicalize_ws_opts) {
+            core_fields.insert("ws-opts", ws);
+        }
+        if let Some(grpc) = obj.get("grpc-opts").and_then(canonicalize_grpc_opts) {
+            core_fields.insert("grpc-opts", grpc);
+        }
+        if let Some(h2) = obj.get("h2-opts").and_then(canonicalize_json_value) {
+            core_fields.insert("h2-opts", h2);
+        }
+        if let Some(http) = obj.get("http-opts").and_then(canonicalize_json_value) {
+            core_fields.insert("http-opts", http);
+        }
+        if let Some(reality) = obj.get("reality-opts").and_then(canonicalize_reality_opts) {
+            core_fields.insert("reality-opts", reality);
+        }
+        if let Some(alpn) = obj.get("alpn").and_then(canonicalize_alpn) {
+            core_fields.insert("alpn", alpn);
+        }
+        if let Some(flow) = non_empty_str(obj.get("flow")) {
+            core_fields.insert("flow", serde_json::Value::String(flow.to_ascii_lowercase()));
+        }
+        if let Some(obfs) = non_empty_str(obj.get("obfs")) {
+            core_fields.insert("obfs", serde_json::Value::String(obfs.to_ascii_lowercase()));
+        }
+        if let Some(obfs_pw) = non_empty_str(
+            obj.get("obfs-password")
+                .or_else(|| obj.get("obfs_password")),
+        ) {
+            core_fields.insert(
+                "obfs-password",
+                serde_json::Value::String(obfs_pw.to_string()),
+            );
+        }
+        if let Some(plugin) = non_empty_str(obj.get("plugin")) {
+            core_fields.insert(
+                "plugin",
+                serde_json::Value::String(plugin.to_ascii_lowercase()),
+            );
+        }
+        if let Some(plugin_opts) = obj.get("plugin-opts").and_then(canonicalize_json_value) {
+            core_fields.insert("plugin-opts", plugin_opts);
+        }
+        if let Some(ports) = non_empty_str(obj.get("ports")) {
+            core_fields.insert("ports", serde_json::Value::String(ports.to_string()));
+        }
+        if let Some(cc) = non_empty_str(
+            obj.get("congestion-controller")
+                .or_else(|| obj.get("congestion_control")),
+        ) {
+            core_fields.insert(
+                "congestion-controller",
+                serde_json::Value::String(cc.to_ascii_lowercase()),
+            );
+        }
+        if let Some(udp_mode) = non_empty_str(
+            obj.get("udp-relay-mode")
+                .or_else(|| obj.get("udp_relay_mode")),
+        ) {
+            core_fields.insert(
+                "udp-relay-mode",
+                serde_json::Value::String(udp_mode.to_ascii_lowercase()),
+            );
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"catcloud-node-fp-v1\x1f");
+    hasher.update(protocol.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(server.as_bytes());
+    hasher.update(b"\x1f");
+    hasher.update(port.to_string().as_bytes());
+    for (k, v) in core_fields {
+        hasher.update(b"\x1f");
+        hasher.update(k.as_bytes());
+        hasher.update(b"=");
+        hash_canonical_json(&mut hasher, &v);
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn canonicalize_json_value(val: &serde_json::Value) -> Option<serde_json::Value> {
+    match val {
+        serde_json::Value::Null => None,
+        serde_json::Value::Bool(b) => Some(serde_json::Value::Bool(*b)),
+        serde_json::Value::Number(n) => Some(serde_json::Value::Number(n.clone())),
+        serde_json::Value::String(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| serde_json::Value::String(trimmed.to_string()))
+        }
+        serde_json::Value::Array(arr) => {
+            let cleaned: Vec<serde_json::Value> =
+                arr.iter().filter_map(canonicalize_json_value).collect();
+            (!cleaned.is_empty()).then_some(serde_json::Value::Array(cleaned))
+        }
+        serde_json::Value::Object(map) => {
+            let mut sorted: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+            for (k, v) in map {
+                let key = k.trim();
+                if key.is_empty() {
+                    continue;
+                }
+                if let Some(cv) = canonicalize_json_value(v) {
+                    sorted.insert(key.to_string(), cv);
+                }
+            }
+            if sorted.is_empty() {
+                None
+            } else {
+                let mut out = serde_json::Map::with_capacity(sorted.len());
+                for (k, v) in sorted {
+                    out.insert(k, v);
+                }
+                Some(serde_json::Value::Object(out))
+            }
+        }
+    }
+}
+
+fn canonicalize_ws_opts(val: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = val.as_object()?;
+    let mut sorted: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (k, v) in obj {
+        let key_lower = k.trim().to_ascii_lowercase();
+        if key_lower.is_empty() {
+            continue;
+        }
+        if key_lower == "headers" {
+            if let Some(hdrs) = v.as_object() {
+                let mut norm_hdrs: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+                for (hk, hv) in hdrs {
+                    let hk_lower = hk.trim().to_ascii_lowercase();
+                    if hk_lower.is_empty() {
+                        continue;
+                    }
+                    if let Some(cv) = canonicalize_json_value(hv) {
+                        let cv = if hk_lower == "host" {
+                            match cv {
+                                serde_json::Value::String(s) => {
+                                    serde_json::Value::String(s.to_ascii_lowercase())
+                                }
+                                other => other,
+                            }
+                        } else {
+                            cv
+                        };
+                        norm_hdrs.insert(hk_lower, cv);
+                    }
+                }
+                if !norm_hdrs.is_empty() {
+                    let mut out = serde_json::Map::with_capacity(norm_hdrs.len());
+                    for (hk, hv) in norm_hdrs {
+                        out.insert(hk, hv);
+                    }
+                    sorted.insert("headers".to_string(), serde_json::Value::Object(out));
+                }
+            }
+        } else if let Some(cv) = canonicalize_json_value(v) {
+            sorted.insert(key_lower, cv);
+        }
+    }
+    if sorted.is_empty() {
+        None
+    } else {
+        let mut out = serde_json::Map::with_capacity(sorted.len());
+        for (k, v) in sorted {
+            out.insert(k, v);
+        }
+        Some(serde_json::Value::Object(out))
+    }
+}
+
+fn canonicalize_grpc_opts(val: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = val.as_object()?;
+    let mut sorted: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (k, v) in obj {
+        let key_norm = match k.trim().to_ascii_lowercase().as_str() {
+            "grpc-service-name" | "service-name" | "service_name" => {
+                "grpc-service-name".to_string()
+            }
+            "" => continue,
+            other => other.to_string(),
+        };
+        if let Some(cv) = canonicalize_json_value(v) {
+            sorted.insert(key_norm, cv);
+        }
+    }
+    if sorted.is_empty() {
+        None
+    } else {
+        let mut out = serde_json::Map::with_capacity(sorted.len());
+        for (k, v) in sorted {
+            out.insert(k, v);
+        }
+        Some(serde_json::Value::Object(out))
+    }
+}
+
+fn canonicalize_reality_opts(val: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = val.as_object()?;
+    let mut sorted: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    for (k, v) in obj {
+        let key_norm = match k.trim().to_ascii_lowercase().as_str() {
+            "public-key" | "public_key" => "public-key".to_string(),
+            "short-id" | "short_id" => "short-id".to_string(),
+            "spider-x" | "spider_x" => "spider-x".to_string(),
+            "" => continue,
+            other => other.to_string(),
+        };
+        if let Some(cv) = canonicalize_json_value(v) {
+            sorted.insert(key_norm, cv);
+        }
+    }
+    if sorted.is_empty() {
+        None
+    } else {
+        let mut out = serde_json::Map::with_capacity(sorted.len());
+        for (k, v) in sorted {
+            out.insert(k, v);
+        }
+        Some(serde_json::Value::Object(out))
+    }
+}
+
+fn canonicalize_alpn(val: &serde_json::Value) -> Option<serde_json::Value> {
+    let mut items: Vec<String> = Vec::new();
+    match val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    let t = s.trim().to_ascii_lowercase();
+                    if !t.is_empty() {
+                        items.push(t);
+                    }
+                }
+            }
+        }
+        serde_json::Value::String(s) => {
+            for part in s.split(',') {
+                let t = part.trim().to_ascii_lowercase();
+                if !t.is_empty() {
+                    items.push(t);
+                }
+            }
+        }
+        _ => {}
+    }
+    (!items.is_empty()).then(|| {
+        serde_json::Value::Array(items.into_iter().map(serde_json::Value::String).collect())
+    })
+}
+
+fn hash_canonical_json(hasher: &mut Sha256, val: &serde_json::Value) {
+    match val {
+        serde_json::Value::Null => hasher.update(b"null"),
+        serde_json::Value::Bool(b) => {
+            hasher.update(if *b { b"true".as_slice() } else { b"false".as_slice() })
+        }
+        serde_json::Value::Number(n) => hasher.update(n.to_string().as_bytes()),
+        serde_json::Value::String(s) => {
+            hasher.update(b"s:");
+            hasher.update((s.len() as u64).to_le_bytes());
+            hasher.update(b":");
+            hasher.update(s.as_bytes());
+        }
+        serde_json::Value::Array(arr) => {
+            hasher.update(b"[");
+            for (idx, item) in arr.iter().enumerate() {
+                if idx > 0 {
+                    hasher.update(b",");
+                }
+                hash_canonical_json(hasher, item);
+            }
+            hasher.update(b"]");
+        }
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            hasher.update(b"{");
+            for (idx, (k, v)) in entries.into_iter().enumerate() {
+                if idx > 0 {
+                    hasher.update(b",");
+                }
+                hasher.update((k.len() as u64).to_le_bytes());
+                hasher.update(b":");
+                hasher.update(k.as_bytes());
+                hasher.update(b"=");
+                hash_canonical_json(hasher, v);
+            }
+            hasher.update(b"}");
+        }
     }
 }
 
@@ -4191,5 +4595,127 @@ mod tests {
             let parsed = fetched.parse("sub-fb-block").expect("parse recovered payload");
             assert_eq!(parsed.nodes.len(), 1);
         }
+    }
+
+    #[test]
+    fn node_dedup_fingerprint_distinguishes_accounts_and_transport_while_ignoring_metadata() {
+        let base_a = ProxyNode {
+            id: "node_old_a".to_string(),
+            sub_id: "sub-alpha".to_string(),
+            name: "🇯🇵 东京 01".to_string(),
+            protocol: "VLESS".to_string(),
+            server: "Edge-JP.Example.Invalid".to_string(),
+            port: 443,
+            raw_config: serde_json::json!({
+                "name": "🇯🇵 东京 01",
+                "type": "vless",
+                "server": "Edge-JP.Example.Invalid",
+                "port": 443,
+                "uuid": "00000000-0000-4000-8000-000000000001",
+                "tls": true,
+                "servername": "CDN.Example.Invalid",
+                "network": "ws",
+                "ws-opts": {
+                    "path": "/stream",
+                    "headers": { "Host": "WS.Example.Invalid", "X-Tag": "1" }
+                },
+                "flow": "xtls-rprx-vision",
+                "alpn": ["h2", "http/1.1"],
+                "dialer-proxy": "private-relay-group",
+                "skip-cert-verify": false
+            }),
+            ..Default::default()
+        };
+
+        // Renamed, moved to another subscription, different key order, `sni` instead of `servername`,
+        // lowercase server/UUID, without dialer-proxy -> MUST produce identical fingerprint.
+        let renamed_same = ProxyNode {
+            id: "node_new_b".to_string(),
+            sub_id: "sub-beta".to_string(),
+            name: "Japan Tokyo Renamed 0.5x".to_string(),
+            protocol: "vless".to_string(),
+            server: "edge-jp.example.invalid".to_string(),
+            port: 443,
+            raw_config: serde_json::json!({
+                "alpn": "H2, HTTP/1.1",
+                "flow": "XTLS-RPRX-VISION",
+                "ws-opts": {
+                    "headers": { "x-tag": "1", "host": "ws.example.invalid" },
+                    "path": "/stream"
+                },
+                "network": "WS",
+                "sni": "cdn.example.invalid",
+                "tls": true,
+                "uuid": "00000000-0000-4000-8000-000000000001",
+                "port": 443,
+                "server": "edge-jp.example.invalid",
+                "type": "vless",
+                "name": "Japan Tokyo Renamed 0.5x",
+                "skip-cert-verify": true
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            node_dedup_fingerprint(&base_a),
+            node_dedup_fingerprint(&renamed_same)
+        );
+
+        // Same IP & port, different UUID (different account on shared server) -> MUST NOT collide.
+        let mut diff_account = base_a.clone();
+        diff_account.raw_config["uuid"] =
+            serde_json::json!("00000000-0000-4000-8000-000000000002");
+        assert_ne!(
+            node_dedup_fingerprint(&base_a),
+            node_dedup_fingerprint(&diff_account)
+        );
+
+        // Same IP, port, UUID, different ws-opts path -> MUST NOT collide.
+        let mut diff_ws_path = base_a.clone();
+        diff_ws_path.raw_config["ws-opts"]["path"] = serde_json::json!("/alt");
+        assert_ne!(
+            node_dedup_fingerprint(&base_a),
+            node_dedup_fingerprint(&diff_ws_path)
+        );
+
+        // Same IP, port, UUID, different reality public-key -> MUST NOT collide.
+        let mut reality_a = base_a.clone();
+        reality_a.raw_config["reality-opts"] =
+            serde_json::json!({ "public-key": "pbk-1", "short-id": "aa" });
+        let mut reality_b = base_a.clone();
+        reality_b.raw_config["reality-opts"] =
+            serde_json::json!({ "public-key": "pbk-2", "short-id": "aa" });
+        assert_ne!(
+            node_dedup_fingerprint(&reality_a),
+            node_dedup_fingerprint(&reality_b)
+        );
+
+        // Default TCP network vs explicit `"network": "tcp"` -> identical fingerprint.
+        let trojan_implicit_tcp = ProxyNode {
+            protocol: "trojan".to_string(),
+            server: "198.51.100.10".to_string(),
+            port: 443,
+            raw_config: serde_json::json!({
+                "type": "trojan",
+                "server": "198.51.100.10",
+                "port": 443,
+                "password": "placeholder-pass-a",
+                "sni": "edge.example.invalid"
+            }),
+            ..Default::default()
+        };
+        let mut trojan_explicit_tcp = trojan_implicit_tcp.clone();
+        trojan_explicit_tcp.raw_config["network"] = serde_json::json!("tcp");
+        assert_eq!(
+            node_dedup_fingerprint(&trojan_implicit_tcp),
+            node_dedup_fingerprint(&trojan_explicit_tcp)
+        );
+
+        // Same trojan IP/port with different password -> MUST NOT collide.
+        let mut trojan_diff_pw = trojan_implicit_tcp.clone();
+        trojan_diff_pw.raw_config["password"] = serde_json::json!("placeholder-pass-b");
+        assert_ne!(
+            node_dedup_fingerprint(&trojan_implicit_tcp),
+            node_dedup_fingerprint(&trojan_diff_pw)
+        );
     }
 }

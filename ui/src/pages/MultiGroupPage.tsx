@@ -7,8 +7,6 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
-  Copy,
-  FileCode2,
   Filter,
   Layers,
   Loader2,
@@ -1170,87 +1168,6 @@ function isNodeAiReady(snap: ProbeSnapshot | undefined): boolean {
   );
 }
 
-function buildMultiGroupAgentMarkdown(group: MultiGroup, meta: TriggerMeta): string {
-  const normalized = normalizeGroupForBackend(group, meta);
-  const snippet = JSON.stringify(
-    {
-      id: normalized.id,
-      name: normalized.name,
-      mode: normalized.mode,
-      independent_routing: Boolean(normalized.independent_routing),
-      match_rules: normalized.match_rules,
-      hard_gates: normalized.hard_gates,
-      trigger_rules: normalized.trigger_rules,
-      formula_expr: normalized.formula_expr,
-      fallback_policy: normalized.fallback_policy,
-      fallback_pool_id: normalized.fallback_pool_id,
-      recover_probe_interval_sec: normalized.recover_probe_interval_sec,
-      switch_mode: normalized.switch_mode,
-      cooldown_sec: normalized.cooldown_sec,
-      hysteresis_pct: normalized.hysteresis_pct,
-    },
-    null,
-    2
-  );
-
-  return [
-    `# 猫猫云梯 · 智能多选组 AI 助手协同指南（${group.name}）`,
-    "",
-    "> 按站点粘性优选、受控均衡、安全 AST 自定义加权公式与三选一兜底策略协同规范。",
-    "",
-    "## 1. 适用场景与量化触发信号",
-    "- AI / 编程客户端（OpenAI、Claude、Gemini、Windsurf）因随机切节点导致 IP 漂移风控或静默区域受限时，应启用 `sticky_best` 并开启 `google_clean == 1` 与 `keepalive_ok == 1` 硬门禁。",
-    "- 需混合多家订阅并优先消耗 0.5x/1x 低倍率节点，仅在主池全员不达标时短暂借调高优备援池，并按回切间隔自动恢复。",
-    "- 流媒体与并发下载站点可使用 `load_balance_consistent_hash` 或 `load_balance_round_robin`，所有入池节点均须先通过硬门禁过滤。",
-    "",
-    "## 2. 外部前提与安全 AST 公式规范",
-    "- 节点库至少导入 2 条可用节点，并完成一次零干扰隔离测速以生成最新 `ProbeSnapshot`。",
-    "- 加权公式由纯 AST 解释器求值（零 `eval`），可用变量：`up_mbps`, `down_mbps`, `ping_ms`, `jitter_ms`, `loss_pct`, `multiplier`, `keepalive_ok`, `google_clean`, `unlocked`, `is_443_native`, `ok`。",
-    '- 支持按探针/站点寻址：`probe_up("id")`, `probe_down("id")`, `probe_ping("id")`, `probe_ok("id")`, `site_unlocked("chatgpt")`；内置函数：`min`, `max`, `clamp`, `abs`, `if`。',
-    "- 兜底策略三选一：`degrade_best_warn` / `cross_pool_escalate` / `strict_circuit_break`。",
-    "",
-    "## 3. GUI 路径与 Headless CLI 热写入验收命令",
-    "- GUI 路径：左侧「智能多选组」→ 选择多选组 → 点击节点加入/切换 → 展开右侧「策略与标准」微调并应用。",
-    "- 查看全部策略组：`catcloud group list --json`",
-    `- 一键切换次优节点并核验连接清理：\`catcloud group switch --group ${group.id} --json\``,
-    "- 热重载生效配置：`catcloud config reload --json`",
-    "",
-    "## 4. 安全回退与排障清单",
-    `- 公式编辑异常导致 0 候选时，可一键复位为默认低倍率性价比模板：\`${FORMULA_COST_EFFECTIVE}\`。`,
-    "- 若策略组长期处于 `REJECT` 熔断态，请先核查 `hard_gates` 与最新测速快照，或临时切为 `degrade_best_warn` 保障连通。",
-    "- 若切节点后旧 HTTP/2 / gRPC 长连接仍卡住，请将该组 `switch_mode` 设为 `force_close_old`。",
-    "",
-    "## 当前策略组参考配置（已脱敏）",
-    "```json",
-    snippet,
-    "```",
-  ].join("\n");
-}
-
-async function copyToClipboard(text: string): Promise<boolean> {
-  try {
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      await navigator.clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    /* fallback below */
-  }
-  try {
-    const area = document.createElement("textarea");
-    area.value = text;
-    area.style.position = "fixed";
-    area.style.opacity = "0";
-    document.body.appendChild(area);
-    area.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(area);
-    return ok;
-  } catch {
-    return false;
-  }
-}
-
 /* ============================================================================
  * Main Component: Three-Column Human-Friendly Smart Multi-Group Workbench
  * ============================================================================ */
@@ -1357,7 +1274,6 @@ export function MultiGroupPage() {
   const [savingGroup, setSavingGroup] = useState(false);
   const [newRuleInput, setNewRuleInput] = useState("");
   const [customGateInput, setCustomGateInput] = useState("");
-  const [copiedGuide, setCopiedGuide] = useState(false);
   const [backendFormulaValidation, setBackendFormulaValidation] = useState<{
     checkedExpr: string;
     ok: boolean;
@@ -1381,13 +1297,11 @@ export function MultiGroupPage() {
   dirtyGroupIdsRef.current = dirtyGroupIds;
   const latestMembersRef = useRef<Record<string, string[]>>({});
   const memberReqSeqRef = useRef<Record<string, number>>({});
-  const copyTimerRef = useRef<number | null>(null);
   const deleteConfirmTimerRef = useRef<number | null>(null);
   const clearConfirmTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     return () => {
-      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
       if (deleteConfirmTimerRef.current !== null) window.clearTimeout(deleteConfirmTimerRef.current);
       if (clearConfirmTimerRef.current !== null) window.clearTimeout(clearConfirmTimerRef.current);
     };
@@ -2340,23 +2254,6 @@ export function MultiGroupPage() {
       }
     }
     await appActions.runEvaluateMultiGroup(selectedGroup.id);
-  };
-
-  const handleCopyAgentGuide = async () => {
-    if (!selectedGroup) return;
-    const md = buildMultiGroupAgentMarkdown(selectedGroup, currentTriggerMeta);
-    const ok = await copyToClipboard(md);
-    if (ok) {
-      setCopiedGuide(true);
-      appActions.showToast("已复制当前多选组的中文 AI 助手协同指南", "ok");
-      if (copyTimerRef.current !== null) window.clearTimeout(copyTimerRef.current);
-      copyTimerRef.current = window.setTimeout(() => {
-        setCopiedGuide(false);
-        copyTimerRef.current = null;
-      }, 2200);
-    } else {
-      appActions.showToast("复制失败，请检查剪贴板权限", "warn");
-    }
   };
 
   const handleCardKeyDown = (ev: KeyboardEvent<HTMLDivElement>, onTrigger: () => void) => {
@@ -4227,16 +4124,11 @@ export function MultiGroupPage() {
 
                       <button
                         type="button"
-                        onClick={() => void handleCopyAgentGuide()}
+                        onClick={() => appActions.openAiAssistant("multigroup")}
                         className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
                       >
-                        {copiedGuide ? (
-                          <Check className="h-3.5 w-3.5 text-[var(--green)]" />
-                        ) : (
-                          <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
-                        )}
-                        <FileCode2 className="h-3 w-3 opacity-70" />
-                        <span>{copiedGuide ? "已复制 AI 协同指南" : "复制 AI 助手协同指南"}</span>
+                        <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
+                        <span>打开 AI 助手 · 多选组指南</span>
                       </button>
                     </div>
                   </div>

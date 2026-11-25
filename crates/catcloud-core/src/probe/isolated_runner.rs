@@ -705,6 +705,248 @@ pub fn generate_preaccel_comparison_yaml(
     Ok(yaml)
 }
 
+/// Generate a strictly isolated, zero-interference Mihomo YAML configuration for real upload and
+/// download throughput measurement of one or more domestic `:443` pre-acceleration relays.
+///
+/// Enforced invariants:
+/// - Loopback-only (`127.0.0.1`), `mixed-port: 0`, `allow-lan: false`, `tun.enable: false`, `geodata-mode: false`
+/// - `dns.enhanced-mode: redir-host` with pure-IP DoH to prevent active TUN Fake-IP pollution
+/// - Every relay is compiled via `compile_relay_to_mihomo_yaml` (enforcing empty SNI on domestic `:443`)
+///   as `cc-rs-relay-{i}`
+/// - When `reference_node` is `Some(node)` and `!node.is_udp_only_transport()`, each relay gets a
+///   chained proxy `cc-rs-chain-{i}` (`dialer-proxy: cc-rs-relay-{i}`) bound to its dedicated
+///   loopback listener; otherwise the listener binds directly to `cc-rs-relay-{i}`
+/// - Prepends deduplicated anti-loop `DIRECT` rules for every relay server and `reference_node.server`
+pub fn generate_preaccel_relay_speed_yaml(
+    relays: &[PreAccelRelay],
+    reference_node: Option<&ProxyNode>,
+    relay_ports: &[(String, u16)],
+    controller_port: u16,
+    secret: &str,
+    dns_servers: &[String],
+) -> CatResult<String> {
+    if controller_port == 0 {
+        return Err(CatError::Validation(
+            "relay speed test controller_port must be non-zero".into(),
+        ));
+    }
+    if secret.trim().is_empty() {
+        return Err(CatError::Validation(
+            "relay speed test controller secret cannot be empty".into(),
+        ));
+    }
+    if relays.is_empty() {
+        return Err(CatError::Validation(
+            "relay speed test requires at least one domestic relay".into(),
+        ));
+    }
+    if relay_ports.len() != relays.len() {
+        return Err(CatError::Validation(format!(
+            "relay speed test port count ({}) must match relay count ({})",
+            relay_ports.len(),
+            relays.len()
+        )));
+    }
+
+    let mut used_ports: HashSet<u16> = HashSet::with_capacity(relays.len() + 1);
+    used_ports.insert(controller_port);
+    for (rid, port) in relay_ports {
+        if *port == 0 {
+            return Err(CatError::Validation(format!(
+                "listener port for relay `{rid}` must be non-zero"
+            )));
+        }
+        if !used_ports.insert(*port) {
+            return Err(CatError::Validation(format!(
+                "duplicate port {port} in relay speed test configuration"
+            )));
+        }
+    }
+
+    let mut resolved_ports: Vec<u16> = Vec::with_capacity(relays.len());
+    let mut consumed_port_indices: HashSet<usize> = HashSet::with_capacity(relays.len());
+    for (idx, relay) in relays.iter().enumerate() {
+        if relay.server.trim().is_empty() || relay.port == 0 {
+            return Err(CatError::Validation(format!(
+                "domestic relay `{}` must specify a valid server and port",
+                relay.id
+            )));
+        }
+        if relay_ports[idx].0 == relay.id && consumed_port_indices.insert(idx) {
+            resolved_ports.push(relay_ports[idx].1);
+        } else if let Some((found_idx, (_, port))) = relay_ports
+            .iter()
+            .enumerate()
+            .find(|(p_idx, (rid, _))| !consumed_port_indices.contains(p_idx) && rid == &relay.id)
+        {
+            consumed_port_indices.insert(found_idx);
+            resolved_ports.push(*port);
+        } else {
+            return Err(CatError::Validation(format!(
+                "missing assigned listener port for relay `{}`",
+                relay.id
+            )));
+        }
+    }
+
+    let resolved_ns = sanitize_isolated_probe_nameservers(dns_servers);
+    let ns_yaml: Vec<YamlValue> = resolved_ns.iter().cloned().map(YamlValue::from).collect();
+    let bootstrap_ns_yaml: Vec<YamlValue> = DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS
+        .iter()
+        .map(|s| YamlValue::from(*s))
+        .collect();
+
+    let mut root = Mapping::new();
+    root.insert(YamlValue::from("mixed-port"), YamlValue::from(0u16));
+    root.insert(YamlValue::from("allow-lan"), YamlValue::from(false));
+    root.insert(
+        YamlValue::from("bind-address"),
+        YamlValue::from(ISOLATED_BIND_HOST),
+    );
+    root.insert(YamlValue::from("mode"), YamlValue::from("rule"));
+    root.insert(YamlValue::from("log-level"), YamlValue::from("warning"));
+    root.insert(YamlValue::from("ipv6"), YamlValue::from(false));
+    root.insert(YamlValue::from("geodata-mode"), YamlValue::from(false));
+    root.insert(
+        YamlValue::from("external-controller"),
+        YamlValue::from(format!("{ISOLATED_BIND_HOST}:{controller_port}")),
+    );
+    root.insert(YamlValue::from("secret"), YamlValue::from(secret));
+
+    let mut profile = Mapping::new();
+    profile.insert(YamlValue::from("store-selected"), YamlValue::from(false));
+    profile.insert(YamlValue::from("store-fake-ip"), YamlValue::from(false));
+    root.insert(YamlValue::from("profile"), YamlValue::Mapping(profile));
+
+    let mut tun = Mapping::new();
+    tun.insert(YamlValue::from("enable"), YamlValue::from(false));
+    root.insert(YamlValue::from("tun"), YamlValue::Mapping(tun));
+
+    let mut dns = Mapping::new();
+    dns.insert(YamlValue::from("enable"), YamlValue::from(true));
+    dns.insert(YamlValue::from("ipv6"), YamlValue::from(false));
+    dns.insert(
+        YamlValue::from("enhanced-mode"),
+        YamlValue::from("redir-host"),
+    );
+    dns.insert(
+        YamlValue::from("default-nameserver"),
+        YamlValue::Sequence(bootstrap_ns_yaml),
+    );
+    dns.insert(
+        YamlValue::from("proxy-server-nameserver"),
+        YamlValue::Sequence(ns_yaml.clone()),
+    );
+    dns.insert(
+        YamlValue::from("nameserver"),
+        YamlValue::Sequence(ns_yaml),
+    );
+    root.insert(YamlValue::from("dns"), YamlValue::Mapping(dns));
+
+    let chain_ref_base: Option<Mapping> = reference_node
+        .filter(|node| !node.is_udp_only_transport())
+        .map(|node| -> CatResult<Mapping> {
+            let mut base = match serde_yaml_ng::to_value(&node.raw_config)? {
+                YamlValue::Mapping(map) => map,
+                _ => Mapping::new(),
+            };
+            base.remove("dialer-proxy");
+            base.remove("dialer_proxy");
+            if !base.contains_key("type") && !node.protocol.trim().is_empty() {
+                base.insert(
+                    YamlValue::from("type"),
+                    YamlValue::from(node.protocol.as_str()),
+                );
+            }
+            if !base.contains_key("server") && !node.server.trim().is_empty() {
+                base.insert(
+                    YamlValue::from("server"),
+                    YamlValue::from(node.server.as_str()),
+                );
+            }
+            if !base.contains_key("port") && node.port > 0 {
+                base.insert(YamlValue::from("port"), YamlValue::from(node.port));
+            }
+            Ok(base)
+        })
+        .transpose()?;
+
+    let mut proxies_seq: Vec<YamlValue> = Vec::with_capacity(if chain_ref_base.is_some() {
+        relays.len() * 2
+    } else {
+        relays.len()
+    });
+    let mut listeners_seq: Vec<YamlValue> = Vec::with_capacity(relays.len());
+
+    for (i, (relay, listen_port)) in relays.iter().zip(resolved_ports.into_iter()).enumerate() {
+        let relay_name = format!("cc-rs-relay-{i}");
+        let relay_yaml = compile_relay_to_mihomo_yaml(relay, &relay_name)?;
+        proxies_seq.push(relay_yaml);
+
+        let listener_proxy = if let Some(ref base_map) = chain_ref_base {
+            let chain_name = format!("cc-rs-chain-{i}");
+            let mut chain_map = base_map.clone();
+            chain_map.insert(
+                YamlValue::from("name"),
+                YamlValue::from(chain_name.as_str()),
+            );
+            chain_map.insert(
+                YamlValue::from("dialer-proxy"),
+                YamlValue::from(relay_name.as_str()),
+            );
+            proxies_seq.push(YamlValue::Mapping(chain_map));
+            chain_name
+        } else {
+            relay_name
+        };
+
+        let mut listener = Mapping::new();
+        listener.insert(
+            YamlValue::from("name"),
+            YamlValue::from(format!("cc-rs-listener-{i}")),
+        );
+        listener.insert(YamlValue::from("type"), YamlValue::from("mixed"));
+        listener.insert(YamlValue::from("port"), YamlValue::from(listen_port));
+        listener.insert(
+            YamlValue::from("listen"),
+            YamlValue::from(ISOLATED_BIND_HOST),
+        );
+        listener.insert(
+            YamlValue::from("proxy"),
+            YamlValue::from(listener_proxy.as_str()),
+        );
+        listeners_seq.push(YamlValue::Mapping(listener));
+    }
+
+    root.insert(YamlValue::from("proxies"), YamlValue::Sequence(proxies_seq));
+    root.insert(
+        YamlValue::from("listeners"),
+        YamlValue::Sequence(listeners_seq),
+    );
+
+    let mut rules_seq: Vec<YamlValue> = Vec::new();
+    let mut seen_rules: HashSet<String> = HashSet::new();
+    for relay in relays {
+        if let Some(rule) = host_to_direct_rule(&relay.server) {
+            if seen_rules.insert(rule.to_ascii_lowercase()) {
+                rules_seq.push(YamlValue::from(rule));
+            }
+        }
+    }
+    if let Some(node) = reference_node {
+        if let Some(rule) = host_to_direct_rule(&node.server) {
+            if seen_rules.insert(rule.to_ascii_lowercase()) {
+                rules_seq.push(YamlValue::from(rule));
+            }
+        }
+    }
+    rules_seq.push(YamlValue::from("MATCH,DIRECT"));
+    root.insert(YamlValue::from("rules"), YamlValue::Sequence(rules_seq));
+
+    let yaml = serde_yaml_ng::to_string(&YamlValue::Mapping(root))?;
+    Ok(yaml)
+}
+
 /// Build an isolated `reqwest::Client` that strips all system/environment proxies (`.no_proxy()`)
 /// and explicitly routes traffic through `socks5h://127.0.0.1:<proxy_port>` so DNS is always
 /// resolved remotely by the isolated probe core rather than the local host.
@@ -1209,6 +1451,169 @@ impl IsolatedProbeCore {
         Ok((core, accel_port, direct_port))
     }
 
+    /// Spawn an isolated temporary Mihomo instance wired for real upload/download speed testing
+    /// across one or more domestic `:443` pre-acceleration relays (optionally chained to a TCP
+    /// overseas `reference_node` via `dialer-proxy`).
+    /// Returns `(core, relay_ports)` where `relay_ports` maps each `relay.id` to its dedicated
+    /// `127.0.0.1` loopback mixed listener port, with full RAII process & work-dir cleanup.
+    pub async fn spawn_for_preaccel_relay_speeds(
+        mihomo_bin: &Path,
+        temp_dir: &Path,
+        job_guard: &JobGuard,
+        relays: &[PreAccelRelay],
+        reference_node: Option<&ProxyNode>,
+        dns_servers: &[String],
+        ready_timeout: Duration,
+    ) -> CatResult<(Self, Vec<(String, u16)>)> {
+        if !mihomo_bin.is_file() {
+            return Err(CatError::NotFound(format!(
+                "isolated probe mihomo binary not found: {}",
+                mihomo_bin.display()
+            )));
+        }
+        if relays.is_empty() {
+            return Err(CatError::Validation(
+                "cannot spawn relay speed probe core with an empty relay list".into(),
+            ));
+        }
+
+        let ports = allocate_ephemeral_ports(relays.len() + 1)?;
+        let controller_port = ports[0];
+        let relay_ports: Vec<(String, u16)> = relays
+            .iter()
+            .zip(ports[1..].iter().copied())
+            .map(|(relay, port)| (relay.id.clone(), port))
+            .collect();
+        let secret = generate_controller_secret();
+
+        let yaml = generate_preaccel_relay_speed_yaml(
+            relays,
+            reference_node,
+            &relay_ports,
+            controller_port,
+            &secret,
+            dns_servers,
+        )?;
+
+        let work_dir = temp_dir.join(format!("catcloud-relay-speed-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir)?;
+        let config_path = work_dir.join("isolated-relay-speed.yaml");
+        let log_path = work_dir.join("probe-core.log");
+
+        let mut cleanup_guard = SpawnCleanupGuard {
+            config_path: config_path.clone(),
+            work_dir: work_dir.clone(),
+            child: None,
+            armed: true,
+        };
+
+        std::fs::write(&config_path, yaml.as_bytes())?;
+
+        let stderr_stdio = match std::fs::File::create(&log_path) {
+            Ok(file) => Stdio::from(file),
+            Err(_) => Stdio::null(),
+        };
+
+        let probe_bin = prepare_probe_core_binary(mihomo_bin, temp_dir)?;
+        let norm_bin = crate::paths::normalize_os_path(&probe_bin);
+        let norm_work = crate::paths::normalize_os_path(&work_dir);
+        let norm_cfg = crate::paths::normalize_os_path(&config_path);
+
+        let mut cmd = Command::new(&norm_bin);
+        cmd.arg("-d")
+            .arg(&norm_work)
+            .arg("-f")
+            .arg(&norm_cfg)
+            .env("GOMEMLIMIT", ISOLATED_CORE_GOMEMLIMIT)
+            .env("GOGC", ISOLATED_CORE_GOGC)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr_stdio)
+            .kill_on_drop(true);
+        JobGuard::configure_tokio_command(&mut cmd);
+
+        let child = cmd.spawn().map_err(|err| {
+            CatError::Process(format!(
+                "failed to spawn isolated relay speed core `{}`: {err}",
+                probe_bin.display()
+            ))
+        })?;
+        cleanup_guard.child = Some(child);
+
+        if let Err(err) = job_guard.assign_tokio_child(
+            cleanup_guard
+                .child
+                .as_mut()
+                .expect("child assigned to spawn cleanup guard"),
+        ) {
+            if let Some(mut c) = cleanup_guard.child.take() {
+                let _ = c.kill().await;
+                let _ = c.wait().await;
+            }
+            remove_work_dir_async(&config_path, &work_dir).await;
+            cleanup_guard.armed = false;
+            return Err(err);
+        }
+
+        let child_pid = cleanup_guard.child.as_ref().and_then(Child::id);
+
+        if let Err(err) = wait_for_controller_ready(
+            controller_port,
+            &secret,
+            cleanup_guard
+                .child
+                .as_mut()
+                .expect("child held by spawn cleanup guard"),
+            &log_path,
+            ready_timeout,
+        )
+        .await
+        {
+            if let Some(mut c) = cleanup_guard.child.take() {
+                let _ = c.kill().await;
+                let _ = c.wait().await;
+            }
+            remove_work_dir_async(&config_path, &work_dir).await;
+            cleanup_guard.armed = false;
+            return Err(err);
+        }
+
+        let use_chain = reference_node.is_some_and(|node| !node.is_udp_only_transport());
+        let mut ordered_bindings = Vec::with_capacity(relay_ports.len());
+        let mut bindings_by_node = HashMap::with_capacity(relay_ports.len());
+        for (i, (relay_id, listen_port)) in relay_ports.iter().enumerate() {
+            let proxy_name = if use_chain {
+                format!("cc-rs-chain-{i}")
+            } else {
+                format!("cc-rs-relay-{i}")
+            };
+            let binding = NodeProbeBinding {
+                node_id: relay_id.clone(),
+                proxy_name,
+                listen_port: *listen_port,
+            };
+            bindings_by_node.insert(relay_id.clone(), binding.clone());
+            ordered_bindings.push(binding);
+        }
+
+        let child = cleanup_guard.child.take();
+        cleanup_guard.armed = false;
+
+        let core = Self {
+            child,
+            child_pid,
+            controller_port,
+            secret,
+            config_path,
+            work_dir,
+            bindings_by_node,
+            ordered_bindings,
+            cleaned_up: false,
+        };
+
+        Ok((core, relay_ports))
+    }
+
     pub fn controller_port(&self) -> u16 {
         self.controller_port
     }
@@ -1547,6 +1952,8 @@ mod tests {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         };
         let mut node = sample_node("n-overseas", "JP-8443");
         node.port = 8443;
@@ -1634,6 +2041,8 @@ mod tests {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         };
 
         // 1. Eligible non-443 TCP node -> MUST receive dialer-proxy: catcloud-probe-relay
@@ -1821,5 +2230,157 @@ mod tests {
         assert_eq!(psn_custom.len(), 2);
         assert_eq!(psn_custom[0].as_str(), Some("https://1.12.12.12/dns-query"));
         assert_eq!(psn_custom[1].as_str(), Some("tls://223.5.5.5:853"));
+    }
+
+    #[test]
+    fn preaccel_relay_speed_yaml_supports_chained_and_direct_modes() {
+        let relay_a = PreAccelRelay {
+            id: "relay-spd-a".to_string(),
+            name: "CN-GZ-443".to_string(),
+            provider: "tencent".to_string(),
+            region: "CN-GZ".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "relay-spd-password-a".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+        let relay_b = PreAccelRelay {
+            id: "relay-spd-b".to_string(),
+            name: "CN-SH-443".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN-SH".to_string(),
+            server: "198.51.100.20".to_string(),
+            port: 443,
+            protocol: "vless".to_string(),
+            password: "11111111-2222-4333-8444-555555555555".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 20,
+            expires_at: None,
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+        let relays = vec![relay_a, relay_b];
+
+        let mut ref_tcp = sample_node("n-ref-jp", "JP-Ref-Node");
+        ref_tcp.server = "ref-jp.example.invalid".to_string();
+        ref_tcp.port = 8443;
+        ref_tcp.raw_config["server"] = serde_json::json!("ref-jp.example.invalid");
+        ref_tcp.raw_config["port"] = serde_json::json!(8443);
+        ref_tcp.raw_config["dialer-proxy"] = serde_json::json!("stale-dialer");
+
+        let ports = allocate_ephemeral_ports(3).unwrap();
+        let relay_ports = vec![
+            ("relay-spd-a".to_string(), ports[1]),
+            ("relay-spd-b".to_string(), ports[2]),
+        ];
+
+        // Mode 1: Chained through a TCP reference node
+        let chained_yaml = generate_preaccel_relay_speed_yaml(
+            &relays,
+            Some(&ref_tcp),
+            &relay_ports,
+            ports[0],
+            "relay-speed-secret-0123456789",
+            &[],
+        )
+        .expect("generate chained relay speed yaml");
+
+        let parsed: YamlValue = serde_yaml_ng::from_str(&chained_yaml).expect("valid chained yaml");
+        assert_eq!(parsed["mixed-port"].as_u64(), Some(0));
+        assert_eq!(parsed["allow-lan"].as_bool(), Some(false));
+        assert_eq!(parsed["bind-address"].as_str(), Some("127.0.0.1"));
+        assert_eq!(parsed["tun"]["enable"].as_bool(), Some(false));
+        assert_eq!(parsed["dns"]["enhanced-mode"].as_str(), Some("redir-host"));
+
+        let proxies = parsed["proxies"].as_sequence().expect("proxies");
+        assert_eq!(proxies.len(), 4);
+        assert_eq!(proxies[0]["name"].as_str(), Some("cc-rs-relay-0"));
+        assert!(proxies[0].get("sni").is_none());
+        assert_eq!(proxies[1]["name"].as_str(), Some("cc-rs-chain-0"));
+        assert_eq!(proxies[1]["dialer-proxy"].as_str(), Some("cc-rs-relay-0"));
+        assert_eq!(proxies[2]["name"].as_str(), Some("cc-rs-relay-1"));
+        assert_eq!(proxies[2]["servername"].as_str(), Some(""));
+        assert_eq!(proxies[3]["name"].as_str(), Some("cc-rs-chain-1"));
+        assert_eq!(proxies[3]["dialer-proxy"].as_str(), Some("cc-rs-relay-1"));
+
+        let listeners = parsed["listeners"].as_sequence().expect("listeners");
+        assert_eq!(listeners.len(), 2);
+        assert_eq!(listeners[0]["listen"].as_str(), Some("127.0.0.1"));
+        assert_eq!(listeners[0]["port"].as_u64(), Some(u64::from(ports[1])));
+        assert_eq!(listeners[0]["proxy"].as_str(), Some("cc-rs-chain-0"));
+        assert_eq!(listeners[1]["listen"].as_str(), Some("127.0.0.1"));
+        assert_eq!(listeners[1]["port"].as_u64(), Some(u64::from(ports[2])));
+        assert_eq!(listeners[1]["proxy"].as_str(), Some("cc-rs-chain-1"));
+
+        let rules: Vec<&str> = parsed["rules"]
+            .as_sequence()
+            .expect("rules")
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .collect();
+        assert!(rules.contains(&"IP-CIDR,203.0.113.10/32,DIRECT,no-resolve"));
+        assert!(rules.contains(&"IP-CIDR,198.51.100.20/32,DIRECT,no-resolve"));
+        assert!(rules.contains(&"DOMAIN,ref-jp.example.invalid,DIRECT"));
+        assert_eq!(rules.last().copied(), Some("MATCH,DIRECT"));
+
+        // Mode 2: Direct relay mode (reference_node = None)
+        let direct_yaml = generate_preaccel_relay_speed_yaml(
+            &relays,
+            None,
+            &relay_ports,
+            ports[0],
+            "relay-speed-secret-0123456789",
+            &[],
+        )
+        .expect("generate direct relay speed yaml");
+
+        let parsed_dir: YamlValue =
+            serde_yaml_ng::from_str(&direct_yaml).expect("valid direct yaml");
+        let dir_proxies = parsed_dir["proxies"].as_sequence().expect("dir proxies");
+        assert_eq!(dir_proxies.len(), 2);
+        assert_eq!(dir_proxies[0]["name"].as_str(), Some("cc-rs-relay-0"));
+        assert!(dir_proxies[0].get("sni").is_none());
+        assert_eq!(dir_proxies[1]["name"].as_str(), Some("cc-rs-relay-1"));
+        assert_eq!(dir_proxies[1]["servername"].as_str(), Some(""));
+
+        let dir_listeners = parsed_dir["listeners"]
+            .as_sequence()
+            .expect("dir listeners");
+        assert_eq!(dir_listeners.len(), 2);
+        assert_eq!(dir_listeners[0]["proxy"].as_str(), Some("cc-rs-relay-0"));
+        assert_eq!(dir_listeners[1]["proxy"].as_str(), Some("cc-rs-relay-1"));
+        assert!(!direct_yaml.contains("cc-rs-chain-"));
+
+        // Mode 3: UDP-only reference node (e.g. hysteria2) falls back to direct relay listeners
+        let mut ref_udp = sample_node("n-ref-hy2", "JP-HY2");
+        ref_udp.protocol = "hysteria2".to_string();
+        let udp_yaml = generate_preaccel_relay_speed_yaml(
+            &relays,
+            Some(&ref_udp),
+            &relay_ports,
+            ports[0],
+            "relay-speed-secret-0123456789",
+            &[],
+        )
+        .expect("generate udp-ref relay speed yaml");
+        let parsed_udp: YamlValue = serde_yaml_ng::from_str(&udp_yaml).expect("valid udp yaml");
+        assert_eq!(parsed_udp["proxies"].as_sequence().unwrap().len(), 2);
+        assert_eq!(
+            parsed_udp["listeners"][0]["proxy"].as_str(),
+            Some("cc-rs-relay-0")
+        );
     }
 }

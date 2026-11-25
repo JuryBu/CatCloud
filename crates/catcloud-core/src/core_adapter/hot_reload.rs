@@ -1509,6 +1509,25 @@ mod tests {
             classify_config_diff(&base, &l3_mem),
             ReloadLevel::L3CoreRestart
         );
+
+        let mut l3_gogc = base.clone();
+        l3_gogc.core_runtime.gogc = 35;
+        assert_eq!(
+            classify_config_diff(&base, &l3_gogc),
+            ReloadLevel::L3CoreRestart
+        );
+
+        let mut l2_skip443 = base.clone();
+        l2_skip443.preaccel.skip_443_native = !base.preaccel.skip_443_native;
+        assert_eq!(
+            classify_config_diff(&base, &l2_skip443),
+            ReloadLevel::L2HotReload
+        );
+
+        let mut l1_lang = base.clone();
+        l1_lang.personalization.language = "en".to_string();
+        assert_eq!(classify_config_diff(&base, &l1_lang), ReloadLevel::L1Rest);
+        assert!(!has_core_config_changes(&base, &l1_lang));
     }
 
     #[tokio::test]

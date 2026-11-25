@@ -1,4 +1,5 @@
 import {
+  Bot,
   Check,
   ChevronDown,
   Globe,
@@ -21,8 +22,10 @@ import {
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { normalizeUiLanguage, useUiDict } from "../i18n";
 import {
   BUILTIN_WALLPAPER_PRESETS,
+  type MascotState,
   type NavRouteId,
   type ProxyMode,
   type ResolvedTheme,
@@ -38,20 +41,25 @@ import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelS
 
 export interface NavItemSpec {
   id: NavRouteId;
+  section: "network" | "assist";
   label: string;
   shortDesc: string;
   icon: LucideIcon;
 }
 
 export const NAV_ITEMS: readonly NavItemSpec[] = [
-  { id: "overview", label: "总览", shortDesc: "代理开关与实时状态", icon: LayoutDashboard },
-  { id: "groups", label: "智能多选组", shortDesc: "路线分组与自动优选", icon: Layers },
-  { id: "nodes", label: "节点与测速", shortDesc: "节点管理、订阅导入与测速", icon: Globe },
-  { id: "preaccel", label: "国内提速", shortDesc: "国内中转与稳连加速", icon: Zap },
-  { id: "rules", label: "分流与连接", shortDesc: "网站分流与当前连接", icon: Network },
-  { id: "logs", label: "运行日志", shortDesc: "查看内核运行记录", icon: ScrollText },
-  { id: "settings", label: "设置", shortDesc: "外观、启动与偏好", icon: SlidersHorizontal },
+  { id: "overview", section: "network", label: "总览", shortDesc: "代理开关与实时状态", icon: LayoutDashboard },
+  { id: "groups", section: "network", label: "智能多选组", shortDesc: "路线分组与自动优选", icon: Layers },
+  { id: "nodes", section: "network", label: "节点与测速", shortDesc: "节点管理、订阅导入与测速", icon: Globe },
+  { id: "preaccel", section: "network", label: "国内提速", shortDesc: "国内中转与稳连加速", icon: Zap },
+  { id: "rules", section: "network", label: "分流与连接", shortDesc: "网站分流与当前连接", icon: Network },
+  { id: "logs", section: "network", label: "运行日志", shortDesc: "查看内核运行记录", icon: ScrollText },
+  { id: "ai", section: "assist", label: "AI 助手", shortDesc: "小白上手、排障与 Agent 代配", icon: Bot },
+  { id: "settings", section: "assist", label: "设置", shortDesc: "外观、启动与偏好", icon: SlidersHorizontal },
 ] as const;
+
+const NETWORK_NAV_ITEMS = NAV_ITEMS.filter((item) => item.section === "network");
+const ASSIST_NAV_ITEMS = NAV_ITEMS.filter((item) => item.section === "assist");
 
 const THEME_BUTTON_LABELS: Record<ThemeMode, string> = {
   auto_time: "自动",
@@ -156,6 +164,14 @@ export function Sidebar() {
   const activeNav = useAppSelector((s) => s.activeNav);
   const themeMode = useAppSelector((s) => s.config.personalization.theme_mode);
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
+  const animationsEnabled = useAppSelector((s) => s.config.personalization.animations_enabled);
+  const mascotEnabled = useAppSelector((s) => s.config.personalization.mascot_enabled);
+  const uiLang = normalizeUiLanguage(
+    useAppSelector((s) => s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
+  const isZh = uiLang === "zh-CN";
+  const mascotState = useAppSelector((s) => s.mascotState);
   const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const runtime = useAppSelector((s) => s.runtime);
@@ -173,41 +189,78 @@ export function Sidebar() {
   const tunAdminPromptReason = useAppSelector((s) => s.tunAdminPromptReason);
 
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
-  const [copyingAiGuide, setCopyingAiGuide] = useState(false);
-  const [copiedAiGuide, setCopiedAiGuide] = useState(false);
+  const [localPetting, setLocalPetting] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
-  const aiGuideTimerRef = useRef<number | null>(null);
+  const petTimerRef = useRef<number | null>(null);
   const platformOs = resolvePlatformOs(runtime.os_label);
   const preaccelSummary = resolvePreAccelSummary(
     runtime,
     globalPreAccel,
     preAccelEnabledConfig
   );
+
+  useEffect(() => {
+    return () => {
+      if (petTimerRef.current !== null) {
+        window.clearTimeout(petTimerRef.current);
+        petTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const effectiveBrandMascotState: MascotState = !mascotEnabled
+    ? "idle"
+    : runtime.status === "error" ||
+        runtime.captive_portal_required ||
+        runtime.active_group_circuit_open
+      ? "approval"
+      : isProbeRunning || runtime.probing_active
+        ? "searching"
+        : runtime.switching_active
+          ? "thinking"
+          : localPetting
+            ? preaccelSummary.enabled
+              ? "complete"
+              : "thinking"
+            : mascotState;
+  const brandMascotScale = effectiveBrandMascotState === "idle" ? 2 : 1;
+  const brandMascotStatusText =
+    effectiveBrandMascotState !== "idle"
+      ? dict.mascot[effectiveBrandMascotState]
+      : preaccelSummary.proxyActive
+        ? preaccelSummary.enabled
+          ? dict.mascot.preaccel
+          : dict.mascot.ok
+        : preaccelSummary.realWinDivertActive
+          ? dict.mascot.preaccel
+          : dict.mascot.idle;
+  const brandMascotTitle = `${dict.common.appName} · ${brandMascotStatusText}`;
+
   const preaccelNavBadge = (() => {
     if (!preaccelSummary.enabled && !preaccelSummary.realWinDivertActive) {
       return null;
     }
     if (preaccelSummary.proxyActive) {
       return {
-        label: "提速中",
+        label: dict.nav.preaccelActiveBadge,
         cls: "bg-[var(--accent-soft)] text-[var(--accent)]",
       };
     }
     if (preaccelSummary.realWinDivertActive) {
       if (preaccelSummary.verifyState === "probing") {
         return {
-          label: "探测中",
+          label: dict.nav.preaccelProbingBadge,
           cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
         };
       }
       if (preaccelSummary.verifyState === "verified") {
         return {
-          label: "已畅通",
+          label: dict.nav.preaccelVerifiedBadge,
           cls: "bg-[var(--green-soft)] text-[var(--green)]",
         };
       }
       return {
-        label: "全局提速",
+        label: dict.nav.preaccelActiveBadge,
         cls: "bg-[var(--accent-soft)] text-[var(--accent)]",
       };
     }
@@ -216,30 +269,30 @@ export function Sidebar() {
       preaccelSummary.installState === "verifying"
     ) {
       return {
-        label: "准备中",
+        label: isZh ? "准备中" : dict.common.loading,
         cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
       };
     }
     if (preaccelSummary.installState === "need_elevation") {
       return {
-        label: "需提权",
+        label: isZh ? "需提权" : dict.mascot.approval,
         cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
       };
     }
     if (preaccelSummary.verifyState === "probing") {
       return {
-        label: "探测中",
+        label: dict.nav.preaccelProbingBadge,
         cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
       };
     }
     if (preaccelSummary.verifyState === "degraded") {
       return {
-        label: "已回退",
+        label: dict.nav.preaccelDegradedBadge,
         cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
       };
     }
     return {
-      label: "待命",
+      label: dict.titleBar.standby,
       cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
     };
   })();
@@ -340,56 +393,203 @@ export function Sidebar() {
     );
   };
 
-  useEffect(() => {
-    return () => {
-      if (aiGuideTimerRef.current !== null) {
-        window.clearTimeout(aiGuideTimerRef.current);
-        aiGuideTimerRef.current = null;
-      }
-    };
-  }, []);
-
-  const handleCopyAiOnboarding = async () => {
-    if (copyingAiGuide) return;
-    setCopyingAiGuide(true);
-    try {
-      const ok = await appActions.copyAiOnboardingForUser();
-      if (ok) {
-        setCopiedAiGuide(true);
-        if (aiGuideTimerRef.current !== null) {
-          window.clearTimeout(aiGuideTimerRef.current);
-        }
-        aiGuideTimerRef.current = window.setTimeout(() => {
-          setCopiedAiGuide(false);
-          aiGuideTimerRef.current = null;
-        }, 2200);
-      }
-    } finally {
-      setCopyingAiGuide(false);
-    }
-  };
-
   const handleOpenAppearanceSettings = () => {
     setThemeMenuOpen(false);
     appActions.openSettingsTab("appearance");
   };
 
+  const resolveNavLabel = (id: NavRouteId): string => {
+    switch (id) {
+      case "overview":
+        return dict.nav.overview;
+      case "groups":
+        return dict.nav.groups;
+      case "speedtest":
+      case "nodes":
+        return dict.nav.nodes;
+      case "preaccel":
+        return dict.nav.preaccel;
+      case "rules":
+        return dict.nav.rules;
+      case "logs":
+        return dict.nav.logs;
+      case "ai":
+        return dict.nav.ai;
+      case "settings":
+        return dict.nav.settings;
+    }
+  };
+
+  const handleToggleBrandMascot = () => {
+    if (!mascotEnabled) return;
+    if (petTimerRef.current !== null) {
+      window.clearTimeout(petTimerRef.current);
+      petTimerRef.current = null;
+    }
+    if (localPetting) {
+      setLocalPetting(false);
+      return;
+    }
+    setLocalPetting(true);
+    petTimerRef.current = window.setTimeout(() => {
+      setLocalPetting(false);
+      petTimerRef.current = null;
+    }, 2500);
+  };
+
+  const renderNavButton = (item: NavItemSpec) => {
+    const Icon = item.icon;
+    const isActive =
+      activeNav === item.id || (item.id === "nodes" && activeNav === "speedtest");
+    const hasBgTask =
+      item.id === "overview"
+        ? bgHome
+        : item.id === "groups"
+          ? bgGroups
+          : item.id === "nodes"
+            ? bgNodes
+            : item.id === "preaccel"
+              ? bgPreaccel
+              : item.id === "settings"
+                ? bgSettings
+                : false;
+    const hasDirtyDraft =
+      item.id === "groups"
+        ? multiGroupHasDirty
+        : item.id === "settings"
+          ? settingsHasDirty
+          : false;
+    const showBgDot =
+      !isActive && hasBgTask && !(item.id === "nodes" && isProbeRunning);
+    const showDirtyDot = !isActive && !showBgDot && hasDirtyDraft;
+    const bgDotTitle =
+      item.id === "overview"
+        ? "后台正在检测网站连通或出口信息，切回即可查看"
+        : item.id === "groups"
+          ? hasDirtyDraft
+            ? "后台正在测速或评估多选组（另有未应用的策略改动），切回即可查看"
+            : "后台正在测速或评估多选组，切回即可查看"
+          : item.id === "nodes"
+            ? "后台正在刷新订阅、测速或捕捉节点，切回即可查看"
+            : item.id === "preaccel"
+              ? "后台正在探测链路、运行提速对比、线路测速或准备组件，切回即可查看"
+              : hasDirtyDraft
+                ? "后台正在更新地理库、检查更新或执行维护任务（另有未保存更改），切回即可查看"
+                : "后台正在更新地理库、检查更新或执行维护任务，切回即可查看";
+    const dirtyDotTitle =
+      item.id === "groups"
+        ? "有未应用的策略改动，切回可继续编辑"
+        : "有未保存的设置更改，切回可继续保存";
+    const hasRightIndicator =
+      (item.id === "nodes" && isProbeRunning) ||
+      (item.id === "preaccel" && Boolean(preaccelNavBadge)) ||
+      (item.id === "overview" && runtime.captive_portal_required) ||
+      showBgDot ||
+      showDirtyDot;
+
+    return (
+      <button
+        key={item.id}
+        type="button"
+        onClick={() => appActions.setNav(item.id)}
+        aria-current={isActive ? "page" : undefined}
+        className={`group relative flex w-full items-center gap-2.5 rounded-xl px-2.5 py-[7px] text-left text-[13px] transition-colors ${
+          isActive
+            ? "bg-[var(--accent-soft)] font-semibold text-[var(--text)]"
+            : "text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--text)]"
+        }`}
+      >
+        {isActive && (
+          <span
+            className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-[var(--accent)]"
+            aria-hidden="true"
+          />
+        )}
+        <Icon
+          className={`h-4 w-4 shrink-0 transition-colors ${
+            isActive
+              ? "text-[var(--accent)]"
+              : item.id === "ai"
+                ? "text-[var(--accent)]/80 group-hover:text-[var(--accent)]"
+                : "text-[var(--muted)] group-hover:text-[var(--text)]"
+          }`}
+        />
+        <span className="truncate">{resolveNavLabel(item.id)}</span>
+
+        {hasRightIndicator && (
+          <span className="ml-auto flex shrink-0 items-center gap-1.5">
+            {item.id === "nodes" && isProbeRunning && (
+              <span className="shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                {isZh ? "测速中" : dict.nav.preaccelProbingBadge}
+              </span>
+            )}
+            {item.id === "preaccel" && preaccelNavBadge && (
+              <span
+                title={preaccelSummary.detailText}
+                className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${preaccelNavBadge.cls}`}
+              >
+                {preaccelNavBadge.label}
+              </span>
+            )}
+            {item.id === "overview" && runtime.captive_portal_required && (
+              <span
+                className="h-2 w-2 rounded-full bg-[var(--red)]"
+                title="校园网待认证"
+              />
+            )}
+            {showBgDot && (
+              <span
+                className="h-1.5 w-1.5 rounded-full bg-[var(--amber)] ring-2 ring-[var(--amber-soft)]"
+                title={bgDotTitle}
+                aria-label={bgDotTitle}
+              />
+            )}
+            {showDirtyDot && (
+              <span
+                className="h-1.5 w-1.5 rounded-full bg-[var(--muted)]/75"
+                title={dirtyDotTitle}
+                aria-label={dirtyDotTitle}
+              />
+            )}
+          </span>
+        )}
+      </button>
+    );
+  };
+
+  const proxyModeOptions: ReadonlyArray<{ id: ProxyMode; label: string; hint: string }> = [
+    { id: "rule", label: dict.home.ruleMode, hint: PROXY_MODES[0].hint },
+    { id: "global", label: dict.home.globalMode, hint: PROXY_MODES[1].hint },
+    { id: "direct", label: dict.home.directMode, hint: PROXY_MODES[2].hint },
+  ];
+
   return (
-    <aside className="cc-surface cc-glass relative z-20 flex h-full w-[236px] shrink-0 flex-col border-r border-[var(--line)] px-3 pb-3 pt-2.5">
-      {/* Brand header with animated cream-cat MascotSprite & theme/wallpaper popover */}
-      <div className="mb-2.5 flex items-center justify-between gap-1.5 px-0.5">
+    <aside className="cc-surface cc-glass relative z-20 flex h-full w-[236px] shrink-0 flex-col border-r border-[var(--line)] px-3 pb-2.5 pt-2">
+      {/* Brand header with reactive cream-cat MascotSprite & theme/wallpaper popover */}
+      <div className="mb-2 flex items-center justify-between gap-1.5 px-0.5">
         <div className="flex min-w-0 items-center gap-1.5">
-          <div className="relative flex h-10 w-[62px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)] px-0.5">
-            <MascotSprite state="idle" scale={2} title="猫猫云梯 · 奶油猫饼" />
+          <button
+            type="button"
+            onClick={handleToggleBrandMascot}
+            title={brandMascotTitle}
+            aria-label={brandMascotTitle}
+            className="relative flex h-10 w-[62px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)] px-0.5 transition-colors hover:border-[var(--line-strong)]"
+          >
+            <MascotSprite
+              state={effectiveBrandMascotState}
+              scale={brandMascotScale}
+              animationsEnabled={animationsEnabled && mascotEnabled}
+              title={brandMascotTitle}
+            />
             <span
               className="cc-pulse-dot absolute -right-0.5 -top-0.5 h-2.5 w-2.5 rounded-full border-2 border-[var(--surface)]"
               style={{ backgroundColor: statusColor }}
               title={statusLabel}
             />
-          </div>
+          </button>
           <div className="min-w-0">
             <div className="truncate text-[14px] font-semibold tracking-tight text-[var(--text)]">
-              猫猫云梯
+              {dict.common.appName}
             </div>
             <div className="flex items-center gap-1 whitespace-nowrap text-[10px] text-[var(--muted)]">
               <span className="cc-mono">v{runtime.app_version}</span>
@@ -538,188 +738,52 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Unified 7-item primary navigation */}
-      <nav className="flex-1 space-y-0.5 overflow-y-auto pr-0.5" aria-label="主导航">
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const isActive =
-            activeNav === item.id || (item.id === "nodes" && activeNav === "speedtest");
-          const hasBgTask =
-            item.id === "overview"
-              ? bgHome
-              : item.id === "groups"
-                ? bgGroups
-                : item.id === "nodes"
-                  ? bgNodes
-                  : item.id === "preaccel"
-                    ? bgPreaccel
-                    : item.id === "settings"
-                      ? bgSettings
-                      : false;
-          const hasDirtyDraft =
-            item.id === "groups"
-              ? multiGroupHasDirty
-              : item.id === "settings"
-                ? settingsHasDirty
-                : false;
-          const showBgDot =
-            !isActive && hasBgTask && !(item.id === "nodes" && isProbeRunning);
-          const showDirtyDot = !isActive && !showBgDot && hasDirtyDraft;
-          const bgDotTitle =
-            item.id === "overview"
-              ? "后台正在检测网站连通或出口信息，切回即可查看"
-              : item.id === "groups"
-                ? hasDirtyDraft
-                  ? "后台正在测速或评估多选组（另有未应用的策略改动），切回即可查看"
-                  : "后台正在测速或评估多选组，切回即可查看"
-                : item.id === "nodes"
-                  ? "后台正在刷新订阅、测速或捕捉节点，切回即可查看"
-                  : item.id === "preaccel"
-                    ? "后台正在探测链路、运行提速对比、线路测速或准备组件，切回即可查看"
-                    : hasDirtyDraft
-                      ? "后台正在更新地理库、检查更新或执行维护任务（另有未保存更改），切回即可查看"
-                      : "后台正在更新地理库、检查更新或执行维护任务，切回即可查看";
-          const dirtyDotTitle =
-            item.id === "groups"
-              ? "有未应用的策略改动，切回可继续编辑"
-              : "有未保存的设置更改，切回可继续保存";
-          const hasRightIndicator =
-            (item.id === "nodes" && isProbeRunning) ||
-            (item.id === "preaccel" && Boolean(preaccelNavBadge)) ||
-            (item.id === "overview" && runtime.captive_portal_required) ||
-            showBgDot ||
-            showDirtyDot;
+      {/* Grouped 8-item primary navigation (6 Network + subtle divider + 2 Assist & Config) */}
+      <nav className="flex-1 overflow-y-auto pr-0.5" aria-label={dict.nav.sectionNetwork}>
+        <div className="mb-1 px-2.5 text-[10px] font-medium tracking-wide text-[var(--muted)]/85">
+          {dict.nav.sectionNetwork}
+        </div>
+        <div className="space-y-0.5">
+          {NETWORK_NAV_ITEMS.map((item) => renderNavButton(item))}
+        </div>
 
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => appActions.setNav(item.id)}
-              aria-current={isActive ? "page" : undefined}
-              className={`group relative flex w-full items-center gap-2.5 rounded-xl px-2.5 py-2 text-left text-[13px] transition-colors ${
-                isActive
-                  ? "bg-[var(--accent-soft)] font-semibold text-[var(--text)]"
-                  : "text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--text)]"
-              }`}
-            >
-              {isActive && (
-                <span
-                  className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-[var(--accent)]"
-                  aria-hidden="true"
-                />
-              )}
-              <Icon
-                className={`h-4 w-4 shrink-0 transition-colors ${
-                  isActive
-                    ? "text-[var(--accent)]"
-                    : "text-[var(--muted)] group-hover:text-[var(--text)]"
-                }`}
-              />
-              <span className="truncate">{item.label}</span>
+        <div className="my-2 border-t border-[var(--line)]/65" role="separator" />
 
-              {hasRightIndicator && (
-                <span className="ml-auto flex shrink-0 items-center gap-1.5">
-                  {item.id === "nodes" && isProbeRunning && (
-                    <span className="shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
-                      测速中
-                    </span>
-                  )}
-                  {item.id === "preaccel" && preaccelNavBadge && (
-                    <span
-                      title={preaccelSummary.detailText}
-                      className={`shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${preaccelNavBadge.cls}`}
-                    >
-                      {preaccelNavBadge.label}
-                    </span>
-                  )}
-                  {item.id === "overview" && runtime.captive_portal_required && (
-                    <span
-                      className="h-2 w-2 rounded-full bg-[var(--red)]"
-                      title="校园网待认证"
-                    />
-                  )}
-                  {showBgDot && (
-                    <span
-                      className="h-1.5 w-1.5 rounded-full bg-[var(--amber)] ring-2 ring-[var(--amber-soft)]"
-                      title={bgDotTitle}
-                      aria-label={bgDotTitle}
-                    />
-                  )}
-                  {showDirtyDot && (
-                    <span
-                      className="h-1.5 w-1.5 rounded-full bg-[var(--muted)]/75"
-                      title={dirtyDotTitle}
-                      aria-label={dirtyDotTitle}
-                    />
-                  )}
-                </span>
-              )}
-            </button>
-          );
-        })}
+        <div className="mb-1 px-2.5 text-[10px] font-medium tracking-wide text-[var(--muted)]/85">
+          {dict.nav.sectionAssist}
+        </div>
+        <div className="space-y-0.5">
+          {ASSIST_NAV_ITEMS.map((item) => renderNavButton(item))}
+        </div>
       </nav>
-
-      {/* Persistent AI Onboarding Guide Button (Always visible across every page) */}
-      <div className="mt-2 border-t border-[var(--line)] pt-2">
-        <button
-          type="button"
-          disabled={copyingAiGuide}
-          onClick={() => void handleCopyAiOnboarding()}
-          title="复制「AI 新手上手指南 + 当前进度」，直接粘贴给任意 AI（如 ChatGPT / 豆包 / DeepSeek）就能一步步带你用猫猫云梯"
-          aria-label="复制 AI 新手上手指南与当前进度"
-          className={`group flex w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-2 text-left text-xs font-semibold transition-colors disabled:opacity-65 ${
-            copiedAiGuide
-              ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
-              : "border-[var(--accent)]/45 bg-[var(--accent-soft)]/80 text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
-          }`}
-        >
-          <span className="inline-flex min-w-0 items-center gap-1.5 truncate">
-            {copiedAiGuide ? (
-              <Check className="h-3.5 w-3.5 shrink-0" />
-            ) : copyingAiGuide ? (
-              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
-            ) : null}
-            <span className="truncate">
-              {copiedAiGuide
-                ? "已复制，粘给 AI 即可"
-                : copyingAiGuide
-                  ? "正在生成指南…"
-                  : "🤖 AI 带我上手"}
-            </span>
-          </span>
-          {!copiedAiGuide && !copyingAiGuide && (
-            <span className="shrink-0 rounded-md bg-[var(--surface)]/85 px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)] group-hover:text-[var(--accent)]">
-              复制
-            </span>
-          )}
-        </button>
-      </div>
 
       {/* Bottom compact control console: hidden on overview page to avoid duplicating Hero controls & sparkline */}
       {activeNav === "overview" ? (
-        <div className="mt-2 border-t border-[var(--line)] pt-2">
-          <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)]/80 bg-[var(--card)]/75 px-2.5 py-2 text-[11px] text-[var(--text-secondary)]">
+        <div className="mt-1.5 border-t border-[var(--line)] pt-1.5">
+          <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)]/80 bg-[var(--card)]/75 px-2.5 py-1.5 text-[11px] text-[var(--text-secondary)]">
             <span className="inline-flex min-w-0 items-center gap-1.5">
               <span
                 className="h-2 w-2 shrink-0 rounded-full"
                 style={{ backgroundColor: statusColor }}
                 aria-hidden="true"
               />
-              <span className="truncate">当前正在总览页管理</span>
+              <span className="truncate">
+                {isZh ? "当前正在总览页管理" : dict.nav.overview}
+              </span>
             </span>
             <button
               type="button"
               onClick={() => void appActions.toggleCapsule()}
               className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--surface)] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--accent)]"
-              title="打开悬浮小窗"
-              aria-label="打开悬浮小窗"
+              title={dict.home.openCapsule}
+              aria-label={dict.home.openCapsule}
             >
               <PictureInPicture2 className="h-3.5 w-3.5" />
             </button>
           </div>
         </div>
       ) : (
-        <div className="mt-2 space-y-2 border-t border-[var(--line)] pt-2">
+        <div className="mt-1.5 space-y-1.5 border-t border-[var(--line)] pt-1.5">
           <TrafficSparkline variant="mini" />
 
           {/* System Proxy / Virtual Network Card Quick Capsules */}
@@ -732,11 +796,11 @@ export function Sidebar() {
                   ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
                   : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
-              title="点击开关系统代理"
+              title={dict.home.systemProxy}
             >
               <span className="inline-flex items-center gap-1 truncate">
                 <Wifi className="h-3 w-3 shrink-0" />
-                系统代理
+                {dict.home.systemProxy}
               </span>
               <span
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${
@@ -755,13 +819,13 @@ export function Sidebar() {
               }`}
               title={
                 runtime.tun_admin_ready
-                  ? "点击开关虚拟网卡（接管电脑全部软件）"
+                  ? dict.home.tunMode
                   : tunElevationCopy.buttonHint
               }
             >
               <span className="inline-flex items-center gap-1 truncate">
                 <ShieldCheck className="h-3 w-3 shrink-0" />
-                虚拟网卡
+                {dict.home.tunMode}
               </span>
               <span
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${
@@ -778,7 +842,7 @@ export function Sidebar() {
               role="group"
               aria-label="快捷切换代理模式"
             >
-              {PROXY_MODES.map((m) => {
+              {proxyModeOptions.map((m) => {
                 const selected = runtime.proxy_mode === m.id;
                 return (
                   <button
@@ -802,8 +866,8 @@ export function Sidebar() {
               type="button"
               onClick={() => void appActions.toggleCapsule()}
               className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--accent)]"
-              title="打开悬浮小窗"
-              aria-label="打开悬浮小窗"
+              title={dict.home.openCapsule}
+              aria-label={dict.home.openCapsule}
             >
               <PictureInPicture2 className="h-3.5 w-3.5" />
             </button>

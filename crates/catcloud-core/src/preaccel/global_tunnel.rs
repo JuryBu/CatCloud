@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener as StdTcp
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -116,6 +116,262 @@ pub const STANDALONE_TUNNEL_GOMEMLIMIT: &str = "24MiB";
 /// Dedicated GC target for the lightweight standalone 443 tunnel subprocess.
 pub const STANDALONE_TUNNEL_GOGC: &str = "25";
 
+/// Well-known non-proxy communication, browser, IDE, office, media, and cloud-drive
+/// executable stems excluded from automatic local proxy listener heuristics.
+///
+/// Intentionally never excludes CLI transfer tools (`ssh.exe`, `git.exe`, `scp.exe`, `rsync.exe`)
+/// or user-configured manual target process lists.
+const NON_PROXY_COMMUNICATION_PROCESS_STEMS: &[&str] = &[
+    // Domestic IM & collaboration
+    "qq",
+    "qqnt",
+    "qqprotect",
+    "qqprotectupd",
+    "qqexternal",
+    "txupd",
+    "txplatform",
+    "tim",
+    "wechat",
+    "weixin",
+    "wechatapp",
+    "wechatappex",
+    "wechatocr",
+    "wechatplayer",
+    "wechatutility",
+    "dingtalk",
+    "feishu",
+    "lark",
+    "wxwork",
+    "wxworkweb",
+    "qywx",
+    "wemeetapp",
+    "tencentmeeting",
+    "aliwangwang",
+    "wwbizsrv",
+    "yy",
+    "foxmail",
+    "telegram",
+    "discord",
+    "slack",
+    "teams",
+    "ms-teams",
+    "zoom",
+    // Browsers & webviews
+    "chrome",
+    "msedge",
+    "msedgewebview2",
+    "firefox",
+    "opera",
+    "brave",
+    "vivaldi",
+    "safari",
+    "360chrome",
+    "360se",
+    "qqbrowser",
+    "quark",
+    // IDEs & editors (never ssh/git)
+    "code",
+    "code-insiders",
+    "cursor",
+    "windsurf",
+    "idea64",
+    "pycharm64",
+    "clion64",
+    "goland64",
+    "webstorm64",
+    "devenv",
+    // Gaming, music, media, netdisk & office
+    "steam",
+    "steamwebhelper",
+    "steamservice",
+    "epicgameslauncher",
+    "wegame",
+    "cloudmusic",
+    "qqmusic",
+    "kugou",
+    "kuwo",
+    "spotify",
+    "baidunetdisk",
+    "baidunetdiskhost",
+    "aliyundrive",
+    "quarkclouddrive",
+    "thunder",
+    "wps",
+    "wpscloudsvr",
+    "wpsoffice",
+    "winword",
+    "excel",
+    "powerpnt",
+    "outlook",
+    "onenote",
+    "obs64",
+    "bilibili",
+    "potplayer64",
+    "potplayermini64",
+    "vlc",
+];
+
+/// Thirteen whitelisted domestic public DNS IPv4 endpoints unconditionally bypassed at the
+/// WinDivert kernel filter layer so DoT/DoH/TCP DNS queries never detour through relays.
+pub const DOMESTIC_PUBLIC_DNS_IPV4S: &[Ipv4Addr] = &[
+    Ipv4Addr::new(1, 2, 4, 8),
+    Ipv4Addr::new(1, 12, 12, 12),
+    Ipv4Addr::new(114, 114, 114, 114),
+    Ipv4Addr::new(114, 114, 115, 115),
+    Ipv4Addr::new(119, 28, 28, 28),
+    Ipv4Addr::new(119, 29, 29, 29),
+    Ipv4Addr::new(120, 53, 53, 53),
+    Ipv4Addr::new(180, 76, 76, 76),
+    Ipv4Addr::new(180, 184, 1, 1),
+    Ipv4Addr::new(180, 184, 2, 2),
+    Ipv4Addr::new(210, 2, 4, 8),
+    Ipv4Addr::new(223, 5, 5, 5),
+    Ipv4Addr::new(223, 6, 6, 6),
+];
+
+/// Compact, strictly sorted, non-overlapping inclusive IPv4 ranges `(start, end)` in host-order
+/// `u32` hex covering major China Mainland ISP, cloud, and academic networks (China Telecom,
+/// China Unicom, China Mobile, Alibaba Cloud CN, Tencent Cloud CN, Huawei Cloud CN, Baidu Cloud,
+/// ByteDance/Volcengine, CERNET, CSTNET, and CNNIC).
+///
+/// Overseas cloud regions and RFC 1918/5737/Fake-IP spaces are strictly excluded.
+const CN_IPV4_RANGES: &[(u32, u32)] = &[
+    (0x0100_0100, 0x0100_03FF), (0x0100_0800, 0x0100_0FFF),
+    (0x0100_2000, 0x0100_3FFF), (0x0101_0000, 0x0101_00FF),
+    (0x0101_0200, 0x0101_3FFF), (0x0102_0000, 0x0102_02FF),
+    (0x0102_0400, 0x0102_7FFF), (0x0104_0100, 0x0104_7FFF),
+    (0x0108_0000, 0x0108_FFFF), (0x010C_0000, 0x010F_FFFF),
+    (0x0118_0000, 0x011F_FFFF), (0x012D_0000, 0x012D_FFFF),
+    (0x0130_0000, 0x0133_FFFF), (0x0138_0000, 0x013F_FFFF),
+    (0x0144_0000, 0x0147_FFFF), (0x0150_0000, 0x015F_FFFF),
+    (0x0174_0000, 0x0177_FFFF), (0x01B4_0000, 0x01B9_FFFF),
+    (0x01BC_0000, 0x01C7_FFFF), (0x01CA_0000, 0x01CF_FFFF),
+    (0x0E10_0000, 0x0E1F_FFFF), (0x0E68_0000, 0x0E7F_FFFF),
+    (0x0E90_0000, 0x0E9F_FFFF), (0x0ED0_0000, 0x0EDF_FFFF),
+    (0x1B08_0000, 0x1B1F_FFFF), (0x1B24_0000, 0x1B2F_FFFF),
+    (0x1B73_0000, 0x1B73_FFFF), (0x1B80_0000, 0x1B81_FFFF),
+    (0x1B94_0000, 0x1B9F_FFFF), (0x1BB8_0000, 0x1BE3_FFFF),
+    (0x2420_0000, 0x243F_FFFF), (0x2460_0000, 0x24BF_FFFF),
+    (0x24F8_0000, 0x24FB_FFFF), (0x2740_0000, 0x276B_FFFF),
+    (0x2780_0000, 0x27BF_FFFF), (0x2A04_0000, 0x2A07_FFFF),
+    (0x2A30_0000, 0x2A3B_FFFF), (0x2A50_0000, 0x2A60_FFFF),
+    (0x2A64_0000, 0x2A67_FFFF), (0x2A78_0000, 0x2A79_FFFF),
+    (0x2AB0_0000, 0x2AB3_FFFF), (0x2AB8_0000, 0x2AB9_FFFF),
+    (0x2AC0_0000, 0x2AC3_FFFF), (0x2AE0_0000, 0x2AEF_FFFF),
+    (0x2F5C_0000, 0x2F7B_FFFF), (0x3140_0000, 0x315F_FFFF),
+    (0x3170_0000, 0x3177_FFFF), (0x31DC_0000, 0x31DF_FFFF),
+    (0x31E8_0000, 0x31EB_FFFF), (0x3A10_0000, 0x3A19_FFFF),
+    (0x3A20_0000, 0x3A3F_FFFF), (0x3A42_0000, 0x3A44_FFFF),
+    (0x3A64_0000, 0x3A65_FFFF), (0x3A80_0000, 0x3A87_FFFF),
+    (0x3A90_0000, 0x3A90_FFFF), (0x3A9A_0000, 0x3A9B_FFFF),
+    (0x3AC0_0000, 0x3ADF_FFFF), (0x3AF0_0000, 0x3AFF_FFFF),
+    (0x3B20_0000, 0x3B53_FFFF), (0x3B6C_0000, 0x3B6F_FFFF),
+    (0x3BAC_0000, 0x3BAF_FFFF), (0x3C00_0000, 0x3C1F_FFFF),
+    (0x3CA0_0000, 0x3CBF_FFFF), (0x3CCC_0000, 0x3CDF_FFFF),
+    (0x3D30_0000, 0x3D37_FFFF), (0x3D80_0000, 0x3DBF_FFFF),
+    (0x3DE8_0000, 0x3DED_FFFF), (0x3DF0_0000, 0x3DF3_FFFF),
+    (0x5144_0000, 0x5147_FFFF), (0x529C_0000, 0x529D_FFFF),
+    (0x6504_0000, 0x6507_FFFF), (0x6510_0000, 0x651F_FFFF),
+    (0x6522_0000, 0x6525_FFFF), (0x6528_0000, 0x652B_FFFF),
+    (0x6540_0000, 0x655F_FFFF), (0x657C_0000, 0x657F_FFFF),
+    (0x6584_0000, 0x6585_FFFF), (0x65C8_0000, 0x65C9_FFFF),
+    (0x65E0_0000, 0x65FF_FFFF), (0x6A02_0000, 0x6A0F_FFFF),
+    (0x6A20_0000, 0x6A3F_FFFF), (0x6A4A_0000, 0x6A4B_FFFF),
+    (0x6A50_0000, 0x6A5F_FFFF), (0x6A70_0000, 0x6A7F_FFFF),
+    (0x6AE0_0000, 0x6AEF_FFFF), (0x6E34_0000, 0x6E37_FFFF),
+    (0x6E48_0000, 0x6E5F_FFFF), (0x6E98_0000, 0x6E9F_FFFF),
+    (0x6EA6_0000, 0x6EA7_FFFF), (0x6EB0_0000, 0x6EBF_FFFF),
+    (0x6EC8_0000, 0x6ECF_FFFF), (0x6EF0_0000, 0x6F3F_FFFF),
+    (0x6F48_0000, 0x6F4F_FFFF), (0x6F70_0000, 0x6FBF_FFFF),
+    (0x6FE0_0000, 0x6FEF_FFFF), (0x7000_0000, 0x7077_FFFF),
+    (0x707A_0000, 0x707F_FFFF), (0x70C0_0000, 0x70C3_FFFF),
+    (0x70E0_0000, 0x711F_FFFF), (0x7138_0000, 0x713B_FFFF),
+    (0x7140_0000, 0x718F_FFFF), (0x71C2_0000, 0x71C3_FFFF),
+    (0x71C8_0000, 0x71FF_FFFF), (0x7240_0000, 0x727F_FFFF),
+    (0x7284_0000, 0x7284_FFFF), (0x72D4_0000, 0x72FF_FFFF),
+    (0x7310_0000, 0x731F_FFFF), (0x7330_0000, 0x733F_FFFF),
+    (0x7396_0000, 0x739F_FFFF), (0x73A8_0000, 0x73AB_FFFF),
+    (0x73C0_0000, 0x73EF_FFFF), (0x7401_0000, 0x741F_FFFF),
+    (0x7434_0000, 0x7437_FFFF), (0x743E_0000, 0x743F_FFFF),
+    (0x7470_0000, 0x74BF_FFFF), (0x74C4_0000, 0x74C7_FFFF),
+    (0x74CC_0000, 0x74FF_FFFF), (0x7508_0000, 0x750F_FFFF),
+    (0x7518_0000, 0x752F_FFFF), (0x753C_0000, 0x755F_FFFF),
+    (0x7580_0000, 0x75BF_FFFF), (0x7618_0000, 0x761F_FFFF),
+    (0x7648_0000, 0x764F_FFFF), (0x7670_0000, 0x767F_FFFF),
+    (0x7690_0000, 0x7691_FFFF), (0x76B2_0000, 0x76BB_FFFF),
+    (0x76BE_0000, 0x76C3_FFFF), (0x76F4_0000, 0x771B_FFFF),
+    (0x771C_1C1C, 0x771C_1C1C), (0x771D_0000, 0x771D_FFFF),
+    (0x7720_0000, 0x773B_FFFF), (0x7754_0000, 0x7757_FFFF),
+    (0x7760_0000, 0x77BF_FFFF), (0x7800_0000, 0x780F_FFFF),
+    (0x7818_0000, 0x781B_FFFF), (0x7820_0000, 0x7837_FFFF),
+    (0x7840_0000, 0x785F_FFFF), (0x7880_0000, 0x788F_FFFF),
+    (0x78C0_0000, 0x78FF_FFFF), (0x7904_0000, 0x7905_FFFF),
+    (0x7908_0000, 0x792B_FFFF), (0x7930_0000, 0x7933_FFFF),
+    (0x7938_0000, 0x7947_FFFF), (0x794C_0000, 0x794F_FFFF),
+    (0x79C0_0000, 0x79C7_FFFF), (0x79CC_0000, 0x79CF_FFFF),
+    (0x79E0_0000, 0x79FF_FFFF), (0x7A04_0000, 0x7A07_FFFF),
+    (0x7A40_0000, 0x7A67_FFFF), (0x7A70_0000, 0x7A73_FFFF),
+    (0x7A88_0000, 0x7A8F_FFFF), (0x7ABC_0000, 0x7ACF_FFFF),
+    (0x7AE0_0000, 0x7AFF_FFFF), (0x7B04_0000, 0x7B0F_FFFF),
+    (0x7B30_0000, 0x7B37_FFFF), (0x7B3C_0000, 0x7B3C_FFFF),
+    (0x7B70_0000, 0x7BBF_FFFF), (0x7BCE_0000, 0x7BCF_FFFF),
+    (0x7BE8_0000, 0x7BEF_FFFF), (0x7C40_0000, 0x7C43_FFFF),
+    (0x7C46_0000, 0x7C4F_FFFF), (0x7C58_0000, 0x7C7F_FFFF),
+    (0x7CA0_0000, 0x7CAF_FFFF), (0x7CC0_0000, 0x7CC3_FFFF),
+    (0x7CC8_0000, 0x7CCF_FFFF), (0x7CDC_0000, 0x7CFF_FFFF),
+    (0x7D20_0000, 0x7D5F_FFFF), (0x7D68_0000, 0x7D7F_FFFF),
+    (0x7DD8_0000, 0x7DDF_FFFF), (0x8B09_0000, 0x8B09_FFFF),
+    (0x8B9B_0000, 0x8B9B_FFFF), (0x8B9F_0000, 0x8B9F_FFFF),
+    (0x8BC4_0000, 0x8BC4_FFFF), (0x8BC6_0000, 0x8BC7_FFFF),
+    (0x8BE0_0000, 0x8BE0_FFFF), (0x8C8F_0000, 0x8C8F_FFFF),
+    (0x8CCD_0000, 0x8CCF_FFFF), (0x969E_0000, 0x969E_FFFF),
+    (0x9888_0000, 0x9888_FFFF), (0x9900_0000, 0x9907_FFFF),
+    (0x9920_0000, 0x9927_FFFF), (0x9F4B_0000, 0x9F4B_FFFF),
+    (0xA20E_0000, 0xA20E_FFFF), (0xA66F_0000, 0xA66F_FFFF),
+    (0xAB08_0000, 0xAB0F_FFFF), (0xAB22_0000, 0xAB2F_FFFF),
+    (0xAB50_0000, 0xAB6F_FFFF), (0xABD0_0000, 0xABDF_FFFF),
+    (0xAF00_0000, 0xAF1F_FFFF), (0xAF2A_0000, 0xAF2B_FFFF),
+    (0xAF92_0000, 0xAFAF_FFFF), (0xB44C_0000, 0xB44C_FFFF),
+    (0xB460_0000, 0xB47F_FFFF), (0xB488_0000, 0xB48F_FFFF),
+    (0xB498_0000, 0xB4AF_FFFF), (0xB4B8_0000, 0xB4B8_FFFF),
+    (0xB620_0000, 0xB62F_FFFF), (0xB650_0000, 0xB69F_FFFF),
+    (0xB6C8_0000, 0xB6CF_FFFF), (0xB6F0_0000, 0xB747_FFFF),
+    (0xB780_0000, 0xB7AF_FFFF), (0xB7B8_0000, 0xB7FF_FFFF),
+    (0xCA60_0000, 0xCA7F_FFFF), (0xCAC0_0000, 0xCADF_FFFF),
+    (0xD202_0400, 0xD202_04FF), (0xD215_0000, 0xD216_FFFF),
+    (0xD21C_0000, 0xD22F_FFFF), (0xD233_0000, 0xD235_FFFF),
+    (0xD248_0000, 0xD24F_FFFF), (0xD2C0_0000, 0xD2C0_FFFF),
+    (0xD340_0000, 0xD36F_FFFF), (0xD388_0000, 0xD3A7_FFFF),
+    (0xDA00_0000, 0xDA1F_FFFF), (0xDA38_0000, 0xDA5F_FFFF),
+    (0xDA68_0000, 0xDA6D_FFFF), (0xDAC0_0000, 0xDACF_FFFF),
+    (0xDAF0_0000, 0xDAF7_FFFF), (0xDB80_0000, 0xDB9F_FFFF),
+    (0xDBD0_0000, 0xDBDF_FFFF), (0xDBE8_0000, 0xDBEF_FFFF),
+    (0xDCA0_0000, 0xDCCF_FFFF), (0xDCF8_0000, 0xDCFB_FFFF),
+    (0xDD00_0000, 0xDD0F_FFFF), (0xDDB0_0000, 0xDDEF_FFFF),
+    (0xDE10_0000, 0xDEDF_FFFF), (0xDEF0_0000, 0xDEFF_FFFF),
+    (0xDF04_0000, 0xDF07_FFFF), (0xDF40_0000, 0xDF7F_FFFF),
+    (0xDFA0_0000, 0xDFA7_FFFF), (0xDFC6_0000, 0xDFC7_FFFF),
+    (0xDFD0_0000, 0xDFDF_FFFF), (0xDFF0_0000, 0xDFFF_FFFF),
+];
+
+/// Binary-search whether `ip` falls inside China Mainland's compact public IPv4 table (O(log N),
+/// zero allocations).
+#[inline]
+pub fn is_domestic_ipv4(ip: Ipv4Addr) -> bool {
+    let target = u32::from(ip);
+    CN_IPV4_RANGES
+        .binary_search_by(|&(start, end)| {
+            if target < start {
+                std::cmp::Ordering::Greater
+            } else if target > end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
+}
+
 /// Built-in core OS and CatCloud process names unconditionally excluded from transparent
 /// WinDivert interception (case-insensitive) to guarantee system stability and zero loops.
 const SYSTEM_AND_SELF_EXCLUDED_PROCESSES: &[&str] = &[
@@ -179,7 +435,7 @@ pub fn compile_standalone_preaccel_yaml_with_interface(
 
     if sanitized_relays.is_empty() {
         return Err(CatError::Validation(
-            "没有已启用的国内 443 中转节点，无法编译独立预加速隧道配置".to_string(),
+            "没有已启用的国内 443 中转节点，无法编译独立国内提速隧道配置".to_string(),
         ));
     }
 
@@ -191,7 +447,7 @@ pub fn compile_standalone_preaccel_yaml_with_interface(
     let plan = build_preaccel_compile_plan(&standalone_preaccel, &sanitized_relays, &[])?;
     if !plan.active || plan.relay_proxies.is_empty() {
         return Err(CatError::Validation(
-            "独立 443 预加速隧道未能生成有效中转节点配置".to_string(),
+            "独立 443 国内提速隧道未能生成有效中转节点配置".to_string(),
         ));
     }
 
@@ -332,6 +588,7 @@ pub struct StandalonePreAccelTunnel {
     socks_port: u16,
     work_dir: PathBuf,
     config_path: PathBuf,
+    config_sha256: String,
     active_relays: Vec<String>,
     bound_physical_interface: Option<String>,
     job_guard: Arc<JobGuard>,
@@ -354,7 +611,7 @@ impl StandalonePreAccelTunnel {
         let bin_res = resolve_mihomo_binary(cfg, paths, &[], false)?;
         let mihomo_bin = bin_res.path.ok_or_else(|| {
             CatError::NotFound(
-                "未找到 Mihomo 内核二进制文件，无法启动独立 443 预加速隧道".to_string(),
+                "未找到 Mihomo 内核二进制文件，无法启动独立 443 国内提速隧道".to_string(),
             )
         })?;
 
@@ -440,6 +697,7 @@ impl StandalonePreAccelTunnel {
         let work_dir = paths.runtime_dir.join("global-preaccel");
         std::fs::create_dir_all(&work_dir)?;
         let config_path = work_dir.join("standalone-preaccel.yaml");
+        let config_sha256 = hex::encode(Sha256::digest(yaml.as_bytes()));
         AppPaths::atomic_write(&config_path, yaml.as_bytes())?;
 
         let stderr_path = work_dir.join("standalone-preaccel-stderr.log");
@@ -467,7 +725,7 @@ impl StandalonePreAccelTunnel {
 
         let mut child = cmd.spawn().map_err(|e| {
             CatError::Process(format!(
-                "启动独立 443 预加速隧道 Mihomo 进程失败 ({}): {e}",
+                "启动独立 443 国内提速隧道 Mihomo 进程失败 ({}): {e}",
                 mihomo_bin.display()
             ))
         })?;
@@ -489,9 +747,9 @@ impl StandalonePreAccelTunnel {
                 }
                 let detail = read_stderr_tail(&stderr_path, 2048);
                 let msg = if detail.is_empty() {
-                    format!("独立 443 预加速隧道启动失败并提前退出 ({status})")
+                    format!("独立 443 国内提速隧道启动失败并提前退出 ({status})")
                 } else {
-                    format!("独立 443 预加速隧道启动失败并提前退出 ({status}): {detail}")
+                    format!("独立 443 国内提速隧道启动失败并提前退出 ({status}): {detail}")
                 };
                 return Err(CatError::Core(msg));
             }
@@ -509,6 +767,7 @@ impl StandalonePreAccelTunnel {
                     socks_port,
                     work_dir,
                     config_path,
+                    config_sha256,
                     active_relays,
                     bound_physical_interface,
                     job_guard,
@@ -525,9 +784,9 @@ impl StandalonePreAccelTunnel {
         }
         let detail = read_stderr_tail(&stderr_path, 2048);
         let msg = if detail.is_empty() {
-            format!("独立 443 预加速隧道在超时前未能在 127.0.0.1:{socks_port} 就绪")
+            format!("独立 443 国内提速隧道在超时前未能在 127.0.0.1:{socks_port} 就绪")
         } else {
-            format!("独立 443 预加速隧道未能在 127.0.0.1:{socks_port} 就绪: {detail}")
+            format!("独立 443 国内提速隧道未能在 127.0.0.1:{socks_port} 就绪: {detail}")
         };
         Err(CatError::Core(msg))
     }
@@ -554,6 +813,10 @@ impl StandalonePreAccelTunnel {
 
     pub fn config_path(&self) -> &Path {
         &self.config_path
+    }
+
+    pub fn config_sha256(&self) -> &str {
+        &self.config_sha256
     }
 
     /// Gracefully terminate the standalone Mihomo subprocess and reap its handle.
@@ -635,7 +898,7 @@ fn allocate_loopback_tcp_port(preferred: Option<u16>, cfg: &AppConfig) -> CatRes
     }
 
     Err(CatError::Process(
-        "无法为独立 443 预加速隧道分配空闲本地回环 TCP 端口".to_string(),
+        "无法为独立 443 国内提速隧道分配空闲本地回环 TCP 端口".to_string(),
     ))
 }
 
@@ -1414,22 +1677,32 @@ pub fn build_security_guidance(
     }
 }
 
-/// Build the high-precision WinDivert v2.2.2 kernel-mode packet filter string.
+/// Build the high-precision WinDivert v2.2.2 kernel-mode packet filter string with configurable
+/// native `:443` skipping.
 ///
 /// Design invariants:
 /// - Matches only IPv4 TCP traffic (`ip and tcp`).
-/// - Outbound public interception excludes loopback (`!loopback`), ports `443` & `53`, all
-///   private/loopback/CGNAT/link-local/Fake-IP/multicast ranges, and every domestic :443
-///   relay public IPv4 address (to guarantee zero loops).
+/// - Outbound public interception excludes loopback (`!loopback`), port `53`, port `443` when
+///   `skip_443_native == true`, all private/loopback/CGNAT/link-local/Fake-IP/multicast ranges,
+///   all 13 domestic public DNS IPv4 endpoints, and every domestic `:443` relay public IPv4
+///   address (to guarantee zero loops).
 /// - Also captures return packets from the local self-loop redirector (`outbound and
 ///   tcp.SrcPort == <local_redirect_port>`) without excluding loopback on the return branch,
 ///   because same-NIC self-loop replies traverse Windows loopback on outbound.
-/// - NEVER bypasses GeoIP CN so domestic-transit airport entry IPs are 100% accelerated!
-pub fn build_windivert_filter(relay_ipv4s: &[Ipv4Addr], local_redirect_port: u16) -> String {
-    let mut outbound_terms: Vec<String> = vec![
-        "!loopback".to_string(),
-        "outbound".to_string(),
-        "tcp.DstPort != 443".to_string(),
+/// - NEVER bypasses GeoIP CN at the kernel filter layer so domestic-transit airport entry IPs
+///   on non-443 ports remain 100% accelerated.
+pub fn build_windivert_filter_with_options(
+    relay_ipv4s: &[Ipv4Addr],
+    local_redirect_port: u16,
+    skip_443_native: bool,
+) -> String {
+    let mut outbound_terms: Vec<String> = Vec::with_capacity(28 + relay_ipv4s.len());
+    outbound_terms.push("!loopback".to_string());
+    outbound_terms.push("outbound".to_string());
+    if skip_443_native {
+        outbound_terms.push("tcp.DstPort != 443".to_string());
+    }
+    outbound_terms.extend([
         "tcp.DstPort != 53".to_string(),
         // Exclude 0.0.0.0/8 (this network) and 224.0.0.0/3 (multicast/reserved/broadcast)
         "ip.DstAddr > 0.255.255.255".to_string(),
@@ -1448,15 +1721,17 @@ pub fn build_windivert_filter(relay_ipv4s: &[Ipv4Addr], local_redirect_port: u16
         "(ip.DstAddr < 192.168.0.0 or ip.DstAddr > 192.168.255.255)".to_string(),
         // Exclude 198.18.0.0/15 (Fake-IP / RFC 2544 benchmark range)
         "(ip.DstAddr < 198.18.0.0 or ip.DstAddr > 198.19.255.255)".to_string(),
-    ];
+    ]);
 
-    let unique_relays: BTreeSet<Ipv4Addr> = relay_ipv4s
-        .iter()
-        .copied()
-        .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
-        .collect();
+    let mut excluded_dst_ips: BTreeSet<Ipv4Addr> =
+        DOMESTIC_PUBLIC_DNS_IPV4S.iter().copied().collect();
+    for &ip in relay_ipv4s {
+        if !ip.is_unspecified() && !ip.is_loopback() {
+            excluded_dst_ips.insert(ip);
+        }
+    }
 
-    for ip in unique_relays {
+    for ip in excluded_dst_ips {
         outbound_terms.push(format!("ip.DstAddr != {ip}"));
     }
 
@@ -1465,6 +1740,33 @@ pub fn build_windivert_filter(relay_ipv4s: &[Ipv4Addr], local_redirect_port: u16
         outbound_terms.join(" and "),
         local_redirect_port
     )
+}
+
+/// Backward-compatible wrapper calling [`build_windivert_filter_with_options`] with
+/// `skip_443_native = true`.
+pub fn build_windivert_filter(relay_ipv4s: &[Ipv4Addr], local_redirect_port: u16) -> String {
+    build_windivert_filter_with_options(relay_ipv4s, local_redirect_port, true)
+}
+
+/// Three-layer guard deciding whether an outbound TCP `:443` flow may be intercepted by WinDivert:
+/// 1. Rejected whenever `skip_443_native == true`.
+/// 2. Strictly limited to precisely identified proxy-core labels (`system_proxy_host`,
+///    `local_proxy_listener`, `open_core_name`), unconditionally bypassing `manual` and `scope_all`.
+/// 3. Rejected when `dst_ip` is a China Mainland IPv4 address (`is_domestic_ipv4(dst_ip)`),
+///    preventing direct domestic HTTPS traffic from detouring through the domestic relay.
+#[inline]
+pub fn should_intercept_port_443(
+    detected_by: &str,
+    skip_443_native: bool,
+    dst_ip: Ipv4Addr,
+) -> bool {
+    if skip_443_native {
+        return false;
+    }
+    matches!(
+        detected_by,
+        "system_proxy_host" | "local_proxy_listener" | "open_core_name"
+    ) && !is_domestic_ipv4(dst_ip)
 }
 
 /// Extract distinct IPv4 addresses of enabled domestic relays (resolving domain relays on a
@@ -1583,6 +1885,18 @@ pub fn is_system_or_self_excluded_process(raw: &str) -> bool {
         || SYSTEM_AND_SELF_EXCLUDED_PROCESSES
             .iter()
             .any(|sys| *sys == lower)
+}
+
+/// Return `true` when `raw` matches a well-known non-proxy communication, browser, IDE, office,
+/// media, or cloud-drive application (used strictly to prevent automatic proxy listener heuristics
+/// from misclassifying ordinary desktop apps, never blocking `ssh.exe`, `git.exe`, or manual lists).
+pub fn is_non_proxy_communication_process(raw: &str) -> bool {
+    let lower = normalize_process_basename(raw);
+    if lower.is_empty() {
+        return false;
+    }
+    let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
+    NON_PROXY_COMMUNICATION_PROCESS_STEMS.contains(&stem)
 }
 
 /// Return `true` when an executable path or basename matches a generic open-source
@@ -1812,22 +2126,73 @@ pub struct NatEntry {
     pub closing_since: Option<Instant>,
 }
 
-/// Bounded-capacity transparent TCP NAT table with idle timeout, closing-grace retention for
-/// clean `FIN-ACK` / `RST` teardown, and oldest-access LRU eviction.
+/// Lightweight `Copy` view of a NAT entry used on the packet worker hot path so per-packet
+/// address translation never clones heap-allocated `String` fields (`process_name`, `detected_by`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NatPacketView {
+    pub orig_src_ip: Ipv4Addr,
+    pub orig_dst_ip: Ipv4Addr,
+    pub orig_dst_port: u16,
+    pub if_idx: u32,
+    pub sub_if_idx: u32,
+    pub is_closing: bool,
+    pub is_self_test: bool,
+}
+
+/// Bounded-capacity transparent TCP NAT table with a lock-free 64K source-port occupancy bitmap,
+/// idle timeout, closing-grace retention for clean `FIN-ACK` / `RST` teardown, and oldest-access
+/// LRU eviction.
 #[derive(Debug)]
 pub struct NatTable {
     max_entries: usize,
     idle_timeout: Duration,
+    /// Lock-free 65,536-bit source-port occupancy bitmap (`1024 * 64` bits).
+    port_bitmap: Box<[AtomicU64; 1024]>,
     entries: Mutex<HashMap<NatKey, NatEntry>>,
 }
 
 impl NatTable {
     pub fn new(max_entries: usize, idle_timeout: Duration) -> Self {
+        let port_bitmap: Box<[AtomicU64; 1024]> = (0..1024)
+            .map(|_| AtomicU64::new(0))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+            .try_into()
+            .unwrap_or_else(|_| unreachable!());
         Self {
             max_entries: max_entries.max(1),
             idle_timeout,
+            port_bitmap,
             entries: Mutex::new(HashMap::with_capacity(max_entries.min(512))),
         }
+    }
+
+    #[inline]
+    fn set_port_bit(&self, port: u16) {
+        let idx = usize::from(port) >> 6;
+        let mask = 1u64 << (port & 63);
+        self.port_bitmap[idx].fetch_or(mask, Ordering::Release);
+    }
+
+    #[inline]
+    fn clear_port_bit_locked(&self, guard: &HashMap<NatKey, NatEntry>, port: u16) {
+        if !guard.contains_key(&(Ipv4Addr::LOCALHOST, port))
+            && !guard.keys().any(|&(_, p)| p == port)
+        {
+            let idx = usize::from(port) >> 6;
+            let mask = !(1u64 << (port & 63));
+            self.port_bitmap[idx].fetch_and(mask, Ordering::Release);
+        }
+    }
+
+    /// O(1) lock-free check indicating whether `port` currently has any NAT entry registered.
+    ///
+    /// Non-SYN packets whose source port bit is clear can be reinjected immediately without
+    /// acquiring the internal `Mutex`.
+    #[inline]
+    pub fn may_contain_port(&self, port: u16) -> bool {
+        let word = self.port_bitmap[usize::from(port) >> 6].load(Ordering::Acquire);
+        (word & (1u64 << (port & 63))) != 0
     }
 
     fn is_entry_expired(entry: &NatEntry, now: Instant, idle_timeout: Duration) -> bool {
@@ -1854,6 +2219,9 @@ impl NatTable {
         incoming_dst_ip: Ipv4Addr,
         incoming_dst_port: u16,
     ) -> bool {
+        if !self.may_contain_port(key.1) {
+            return false;
+        }
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let Some(existing) = guard.get(key) else {
             return false;
@@ -1861,6 +2229,7 @@ impl NatTable {
         let now = Instant::now();
         if Self::is_entry_expired(existing, now, self.idle_timeout) {
             guard.remove(key);
+            self.clear_port_bit_locked(&guard, key.1);
             return false;
         }
         if existing.closing_since.is_some() {
@@ -1878,7 +2247,17 @@ impl NatTable {
         let now = entry.last_seen;
         if !guard.contains_key(&key) && guard.len() >= self.max_entries {
             let timeout = self.idle_timeout;
-            guard.retain(|_, v| !Self::is_entry_expired(v, now, timeout));
+            let mut evicted_ports: Vec<u16> = Vec::new();
+            guard.retain(|&(_, port), v| {
+                let keep = !Self::is_entry_expired(v, now, timeout);
+                if !keep {
+                    evicted_ports.push(port);
+                }
+                keep
+            });
+            for port in evicted_ports {
+                self.clear_port_bit_locked(&guard, port);
+            }
             // Prefer evicting already-closing entries before live flows when at capacity.
             while guard.len() >= self.max_entries {
                 let candidate = guard
@@ -1889,21 +2268,53 @@ impl NatTable {
                     .map(|(k, _)| *k);
                 if let Some(oldest_key) = candidate {
                     guard.remove(&oldest_key);
+                    self.clear_port_bit_locked(&guard, oldest_key.1);
                 } else {
                     break;
                 }
             }
         }
         guard.insert(key, entry);
+        self.set_port_bit(key.1);
     }
 
-    /// Look up a NAT mapping and refresh its `last_seen` timestamp.
-    pub fn get_and_touch(&self, key: &NatKey) -> Option<NatEntry> {
+    /// Look up a lightweight `Copy` packet-rewrite view for `key` and refresh `last_seen`,
+    /// avoiding any `String` heap allocation on the WinDivert packet worker hot path.
+    pub fn get_packet_view_and_touch(&self, key: &NatKey) -> Option<NatPacketView> {
+        if !self.may_contain_port(key.1) {
+            return None;
+        }
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let entry = guard.get_mut(key)?;
         let now = Instant::now();
         if Self::is_entry_expired(entry, now, self.idle_timeout) {
             guard.remove(key);
+            self.clear_port_bit_locked(&guard, key.1);
+            return None;
+        }
+        entry.last_seen = now;
+        Some(NatPacketView {
+            orig_src_ip: entry.orig_src_ip,
+            orig_dst_ip: entry.orig_dst_ip,
+            orig_dst_port: entry.orig_dst_port,
+            if_idx: entry.if_idx,
+            sub_if_idx: entry.sub_if_idx,
+            is_closing: entry.closing_since.is_some(),
+            is_self_test: entry.detected_by == SELF_TEST_DETECTED_BY,
+        })
+    }
+
+    /// Look up a NAT mapping and refresh its `last_seen` timestamp.
+    pub fn get_and_touch(&self, key: &NatKey) -> Option<NatEntry> {
+        if !self.may_contain_port(key.1) {
+            return None;
+        }
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = guard.get_mut(key)?;
+        let now = Instant::now();
+        if Self::is_entry_expired(entry, now, self.idle_timeout) {
+            guard.remove(key);
+            self.clear_port_bit_locked(&guard, key.1);
             return None;
         }
         entry.last_seen = now;
@@ -1912,10 +2323,15 @@ impl NatTable {
 
     /// Remove and return the NAT entry for `key`, if present.
     pub fn remove(&self, key: &NatKey) -> Option<NatEntry> {
-        self.entries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key)
+        if !self.may_contain_port(key.1) {
+            return None;
+        }
+        let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = guard.remove(key);
+        if removed.is_some() {
+            self.clear_port_bit_locked(&guard, key.1);
+        }
+        removed
     }
 
     /// Mark the NAT entry for `key` as closing (retaining translation for `NAT_CLOSING_GRACE`
@@ -1928,6 +2344,9 @@ impl NatTable {
         orig_dst_ip: Ipv4Addr,
         orig_dst_port: u16,
     ) -> bool {
+        if !self.may_contain_port(key.1) {
+            return false;
+        }
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = guard.get_mut(key) {
             if entry.orig_src_ip == orig_src_ip
@@ -1953,6 +2372,9 @@ impl NatTable {
         dst_ip: Ipv4Addr,
         dst_port: u16,
     ) -> bool {
+        if !self.may_contain_port(key.1) {
+            return false;
+        }
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let matches = guard.get(key).is_some_and(|entry| {
             entry.closing_since.is_none()
@@ -1962,6 +2384,7 @@ impl NatTable {
         });
         if matches {
             guard.remove(key);
+            self.clear_port_bit_locked(&guard, key.1);
             true
         } else {
             false
@@ -1977,12 +2400,16 @@ impl NatTable {
         orig_dst_ip: Ipv4Addr,
         orig_dst_port: u16,
     ) -> bool {
+        if !self.may_contain_port(key.1) {
+            return false;
+        }
         let mut guard = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let matches = guard.get(key).is_some_and(|entry| {
             entry.orig_dst_ip == orig_dst_ip && entry.orig_dst_port == orig_dst_port
         });
         if matches {
             guard.remove(key);
+            self.clear_port_bit_locked(&guard, key.1);
             true
         } else {
             false
@@ -2195,18 +2622,63 @@ pub struct AcceleratedProcessStat {
     pub last_seen_ms: u64,
 }
 
+const DETECTED_BY_RUNTIME: u8 = 0;
+const DETECTED_BY_SCOPE_ALL: u8 = 1;
+const DETECTED_BY_MANUAL: u8 = 2;
+const DETECTED_BY_LOCAL_PROXY_LISTENER: u8 = 3;
+const DETECTED_BY_OPEN_CORE_NAME: u8 = 4;
+const DETECTED_BY_SYSTEM_PROXY_HOST: u8 = 5;
+
+fn encode_detected_by(reason: &str) -> u8 {
+    let trimmed = reason.trim();
+    if trimmed.eq_ignore_ascii_case("system_proxy_host") {
+        DETECTED_BY_SYSTEM_PROXY_HOST
+    } else if trimmed.eq_ignore_ascii_case("open_core_name") {
+        DETECTED_BY_OPEN_CORE_NAME
+    } else if trimmed.eq_ignore_ascii_case("local_proxy_listener") {
+        DETECTED_BY_LOCAL_PROXY_LISTENER
+    } else if trimmed.eq_ignore_ascii_case("manual") {
+        DETECTED_BY_MANUAL
+    } else if trimmed.eq_ignore_ascii_case("scope_all") {
+        DETECTED_BY_SCOPE_ALL
+    } else {
+        DETECTED_BY_RUNTIME
+    }
+}
+
+fn decode_detected_by(code: u8) -> &'static str {
+    match code {
+        DETECTED_BY_SYSTEM_PROXY_HOST => "system_proxy_host",
+        DETECTED_BY_OPEN_CORE_NAME => "open_core_name",
+        DETECTED_BY_LOCAL_PROXY_LISTENER => "local_proxy_listener",
+        DETECTED_BY_MANUAL => "manual",
+        DETECTED_BY_SCOPE_ALL => "scope_all",
+        _ => "runtime",
+    }
+}
+
+/// Lock-free monotonic priority promotion for `ProcessCounters::detected_by_code`:
+/// `system_proxy_host(5) > open_core_name(4) > local_proxy_listener(3) > manual(2) > scope_all(1) > runtime(0)`.
+fn upgrade_detected_by_atomic(slot: &AtomicU8, candidate: u8) {
+    let mut cur = slot.load(Ordering::Relaxed);
+    while candidate > cur {
+        match slot.compare_exchange_weak(cur, candidate, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProcessStatKey {
     process_name_lower: String,
-    pid: u32,
-    detected_by: String,
 }
 
 #[derive(Debug)]
 struct ProcessCounters {
     process_name: String,
-    pid: u32,
-    detected_by: String,
+    pid: AtomicU32,
+    detected_by_code: AtomicU8,
     active_connections: AtomicUsize,
     total_connections: AtomicU64,
     tx_bytes: AtomicU64,
@@ -2327,18 +2799,9 @@ impl GlobalPreAccelMetrics {
                 return None;
             }
         };
-        let reason = {
-            let trimmed = detected_by.trim();
-            if trimmed.is_empty() {
-                "unknown"
-            } else {
-                trimmed
-            }
-        };
+        let reason_code = encode_detected_by(detected_by);
         let key = ProcessStatKey {
             process_name_lower: display_name.to_ascii_lowercase(),
-            pid,
-            detected_by: reason.to_string(),
         };
 
         let mut guard = self
@@ -2346,6 +2809,10 @@ impl GlobalPreAccelMetrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = guard.get(&key) {
+            if pid > 0 {
+                existing.pid.store(pid, Ordering::Relaxed);
+            }
+            upgrade_detected_by_atomic(&existing.detected_by_code, reason_code);
             return Some(Arc::clone(existing));
         }
 
@@ -2366,8 +2833,8 @@ impl GlobalPreAccelMetrics {
 
         let counters = Arc::new(ProcessCounters {
             process_name: display_name,
-            pid,
-            detected_by: reason.to_string(),
+            pid: AtomicU32::new(pid),
+            detected_by_code: AtomicU8::new(reason_code),
             active_connections: AtomicUsize::new(0),
             total_connections: AtomicU64::new(0),
             tx_bytes: AtomicU64::new(0),
@@ -2394,11 +2861,14 @@ impl GlobalPreAccelMetrics {
     }
 
     /// Record a redirected connection closing for `(pid, process_name, detected_by)`.
+    ///
+    /// Matches solely by lowercase process name so PID restarts or detection-priority upgrades
+    /// never leak `active_connections`.
     pub fn record_process_connection_close(
         &self,
         pid: u32,
         process_name: &str,
-        detected_by: &str,
+        _detected_by: &str,
     ) {
         let display_name = {
             let trimmed = process_name.trim();
@@ -2410,18 +2880,8 @@ impl GlobalPreAccelMetrics {
                 return;
             }
         };
-        let reason = {
-            let trimmed = detected_by.trim();
-            if trimmed.is_empty() {
-                "unknown"
-            } else {
-                trimmed
-            }
-        };
         let key = ProcessStatKey {
             process_name_lower: display_name.to_ascii_lowercase(),
-            pid,
-            detected_by: reason.to_string(),
         };
         let guard = self
             .process_stats
@@ -2467,8 +2927,9 @@ impl GlobalPreAccelMetrics {
             .values()
             .map(|pc| AcceleratedProcessStat {
                 process_name: pc.process_name.clone(),
-                pid: pc.pid,
-                detected_by: pc.detected_by.clone(),
+                pid: pc.pid.load(Ordering::Relaxed),
+                detected_by: decode_detected_by(pc.detected_by_code.load(Ordering::Relaxed))
+                    .to_string(),
                 active_connections: pc.active_connections.load(Ordering::Relaxed),
                 total_connections: pc.total_connections.load(Ordering::Relaxed),
                 tx_bytes: pc.tx_bytes.load(Ordering::Relaxed),
@@ -2578,9 +3039,22 @@ impl Drop for NatEntryCleanupGuard {
     }
 }
 
+#[cfg_attr(
+    any(not(target_os = "windows"), target_arch = "aarch64"),
+    allow(dead_code)
+)]
+const COUNTING_LAST_SEEN_REFRESH_BYTES: u64 = 64 * 1024;
+
+#[cfg_attr(
+    any(not(target_os = "windows"), target_arch = "aarch64"),
+    allow(dead_code)
+)]
+const REDIRECT_COPY_BUFFER_BYTES: usize = 64 * 1024;
+
 /// Zero-copy `TcpStream` wrapper that atomically tracks real-time upload/download bytes
 /// from the client side (`read` = upload/tx, `write` = download/rx) across both global and
-/// per-process telemetry buckets without taking any mutex on the data path.
+/// per-process telemetry buckets without taking any mutex or clock syscall on small packets,
+/// refreshing `last_seen_ms` strictly at `>= 64 KiB` byte thresholds (in addition to stream open/close).
 #[cfg_attr(
     any(not(target_os = "windows"), target_arch = "aarch64"),
     allow(dead_code)
@@ -2589,6 +3063,7 @@ struct CountingTcpStream {
     inner: TcpStream,
     metrics: Arc<GlobalPreAccelMetrics>,
     process_counters: Option<Arc<ProcessCounters>>,
+    bytes_since_refresh: u64,
 }
 
 #[cfg_attr(
@@ -2605,6 +3080,18 @@ impl CountingTcpStream {
             inner,
             metrics,
             process_counters,
+            bytes_since_refresh: 0,
+        }
+    }
+
+    #[inline]
+    fn maybe_refresh_last_seen(&mut self, delta: u64) {
+        self.bytes_since_refresh = self.bytes_since_refresh.saturating_add(delta);
+        if self.bytes_since_refresh >= COUNTING_LAST_SEEN_REFRESH_BYTES {
+            if let Some(ref pc) = self.process_counters {
+                pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
+            }
+            self.bytes_since_refresh = 0;
         }
     }
 }
@@ -2624,8 +3111,8 @@ impl AsyncRead for CountingTcpStream {
                 this.metrics.up_bytes.fetch_add(delta, Ordering::Relaxed);
                 if let Some(ref pc) = this.process_counters {
                     pc.tx_bytes.fetch_add(delta, Ordering::Relaxed);
-                    pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
                 }
+                this.maybe_refresh_last_seen(delta);
             }
         }
         res
@@ -2648,8 +3135,8 @@ impl AsyncWrite for CountingTcpStream {
                     .fetch_add(delta, Ordering::Relaxed);
                 if let Some(ref pc) = this.process_counters {
                     pc.rx_bytes.fetch_add(delta, Ordering::Relaxed);
-                    pc.last_seen_ms.store(now_epoch_ms(), Ordering::Relaxed);
                 }
+                this.maybe_refresh_last_seen(delta);
             }
         }
         res
@@ -2824,14 +3311,24 @@ pub(super) async fn forward_redirected_stream(
     }
     if is_self_test {
         tokio::select! {
-            _ = tokio::io::copy_bidirectional(&mut client_stream, &mut upstream) => {}
+            _ = tokio::io::copy_bidirectional_with_sizes(
+                &mut client_stream,
+                &mut upstream,
+                REDIRECT_COPY_BUFFER_BYTES,
+                REDIRECT_COPY_BUFFER_BYTES,
+            ) => {}
             _ = shutdown_rx.changed() => {}
         }
     } else {
         let mut counting_client =
             CountingTcpStream::client_side(client_stream, metrics, process_counters);
         tokio::select! {
-            _ = tokio::io::copy_bidirectional(&mut counting_client, &mut upstream) => {}
+            _ = tokio::io::copy_bidirectional_with_sizes(
+                &mut counting_client,
+                &mut upstream,
+                REDIRECT_COPY_BUFFER_BYTES,
+                REDIRECT_COPY_BUFFER_BYTES,
+            ) => {}
             _ = shutdown_rx.changed() => {}
         }
     }
@@ -2984,13 +3481,18 @@ struct ActiveGlobalRuntime {
 }
 
 impl ActiveGlobalRuntime {
-    async fn stop(mut self) {
+    async fn stop(mut self, teardown_service: bool) {
         // Stop WinDivert kernel interception BEFORE tearing down the standalone 443 tunnel so
         // native network flow resumes immediately with zero packet drops.
         #[cfg(target_os = "windows")]
         if let Some(mut engine) = self.engine.take() {
-            let _ = tokio::task::spawn_blocking(move || engine.stop_sync()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                engine.stop_sync_with_teardown(teardown_service);
+            })
+            .await;
         }
+        #[cfg(not(target_os = "windows"))]
+        let _ = teardown_service;
         self.tunnel.stop().await;
     }
 }
@@ -3128,13 +3630,14 @@ impl GlobalPreAccelManager {
             *dir_guard = cfg.preaccel.windivert_dir.clone();
         }
 
-        // Cleanly stop any previous runtime before starting a fresh instance.
+        // Cleanly stop any previous runtime before starting a fresh instance (hot rebuild:
+        // keep the WinDivert kernel service loaded to avoid Win32 error 1072 races).
         let previous = {
             let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
             rt_guard.take()
         };
         if let Some(prev) = previous {
-            prev.stop().await;
+            prev.stop(false).await;
         }
         self.metrics.reset();
         self.set_last_error(None);
@@ -3213,6 +3716,7 @@ impl GlobalPreAccelManager {
                     dll_path,
                     socks_port,
                     relay_ipv4s,
+                    skip_443_native: cfg.preaccel.skip_443_native,
                     scope: cfg.preaccel.global_scope,
                     target_processes: cfg.preaccel.global_target_processes.clone(),
                     excluded_pids: static_excluded_pids,
@@ -3257,9 +3761,12 @@ impl GlobalPreAccelManager {
                             }
                             other => {
                                 // Fail-safe circuit breaker: immediately tear down WinDivert
-                                // interception so broken packet injection never blackholes the host.
-                                let _ = tokio::task::spawn_blocking(move || engine.stop_sync())
-                                    .await;
+                                // interception and stop its kernel service so broken packet
+                                // injection never blackholes the host.
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    engine.stop_sync_with_teardown(true);
+                                })
+                                .await;
                                 let (msg, guidance) = classify_self_test_failure(
                                     &other,
                                     &detected_products,
@@ -3460,6 +3967,7 @@ impl GlobalPreAccelManager {
                 dll_path,
                 socks_port,
                 relay_ipv4s,
+                skip_443_native: cfg.preaccel.skip_443_native,
                 scope: cfg.preaccel.global_scope,
                 target_processes: cfg.preaccel.global_target_processes.clone(),
                 excluded_pids: static_excluded_pids,
@@ -3505,8 +4013,11 @@ impl GlobalPreAccelManager {
                                 }
                             };
                             if let Some(mut stale) = displaced_engine {
-                                let _ =
-                                    tokio::task::spawn_blocking(move || stale.stop_sync()).await;
+                                let teardown_service = !installed;
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    stale.stop_sync_with_teardown(teardown_service);
+                                })
+                                .await;
                             }
                             if installed {
                                 self.set_install_state("ready");
@@ -3538,8 +4049,10 @@ impl GlobalPreAccelManager {
                             Ok(self.status())
                         }
                         other => {
-                            let _ =
-                                tokio::task::spawn_blocking(move || engine.stop_sync()).await;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                engine.stop_sync_with_teardown(true);
+                            })
+                            .await;
                             let (msg, guidance) = classify_self_test_failure(
                                 &other,
                                 &detected_products,
@@ -3665,8 +4178,10 @@ impl GlobalPreAccelManager {
                                 }
                             };
                             if let Some(mut orphan) = leftover_engine {
-                                let _ = tokio::task::spawn_blocking(move || orphan.stop_sync())
-                                    .await;
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    orphan.stop_sync_with_teardown(true);
+                                })
+                                .await;
                                 return Ok(self.status());
                             }
                             self.set_last_error(None);
@@ -3682,7 +4197,10 @@ impl GlobalPreAccelManager {
                             return Ok(self.status());
                         }
                         other => {
-                            let _ = tokio::task::spawn_blocking(move || engine.stop_sync()).await;
+                            let _ = tokio::task::spawn_blocking(move || {
+                                engine.stop_sync_with_teardown(true);
+                            })
+                            .await;
                             {
                                 let mut guard =
                                     self.runtime.lock().unwrap_or_else(|e| e.into_inner());
@@ -3730,7 +4248,141 @@ impl GlobalPreAccelManager {
         }
     }
 
-    /// Deterministically stop transparent interception and terminate the standalone :443 tunnel.
+    /// Stop only the active WinDivert packet-interception handle for an imminent hot reload
+    /// without stopping the `WinDivert` kernel driver service (avoiding Win32 error 1072 races)
+    /// and without interrupting the standalone `:443` SOCKS5 tunnel.
+    pub async fn stop_windivert_for_reload(&self) -> CatResult<GlobalPreAccelStatus> {
+        let _op = self.op_lock.lock().await;
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        {
+            let engine_opt = {
+                let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(rt) = rt_guard.as_mut() {
+                    let taken = rt.engine.take();
+                    if taken.is_some() {
+                        rt.mode = "local_socks5".to_string();
+                    }
+                    taken
+                } else {
+                    None
+                }
+            };
+            if let Some(mut engine) = engine_opt {
+                let _ = tokio::task::spawn_blocking(move || {
+                    engine.stop_sync_with_teardown(false);
+                })
+                .await;
+                self.metrics.clear_active_connections();
+            }
+        }
+        Ok(self.status())
+    }
+
+    /// Hot-rebuild the running WinDivert transparent engine (and, when relay/probe settings
+    /// changed, the standalone `:443` tunnel) using `stop_sync_with_teardown(false)` so the
+    /// `WinDivert` kernel service stays loaded across reloads without triggering Win32 1072 errors.
+    ///
+    /// Returns the current idle status without launching anything if the manager is not running.
+    pub async fn restart_windivert_if_running(
+        &self,
+        cfg: &AppConfig,
+        relays: &[PreAccelRelay],
+        extra_excluded_pids: &[u32],
+    ) -> CatResult<GlobalPreAccelStatus> {
+        let _op = self.op_lock.lock().await;
+        let runtime_info = {
+            let rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            rt_guard.as_ref().map(|rt| {
+                #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+                let has_engine = rt.engine.is_some();
+                #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+                let has_engine = false;
+                (
+                    rt.socks_port,
+                    rt.bound_physical_interface.clone(),
+                    rt.tunnel.config_sha256().to_string(),
+                    has_engine,
+                )
+            })
+        };
+        let Some((socks_port, bound_if, current_yaml_sha, has_windivert_engine)) = runtime_info
+        else {
+            return Ok(self.status());
+        };
+
+        let next_yaml_sha = compile_standalone_preaccel_yaml_with_interface(
+            cfg,
+            relays,
+            socks_port,
+            bound_if.as_deref(),
+        )
+        .ok()
+        .map(|yaml| hex::encode(Sha256::digest(yaml.as_bytes())));
+        let tunnel_changed = next_yaml_sha.as_deref() != Some(current_yaml_sha.as_str());
+
+        if tunnel_changed {
+            return self
+                .start_locked(cfg, relays, extra_excluded_pids, &_op)
+                .await;
+        }
+
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        {
+            if has_windivert_engine {
+                let old_engine = {
+                    let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(rt) = rt_guard.as_mut() {
+                        let taken = rt.engine.take();
+                        if taken.is_some() {
+                            rt.mode = "local_socks5".to_string();
+                        }
+                        taken
+                    } else {
+                        None
+                    }
+                };
+                if let Some(mut engine) = old_engine {
+                    let _ = tokio::task::spawn_blocking(move || {
+                        engine.stop_sync_with_teardown(false);
+                    })
+                    .await;
+                    self.metrics.clear_active_connections();
+                }
+                return self
+                    .upgrade_to_windivert_in_place_locked(cfg, relays, extra_excluded_pids, &_op)
+                    .await;
+            }
+        }
+
+        {
+            let mut dir_guard = self
+                .custom_windivert_dir
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *dir_guard = cfg.preaccel.windivert_dir.clone();
+        }
+
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            if !has_windivert_engine
+                && default_platform().capabilities().is_elevated
+                && locate_windivert_paths(&self.paths, cfg.preaccel.windivert_dir.as_deref())
+                    .is_some()
+            {
+                return self
+                    .upgrade_to_windivert_in_place_locked(cfg, relays, extra_excluded_pids, &_op)
+                    .await;
+            }
+        }
+
+        #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+        let _ = (extra_excluded_pids, has_windivert_engine);
+
+        Ok(self.status())
+    }
+
+    /// Deterministically stop transparent interception (including stopping the WinDivert kernel
+    /// service cleanly) and terminate the standalone :443 tunnel, clearing stale process cards.
     pub async fn stop(&self) -> CatResult<GlobalPreAccelStatus> {
         let _op = self.op_lock.lock().await;
         let current = {
@@ -3738,9 +4390,9 @@ impl GlobalPreAccelManager {
             rt_guard.take()
         };
         if let Some(rt) = current {
-            rt.stop().await;
+            rt.stop(true).await;
         }
-        self.metrics.clear_active_connections();
+        self.metrics.reset();
         self.reset_verify_snapshot();
         self.set_last_error(None);
         Ok(self.status())
@@ -3968,6 +4620,8 @@ mod tests {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         }
     }
 
@@ -3988,6 +4642,8 @@ mod tests {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         }
     }
 
@@ -5663,5 +6319,423 @@ mod tests {
         assert_eq!(reverified.mode, "off");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn process_stats_dedup_by_lowercase_name_upgrades_detected_by_priority_and_prevents_active_leak()
+    {
+        let metrics = GlobalPreAccelMetrics::default();
+
+        // Unknown/empty labels normalize to lowest-priority `"runtime"` (0).
+        metrics.record_process_connection_open(1000, "ProxyCore.exe", "");
+        let snap0 = metrics.snapshot();
+        assert_eq!(snap0.len(), 1);
+        assert_eq!(snap0[0].detected_by, "runtime");
+
+        // Same executable across different PIDs, casing, and detection labels must merge into one card
+        // and monotonically promote priority: runtime(0) < scope_all(1) < manual(2) <
+        // local_proxy_listener(3) < open_core_name(4) < system_proxy_host(5).
+        metrics.record_process_connection_open(1001, "ProxyCore.exe", "scope_all");
+        assert_eq!(metrics.snapshot()[0].detected_by, "scope_all");
+        metrics.record_process_connection_open(1002, "proxycore.exe", "manual");
+        assert_eq!(metrics.snapshot()[0].detected_by, "manual");
+        metrics.record_process_connection_open(1003, "PROXYCORE.EXE", "local_proxy_listener");
+        assert_eq!(metrics.snapshot()[0].detected_by, "local_proxy_listener");
+        metrics.record_process_connection_open(1004, "proxycore.exe", "open_core_name");
+        assert_eq!(metrics.snapshot()[0].detected_by, "open_core_name");
+        metrics.record_process_connection_open(1005, "proxycore.exe", "system_proxy_host");
+        assert_eq!(metrics.snapshot()[0].detected_by, "system_proxy_host");
+        // Lower-priority subsequent open must NEVER downgrade `detected_by`.
+        metrics.record_process_connection_open(1006, "proxycore.exe", "manual");
+        metrics.record_process_bytes(1006, "proxycore.exe", "scope_all", 128, 256);
+
+        let snap1 = metrics.snapshot();
+        assert_eq!(snap1.len(), 1);
+        assert_eq!(snap1[0].process_name, "ProxyCore.exe");
+        assert_eq!(snap1[0].pid, 1006);
+        assert_eq!(snap1[0].detected_by, "system_proxy_host");
+        assert_eq!(snap1[0].active_connections, 7);
+        assert_eq!(snap1[0].total_connections, 7);
+        assert_eq!(snap1[0].tx_bytes, 128);
+        assert_eq!(snap1[0].rx_bytes, 256);
+
+        // Closing with old PIDs and old detection labels must still decrement cleanly to 0.
+        for (pid, label) in [
+            (1000, "runtime"),
+            (1001, "scope_all"),
+            (1002, "manual"),
+            (1003, "local_proxy_listener"),
+            (1004, "open_core_name"),
+            (1005, "system_proxy_host"),
+            (9999, "runtime"),
+        ] {
+            metrics.record_process_connection_close(pid, "PROXYCORE.EXE", label);
+        }
+        let snap2 = metrics.snapshot();
+        assert_eq!(snap2.len(), 1);
+        assert_eq!(snap2[0].active_connections, 0);
+        assert_eq!(snap2[0].detected_by, "system_proxy_host");
+    }
+
+    #[tokio::test]
+    async fn manager_stop_clears_stale_process_cards_and_reload_helpers_are_noop_when_idle() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-stop-clear-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.join("data"), true).unwrap();
+        let job_guard = Arc::new(JobGuard::new().unwrap());
+        let manager = GlobalPreAccelManager::new(paths, job_guard);
+        let cfg = AppConfig::default();
+        let relays = vec![sample_anytls_relay_with_dirty_sni()];
+
+        // Simulate active telemetry from a prior session.
+        manager
+            .metrics
+            .record_process_connection_open(4100, "mihomo.exe", "open_core_name");
+        manager
+            .metrics
+            .record_process_bytes(4100, "mihomo.exe", "open_core_name", 1024, 2048);
+        assert_eq!(manager.status().process_stats.len(), 1);
+        assert_eq!(manager.status().accelerated_processes.len(), 1);
+
+        // Stopping must wipe both `process_stats` and `accelerated_processes` completely.
+        let stopped = manager.stop().await.expect("stop manager");
+        assert!(!stopped.running);
+        assert_eq!(stopped.mode, "off");
+        assert!(stopped.process_stats.is_empty());
+        assert!(stopped.accelerated_processes.is_empty());
+
+        // Reload helpers on an idle manager must remain safe no-ops without starting runtime.
+        let after_stop_reload = manager
+            .stop_windivert_for_reload()
+            .await
+            .expect("stop_windivert_for_reload when idle");
+        assert!(!after_stop_reload.running);
+        let after_restart = manager
+            .restart_windivert_if_running(&cfg, &relays, &[])
+            .await
+            .expect("restart_windivert_if_running when idle");
+        assert!(!after_restart.running);
+        assert_eq!(after_restart.mode, "off");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_non_proxy_communication_process_filters_im_browsers_ides_without_hitting_ssh_git_or_manual()
+    {
+        for blocked in [
+            "QQ.exe",
+            r"C:\Program Files\Tencent\QQNT\QQNT.exe",
+            "QQProtect.exe",
+            "txupd.exe",
+            "TIM.exe",
+            "WeChat.exe",
+            "Weixin.exe",
+            "WeChatAppEx.exe",
+            "WeChatOCR.exe",
+            "DingTalk.exe",
+            "Feishu.exe",
+            "Lark.exe",
+            "WXWork.exe",
+            "QYWX.exe",
+            "wemeetapp.exe",
+            "TencentMeeting.exe",
+            "AliWangWang.exe",
+            "YY.exe",
+            "Foxmail.exe",
+            "chrome.exe",
+            "msedge.exe",
+            "firefox.exe",
+            "Code.exe",
+            "steam.exe",
+            "steamwebhelper.exe",
+            "cloudmusic.exe",
+            "QQMusic.exe",
+            "BaiduNetdisk.exe",
+            "wps.exe",
+        ] {
+            assert!(
+                is_non_proxy_communication_process(blocked),
+                "`{blocked}` must be classified as a non-proxy communication/desktop process"
+            );
+        }
+
+        // Must never misclassify SSH/Git/transfer tools or open-source proxy cores.
+        for allowed in [
+            "ssh.exe",
+            "git.exe",
+            "scp.exe",
+            "rsync.exe",
+            "mihomo.exe",
+            "xray.exe",
+            "sing-box.exe",
+            "proxy-engine.exe",
+            "",
+        ] {
+            assert!(
+                !is_non_proxy_communication_process(allowed),
+                "`{allowed}` must NOT be classified as a non-proxy communication process"
+            );
+        }
+
+        // User manual target list still works even if a user explicitly adds an app name.
+        let manual_targets: HashSet<String> = ["ssh.exe", "git.exe", "qq.exe"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let empty_excl = HashSet::new();
+        let empty_det = HashMap::new();
+        assert_eq!(
+            classify_intercept_process(
+                5001,
+                Some("ssh.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &manual_targets,
+                &empty_excl,
+                &empty_det
+            ),
+            Some("manual")
+        );
+        assert_eq!(
+            classify_intercept_process(
+                5002,
+                Some("qq.exe"),
+                GlobalPreAccelScope::ProxyAppsOnly,
+                &manual_targets,
+                &empty_excl,
+                &empty_det
+            ),
+            Some("manual")
+        );
+    }
+
+    #[test]
+    fn cn_ipv4_ranges_are_strictly_sorted_disjoint_and_is_domestic_ipv4_classifies_accurately() {
+        assert!(!CN_IPV4_RANGES.is_empty());
+        for pair in CN_IPV4_RANGES.windows(2) {
+            let (s0, e0) = pair[0];
+            let (s1, e1) = pair[1];
+            assert!(s0 <= e0, "invalid range {s0:#010X}..={e0:#010X}");
+            assert!(s1 <= e1, "invalid range {s1:#010X}..={e1:#010X}");
+            assert!(
+                e0 < s1,
+                "CN_IPV4_RANGES must be strictly ascending & non-overlapping: {e0:#010X} >= {s1:#010X}"
+            );
+        }
+
+        // All 13 whitelisted domestic public DNS IPs & major CN ISP/cloud/CERNET hex samples match.
+        for &dns_ip in DOMESTIC_PUBLIC_DNS_IPV4S {
+            assert!(is_domestic_ipv4(dns_ip), "domestic DNS {dns_ip} must match CN table");
+        }
+        for hex_cn in [
+            0xDCB5_2694u32, // China Telecom web portal range
+            0x279C_420Au32, // China Mobile range
+            0xB702_ACB9u32, // China Telecom GD range
+            0x6F0D_65D0u32, // China Mobile core range
+            0x2F60_0101u32, // Alibaba Cloud CN range
+            0x7904_0101u32, // Tencent Cloud CN range
+            0x72D4_0101u32, // CERNET range
+            0xCA70_0E97u32, // CERNET backbone range
+            0xA66F_0464u32, // CERNET university range
+        ] {
+            let ip = Ipv4Addr::from(hex_cn);
+            assert!(
+                is_domestic_ipv4(ip),
+                "expected hex {hex_cn:#010X} to be domestic CN IPv4"
+            );
+        }
+
+        // Overseas public IPs, overseas cloud ranges, private LAN, Fake-IP, and RFC 5737 must return false.
+        for hex_non_cn in [
+            0x0101_0101u32, // Cloudflare DNS
+            0x0808_0808u32, // Google DNS
+            0x0909_0909u32, // Quad9 DNS
+            0x6812_0001u32, // Overseas CDN
+            0x8EFA_0101u32, // Overseas search edge
+            0x8C52_7904u32, // Overseas git forge
+            0xACD9_A04Eu32, // Overseas search cloud
+            0x2F4A_0101u32, // Overseas cloud node
+            0x2B82_0101u32, // Overseas cloud node
+            0x6520_0101u32, // Overseas cloud node
+            0x771C_0101u32, // Overseas cloud node
+            0x0A00_0001u32, // RFC 1918
+            0x7F00_0001u32, // Loopback
+            0xC0A8_0101u32, // RFC 1918
+            0xC612_0001u32, // Fake-IP
+            0xCB00_710Au32, // RFC 5737
+        ] {
+            let ip = Ipv4Addr::from(hex_non_cn);
+            assert!(
+                !is_domestic_ipv4(ip),
+                "expected hex {hex_non_cn:#010X} NOT to match CN IPv4 table"
+            );
+        }
+    }
+
+    #[test]
+    fn build_windivert_filter_with_options_toggles_443_and_excludes_13_domestic_dns_ips() {
+        let relays = [Ipv4Addr::new(203, 0, 113, 10)];
+
+        let filter_skip = build_windivert_filter_with_options(&relays, 55000, true);
+        assert!(filter_skip.contains("tcp.DstPort != 443"));
+        assert!(filter_skip.contains("tcp.DstPort != 53"));
+        assert!(filter_skip.contains("ip.DstAddr != 203.0.113.10"));
+        assert_eq!(DOMESTIC_PUBLIC_DNS_IPV4S.len(), 13);
+        for &dns_ip in DOMESTIC_PUBLIC_DNS_IPV4S {
+            let clause = format!("ip.DstAddr != {dns_ip}");
+            assert!(
+                filter_skip.contains(&clause),
+                "missing domestic DNS exclusion `{clause}`"
+            );
+        }
+
+        let filter_include_443 = build_windivert_filter_with_options(&relays, 55000, false);
+        assert!(!filter_include_443.contains("tcp.DstPort != 443"));
+        assert!(filter_include_443.contains("tcp.DstPort != 53"));
+        assert!(filter_include_443.contains("ip.DstAddr != 203.0.113.10"));
+        for &dns_ip in DOMESTIC_PUBLIC_DNS_IPV4S {
+            assert!(filter_include_443.contains(&format!("ip.DstAddr != {dns_ip}")));
+        }
+    }
+
+    #[test]
+    fn should_intercept_port_443_enforces_skip_flag_proxy_tags_and_non_domestic_dst() {
+        let overseas_dst = Ipv4Addr::from(0x6812_0001u32);
+        let domestic_dst = Ipv4Addr::from(0xDCB5_2694u32);
+
+        // skip_443_native == true always rejects 443 regardless of label or destination.
+        assert!(!should_intercept_port_443("system_proxy_host", true, overseas_dst));
+        assert!(!should_intercept_port_443("open_core_name", true, overseas_dst));
+
+        // skip_443_native == false allows ONLY exact proxy-core tags to non-domestic IPs.
+        for allowed_tag in ["system_proxy_host", "local_proxy_listener", "open_core_name"] {
+            assert!(should_intercept_port_443(allowed_tag, false, overseas_dst));
+            assert!(!should_intercept_port_443(allowed_tag, false, domestic_dst));
+        }
+
+        // manual & scope_all & unknown must ALWAYS bypass 443 even when skip_443_native == false.
+        for denied_tag in ["manual", "scope_all", "unknown", "self_test"] {
+            assert!(!should_intercept_port_443(denied_tag, false, overseas_dst));
+        }
+    }
+
+    #[test]
+    fn nat_table_lockfree_port_bitmap_and_copy_packet_view_stay_in_sync_across_insert_evict_remove()
+    {
+        let table = NatTable::new(2, Duration::from_secs(60));
+        let now = Instant::now();
+        let k1 = (Ipv4Addr::LOCALHOST, 45001);
+        let k2 = (Ipv4Addr::LOCALHOST, 45002);
+        let k3 = (Ipv4Addr::LOCALHOST, 45003);
+
+        assert!(!table.may_contain_port(45001));
+        assert!(table.get_packet_view_and_touch(&k1).is_none());
+
+        table.insert(
+            k1,
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
+                orig_dst_port: 8443,
+                if_idx: 3,
+                sub_if_idx: 1,
+                owner_pid: 1111,
+                process_name: "mihomo.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: now - Duration::from_secs(10),
+                closing_since: None,
+            },
+        );
+        assert!(table.may_contain_port(45001));
+        let view1 = table.get_packet_view_and_touch(&k1).expect("view1");
+        assert_eq!(view1.orig_dst_ip, Ipv4Addr::new(203, 0, 113, 10));
+        assert_eq!(view1.orig_dst_port, 8443);
+        assert_eq!(view1.if_idx, 3);
+        assert_eq!(view1.sub_if_idx, 1);
+        assert!(!view1.is_closing);
+        assert!(!view1.is_self_test);
+
+        // Insert k2 and k3 to trigger LRU eviction (k1 has older last_seen before touch? set k1 older again).
+        table.insert(
+            k1,
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
+                orig_dst_port: 8443,
+                if_idx: 3,
+                sub_if_idx: 1,
+                owner_pid: 1111,
+                process_name: "mihomo.exe".to_string(),
+                detected_by: SELF_TEST_DETECTED_BY.to_string(),
+                last_seen: now - Duration::from_secs(20),
+                closing_since: None,
+            },
+        );
+        assert!(table.get_packet_view_and_touch(&k1).unwrap().is_self_test);
+        // Re-age k1 so k1 is oldest when k3 forces eviction.
+        table.insert(
+            k1,
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
+                orig_dst_port: 8443,
+                if_idx: 3,
+                sub_if_idx: 1,
+                owner_pid: 1111,
+                process_name: "mihomo.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: now - Duration::from_secs(30),
+                closing_since: None,
+            },
+        );
+        table.insert(
+            k2,
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 20),
+                orig_dst_port: 9443,
+                if_idx: 3,
+                sub_if_idx: 0,
+                owner_pid: 2222,
+                process_name: "xray.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: now - Duration::from_secs(5),
+                closing_since: None,
+            },
+        );
+        table.insert(
+            k3,
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 10),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 30),
+                orig_dst_port: 2053,
+                if_idx: 3,
+                sub_if_idx: 0,
+                owner_pid: 3333,
+                process_name: "ssh.exe".to_string(),
+                detected_by: "manual".to_string(),
+                last_seen: now,
+                closing_since: None,
+            },
+        );
+
+        // Evicted k1 must have its bitmap bit cleared while k2 & k3 remain set.
+        assert!(!table.may_contain_port(45001));
+        assert!(table.may_contain_port(45002));
+        assert!(table.may_contain_port(45003));
+
+        // Direct removal clears bitmap bit cleanly.
+        assert!(table.remove(&k2).is_some());
+        assert!(!table.may_contain_port(45002));
+        assert!(table.remove_active_if_matching(
+            &k3,
+            Ipv4Addr::new(192, 0, 2, 10),
+            Ipv4Addr::new(203, 0, 113, 30),
+            2053
+        ));
+        assert!(!table.may_contain_port(45003));
+        assert!(table.is_empty());
     }
 }

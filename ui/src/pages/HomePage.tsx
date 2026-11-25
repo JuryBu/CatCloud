@@ -2,10 +2,9 @@ import {
   Activity,
   AlertTriangle,
   ArrowDown,
+  ArrowLeftRight,
   ArrowRight,
   ArrowUp,
-  BookOpen,
-  Check,
   CheckCircle2,
   ChevronDown,
   Clock,
@@ -16,13 +15,13 @@ import {
   HardDriveDownload,
   HardDriveUpload,
   Layers,
+  Link2,
   Minimize2,
   PictureInPicture2,
   Plus,
   Power,
   RefreshCw,
   RotateCcw,
-  ScrollText,
   Search,
   Server,
   ShieldAlert,
@@ -45,18 +44,18 @@ import {
   catcloudApi,
   formatErrorMessage,
 } from "../api/tauri";
-import { MASCOT_STATE_LABELS, type MascotState, MascotSprite } from "../components/MascotSprite";
+import { type MascotState, MascotSprite } from "../components/MascotSprite";
 import { TrafficSparkline, formatBytes, formatRate } from "../components/TrafficSparkline";
-import { appActions, useAppSelector, useLatestTraffic } from "../store/appStore";
+import { normalizeUiLanguage, useUiDict } from "../i18n";
+import {
+  appActions,
+  selectHasBackgroundActivity,
+  useAppSelector,
+  useLatestTraffic,
+} from "../store/appStore";
 import { resolvePlatformOs } from "../utils/platform";
 import { resolvePreAccelSummary } from "../utils/preaccelStatus";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
-
-const PROXY_MODE_OPTIONS: ReadonlyArray<{ id: ProxyMode; label: string; hint: string }> = [
-  { id: "rule", label: "规则", hint: "国内直连、海外自动走代理" },
-  { id: "global", label: "全局", hint: "所有网站全部走当前代理" },
-  { id: "direct", label: "直连", hint: "暂时绕过代理直接联网" },
-];
 
 const MAX_VISIBLE_QUICK_NODES = 60;
 
@@ -159,16 +158,26 @@ function getLatencyColor(latencyMs: number | null, ok: boolean | null): string {
 
 const HomeLiveKpiGrid = memo(function HomeLiveKpiGrid({
   connectionSubLabel,
-  memSubLabel,
+  kernelMemoryTitle,
+  kernelMemorySub,
+  kernelMemoryTooltip,
+  gomemlimitMb,
 }: {
   connectionSubLabel: string;
-  memSubLabel: string;
+  kernelMemoryTitle: string;
+  kernelMemorySub: string;
+  kernelMemoryTooltip: string;
+  gomemlimitMb: number;
 }) {
   const traffic = useLatestTraffic();
   const tunnelCount = traffic.tunnel_connections ?? 0;
   const compactConnBase = connectionSubLabel.replace("已接管", "");
   const connSub =
     tunnelCount > 0 ? `${compactConnBase} · 含 ${tunnelCount} 隧道` : connectionSubLabel;
+  const memoryTooltip =
+    gomemlimitMb > 0
+      ? `${kernelMemoryTooltip}（核心内存上限 ${gomemlimitMb} MB）`
+      : kernelMemoryTooltip;
 
   const kpiCards = [
     {
@@ -215,10 +224,10 @@ const HomeLiveKpiGrid = memo(function HomeLiveKpiGrid({
       icon: HardDriveDownload,
     },
     {
-      label: "内核内存",
+      label: kernelMemoryTitle,
       value: `${traffic.memory_mb.toFixed(1)} MB`,
-      sub: memSubLabel,
-      title: undefined as string | undefined,
+      sub: kernelMemorySub,
+      title: memoryTooltip,
       accent: "var(--green)",
       icon: Cpu,
     },
@@ -249,6 +258,155 @@ const HomeLiveKpiGrid = memo(function HomeLiveKpiGrid({
         );
       })}
     </div>
+  );
+});
+
+const HIGH_TRAFFIC_THRESHOLD_BPS = 512 * 1024;
+const MASCOT_PAT_DURATION_MS = 2500;
+
+interface MascotLabelSet {
+  idle: string;
+  ok: string;
+  preaccel: string;
+  searching: string;
+  thinking: string;
+  typing: string;
+  approval: string;
+  complete: string;
+  pat: string;
+}
+
+/**
+ * Isolated real-time mascot panel subscribing to 1Hz traffic telemetry independently
+ * so the rest of HomePage never re-renders on traffic ticks.
+ * Clicking triggers a local 2.5s head-pat Easter egg and restores real live state automatically.
+ */
+const HomeMascotPanel = memo(function HomeMascotPanel({
+  needsApproval,
+  isSearching,
+  isThinking,
+  storeMascotState,
+  coreRunning,
+  proxyActive,
+  preaccelActive,
+  directMode,
+  labels,
+  patTooltip,
+}: {
+  needsApproval: boolean;
+  isSearching: boolean;
+  isThinking: boolean;
+  storeMascotState: MascotState;
+  coreRunning: boolean;
+  proxyActive: boolean;
+  preaccelActive: boolean;
+  directMode: boolean;
+  labels: MascotLabelSet;
+  patTooltip: string;
+}) {
+  const traffic = useLatestTraffic();
+  const [patting, setPatting] = useState(false);
+  const patTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (patTimerRef.current !== null) {
+        window.clearTimeout(patTimerRef.current);
+        patTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const handlePatMascot = () => {
+    setPatting(true);
+    if (patTimerRef.current !== null) {
+      window.clearTimeout(patTimerRef.current);
+    }
+    patTimerRef.current = window.setTimeout(() => {
+      patTimerRef.current = null;
+      setPatting(false);
+    }, MASCOT_PAT_DURATION_MS);
+  };
+
+  const isHighTraffic =
+    coreRunning && traffic.up_bps + traffic.down_bps > HIGH_TRAFFIC_THRESHOLD_BPS;
+
+  let effectiveMascotState: MascotState;
+  let effectiveLabel: string;
+
+  if (needsApproval || storeMascotState === "approval") {
+    effectiveMascotState = "approval";
+    effectiveLabel = labels.approval;
+  } else if (isSearching || storeMascotState === "searching") {
+    effectiveMascotState = "searching";
+    effectiveLabel = labels.searching;
+  } else if (isThinking || storeMascotState === "thinking") {
+    effectiveMascotState = "thinking";
+    effectiveLabel = labels.thinking;
+  } else if (storeMascotState === "typing") {
+    effectiveMascotState = "typing";
+    effectiveLabel = labels.typing;
+  } else if (storeMascotState === "complete") {
+    effectiveMascotState = "complete";
+    effectiveLabel = labels.complete;
+  } else if (isHighTraffic) {
+    effectiveMascotState = "typing";
+    effectiveLabel =
+      preaccelActive && !directMode
+        ? labels.preaccel
+        : proxyActive && !directMode
+          ? labels.ok
+          : labels.typing;
+  } else {
+    effectiveMascotState = "idle";
+    effectiveLabel =
+      preaccelActive && !directMode
+        ? labels.preaccel
+        : proxyActive && !directMode
+          ? labels.ok
+          : labels.idle;
+  }
+
+  const displayedState: MascotState = patting ? "complete" : effectiveMascotState;
+  const displayedLabel = patting ? labels.pat : effectiveLabel;
+
+  return (
+    <button
+      type="button"
+      onClick={handlePatMascot}
+      className={`relative hidden min-w-[92px] shrink-0 flex-col items-center justify-center rounded-2xl border px-2.5 py-2 text-center transition-colors sm:flex ${
+        patting
+          ? "border-[var(--accent)]/70 bg-[var(--accent-soft)]/55"
+          : displayedState === "approval"
+            ? "border-[var(--amber)]/65 bg-[var(--amber-soft)]/35 hover:border-[var(--amber)]"
+            : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
+      }`}
+      title={`${displayedLabel} · ${patTooltip}`}
+      aria-label={`${displayedLabel} · ${patTooltip}`}
+    >
+      {patting && (
+        <span
+          aria-live="polite"
+          className="pointer-events-none absolute -top-2.5 left-1/2 -translate-x-1/2 whitespace-nowrap rounded-full border border-[var(--accent)]/55 bg-[var(--surface)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent)] shadow-xs"
+        >
+          {labels.pat}
+        </span>
+      )}
+      <div className="flex h-[68px] w-[68px] items-end justify-center pb-0.5">
+        <MascotSprite state={displayedState} scale={2} title={displayedLabel} />
+      </div>
+      <div
+        className={`mt-1.5 max-w-[104px] truncate whitespace-nowrap leading-none text-[10px] ${
+          patting
+            ? "font-semibold text-[var(--accent)]"
+            : displayedState === "approval"
+              ? "font-medium text-[var(--amber)]"
+              : "text-[var(--muted)]"
+        }`}
+      >
+        {displayedLabel}
+      </div>
+    </button>
   );
 });
 
@@ -283,20 +441,34 @@ const HomeLiveUptime = memo(function HomeLiveUptime({
       );
     };
 
-    const tickId = window.setInterval(() => {
-      if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
-      syncFromAnchor();
-    }, 1000);
+    let tickId: number | null = null;
+    const stopTick = () => {
+      if (tickId !== null) {
+        window.clearInterval(tickId);
+        tickId = null;
+      }
+    };
+    const startTick = () => {
+      if (tickId !== null) return;
+      tickId = window.setInterval(syncFromAnchor, 1000);
+    };
+
+    if (typeof document === "undefined" || document.visibilityState === "visible") {
+      startTick();
+    }
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === "visible") {
         syncFromAnchor();
+        startTick();
+      } else {
+        stopTick();
       }
     };
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
-      window.clearInterval(tickId);
+      stopTick();
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [running, uptimeSec]);
@@ -307,10 +479,17 @@ const HomeLiveUptime = memo(function HomeLiveUptime({
 export function HomePage() {
   const runtime = useAppSelector((s) => s.runtime);
   const config = useAppSelector((s) => s.config);
+  const uiLang = useAppSelector((s) =>
+    normalizeUiLanguage(s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const groups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
+  const probeProgress = useAppSelector((s) => s.probeProgress);
+  const bgActivity = useAppSelector(selectHasBackgroundActivity);
+  const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
   const subscriptions = useAppSelector((s) => s.subscriptions);
   const exitIp = useAppSelector((s) => s.exitIp);
   const sites = useAppSelector((s) => s.quickSites);
@@ -332,25 +511,21 @@ export function HomePage() {
   const [pendingRemoveSite, setPendingRemoveSite] = useState<SiteCheckItem | null>(null);
   const [removingSite, setRemovingSite] = useState(false);
 
-  const [copyingAiDiag, setCopyingAiDiag] = useState(false);
-  const [copiedAiDiag, setCopiedAiDiag] = useState(false);
-  const [copyingAiOnboarding, setCopyingAiOnboarding] = useState(false);
-  const [copiedAiOnboarding, setCopiedAiOnboarding] = useState(false);
-
-  const timerIdsRef = useRef<number[]>([]);
   const nodeDropdownRef = useRef<HTMLDivElement | null>(null);
   const nodeSearchInputRef = useRef<HTMLInputElement | null>(null);
 
   const isSingleMode = runtime.route_mode === "single";
 
-  useEffect(() => {
-    return () => {
-      for (const id of timerIdsRef.current) {
-        window.clearTimeout(id);
-      }
-      timerIdsRef.current = [];
-    };
-  }, []);
+  const proxyModeOptions = useMemo<
+    ReadonlyArray<{ id: ProxyMode; label: string; hint: string }>
+  >(
+    () => [
+      { id: "rule", label: dict.home.ruleMode, hint: "国内直连、海外自动走代理" },
+      { id: "global", label: dict.home.globalMode, hint: "所有网站全部走当前代理" },
+      { id: "direct", label: dict.home.directMode, hint: "暂时绕过代理直接联网" },
+    ],
+    [dict.home.directMode, dict.home.globalMode, dict.home.ruleMode]
+  );
 
   useEffect(() => {
     if (!pendingRemoveSite) return;
@@ -399,14 +574,6 @@ export function HomePage() {
     const tid = window.setTimeout(() => nodeSearchInputRef.current?.focus(), 20);
     return () => window.clearTimeout(tid);
   }, [nodeMenuOpen]);
-
-  const scheduleTimeout = (fn: () => void, ms: number) => {
-    const id = window.setTimeout(() => {
-      timerIdsRef.current = timerIdsRef.current.filter((item) => item !== id);
-      fn();
-    }, ms);
-    timerIdsRef.current.push(id);
-  };
 
   // Active group & candidate nodes for the interactive route selector
   const activeGroup = useMemo(() => {
@@ -638,12 +805,12 @@ export function HomePage() {
     : "一键开启国内提速（开启后猫猫云梯与电脑上其它代理软件都会一起走国内 443 提速）";
 
   const preAccelPillLabel = (() => {
-    if (!preaccelSummary.enabled) return "国内提速";
+    if (!preaccelSummary.enabled) return dict.home.preaccel;
     if (!isProxyEnabled) {
       if (preaccelSummary.realWinDivertActive) {
-        if (preaccelSummary.verifyState === "probing") return "探测中…";
-        if (preaccelSummary.verifyState === "verified") return "已探测畅通";
-        return "全局提速中";
+        if (preaccelSummary.verifyState === "probing") return `${dict.nav.preaccelProbingBadge}…`;
+        if (preaccelSummary.verifyState === "verified") return dict.nav.preaccelVerifiedBadge;
+        return dict.nav.preaccelActiveBadge;
       }
       if (
         preaccelSummary.installState === "downloading" ||
@@ -652,10 +819,10 @@ export function HomePage() {
         return "准备组件…";
       }
       if (preaccelSummary.installState === "need_elevation") return "需管理员";
-      if (preaccelSummary.verifyState === "probing") return "探测中…";
-      if (preaccelSummary.verifyState === "degraded") return "已保护回退";
+      if (preaccelSummary.verifyState === "probing") return `${dict.nav.preaccelProbingBadge}…`;
+      if (preaccelSummary.verifyState === "degraded") return dict.nav.preaccelDegradedBadge;
     }
-    return "国内提速";
+    return dict.home.preaccel;
   })();
 
   const tunPillTitle = runtime.tun_admin_ready
@@ -676,13 +843,40 @@ export function HomePage() {
     }
   };
 
-  // Dual-form mascot: cream cat idle by default, working sprite during probing/switching/toggling
-  const effectiveMascotState: MascotState =
-    checkingSites || refreshingIp
-      ? "searching"
-      : switchingNode || togglingProxy || togglingPreAccel
-        ? "thinking"
-        : mascotState;
+  // Real-time live state signals driving HomeMascotPanel (zero fake binary toggle)
+  const needsMascotApproval = Boolean(
+    tunAdminPromptOpen ||
+      runtime.captive_portal_required ||
+      runtime.status === "error" ||
+      runtime.status === "warn" ||
+      runtime.active_group_circuit_open ||
+      globalPreAccel.verify_state === "degraded" ||
+      globalPreAccel.verify_state === "failed" ||
+      preaccelSummary.verifyState === "degraded" ||
+      preaccelSummary.verifyState === "failed"
+  );
+  const isMascotSearching = Boolean(
+    checkingSites ||
+      refreshingIp ||
+      probeProgress.running ||
+      bgActivity.nodes ||
+      bgActivity.preaccel ||
+      bgActivity.home ||
+      runtime.probing_active ||
+      preaccelSummary.verifyState === "probing"
+  );
+  const isMascotThinking = Boolean(
+    switchingNode ||
+      togglingProxy ||
+      togglingPreAccel ||
+      bgActivity.groups ||
+      bgActivity.settings ||
+      runtime.switching_active
+  );
+  const isPreAccelGuarding = Boolean(
+    preaccelSummary.enabled &&
+      (runtime.preaccel_active || preaccelSummary.realWinDivertActive)
+  );
 
   const handleToggleMainPower = async () => {
     if (togglingProxy) return;
@@ -840,34 +1034,6 @@ export function HomePage() {
     await appActions.runRefreshExitIp();
   };
 
-  const handleCopyAiOnboarding = async () => {
-    if (copyingAiOnboarding) return;
-    setCopyingAiOnboarding(true);
-    try {
-      const ok = await appActions.copyAiOnboardingForUser();
-      if (ok) {
-        setCopiedAiOnboarding(true);
-        scheduleTimeout(() => setCopiedAiOnboarding(false), 2200);
-      }
-    } finally {
-      setCopyingAiOnboarding(false);
-    }
-  };
-
-  const handleCopyAiDiag = async () => {
-    if (copyingAiDiag) return;
-    setCopyingAiDiag(true);
-    try {
-      const ok = await appActions.copySanitizedDiagnosticsForAi();
-      if (ok) {
-        setCopiedAiDiag(true);
-        scheduleTimeout(() => setCopiedAiDiag(false), 2200);
-      }
-    } finally {
-      setCopyingAiDiag(false);
-    }
-  };
-
   const connectionSubLabel = runtime.tun_enabled
     ? "虚拟网卡已接管"
     : runtime.system_proxy_enabled
@@ -881,11 +1047,6 @@ export function HomePage() {
             ? "已保护回退"
             : "本地通道待命"
           : "本地待命";
-
-  const memSubLabel =
-    config.gomemlimit_mb === 0
-      ? "自动省内存"
-      : `上限 ${config.gomemlimit_mb} MB`;
 
   // Determine whether exit IP has actually been probed
   const hasExitIpData = hasRealExitIp(exitIp);
@@ -936,65 +1097,47 @@ export function HomePage() {
 
   return (
     <div className="space-y-3 pb-3">
-      {/* Gentle two-step onboarding banner when no nodes have been imported yet */}
+      {/* 0-Node Onboarding Guide Card: car/fuel metaphor + 3 clear entry actions */}
       {initialized && nodes.length === 0 && (
         <section className="cc-card cc-glass rounded-2xl border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 p-4">
-          <div className="flex flex-col gap-3.5 lg:flex-row lg:items-center lg:justify-between">
-            <div className="space-y-2">
+          <div className="space-y-3">
+            <div className="space-y-1">
               <div className="flex items-center gap-2">
-                <Sparkles className="h-4 w-4 text-[var(--accent)]" />
-                <h2 className="text-sm font-semibold text-[var(--text)]">两步开始使用猫猫云梯</h2>
+                <Sparkles className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+                <h2 className="text-sm font-semibold text-[var(--text)]">
+                  {dict.home.emptyCardTitle}
+                </h2>
               </div>
-              <div className="flex flex-col gap-1.5 text-xs text-[var(--text-secondary)] sm:flex-row sm:items-center sm:gap-5">
-                <div className="flex items-center gap-2">
-                  <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[11px] font-bold text-[var(--accent-ink)]">
-                    1
-                  </span>
-                  <span>导入订阅链接，或从已有代理软件一键迁移节点</span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-[var(--accent)]/60 bg-[var(--card)] text-[11px] font-bold text-[var(--accent)]">
-                    2
-                  </span>
-                  <span>打开下方代理总开关，即可轻松上网</span>
-                </div>
-              </div>
-              <p className="text-[11px] text-[var(--muted)]">
-                不知道节点是什么？点一下直接粘给任意 AI，它会按你的当前画面手把手教你
+              <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+                {dict.home.emptyCardMetaphor}
               </p>
             </div>
 
-            <div className="flex shrink-0 flex-wrap items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => appActions.openNodesWorkspace("subs")}
-                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                onClick={() => appActions.openNodesWorkspace("subs", null, "migration")}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
               >
-                <span>去导入节点</span>
-                <ArrowRight className="h-3.5 w-3.5" />
+                <ArrowLeftRight className="h-3.5 w-3.5 shrink-0" />
+                <span>{dict.home.emptyStepMigrate}</span>
               </button>
 
               <button
                 type="button"
-                disabled={copyingAiOnboarding}
-                onClick={() => void handleCopyAiOnboarding()}
-                className={`inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl border px-3.5 py-2.5 text-xs font-semibold transition-colors disabled:opacity-60 ${
-                  copiedAiOnboarding
-                    ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
-                    : "border-[var(--accent)]/55 bg-[var(--card)] text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
-                }`}
-                title="一键复制新手上手指南与当前进度，粘给 ChatGPT / 豆包 / DeepSeek 即可手把手教学"
+                onClick={() => appActions.openNodesWorkspace("subs")}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl border border-[var(--accent)]/55 bg-[var(--card)] px-3.5 py-2 text-xs font-semibold text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
               >
-                {copiedAiOnboarding ? (
-                  <>
-                    <Check className="h-3.5 w-3.5 shrink-0" />
-                    <span>已复制上手指南</span>
-                  </>
-                ) : (
-                  <span>
-                    {copyingAiOnboarding ? "正在生成…" : "🤖 复制发给 AI，一步步教我用"}
-                  </span>
-                )}
+                <Link2 className="h-3.5 w-3.5 shrink-0" />
+                <span>{dict.home.emptyStepImport}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => appActions.openAiAssistant("onboarding", "web")}
+                className="inline-flex shrink-0 items-center justify-center gap-1 rounded-xl px-2 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--accent)] hover:underline"
+              >
+                <span>{dict.home.emptyStepAi}</span>
               </button>
             </div>
           </div>
@@ -1043,8 +1186,10 @@ export function HomePage() {
                           ? "正在关闭代理…"
                           : "正在开启代理…"
                         : isProxyEnabled
-                          ? "已开启代理"
-                          : "点击开启代理"}
+                          ? dict.home.powerOnTitle
+                          : preaccelSummary.realWinDivertActive
+                            ? dict.home.powerPreaccelOnlyTitle
+                            : dict.home.powerOffTitle}
                     </span>
                   </div>
                   <p
@@ -1071,7 +1216,7 @@ export function HomePage() {
                 role="group"
                 aria-label="代理模式"
               >
-                {PROXY_MODE_OPTIONS.map((mode) => {
+                {proxyModeOptions.map((mode) => {
                   const selected = runtime.proxy_mode === mode.id;
                   return (
                     <button
@@ -1104,7 +1249,7 @@ export function HomePage() {
                   title="接管浏览器和大多数常用软件"
                 >
                   <Wifi className="h-3.5 w-3.5" />
-                  <span>系统代理</span>
+                  <span>{dict.home.systemProxy}</span>
                 </button>
 
                 <button
@@ -1118,7 +1263,7 @@ export function HomePage() {
                   title={tunPillTitle}
                 >
                   <ShieldCheck className="h-3.5 w-3.5" />
-                  <span>虚拟网卡</span>
+                  <span>{dict.home.tunMode}</span>
                 </button>
 
                 <button
@@ -1694,31 +1839,22 @@ export function HomePage() {
                 )}
               </div>
 
-              {/* Dual-Form Mascot Panel */}
-              <button
-                type="button"
-                onClick={() =>
-                  appActions.setMascotState(
-                    effectiveMascotState === "idle"
-                      ? runtime.preaccel_active
-                        ? "complete"
-                        : "searching"
-                      : "idle"
-                  )
-                }
-                className="hidden min-w-[84px] shrink-0 flex-col items-center justify-center rounded-2xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-center transition-colors hover:border-[var(--line-strong)] sm:flex"
-                title="点击切换奶油猫饼待机与工作形态"
-              >
-                <div className="flex h-[68px] w-[68px] items-end justify-center pb-0.5">
-                  <MascotSprite state={effectiveMascotState} scale={2} />
-                </div>
-                <div className="mt-1.5 whitespace-nowrap leading-none text-[10px] text-[var(--muted)]">
-                  {MASCOT_STATE_LABELS[effectiveMascotState]}
-                </div>
-              </button>
+              {/* Real-Time Dynamic Mascot Panel (click for 2.5s local pat easter egg) */}
+              <HomeMascotPanel
+                needsApproval={needsMascotApproval}
+                isSearching={isMascotSearching}
+                isThinking={isMascotThinking}
+                storeMascotState={mascotState}
+                coreRunning={runtime.running}
+                proxyActive={isProxyEnabled}
+                preaccelActive={isPreAccelGuarding}
+                directMode={runtime.proxy_mode === "direct"}
+                labels={dict.mascot}
+                patTooltip={uiLang === "zh-CN" ? "点我揉揉小猫" : "Click to pat"}
+              />
             </div>
 
-            {/* Row 3: Mode-Aware Quick Actions */}
+            {/* Row 3: Mode-Aware Quick Actions (zero duplicate AI buttons; AI Hub lives in sidebar) */}
             <div className="flex flex-wrap items-center gap-2">
               {isSingleMode ? (
                 <>
@@ -1737,7 +1873,7 @@ export function HomePage() {
                     className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
                   >
                     <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
-                    <span>改用智能多选组</span>
+                    <span>{dict.home.switchGroup}</span>
                   </button>
                 </>
               ) : (
@@ -1749,7 +1885,7 @@ export function HomePage() {
                     className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
                   >
                     <Zap className="h-3.5 w-3.5" />
-                    <span>{switchingNode ? "正在切换…" : "换下一个更快节点"}</span>
+                    <span>{switchingNode ? "正在切换…" : dict.home.switchNextNode}</span>
                   </button>
 
                   <button
@@ -1758,7 +1894,7 @@ export function HomePage() {
                     className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
                   >
                     <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
-                    <span>切换多选组</span>
+                    <span>{dict.home.switchGroup}</span>
                   </button>
                 </>
               )}
@@ -1770,7 +1906,7 @@ export function HomePage() {
                 title="显示桌面小悬浮条"
               >
                 <PictureInPicture2 className="h-3.5 w-3.5 text-[var(--accent)]" />
-                <span>悬浮小窗</span>
+                <span>{dict.home.openCapsule}</span>
               </button>
 
               <button
@@ -1780,32 +1916,7 @@ export function HomePage() {
                 title="关闭主界面仅留托盘图标，大幅减少内存占用"
               >
                 <Minimize2 className="h-3.5 w-3.5 text-[var(--green)]" />
-                <span>托盘省内存</span>
-              </button>
-
-              <button
-                type="button"
-                disabled={copyingAiOnboarding}
-                onClick={() => void handleCopyAiOnboarding()}
-                className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors disabled:opacity-60 ${
-                  copiedAiOnboarding
-                    ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
-                    : "border-[var(--accent)]/40 bg-[var(--accent-soft)]/60 text-[var(--accent)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
-                }`}
-                title="复制新手上手指南与当前进度，直接粘贴给任意 AI 一步步教你用猫猫云梯"
-              >
-                {copiedAiOnboarding ? (
-                  <Check className="h-3.5 w-3.5 shrink-0" />
-                ) : (
-                  <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                )}
-                <span>
-                  {copiedAiOnboarding
-                    ? "已复制指南"
-                    : copyingAiOnboarding
-                      ? "生成中…"
-                      : "AI 带我用"}
-                </span>
+                <span>{dict.home.traySaveMem}</span>
               </button>
             </div>
           </div>
@@ -1817,7 +1928,10 @@ export function HomePage() {
         <TrafficSparkline variant="full" />
         <HomeLiveKpiGrid
           connectionSubLabel={connectionSubLabel}
-          memSubLabel={memSubLabel}
+          kernelMemoryTitle={dict.home.kernelMemoryTitle}
+          kernelMemorySub={dict.home.kernelMemorySub}
+          kernelMemoryTooltip={dict.home.kernelMemoryTooltip}
+          gomemlimitMb={config.gomemlimit_mb}
         />
       </section>
 
@@ -1827,7 +1941,9 @@ export function HomePage() {
         <div className="cc-card cc-glass rounded-2xl p-4 lg:col-span-7">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div>
-              <h2 className="text-sm font-semibold text-[var(--text)]">常用网站连通检测</h2>
+              <h2 className="text-sm font-semibold text-[var(--text)]">
+                {dict.home.quickSitesTitle}
+              </h2>
               <p className="mt-0.5 text-[11px] text-[var(--muted)]">
                 点击右侧「测一下」检测，平时零后台流量
               </p>
@@ -1958,7 +2074,9 @@ export function HomePage() {
               <div className="flex items-start gap-2">
                 <Globe className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
                 <div>
-                  <h2 className="text-sm font-semibold text-[var(--text)]">出口信息</h2>
+                  <h2 className="text-sm font-semibold text-[var(--text)]">
+                    {dict.home.exitInfoTitle}
+                  </h2>
                   <p className="mt-0.5 text-[11px] text-[var(--muted)]">
                     按需点击检测，默认不消耗流量
                   </p>
@@ -2041,84 +2159,6 @@ export function HomePage() {
               </div>
             </dl>
           </div>
-        </div>
-      </section>
-
-      {/* Compact Agent-Friendly Onboarding & Troubleshooting Strip */}
-      <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl border-[var(--accent)]/30 px-4 py-3">
-        <div className="flex min-w-0 flex-1 items-center gap-2.5">
-          <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
-            <Sparkles className="h-4 w-4" />
-          </span>
-          <div className="min-w-0">
-            <div className="flex flex-wrap items-center gap-1.5">
-              <h2 className="text-xs font-semibold text-[var(--text)]">
-                AI 新手指导与排障助手
-              </h2>
-              <span className="rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                自动隐私脱敏
-              </span>
-            </div>
-            <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-              新手不知道怎么下手，或遇到连不上、变慢、想调分流规则？一键复制发给任意 AI 帮你解决
-            </p>
-          </div>
-        </div>
-
-        <div className="flex shrink-0 flex-wrap items-center gap-1.5">
-          <button
-            type="button"
-            disabled={copyingAiOnboarding}
-            onClick={() => void handleCopyAiOnboarding()}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-            title="一键复制小白上手指南与当前进度，直接粘贴给任意 AI 就能手把手带你操作"
-          >
-            {copiedAiOnboarding ? (
-              <>
-                <Check className="h-3.5 w-3.5 shrink-0" />
-                <span>已复制上手指南</span>
-              </>
-            ) : (
-              <span>
-                {copyingAiOnboarding ? "正在生成…" : "🤖 复制上手指南给 AI（推荐小白）"}
-              </span>
-            )}
-          </button>
-
-          <button
-            type="button"
-            disabled={copyingAiDiag}
-            onClick={() => void handleCopyAiDiag()}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--accent)]/45 bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-semibold text-[var(--accent)] transition-opacity hover:opacity-90 disabled:opacity-60"
-            title="一键复制脱敏后的运行状态、最近日志与只读 CLI 指引，直接粘贴给 AI 助手排查故障"
-          >
-            {copiedAiDiag ? (
-              <>
-                <Check className="h-3.5 w-3.5 shrink-0" />
-                <span>已复制诊断包</span>
-              </>
-            ) : (
-              <span>{copyingAiDiag ? "正在打包…" : "🩺 复制排障诊断给 AI"}</span>
-            )}
-          </button>
-
-          <button
-            type="button"
-            onClick={() => appActions.setNav("logs")}
-            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-          >
-            <ScrollText className="h-3.5 w-3.5 text-[var(--muted)]" />
-            <span>查看运行日志 →</span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => appActions.openSettingsAgentDocs()}
-            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-          >
-            <BookOpen className="h-3.5 w-3.5 text-[var(--accent)]" />
-            <span>AI 协作指南 →</span>
-          </button>
         </div>
       </section>
 
@@ -2214,7 +2254,7 @@ export function HomePage() {
                   onClick={() => setPendingRemoveSite(null)}
                   className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text)] disabled:opacity-50"
                 >
-                  取消
+                  {dict.common.cancel}
                 </button>
                 <button
                   type="button"

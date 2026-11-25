@@ -88,6 +88,20 @@ impl AppPaths {
         if flag.is_file() || sibling_data.is_dir() {
             return (sibling_data, true);
         }
+        // When launched from `<portable_root>/cli/catcloud(.exe)`, allow one-level upward
+        // lookup strictly gated by `<portable_root>/portable.flag` (never `../data` alone,
+        // and never when `<portable_root>` is a filesystem/drive root).
+        let is_cli_subdir = exe_dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("cli"));
+        if is_cli_subdir {
+            if let Some(parent) = exe_dir.parent() {
+                if parent.parent().is_some() && parent.join("portable.flag").is_file() {
+                    return (parent.join("data"), true);
+                }
+            }
+        }
         let std_dir = Self::standard_os_data_dir();
         (std_dir, false)
     }
@@ -539,6 +553,74 @@ mod tests {
         let sibling_prefix_paths =
             AppPaths::from_data_dir(sibling_prefix_dir.join("data"), true).expect("sibling paths");
         assert!(!sibling_prefix_paths.is_self_updatable_portable_for_exe_dir(&portable_exe_dir));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn detect_portable_or_standard_supports_cli_subdir_with_parent_flag_only() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-cli-portable-detect-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let app_dir = root.join("CatCloud-Portable");
+        let cli_dir = app_dir.join("cli");
+        let cli_upper_dir = root.join("CatCloud-Upper").join("CLI");
+        let tools_dir = app_dir.join("tools");
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::create_dir_all(&cli_upper_dir).unwrap();
+        std::fs::create_dir_all(&tools_dir).unwrap();
+
+        // 1. Only `../data/` without `../portable.flag` MUST NOT hijack CLI portable detection.
+        std::fs::create_dir_all(app_dir.join("data")).unwrap();
+        let (_, is_portable_no_flag) = AppPaths::detect_portable_or_standard(&cli_dir);
+        assert!(
+            !is_portable_no_flag,
+            "cli/ must not be hijacked by ../data without ../portable.flag"
+        );
+
+        // 2. Adding `../portable.flag` enables upward lookup for `cli/` (case-insensitive)
+        //    while non-`cli` subdirectories stay standard.
+        std::fs::write(app_dir.join("portable.flag"), b"1").unwrap();
+        std::fs::write(cli_upper_dir.parent().unwrap().join("portable.flag"), b"1").unwrap();
+
+        let (resolved_cli, cli_portable) = AppPaths::detect_portable_or_standard(&cli_dir);
+        assert!(cli_portable);
+        assert_eq!(resolved_cli, app_dir.join("data"));
+
+        let (resolved_upper, upper_portable) =
+            AppPaths::detect_portable_or_standard(&cli_upper_dir);
+        assert!(upper_portable);
+        assert_eq!(resolved_upper, cli_upper_dir.parent().unwrap().join("data"));
+
+        let (_, tools_portable) = AppPaths::detect_portable_or_standard(&tools_dir);
+        assert!(!tools_portable, "non-cli subdir must not walk upward");
+
+        // 3. Upward cli/ resolution must NOT mark `cli/` itself as self-updatable portable.
+        let cli_paths = AppPaths::from_data_dir(resolved_cli, true).expect("cli AppPaths");
+        assert!(
+            !cli_paths.is_self_updatable_portable_for_exe_dir(&cli_dir),
+            "cli/ subdir must not pass is_self_updatable_portable_for_exe_dir"
+        );
+        assert!(
+            cli_paths.is_self_updatable_portable_for_exe_dir(&app_dir),
+            "parent portable root must remain self-updatable portable"
+        );
+
+        // 4. Sibling `cli/portable.flag` still takes first priority over parent `../portable.flag`.
+        std::fs::write(cli_dir.join("portable.flag"), b"1").unwrap();
+        let (sibling_resolved, sibling_portable) = AppPaths::detect_portable_or_standard(&cli_dir);
+        assert!(sibling_portable);
+        assert_eq!(sibling_resolved, cli_dir.join("data"));
+
+        // 5. Filesystem/drive root guard: `<root>/cli` has `parent.parent().is_none()` and must never walk upward.
+        #[cfg(target_os = "windows")]
+        let root_cli = Path::new(r"C:\cli");
+        #[cfg(not(target_os = "windows"))]
+        let root_cli = Path::new("/cli");
+        assert!(root_cli.parent().and_then(Path::parent).is_none());
+        let (_, root_cli_portable) = AppPaths::detect_portable_or_standard(root_cli);
+        assert!(!root_cli_portable);
 
         let _ = std::fs::remove_dir_all(&root);
     }

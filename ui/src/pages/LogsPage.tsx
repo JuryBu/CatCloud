@@ -4,6 +4,8 @@ import {
   Check,
   Copy,
   Download,
+  Loader2,
+  MessageSquareWarning,
   Network,
   Pause,
   Play,
@@ -15,6 +17,7 @@ import {
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { catcloudApi, isTauriEnv } from "../api/tauri";
+import { normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, useAppSelector } from "../store/appStore";
 import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 
@@ -511,6 +514,10 @@ const STREAM_SAMPLES: Array<{ level: LogLevel; module: string; message: string }
 export function LogsPage() {
   const inTauri = isTauriEnv();
   const runtime = useAppSelector((s) => s.runtime);
+  const uiLang = normalizeUiLanguage(
+    useAppSelector((s) => s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
   const [logState, setLogState] = useState<LogBufferState>(() => ({
     entries: inTauri ? [] : buildSeedLogs(),
     truncatedCount: 0,
@@ -532,6 +539,7 @@ export function LogsPage() {
   const [copied, setCopied] = useState<boolean>(false);
   const [copyingAiDiag, setCopyingAiDiag] = useState<boolean>(false);
   const [copiedAiDiag, setCopiedAiDiag] = useState<boolean>(false);
+  const [openingIssue, setOpeningIssue] = useState<boolean>(false);
 
   const nextIdRef = useRef<number>(100);
   const sampleCursorRef = useRef<number>(0);
@@ -967,7 +975,7 @@ export function LogsPage() {
           </div>
           <div>
             <div className="flex flex-wrap items-center gap-2">
-              <h1 className="text-sm font-semibold text-[var(--text)]">运行日志</h1>
+              <h1 className="text-sm font-semibold text-[var(--text)]">{dict.nav.logs}</h1>
               <span className="cc-mono rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
                 {entries.length} / {MAX_LOG_LINES} 条
               </span>
@@ -1017,16 +1025,42 @@ export function LogsPage() {
             className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
           >
             <Network className="h-3.5 w-3.5 text-[var(--muted)]" />
-            <span>分流与连接</span>
+            <span>{dict.nav.rules}</span>
           </button>
 
           <button
             type="button"
-            onClick={() => appActions.openSettingsAgentDocs()}
+            onClick={() => appActions.openAiAssistant("troubleshooting")}
+            title={
+              uiLang === "zh-CN"
+                ? "前往 AI 助手查看通用排障总纲与只读诊断命令"
+                : dict.aiHub.subtitle
+            }
             className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
           >
             <BookOpen className="h-3.5 w-3.5 text-[var(--accent)]" />
-            <span>AI 协作指南</span>
+            <span>{uiLang === "zh-CN" ? "AI 协作指南" : dict.nav.ai}</span>
+          </button>
+
+          <button
+            type="button"
+            disabled={openingIssue}
+            onClick={() => {
+              if (openingIssue) return;
+              setOpeningIssue(true);
+              void appActions.openGithubIssueFeedback().finally(() => {
+                setOpeningIssue(false);
+              });
+            }}
+            title={dict.common.openIssue}
+            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--amber)] hover:text-[var(--text)] disabled:opacity-60"
+          >
+            {openingIssue ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--amber)]" />
+            ) : (
+              <MessageSquareWarning className="h-3.5 w-3.5 text-[var(--amber)]" />
+            )}
+            <span>{uiLang === "zh-CN" ? "反馈 Issue" : "Issue"}</span>
           </button>
 
           <button

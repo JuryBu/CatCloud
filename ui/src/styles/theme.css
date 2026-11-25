@@ -314,6 +314,41 @@ select optgroup {
   box-shadow: 0 0 0 2px rgba(var(--surface-rgb), 0.72);
 }
 
+/* Controlled micro-pulse ONLY for active working/alert capsule status dots (zero GPU cost at idle) */
+@keyframes cc-capsule-dot-ripple {
+  0% {
+    transform: scale(1);
+    opacity: 0.72;
+  }
+  70% {
+    transform: scale(2.15);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.15);
+    opacity: 0;
+  }
+}
+
+.cc-capsule-dot-work::after,
+.cc-capsule-dot-alert::after {
+  content: "";
+  position: absolute;
+  inset: -2px;
+  border-radius: 9999px;
+  background-color: currentColor;
+  pointer-events: none;
+  will-change: transform, opacity;
+}
+
+.cc-capsule-dot-work::after {
+  animation: cc-capsule-dot-ripple 1.85s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
+.cc-capsule-dot-alert::after {
+  animation: cc-capsule-dot-ripple 1.25s cubic-bezier(0.22, 1, 0.36, 1) infinite;
+}
+
 /* ============================================================================
  * Zero-Animation Accessibility, Hidden-Window Pause & Low-Power Mode
  * ============================================================================ */
@@ -325,6 +360,12 @@ select optgroup {
   transition-duration: 0.001ms !important;
 }
 
+[data-paused="on"] .cc-capsule-dot-work::after,
+[data-paused="on"] .cc-capsule-dot-alert::after {
+  animation: none !important;
+  display: none !important;
+}
+
 [data-animations="off"] *,
 [data-animations="off"] *::before,
 [data-animations="off"] *::after {
@@ -334,8 +375,15 @@ select optgroup {
   scroll-behavior: auto !important;
 }
 
-[data-animations="off"] .cc-pulse-dot {
+[data-animations="off"] .cc-pulse-dot,
+[data-animations="off"] .cc-capsule-dot-work::after,
+[data-animations="off"] .cc-capsule-dot-alert::after {
   animation: none !important;
+}
+
+[data-animations="off"] .cc-capsule-dot-work::after,
+[data-animations="off"] .cc-capsule-dot-alert::after {
+  display: none !important;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -348,8 +396,15 @@ select optgroup {
     scroll-behavior: auto !important;
   }
 
-  .cc-pulse-dot {
+  .cc-pulse-dot,
+  .cc-capsule-dot-work::after,
+  .cc-capsule-dot-alert::after {
     animation: none !important;
+  }
+
+  .cc-capsule-dot-work::after,
+  .cc-capsule-dot-alert::after {
+    display: none !important;
   }
 }
 

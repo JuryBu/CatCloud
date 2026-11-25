@@ -6,11 +6,13 @@ use crate::platform::windows::WindowsPlatform;
 use crate::platform::{PlatformAdapter as _, SystemProxySpec};
 use crate::preaccel::global_tunnel::{
     ExcludedPidTracker, GlobalPreAccelMetrics, Ipv4TcpMeta, MAX_NAT_ENTRIES, NAT_IDLE_TIMEOUT,
-    NatEntry, NatTable, SELF_TEST_DETECTED_BY, WinDivertAddress, build_security_guidance,
-    build_windivert_filter, clamp_tcp_syn_mss, classify_intercept_process,
-    classify_security_products_from_process_names, forward_redirected_stream,
-    is_physical_nic_descriptor, is_system_or_self_excluded_process, normalize_process_basename,
-    parse_ipv4_tcp_packet, rewrite_ipv4_tcp_from_loopback, rewrite_ipv4_tcp_to_loopback,
+    NatEntry, NatPacketView, NatTable, SELF_TEST_DETECTED_BY, WinDivertAddress,
+    build_security_guidance, build_windivert_filter_with_options, clamp_tcp_syn_mss,
+    classify_intercept_process, classify_security_products_from_process_names,
+    forward_redirected_stream, is_domestic_ipv4, is_non_proxy_communication_process,
+    is_open_source_proxy_core_name, is_physical_nic_descriptor, is_system_or_self_excluded_process,
+    normalize_process_basename, parse_ipv4_tcp_packet, rewrite_ipv4_tcp_from_loopback,
+    rewrite_ipv4_tcp_to_loopback, should_intercept_port_443,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, c_void};
@@ -47,6 +49,11 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_WITH_ALTERED_SEARCH_PATH, LoadLibraryExW, LoadLibraryW,
 };
+use windows_sys::Win32::System::Services::{
+    CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+    SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_CONTROL_STOP, SERVICE_QUERY_STATUS, SERVICE_STATUS,
+    SERVICE_STOP, SERVICE_STOPPED,
+};
 use windows_sys::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -56,6 +63,11 @@ const WINDIVERT_SHUTDOWN_BOTH: i32 = 3;
 const WINDIVERT_PARAM_QUEUE_LENGTH: i32 = 0;
 const WINDIVERT_PARAM_QUEUE_TIME: i32 = 1;
 const WINDIVERT_PARAM_QUEUE_SIZE: i32 = 2;
+const WINDIVERT_QUEUE_LENGTH: u64 = 8192;
+const WINDIVERT_QUEUE_SIZE_BYTES: u64 = 16 * 1024 * 1024;
+const WINDIVERT_SERVICE_NAME: &str = "WinDivert";
+const WINDIVERT_SERVICE_STOP_TIMEOUT: Duration = Duration::from_millis(700);
+const WINDIVERT_SERVICE_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const STANDARD_ETHERNET_TCP_MSS: u16 = 1460;
 const ERROR_SERVICE_MARKED_FOR_DELETE: u32 = 1072;
 const MIB_TCP_STATE_SYN_SENT: u32 = 3;
@@ -104,6 +116,18 @@ const EXCLUDED_NON_PROXY_LISTENER_PROCESSES: &[&str] = &[
     "sihost.exe",
     "searchindexer.exe",
     "dwm.exe",
+    "mpdefendercoreservice.exe",
+    "msmpeng.exe",
+    "vsserv.exe",
+    "hipsdaemon.exe",
+    "qqpcsvc.exe",
+    "itunes.exe",
+    "ituneshelper.exe",
+    "gamingservices.exe",
+    "gamingservicesnet.exe",
+    "wslservice.exe",
+    "vmware-authd.exe",
+    "vmware-hostd.exe",
 ];
 
 struct ScopedHandle(HANDLE);
@@ -288,11 +312,98 @@ impl Drop for WinDivertLib {
     }
 }
 
+struct ScopedScHandle(SC_HANDLE);
+
+impl Drop for ScopedScHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: Valid Service Control Manager or Service handle owned exclusively by this guard.
+            unsafe {
+                let _ = CloseServiceHandle(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Best-effort bounded stop of the `WinDivert` kernel driver service via Windows SCM
+/// (`ControlService(SERVICE_CONTROL_STOP)` + 50ms poll up to 700ms).
+///
+/// Intentionally NEVER calls `DeleteService` to prevent `ERROR_SERVICE_MARKED_FOR_DELETE (1072)`
+/// races on rapid re-enable and to avoid disrupting unrelated tools sharing WinDivert on the host.
+pub(super) fn stop_windivert_kernel_service() -> bool {
+    // SAFETY: Read-only connect to local SCM; deterministically closed by `ScopedScHandle`.
+    let scm_raw =
+        unsafe { OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT) };
+    if scm_raw.is_null() {
+        return false;
+    }
+    let scm = ScopedScHandle(scm_raw);
+
+    let service_wide: Vec<u16> = WINDIVERT_SERVICE_NAME
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `scm.0` is valid and `service_wide` is NUL-terminated UTF-16.
+    let svc_raw = unsafe {
+        OpenServiceW(
+            scm.0,
+            service_wide.as_ptr(),
+            SERVICE_STOP | SERVICE_QUERY_STATUS,
+        )
+    };
+    if svc_raw.is_null() {
+        return false;
+    }
+    let svc = ScopedScHandle(svc_raw);
+
+    let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+    if unsafe { QueryServiceStatus(svc.0, &mut status) } != 0
+        && status.dwCurrentState == SERVICE_STOPPED
+    {
+        return true;
+    }
+
+    const ERROR_SERVICE_CANNOT_ACCEPT_CTRL: u32 = 1061;
+    const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
+
+    let ctrl_ok = unsafe { ControlService(svc.0, SERVICE_CONTROL_STOP, &mut status) };
+    if ctrl_ok == 0 {
+        let err = unsafe { GetLastError() };
+        if err == ERROR_SERVICE_NOT_ACTIVE {
+            return true;
+        }
+        // Only fall through to bounded status polling when SCM reports the service is already
+        // mid-transition (1061); fail fast on access-denied or external-handle refusal so
+        // shutdown never stalls for 700ms unnecessarily.
+        if err != ERROR_SERVICE_CANNOT_ACCEPT_CTRL {
+            return false;
+        }
+    } else if status.dwCurrentState == SERVICE_STOPPED {
+        return true;
+    }
+
+    let deadline = Instant::now() + WINDIVERT_SERVICE_STOP_TIMEOUT;
+    while Instant::now() < deadline {
+        std::thread::sleep(WINDIVERT_SERVICE_STOP_POLL_INTERVAL);
+        let mut cur: SERVICE_STATUS = unsafe { std::mem::zeroed() };
+        if unsafe { QueryServiceStatus(svc.0, &mut cur) } == 0 {
+            return false;
+        }
+        if cur.dwCurrentState == SERVICE_STOPPED {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Runtime parameters passed to start the Windows transparent WinDivert TCP NAT engine.
 pub struct WinDivertEngineConfig {
     pub dll_path: std::path::PathBuf,
     pub socks_port: u16,
     pub relay_ipv4s: Vec<Ipv4Addr>,
+    pub skip_443_native: bool,
     pub scope: GlobalPreAccelScope,
     pub target_processes: Vec<String>,
     pub excluded_pids: HashSet<u32>,
@@ -358,6 +469,8 @@ pub struct WinDivertEngine {
     accept_task: Option<TokioJoinHandle<()>>,
     refresh_task: Option<TokioJoinHandle<()>>,
     redirect_port: u16,
+    stopped: bool,
+    service_torn_down: bool,
 }
 
 impl std::fmt::Debug for WinDivertEngine {
@@ -430,7 +543,11 @@ impl WinDivertEngine {
                 .await;
             }
 
-            let filter_str = build_windivert_filter(&cfg.relay_ipv4s, redirect_port);
+            let filter_str = build_windivert_filter_with_options(
+                &cfg.relay_ipv4s,
+                redirect_port,
+                cfg.skip_443_native,
+            );
             let filter_cstr = CString::new(filter_str.as_str()).map_err(|e| {
                 CatError::Validation(format!("WinDivert 过滤表达式包含非法字符: {e}"))
             })?;
@@ -496,9 +613,13 @@ impl WinDivertEngine {
             if let Some(set_param) = lib.set_param {
                 // SAFETY: `raw_handle` is a newly opened valid WinDivert handle.
                 unsafe {
-                    let _ = set_param(raw_handle, WINDIVERT_PARAM_QUEUE_LENGTH, 4096);
+                    let _ = set_param(raw_handle, WINDIVERT_PARAM_QUEUE_LENGTH, WINDIVERT_QUEUE_LENGTH);
                     let _ = set_param(raw_handle, WINDIVERT_PARAM_QUEUE_TIME, 2000);
-                    let _ = set_param(raw_handle, WINDIVERT_PARAM_QUEUE_SIZE, 8 * 1024 * 1024);
+                    let _ = set_param(
+                        raw_handle,
+                        WINDIVERT_PARAM_QUEUE_SIZE,
+                        WINDIVERT_QUEUE_SIZE_BYTES,
+                    );
                 }
             }
 
@@ -614,6 +735,7 @@ impl WinDivertEngine {
                 stop_flag: Arc::clone(&stop_flag),
                 nat_table,
                 redirect_port,
+                skip_443_native: cfg.skip_443_native,
                 scope: cfg.scope,
                 target_processes_lower,
                 excluded_pids: excluded_pid_tracker.shared_set(),
@@ -657,6 +779,8 @@ impl WinDivertEngine {
                 accept_task: Some(accept_task),
                 refresh_task: Some(refresh_task),
                 redirect_port,
+                stopped: false,
+                service_torn_down: false,
             })
         }
     }
@@ -877,8 +1001,21 @@ impl WinDivertEngine {
         self.redirect_port
     }
 
-    /// Deterministically stop packet interception, close the kernel handle, and abort background tasks.
+    /// Deterministically stop packet interception, close the kernel handle, abort background
+    /// tasks, and cleanly stop the `WinDivert` kernel driver service (`teardown_service = true`).
+    ///
+    /// For hot rebuilds that will immediately reopen WinDivert, call
+    /// [`Self::stop_sync_with_teardown`]`(false)` instead to avoid Win32 error 1072 races.
+    #[allow(dead_code)]
     pub fn stop_sync(&mut self) {
+        self.stop_sync_with_teardown(true);
+    }
+
+    /// Deterministically stop packet interception, close the kernel handle, abort background tasks,
+    /// and when `teardown_service == true` issue a bounded `ControlService(STOP)` (<= 700ms) on
+    /// the `WinDivert` kernel service without calling `DeleteService`.
+    pub fn stop_sync_with_teardown(&mut self, teardown_service: bool) {
+        self.stopped = true;
         self.stop_flag.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(true);
 
@@ -909,12 +1046,21 @@ impl WinDivertEngine {
         if let Some(task) = self.accept_task.take() {
             task.abort();
         }
+
+        if teardown_service && !self.service_torn_down {
+            self.service_torn_down = true;
+            let _ = stop_windivert_kernel_service();
+        }
     }
 }
 
 impl Drop for WinDivertEngine {
     fn drop(&mut self) {
-        self.stop_sync();
+        // When dropped without an explicit `stop_sync_with_teardown(false)` hot-reload call,
+        // perform full teardown including cleanly stopping the `WinDivert` kernel service.
+        if !self.stopped {
+            self.stop_sync_with_teardown(true);
+        }
     }
 }
 
@@ -924,6 +1070,7 @@ struct PacketWorkerContext {
     stop_flag: Arc<AtomicBool>,
     nat_table: Arc<NatTable>,
     redirect_port: u16,
+    skip_443_native: bool,
     scope: GlobalPreAccelScope,
     target_processes_lower: HashSet<String>,
     excluded_pids: Arc<RwLock<HashSet<u32>>>,
@@ -988,7 +1135,7 @@ fn run_packet_worker(ctx: PacketWorkerContext) {
         {
             if let Some(entry) = ctx
                 .nat_table
-                .get_and_touch(&(Ipv4Addr::LOCALHOST, meta.dst_port))
+                .get_packet_view_and_touch(&(Ipv4Addr::LOCALHOST, meta.dst_port))
             {
                 if rewrite_ipv4_tcp_from_loopback(
                     &mut pkt_buf[..pkt_len],
@@ -1031,7 +1178,7 @@ fn run_packet_worker(ctx: PacketWorkerContext) {
             continue;
         }
 
-        // Branch 2: Outbound public non-443/non-53 TCP packet.
+        // Branch 2: Outbound public TCP packet.
         // Strict fail-closed: only intercept traffic leaving confirmed physical interfaces
         // refreshed asynchronously in the background (when physical NIC set is empty or does not
         // contain `if_idx`, pass through untouched so virtual Wintun/VPN adapters are never hijacked).
@@ -1052,9 +1199,14 @@ fn run_packet_worker(ctx: PacketWorkerContext) {
         let nat_key = (Ipv4Addr::LOCALHOST, meta.src_port);
         let flow_key = (meta.src_ip, meta.src_port, meta.dst_ip, meta.dst_port);
 
-        // Fast path: already tracked in NAT table for the exact same `(orig_src_ip, orig_dst_ip, orig_dst_port)`.
+        // Fast path: non-SYN packets check the O(1) lock-free 64K source-port bitmap first to
+        // bypass untracked flows without ever acquiring the NAT table mutex.
         if !meta.is_syn_only() {
-            if let Some(existing) = ctx.nat_table.get_and_touch(&nat_key) {
+            if !ctx.nat_table.may_contain_port(meta.src_port) {
+                reinject_raw(&ctx.lib, ctx.handle.0, &pkt_buf[..pkt_len], &addr);
+                continue;
+            }
+            if let Some(existing) = ctx.nat_table.get_packet_view_and_touch(&nat_key) {
                 if existing.orig_src_ip == meta.src_ip
                     && existing.orig_dst_ip == meta.dst_ip
                     && existing.orig_dst_port == meta.dst_port
@@ -1085,15 +1237,19 @@ fn run_packet_worker(ctx: PacketWorkerContext) {
         // Idempotent client SYN retransmission path: if an active (non-closing) NAT entry already
         // exists for the exact same `(orig_src_ip, orig_dst_ip, orig_dst_port)`, immediately rewrite
         // and inject without re-running `lookup_tcp_owner_pid` (preventing race-induced deletion).
-        if let Some(existing) = ctx.nat_table.get_and_touch(&nat_key) {
-            if is_matching_active_syn_retransmit(&existing, meta.src_ip, meta.dst_ip, meta.dst_port)
-            {
+        if let Some(existing) = ctx.nat_table.get_packet_view_and_touch(&nat_key) {
+            if is_matching_active_syn_retransmit_view(
+                &existing,
+                meta.src_ip,
+                meta.dst_ip,
+                meta.dst_port,
+            ) {
                 if rewrite_ipv4_tcp_to_loopback(
                     &mut pkt_buf[..pkt_len],
                     meta.ihl_bytes,
                     ctx.redirect_port,
                 ) {
-                    if existing.detected_by == SELF_TEST_DETECTED_BY {
+                    if existing.is_self_test {
                         ctx.self_test_intercepted.fetch_add(1, Ordering::SeqCst);
                     }
                     let _ = clamp_tcp_syn_mss(
@@ -1175,6 +1331,16 @@ fn run_packet_worker(ctx: PacketWorkerContext) {
             }
         }
 
+        // Bypass plain domestic HTTP :80 connections (and domestic/skipped :443 connections)
+        // directly after self-test 204 probe handling and BEFORE `lookup_tcp_owner_pid` so
+        // ordinary domestic web/IM traffic never pays a TCP table scan or detours through relays.
+        if should_bypass_domestic_http_80(meta.dst_port, meta.dst_ip)
+            || should_fast_bypass_port_443(meta.dst_port, ctx.skip_443_native, meta.dst_ip)
+        {
+            reinject_raw(&ctx.lib, ctx.handle.0, &pkt_buf[..pkt_len], &addr);
+            continue;
+        }
+
         // Guard against ephemeral port collisions (distinct source IPs on active entries, or any
         // different 4-tuple reusing a port whose prior entry is still inside the closing grace window).
         if ctx
@@ -1231,13 +1397,18 @@ fn run_packet_worker(ctx: PacketWorkerContext) {
                         &detected_guard,
                     )
                 };
-                detected_by.map(|reason| {
-                    (
-                        pid,
-                        proc_name.unwrap_or_else(|| format!("pid:{pid}")),
-                        reason,
-                    )
-                })
+                detected_by
+                    .filter(|reason| {
+                        meta.dst_port != 443
+                            || should_intercept_port_443(reason, ctx.skip_443_native, meta.dst_ip)
+                    })
+                    .map(|reason| {
+                        (
+                            pid,
+                            proc_name.unwrap_or_else(|| format!("pid:{pid}")),
+                            reason,
+                        )
+                    })
             }
             None => None,
         };
@@ -1426,7 +1597,7 @@ fn is_excluded_non_proxy_listener_port(port: u16) -> bool {
 }
 
 fn is_excluded_non_proxy_listener_process(name: &str) -> bool {
-    if is_system_or_self_excluded_process(name) {
+    if is_system_or_self_excluded_process(name) || is_non_proxy_communication_process(name) {
         return true;
     }
     let lower = normalize_process_basename(name);
@@ -1435,9 +1606,51 @@ fn is_excluded_non_proxy_listener_process(name: &str) -> bool {
         .any(|p| *p == lower)
 }
 
+fn is_common_proxy_listener_port(port: u16) -> bool {
+    matches!(
+        port,
+        1080 | 1081 | 2080 | 2081 | 7890..=7899 | 10808 | 10809 | 17890..=17899 | 20170..=20172
+    )
+}
+
+fn has_generic_proxy_process_stem(name: &str) -> bool {
+    if is_open_source_proxy_core_name(name) {
+        return true;
+    }
+    let lower = normalize_process_basename(name);
+    if lower.is_empty() || is_excluded_non_proxy_listener_process(&lower) {
+        return false;
+    }
+    const GENERIC_PROXY_STEMS: &[&str] = &[
+        "proxy",
+        "socks",
+        "privoxy",
+        "gost",
+        "brook",
+        "juicity",
+        "mieru",
+        "tun",
+        "core",
+        "serv",
+    ];
+    GENERIC_PROXY_STEMS.iter().any(|stem| lower.contains(stem))
+}
+
+#[inline]
+fn should_bypass_domestic_http_80(dst_port: u16, dst_ip: Ipv4Addr) -> bool {
+    dst_port == 80 && is_domestic_ipv4(dst_ip)
+}
+
+#[inline]
+fn should_fast_bypass_port_443(dst_port: u16, skip_443_native: bool, dst_ip: Ipv4Addr) -> bool {
+    dst_port == 443 && (skip_443_native || is_domestic_ipv4(dst_ip))
+}
+
 /// Classify local IPv4 TCP listeners on `127.0.0.1`/`0.0.0.0` ports `1024..=65535`:
 /// - PID hosting the live Windows system proxy port -> `"system_proxy_host"` (highest priority).
-/// - Other non-excluded local listeners outside known database/system ports -> `"local_proxy_listener"`.
+/// - Non-system-proxy listeners are NEVER blindly tagged: they must not belong to excluded OS,
+///   database, or communication/desktop processes, AND must match either a generic proxy stem
+///   or a standard local proxy port (`1080/1081/2080/2081/7890..=7899/10808/10809/17890..=17899/20170..=20172`).
 /// - Always excludes `pid == 0`, `pid == 4`, `excluded_pids`, and core OS / CatCloud binaries.
 fn classify_local_proxy_listeners(
     listeners: &[(Ipv4Addr, u16, u32)],
@@ -1457,7 +1670,8 @@ fn classify_local_proxy_listeners(
         if port < 1024 {
             continue;
         }
-        if let Some(name) = pid_names.get(&pid) {
+        let name_opt = pid_names.get(&pid).map(String::as_str);
+        if let Some(name) = name_opt {
             if is_system_or_self_excluded_process(name) {
                 continue;
             }
@@ -1471,10 +1685,16 @@ fn classify_local_proxy_listeners(
         if is_excluded_non_proxy_listener_port(port) {
             continue;
         }
-        if let Some(name) = pid_names.get(&pid) {
+        if let Some(name) = name_opt {
             if is_excluded_non_proxy_listener_process(name) {
                 continue;
             }
+        }
+
+        let matches_proxy_signal = is_common_proxy_listener_port(port)
+            || name_opt.is_some_and(has_generic_proxy_process_stem);
+        if !matches_proxy_signal {
+            continue;
         }
 
         detected.entry(pid).or_insert("local_proxy_listener");
@@ -1603,8 +1823,24 @@ fn configure_loopback_outbound_addr(addr: &mut WinDivertAddress) {
     addr.set_network_sub_if_idx(0);
 }
 
+/// Return `true` when an existing `Copy` NAT packet view represents an active (non-closing) flow
+/// matching the exact 4-tuple of a retransmitted client TCP `SYN`.
+#[inline]
+fn is_matching_active_syn_retransmit_view(
+    view: &NatPacketView,
+    src_ip: Ipv4Addr,
+    dst_ip: Ipv4Addr,
+    dst_port: u16,
+) -> bool {
+    !view.is_closing
+        && view.orig_src_ip == src_ip
+        && view.orig_dst_ip == dst_ip
+        && view.orig_dst_port == dst_port
+}
+
 /// Return `true` when an existing NAT entry represents an active (non-closing) flow matching the
 /// exact 4-tuple of a retransmitted client TCP `SYN`.
+#[cfg(test)]
 fn is_matching_active_syn_retransmit(
     entry: &NatEntry,
     src_ip: Ipv4Addr,
@@ -3149,5 +3385,93 @@ mod tests {
             .expect("eof read ok");
         assert_eq!(code2, None);
         let _ = writer2.await;
+    }
+
+    #[test]
+    fn classify_local_proxy_listeners_rejects_im_and_random_ports_while_keeping_proxy_stems_and_common_ports()
+    {
+        let excluded: HashSet<u32> = HashSet::new();
+        let mut names: HashMap<u32, String> = HashMap::new();
+        names.insert(2001, "QQ.exe".to_string());
+        names.insert(2002, "WeChat.exe".to_string());
+        names.insert(2003, "Code.exe".to_string());
+        names.insert(2004, "random-desktop-app.exe".to_string());
+        names.insert(2005, "opaque-app.exe".to_string());
+        names.insert(2006, "custom-socks-daemon.exe".to_string());
+        names.insert(2007, "proxy-engine.exe".to_string());
+        names.insert(2008, "custom-tun-helper.exe".to_string());
+        names.insert(2009, "custom-core.exe".to_string());
+        names.insert(2010, "custom-serv.exe".to_string());
+        names.insert(2011, "MpDefenderCoreService.exe".to_string());
+        names.insert(2012, "iTunes.exe".to_string());
+        names.insert(2013, "chrome.exe".to_string());
+        names.insert(2014, "steam.exe".to_string());
+        names.insert(2015, "opaque-local.exe".to_string());
+
+        let listeners = vec![
+            // IM / IDE / browser / gaming apps must NEVER be tagged even on standard proxy ports.
+            (Ipv4Addr::LOCALHOST, 4301, 2001),
+            (Ipv4Addr::LOCALHOST, 7890, 2001),
+            (Ipv4Addr::LOCALHOST, 10808, 2002),
+            (Ipv4Addr::LOCALHOST, 20170, 2003),
+            (Ipv4Addr::LOCALHOST, 17890, 2013),
+            (Ipv4Addr::LOCALHOST, 7891, 2014),
+            // Non-proxy OS/AV/media binaries containing `core`/`serv`/`tun` must NOT be tagged.
+            (Ipv4Addr::LOCALHOST, 18900, 2011),
+            (Ipv4Addr::LOCALHOST, 18901, 2012),
+            // Generic unknown desktop app on a random non-proxy port must NOT be blindly tagged.
+            (Ipv4Addr::LOCALHOST, 54321, 2004),
+            // Unknown binaries on standard proxy ports (`7897`, `17890`) ARE tagged as local_proxy_listener.
+            (Ipv4Addr::LOCALHOST, 7897, 2005),
+            (Ipv4Addr::LOCALHOST, 17890, 2015),
+            // Generic proxy stems (`socks`, `proxy`, `tun`, `core`, `serv`) on custom high ports ARE tagged.
+            (Ipv4Addr::LOCALHOST, 18888, 2006),
+            (Ipv4Addr::UNSPECIFIED, 10808, 2007),
+            (Ipv4Addr::LOCALHOST, 19901, 2008),
+            (Ipv4Addr::LOCALHOST, 19902, 2009),
+            (Ipv4Addr::LOCALHOST, 19903, 2010),
+        ];
+
+        let detected = classify_local_proxy_listeners(&listeners, None, &excluded, &names);
+        for rejected in [2001, 2002, 2003, 2004, 2011, 2012, 2013, 2014] {
+            assert!(
+                !detected.contains_key(&rejected),
+                "pid {rejected} must NOT be tagged as local_proxy_listener"
+            );
+        }
+        for accepted in [2005, 2006, 2007, 2008, 2009, 2010, 2015] {
+            assert_eq!(
+                detected.get(&accepted).copied(),
+                Some("local_proxy_listener"),
+                "pid {accepted} should be tagged as local_proxy_listener"
+            );
+        }
+        assert_eq!(detected.len(), 7);
+    }
+
+    #[test]
+    fn domestic_http_80_bypass_and_443_gate_decisions_work_accurately() {
+        let cn_ip = Ipv4Addr::from(0xDCB5_2694u32);
+        let overseas_ip = Ipv4Addr::from(0x6812_0001u32);
+
+        // Domestic HTTP :80 bypasses directly; overseas :80 and domestic non-80 (e.g. airport entry) do not.
+        assert!(should_bypass_domestic_http_80(80, cn_ip));
+        assert!(!should_bypass_domestic_http_80(80, overseas_ip));
+        assert!(!should_bypass_domestic_http_80(8443, cn_ip));
+        assert!(!should_bypass_domestic_http_80(443, cn_ip));
+
+        // Fast-path 443 bypass rejects skipped or domestic 443 before PID lookup, while letting
+        // overseas 443 proceed to proxy-core identity verification when `skip_443_native == false`.
+        assert!(should_fast_bypass_port_443(443, true, overseas_ip));
+        assert!(should_fast_bypass_port_443(443, false, cn_ip));
+        assert!(!should_fast_bypass_port_443(443, false, overseas_ip));
+        assert!(!should_fast_bypass_port_443(8443, false, cn_ip));
+
+        // Port 443 gate respects skip_443_native, exact proxy labels, and non-domestic destination.
+        assert!(!should_intercept_port_443("open_core_name", true, overseas_ip));
+        assert!(should_intercept_port_443("open_core_name", false, overseas_ip));
+        assert!(!should_intercept_port_443("open_core_name", false, cn_ip));
+        assert!(!should_intercept_port_443("manual", false, overseas_ip));
+        assert!(!should_intercept_port_443("scope_all", false, overseas_ip));
     }
 }

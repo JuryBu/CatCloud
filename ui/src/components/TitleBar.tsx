@@ -2,58 +2,61 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { isTauriEnv } from "../api/tauri";
-import { useAppSelector } from "../store/appStore";
+import { normalizeUiLanguage, useUiDict } from "../i18n";
+import { selectHasBackgroundActivity, useAppSelector } from "../store/appStore";
 import { resolvePlatformOs } from "../utils/platform";
 import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
 
 function resolveModeBadge(
   status: string,
   proxyMode: string,
-  preaccel: PreAccelSummary
+  preaccel: PreAccelSummary,
+  dict: ReturnType<typeof useUiDict>,
+  isZh: boolean
 ): { label: string; dotColor: string } {
   if (!preaccel.proxyActive) {
     if (status === "error") {
-      return { label: "核心异常", dotColor: "var(--red)" };
+      return { label: isZh ? "核心异常" : dict.mascot.approval, dotColor: "var(--red)" };
     }
     if (preaccel.realWinDivertActive) {
       if (preaccel.verifyState === "probing") {
         return {
-          label: "探测链路中…",
+          label: dict.nav.preaccelProbingBadge,
           dotColor: "var(--amber)",
         };
       }
       if (preaccel.verifyState === "verified") {
         return {
           label: preaccel.verifyLatencyMs
-            ? `已畅通 ${preaccel.verifyLatencyMs}ms`
-            : "已探测畅通",
+            ? `${dict.nav.preaccelVerifiedBadge} ${preaccel.verifyLatencyMs}ms`
+            : dict.nav.preaccelVerifiedBadge,
           dotColor: status === "warn" ? "var(--amber)" : "var(--green)",
         };
       }
       return {
-        label: "全局提速中",
+        label: dict.nav.preaccelActiveBadge,
         dotColor: status === "warn" ? "var(--amber)" : "var(--accent)",
       };
     }
     if (preaccel.enabled) {
       if (preaccel.installState === "downloading" || preaccel.installState === "verifying") {
-        return { label: "准备提速组件…", dotColor: "var(--amber)" };
+        return { label: isZh ? "准备提速组件…" : dict.common.loading, dotColor: "var(--amber)" };
       }
       if (preaccel.installState === "need_elevation") {
-        return { label: "提速需管理员", dotColor: "var(--amber)" };
+        return { label: isZh ? "提速需管理员" : dict.mascot.approval, dotColor: "var(--amber)" };
       }
       if (preaccel.verifyState === "probing") {
-        return { label: "探测链路中…", dotColor: "var(--amber)" };
+        return { label: dict.nav.preaccelProbingBadge, dotColor: "var(--amber)" };
       }
       if (preaccel.verifyState === "degraded") {
-        return { label: "已保护回退", dotColor: "var(--amber)" };
+        return { label: dict.nav.preaccelDegradedBadge, dotColor: "var(--amber)" };
       }
-      return { label: "本地通道待命", dotColor: "var(--amber)" };
+      return { label: `${dict.titleBar.preaccelOn} · ${dict.titleBar.standby}`, dotColor: "var(--amber)" };
     }
     if (status === "warn") {
-      return { label: "待认证", dotColor: "var(--amber)" };
+      return { label: isZh ? "待认证" : dict.mascot.approval, dotColor: "var(--amber)" };
     }
-    return { label: "待命", dotColor: "var(--muted)" };
+    return { label: dict.titleBar.standby, dotColor: "var(--muted)" };
   }
 
   const isProbing = preaccel.enabled && preaccel.verifyState === "probing";
@@ -67,13 +70,17 @@ function resolveModeBadge(
           : "var(--green)";
 
   const modeLabel =
-    proxyMode === "global" ? "全局" : proxyMode === "direct" ? "直连" : "规则";
+    proxyMode === "global"
+      ? dict.titleBar.modeGlobal
+      : proxyMode === "direct"
+        ? dict.titleBar.modeDirect
+        : dict.titleBar.modeRule;
   const label = preaccel.enabled
     ? isProbing
-      ? `${modeLabel} · 探测链路中…`
+      ? `${modeLabel} · ${dict.nav.preaccelProbingBadge}`
       : preaccel.realWinDivertActive
-        ? `${modeLabel} · 全局提速`
-        : `${modeLabel} · 提速`
+        ? `${modeLabel} · ${dict.nav.preaccelActiveBadge}`
+        : `${modeLabel} · ${dict.titleBar.preaccelOn}`
     : modeLabel;
   return { label, dotColor };
 }
@@ -85,6 +92,13 @@ export function TitleBar() {
   const minimizeToTrayOnClose = useAppSelector(
     (s) => s.config?.behavior?.minimize_to_tray_on_close ?? true
   );
+  const uiLang = normalizeUiLanguage(
+    useAppSelector((s) => s.config.personalization.ui_language)
+  );
+  const bg = useAppSelector(selectHasBackgroundActivity);
+  const dict = useUiDict(uiLang);
+  const isZh = uiLang === "zh-CN";
+  const hasAnyBgTask = bg.preaccel || bg.nodes || bg.groups || bg.home || bg.settings;
   const [maximized, setMaximized] = useState(false);
   const inTauri = isTauriEnv();
   const isMac = resolvePlatformOs(runtime.os_label) === "macos";
@@ -173,11 +187,19 @@ export function TitleBar() {
     preAccelEnabledConfig
   );
 
-  const badge = resolveModeBadge(runtime.status, runtime.proxy_mode, preaccelSummary);
+  const badge = resolveModeBadge(runtime.status, runtime.proxy_mode, preaccelSummary, dict, isZh);
 
   const closeButtonLabel = minimizeToTrayOnClose
-    ? "关闭（最小化到托盘）"
-    : "关闭并退出";
+    ? hasAnyBgTask
+      ? dict.titleBar.closeToTrayBusy
+      : dict.titleBar.closeToTray
+    : dict.titleBar.closeApp;
+
+  const brandFull = dict.common.appNameFull;
+  const brandSepIdx = brandFull.indexOf("·");
+  const brandPrimary =
+    brandSepIdx >= 0 ? brandFull.slice(0, brandSepIdx).trim() : dict.common.appName;
+  const brandSuffix = brandSepIdx >= 0 ? brandFull.slice(brandSepIdx).trim() : "";
 
   return (
     <header className="cc-surface relative z-30 flex h-9 shrink-0 select-none items-center justify-between border-b border-[var(--line)]/60">
@@ -191,14 +213,16 @@ export function TitleBar() {
       >
         <img
           src="./icons/icon_a_cream_cat.png"
-          alt="猫猫云梯"
+          alt={dict.common.appName}
           className="pointer-events-none h-[18px] w-[18px] shrink-0 rounded-[5px] object-cover ring-1 ring-[var(--line)]"
           draggable={false}
         />
 
         <span className="pointer-events-none truncate text-xs font-semibold tracking-tight text-[var(--text)]">
-          猫猫云梯
-          <span className="ml-1 font-normal text-[var(--muted)]">· CatCloud</span>
+          {brandPrimary}
+          {brandSuffix && (
+            <span className="ml-1 font-normal text-[var(--muted)]">{brandSuffix}</span>
+          )}
         </span>
 
         <span className="pointer-events-none inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--line)]/80 bg-[var(--card)]/85 px-2 py-0.5 text-[10px] font-medium leading-none text-[var(--text-secondary)]">
@@ -218,8 +242,8 @@ export function TitleBar() {
             type="button"
             onClick={() => void handleMinimize()}
             className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[var(--card-hover)] hover:text-[var(--text)]"
-            aria-label="最小化窗口"
-            title="最小化"
+            aria-label={dict.titleBar.minimize}
+            title={dict.titleBar.minimize}
           >
             <Minus className="h-3.5 w-3.5" />
           </button>
@@ -228,8 +252,8 @@ export function TitleBar() {
             type="button"
             onClick={() => void handleToggleMaximize()}
             className="inline-flex h-9 w-11 cursor-pointer items-center justify-center text-[var(--text-secondary)] transition-colors hover:bg-[var(--card-hover)] hover:text-[var(--text)]"
-            aria-label={maximized ? "还原窗口" : "最大化窗口"}
-            title={maximized ? "还原" : "最大化"}
+            aria-label={maximized ? dict.titleBar.restore : dict.titleBar.maximize}
+            title={maximized ? dict.titleBar.restore : dict.titleBar.maximize}
           >
             {maximized ? <Copy className="h-3 w-3" /> : <Square className="h-3 w-3" />}
           </button>

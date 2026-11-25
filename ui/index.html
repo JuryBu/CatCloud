@@ -37,6 +37,18 @@
           if (prefs && prefs.animations_enabled === false) {
             root.setAttribute("data-animations", "off");
           }
+          if (prefs && typeof prefs.ui_language === "string") {
+            var langLower = prefs.ui_language.trim().toLowerCase().replace("_", "-");
+            var safeLang =
+              langLower === "en" || langLower.indexOf("en-") === 0
+                ? "en"
+                : langLower === "ja" || langLower.indexOf("ja-") === 0
+                  ? "ja"
+                  : langLower === "ru" || langLower.indexOf("ru-") === 0
+                    ? "ru"
+                    : "zh-CN";
+            root.setAttribute("lang", safeLang);
+          }
         } catch (_e) {
           /* ignore storage access errors */
         }

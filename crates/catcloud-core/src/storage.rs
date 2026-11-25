@@ -4,12 +4,51 @@ use crate::models::{
     PreAccelRelay, ProbeDefinition, ProbeKind, ProbeResultRecord, ProbeSnapshot, ProxyNode,
     SubscriptionKind, SubscriptionRecord, SwitchMode, TriggerRule,
 };
+use crate::subscription::parser::node_dedup_fingerprint;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Current SQLite schema version tracked via `PRAGMA user_version`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// Strategy used by `Storage::update_subscription_nodes_with_mode` when updating an existing
+/// subscription group with newly fetched, captured, or imported nodes.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionUpdateMode {
+    /// Keep only nodes present in the incoming payload while reusing existing node IDs
+    /// (first by exact `id`, then by `node_dedup_fingerprint`) to preserve probe history
+    /// and multi-group references.
+    ReplaceLatest,
+    /// Preserve all existing nodes and their IDs, updating in-place any matching fingerprint
+    /// nodes and inserting only truly new fingerprints.
+    MergeDedup,
+}
+
+/// Summary returned by `Storage::update_subscription_nodes_with_mode`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionNodesUpdateResult {
+    pub sub_id: String,
+    pub kept_count: usize,
+    pub added_count: usize,
+    pub replaced_count: usize,
+    pub total_count: usize,
+    pub id_remap: HashMap<String, String>,
+}
+
+/// Summary returned by `Storage::merge_subscriptions`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MergeSubscriptionsResult {
+    pub target_sub_id: String,
+    pub source_sub_id: String,
+    pub moved_count: usize,
+    pub deduplicated_count: usize,
+    pub total_count: usize,
+    pub id_remap: HashMap<String, String>,
+}
 
 /// SQLite persistence layer backed by bundled `rusqlite` in WAL mode.
 pub struct Storage {
@@ -119,6 +158,33 @@ impl Storage {
                     "INTEGER NOT NULL DEFAULT 0",
                 )?;
             }
+            if current < 3 {
+                tx.execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS preaccel_relays (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        name TEXT NOT NULL,
+                        provider TEXT NOT NULL DEFAULT '',
+                        region TEXT NOT NULL DEFAULT '',
+                        server TEXT NOT NULL,
+                        port INTEGER NOT NULL DEFAULT 443,
+                        protocol TEXT NOT NULL,
+                        password TEXT NOT NULL DEFAULT '',
+                        sni TEXT,
+                        skip_cert_verify INTEGER NOT NULL DEFAULT 1,
+                        priority INTEGER NOT NULL DEFAULT 100,
+                        expires_at TEXT,
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        last_probe_ms REAL,
+                        last_mbps REAL,
+                        last_up_mbps REAL,
+                        last_down_mbps REAL
+                    );
+                    ",
+                )?;
+                ensure_column_exists(tx, "preaccel_relays", "last_up_mbps", "REAL")?;
+                ensure_column_exists(tx, "preaccel_relays", "last_down_mbps", "REAL")?;
+            }
             tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION as i64)?;
             Ok(())
         })
@@ -211,6 +277,452 @@ impl Storage {
             .conn
             .execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
         Ok(changed > 0)
+    }
+
+    /// Rename an existing subscription in place without touching its nodes, probe results,
+    /// or multi-group memberships.
+    pub fn rename_subscription(&self, sub_id: &str, new_name: &str) -> CatResult<SubscriptionRecord> {
+        let id = sub_id.trim();
+        if id.is_empty() {
+            return Err(CatError::Validation("订阅 ID 不能为空".into()));
+        }
+        let trimmed_name = new_name.trim();
+        if trimmed_name.is_empty() {
+            return Err(CatError::Validation("订阅名称不能为空".into()));
+        }
+
+        let changed = self.conn.execute(
+            "
+            UPDATE subscriptions
+            SET name = ?2,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+            WHERE id = ?1
+            ",
+            params![id, trimmed_name],
+        )?;
+        if changed == 0 {
+            return Err(CatError::NotFound(format!("未找到订阅：{id}")));
+        }
+
+        self.get_subscription(id)?
+            .ok_or_else(|| CatError::NotFound(format!("未找到订阅：{id}")))
+    }
+
+    /// Atomically update an existing subscription's nodes using either `ReplaceLatest` or
+    /// `MergeDedup`, preserving probe history and multi-group references across ID reuse and
+    /// deduplication remaps.
+    ///
+    /// - Rejects empty `incoming_nodes` immediately without mutating any table.
+    /// - `ReplaceLatest`: matches incoming nodes to existing ones by exact `id` first, then by
+    ///   `node_dedup_fingerprint` so surviving nodes keep their original ID, `probe_results`,
+    ///   and `multi_groups` memberships; remaps duplicate vanished nodes and removes stale ones.
+    /// - `MergeDedup`: keeps every existing node and ID intact, updates matching fingerprint
+    ///   nodes in place (preserving original ID and `probe_results`), and inserts only new
+    ///   fingerprints.
+    pub fn update_subscription_nodes_with_mode(
+        &self,
+        target_sub_id: &str,
+        incoming_nodes: &[ProxyNode],
+        mode: SubscriptionUpdateMode,
+    ) -> CatResult<SubscriptionNodesUpdateResult> {
+        let sub_id = target_sub_id.trim();
+        if sub_id.is_empty() {
+            return Err(CatError::Validation("目标订阅 ID 不能为空".into()));
+        }
+        if incoming_nodes.is_empty() {
+            return Err(CatError::Validation(
+                "新节点列表为空，已取消更新以保留原有节点数据".into(),
+            ));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        if !subscription_exists_in_tx(&tx, sub_id)? {
+            return Err(CatError::NotFound(format!("未找到目标订阅：{sub_id}")));
+        }
+
+        let existing_nodes = load_nodes_for_subscription_in_tx(&tx, sub_id)?;
+        let foreign_ids = load_foreign_node_ids_in_tx(&tx, sub_id)?;
+
+        let mut existing_by_id: HashMap<String, &ProxyNode> =
+            HashMap::with_capacity(existing_nodes.len());
+        let mut existing_by_fp: HashMap<String, Vec<String>> = HashMap::new();
+        for node in &existing_nodes {
+            existing_by_id.insert(node.id.clone(), node);
+            let fp = node_dedup_fingerprint(node);
+            existing_by_fp.entry(fp).or_default().push(node.id.clone());
+        }
+
+        let incoming_fps: Vec<String> = incoming_nodes.iter().map(node_dedup_fingerprint).collect();
+
+        let result = match mode {
+            SubscriptionUpdateMode::ReplaceLatest => {
+                let mut assignments: Vec<Option<String>> = vec![None; incoming_nodes.len()];
+                let mut claimed_old_ids: HashSet<String> = HashSet::new();
+                let mut accepted_fps: HashSet<String> = HashSet::new();
+                let mut fp_to_kept_id: HashMap<String, String> = HashMap::new();
+                let mut occupied_ids: HashSet<String> = foreign_ids;
+                for node in &existing_nodes {
+                    occupied_ids.insert(node.id.clone());
+                }
+
+                // Pass 1: exact node ID reuse.
+                for (idx, incoming) in incoming_nodes.iter().enumerate() {
+                    let fp = &incoming_fps[idx];
+                    if accepted_fps.contains(fp) {
+                        continue;
+                    }
+                    let cid = incoming.id.trim();
+                    if !cid.is_empty()
+                        && existing_by_id.contains_key(cid)
+                        && claimed_old_ids.insert(cid.to_string())
+                    {
+                        assignments[idx] = Some(cid.to_string());
+                        accepted_fps.insert(fp.clone());
+                        fp_to_kept_id.insert(fp.clone(), cid.to_string());
+                    }
+                }
+
+                // Pass 2: physical fingerprint reuse of unclaimed existing node IDs.
+                for (idx, _incoming) in incoming_nodes.iter().enumerate() {
+                    if assignments[idx].is_some() {
+                        continue;
+                    }
+                    let fp = &incoming_fps[idx];
+                    if accepted_fps.contains(fp) {
+                        continue;
+                    }
+                    if let Some(old_candidates) = existing_by_fp.get(fp) {
+                        if let Some(reused_id) = old_candidates
+                            .iter()
+                            .find(|oid| !claimed_old_ids.contains(oid.as_str()))
+                            .cloned()
+                        {
+                            claimed_old_ids.insert(reused_id.clone());
+                            assignments[idx] = Some(reused_id.clone());
+                            accepted_fps.insert(fp.clone());
+                            fp_to_kept_id.insert(fp.clone(), reused_id);
+                        }
+                    }
+                }
+
+                // Pass 3: allocate collision-free IDs for genuinely new incoming nodes.
+                let mut added_count = 0usize;
+                for (idx, incoming) in incoming_nodes.iter().enumerate() {
+                    if assignments[idx].is_some() {
+                        continue;
+                    }
+                    let fp = &incoming_fps[idx];
+                    if accepted_fps.contains(fp) {
+                        continue;
+                    }
+                    let raw_id = incoming.id.trim();
+                    let new_id = if !raw_id.is_empty() && occupied_ids.insert(raw_id.to_string()) {
+                        raw_id.to_string()
+                    } else {
+                        allocate_unique_node_id(sub_id, fp, &mut occupied_ids)
+                    };
+                    assignments[idx] = Some(new_id.clone());
+                    accepted_fps.insert(fp.clone());
+                    fp_to_kept_id.insert(fp.clone(), new_id);
+                    added_count += 1;
+                }
+
+                let kept_count = claimed_old_ids.len();
+
+                // Handle vanished existing nodes: migrate newer probe_results if another surviving
+                // node holds the same physical fingerprint, record id_remap, and delete vanished rows.
+                let mut id_remap: HashMap<String, String> = HashMap::new();
+                let mut removed_unmapped_ids: HashSet<String> = HashSet::new();
+                let mut replaced_count = 0usize;
+
+                for old in &existing_nodes {
+                    if claimed_old_ids.contains(&old.id) {
+                        continue;
+                    }
+                    replaced_count += 1;
+                    let old_fp = node_dedup_fingerprint(old);
+                    if let Some(kept_id) = fp_to_kept_id.get(&old_fp) {
+                        if kept_id != &old.id {
+                            migrate_newer_probe_results_in_tx(&tx, &old.id, kept_id)?;
+                            id_remap.insert(old.id.clone(), kept_id.clone());
+                        }
+                    } else {
+                        removed_unmapped_ids.insert(old.id.clone());
+                    }
+                    tx.execute("DELETE FROM nodes WHERE id = ?1", params![old.id])?;
+                }
+
+                // Upsert all surviving and newly added nodes (preserving per-node preaccel_override
+                // when incoming does not explicitly specify one).
+                for (idx, incoming) in incoming_nodes.iter().enumerate() {
+                    let Some(assigned_id) = assignments[idx].as_ref() else {
+                        continue;
+                    };
+                    let mut node = incoming.clone();
+                    node.id = assigned_id.clone();
+                    node.sub_id = sub_id.to_string();
+                    if node.preaccel_override.is_none() {
+                        if let Some(prev) = existing_by_id.get(assigned_id) {
+                            node.preaccel_override = prev.preaccel_override;
+                        }
+                    }
+                    upsert_node_with_conn(&tx, &node)?;
+                }
+
+                if !id_remap.is_empty() || !removed_unmapped_ids.is_empty() {
+                    remap_multi_groups_in_tx(&tx, &id_remap, &removed_unmapped_ids, None)?;
+                }
+
+                let total_count = kept_count + added_count;
+                SubscriptionNodesUpdateResult {
+                    sub_id: sub_id.to_string(),
+                    kept_count,
+                    added_count,
+                    replaced_count,
+                    total_count,
+                    id_remap,
+                }
+            }
+            SubscriptionUpdateMode::MergeDedup => {
+                let mut occupied_ids: HashSet<String> = foreign_ids;
+                for node in &existing_nodes {
+                    occupied_ids.insert(node.id.clone());
+                }
+
+                let mut updated_old_ids: HashSet<String> = HashSet::new();
+                let mut inserted_fps: HashSet<String> = HashSet::new();
+                let mut matched_indices: HashSet<usize> = HashSet::new();
+                let mut added_count = 0usize;
+
+                // Pass 1: exact existing ID updates in place (preserve original ID & probe history).
+                for (idx, incoming) in incoming_nodes.iter().enumerate() {
+                    let cid = incoming.id.trim();
+                    if !cid.is_empty() && existing_by_id.contains_key(cid) {
+                        let mut node = incoming.clone();
+                        node.id = cid.to_string();
+                        node.sub_id = sub_id.to_string();
+                        if node.preaccel_override.is_none() {
+                            if let Some(prev) = existing_by_id.get(cid) {
+                                node.preaccel_override = prev.preaccel_override;
+                            }
+                        }
+                        upsert_node_with_conn(&tx, &node)?;
+                        updated_old_ids.insert(cid.to_string());
+                        matched_indices.insert(idx);
+                    }
+                }
+
+                // Pass 2: fingerprint match updates existing node in place; unseen fingerprints insert.
+                for (idx, incoming) in incoming_nodes.iter().enumerate() {
+                    if matched_indices.contains(&idx) {
+                        continue;
+                    }
+                    let fp = &incoming_fps[idx];
+                    if let Some(old_candidates) = existing_by_fp.get(fp) {
+                        let target_old_id = old_candidates
+                            .iter()
+                            .find(|oid| !updated_old_ids.contains(oid.as_str()))
+                            .or_else(|| old_candidates.first())
+                            .cloned();
+                        if let Some(old_id) = target_old_id {
+                            let mut node = incoming.clone();
+                            node.id = old_id.clone();
+                            node.sub_id = sub_id.to_string();
+                            if node.preaccel_override.is_none() {
+                                if let Some(prev) = existing_by_id.get(&old_id) {
+                                    node.preaccel_override = prev.preaccel_override;
+                                }
+                            }
+                            upsert_node_with_conn(&tx, &node)?;
+                            updated_old_ids.insert(old_id);
+                            continue;
+                        }
+                    }
+
+                    if !inserted_fps.insert(fp.clone()) {
+                        continue;
+                    }
+
+                    let raw_id = incoming.id.trim();
+                    let new_id = if !raw_id.is_empty() && occupied_ids.insert(raw_id.to_string()) {
+                        raw_id.to_string()
+                    } else {
+                        allocate_unique_node_id(sub_id, fp, &mut occupied_ids)
+                    };
+                    let mut node = incoming.clone();
+                    node.id = new_id;
+                    node.sub_id = sub_id.to_string();
+                    upsert_node_with_conn(&tx, &node)?;
+                    added_count += 1;
+                }
+
+                let replaced_count = updated_old_ids.len();
+                let kept_count = existing_nodes.len().saturating_sub(replaced_count);
+                let total_count = existing_nodes.len() + added_count;
+                SubscriptionNodesUpdateResult {
+                    sub_id: sub_id.to_string(),
+                    kept_count,
+                    added_count,
+                    replaced_count,
+                    total_count,
+                    id_remap: HashMap::new(),
+                }
+            }
+        };
+
+        tx.execute(
+            "UPDATE subscriptions SET updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
+            params![sub_id],
+        )?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Atomically merge `source_sub_id` into `target_sub_id` in a single SQLite transaction
+    /// with zero accidental cascade deletion:
+    /// 1. Verify both subscriptions exist and differ.
+    /// 2. Identify duplicate source nodes by `node_dedup_fingerprint` when `deduplicate` is true.
+    /// 3. Move non-duplicate source nodes in place (`UPDATE nodes SET sub_id = ?target WHERE id = ?id`)
+    ///    so their IDs, `probe_results`, and `multi_groups` references remain intact.
+    /// 4. For each deduplicated source node `S_dup -> T_keep`, migrate newer `probe_results` rows
+    ///    (replacing only when `T_keep` has no record for that probe or `S_dup.tested_at` is newer),
+    ///    delete `S_dup`, and remap every `multi_groups` entry (`member_node_ids` deduplicated,
+    ///    `active_node_id`, and `dynamic_filter.sub_ids` rewriting `source_sub_id -> target_sub_id`).
+    /// 5. Optionally rename `target_sub_id` and/or convert its `kind` to `migrated`.
+    /// 6. Finally `DELETE FROM subscriptions WHERE id = ?source_sub_id`.
+    pub fn merge_subscriptions(
+        &self,
+        source_sub_id: &str,
+        target_sub_id: &str,
+        new_target_name: Option<&str>,
+        deduplicate: bool,
+        convert_target_to_migrated: bool,
+    ) -> CatResult<MergeSubscriptionsResult> {
+        let src_id = source_sub_id.trim();
+        let tgt_id = target_sub_id.trim();
+        if src_id.is_empty() || tgt_id.is_empty() {
+            return Err(CatError::Validation("源订阅和目标订阅 ID 均不能为空".into()));
+        }
+        if src_id == tgt_id {
+            return Err(CatError::Validation("不能将订阅合并到自身".into()));
+        }
+        let validated_name = match new_target_name {
+            Some(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    return Err(CatError::Validation("合并后的目标订阅名称不能为空".into()));
+                }
+                Some(trimmed.to_string())
+            }
+            None => None,
+        };
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Step 1: Verify both subscriptions exist.
+        if !subscription_exists_in_tx(&tx, src_id)? {
+            return Err(CatError::NotFound(format!("未找到源订阅：{src_id}")));
+        }
+        if !subscription_exists_in_tx(&tx, tgt_id)? {
+            return Err(CatError::NotFound(format!("未找到目标订阅：{tgt_id}")));
+        }
+
+        // Step 2: Load nodes and compute physical fingerprints for deduplication.
+        let target_nodes = load_nodes_for_subscription_in_tx(&tx, tgt_id)?;
+        let source_nodes = load_nodes_for_subscription_in_tx(&tx, src_id)?;
+
+        let mut target_fp_to_id: HashMap<String, String> =
+            HashMap::with_capacity(target_nodes.len());
+        for node in &target_nodes {
+            let fp = node_dedup_fingerprint(node);
+            target_fp_to_id.entry(fp).or_insert_with(|| node.id.clone());
+        }
+
+        let mut nodes_to_move: Vec<String> = Vec::new();
+        let mut dup_pairs: Vec<(String, String)> = Vec::new();
+        let mut id_remap: HashMap<String, String> = HashMap::new();
+
+        for s_node in &source_nodes {
+            if deduplicate {
+                let fp = node_dedup_fingerprint(s_node);
+                if let Some(t_keep_id) = target_fp_to_id.get(&fp) {
+                    dup_pairs.push((s_node.id.clone(), t_keep_id.clone()));
+                    id_remap.insert(s_node.id.clone(), t_keep_id.clone());
+                } else {
+                    target_fp_to_id.insert(fp, s_node.id.clone());
+                    nodes_to_move.push(s_node.id.clone());
+                }
+            } else {
+                nodes_to_move.push(s_node.id.clone());
+            }
+        }
+
+        // Step 3: Move non-duplicate source nodes in place (preserving ID and probe_results).
+        for move_id in &nodes_to_move {
+            tx.execute(
+                "
+                UPDATE nodes
+                SET sub_id = ?1,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?2
+                ",
+                params![tgt_id, move_id],
+            )?;
+        }
+
+        // Step 4: Migrate newer probe_results from S_dup -> T_keep, remove S_dup, and remap
+        // all multi_groups (member_node_ids, active_node_id, dynamic_filter.sub_ids).
+        for (s_dup_id, t_keep_id) in &dup_pairs {
+            migrate_newer_probe_results_in_tx(&tx, s_dup_id, t_keep_id)?;
+            tx.execute("DELETE FROM nodes WHERE id = ?1", params![s_dup_id])?;
+        }
+        let empty_removed: HashSet<String> = HashSet::new();
+        remap_multi_groups_in_tx(&tx, &id_remap, &empty_removed, Some((src_id, tgt_id)))?;
+
+        // Step 5: Optional target rename and/or kind conversion to `migrated`.
+        if let Some(ref new_name) = validated_name {
+            tx.execute(
+                "
+                UPDATE subscriptions
+                SET name = ?2,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?1
+                ",
+                params![tgt_id, new_name],
+            )?;
+        }
+        if convert_target_to_migrated {
+            tx.execute(
+                "
+                UPDATE subscriptions
+                SET kind = ?2,
+                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                WHERE id = ?1
+                ",
+                params![tgt_id, SubscriptionKind::Migrated.as_str()],
+            )?;
+        }
+
+        // Step 6: Delete now-empty source subscription (zero unintended cascade deletes).
+        tx.execute("DELETE FROM subscriptions WHERE id = ?1", params![src_id])?;
+
+        let total_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE sub_id = ?1",
+            params![tgt_id],
+            |r| r.get(0),
+        )?;
+
+        tx.commit()?;
+
+        Ok(MergeSubscriptionsResult {
+            target_sub_id: tgt_id.to_string(),
+            source_sub_id: src_id.to_string(),
+            moved_count: nodes_to_move.len(),
+            deduplicated_count: dup_pairs.len(),
+            total_count: total_count.max(0) as usize,
+            id_remap,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -929,8 +1441,8 @@ impl Storage {
             INSERT INTO preaccel_relays (
                 id, name, provider, region, server, port, protocol,
                 password, sni, skip_cert_verify, priority, expires_at,
-                enabled, last_probe_ms, last_mbps
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 provider = excluded.provider,
@@ -945,7 +1457,9 @@ impl Storage {
                 expires_at = excluded.expires_at,
                 enabled = excluded.enabled,
                 last_probe_ms = excluded.last_probe_ms,
-                last_mbps = excluded.last_mbps
+                last_mbps = excluded.last_mbps,
+                last_up_mbps = excluded.last_up_mbps,
+                last_down_mbps = excluded.last_down_mbps
             ",
             params![
                 relay.id,
@@ -963,6 +1477,8 @@ impl Storage {
                 bool_to_int(relay.enabled),
                 relay.last_probe_ms,
                 relay.last_mbps,
+                relay.last_up_mbps,
+                relay.last_down_mbps,
             ],
         )?;
         Ok(())
@@ -974,7 +1490,7 @@ impl Storage {
                 "
                 SELECT id, name, provider, region, server, port, protocol,
                        password, sni, skip_cert_verify, priority, expires_at,
-                       enabled, last_probe_ms, last_mbps
+                       enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
                 FROM preaccel_relays
                 WHERE id = ?1
                 ",
@@ -990,7 +1506,7 @@ impl Storage {
             "
             SELECT id, name, provider, region, server, port, protocol,
                    password, sni, skip_cert_verify, priority, expires_at,
-                   enabled, last_probe_ms, last_mbps
+                   enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
             FROM preaccel_relays
             WHERE enabled = 1
             ORDER BY priority ASC, id ASC
@@ -999,7 +1515,7 @@ impl Storage {
             "
             SELECT id, name, provider, region, server, port, protocol,
                    password, sni, skip_cert_verify, priority, expires_at,
-                   enabled, last_probe_ms, last_mbps
+                   enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
             FROM preaccel_relays
             ORDER BY priority ASC, id ASC
             "
@@ -1034,6 +1550,27 @@ impl Storage {
             WHERE id = ?1
             ",
             params![id, last_probe_ms, last_mbps],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn update_preaccel_speed_metrics(
+        &self,
+        id: &str,
+        last_probe_ms: Option<f64>,
+        last_up_mbps: Option<f64>,
+        last_down_mbps: Option<f64>,
+    ) -> CatResult<bool> {
+        let changed = self.conn.execute(
+            "
+            UPDATE preaccel_relays
+            SET last_probe_ms = COALESCE(?2, last_probe_ms),
+                last_up_mbps = COALESCE(?3, last_up_mbps),
+                last_down_mbps = COALESCE(?4, last_down_mbps),
+                last_mbps = COALESCE(?3, last_mbps)
+            WHERE id = ?1
+            ",
+            params![id, last_probe_ms, last_up_mbps, last_down_mbps],
         )?;
         Ok(changed > 0)
     }
@@ -1161,7 +1698,9 @@ CREATE TABLE IF NOT EXISTS preaccel_relays (
     expires_at TEXT,
     enabled INTEGER NOT NULL DEFAULT 1,
     last_probe_ms REAL,
-    last_mbps REAL
+    last_mbps REAL,
+    last_up_mbps REAL,
+    last_down_mbps REAL
 );
 CREATE INDEX IF NOT EXISTS idx_preaccel_priority ON preaccel_relays(enabled, priority ASC);
 "#;
@@ -1447,11 +1986,251 @@ fn row_to_preaccel_relay(row: &Row<'_>) -> rusqlite::Result<PreAccelRelay> {
         enabled: enabled != 0,
         last_probe_ms: row.get(13)?,
         last_mbps: row.get(14)?,
+        last_up_mbps: row.get(15)?,
+        last_down_mbps: row.get(16)?,
     })
 }
 
 fn bool_to_int(v: bool) -> i64 {
     if v { 1 } else { 0 }
+}
+
+fn subscription_exists_in_tx(tx: &Transaction<'_>, sub_id: &str) -> CatResult<bool> {
+    let exists: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM subscriptions WHERE id = ?1",
+            params![sub_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(exists.is_some())
+}
+
+fn load_nodes_for_subscription_in_tx(
+    tx: &Transaction<'_>,
+    sub_id: &str,
+) -> CatResult<Vec<ProxyNode>> {
+    let mut stmt = tx.prepare(
+        "
+        SELECT id, sub_id, name, protocol, server, port, raw_json,
+               region_code, multiplier, is_443_native, preaccel_eligible,
+               preaccel_override, tags_json, enabled
+        FROM nodes
+        WHERE sub_id = ?1
+        ORDER BY id ASC
+        ",
+    )?;
+    let rows = stmt.query_map(params![sub_id], row_to_node)?;
+    let mut nodes = Vec::new();
+    for row in rows {
+        nodes.push(row?);
+    }
+    Ok(nodes)
+}
+
+fn load_foreign_node_ids_in_tx(
+    tx: &Transaction<'_>,
+    sub_id: &str,
+) -> CatResult<HashSet<String>> {
+    let mut stmt = tx.prepare("SELECT id FROM nodes WHERE sub_id != ?1")?;
+    let rows = stmt.query_map(params![sub_id], |r| r.get::<_, String>(0))?;
+    let mut ids = HashSet::new();
+    for row in rows {
+        ids.insert(row?);
+    }
+    Ok(ids)
+}
+
+fn allocate_unique_node_id(
+    target_sub_id: &str,
+    fingerprint: &str,
+    occupied_ids: &mut HashSet<String>,
+) -> String {
+    let mut attempt = 0u32;
+    loop {
+        let mut hasher = Sha256::new();
+        hasher.update(target_sub_id.as_bytes());
+        hasher.update(b"\x1f");
+        hasher.update(fingerprint.as_bytes());
+        if attempt > 0 {
+            hasher.update(b"\x1f");
+            hasher.update(attempt.to_string().as_bytes());
+        }
+        let digest = hex::encode(hasher.finalize());
+        let candidate = format!("node_{}", &digest[..16]);
+        if occupied_ids.insert(candidate.clone()) {
+            return candidate;
+        }
+        attempt = attempt.saturating_add(1);
+    }
+}
+
+/// Migrate latest per-probe `probe_results` rows from `from_node_id` to `to_node_id`
+/// whenever `to_node_id` lacks a result for that `probe_id` or `from_node_id`'s latest
+/// `tested_at` timestamp is strictly newer.
+fn migrate_newer_probe_results_in_tx(
+    tx: &Transaction<'_>,
+    from_node_id: &str,
+    to_node_id: &str,
+) -> CatResult<()> {
+    if from_node_id == to_node_id {
+        return Ok(());
+    }
+
+    let mut latest_from: Vec<(i64, String, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "
+            SELECT id, probe_id, tested_at
+            FROM (
+                SELECT id, probe_id, tested_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY probe_id
+                           ORDER BY tested_at DESC, id DESC
+                       ) AS rn
+                FROM probe_results
+                WHERE node_id = ?1
+            )
+            WHERE rn = 1
+            ",
+        )?;
+        let rows = stmt.query_map(params![from_node_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        for row in rows {
+            latest_from.push(row?);
+        }
+    }
+
+    for (from_row_id, probe_id, from_tested_at) in latest_from {
+        let to_latest_tested_at: Option<String> = tx
+            .query_row(
+                "
+                SELECT tested_at
+                FROM probe_results
+                WHERE node_id = ?1 AND probe_id = ?2
+                ORDER BY tested_at DESC, id DESC
+                LIMIT 1
+                ",
+                params![to_node_id, probe_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let should_replace = match to_latest_tested_at.as_deref() {
+            None => true,
+            Some(existing_ts) => from_tested_at.as_str() > existing_ts,
+        };
+        if should_replace {
+            tx.execute(
+                "DELETE FROM probe_results WHERE node_id = ?1 AND probe_id = ?2",
+                params![to_node_id, probe_id],
+            )?;
+            tx.execute(
+                "UPDATE probe_results SET node_id = ?1 WHERE id = ?2",
+                params![to_node_id, from_row_id],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn remap_multi_groups_in_tx(
+    tx: &Transaction<'_>,
+    id_remap: &HashMap<String, String>,
+    removed_unmapped_ids: &HashSet<String>,
+    sub_id_replace: Option<(&str, &str)>,
+) -> CatResult<()> {
+    let mut groups: Vec<MultiGroup> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "
+            SELECT id, name, mode, match_rules_json, member_node_ids_json,
+                   dynamic_filter_json, primary_probe_id, hard_gates_json,
+                   trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
+                   escalated_since, recover_probe_interval_sec, switch_mode,
+                   cooldown_sec, hysteresis_pct, active_node_id, state,
+                   independent_routing
+            FROM multi_groups
+            ",
+        )?;
+        let rows = stmt.query_map([], row_to_multi_group)?;
+        for r in rows {
+            groups.push(r?);
+        }
+    }
+
+    for group in groups {
+        let mut new_members = Vec::with_capacity(group.member_node_ids.len());
+        let mut seen_members: HashSet<String> = HashSet::with_capacity(group.member_node_ids.len());
+        for mid in &group.member_node_ids {
+            let resolved = if let Some(mapped) = id_remap.get(mid) {
+                mapped.as_str()
+            } else if removed_unmapped_ids.contains(mid) {
+                continue;
+            } else {
+                mid.as_str()
+            };
+            if seen_members.insert(resolved.to_string()) {
+                new_members.push(resolved.to_string());
+            }
+        }
+
+        let new_active = match group.active_node_id.as_deref() {
+            Some(cur) => {
+                if let Some(mapped) = id_remap.get(cur) {
+                    Some(mapped.clone())
+                } else if removed_unmapped_ids.contains(cur) {
+                    None
+                } else {
+                    Some(cur.to_string())
+                }
+            }
+            None => None,
+        };
+
+        let mut new_dynamic_filter = group.dynamic_filter.clone();
+        if let (Some((src_sub, dst_sub)), Some(df)) = (sub_id_replace, new_dynamic_filter.as_mut())
+        {
+            let mut updated_sub_ids = Vec::with_capacity(df.sub_ids.len());
+            let mut seen_subs: HashSet<String> = HashSet::with_capacity(df.sub_ids.len());
+            for sid in &df.sub_ids {
+                let resolved = if sid == src_sub { dst_sub } else { sid.as_str() };
+                if seen_subs.insert(resolved.to_string()) {
+                    updated_sub_ids.push(resolved.to_string());
+                }
+            }
+            df.sub_ids = updated_sub_ids;
+        }
+
+        if new_members != group.member_node_ids
+            || new_active != group.active_node_id
+            || new_dynamic_filter != group.dynamic_filter
+        {
+            let member_json = serde_json::to_string(&new_members)?;
+            let df_json = new_dynamic_filter
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+            tx.execute(
+                "
+                UPDATE multi_groups
+                SET member_node_ids_json = ?2,
+                    active_node_id = ?3,
+                    dynamic_filter_json = ?4
+                WHERE id = ?1
+                ",
+                params![group.id, member_json, new_active, df_json],
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 fn make_placeholders(count: usize) -> String {
@@ -1718,6 +2497,8 @@ mod tests {
             enabled: true,
             last_probe_ms: Some(14.5),
             last_mbps: Some(92.0),
+            last_up_mbps: Some(85.0),
+            last_down_mbps: Some(180.0),
         };
         let relay2 = PreAccelRelay {
             id: "relay-standby".to_string(),
@@ -1735,6 +2516,8 @@ mod tests {
             enabled: false,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         };
         storage.upsert_preaccel_relay(&relay2).unwrap();
         storage.upsert_preaccel_relay(&relay1).unwrap();
@@ -2200,6 +2983,614 @@ mod tests {
             let groups = storage.list_multi_groups().unwrap();
             assert_eq!(groups.len(), 1);
             assert!(groups[0].independent_routing);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sample_vless_node(
+        id: &str,
+        sub_id: &str,
+        name: &str,
+        server: &str,
+        port: u16,
+        uuid: &str,
+        ws_path: &str,
+    ) -> ProxyNode {
+        ProxyNode {
+            id: id.to_string(),
+            sub_id: sub_id.to_string(),
+            name: name.to_string(),
+            protocol: "vless".to_string(),
+            server: server.to_string(),
+            port,
+            raw_config: serde_json::json!({
+                "name": name,
+                "type": "vless",
+                "server": server,
+                "port": port,
+                "uuid": uuid,
+                "tls": true,
+                "network": "ws",
+                "ws-opts": { "path": ws_path }
+            }),
+            region_code: "JP".to_string(),
+            multiplier: 1.0,
+            is_443_native: port == 443,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            tags: vec!["ai".to_string()],
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn rename_subscription_updates_name_only_without_touching_nodes_or_probes() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.seed_builtin_probes().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-ren", "Old Name"))
+            .unwrap();
+        let node = sample_vless_node(
+            "n-ren-1",
+            "sub-ren",
+            "JP Node",
+            "203.0.113.10",
+            443,
+            "00000000-0000-4000-8000-000000000001",
+            "/ws",
+        );
+        storage.upsert_node(&node).unwrap();
+        storage
+            .insert_probe_result(&ProbeResultRecord {
+                node_id: "n-ren-1".into(),
+                probe_id: "builtin_latency".into(),
+                tested_at: "2026-11-24T01:00:00Z".into(),
+                ok: true,
+                latency_ms: Some(42.0),
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert!(storage.rename_subscription("sub-ren", "   ").is_err());
+        assert!(storage.rename_subscription("sub-missing", "Valid").is_err());
+
+        let renamed = storage
+            .rename_subscription("sub-ren", "  Renamed Feed  ")
+            .unwrap();
+        assert_eq!(renamed.name, "Renamed Feed");
+        assert_eq!(renamed.id, "sub-ren");
+        assert_eq!(storage.get_node("n-ren-1").unwrap().unwrap().sub_id, "sub-ren");
+        assert_eq!(
+            storage.latest_probe_results_for_node("n-ren-1").unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn update_subscription_nodes_with_mode_replace_latest_and_merge_dedup_preserve_probes_and_groups() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.seed_builtin_probes().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-main", "Main Feed"))
+            .unwrap();
+
+        // Seed two nodes (plus a duplicate-fingerprint legacy node to exercise remap).
+        let n_keep = sample_vless_node(
+            "old-keep",
+            "sub-main",
+            "JP Primary",
+            "203.0.113.11",
+            443,
+            "00000000-0000-4000-8000-000000000011",
+            "/p1",
+        );
+        let n_dup = sample_vless_node(
+            "old-dup",
+            "sub-main",
+            "JP Primary Duplicate",
+            "203.0.113.11",
+            443,
+            "00000000-0000-4000-8000-000000000011",
+            "/p1",
+        );
+        let n_gone = sample_vless_node(
+            "old-gone",
+            "sub-main",
+            "SG Vanished",
+            "203.0.113.12",
+            443,
+            "00000000-0000-4000-8000-000000000012",
+            "/p2",
+        );
+        storage
+            .upsert_nodes_batch(&[n_keep.clone(), n_dup.clone(), n_gone.clone()])
+            .unwrap();
+
+        storage
+            .insert_probe_results_batch(&[
+                ProbeResultRecord {
+                    node_id: "old-keep".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-24T03:00:00Z".into(),
+                    ok: true,
+                    latency_ms: Some(28.0),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "old-dup".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-24T01:00:00Z".into(),
+                    ok: true,
+                    latency_ms: Some(50.0),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+
+        let grp = MultiGroup {
+            id: "grp-upd".into(),
+            name: "Update Group".into(),
+            member_node_ids: vec![
+                "old-dup".into(),
+                "old-keep".into(),
+                "old-gone".into(),
+            ],
+            active_node_id: Some("old-dup".into()),
+            ..Default::default()
+        };
+        storage.upsert_multi_group(&grp).unwrap();
+
+        // Empty incoming list must fail and leave DB untouched.
+        assert!(
+            storage
+                .update_subscription_nodes_with_mode(
+                    "sub-main",
+                    &[],
+                    SubscriptionUpdateMode::ReplaceLatest
+                )
+                .is_err()
+        );
+        assert_eq!(storage.list_nodes().unwrap().len(), 3);
+
+        // ReplaceLatest: incoming has different IDs, one matches fingerprint of old-keep/old-dup,
+        // one is brand new (same IP/port but different UUID -> must NOT collide).
+        let incoming_replace = vec![
+            sample_vless_node(
+                "fresh-id-1",
+                "cap-temp",
+                "JP Primary Renamed",
+                "203.0.113.11",
+                443,
+                "00000000-0000-4000-8000-000000000011",
+                "/p1",
+            ),
+            sample_vless_node(
+                "fresh-id-2",
+                "cap-temp",
+                "JP Second Account",
+                "203.0.113.11",
+                443,
+                "00000000-0000-4000-8000-000000000099",
+                "/p1",
+            ),
+        ];
+
+        let rep = storage
+            .update_subscription_nodes_with_mode(
+                "sub-main",
+                &incoming_replace,
+                SubscriptionUpdateMode::ReplaceLatest,
+            )
+            .unwrap();
+        assert_eq!(rep.sub_id, "sub-main");
+        assert_eq!(rep.kept_count, 1);
+        assert_eq!(rep.added_count, 1);
+        assert_eq!(rep.replaced_count, 2);
+        assert_eq!(rep.total_count, 2);
+        // Deterministic ORDER BY id ASC puts "old-dup" before "old-keep", so "old-dup" is reused
+        // and "old-keep" remaps to "old-dup".
+        let kept_id = rep
+            .id_remap
+            .values()
+            .next()
+            .cloned()
+            .expect("duplicate vanished node must be remapped");
+        assert!(storage.get_node("old-gone").unwrap().is_none());
+        let kept_node = storage.get_node(&kept_id).unwrap().expect("kept node exists");
+        assert_eq!(kept_node.name, "JP Primary Renamed");
+        assert_eq!(kept_node.sub_id, "sub-main");
+
+        // Newer probe from vanished duplicate (`old-keep`, 28ms at 03:00) must migrate onto `old-dup`.
+        let latest_probes = storage.latest_probe_results_for_node(&kept_id).unwrap();
+        assert_eq!(latest_probes.len(), 1);
+        assert_eq!(latest_probes[0].latency_ms, Some(28.0));
+
+        // Multi-group must have deduplicated kept_id, removed old-gone, and valid active_node_id.
+        let updated_grp = storage.get_multi_group("grp-upd").unwrap().unwrap();
+        assert_eq!(updated_grp.member_node_ids, vec![kept_id.clone()]);
+        assert_eq!(updated_grp.active_node_id, Some(kept_id.clone()));
+
+        // MergeDedup: keeps all existing nodes, updates matching fingerprint in place preserving ID
+        // & probe history, and inserts only unseen fingerprints.
+        let incoming_merge = vec![
+            sample_vless_node(
+                "brand-new-id-matching-fp",
+                "other-sub",
+                "JP Primary V3",
+                "203.0.113.11",
+                443,
+                "00000000-0000-4000-8000-000000000011",
+                "/p1",
+            ),
+            sample_vless_node(
+                "fresh-id-3",
+                "other-sub",
+                "US New Node",
+                "198.51.100.33",
+                443,
+                "00000000-0000-4000-8000-000000000033",
+                "/us",
+            ),
+        ];
+        let merged = storage
+            .update_subscription_nodes_with_mode(
+                "sub-main",
+                &incoming_merge,
+                SubscriptionUpdateMode::MergeDedup,
+            )
+            .unwrap();
+        assert_eq!(merged.kept_count, 1);
+        assert_eq!(merged.replaced_count, 1);
+        assert_eq!(merged.added_count, 1);
+        assert_eq!(merged.total_count, 3);
+        assert_eq!(
+            storage.get_node(&kept_id).unwrap().unwrap().name,
+            "JP Primary V3"
+        );
+        assert_eq!(
+            storage
+                .latest_probe_results_for_node(&kept_id)
+                .unwrap()[0]
+                .latency_ms,
+            Some(28.0)
+        );
+        assert!(storage.get_node("fresh-id-3").unwrap().is_some());
+    }
+
+    #[test]
+    fn merge_subscriptions_preserves_non_dup_ids_migrates_newer_probes_and_rewrites_groups_and_dynamic_filter() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.seed_builtin_probes().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-src", "Source Feed"))
+            .unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-tgt", "Target Feed"))
+            .unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-other", "Other Feed"))
+            .unwrap();
+
+        // Target has T_keep (203.0.113.20:443 uuid-1) and T_stay (203.0.113.21:443 uuid-2).
+        let t_keep = sample_vless_node(
+            "t-keep",
+            "sub-tgt",
+            "JP Target Shared",
+            "203.0.113.20",
+            443,
+            "00000000-0000-4000-8000-000000000001",
+            "/ws",
+        );
+        let t_stay = sample_vless_node(
+            "t-stay",
+            "sub-tgt",
+            "JP Target Only",
+            "203.0.113.21",
+            443,
+            "00000000-0000-4000-8000-000000000002",
+            "/ws",
+        );
+        // Source has S_dup (same physical fingerprint as T_keep), S_move (unique), and
+        // S_same_ip_diff_acct (same IP/port as T_keep but different UUID -> must NOT deduplicate!).
+        let s_dup = sample_vless_node(
+            "s-dup",
+            "sub-src",
+            "JP Source Shared Renamed",
+            "203.0.113.20",
+            443,
+            "00000000-0000-4000-8000-000000000001",
+            "/ws",
+        );
+        let s_move = sample_vless_node(
+            "s-move",
+            "sub-src",
+            "SG Source Unique",
+            "198.51.100.40",
+            443,
+            "00000000-0000-4000-8000-000000000003",
+            "/sg",
+        );
+        let s_diff_acct = sample_vless_node(
+            "s-diff-acct",
+            "sub-src",
+            "JP Shared IP Other Account",
+            "203.0.113.20",
+            443,
+            "00000000-0000-4000-8000-000000000004",
+            "/ws",
+        );
+
+        storage
+            .upsert_nodes_batch(&[t_keep, t_stay, s_dup, s_move, s_diff_acct])
+            .unwrap();
+
+        // Probes:
+        // - `builtin_latency`: S_dup (03:00, 18ms) is NEWER than T_keep (01:00, 65ms) -> T_keep gets 18ms.
+        // - `builtin_google_cn`: T_keep (04:00, clean=true) is NEWER than S_dup (02:00, clean=false) -> T_keep keeps true.
+        // - `builtin_upload`: only S_dup has it (02:30, 55 Mbps) -> T_keep inherits it.
+        // - `s-move` probe must remain intact after sub_id update + source subscription deletion.
+        storage
+            .insert_probe_results_batch(&[
+                ProbeResultRecord {
+                    node_id: "t-keep".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-24T01:00:00Z".into(),
+                    ok: true,
+                    latency_ms: Some(65.0),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "s-dup".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-24T03:00:00Z".into(),
+                    ok: true,
+                    latency_ms: Some(18.0),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "t-keep".into(),
+                    probe_id: "builtin_google_cn".into(),
+                    tested_at: "2026-11-24T04:00:00Z".into(),
+                    ok: true,
+                    google_clean: Some(true),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "s-dup".into(),
+                    probe_id: "builtin_google_cn".into(),
+                    tested_at: "2026-11-24T02:00:00Z".into(),
+                    ok: false,
+                    google_clean: Some(false),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "s-dup".into(),
+                    probe_id: "builtin_upload".into(),
+                    tested_at: "2026-11-24T02:30:00Z".into(),
+                    ok: true,
+                    up_mbps: Some(55.0),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "s-move".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-24T01:30:00Z".into(),
+                    ok: true,
+                    latency_ms: Some(25.0),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+
+        let grp = MultiGroup {
+            id: "grp-merge".into(),
+            name: "AI Pool".into(),
+            member_node_ids: vec![
+                "s-dup".into(),
+                "t-keep".into(),
+                "s-move".into(),
+            ],
+            active_node_id: Some("s-dup".into()),
+            dynamic_filter: Some(DynamicFilterSpec {
+                sub_ids: vec![
+                    "sub-src".into(),
+                    "sub-tgt".into(),
+                    "sub-other".into(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        storage.upsert_multi_group(&grp).unwrap();
+
+        // Guard: merging into self or missing IDs must fail cleanly.
+        assert!(
+            storage
+                .merge_subscriptions("sub-src", "sub-src", None, true, false)
+                .is_err()
+        );
+        assert!(
+            storage
+                .merge_subscriptions("sub-missing", "sub-tgt", None, true, false)
+                .is_err()
+        );
+
+        let res = storage
+            .merge_subscriptions(
+                "sub-src",
+                "sub-tgt",
+                Some("Unified Migrated Pool"),
+                true,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(res.source_sub_id, "sub-src");
+        assert_eq!(res.target_sub_id, "sub-tgt");
+        assert_eq!(res.moved_count, 2); // s-move + s-diff-acct
+        assert_eq!(res.deduplicated_count, 1); // s-dup -> t-keep
+        assert_eq!(res.total_count, 4);
+        assert_eq!(res.id_remap.get("s-dup").map(String::as_str), Some("t-keep"));
+
+        // Source subscription deleted; target renamed & converted to `migrated`.
+        assert!(storage.get_subscription("sub-src").unwrap().is_none());
+        let tgt_sub = storage.get_subscription("sub-tgt").unwrap().unwrap();
+        assert_eq!(tgt_sub.name, "Unified Migrated Pool");
+        assert_eq!(tgt_sub.kind, SubscriptionKind::Migrated);
+
+        // Non-duplicate source nodes survived in place with original IDs and probe history.
+        let moved = storage.get_node("s-move").unwrap().expect("s-move must survive");
+        assert_eq!(moved.sub_id, "sub-tgt");
+        assert_eq!(
+            storage
+                .latest_probe_results_for_node("s-move")
+                .unwrap()[0]
+                .latency_ms,
+            Some(25.0)
+        );
+        let diff_acct = storage
+            .get_node("s-diff-acct")
+            .unwrap()
+            .expect("distinct account on same IP/port must not be deduplicated");
+        assert_eq!(diff_acct.sub_id, "sub-tgt");
+        assert!(storage.get_node("s-dup").unwrap().is_none());
+
+        // T_keep received newer latency (18ms), missing upload (55Mbps), and kept newer google_clean (true).
+        let snap = storage.get_probe_snapshot("t-keep", None).unwrap().unwrap();
+        assert_eq!(snap.probe_ping("builtin_latency"), Some(18.0));
+        assert_eq!(snap.probe_up("builtin_upload"), Some(55.0));
+        assert_eq!(snap.google_clean, Some(true));
+
+        // Multi-group members deduplicated, active_node_id remapped, dynamic_filter.sub_ids rewritten.
+        let updated_grp = storage.get_multi_group("grp-merge").unwrap().unwrap();
+        assert_eq!(
+            updated_grp.member_node_ids,
+            vec!["t-keep".to_string(), "s-move".to_string()]
+        );
+        assert_eq!(updated_grp.active_node_id.as_deref(), Some("t-keep"));
+        assert_eq!(
+            updated_grp.dynamic_filter.unwrap().sub_ids,
+            vec!["sub-tgt".to_string(), "sub-other".to_string()]
+        );
+    }
+
+    #[test]
+    fn migrates_v2_preaccel_relays_to_v3_and_preserves_speed_metrics_across_probe_updates() {
+        let dir = std::env::temp_dir().join(format!("catcloud-db-mig-v3-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("legacy-v2.sqlite");
+
+        // Build a legacy v2 SQLite database whose `preaccel_relays` table lacks
+        // `last_up_mbps` and `last_down_mbps`.
+        {
+            let conn = Connection::open(&db_path).expect("create legacy v2 sqlite");
+            conn.execute_batch(
+                "
+                CREATE TABLE preaccel_relays (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '',
+                    region TEXT NOT NULL DEFAULT '',
+                    server TEXT NOT NULL,
+                    port INTEGER NOT NULL DEFAULT 443,
+                    protocol TEXT NOT NULL,
+                    password TEXT NOT NULL DEFAULT '',
+                    sni TEXT,
+                    skip_cert_verify INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    expires_at TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_probe_ms REAL,
+                    last_mbps REAL
+                );
+                INSERT INTO preaccel_relays (
+                    id, name, provider, region, server, port, protocol,
+                    password, sni, skip_cert_verify, priority, enabled,
+                    last_probe_ms, last_mbps
+                ) VALUES (
+                    'relay-v2-legacy', 'Legacy Relay 443', 'cloud-v2', 'CN-East',
+                    '203.0.113.10', 443, 'anytls', 'placeholder-pass', NULL, 1, 10, 1,
+                    22.5, 45.0
+                );
+                PRAGMA user_version = 2;
+                ",
+            )
+            .expect("seed legacy v2 schema");
+        }
+
+        // First open: migrates v2 -> v3 idempotently without losing legacy rows.
+        {
+            let storage = Storage::open(&db_path).expect("open & migrate v2 db");
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let relay = storage
+                .get_preaccel_relay("relay-v2-legacy")
+                .unwrap()
+                .expect("legacy relay preserved");
+            assert_eq!(relay.last_probe_ms, Some(22.5));
+            assert_eq!(relay.last_mbps, Some(45.0));
+            assert_eq!(relay.last_up_mbps, None);
+            assert_eq!(relay.last_down_mbps, None);
+
+            // Update speed metrics (updates latency, up, down, and mirrors up into last_mbps).
+            assert!(
+                storage
+                    .update_preaccel_speed_metrics(
+                        "relay-v2-legacy",
+                        Some(18.2),
+                        Some(64.5),
+                        Some(195.8),
+                    )
+                    .unwrap()
+            );
+            let after_speed = storage
+                .get_preaccel_relay("relay-v2-legacy")
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_speed.last_probe_ms, Some(18.2));
+            assert_eq!(after_speed.last_up_mbps, Some(64.5));
+            assert_eq!(after_speed.last_down_mbps, Some(195.8));
+            assert_eq!(after_speed.last_mbps, Some(64.5));
+
+            // COALESCE semantics: passing None preserves previously recorded values.
+            assert!(
+                storage
+                    .update_preaccel_speed_metrics("relay-v2-legacy", Some(16.0), None, Some(210.0))
+                    .unwrap()
+            );
+            let after_partial = storage
+                .get_preaccel_relay("relay-v2-legacy")
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_partial.last_probe_ms, Some(16.0));
+            assert_eq!(after_partial.last_up_mbps, Some(64.5));
+            assert_eq!(after_partial.last_down_mbps, Some(210.0));
+            assert_eq!(after_partial.last_mbps, Some(64.5));
+
+            // Legacy latency probe update MUST NOT wipe out `last_up_mbps` / `last_down_mbps`.
+            assert!(
+                storage
+                    .update_preaccel_probe_metrics("relay-v2-legacy", Some(14.0), None)
+                    .unwrap()
+            );
+            let after_probe = storage
+                .get_preaccel_relay("relay-v2-legacy")
+                .unwrap()
+                .unwrap();
+            assert_eq!(after_probe.last_probe_ms, Some(14.0));
+            assert_eq!(after_probe.last_mbps, None);
+            assert_eq!(after_probe.last_up_mbps, Some(64.5));
+            assert_eq!(after_probe.last_down_mbps, Some(210.0));
+        }
+
+        // Re-opening must be idempotent and retain all v3 columns and values.
+        {
+            let storage = Storage::open(&db_path).expect("reopen migrated v3 db");
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let relays = storage.list_preaccel_relays(false).unwrap();
+            assert_eq!(relays.len(), 1);
+            assert_eq!(relays[0].last_up_mbps, Some(64.5));
+            assert_eq!(relays[0].last_down_mbps, Some(210.0));
         }
 
         let _ = std::fs::remove_dir_all(&dir);

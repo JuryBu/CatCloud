@@ -6,6 +6,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use uuid::Uuid;
 
@@ -528,6 +529,77 @@ pub fn validate_relay_strict_at(relay: &PreAccelRelay, now: DateTime<Utc>) -> Ca
         .collect::<Vec<_>>()
         .join("; ");
     Err(CatError::Validation(summary))
+}
+
+/// Safely validate, deduplicate by `(protocol, server, port)` fingerprint, protect existing
+/// relay IDs from collision, strip local speed caches, and upsert relays into SQLite storage.
+///
+/// Returns `(imported_count, warnings)`.
+pub fn import_relays_dedup_into_storage(
+    db: &crate::storage::Storage,
+    relays: Vec<crate::models::PreAccelRelay>,
+) -> crate::error::CatResult<(usize, Vec<String>)> {
+    let existing = db.list_preaccel_relays(false)?;
+    let mut fp_to_id: HashMap<(String, String, u16), String> =
+        HashMap::with_capacity(existing.len() + relays.len());
+    let mut used_ids: HashSet<String> = HashSet::with_capacity(existing.len() + relays.len());
+
+    for r in &existing {
+        used_ids.insert(r.id.clone());
+        let fp = relay_dedup_fingerprint(r);
+        fp_to_id.entry(fp).or_insert_with(|| r.id.clone());
+    }
+
+    let mut imported_count = 0usize;
+    let mut warnings = Vec::new();
+
+    for mut relay in relays {
+        relay.last_probe_ms = None;
+        relay.last_mbps = None;
+        relay.last_up_mbps = None;
+        relay.last_down_mbps = None;
+
+        if let Err(err) = validate_relay_strict(&relay) {
+            let label = if relay.name.trim().is_empty() {
+                relay.server.trim()
+            } else {
+                relay.name.trim()
+            };
+            warnings.push(format!("已跳过无效中转「{label}」：{err}"));
+            continue;
+        }
+
+        let fp = relay_dedup_fingerprint(&relay);
+        if let Some(existing_id) = fp_to_id.get(&fp).cloned() {
+            relay.id = existing_id;
+        } else {
+            let candidate_id = relay.id.trim().to_string();
+            if candidate_id.is_empty() || used_ids.contains(&candidate_id) {
+                let mut generated = format!("relay-{}", Uuid::new_v4().simple());
+                while used_ids.contains(&generated) {
+                    generated = format!("relay-{}", Uuid::new_v4().simple());
+                }
+                relay.id = generated;
+            } else {
+                relay.id = candidate_id;
+            }
+            used_ids.insert(relay.id.clone());
+            fp_to_id.insert(fp, relay.id.clone());
+        }
+
+        db.upsert_preaccel_relay(&relay)?;
+        imported_count += 1;
+    }
+
+    Ok((imported_count, warnings))
+}
+
+fn relay_dedup_fingerprint(relay: &PreAccelRelay) -> (String, String, u16) {
+    let protocol_lower = RelayProtocol::parse(&relay.protocol)
+        .map(|p| p.mihomo_type().to_string())
+        .unwrap_or_else(|| relay.protocol.trim().to_ascii_lowercase());
+    let server_lower = relay.server.trim().to_ascii_lowercase();
+    (protocol_lower, server_lower, relay.port)
 }
 
 fn strip_mmrelay_prefix(raw: &str) -> Option<&str> {

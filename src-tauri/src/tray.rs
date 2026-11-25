@@ -288,6 +288,8 @@ pub struct TrayTooltipInfo {
     pub preaccel_summary: Option<String>,
     pub primary_group_summary: Option<String>,
     pub realtime_speed: Option<String>,
+    #[serde(default)]
+    pub status_notice: Option<String>,
 }
 
 impl Default for TrayTooltipInfo {
@@ -301,6 +303,7 @@ impl Default for TrayTooltipInfo {
             preaccel_summary: None,
             primary_group_summary: None,
             realtime_speed: None,
+            status_notice: None,
         }
     }
 }
@@ -308,7 +311,7 @@ impl Default for TrayTooltipInfo {
 impl TrayTooltipInfo {
     /// Format a compact multi-line tooltip clamped safely to Windows' 127 UTF-16 limit.
     pub fn format_tooltip(&self) -> String {
-        let mut lines = Vec::with_capacity(5);
+        let mut lines = Vec::with_capacity(6);
         lines.push(format!(
             "猫猫云梯 v{} · {}",
             self.version, self.runtime_mode_label
@@ -319,9 +322,14 @@ impl TrayTooltipInfo {
             if self.tun_enabled { "开" } else { "关" },
             if self.system_proxy_enabled { "开" } else { "关" },
         ));
+        if let Some(ref notice) = self.status_notice {
+            if !notice.trim().is_empty() {
+                lines.push(format!("状态: {}", notice.trim()));
+            }
+        }
         if let Some(ref preaccel) = self.preaccel_summary {
             if !preaccel.trim().is_empty() {
-                lines.push(format!("预加速: {}", preaccel.trim()));
+                lines.push(format!("国内提速: {}", preaccel.trim()));
             }
         }
         if let Some(ref group) = self.primary_group_summary {
@@ -1360,9 +1368,10 @@ mod tests {
             proxy_mode: TrayProxyMode::Rule,
             tun_enabled: true,
             system_proxy_enabled: false,
-            preaccel_summary: Some("国内主节点 443 预加速 (265 Mbps)".into()),
+            preaccel_summary: Some("国内主节点 443 提速 (265 Mbps)".into()),
             primary_group_summary: Some("AI 专线: 节点 A (1x 零送中 · 超长描述测试文本测试文本测试文本测试文本)".into()),
             realtime_speed: Some("↑ 2.68 MB/s ↓ 18.4 MB/s".into()),
+            status_notice: None,
         };
         let formatted = info.format_tooltip();
         assert!(formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
@@ -1517,9 +1526,10 @@ mod tests {
             ),
             primary_group_summary: Some("主力路线组 -> 🇯🇵 Tokyo 01 超长节点名测试测试测试".into()),
             realtime_speed: None,
+            status_notice: None,
         };
         let formatted = info.format_tooltip();
-        assert!(formatted.contains("预加速: 全局提速中"));
+        assert!(formatted.contains("国内提速: 全局提速中"));
         assert!(formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
     }
 
@@ -1588,5 +1598,34 @@ mod tests {
         let default_visual = TrayVisualState::default();
         assert_eq!(default_visual.global_preaccel_verify_state, "idle");
         assert_eq!(default_visual.global_preaccel_verify_ms, None);
+    }
+
+    #[test]
+    fn tooltip_status_notice_surfaces_circuit_open_probing_switching_and_direct_mode() {
+        let circuit_info = TrayTooltipInfo {
+            proxy_mode: TrayProxyMode::Rule,
+            system_proxy_enabled: true,
+            status_notice: Some("活跃分组已熔断 (REJECT)".into()),
+            ..Default::default()
+        };
+        let circuit_tip = circuit_info.format_tooltip();
+        assert!(circuit_tip.contains("状态: 活跃分组已熔断 (REJECT)"));
+        assert!(circuit_tip.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
+
+        let direct_info = TrayTooltipInfo {
+            proxy_mode: TrayProxyMode::Direct,
+            system_proxy_enabled: true,
+            status_notice: Some("直连模式（不走海外代理）".into()),
+            ..Default::default()
+        };
+        let direct_tip = direct_info.format_tooltip();
+        assert!(direct_tip.contains("模式: 直连"));
+        assert!(direct_tip.contains("状态: 直连模式（不走海外代理）"));
+
+        let busy_info = TrayTooltipInfo {
+            status_notice: Some("测速进行中…".into()),
+            ..Default::default()
+        };
+        assert!(busy_info.format_tooltip().contains("状态: 测速进行中…"));
     }
 }

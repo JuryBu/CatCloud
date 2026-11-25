@@ -1,5 +1,7 @@
 use crate::error::{CatError, CatResult};
-use crate::models::{AppConfig, OverrideMode};
+use crate::models::{
+    AppConfig, CONFIG_SCHEMA_VERSION, OverrideMode, is_supported_ui_language,
+};
 use crate::paths::AppPaths;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -91,22 +93,51 @@ impl ConfigManager {
     }
 }
 
-/// Load `data/config.json` and validate it, or return `AppConfig::default()` when absent.
+/// Apply idempotent in-memory schema migrations on a loaded configuration.
+///
+/// - Upgrades legacy `schema_version < 2` configs whose `core_runtime.gogc == 35` to `25`
+///   without ever overwriting user-customized `gogc` values or v2+ configs.
+/// - Returns `true` if `schema_version` or any field was migrated.
+fn migrate_config_in_memory(cfg: &mut AppConfig) -> bool {
+    let mut migrated = false;
+    if cfg.schema_version < CONFIG_SCHEMA_VERSION {
+        if cfg.core_runtime.gogc == 35 {
+            cfg.core_runtime.gogc = 25;
+        }
+        cfg.schema_version = CONFIG_SCHEMA_VERSION;
+        migrated = true;
+    }
+    migrated
+}
+
+fn load_from_disk_with_migration(paths: &AppPaths) -> CatResult<(AppConfig, bool)> {
+    let raw = std::fs::read_to_string(&paths.config_path)?;
+    let mut cfg: AppConfig = serde_json::from_str(&raw)?;
+    let migrated = migrate_config_in_memory(&mut cfg);
+    validate_config(&cfg)?;
+    Ok((cfg, migrated))
+}
+
+/// Load `data/config.json`, apply idempotent in-memory schema migrations without touching disk,
+/// and validate it, or return `AppConfig::default()` when absent.
 pub fn load_or_default(paths: &AppPaths) -> CatResult<AppConfig> {
     if paths.config_path.is_file() {
-        let raw = std::fs::read_to_string(&paths.config_path)?;
-        let cfg: AppConfig = serde_json::from_str(&raw)?;
-        validate_config(&cfg)?;
+        let (cfg, _) = load_from_disk_with_migration(paths)?;
         Ok(cfg)
     } else {
         Ok(AppConfig::default())
     }
 }
 
-/// Load `data/config.json`, or initialize and atomically persist defaults on first launch.
+/// Load `data/config.json` (atomically persisting any in-memory schema migration),
+/// or initialize and atomically persist defaults on first launch.
 pub fn load_or_init(paths: &AppPaths) -> CatResult<AppConfig> {
     if paths.config_path.is_file() {
-        load_or_default(paths)
+        let (cfg, migrated) = load_from_disk_with_migration(paths)?;
+        if migrated {
+            save(paths, &cfg)?;
+        }
+        Ok(cfg)
     } else {
         let cfg = AppConfig::default();
         save(paths, &cfg)?;
@@ -114,10 +145,13 @@ pub fn load_or_init(paths: &AppPaths) -> CatResult<AppConfig> {
     }
 }
 
-/// Validate `cfg` and persist it atomically to `paths.config_path` via `AppPaths::atomic_write`.
+/// Validate `cfg` and persist it atomically to `paths.config_path` via `AppPaths::atomic_write`,
+/// unconditionally ensuring persisted configs carry `schema_version == CONFIG_SCHEMA_VERSION`.
 pub fn save(paths: &AppPaths, cfg: &AppConfig) -> CatResult<()> {
     validate_config(cfg)?;
-    let bytes = serde_json::to_vec_pretty(cfg)?;
+    let mut to_save = cfg.clone();
+    to_save.schema_version = CONFIG_SCHEMA_VERSION;
+    let bytes = serde_json::to_vec_pretty(&to_save)?;
     AppPaths::atomic_write(&paths.config_path, &bytes)
 }
 
@@ -167,20 +201,36 @@ pub fn import_backup(paths: &AppPaths, backup_path: &Path) -> CatResult<AppConfi
     let raw = std::fs::read_to_string(backup_path)?;
     let value: serde_json::Value = serde_json::from_str(&raw)?;
 
-    let imported: AppConfig = if value.get("schema").and_then(|v| v.as_str()) == Some(BACKUP_SCHEMA)
-    {
-        let bundle: ConfigBackupBundle = serde_json::from_value(value)?;
-        let expected = sha256_hex(&serde_json::to_vec(&bundle.config)?);
-        if !expected.eq_ignore_ascii_case(&bundle.config_sha256) {
-            return Err(CatError::Validation(
-                "backup integrity check failed: SHA-256 digest mismatch".to_string(),
-            ));
-        }
-        bundle.config
-    } else {
-        serde_json::from_value(value)?
-    };
+    let mut imported: AppConfig =
+        if value.get("schema").and_then(|v| v.as_str()) == Some(BACKUP_SCHEMA) {
+            let raw_config_compact_sha = extract_raw_json_object_field_compact(&raw, "config")
+                .map(|bytes| sha256_hex(&bytes));
+            let raw_config_value_sha = value
+                .get("config")
+                .and_then(|v| serde_json::to_vec(v).ok())
+                .map(|bytes| sha256_hex(&bytes));
+            let bundle: ConfigBackupBundle = serde_json::from_value(value)?;
+            let reserialized_sha = sha256_hex(&serde_json::to_vec(&bundle.config)?);
 
+            let digest_matches = raw_config_compact_sha
+                .as_deref()
+                .is_some_and(|h| h.eq_ignore_ascii_case(&bundle.config_sha256))
+                || raw_config_value_sha
+                    .as_deref()
+                    .is_some_and(|h| h.eq_ignore_ascii_case(&bundle.config_sha256))
+                || reserialized_sha.eq_ignore_ascii_case(&bundle.config_sha256);
+
+            if !digest_matches {
+                return Err(CatError::Validation(
+                    "backup integrity check failed: SHA-256 digest mismatch".to_string(),
+                ));
+            }
+            bundle.config
+        } else {
+            serde_json::from_value(value)?
+        };
+
+    migrate_config_in_memory(&mut imported);
     validate_config(&imported)?;
 
     if paths.config_path.is_file() {
@@ -481,6 +531,14 @@ pub fn validate_config_detailed(cfg: &AppConfig) -> Vec<ConfigValidationIssue> {
             "wallpaper blur radius must be <= 64 px",
         );
     }
+    let lang = cfg.personalization.language.trim();
+    if lang.is_empty() || !is_supported_ui_language(lang) {
+        push_err(
+            &mut issues,
+            "personalization.language",
+            "unsupported UI language (expected one of: zh-CN, en, ja, ru)",
+        );
+    }
 
     // 9. Updater config
     if !is_valid_github_repo(&cfg.update.repo) {
@@ -599,6 +657,159 @@ fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
+}
+
+/// Extract the exact raw JSON object value for top-level key `field_name` and compact all
+/// structural whitespace outside string literals while preserving original field order.
+///
+/// This lets `import_backup` verify historical `ConfigBackupBundle` SHA-256 digests generated by
+/// older CatCloud releases even after newer releases add fields to `AppConfig`.
+fn extract_raw_json_object_field_compact(raw: &str, field_name: &str) -> Option<Vec<u8>> {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+
+    let skip_ws = |idx: &mut usize| {
+        while *idx < len && matches!(bytes[*idx], b' ' | b'\t' | b'\r' | b'\n') {
+            *idx += 1;
+        }
+    };
+
+    skip_ws(&mut i);
+    if i >= len || bytes[i] != b'{' {
+        return None;
+    }
+    i += 1;
+
+    let mut depth: usize = 1;
+    while i < len && depth == 1 {
+        skip_ws(&mut i);
+        if i >= len || bytes[i] == b'}' {
+            return None;
+        }
+        if bytes[i] != b'"' {
+            return None;
+        }
+        let key_start = i;
+        i += 1;
+        let mut escaped = false;
+        while i < len {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
+        let key_str: String = serde_json::from_str(&raw[key_start..i]).ok()?;
+        skip_ws(&mut i);
+        if i >= len || bytes[i] != b':' {
+            return None;
+        }
+        i += 1;
+        skip_ws(&mut i);
+        if i >= len {
+            return None;
+        }
+
+        let val_start = i;
+        // Advance past this JSON value (object, array, string, or primitive).
+        match bytes[i] {
+            b'{' | b'[' => {
+                let mut inner_depth = 0usize;
+                let mut in_str = false;
+                let mut esc = false;
+                while i < len {
+                    let b = bytes[i];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if b == b'\\' {
+                            esc = true;
+                        } else if b == b'"' {
+                            in_str = false;
+                        }
+                    } else {
+                        match b {
+                            b'"' => in_str = true,
+                            b'{' | b'[' => inner_depth += 1,
+                            b'}' | b']' => {
+                                inner_depth = inner_depth.saturating_sub(1);
+                                if inner_depth == 0 {
+                                    i += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                let mut esc = false;
+                while i < len {
+                    let b = bytes[i];
+                    if esc {
+                        esc = false;
+                    } else if b == b'\\' {
+                        esc = true;
+                    } else if b == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                while i < len && !matches!(bytes[i], b',' | b'}' | b' ' | b'\t' | b'\r' | b'\n') {
+                    i += 1;
+                }
+            }
+        }
+        let val_end = i;
+
+        if key_str == field_name {
+            let slice = &bytes[val_start..val_end];
+            let mut compact = Vec::with_capacity(slice.len());
+            let mut in_str = false;
+            let mut esc = false;
+            for &b in slice {
+                if in_str {
+                    compact.push(b);
+                    if esc {
+                        esc = false;
+                    } else if b == b'\\' {
+                        esc = true;
+                    } else if b == b'"' {
+                        in_str = false;
+                    }
+                } else if b == b'"' {
+                    in_str = true;
+                    compact.push(b);
+                } else if !matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                    compact.push(b);
+                }
+            }
+            return Some(compact);
+        }
+
+        skip_ws(&mut i);
+        if i < len && bytes[i] == b',' {
+            i += 1;
+        } else if i < len && bytes[i] == b'}' {
+            depth = 0;
+        } else {
+            return None;
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -779,6 +990,126 @@ mod tests {
         let still_good = load_or_default(&paths).expect("existing good config remains intact");
         assert_eq!(still_good.mixed_port, 17900);
         assert!(still_good.preaccel.probe_url.contains("hicloud.com"));
+
+        cleanup_dir(&paths);
+    }
+
+    #[test]
+    fn legacy_schema_v1_gogc_35_migrates_idempotently_and_preserves_custom_values() {
+        let paths = temp_paths("gogc-migration");
+        let mgr = ConfigManager::new(paths.clone());
+
+        // 1. Legacy v1 config (missing schema_version) with gogc == 35:
+        //    `load_or_default` migrates in memory ONLY without mutating disk.
+        let legacy_v1_raw = r#"{"core_runtime":{"gogc":35},"mixed_port":17890}"#;
+        std::fs::write(&paths.config_path, legacy_v1_raw).unwrap();
+
+        let loaded_ro = mgr.load_or_default().expect("load_or_default legacy v1");
+        assert_eq!(loaded_ro.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(loaded_ro.core_runtime.gogc, 25);
+        assert_eq!(loaded_ro.mixed_port, 17890);
+        assert_eq!(
+            std::fs::read_to_string(&paths.config_path).unwrap(),
+            legacy_v1_raw,
+            "load_or_default must remain strictly read-only"
+        );
+
+        // `load_or_init` atomically persists the migrated v2 config to disk.
+        let loaded_init = mgr.load_or_init().expect("load_or_init legacy v1");
+        assert_eq!(loaded_init.schema_version, 2);
+        assert_eq!(loaded_init.core_runtime.gogc, 25);
+        let disk_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.config_path).unwrap()).unwrap();
+        assert_eq!(disk_json["schema_version"].as_u64(), Some(2));
+        assert_eq!(disk_json["core_runtime"]["gogc"].as_u64(), Some(25));
+
+        // 2. Legacy v1 config with user-customized gogc == 60 must NOT be overwritten.
+        std::fs::write(
+            &paths.config_path,
+            r#"{"schema_version":1,"core_runtime":{"gogc":60}}"#,
+        )
+        .unwrap();
+        let custom_v1 = mgr.load_or_init().expect("load_or_init custom gogc");
+        assert_eq!(custom_v1.schema_version, 2);
+        assert_eq!(custom_v1.core_runtime.gogc, 60);
+
+        // 3. Explicit v2 config where user manually chose gogc == 35 must stay 35.
+        std::fs::write(
+            &paths.config_path,
+            r#"{"schema_version":2,"core_runtime":{"gogc":35}}"#,
+        )
+        .unwrap();
+        let explicit_v2 = mgr.load_or_default().expect("load v2 gogc=35");
+        assert_eq!(explicit_v2.schema_version, 2);
+        assert_eq!(explicit_v2.core_runtime.gogc, 35);
+
+        // 4. `save()` unconditionally persists schema_version == 2.
+        let mut stale = AppConfig::default();
+        stale.schema_version = 1;
+        stale.core_runtime.gogc = 50;
+        mgr.save(&stale).expect("save with stale schema_version");
+        let saved_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.config_path).unwrap()).unwrap();
+        assert_eq!(saved_json["schema_version"].as_u64(), Some(2));
+        assert_eq!(saved_json["core_runtime"]["gogc"].as_u64(), Some(50));
+
+        cleanup_dir(&paths);
+    }
+
+    #[test]
+    fn validates_ui_language_and_imports_legacy_raw_json_backup_digest() {
+        let paths = temp_paths("lang-and-legacy-backup");
+        let mgr = ConfigManager::new(paths.clone());
+
+        // Reject unsupported or empty UI language; accept zh-CN, en, ja, ru.
+        for ok_lang in ["zh-CN", "en", "en-US", "ja", "ja-JP", "ru", "ru-RU"] {
+            let mut cfg = AppConfig::default();
+            cfg.personalization.language = ok_lang.to_string();
+            assert!(validate_config(&cfg).is_ok(), "language `{ok_lang}` should pass");
+        }
+        for bad_lang in ["", "   ", "fr-FR", "ko-KR"] {
+            let mut cfg = AppConfig::default();
+            cfg.personalization.language = bad_lang.to_string();
+            let err = validate_config(&cfg).expect_err("unsupported language must fail");
+            assert!(err.to_string().contains("personalization.language"));
+        }
+
+        // Simulate a historical v1 backup whose SHA-256 was computed over a sparse legacy JSON
+        // object (missing newer fields, containing schema_version=1, gogc=35, and ui_language alias).
+        let legacy_cfg_compact = r#"{"schema_version":1,"mixed_port":17911,"core_runtime":{"gogc":35},"personalization":{"ui_language":"ja"}}"#;
+        let legacy_sha = sha256_hex(legacy_cfg_compact.as_bytes());
+        let legacy_bundle_pretty = format!(
+            "{{\n  \"schema\": \"{BACKUP_SCHEMA}\",\n  \"exported_at\": \"2026-01-01T00:00:00Z\",\n  \"app_version\": \"0.0.9\",\n  \"config_sha256\": \"{legacy_sha}\",\n  \"config\": {{\n    \"schema_version\": 1,\n    \"mixed_port\": 17911,\n    \"core_runtime\": {{\n      \"gogc\": 35\n    }},\n    \"personalization\": {{\n      \"ui_language\": \"ja\"\n    }}\n  }}\n}}"
+        );
+        let backup_file = paths.backup_dir.join("legacy-v1-backup.json");
+        std::fs::create_dir_all(&paths.backup_dir).unwrap();
+        std::fs::write(&backup_file, &legacy_bundle_pretty).unwrap();
+
+        let restored = mgr
+            .import_backup(&backup_file)
+            .expect("legacy raw-JSON digest backup must import cleanly");
+        assert_eq!(restored.mixed_port, 17911);
+        assert_eq!(restored.schema_version, 2);
+        assert_eq!(restored.core_runtime.gogc, 25);
+        assert_eq!(restored.personalization.normalized_ui_language(), "ja");
+
+        // Saved config preserves `"language"` JSON key name.
+        let saved_raw = std::fs::read_to_string(&paths.config_path).unwrap();
+        let saved_val: serde_json::Value = serde_json::from_str(&saved_raw).unwrap();
+        assert_eq!(
+            saved_val["personalization"]["language"].as_str(),
+            Some("ja")
+        );
+        assert!(saved_val["personalization"].get("ui_language").is_none());
+
+        // Tampering any value in the legacy backup must still fail SHA-256 verification.
+        let tampered_path = paths.backup_dir.join("legacy-v1-tampered.json");
+        std::fs::write(
+            &tampered_path,
+            legacy_bundle_pretty.replace("17911", "17999"),
+        )
+        .unwrap();
+        assert!(mgr.import_backup(&tampered_path).is_err());
 
         cleanup_dir(&paths);
     }

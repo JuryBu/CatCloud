@@ -26,7 +26,8 @@ pub use isolated_runner::{
     allocate_ephemeral_ports, build_direct_no_proxy_client, build_isolated_http_client,
     build_isolated_http_client_with_options, build_isolated_probe_yaml,
     build_isolated_probe_yaml_with_preaccel, generate_controller_secret,
-    generate_preaccel_comparison_yaml, isolated_proxy_url, resolve_unique_proxy_names,
+    generate_preaccel_comparison_yaml, generate_preaccel_relay_speed_yaml, isolated_proxy_url,
+    resolve_unique_proxy_names,
 };
 pub use registry::{
     DEFAULT_DOWNLOAD_PAYLOAD_BYTES, DEFAULT_UPLOAD_PAYLOAD_BYTES, FunnelTier, MAX_PAYLOAD_BYTES,

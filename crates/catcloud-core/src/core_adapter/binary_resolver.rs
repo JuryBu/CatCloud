@@ -195,12 +195,26 @@ pub fn resolve_mihomo_binary_with_exe_dir(
     // 2. Portable/user data bin directory (supports hot-swapped kernel binaries)
     ordered_candidates.push((paths.bin_dir.join(bin_name), BinarySource::UserDataBin));
 
-    // 3. Bundled resources/bin locations (portable, macOS .app bundle, Linux system packages)
+    // 3. Bundled resources/bin locations (portable, portable cli/, macOS .app bundle, Linux system packages)
     if let Some(dir) = exe_dir {
         ordered_candidates.push((
             dir.join("resources").join("bin").join(bin_name),
             BinarySource::BundledResourcesBin,
         ));
+        if dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("cli"))
+        {
+            if let Some(parent) = dir.parent() {
+                if parent.parent().is_some() {
+                    ordered_candidates.push((
+                        parent.join("resources").join("bin").join(bin_name),
+                        BinarySource::BundledResourcesBin,
+                    ));
+                }
+            }
+        }
         let parent_dir = dir
             .parent()
             .map(Path::to_path_buf)
@@ -557,6 +571,52 @@ mod tests {
         let repaired_mode = std::fs::metadata(&data_bin).unwrap().permissions().mode();
         assert_ne!(repaired_mode & 0o111, 0, "execute bit must be restored");
         assert_eq!(repaired_mode & 0o777, 0o755);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_parent_resources_bin_when_launched_from_portable_cli_subdir() {
+        let (root, paths, _) = make_temp_env("cli-parent-res");
+        let bin_name = mihomo_binary_name();
+        let portable_root = root.join("CatCloud-Portable");
+        let cli_dir = portable_root.join("cli");
+        let tools_dir = portable_root.join("tools");
+        let parent_res_bin = portable_root.join("resources").join("bin").join(bin_name);
+
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::create_dir_all(&tools_dir).unwrap();
+        std::fs::create_dir_all(parent_res_bin.parent().unwrap()).unwrap();
+        std::fs::write(&parent_res_bin, b"parent-res-mihomo").unwrap();
+
+        let cfg = AppConfig::default();
+
+        // 1. From `cli/`, resolves `../resources/bin/mihomo(.exe)` as BundledResourcesBin.
+        let r_cli = resolve_mihomo_binary_with_exe_dir(&cfg, &paths, Some(&cli_dir), &[], false)
+            .unwrap();
+        assert!(r_cli.found);
+        assert_eq!(r_cli.source, BinarySource::BundledResourcesBin);
+        assert_eq!(
+            r_cli.path.unwrap(),
+            crate::paths::normalize_os_path(&std::fs::canonicalize(&parent_res_bin).unwrap())
+        );
+
+        // 2. Non-`cli` subdir does NOT check `../resources/bin` in checked_candidates.
+        let r_tools =
+            resolve_mihomo_binary_with_exe_dir(&cfg, &paths, Some(&tools_dir), &[], false)
+                .unwrap();
+        assert!(
+            !r_tools.checked_candidates.contains(&parent_res_bin),
+            "non-cli subdir must not include parent resources/bin candidate"
+        );
+
+        // 3. `UserDataBin` still takes precedence over `../resources/bin`.
+        let data_bin = paths.bin_dir.join(bin_name);
+        std::fs::write(&data_bin, b"user-data-mihomo").unwrap();
+        let r_user = resolve_mihomo_binary_with_exe_dir(&cfg, &paths, Some(&cli_dir), &[], false)
+            .unwrap();
+        assert!(r_user.found);
+        assert_eq!(r_user.source, BinarySource::UserDataBin);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -12,6 +12,7 @@ import {
   Filter,
   Layers,
   Loader2,
+  Package,
   Play,
   Plus,
   Rocket,
@@ -51,6 +52,8 @@ import { AppSelect } from "../components/AppSelect";
 import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
 import { GroupMembershipPopover } from "../components/GroupMembershipPopover";
 import { MascotSprite } from "../components/MascotSprite";
+import { ShareBundleModal } from "../components/ShareBundleModal";
+import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import {
   appActions,
   appStore,
@@ -496,6 +499,25 @@ function getLatencyColor(latencyMs: number | null | undefined, ok: boolean | und
   return "var(--red)";
 }
 
+function hasAnyAiUnlocked(snap: ProbeSnapshot | undefined): boolean {
+  if (!snap) return false;
+  const sites = snap.unlocked_sites ?? {};
+  const gemini = Boolean(sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai);
+  const chatgpt = Boolean(sites.chatgpt);
+  const claude = Boolean(sites.claude);
+  const windsurf = Boolean(sites.windsurf ?? snap.per_probe_ok?.builtin_unlock_windsurf);
+  return gemini || chatgpt || claude || windsurf;
+}
+
+function isGoldenCore(snap: ProbeSnapshot | undefined): boolean {
+  return Boolean(snap && snap.ok && snap.google_clean === true && hasAnyAiUnlocked(snap));
+}
+
+function hasMeasuredSpeed(snap: ProbeSnapshot | undefined): boolean {
+  if (!snap) return false;
+  return snap.up_mbps !== null || snap.down_mbps !== null;
+}
+
 interface CtrlDragState {
   dragging: boolean;
   action: "add" | "remove";
@@ -517,6 +539,8 @@ export function SpeedTestPage({
   const subscriptions = useAppSelector((s) => s.subscriptions);
   const groups = useAppSelector((s) => s.groups);
   const config = useAppSelector((s) => s.config);
+  const dict = useUiDict(normalizeUiLanguage(config.personalization.ui_language));
+  const [shareModalOpen, setShareModalOpen] = useState(false);
   const preAccelRelays = useAppSelector((s) => s.preAccelRelays);
   const runtime = useAppSelector((s) => s.runtime);
   const isSingleMode = runtime.route_mode === "single";
@@ -656,6 +680,8 @@ export function SpeedTestPage({
     "asc",
     oneOfPref(["asc", "desc"] as const)
   );
+  // Transient flag: stays false when toggling "黄金节点" so persisted sortKey/sortDir are never mutated
+  const [goldenManualSortOverride, setGoldenManualSortOverride] = useState(false);
   const [pageSize, setPageSize] = usePersistedState<number>(
     "speedtest.pageSize",
     50,
@@ -1047,10 +1073,10 @@ export function SpeedTestPage({
     return out;
   }, [selectedIds, nodeIdSet]);
 
-  const filteredRows = useMemo(() => {
+  const baseFilteredRows = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const healthHints = runtime.node_health_hints;
-    const list = nodes
+    return nodes
       .map((node) => {
         const snap = probes[node.id];
         const healthHint = healthHints?.[node.id];
@@ -1100,13 +1126,9 @@ export function SpeedTestPage({
         );
         const unlockScore = Object.values(unlocks).filter(Boolean).length;
         const isGoogleClean = snap?.google_clean === true;
-        const hasMeasuredSpeed = Boolean(
-          (snap?.up_mbps !== null && snap?.up_mbps !== undefined && snap.up_mbps > 0) ||
-            (snap?.down_mbps !== null && snap?.down_mbps !== undefined && snap.down_mbps > 0)
-        );
-        const isGolden = Boolean(
-          snap && snap.ok !== false && isGoogleClean && unlockScore > 0 && hasMeasuredSpeed
-        );
+        const goldenCore = isGoldenCore(snap);
+        const measuredSpeed = hasMeasuredSpeed(snap);
+        const isGolden = goldenCore && measuredSpeed;
         const regionMismatch =
           Boolean(snap?.google_risk_mismatch) ||
           Boolean(
@@ -1130,6 +1152,8 @@ export function SpeedTestPage({
           hasUnlockData,
           unlockScore,
           isGoogleClean,
+          isGoldenCore: goldenCore,
+          hasMeasuredSpeed: measuredSpeed,
           isGolden,
           regionMismatch,
         };
@@ -1152,12 +1176,81 @@ export function SpeedTestPage({
           return false;
         }
         if (!nodeMatchesContinentAndRegion(row.node, filterContinent, regionFilter)) return false;
-        if (onlyGolden && !row.isGolden) return false;
         if (onlyTested && !row.snap) return false;
         if (onlyGoogleClean && !row.isGoogleClean) return false;
         if (onlyAiUnlocked && row.unlockScore === 0) return false;
         return true;
       });
+  }, [
+    nodes,
+    probes,
+    runtime.node_health_hints,
+    subNameById,
+    searchQuery,
+    sourceFilter,
+    selectedGroupObj,
+    selectedGroupMemberSet,
+    selectedGroupDynamicFilter,
+    filterContinent,
+    regionFilter,
+    onlyTested,
+    onlyGoogleClean,
+    onlyAiUnlocked,
+  ]);
+
+  const anyTestedInAllNodes = useMemo(
+    () => nodes.some((n) => Boolean(probes[n.id])),
+    [nodes, probes]
+  );
+
+  const anyUnlockTestedInAllNodes = useMemo(
+    () =>
+      nodes.some((n) => {
+        const snap = probes[n.id];
+        if (!snap) return false;
+        return (
+          snap.google_clean !== null ||
+          Object.keys(snap.unlocked_sites ?? {}).length > 0 ||
+          snap.per_probe_ok?.builtin_unlock_windsurf !== undefined
+        );
+      }),
+    [nodes, probes]
+  );
+
+  const {
+    filteredRows,
+    isGoldenLatencyFallback,
+    goldenFallbackCandidates,
+    effectiveSortKey,
+    effectiveSortDir,
+  } = useMemo(() => {
+    let list = [...baseFilteredRows];
+    let fallbackActive = false;
+    let fallbackCandidates: typeof baseFilteredRows = [];
+    let activeSortKey: SortKey = sortKey;
+    let activeSortDir: SortDir = sortDir;
+
+    if (onlyGolden) {
+      const goldenCoreRows = baseFilteredRows.filter((row) => row.isGoldenCore);
+      const goldenFullRows = goldenCoreRows.filter((row) => row.hasMeasuredSpeed);
+      if (goldenFullRows.length > 0) {
+        list = [...goldenFullRows];
+        if (!goldenManualSortOverride) {
+          activeSortKey = "up";
+          activeSortDir = "desc";
+        }
+      } else if (goldenCoreRows.length > 0) {
+        fallbackActive = true;
+        fallbackCandidates = goldenCoreRows;
+        list = [...goldenCoreRows];
+        if (!goldenManualSortOverride) {
+          activeSortKey = "latency";
+          activeSortDir = "asc";
+        }
+      } else {
+        list = [];
+      }
+    }
 
     if (isRunning && lockedOrderMap) {
       list.sort((a, b) => {
@@ -1166,12 +1259,18 @@ export function SpeedTestPage({
         if (aIdx !== bIdx) return aIdx - bIdx;
         return a.node.name.localeCompare(b.node.name);
       });
-      return list;
+      return {
+        filteredRows: list,
+        isGoldenLatencyFallback: fallbackActive,
+        goldenFallbackCandidates: fallbackCandidates,
+        effectiveSortKey: activeSortKey,
+        effectiveSortDir: activeSortDir,
+      };
     }
 
     list.sort((a, b) => {
       let diff = 0;
-      switch (sortKey) {
+      switch (activeSortKey) {
         case "name":
           diff = a.node.name.localeCompare(b.node.name);
           break;
@@ -1224,26 +1323,20 @@ export function SpeedTestPage({
         }
       }
       if (diff === 0) return a.node.name.localeCompare(b.node.name);
-      return sortDir === "asc" ? diff : -diff;
+      return activeSortDir === "asc" ? diff : -diff;
     });
 
-    return list;
+    return {
+      filteredRows: list,
+      isGoldenLatencyFallback: fallbackActive,
+      goldenFallbackCandidates: fallbackCandidates,
+      effectiveSortKey: activeSortKey,
+      effectiveSortDir: activeSortDir,
+    };
   }, [
-    nodes,
-    probes,
-    runtime.node_health_hints,
-    subNameById,
-    searchQuery,
-    sourceFilter,
-    selectedGroupObj,
-    selectedGroupMemberSet,
-    selectedGroupDynamicFilter,
-    filterContinent,
-    regionFilter,
+    baseFilteredRows,
     onlyGolden,
-    onlyTested,
-    onlyGoogleClean,
-    onlyAiUnlocked,
+    goldenManualSortOverride,
     sortKey,
     sortDir,
     isRunning,
@@ -1454,6 +1547,7 @@ export function SpeedTestPage({
     setFilterContinent("all");
     setRegionFilter("all");
     setOnlyGolden(false);
+    setGoldenManualSortOverride(false);
     setOnlyTested(false);
     setOnlyGoogleClean(false);
     setOnlyAiUnlocked(false);
@@ -1692,20 +1786,25 @@ export function SpeedTestPage({
   };
 
   const handleSort = (key: SortKey) => {
-    if (sortKey === key) {
-      setSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+    if (effectiveSortKey === key) {
+      const nextDir: SortDir = effectiveSortDir === "asc" ? "desc" : "asc";
+      setSortKey(key);
+      setSortDir(nextDir);
     } else {
       setSortKey(key);
       setSortDir(key === "latency" || key === "name" || key === "source" ? "asc" : "desc");
+    }
+    if (onlyGolden) {
+      setGoldenManualSortOverride(true);
     }
     setPage(1);
   };
 
   const renderSortIcon = (key: SortKey) => {
-    if (sortKey !== key) {
+    if (effectiveSortKey !== key) {
       return <ArrowUpDown className="h-3 w-3 opacity-45" />;
     }
-    return sortDir === "asc" ? (
+    return effectiveSortDir === "asc" ? (
       <ArrowUp className="h-3 w-3 text-[var(--accent)]" />
     ) : (
       <ArrowDown className="h-3 w-3 text-[var(--accent)]" />
@@ -2376,20 +2475,17 @@ export function SpeedTestPage({
             onClick={() => {
               const next = !onlyGolden;
               setOnlyGolden(next);
-              if (next) {
-                setSortKey("up");
-                setSortDir("desc");
-              }
+              setGoldenManualSortOverride(false);
               setPage(1);
             }}
-            title="筛选谷歌未送中、AI 有解锁且已测出速度的优质节点，开启后自动按上传最快排序"
+            title="筛选谷歌未送中、AI 有解锁且高速的优质节点；未测上下行时自动按延迟最低排好候选"
             className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold transition-colors ${
               onlyGolden
                 ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]"
                 : "border-[var(--accent)]/45 bg-[var(--accent-soft)] text-[var(--accent)] hover:border-[var(--accent)]"
             }`}
           >
-            ⭐ 黄金节点（未送中 + AI + 高速）
+            {dict.nodes.goldenButton}
           </button>
 
           <button
@@ -2450,7 +2546,7 @@ export function SpeedTestPage({
                 { key: "latency", dir: "asc", label: "延迟最低" },
               ] as const
             ).map((opt) => {
-              const active = sortKey === opt.key && sortDir === opt.dir;
+              const active = effectiveSortKey === opt.key && effectiveSortDir === opt.dir;
               return (
                 <button
                   key={opt.key}
@@ -2458,6 +2554,9 @@ export function SpeedTestPage({
                   onClick={() => {
                     setSortKey(opt.key);
                     setSortDir(opt.dir);
+                    if (onlyGolden) {
+                      setGoldenManualSortOverride(true);
+                    }
                     setPage(1);
                   }}
                   className={`rounded-md px-2 py-1 font-medium transition-colors ${
@@ -2483,6 +2582,35 @@ export function SpeedTestPage({
             </button>
           )}
         </div>
+
+        {/* Gentle Fallback Banner when Golden Filter Has Only Unmeasured-Speed Candidates */}
+        {isGoldenLatencyFallback && (
+          <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)]/55 px-3.5 py-2 text-xs">
+            <div className="flex min-w-0 flex-1 items-center gap-2 text-[var(--text)]">
+              <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--amber)]" />
+              <span className="leading-relaxed">{dict.nodes.goldenFallbackBanner}</span>
+            </div>
+            <button
+              type="button"
+              disabled={isProbeActionDisabled}
+              onClick={() =>
+                void executeProbes(
+                  goldenFallbackCandidates.map((r) => r.node.id),
+                  "full",
+                  true
+                )
+              }
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+            >
+              <Rocket className="h-3 w-3 shrink-0" />
+              <span>
+                {formatI18nTemplate(dict.nodes.goldenFallbackAction, {
+                  count: goldenFallbackCandidates.length,
+                })}
+              </span>
+            </button>
+          </div>
+        )}
 
         {/* Multi-Selection Status Bar + Selection Guide */}
         <div
@@ -2519,6 +2647,16 @@ export function SpeedTestPage({
             </div>
 
             <div className="flex flex-wrap items-center gap-1.5">
+              {selectedCount >= 1 && (
+                <button
+                  type="button"
+                  onClick={() => setShareModalOpen(true)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-[var(--accent)]/55 bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
+                >
+                  <Package className="h-3 w-3 shrink-0" />
+                  <span>导出已选 (.zip)</span>
+                </button>
+              )}
               <button
                 type="button"
                 disabled={totalFiltered === 0}
@@ -3006,8 +3144,84 @@ export function SpeedTestPage({
                           <span>去导入订阅</span>
                         </button>
                       </div>
+                    ) : onlyGolden && (!anyTestedInAllNodes || !anyUnlockTestedInAllNodes) ? (
+                      <div className="flex flex-col items-center justify-center gap-2.5">
+                        <span className="max-w-md leading-relaxed text-[var(--text-secondary)]">
+                          {!anyTestedInAllNodes
+                            ? dict.nodes.goldenEmptyUntested
+                            : "当前仅测过延迟，尚未检测谷歌地区与 AI 解锁，请先运行『测延迟 + 送中/AI』"}
+                        </span>
+                        <div className="flex flex-wrap items-center justify-center gap-2">
+                          <button
+                            type="button"
+                            disabled={isProbeActionDisabled}
+                            onClick={() => {
+                              setOnlyGolden(false);
+                              setGoldenManualSortOverride(false);
+                              setPage(1);
+                              if (nodes.length > 50) {
+                                setPendingLargeRunTier("unlock");
+                              } else {
+                                void executeProbes(
+                                  nodes.map((n) => n.id),
+                                  "unlock"
+                                );
+                              }
+                            }}
+                            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+                          >
+                            <ShieldCheck className="h-3.5 w-3.5" />
+                            <span>测延迟 + 送中/AI（省流）</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setOnlyGolden(false);
+                              setGoldenManualSortOverride(false);
+                              setPage(1);
+                            }}
+                            className="rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+                          >
+                            查看全部节点
+                          </button>
+                        </div>
+                      </div>
+                    ) : onlyGolden ? (
+                      <div className="flex flex-col items-center justify-center gap-2.5">
+                        <span className="max-w-md leading-relaxed text-[var(--text-secondary)]">
+                          {dict.nodes.goldenEmptyNoMatch}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (baseFilteredRows.length > 0) {
+                              setOnlyGolden(false);
+                              setGoldenManualSortOverride(false);
+                              setPage(1);
+                            } else {
+                              handleResetFilters();
+                            }
+                          }}
+                          className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--accent)]/60 bg-[var(--accent-soft)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
+                        >
+                          <RotateCcw className="h-3.5 w-3.5" />
+                          <span>恢复查看全部节点</span>
+                        </button>
+                      </div>
                     ) : (
-                      "没有找到符合条件的节点，试试放宽筛选条件吧"
+                      <div className="flex flex-col items-center justify-center gap-2">
+                        <span>没有找到符合条件的节点，试试放宽筛选条件吧</span>
+                        {hasActiveFilters && (
+                          <button
+                            type="button"
+                            onClick={handleResetFilters}
+                            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-1 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+                          >
+                            <RotateCcw className="h-3 w-3" />
+                            <span>重置筛选</span>
+                          </button>
+                        )}
+                      </div>
                     )}
                   </td>
                 </tr>
@@ -3033,6 +3247,15 @@ export function SpeedTestPage({
           />
         )}
       </section>
+
+      <ShareBundleModal
+        open={shareModalOpen}
+        mode="export"
+        defaultTab="nodes"
+        defaultPackName="精选节点分享包"
+        initialNodeIds={Array.from(validSelectedIds)}
+        onClose={() => setShareModalOpen(false)}
+      />
     </div>
   );
 }

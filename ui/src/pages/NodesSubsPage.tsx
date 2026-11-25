@@ -13,10 +13,13 @@ import {
   FileText,
   Filter,
   FolderOpen,
+  GitMerge,
   Globe,
   Layers,
   Link2,
   Minus,
+  Package,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
@@ -44,6 +47,7 @@ import {
   type ProbeSnapshot,
   type ProxyNode,
   type SubscriptionRecord,
+  type SubscriptionUpdateMode,
   catcloudApi,
   formatErrorMessage,
   isTauriEnv,
@@ -54,6 +58,8 @@ import {
   PaginationBar,
 } from "../components/ContinentRegionFilter";
 import { GroupMembershipPopover } from "../components/GroupMembershipPopover";
+import { ShareBundleModal } from "../components/ShareBundleModal";
+import { normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
 import {
   type ContinentId,
@@ -1812,13 +1818,19 @@ function formatCaptureEventTime(tsMs: number): string {
   return `${hh}:${mm}:${ss}`;
 }
 
+interface CaptureConfirmPayload {
+  name: string;
+  outcome: LiveCaptureOutcomeDto;
+  selectedNodes: ProxyNode[];
+  targetMode: "new" | "existing";
+  targetSubId?: string;
+  updateMode?: SubscriptionUpdateMode;
+}
+
 interface ProcessAttachDrawerProps {
   open: boolean;
   onClose: () => void;
-  onConfirmCapture: (payload: {
-    name: string;
-    outcome: LiveCaptureOutcomeDto;
-  }) => Promise<boolean>;
+  onConfirmCapture: (payload: CaptureConfirmPayload) => Promise<boolean>;
   onGoToSubUrl: () => void;
 }
 
@@ -1829,6 +1841,10 @@ function ProcessAttachDrawer({
   onGoToSubUrl,
 }: ProcessAttachDrawerProps) {
   const bgCapture = useAppSelector((s) => s.bgTasks.capture);
+  const subscriptions = useAppSelector((s) => s.subscriptions);
+  const allStoreNodes = useAppSelector((s) => s.nodes);
+  const uiLang = useAppSelector((s) => s.config.personalization.ui_language);
+  const dict = useUiDict(normalizeUiLanguage(uiLang));
   const captureStatus = bgCapture.status;
   const finishingCapture = bgCapture.finishing;
   const outcome = bgCapture.outcome;
@@ -1855,7 +1871,45 @@ function ProcessAttachDrawer({
     return `抓取 · ${label}`;
   });
   const [nodeFilter, setNodeFilter] = useState("");
+  const [selectedOutcomeIndices, setSelectedOutcomeIndices] = useState<Set<number>>(
+    () => new Set()
+  );
+  const [captureTargetMode, setCaptureTargetMode] = useState<"new" | "existing">("new");
+  const [captureTargetSubId, setCaptureTargetSubId] = useState<string>(
+    () => subscriptions[0]?.id ?? ""
+  );
   const [importingOutcome, setImportingOutcome] = useState(false);
+
+  const subNodeCountMap = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const n of allStoreNodes) {
+      map.set(n.sub_id, (map.get(n.sub_id) ?? 0) + 1);
+    }
+    return map;
+  }, [allStoreNodes]);
+
+  // Reset selected node checkboxes whenever a new capture outcome arrives
+  useEffect(() => {
+    if (!outcome || !outcome.supported) {
+      setSelectedOutcomeIndices(new Set());
+      return;
+    }
+    setSelectedOutcomeIndices(new Set(outcome.nodes.map((_, idx) => idx)));
+    setCaptureTargetMode("new");
+    if (subscriptions.length > 0 && !subscriptions.some((s) => s.id === captureTargetSubId)) {
+      setCaptureTargetSubId(subscriptions[0].id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [outcome]);
+
+  useEffect(() => {
+    if (subscriptions.length === 0) {
+      if (captureTargetMode === "existing") setCaptureTargetMode("new");
+      if (captureTargetSubId !== "") setCaptureTargetSubId("");
+    } else if (!subscriptions.some((s) => s.id === captureTargetSubId)) {
+      setCaptureTargetSubId(subscriptions[0].id);
+    }
+  }, [subscriptions, captureTargetMode, captureTargetSubId]);
 
   const mountedRef = useRef(true);
   const openRef = useRef(open);
@@ -2073,11 +2127,12 @@ function ProcessAttachDrawer({
       .sort((a, b) => b.count - a.count);
   }, [outcome]);
 
-  const filteredOutcomeNodes = useMemo(() => {
-    if (!outcome) return [] as ProxyNode[];
+  const filteredOutcomeEntries = useMemo(() => {
+    if (!outcome) return [] as Array<{ node: ProxyNode; index: number }>;
+    const all = outcome.nodes.map((node, index) => ({ node, index }));
     const kw = nodeFilter.trim().toLowerCase();
-    if (!kw) return outcome.nodes;
-    return outcome.nodes.filter((n) => {
+    if (!kw) return all;
+    return all.filter(({ node: n }) => {
       const regionCode = resolveNodeRegionCode(n);
       return (
         n.name.toLowerCase().includes(kw) ||
@@ -2088,6 +2143,40 @@ function ProcessAttachDrawer({
       );
     });
   }, [outcome, nodeFilter]);
+
+  const selectedOutcomeNodes = useMemo(() => {
+    if (!outcome) return [] as ProxyNode[];
+    return outcome.nodes.filter((_, idx) => selectedOutcomeIndices.has(idx));
+  }, [outcome, selectedOutcomeIndices]);
+
+  const allFilteredOutcomeSelected = useMemo(
+    () =>
+      filteredOutcomeEntries.length > 0 &&
+      filteredOutcomeEntries.every((entry) => selectedOutcomeIndices.has(entry.index)),
+    [filteredOutcomeEntries, selectedOutcomeIndices]
+  );
+
+  const toggleOutcomeNodeIndex = (idx: number) => {
+    setSelectedOutcomeIndices((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) next.delete(idx);
+      else next.add(idx);
+      return next;
+    });
+  };
+
+  const handleToggleAllFilteredOutcome = () => {
+    if (filteredOutcomeEntries.length === 0) return;
+    setSelectedOutcomeIndices((prev) => {
+      const next = new Set(prev);
+      if (allFilteredOutcomeSelected) {
+        for (const entry of filteredOutcomeEntries) next.delete(entry.index);
+      } else {
+        for (const entry of filteredOutcomeEntries) next.add(entry.index);
+      }
+      return next;
+    });
+  };
 
   const handleStartLiveCapture = async () => {
     if (!selectedCandidate || startingCapture) return;
@@ -2135,20 +2224,41 @@ function ProcessAttachDrawer({
     setStep(3);
   };
 
-  const handleConfirmImportOutcome = async () => {
+  const handleConfirmImportOutcome = async (
+    targetModeOverride?: "new" | "existing",
+    updateModeOverride?: SubscriptionUpdateMode
+  ) => {
     if (!outcome || !outcome.supported || outcome.nodes.length === 0 || importingOutcome) {
+      return;
+    }
+    if (selectedOutcomeNodes.length === 0) {
+      appActions.showToast("请至少勾选 1 个要导入的节点", "warn");
+      return;
+    }
+    const resolvedMode = targetModeOverride ?? captureTargetMode;
+    if (resolvedMode === "existing" && !captureTargetSubId) {
+      appActions.showToast("请先选择一个要更新的已有分组", "warn");
       return;
     }
     const finalName =
       importName.trim() || `抓取 · ${outcome.target_name || "桌面软件"}`;
     setImportingOutcome(true);
     try {
-      const ok = await onConfirmCapture({ name: finalName, outcome });
+      const ok = await onConfirmCapture({
+        name: finalName,
+        outcome,
+        selectedNodes: selectedOutcomeNodes,
+        targetMode: resolvedMode,
+        targetSubId: resolvedMode === "existing" ? captureTargetSubId : undefined,
+        updateMode: resolvedMode === "existing" ? (updateModeOverride ?? "merge_dedup") : undefined,
+      });
       if (ok) {
         appActions.clearLiveCaptureOutcome();
         if (mountedRef.current) {
           setImportName("");
           setNodeFilter("");
+          setSelectedOutcomeIndices(new Set());
+          setCaptureTargetMode("new");
           onClose();
         }
       }
@@ -2157,6 +2267,11 @@ function ProcessAttachDrawer({
         setImportingOutcome(false);
       }
     }
+  };
+
+  const handleCancelExistingUpdate = () => {
+    setCaptureTargetMode("new");
+    appActions.showToast("已取消更新，原有分组与节点保持不变", "info");
   };
 
   const handleResetToStep1 = async () => {
@@ -2685,7 +2800,7 @@ function ProcessAttachDrawer({
                   <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-[var(--green)]" />
                   <div className="min-w-0 flex-1">
                     <div className="text-sm font-semibold text-[var(--text)]">
-                      成功捕捉到 {outcome.nodes.length} 个可用节点！
+                      成功捕捉到 {outcome.nodes.length} 个可用节点（已选 {selectedOutcomeNodes.length} 个）
                     </div>
                     <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
                       来源软件：
@@ -2696,8 +2811,8 @@ function ProcessAttachDrawer({
                       {outcome.is_ephemeral_source || outcome.source_kind === "migrated"
                         ? "将以永久节点方式安全落库，重启后也不会失效。"
                         : outcome.source_kind === "file"
-                          ? "已识别到稳定配置文件，将以只读方式关联并导入节点。"
-                          : "已识别到本地公开接口，将以只读方式关联并导入节点。"}
+                          ? "已识别到稳定配置文件，可勾选需要的节点直接导入或并入已有分组。"
+                          : "已识别到本地公开接口，可勾选需要的节点直接导入或并入已有分组。"}
                     </p>
                   </div>
                 </div>
@@ -2724,26 +2839,148 @@ function ProcessAttachDrawer({
                   </div>
                 )}
 
-                {/* Subscription Name Input */}
-                <label className="block text-xs text-[var(--muted)]">
-                  导入后的订阅名称
-                  <input
-                    type="text"
-                    disabled={importingOutcome}
-                    value={importName}
-                    onChange={(e) => setImportName(e.target.value)}
-                    placeholder={`抓取 · ${outcome.target_name || "桌面软件"}`}
-                    className="mt-1.5 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-60"
-                  />
-                </label>
+                {/* Destination Mode Switch: Save as New Group vs Update Existing Group */}
+                <div className="space-y-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/70 p-3.5">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={importingOutcome}
+                      onClick={() => setCaptureTargetMode("new")}
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold transition-colors ${
+                        captureTargetMode === "new"
+                          ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                          : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                      }`}
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      <span>{dict.nodes.captureSaveNew}</span>
+                    </button>
 
-                {/* Full Captured Node Preview */}
+                    <button
+                      type="button"
+                      disabled={importingOutcome || subscriptions.length === 0}
+                      onClick={() => setCaptureTargetMode("existing")}
+                      title={
+                        subscriptions.length === 0
+                          ? "当前暂无已有分组，请先保存为新分组"
+                          : "将本次勾选的节点替换或去重并入已有分组"
+                      }
+                      className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-semibold transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
+                        captureTargetMode === "existing"
+                          ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                          : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:text-[var(--text)]"
+                      }`}
+                    >
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      <span>{dict.nodes.captureUpdateExisting}</span>
+                    </button>
+                  </div>
+
+                  {captureTargetMode === "new" ? (
+                    <label className="block text-xs text-[var(--muted)]">
+                      导入后的分组名称（可直接修改）
+                      <input
+                        type="text"
+                        disabled={importingOutcome}
+                        value={importName}
+                        onChange={(e) => setImportName(e.target.value)}
+                        placeholder={`抓取 · ${outcome.target_name || "桌面软件"}`}
+                        className="mt-1.5 w-full rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-xs text-[var(--text)] focus:border-[var(--accent)] focus:outline-none disabled:opacity-60"
+                      />
+                    </label>
+                  ) : (
+                    <div className="space-y-2.5">
+                      <div className="space-y-1">
+                        <span className="block text-[11px] font-medium text-[var(--muted)]">
+                          选择要更新的目标已有分组
+                        </span>
+                        <AppSelect
+                          aria-label="选择要更新的目标已有分组"
+                          size="sm"
+                          disabled={importingOutcome}
+                          value={captureTargetSubId}
+                          onChange={setCaptureTargetSubId}
+                          options={subscriptions.map((sub) => ({
+                            value: sub.id,
+                            label: `${sub.name}（现有 ${subNodeCountMap.get(sub.id) ?? 0} 个节点）`,
+                          }))}
+                          className="w-full"
+                          buttonClassName="bg-[var(--card)]"
+                        />
+                      </div>
+
+                      <div className="text-[11px] leading-relaxed text-[var(--muted)]">
+                        选择更新方式（如更新失败，原有分组与节点会自动保持不变）：
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={
+                            importingOutcome ||
+                            selectedOutcomeNodes.length === 0 ||
+                            !captureTargetSubId
+                          }
+                          onClick={() =>
+                            void handleConfirmImportOutcome("existing", "replace_latest")
+                          }
+                          className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          {importingOutcome ? (
+                            <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Check className="h-3.5 w-3.5" />
+                          )}
+                          <span>{dict.nodes.captureModeReplace}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={
+                            importingOutcome ||
+                            selectedOutcomeNodes.length === 0 ||
+                            !captureTargetSubId
+                          }
+                          onClick={() =>
+                            void handleConfirmImportOutcome("existing", "merge_dedup")
+                          }
+                          className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--accent)]/60 bg-[var(--accent-soft)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <GitMerge className="h-3.5 w-3.5" />
+                          <span>{dict.nodes.captureModeMerge}</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          disabled={importingOutcome}
+                          onClick={handleCancelExistingUpdate}
+                          className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                          <span>{dict.nodes.captureModeCancel}</span>
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Full Captured Node Preview with Checkboxes */}
                 <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--card)] p-3.5">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-xs font-semibold text-[var(--text)]">
-                      捕获节点预览（{filteredOutcomeNodes.length} / {outcome.nodes.length}）
-                    </span>
-                    {outcome.nodes.length > 8 && (
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-[var(--text)]">
+                        捕获节点预览（已选 {selectedOutcomeNodes.length} / {outcome.nodes.length}）
+                      </span>
+                      <button
+                        type="button"
+                        disabled={filteredOutcomeEntries.length === 0}
+                        onClick={handleToggleAllFilteredOutcome}
+                        className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-45"
+                      >
+                        {allFilteredOutcomeSelected ? "取消全选当前" : "全选当前"}
+                      </button>
+                    </div>
+                    {outcome.nodes.length > 6 && (
                       <div className="relative w-48">
                         <Search className="pointer-events-none absolute left-2 top-1/2 h-3 w-3 -translate-y-1/2 text-[var(--muted)]" />
                         <input
@@ -2756,21 +2993,38 @@ function ProcessAttachDrawer({
                       </div>
                     )}
                   </div>
+                  <p className="text-[11px] text-[var(--muted)]">
+                    可取消勾选不需要的假节点、剩余流量提示条或到期提醒行，只保留真实可用节点。
+                  </p>
 
                   <div className="max-h-60 space-y-1.5 overflow-y-auto pr-1">
-                    {filteredOutcomeNodes.map((node, idx) => {
+                    {filteredOutcomeEntries.map(({ node, index }) => {
                       const regionCode = resolveNodeRegionCode(node);
+                      const checked = selectedOutcomeIndices.has(index);
                       return (
-                        <div
-                          key={`${node.id}-${idx}`}
-                          className="flex items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs"
+                        <label
+                          key={`${node.id}-${index}`}
+                          className={`flex cursor-pointer items-center justify-between gap-2 rounded-lg border px-2.5 py-1.5 text-xs transition-colors ${
+                            checked
+                              ? "border-[var(--accent)]/45 bg-[var(--bg-elevated)]"
+                              : "border-[var(--line)]/60 bg-[var(--bg-elevated)]/45 opacity-55 hover:opacity-85"
+                          }`}
                         >
-                          <div className="min-w-0">
-                            <div className="truncate font-medium text-[var(--text)]">
-                              {node.name}
-                            </div>
-                            <div className="cc-mono text-[10px] text-[var(--muted)]">
-                              {node.protocol.toUpperCase()} · {node.server}:{node.port}
+                          <div className="flex min-w-0 flex-1 items-center gap-2">
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={importingOutcome}
+                              onChange={() => toggleOutcomeNodeIndex(index)}
+                              className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-[var(--accent)]"
+                            />
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-medium text-[var(--text)]">
+                                {node.name}
+                              </div>
+                              <div className="cc-mono text-[10px] text-[var(--muted)]">
+                                {node.protocol.toUpperCase()} · {node.server}:{node.port}
+                              </div>
                             </div>
                           </div>
                           <div className="flex shrink-0 items-center gap-1.5 cc-mono text-[10px]">
@@ -2789,7 +3043,7 @@ function ProcessAttachDrawer({
                               </span>
                             )}
                           </div>
-                        </div>
+                        </label>
                       );
                     })}
                   </div>
@@ -2806,6 +3060,10 @@ function ProcessAttachDrawer({
                 </h3>
                 <p className="mt-2 max-w-md text-xs leading-relaxed text-[var(--text-secondary)]">
                   {UNSUPPORTED_CAPTURE_NOTICE}
+                </p>
+                <p className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-[var(--green)]/35 bg-[var(--green-soft)]/50 px-3 py-1.5 text-[11px] font-medium text-[var(--green)]">
+                  <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                  <span>你原有的订阅分组与节点均已完整保留不动</span>
                 </p>
                 {outcome.unsupported_reason &&
                   outcome.unsupported_reason.trim() !== UNSUPPORTED_CAPTURE_NOTICE && (
@@ -2925,7 +3183,9 @@ function ProcessAttachDrawer({
             <>
               <span className="truncate text-[11px] text-[var(--muted)]">
                 {isOutcomeSupported
-                  ? "安全只读提取，不会修改原软件配置"
+                  ? captureTargetMode === "existing"
+                    ? "请在上方点选「保留最新」或「整合去重」完成更新"
+                    : "安全只读提取，不会修改原软件配置"
                   : "换个支持的软件或使用标准订阅链接"}
               </span>
               <div className="flex shrink-0 items-center gap-2">
@@ -2939,21 +3199,25 @@ function ProcessAttachDrawer({
                     >
                       返回重选
                     </button>
-                    <button
-                      type="button"
-                      disabled={importingOutcome || !outcome}
-                      onClick={() => void handleConfirmImportOutcome()}
-                      className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
-                    >
-                      {importingOutcome ? (
-                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Check className="h-3.5 w-3.5" />
-                      )}
-                      {importingOutcome
-                        ? "正在导入…"
-                        : `确认导入全部 ${outcome?.nodes.length ?? 0} 个节点`}
-                    </button>
+                    {captureTargetMode === "new" && (
+                      <button
+                        type="button"
+                        disabled={
+                          importingOutcome || !outcome || selectedOutcomeNodes.length === 0
+                        }
+                        onClick={() => void handleConfirmImportOutcome("new")}
+                        className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {importingOutcome ? (
+                          <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                        ) : (
+                          <Check className="h-3.5 w-3.5" />
+                        )}
+                        {importingOutcome
+                          ? "正在导入…"
+                          : `${dict.nodes.captureSaveNew}（${selectedOutcomeNodes.length} 个）`}
+                      </button>
+                    )}
                   </>
                 ) : (
                   <button
@@ -2996,8 +3260,11 @@ export function NodesSubsPage({
   const storeGroups = useAppSelector((s) => s.groups);
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.config.preaccel);
+  const uiLang = useAppSelector((s) => s.config.personalization.ui_language);
+  const dict = useUiDict(normalizeUiLanguage(uiLang));
   const subsBg = useAppSelector((s) => s.bgTasks.subs);
   const bgCapture = useAppSelector((s) => s.bgTasks.capture);
+  const nodesTabHint = useAppSelector((s) => s.nodesTabHint);
   const isSingleMode = runtime.route_mode === "single";
 
   // Directly subscribe to appStore so edits on other pages always stay in sync
@@ -3031,13 +3298,85 @@ export function NodesSubsPage({
   const [copiedAiOnboarding, setCopiedAiOnboarding] = useState(false);
   const aiGuideTimerRef = useRef<number | null>(null);
 
-  // Drawers & Delete Confirmation
+  // Drawers, Share Bundle Modal, Inline Rename & Merge Modal
   const [migrationOpen, setMigrationOpen] = useState(false);
   const [migrationInitialTab, setMigrationInitialTab] = useState<"scan" | "paste">("scan");
   const [migrationInitialPaste, setMigrationInitialPaste] = useState<string | null>(null);
   const [processAttachOpen, setProcessAttachOpen] = useState(false);
   const [pendingDeleteSub, setPendingDeleteSub] = useState<SubscriptionRecord | null>(null);
   const [deletingSub, setDeletingSub] = useState(false);
+
+  const [shareModalState, setShareModalState] = useState<{
+    open: boolean;
+    mode: "export" | "import";
+    defaultTab: "nodes" | "relays";
+    initialNodeIds?: string[];
+    defaultPackName?: string;
+  }>({
+    open: false,
+    mode: "export",
+    defaultTab: "nodes",
+  });
+
+  const [renamingSubId, setRenamingSubId] = useState<string | null>(null);
+  const [renamingSubName, setRenamingSubName] = useState<string>("");
+  const [renamingBusy, setRenamingBusy] = useState<boolean>(false);
+
+  const [mergeModalOpen, setMergeModalOpen] = useState<boolean>(false);
+  const [mergeSourceSubId, setMergeSourceSubId] = useState<string>("");
+  const [mergeTargetSubId, setMergeTargetSubId] = useState<string>("");
+  const [mergeNewName, setMergeNewName] = useState<string>("");
+  const [mergeDedup, setMergeDedup] = useState<boolean>(true);
+  const [mergingSubs, setMergingSubs] = useState<boolean>(false);
+  const [mergeError, setMergeError] = useState<string | null>(null);
+
+  const openShareExport = useCallback(
+    (initialNodeIds?: string[], defaultPackName?: string) => {
+      setShareModalState({
+        open: true,
+        mode: "export",
+        defaultTab: "nodes",
+        initialNodeIds,
+        defaultPackName,
+      });
+    },
+    []
+  );
+
+  const openShareImport = useCallback(() => {
+    setShareModalState({
+      open: true,
+      mode: "import",
+      defaultTab: "nodes",
+    });
+  }, []);
+
+  const openMergeModal = useCallback(() => {
+    const subs = appStore.getState().subscriptions;
+    if (subs.length < 2) {
+      appActions.showToast("至少需要 2 个订阅分组才能执行合并", "info");
+      return;
+    }
+    const target = subs[0];
+    const source = subs[1];
+    setMergeSourceSubId(source.id);
+    setMergeTargetSubId(target.id);
+    setMergeNewName(target.name);
+    setMergeDedup(true);
+    setMergeError(null);
+    setMergeModalOpen(true);
+  }, []);
+
+  useEffect(() => {
+    if (!mergeModalOpen) return;
+    const onKeyDown = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape" && !mergingSubs) {
+        setMergeModalOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [mergeModalOpen, mergingSubs]);
   const closeMigration = useCallback(() => {
     setMigrationOpen(false);
     setMigrationInitialTab("scan");
@@ -3048,6 +3387,12 @@ export function NodesSubsPage({
     setMigrationInitialPaste(null);
     setMigrationOpen(true);
   }, []);
+
+  useEffect(() => {
+    if (nodesTabHint?.action !== "migration") return;
+    openMigrationScan();
+    appActions.consumeNodesTabHint();
+  }, [nodesTabHint, openMigrationScan]);
   const openMigrationWithPaste = useCallback((rawText: string) => {
     setMigrationInitialTab("paste");
     setMigrationInitialPaste(rawText.trim());
@@ -3846,19 +4191,150 @@ export function NodesSubsPage({
     return true;
   };
 
-  const handleLiveCaptureImport = async (payload: {
-    name: string;
-    outcome: LiveCaptureOutcomeDto;
-  }): Promise<boolean> => {
-    const { name, outcome } = payload;
+  const handleStartRenameSub = (sub: SubscriptionRecord) => {
+    setRenamingSubId(sub.id);
+    setRenamingSubName(sub.name);
+  };
+
+  const handleCancelRenameSub = () => {
+    if (renamingBusy) return;
+    setRenamingSubId(null);
+    setRenamingSubName("");
+  };
+
+  const handleSubmitRenameSub = async (sub: SubscriptionRecord) => {
+    if (renamingBusy) return;
+    const trimmed = renamingSubName.trim();
+    if (!trimmed) {
+      appActions.showToast("分组名称不能为空", "warn");
+      return;
+    }
+    if (trimmed === sub.name) {
+      setRenamingSubId(null);
+      setRenamingSubName("");
+      return;
+    }
+    setRenamingBusy(true);
+    try {
+      await catcloudApi.renameSubscription(sub.id, trimmed);
+      await appActions.refreshAllData();
+      setRenamingSubId(null);
+      setRenamingSubName("");
+      appActions.showToast(`分组已改名为「${trimmed}」`, "ok");
+    } catch (err) {
+      appActions.showToast(`修改分组名称失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setRenamingBusy(false);
+    }
+  };
+
+  const handleConfirmMergeSubs = async () => {
+    if (mergingSubs) return;
+    if (!mergeSourceSubId || !mergeTargetSubId) {
+      setMergeError("请选择源分组和目标分组");
+      return;
+    }
+    if (mergeSourceSubId === mergeTargetSubId) {
+      setMergeError("源分组和目标分组不能是同一个组");
+      return;
+    }
+    const sourceSub = subscriptions.find((s) => s.id === mergeSourceSubId);
+    const targetSub = subscriptions.find((s) => s.id === mergeTargetSubId);
+    setMergingSubs(true);
+    setMergeError(null);
+    try {
+      const res = await catcloudApi.mergeSubscriptions({
+        sourceSubId: mergeSourceSubId,
+        targetSubId: mergeTargetSubId,
+        newTargetName: mergeNewName.trim() || targetSub?.name || null,
+        deduplicate: mergeDedup,
+      });
+      await appActions.refreshAllData();
+      if (filterSubId === mergeSourceSubId) {
+        setFilterSubId(mergeTargetSubId);
+      }
+      setMergeModalOpen(false);
+      const dedupText =
+        res.deduplicated_count > 0 ? `，自动去重 ${res.deduplicated_count} 个` : "";
+      appActions.showToast(
+        `已将「${sourceSub?.name ?? "源分组"}」合并入「${mergeNewName.trim() || targetSub?.name || "目标分组"}」（移入 ${res.moved_count} 个${dedupText}，现共 ${res.total_count} 个节点）`,
+        "ok",
+        5200
+      );
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      setMergeError(msg);
+      appActions.showToast(`合并分组失败：${msg}`, "warn");
+    } finally {
+      setMergingSubs(false);
+    }
+  };
+
+  const handleLiveCaptureImport = async (
+    payload: CaptureConfirmPayload
+  ): Promise<boolean> => {
+    const { name, outcome, selectedNodes, targetMode, targetSubId, updateMode } = payload;
     const cleanName = name.trim() || `抓取 · ${outcome.target_name || "桌面软件"}`;
-    const capturedNodes = Array.isArray(outcome.nodes) ? outcome.nodes : [];
+    const capturedNodes =
+      Array.isArray(selectedNodes) && selectedNodes.length > 0
+        ? selectedNodes
+        : Array.isArray(outcome.nodes)
+          ? outcome.nodes
+          : [];
     if (!outcome.supported || capturedNodes.length === 0) {
-      appActions.showToast("未捕获到可导入节点", "warn");
+      appActions.showToast("未捕获到可导入节点，原有分组已保留不动", "warn");
       return false;
     }
 
+    // Update existing subscription group (replace_latest or merge_dedup)
+    if (targetMode === "existing") {
+      if (!targetSubId) {
+        appActions.showToast("请先选择要更新的目标已有分组", "warn");
+        return false;
+      }
+      const targetSub = subscriptions.find((s) => s.id === targetSubId);
+      const effectiveMode: SubscriptionUpdateMode = updateMode ?? "merge_dedup";
+      try {
+        const res = await catcloudApi.applyNodesToExistingSubscription(
+          targetSubId,
+          capturedNodes,
+          effectiveMode
+        );
+        await appActions.refreshAllData();
+        setFilterSubId(targetSubId);
+        const targetLabel = targetSub?.name ?? "已有分组";
+        setImportSuccessBanner({
+          count: res.total_count,
+          sourceName: targetLabel,
+          subId: targetSubId,
+        });
+        if (effectiveMode === "replace_latest") {
+          appActions.showToast(
+            `已替换更新「${targetLabel}」：现有 ${res.total_count} 个最新节点`,
+            "ok",
+            4800
+          );
+        } else {
+          appActions.showToast(
+            `已整合去重并入「${targetLabel}」：保留 ${res.kept_count} 个、新增 ${res.added_count} 个，共 ${res.total_count} 个节点`,
+            "ok",
+            5200
+          );
+        }
+        return true;
+      } catch (err) {
+        appActions.showToast(
+          `更新已有分组失败（已保留旧组不动）：${formatErrorMessage(err)}`,
+          "warn",
+          5200
+        );
+        return false;
+      }
+    }
+
+    const userFilteredSubset = capturedNodes.length < outcome.nodes.length;
     const useMigratedPersistence =
+      userFilteredSubset ||
       outcome.is_ephemeral_source ||
       outcome.source_kind === "migrated" ||
       outcome.source_kind === "none" ||
@@ -4718,30 +5194,68 @@ export function NodesSubsPage({
        * 3. Adaptive Subscription Cards Grid
        * ==================================================================== */}
       <section aria-label="已导入订阅卡片" className="space-y-2.5">
-        {embeddedSubsOnly && (
-          <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
-            <div className="flex flex-wrap items-center gap-2">
-              <h2 className="text-xs font-semibold text-[var(--text)]">
-                已导入订阅（{subscriptions.length}）
-              </h2>
-              <span className="inline-flex items-center gap-1 text-[11px] text-[var(--green)]">
-                <ShieldCheck className="h-3.5 w-3.5" />
-                刷新失败时自动保留原有节点
-              </span>
-            </div>
+        <div className="flex flex-wrap items-center justify-between gap-2 px-0.5">
+          <div className="flex flex-wrap items-center gap-2">
+            <h2 className="text-xs font-semibold text-[var(--text)]">
+              已导入订阅（{subscriptions.length}）
+            </h2>
+            <span className="inline-flex items-center gap-1 text-[11px] text-[var(--green)]">
+              <ShieldCheck className="h-3.5 w-3.5" />
+              刷新失败时自动保留原有节点
+            </span>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
             <button
               type="button"
-              disabled={refreshingAll || subscriptions.length === 0}
-              onClick={() => void refreshAllSubscriptions()}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
+              onClick={openShareImport}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              title="从朋友发来的 .zip 分享包导入节点或国内中转"
             >
-              <RefreshCw
-                className={`h-3.5 w-3.5 text-[var(--accent)] ${refreshingAll ? "animate-spin" : ""}`}
-              />
-              全部刷新
+              <Package className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <span>导入分享包 (.zip)</span>
             </button>
+
+            <button
+              type="button"
+              onClick={() => openShareExport(undefined, "猫猫云梯分享包")}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              title="挑选节点或国内中转导出为 .zip 分享包"
+            >
+              <Upload className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <span>导出分享包 (.zip)</span>
+            </button>
+
+            <button
+              type="button"
+              disabled={subscriptions.length < 2}
+              onClick={openMergeModal}
+              title={
+                subscriptions.length < 2
+                  ? "至少需要 2 个已导入分组才可合并"
+                  : "把一个分组安全整合进另一个分组，并保留原测速与多选组引用"
+              }
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <GitMerge className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <span>{dict.nodes.mergeSubsBtn}</span>
+            </button>
+
+            {embeddedSubsOnly && (
+              <button
+                type="button"
+                disabled={refreshingAll || subscriptions.length === 0}
+                onClick={() => void refreshAllSubscriptions()}
+                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
+              >
+                <RefreshCw
+                  className={`h-3.5 w-3.5 text-[var(--accent)] ${refreshingAll ? "animate-spin" : ""}`}
+                />
+                全部刷新
+              </button>
+            )}
           </div>
-        )}
+        </div>
 
         {subscriptions.length === 0 ? (
           <div className="cc-card cc-glass rounded-2xl px-4 py-6 text-center text-xs text-[var(--muted)]">
@@ -4775,6 +5289,7 @@ export function NodesSubsPage({
             const isSelectedFilter = !embeddedSubsOnly && filterSubId === sub.id;
             const isRefreshing = refreshingIdSet.has(sub.id) || refreshingAll;
             const maskedSource = maskSubscriptionSource(getSubSource(sub));
+            const isRenamingThis = renamingSubId === sub.id;
 
             return (
               <article
@@ -4786,30 +5301,73 @@ export function NodesSubsPage({
                 <div>
                   {/* Card Top Header */}
                   <div className="flex items-start justify-between gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (onViewSubNodes) {
-                          onViewSubNodes(sub.id);
-                        } else {
-                          setFilterSubId(isSelectedFilter ? "all" : sub.id);
-                        }
-                      }}
-                      className="min-w-0 text-left"
-                      title={onViewSubNodes ? "查看这个订阅下的节点" : "点击只看这个订阅的节点"}
-                    >
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate text-sm font-semibold text-[var(--text)]">
-                          {sub.name}
-                        </span>
-                        <span className="shrink-0 rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                          {SUB_KIND_LABELS[sub.kind]}
-                        </span>
+                    {isRenamingThis ? (
+                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <input
+                          type="text"
+                          autoFocus
+                          disabled={renamingBusy}
+                          value={renamingSubName}
+                          onChange={(e) => setRenamingSubName(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              void handleSubmitRenameSub(sub);
+                            } else if (e.key === "Escape") {
+                              e.preventDefault();
+                              handleCancelRenameSub();
+                            }
+                          }}
+                          aria-label={dict.nodes.renameSubTitle}
+                          className="min-w-0 flex-1 rounded-lg border border-[var(--accent)] bg-[var(--card)] px-2 py-1 text-xs font-semibold text-[var(--text)] outline-none"
+                        />
+                        <button
+                          type="button"
+                          disabled={renamingBusy}
+                          onClick={() => void handleSubmitRenameSub(sub)}
+                          title={dict.common.confirm}
+                          aria-label="确认修改分组名"
+                          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50"
+                        >
+                          <Check className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={renamingBusy}
+                          onClick={handleCancelRenameSub}
+                          title={dict.common.cancel}
+                          aria-label="取消修改分组名"
+                          className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
                       </div>
-                      <div className="mt-0.5 truncate cc-mono text-[11px] text-[var(--muted)]">
-                        {maskedSource}
-                      </div>
-                    </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (onViewSubNodes) {
+                            onViewSubNodes(sub.id);
+                          } else {
+                            setFilterSubId(isSelectedFilter ? "all" : sub.id);
+                          }
+                        }}
+                        className="min-w-0 text-left"
+                        title={onViewSubNodes ? "查看这个订阅下的节点" : "点击只看这个订阅的节点"}
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="truncate text-sm font-semibold text-[var(--text)]">
+                            {sub.name}
+                          </span>
+                          <span className="shrink-0 rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                            {SUB_KIND_LABELS[sub.kind]}
+                          </span>
+                        </div>
+                        <div className="mt-0.5 truncate cc-mono text-[11px] text-[var(--muted)]">
+                          {maskedSource}
+                        </div>
+                      </button>
+                    )}
 
                     <div className="flex shrink-0 items-center gap-1">
                       <button
@@ -4823,6 +5381,30 @@ export function NodesSubsPage({
                           className={`h-3 w-3 ${isRefreshing ? "animate-spin" : ""}`}
                         />
                         刷新
+                      </button>
+                      <button
+                        type="button"
+                        disabled={renamingBusy}
+                        onClick={() => handleStartRenameSub(sub)}
+                        className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
+                        title={dict.nodes.renameSubTitle}
+                        aria-label={`改名：${sub.name}`}
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          openShareExport(
+                            nodes.filter((n) => n.sub_id === sub.id).map((n) => n.id),
+                            `${sub.name} 分享包`
+                          )
+                        }
+                        className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                        title="导出该组节点为 .zip 分享包"
+                        aria-label={`导出分组：${sub.name}`}
+                      >
+                        <Upload className="h-3.5 w-3.5" />
                       </button>
                       {!inTauri && (
                         <button
@@ -5742,6 +6324,202 @@ export function NodesSubsPage({
         onConfirmCapture={handleLiveCaptureImport}
         onGoToSubUrl={handleFocusSubUrlInput}
       />
+
+      {/* Share Bundle Export / Import Modal */}
+      <ShareBundleModal
+        open={shareModalState.open}
+        mode={shareModalState.mode}
+        defaultTab={shareModalState.defaultTab}
+        initialNodeIds={shareModalState.initialNodeIds}
+        defaultPackName={shareModalState.defaultPackName}
+        allowModeSwitch
+        onClose={() =>
+          setShareModalState((prev) => ({
+            ...prev,
+            open: false,
+          }))
+        }
+      />
+
+      {/* Merge Two Subscriptions Portal Modal */}
+      {mergeModalOpen &&
+        typeof document !== "undefined" &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
+            onClick={() => {
+              if (!mergingSubs) setMergeModalOpen(false);
+            }}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label={dict.nodes.mergeSubsTitle}
+              onClick={(e) => e.stopPropagation()}
+              className="cc-surface w-full max-w-lg rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                    <GitMerge className="h-4 w-4" />
+                  </span>
+                  <div>
+                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                      {dict.nodes.mergeSubsTitle}
+                    </h3>
+                    <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                      把源分组中的节点安全整合进目标分组，便于统一管理
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={mergingSubs}
+                  onClick={() => setMergeModalOpen(false)}
+                  aria-label="关闭合并分组弹窗"
+                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+
+              <div className="mt-4 space-y-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="space-y-1">
+                    <span className="block text-[11px] font-medium text-[var(--text-secondary)]">
+                      源分组（将被合并移入）
+                    </span>
+                    <AppSelect
+                      aria-label="选择源分组"
+                      size="sm"
+                      disabled={mergingSubs}
+                      value={mergeSourceSubId}
+                      onChange={(nextSource) => {
+                        setMergeSourceSubId(nextSource);
+                        setMergeError(null);
+                        if (nextSource === mergeTargetSubId) {
+                          const altTarget = subscriptions.find((s) => s.id !== nextSource);
+                          if (altTarget) {
+                            setMergeTargetSubId(altTarget.id);
+                            setMergeNewName(altTarget.name);
+                          }
+                        }
+                      }}
+                      options={subscriptions.map((s) => ({
+                        value: s.id,
+                        label: `${s.name}（${subNodeCountMap.get(s.id) ?? 0} 节点）`,
+                      }))}
+                      className="w-full"
+                      buttonClassName="bg-[var(--card)]"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <span className="block text-[11px] font-medium text-[var(--text-secondary)]">
+                      目标分组（合并后保留）
+                    </span>
+                    <AppSelect
+                      aria-label="选择目标分组"
+                      size="sm"
+                      disabled={mergingSubs}
+                      value={mergeTargetSubId}
+                      onChange={(nextTarget) => {
+                        setMergeTargetSubId(nextTarget);
+                        setMergeError(null);
+                        const found = subscriptions.find((s) => s.id === nextTarget);
+                        if (found) setMergeNewName(found.name);
+                        if (nextTarget === mergeSourceSubId) {
+                          const altSource = subscriptions.find((s) => s.id !== nextTarget);
+                          if (altSource) setMergeSourceSubId(altSource.id);
+                        }
+                      }}
+                      options={subscriptions.map((s) => ({
+                        value: s.id,
+                        label: `${s.name}（${subNodeCountMap.get(s.id) ?? 0} 节点）`,
+                      }))}
+                      className="w-full"
+                      buttonClassName="bg-[var(--card)]"
+                    />
+                  </div>
+                </div>
+
+                <label className="block text-[11px] font-medium text-[var(--text-secondary)]">
+                  合并后的分组名称
+                  <input
+                    type="text"
+                    disabled={mergingSubs}
+                    value={mergeNewName}
+                    onChange={(e) => setMergeNewName(e.target.value)}
+                    placeholder="留空则沿用目标分组原名"
+                    className="mt-1 w-full rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                  />
+                </label>
+
+                <label className="flex cursor-pointer items-start gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/70 px-3 py-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={mergeDedup}
+                    disabled={mergingSubs}
+                    onChange={(e) => setMergeDedup(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 shrink-0 cursor-pointer accent-[var(--accent)]"
+                  />
+                  <div className="min-w-0">
+                    <div className="font-medium text-[var(--text)]">
+                      按节点物理指纹自动去重（推荐）
+                    </div>
+                    <div className="mt-0.5 text-[11px] text-[var(--muted)]">
+                      自动过滤协议、地址与端口完全一致的重复线路，避免合并后出现重复条目
+                    </div>
+                  </div>
+                </label>
+
+                <div className="flex items-start gap-2 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)]/55 px-3 py-2.5 text-[11px] leading-relaxed text-[var(--amber)]">
+                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>
+                    合并后，源分组中的节点将安全整合进目标分组并移除源分组外壳；原有的测速记录与智能多选组中的节点引用均会自动保留，不会丢失。
+                  </span>
+                </div>
+
+                {mergeError && (
+                  <div className="flex items-start gap-2 rounded-xl border border-[var(--red)]/45 bg-[var(--red-soft)] px-3 py-2 text-xs text-[var(--red)]">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                    <span>{mergeError}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={mergingSubs}
+                  onClick={() => setMergeModalOpen(false)}
+                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  disabled={
+                    mergingSubs ||
+                    !mergeSourceSubId ||
+                    !mergeTargetSubId ||
+                    mergeSourceSubId === mergeTargetSubId
+                  }
+                  onClick={() => void handleConfirmMergeSubs()}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {mergingSubs ? (
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <GitMerge className="h-3.5 w-3.5" />
+                  )}
+                  <span>{mergingSubs ? "正在合并…" : "确认合并分组"}</span>
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body
+        )}
 
       {/* Delete Subscription Two-Step Confirmation Modal */}
       {pendingDeleteSub &&

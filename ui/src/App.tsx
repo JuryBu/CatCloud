@@ -3,6 +3,7 @@ import { Suspense, lazy, useEffect, useLayoutEffect, useRef, useState } from "re
 import { type AppConfig, catcloudApi, isTauriEnv } from "./api/tauri";
 import { Sidebar } from "./components/Sidebar";
 import { TitleBar } from "./components/TitleBar";
+import { normalizeUiLanguage, useUiDict } from "./i18n";
 import {
   type NavRouteId,
   appActions,
@@ -41,6 +42,9 @@ const RulesConnsPage = lazy(() =>
 const LogsPage = lazy(() =>
   import("./pages/LogsPage").then((m) => ({ default: m.LogsPage }))
 );
+const AiAssistantPage = lazy(() =>
+  import("./pages/AiAssistantPage").then((m) => ({ default: m.AiAssistantPage }))
+);
 const SettingsPage = lazy(() =>
   import("./pages/SettingsPage").then((m) => ({ default: m.SettingsPage }))
 );
@@ -48,10 +52,10 @@ const CapsuleWindow = lazy(() =>
   import("./pages/CapsuleWindow").then((m) => ({ default: m.CapsuleWindow }))
 );
 
-function PageLoadingFallback() {
+function PageLoadingFallback({ label }: { label: string }) {
   return (
     <div className="flex h-full min-h-[240px] items-center justify-center text-xs text-[var(--muted)]">
-      正在载入模块...
+      {label}
     </div>
   );
 }
@@ -71,6 +75,8 @@ function renderActivePage(route: NavRouteId) {
       return <RulesConnsPage />;
     case "logs":
       return <LogsPage />;
+    case "ai":
+      return <AiAssistantPage />;
     case "settings":
       return <SettingsPage />;
   }
@@ -81,6 +87,10 @@ export function App() {
   const activeNav = useAppSelector((s) => s.activeNav);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
+  const uiLang = normalizeUiLanguage(
+    useAppSelector((s) => s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
   const toast = useAppSelector((s) => s.toast);
   const [dismissedToastId, setDismissedToastId] = useState<number | null>(null);
   const mainScrollRef = useRef<HTMLDivElement | null>(null);
@@ -317,7 +327,7 @@ export function App() {
             }}
             className="flex-1 overflow-y-auto px-5 py-4"
           >
-            <Suspense fallback={<PageLoadingFallback />}>
+            <Suspense fallback={<PageLoadingFallback label={dict.common.loading} />}>
               {renderActivePage(activeNav)}
             </Suspense>
           </div>
@@ -346,8 +356,8 @@ export function App() {
               type="button"
               onClick={() => setDismissedToastId(visibleToast.id)}
               className="-mr-1 -mt-0.5 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-md text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
-              aria-label="关闭提示"
-              title="关闭提示"
+              aria-label={dict.common.close}
+              title={dict.common.close}
             >
               <X className="h-3.5 w-3.5" />
             </button>

@@ -594,7 +594,11 @@ pub fn compile_mihomo_config_with_runtime_dir(
 
     root.insert(
         str_val("sniffer"),
-        Value::Mapping(build_sniffer_section(cfg.rules_override.block_quic_udp_443)),
+        Value::Mapping(build_sniffer_section(
+            cfg.rules_override.block_quic_udp_443,
+            cfg.rules_override.domestic_direct_enabled,
+            has_geoip,
+        )),
     );
 
     if cfg.dns.use_hosts && !cfg.dns.hosts.is_empty() {
@@ -1191,7 +1195,42 @@ pub fn compile_mihomo_config_with_runtime_dir(
         }
     }
 
+    const DOMESTIC_QUIC_DIRECT_DOMAINS: &[&str] = &[
+        "cn",
+        "qq.com",
+        "qpic.cn",
+        "qlogo.cn",
+        "gtimg.cn",
+        "gtimg.com",
+        "weixin.qq.com",
+        "tencent.com",
+        "bilibili.com",
+        "bilivideo.com",
+        "bilivideo.cn",
+    ];
     if cfg.rules_override.block_quic_udp_443 {
+        if cfg.rules_override.domestic_direct_enabled {
+            for domain in DOMESTIC_QUIC_DIRECT_DOMAINS {
+                push_unique(
+                    &mut rules,
+                    format!(
+                        "AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,{domain})),DIRECT"
+                    ),
+                );
+            }
+            if has_geosite {
+                push_unique(
+                    &mut rules,
+                    "AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT".to_string(),
+                );
+            }
+            if has_geoip {
+                push_unique(
+                    &mut rules,
+                    "AND,((NETWORK,UDP),(DST-PORT,443),(GEOIP,CN,no-resolve)),DIRECT".to_string(),
+                );
+            }
+        }
         push_unique(
             &mut rules,
             "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT".to_string(),
@@ -2062,7 +2101,11 @@ fn expand_chained_dialer_nodes<'a>(
     }
 }
 
-fn build_sniffer_section(block_quic_udp_443: bool) -> Mapping {
+fn build_sniffer_section(
+    block_quic_udp_443: bool,
+    domestic_direct_enabled: bool,
+    has_geoip: bool,
+) -> Mapping {
     let mut map = Mapping::new();
     insert_bool(&mut map, "enable", true);
     insert_bool(&mut map, "force-dns-mapping", true);
@@ -2092,7 +2135,11 @@ fn build_sniffer_section(block_quic_udp_443: bool) -> Mapping {
     );
     sniff.insert(str_val("TLS"), Value::Mapping(tls));
 
-    if !block_quic_udp_443 {
+    // When `block_quic_udp_443` and `domestic_direct_enabled` are both active while GeoIP
+    // (`Country.mmdb` / `geoip.dat`) is absent, keep QUIC sniffing enabled so Mihomo can extract
+    // the SNI from QUIC ClientHello on real-IP (`fake-ip-filter`) packets and match domestic IM
+    // `DOMAIN-SUFFIX` DIRECT rules (e.g. QQ/WeChat) before falling through to UDP/443 REJECT.
+    if !block_quic_udp_443 || (domestic_direct_enabled && !has_geoip) {
         let mut quic = Mapping::new();
         quic.insert(
             str_val("ports"),
@@ -2231,6 +2278,21 @@ fn build_dns_section(
     const DOMESTIC_DNS_FAKE_IP_FILTERS: &[&str] =
         &["dns.alidns.com", "doh.pub", "dot.pub", "dns.pub"];
     for item in DOMESTIC_DNS_FAKE_IP_FILTERS {
+        push_unique(&mut merged_fake_ip_filter, (*item).to_string());
+    }
+    const DOMESTIC_IM_FAKE_IP_FILTERS: &[&str] = &[
+        "+.qq.com",
+        "+.qpic.cn",
+        "+.qlogo.cn",
+        "+.gtimg.cn",
+        "+.gtimg.com",
+        "+.nt.qq.com.cn",
+        "+.weixin.qq.com",
+        "+.tencent.com",
+        "+.qcloud.com",
+        "+.myqcloud.com",
+    ];
+    for item in DOMESTIC_IM_FAKE_IP_FILTERS {
         push_unique(&mut merged_fake_ip_filter, (*item).to_string());
     }
     for item in anti_loop_fake_ip_domains {
@@ -2446,7 +2508,7 @@ fn build_relay_proxy_mapping(relay: &PreAccelRelay, unique_name: &str) -> CatRes
     }
 }
 
-fn build_node_proxy_mapping(node: &ProxyNode, unique_name: &str) -> CatResult<Mapping> {
+pub fn build_node_proxy_mapping(node: &ProxyNode, unique_name: &str) -> CatResult<Mapping> {
     let mut map = match serde_yaml_ng::to_value(&node.raw_config)? {
         Value::Mapping(m) => m,
         _ => Mapping::new(),
@@ -2778,6 +2840,8 @@ mod tests {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         }
     }
 
@@ -4602,12 +4666,13 @@ rules:
         assert_eq!(compiled_4.value["proxies"].as_sequence().unwrap().len(), 4);
 
         // Unconditional memory tunings: geodata-loader=memconservative even when geodata_mode=false,
-        // keep-alive-idle=15, keep-alive-interval=15, and QUIC sniffer skipped when block_quic_udp_443=true.
+        // keep-alive-idle=15, keep-alive-interval=15; when GeoIP is absent while domestic_direct_enabled=true,
+        // QUIC sniffer stays enabled so domestic IM UDP/443 can match DOMAIN-SUFFIX DIRECT before REJECT.
         assert_eq!(compiled_4.value["geodata-mode"], Value::Bool(false));
         assert_eq!(compiled_4.value["geodata-loader"], "memconservative");
         assert_eq!(compiled_4.value["keep-alive-idle"], 15);
         assert_eq!(compiled_4.value["keep-alive-interval"], 15);
-        assert!(compiled_4.value["sniffer"]["sniff"].get("QUIC").is_none());
+        assert!(compiled_4.value["sniffer"]["sniff"].get("QUIC").is_some());
         assert!(compiled_4.value["sniffer"]["sniff"].get("TLS").is_some());
 
         // fake-ip-filter only includes domains of compiled active nodes, not pruned nodes.
@@ -5195,6 +5260,234 @@ rules:
                 .unwrap_or_else(|| panic!("missing `{expected}` with geosite.dat"));
             assert!(idx < idx_geosite);
         }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allows_domestic_quic_udp_443_before_reject_and_always_adds_qq_fake_ip_filters() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-compiler-domestic-quic-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cfg = AppConfig::default();
+        let ports = sample_ports();
+        let nodes = vec![sample_node("n1", "Node-JP-01", 443, true)];
+        let group = MultiGroup {
+            id: "g-ai".to_string(),
+            name: "AI-Group".to_string(),
+            match_rules: vec!["DOMAIN-SUFFIX,openai.com".to_string()],
+            member_node_ids: vec!["n1".to_string()],
+            ..Default::default()
+        };
+        let empty = HashMap::new();
+        let input = CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[group],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        };
+
+        // 1. Without geosite/geoip files: domain-based domestic QUIC DIRECT rules precede QUIC REJECT,
+        //    which still precedes group match rules; GEOSITE/GEOIP QUIC rules stay absent.
+        let no_geo = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(no_geo.validation.ok, "issues: {:?}", no_geo.validation.issues);
+        let rules_no_geo: Vec<&str> = no_geo.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let idx_reject = rules_no_geo
+            .iter()
+            .position(|r| *r == "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT")
+            .expect("QUIC reject rule");
+        let idx_group = rules_no_geo
+            .iter()
+            .position(|r| *r == "DOMAIN-SUFFIX,openai.com,AI-Group")
+            .expect("group match rule");
+        assert!(idx_reject < idx_group);
+        for domain in [
+            "cn",
+            "qq.com",
+            "qpic.cn",
+            "qlogo.cn",
+            "gtimg.cn",
+            "gtimg.com",
+            "weixin.qq.com",
+            "tencent.com",
+            "bilibili.com",
+            "bilivideo.com",
+            "bilivideo.cn",
+        ] {
+            let expected =
+                format!("AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,{domain})),DIRECT");
+            let idx = rules_no_geo
+                .iter()
+                .position(|r| *r == expected)
+                .unwrap_or_else(|| panic!("missing domestic QUIC allow rule `{expected}`"));
+            assert!(idx < idx_reject, "`{expected}` must precede QUIC REJECT");
+        }
+        assert!(
+            !rules_no_geo.contains(&"AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT")
+        );
+        assert!(
+            !rules_no_geo
+                .contains(&"AND,((NETWORK,UDP),(DST-PORT,443),(GEOIP,CN,no-resolve)),DIRECT")
+        );
+
+        // Unconditional QQ/WeChat/Tencent Cloud fake-ip-filter entries must always be present.
+        let fake_filters: Vec<&str> = no_geo.value["dns"]["fake-ip-filter"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for pattern in [
+            "+.qq.com",
+            "+.qpic.cn",
+            "+.qlogo.cn",
+            "+.gtimg.cn",
+            "+.gtimg.com",
+            "+.nt.qq.com.cn",
+            "+.weixin.qq.com",
+            "+.tencent.com",
+            "+.qcloud.com",
+            "+.myqcloud.com",
+        ] {
+            assert!(
+                fake_filters.contains(&pattern),
+                "missing unconditional fake-ip-filter `{pattern}`"
+            );
+        }
+
+        // 2. With geosite.dat + Country.mmdb: both GEOSITE & GEOIP domestic QUIC DIRECT rules precede REJECT.
+        std::fs::write(dir.join("geosite.dat"), b"stub").unwrap();
+        std::fs::write(dir.join("Country.mmdb"), b"stub").unwrap();
+        let with_geo = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(with_geo.validation.ok, "issues: {:?}", with_geo.validation.issues);
+        let rules_geo: Vec<&str> = with_geo.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let idx_reject_geo = rules_geo
+            .iter()
+            .position(|r| *r == "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT")
+            .expect("QUIC reject rule");
+        let idx_geosite_quic = rules_geo
+            .iter()
+            .position(|r| *r == "AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT")
+            .expect("GEOSITE cn QUIC allow rule");
+        let idx_geoip_quic = rules_geo
+            .iter()
+            .position(|r| *r == "AND,((NETWORK,UDP),(DST-PORT,443),(GEOIP,CN,no-resolve)),DIRECT")
+            .expect("GEOIP CN QUIC allow rule");
+        assert!(idx_geosite_quic < idx_reject_geo);
+        assert!(idx_geoip_quic < idx_reject_geo);
+
+        // 3. When domestic_direct_enabled == false, domestic QUIC allow rules are omitted while REJECT stays.
+        let mut cfg_no_dom = AppConfig::default();
+        cfg_no_dom.rules_override.domestic_direct_enabled = false;
+        let no_dom = compile_mihomo_config_with_runtime_dir(
+            &CompileInput {
+                config: &cfg_no_dom,
+                ..input
+            },
+            Some(&dir),
+        )
+        .unwrap();
+        let rules_no_dom: Vec<&str> = no_dom.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(rules_no_dom.contains(&"AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"));
+        assert!(
+            !rules_no_dom
+                .contains(&"AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,qq.com)),DIRECT")
+        );
+        assert!(
+            !rules_no_dom.contains(&"AND,((NETWORK,UDP),(DST-PORT,443),(GEOSITE,cn)),DIRECT")
+        );
+
+        // 4. `build_node_proxy_mapping` is public and produces valid proxy mapping.
+        let mapped = build_node_proxy_mapping(&nodes[0], "Share-Node-01").expect("public mapping");
+        assert_eq!(mapped.get("name").and_then(Value::as_str), Some("Share-Node-01"));
+        assert_eq!(mapped.get("type").and_then(Value::as_str), Some("trojan"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn keeps_quic_sniffer_when_geoip_missing_and_omits_when_geoip_present_or_domestic_disabled() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-compiler-quic-sniffer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let nodes = vec![sample_node("n1", "JP-Edge-01", 443, true)];
+        let groups = vec![MultiGroup {
+            id: "grp-main".to_string(),
+            name: "Main-Group".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n1".into()],
+            ..Default::default()
+        }];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        // 1. Missing Country.mmdb (has_geoip = false) with block_quic_udp_443 = true and
+        //    domestic_direct_enabled = true MUST retain QUIC sniffer so domestic IM packets
+        //    carrying real IPs can still extract SNI and hit DOMAIN-SUFFIX DIRECT rules.
+        let mut cfg = AppConfig::default();
+        cfg.rules_override.block_quic_udp_443 = true;
+        cfg.rules_override.domestic_direct_enabled = true;
+        let input = CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        };
+        let without_geoip = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(
+            without_geoip.value["sniffer"]["sniff"].get("QUIC").is_some(),
+            "QUIC sniffer must remain enabled when Country.mmdb is absent"
+        );
+
+        // 2. When domestic_direct_enabled = false and block_quic_udp_443 = true, QUIC sniffer is omitted.
+        let mut cfg_no_dom = cfg.clone();
+        cfg_no_dom.rules_override.domestic_direct_enabled = false;
+        let no_dom = compile_mihomo_config_with_runtime_dir(
+            &CompileInput {
+                config: &cfg_no_dom,
+                ..input
+            },
+            Some(&dir),
+        )
+        .unwrap();
+        assert!(no_dom.value["sniffer"]["sniff"].get("QUIC").is_none());
+
+        // 3. Once Country.mmdb exists (has_geoip = true), GEOIP,CN protects domestic QUIC and
+        //    QUIC sniffer can be omitted when block_quic_udp_443 = true.
+        std::fs::write(dir.join("Country.mmdb"), b"stub").unwrap();
+        let with_geoip = compile_mihomo_config_with_runtime_dir(&input, Some(&dir)).unwrap();
+        assert!(with_geoip.value["sniffer"]["sniff"].get("QUIC").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

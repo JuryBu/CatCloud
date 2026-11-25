@@ -44,7 +44,10 @@ export function NodesWorkspacePage() {
         page: 1,
       });
     }
-    appActions.consumeNodesTabHint();
+    // Defer consuming hint when a sub-page action (e.g. "migration") needs to be handled by NodesSubsPage
+    if (!nodesTabHint.action) {
+      appActions.consumeNodesTabHint();
+    }
   }, [nodesTabHint]);
 
   // Align initial default tab once after first backend hydration if user hasn't picked yet

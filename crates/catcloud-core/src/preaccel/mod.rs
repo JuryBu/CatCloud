@@ -39,11 +39,11 @@ pub use global_tunnel::{
 pub use schema::{
     EXPIRY_SOON_THRESHOLD_DAYS, MMRELAY_URI_PREFIX, RelayExpiryStatus, RelayProtocol,
     RelayValidationCode, RelayValidationIssue, RelayValidationSeverity, bundle_from_relays,
-    days_until_expiry, decode_mmrelay_uri, encode_mmrelay_uri, evaluate_expiry, is_pure_ip_server,
-    parse_expiry_timestamp, parse_mmrelay_clipboard, parse_mmrelay_json, parse_server_ip,
-    sanitize_relay_for_domestic_443, serialize_mmrelay_json, serialize_mmrelay_json_compact,
-    validate_bundle_envelope, validate_relay, validate_relay_at, validate_relay_strict,
-    validate_relay_strict_at,
+    days_until_expiry, decode_mmrelay_uri, encode_mmrelay_uri, evaluate_expiry,
+    import_relays_dedup_into_storage, is_pure_ip_server, parse_expiry_timestamp,
+    parse_mmrelay_clipboard, parse_mmrelay_json, parse_server_ip, sanitize_relay_for_domestic_443,
+    serialize_mmrelay_json, serialize_mmrelay_json_compact, validate_bundle_envelope,
+    validate_relay, validate_relay_at, validate_relay_strict, validate_relay_strict_at,
 };
 
 #[cfg(test)]
@@ -81,6 +81,8 @@ mod tests {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         }
     }
 
@@ -101,6 +103,8 @@ mod tests {
             enabled: true,
             last_probe_ms: None,
             last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
         }
     }
 
@@ -661,7 +665,7 @@ mod tests {
         assert_eq!(throttled.non_443_mbps, 12.0);
         assert_eq!(throttled.speedup_ratio, 10.0);
         assert_eq!(throttled.confidence, ThrottleConfidence::High);
-        assert!(throttled.recommendation_zh.contains("开启国内预加速"));
+        assert!(throttled.recommendation_zh.contains("开启国内提速"));
 
         // Balanced ports should not flag throttling.
         let balanced = analyze_mixed_port_samples(&[
@@ -690,5 +694,73 @@ mod tests {
         assert!(near_zero.throttled_detected);
         assert!(near_zero.speedup_ratio.is_finite());
         assert!(near_zero.speedup_ratio > 10.0);
+    }
+
+    #[test]
+    fn import_relays_dedup_reuses_fingerprint_id_and_avoids_id_collision() {
+        let db = crate::storage::Storage::open_in_memory().expect("open in-memory storage");
+
+        let mut initial = sample_tencent_relay();
+        initial.last_probe_ms = Some(19.0);
+        initial.last_mbps = Some(110.0);
+        initial.last_up_mbps = Some(110.0);
+        initial.last_down_mbps = Some(210.0);
+        db.upsert_preaccel_relay(&initial).expect("seed initial relay");
+
+        // 1. Same physical fingerprint (case-insensitive protocol) with a different incoming ID
+        //    must reuse `relay-tx-gz` and clear all cached speed metrics.
+        let mut same_fp = sample_tencent_relay();
+        same_fp.id = "relay-incoming-dup".to_string();
+        same_fp.name = "Tencent-GZ-Updated".to_string();
+        same_fp.protocol = "AnyTLS".to_string();
+        same_fp.last_probe_ms = Some(99.0);
+        same_fp.last_mbps = Some(99.0);
+        same_fp.last_up_mbps = Some(88.0);
+        same_fp.last_down_mbps = Some(77.0);
+
+        // 2. Different physical server reusing existing ID `relay-tx-gz` must NOT overwrite the
+        //    original relay; instead it must receive a freshly generated `relay-...` ID.
+        let mut colliding_id = sample_aliyun_vless_relay();
+        colliding_id.id = "relay-tx-gz".to_string();
+        colliding_id.name = "Aliyun-SH-Fresh".to_string();
+
+        // 3. Invalid domestic :443 relay with non-empty SNI must be skipped with Chinese warning.
+        let mut invalid_sni = sample_tencent_relay();
+        invalid_sni.id = "relay-bad-sni".to_string();
+        invalid_sni.name = "Bad-SNI-Relay".to_string();
+        invalid_sni.server = "192.0.2.88".to_string();
+        invalid_sni.sni = Some("forbidden.example.com".to_string());
+
+        let (imported, warnings) = import_relays_dedup_into_storage(
+            &db,
+            vec![same_fp, colliding_id, invalid_sni],
+        )
+        .expect("import relays dedup");
+
+        assert_eq!(imported, 2);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("已跳过无效中转「Bad-SNI-Relay」"));
+
+        let stored = db.list_preaccel_relays(false).expect("list stored relays");
+        assert_eq!(stored.len(), 2);
+
+        let tx = db
+            .get_preaccel_relay("relay-tx-gz")
+            .unwrap()
+            .expect("original relay-tx-gz preserved");
+        assert_eq!(tx.server, "203.0.113.10");
+        assert_eq!(tx.name, "Tencent-GZ-Updated");
+        assert_eq!(tx.last_probe_ms, None);
+        assert_eq!(tx.last_mbps, None);
+        assert_eq!(tx.last_up_mbps, None);
+        assert_eq!(tx.last_down_mbps, None);
+
+        let ali = stored
+            .iter()
+            .find(|r| r.server == "198.51.100.20")
+            .expect("colliding relay stored under regenerated id");
+        assert_ne!(ali.id, "relay-tx-gz");
+        assert!(ali.id.starts_with("relay-"));
+        assert_eq!(ali.name, "Aliyun-SH-Fresh");
     }
 }
