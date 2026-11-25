@@ -7,13 +7,34 @@
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB.svg)](https://v2.tauri.app/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/JuryBu/CatCloud/releases)
 
-> **English Quick Overview**: **CatCloud** is a performance-focused, extensible, Agent-friendly, and highly personalizable cross-platform intelligent proxy desktop client (Windows / macOS / Linux) and headless CLI (`catcloud`). Built with a decoupled **Forwarding Engine (Mihomo) × Rust Control Brain (`catcloud-core`) × Destroyable Desktop UI (Tauri v2 + React 19)** architecture, CatCloud delivers a `<= 70 MB` windowless tray memory footprint, zero-interference isolated probing, smart per-site multi-node orchestration, domestic `:443` pre-acceleration (AnyTLS / Hysteria2 / Trojan / VLESS), campus-network DoH-443 protection, one-click `.zip` share bundles, and a built-in AI assistant with four-language guides.
+> **English Quick Overview**: **CatCloud** is a performance-focused, extensible, Agent-friendly, and highly personalizable cross-platform intelligent proxy desktop client (Windows / macOS / Linux; Android app on the roadmap) and headless CLI (`catcloud`). Built with a decoupled **Forwarding Engine (Mihomo) × Rust Control Brain (`catcloud-core`) × Destroyable Desktop UI (Tauri v2 + React 19)** architecture, CatCloud achieves `5.4×–12.4×` campus-network upload acceleration via `:443` pre-acceleration (AnyTLS / Hysteria2), `52.3 MB` real windowless tray RAM (`-93%` vs. traditional Electron/WebView clients), `-92.9%` active-node YAML pruning, dual-origin failover stability, one-click `.zip` share bundles, and seamless synergy with `MCP-SKILL-RULES_packages` and `antigravity-monitor` to slash end-to-end Antigravity TTFT (`P50: 22.8s → 6.9s`, `P95: 114.3s → 14.8s` across `n = 5,051` production steps).
+
+---
+
+## 核心实测基准（CatCloud v0.1.0 Benchmarks）
+
+> 完整发布说明与评测口径请参阅 [docs/RELEASE_v0.1.0_ANNOUNCEMENT.md](./docs/RELEASE_v0.1.0_ANNOUNCEMENT.md)。
+
+### 1. 网络层 443 预加速 × Antigravity 原生 TTFT 端到端实测
+![网络层 443 预加速与 Antigravity 原生 TTFT 端到端实测](./docs/assets/benchmark_01_acceleration_ttft.jpg)
+
+### 2. 三层解耦极简内存 × 配置瘦身 × 长跑稳定性全维评测
+![三层解耦极简内存、配置瘦身与长跑稳定性全维评测](./docs/assets/benchmark_02_memory_stability.jpg)
+
+### 3. 三仓库协同架构 × 集百家之长能力矩阵
+![Antigravity 低 TTFT 三仓库协同与集百家之长能力矩阵](./docs/assets/benchmark_03_ecosystem_triad.jpg)
+
+| 生态协同仓库 | 所在层级 | 核心作用 |
+|---|---|---|
+| [**CatCloud**](https://github.com/JuryBu/CatCloud)（本仓库） | **网络与调度层** | 国内 `:443` 预加速突破校园网 `2–4 Mbps` 上行瓶颈（实测 `5.4×–12.4×`）、AnyTLS 复连延迟下降 `80.9%`、双源长跑守护与随包无头 CLI |
+| [**MCP-SKILL-RULES_packages**](https://github.com/JuryBu/MCP-SKILL-RULES_packages) | **请求体层** | 对大图、音视频与超大 PDF 落地分层请求体附件瘦身，避免原生环境每轮重复上传臃肿二进制，从源头压缩上传字节与 TTFT（首字响应延迟） |
+| [**antigravity-monitor**](https://github.com/JuryBu/antigravity-monitor) | **观测验真层** | Windows 纯只读零侵入观测器，按请求步实时监测 TTFT、`tok/s`、请求体增量与 Prompt Cache（提示词缓存）命中状态，让端到端 TTFT 下降（P50 `22.8s → 6.9s` / P95 `114.3s → 14.8s`，`n = 5,051`）直观可见 |
 
 ---
 
 ## 下载与内测快速上手
 
-前往 [GitHub Releases](https://github.com/JuryBu/CatCloud/releases) 下载对应平台安装包（全部桌面包均已内置官方 `mihomo` 核心与无头 `catcloud` 命令行工具，开箱即用）：
+前往 [GitHub Releases](https://github.com/JuryBu/CatCloud/releases) 下载对应平台安装包（全部桌面包均已内置官方 `mihomo` 核心与无头 `catcloud` 命令行工具，开箱即用；**Android 客户端将在桌面端首批内测收敛后基于同一套核心与 `.zip` 分享包协议逐步推进开发**）：
 
 | 操作系统 | 推荐安装包 | 架构说明 | 当前实测状态 |
 |---|---|---|---|
@@ -33,9 +54,9 @@
   （注：macOS 15 Sequoia 及以上已取消 Finder 右键直接放行未签名应用；如系统仍有拦截，请在「系统设置 → 隐私与安全性」底部点击「仍要打开」。）
 - **管理员权限说明**：仅开启系统代理（浏览器等）无需管理员权限；开启 **「虚拟网卡（接管全部桌面应用与 IDE）」** 或 Windows 下点击 **「开启国内提速」** 启用底层全局透明提速时，界面会明确提示并在你点击确认后拉起系统提权。
 
-### 30 秒上手路径（小白 / 朋友内测推荐）
+### 30 秒上手路径（新手 / 朋友内测推荐）
 1. **收到朋友发的 `.zip` 分享包**：打开左侧 **「节点与测速 → 订阅与导入」**，在「已导入订阅」标题栏点击 **「导入分享包 (.zip)」**（或在 **「国内提速」** 页中转列表头部点击 **「分享包」**），选中 `.zip` 预览并一键导入（可同时导入节点与国内提速中转，自动去重且不覆盖原有线路）。需要给朋友打包导出时，在「节点与测速」主表勾选目标节点后点击顶部 **「导出已选 (.zip)」**，或在「国内提速」页点击 **「分享包」**。
-2. **已有订阅链接或其它客户端**：打开 **「节点与测速 → 订阅与导入」**，粘贴订阅链接、只读迁移本机开源客户端配置，或使用 `1→2→3` 实时捕捉向导。
+2. **已有订阅链接或其它客户端**：打开 **「节点与测速 → 订阅与导入」**，粘贴订阅链接、只读迁移本机开源客户端配置，或使用三步实时捕捉向导。
 3. **让自己的 AI 帮你配置或排障**：点击左侧 **「AI 助手」** 一级菜单：
    - **发给网页 AI（DeepSeek / 豆包 / Kimi / ChatGPT / Gemini 等，未开启代理时优先用国内网页 AI）**：在左卡点击 **「复制新手上手指南」** 或 **「复制排障诊断包」**（亦支持 **「导出单文件 (.md)」**）直接粘贴发问；
    - **发给本机 AI Agent（Codex / Claude Code 等）**：在右卡点击 **「复制本机 Agent 引导」** 或 **「复制完整排障包」**，会自动附带随包 `catcloud` CLI 精确路径与手册树以便 Agent 自主听诊（注：Linux AppImage 运行时该路径位于临时挂载目录，仅在本次应用运行期间有效）；
@@ -50,9 +71,9 @@
 - 导入端支持预览内容、自动指纹去重、保留本机冲突线路，并内建 Zip Slip / 符号链接 / Zip Bomb 防护；命令行同步支持 `catcloud share export / inspect / import`。
 
 ### 2. 智能多选组与常驻轻量健康池
-- **四种按站点独立模式**：`sticky_best`（AI 专线默认粘性锁定防 IP 跳变）、`conditional_pool`（按倍率/地区/干净度动态纳新）、`load_balance_consistent_hash` 与 `load_balance_round_robin`。
-- **无 `eval` 安全 AST 评分公式与三选一兜底**：内置「低倍率性价比优先」与「纯性能最快」模板；支持 `degrade_best_warn`、`cross_pool_escalate`（借道备用池并滞回回切）与 `strict_circuit_break`。
-- **双源防半残守护**：结合 Google + Cloudflare 并发双源探活、1.5 秒失败即时复测（避免误杀）、渐进冷却恢复观察态与 EWMA 平滑防乒乓切换。
+- **四种按站点独立模式**：`sticky_best`（AI 专线默认粘性锁定防 IP 跳变）、`conditional_pool`（按倍率/地区/干净度动态纳新）、`load_balance_consistent_hash`（按目标哈希一致性负载均衡）与 `load_balance_round_robin`（轮询负载均衡）。
+- **无 `eval` 安全 AST 评分公式与三选一兜底**：内置「低倍率性价比优先」与「纯性能最快」模板；支持 `degrade_best_warn`（降级选最优并告警）、`cross_pool_escalate`（借道备用池并滞回回切）与 `strict_circuit_break`（严格熔断保护）。
+- **双源防半残守护**：结合 Google + Cloudflare 并发双源探活、1.5 秒失败即时复测（避免误杀）、渐进冷却恢复观察态与指数加权移动平均（EWMA）平滑防乒乓切换。
 
 ### 3. 零干扰临时隔离测速引擎
 - **现役业务零断流**：按需拉起临时隔离 Mihomo 子进程（严格仅监听 `127.0.0.1`、`tun.enable: false`、`redir-host` + 纯 IP DoH 443 防现役 TUN 劫持、`GOMEMLIMIT=32MiB`），测完立即销毁回收。
@@ -73,12 +94,12 @@
 
 | 维度 | 传统桌面代理客户端（Electron / 常驻 WebView） | 猫猫云梯（CatCloud） |
 |---|---|---|
-| **后台托盘内存** | 窗口隐藏后常驻完整渲染进程，通常 `400 ~ 800 MB` | 关窗即销毁 WebView，纯无窗托盘态内存预算 **`<= 70 MB`**，唤醒目标 `< 600 ms` |
+| **后台托盘内存** | 窗口隐藏后常驻完整渲染进程，通常 `400 ~ 800 MB` | 关窗即销毁 WebView，无窗托盘实测稳态 **`52.3 MB`**（设计预算 `<= 70 MB`），唤醒目标 `< 600 ms` |
 | **节点测速方式** | 常复用现役核心或仅测简单 Ping，难检上行限速与静默断流 | 临时隔离核心 + 纯 IP DoH 防污染，支持真实上下行、AI 语义解锁与长连复检 |
 | **朋友分享与迁移** | 手工传明文订阅链接或复杂 YAML，中转与节点割裂 | 一键勾选节点 + 国内中转导出 `.zip` 分享包，人机双读、安全去重导入 |
 | **校园网与弱网适应** | 明文 53 解析常被校园网阻断，普通权限开网卡易假状态 | 默认纯 IP DoH 443 + 校内系统解析 + 虚拟网卡真实权限诚实门禁 |
 | **自动化与 AI 协同** | 强耦合图形界面，排障靠人工截屏 | 独立 AI 助手菜单 + 内置无头 `catcloud` CLI（自动鉴权、`--json`、默认脱敏） |
-| **进程与更新治理** | 异常退出偶留僵尸内核；便携版覆盖易冲突 | OS 原生 JobObject / `PR_SET_PDEATHSIG` 零僵尸回收 + 同卷换轨自动回滚 |
+| **进程与更新治理** | 异常退出偶留僵尸内核；便携版覆盖易冲突 | OS 原生 JobObject / `PR_SET_PDEATHSIG` 零僵尸回收 + 同盘原子替换与失败自动回滚 |
 
 ---
 
