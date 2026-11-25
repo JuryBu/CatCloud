@@ -1,5 +1,11 @@
 # 发布猫猫云梯（CatCloud）v0.1.0：面向 AI 开发工作流与校园网环境的跨平台智能代理桌面端与无头 CLI
 
+> **快速下载（防点错架构）**：GitHub 底部附件列表按字母排序会把 `arm64` 排在 `x64` 前面，**99% 的普通 Windows（Intel / AMD）电脑请直接点下方 `x64` 链接，不要下 `arm64`**：
+> - **Windows 普通电脑（x64）**：[安装版 (.exe, 15.86 MiB)](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-windows-x64-setup.exe) ｜ [绿色便携版 (.zip, 21.53 MiB，解压即用)](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-windows-x64-portable.zip) ｜ [MSI 安装包](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-windows-x64.msi)
+> - **macOS**：[Apple Silicon M 系列 (.dmg)](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-macos-aarch64.dmg) ｜ [Intel Mac (.dmg)](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-macos-x64.dmg)
+> - **Linux（x86_64）**：[AppImage](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-linux-x86_64.AppImage) ｜ [.deb](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-linux-x86_64.deb) ｜ [.rpm](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/CatCloud-0.1.0-linux-x86_64.rpm)
+> - *仅骁龙 / ARM 架构 Windows 笔记本选用 `windows-arm64-*`；校验文件见 [SHA256SUMS.txt](https://github.com/JuryBu/CatCloud/releases/download/v0.1.0/SHA256SUMS.txt)。*
+
 今天，我们正式发布 **猫猫云梯（CatCloud）v0.1.0（首批公开内测版）**——一款集国内 `:443` 预加速、低内存三层架构、长程稳定调度与原生 AI Agent 协同能力于一体的跨平台代理桌面端与无头命令行工具（Windows / macOS / Linux）。
 
 在日常上网与高强度 AI 编程工作流中，桌面代理工具长期面临三个彼此牵制的问题：高校校园网与弱网环境对非 443 端口的严苛上行限速（往往限制在 `2–4 Mbps`）会让传图与长上下文请求频频卡顿；基于 Electron 或常驻 WebView 的传统桌面客户端，即便缩进系统托盘也常驻 `400–800 MB` 内存；而在连续多步工具调用与长程任务中，单源 Ping 误切、半残节点反复切换以及目标站点地区误判，随时可能中断正在运行的任务。
