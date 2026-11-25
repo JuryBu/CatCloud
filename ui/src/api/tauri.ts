@@ -496,6 +496,8 @@ export interface CoreRuntimeInfo {
   captive_portal_required: boolean;
   system_proxy_enabled: boolean;
   tun_enabled: boolean;
+  tun_configured?: boolean;
+  tun_needs_elevation?: boolean;
   tun_admin_ready: boolean;
   app_version: string;
   os_label: string;
@@ -1704,9 +1706,36 @@ const MOCK_QUICK_SITES: SiteCheckItem[] = [
   { id: "site-chatgpt", name: "OpenAI", url: "https://chatgpt.com/cdn-cgi/trace", latency_ms: 95, ok: true },
 ];
 
-let mockConfig: AppConfig = structuredClone(DEFAULT_APP_CONFIG);
+export function hasPreviewTunNeedsAdminFlag(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    const searchParams = new URLSearchParams(window.location.search);
+    if (searchParams.get("preview_tun_needs_admin") === "1") return true;
+    const hash = window.location.hash || "";
+    const qIdx = hash.indexOf("?");
+    if (qIdx >= 0) {
+      const hashParams = new URLSearchParams(hash.slice(qIdx + 1));
+      if (hashParams.get("preview_tun_needs_admin") === "1") return true;
+    }
+    return /(?:^|[?&#])preview_tun_needs_admin=1(?:$|&|#)/.test(hash);
+  } catch {
+    return false;
+  }
+}
+
+const previewTunNeedsAdmin = !isTauriEnv() && hasPreviewTunNeedsAdminFlag();
+
+let mockConfig: AppConfig = {
+  ...structuredClone(DEFAULT_APP_CONFIG),
+  system_proxy_enabled: previewTunNeedsAdmin ? true : DEFAULT_APP_CONFIG.system_proxy_enabled,
+  tun_enabled: previewTunNeedsAdmin ? true : DEFAULT_APP_CONFIG.tun_enabled,
+};
 let mockFullConfig: FullAppConfig = {
   allow_lan: false,
+  tun: {
+    enabled: mockConfig.tun_enabled,
+    stack_mode: mockConfig.tun_stack_mode,
+  },
   controller_host: "127.0.0.1",
   controller_port: DEFAULT_APP_CONFIG.controller_port,
   controller_secret: null,
@@ -1944,7 +1973,7 @@ let mockGlobalPreAccel: GlobalPreAccelStatus = {
   socks_port: null,
   windivert_available: detectNavigatorOs() === "windows",
   windivert_path: detectNavigatorOs() === "windows" ? "bin/WinDivert64.dll" : null,
-  is_elevated: true,
+  is_elevated: !previewTunNeedsAdmin,
   active_connections: 0,
   total_connections: 0,
   up_bytes: 0,
@@ -1953,7 +1982,12 @@ let mockGlobalPreAccel: GlobalPreAccelStatus = {
   active_relays: MOCK_PREACCEL_RELAYS.filter((r) => r.enabled).map((r) => r.name),
   last_error: null,
   is_windivert_active: false,
-  install_state: detectNavigatorOs() === "windows" ? "ready" : "idle",
+  install_state:
+    detectNavigatorOs() === "windows"
+      ? previewTunNeedsAdmin
+        ? "need_elevation"
+        : "ready"
+      : "idle",
   process_stats: [],
   verify_state: "idle",
   verify_latency_ms: null,
@@ -1991,7 +2025,12 @@ let mockRuntime: CoreRuntimeInfo = {
   global_preaccel_socks_port: null,
   global_preaccel_connections: 0,
   global_windivert_active: false,
-  preaccel_install_state: detectNavigatorOs() === "windows" ? "ready" : "idle",
+  preaccel_install_state:
+    detectNavigatorOs() === "windows"
+      ? previewTunNeedsAdmin
+        ? "need_elevation"
+        : "ready"
+      : "idle",
   global_preaccel_verify_state: "idle",
   global_preaccel_verify_ms: null,
   node_health_hints: {
@@ -2001,8 +2040,10 @@ let mockRuntime: CoreRuntimeInfo = {
   },
   captive_portal_required: false,
   system_proxy_enabled: mockConfig.system_proxy_enabled,
-  tun_enabled: mockConfig.tun_enabled,
-  tun_admin_ready: true,
+  tun_enabled: mockConfig.tun_enabled && !previewTunNeedsAdmin,
+  tun_configured: mockConfig.tun_enabled,
+  tun_needs_elevation: mockConfig.tun_enabled && previewTunNeedsAdmin,
+  tun_admin_ready: !previewTunNeedsAdmin,
   app_version: "0.1.0",
   os_label: "Windows 11 x64",
   autostart_enabled: true,
@@ -2011,8 +2052,12 @@ let mockRuntime: CoreRuntimeInfo = {
 };
 
 function syncMockPreAccelRuntime(): void {
+  const tunConfigured = mockConfig.tun_enabled;
+  const tunAdminReady = mockRuntime.tun_admin_ready;
+  const effectiveTunEnabled = tunConfigured && tunAdminReady;
+  const tunNeedsElevation = tunConfigured && !tunAdminReady;
   const proxyActive =
-    mockRuntime.running && (mockRuntime.system_proxy_enabled || mockRuntime.tun_enabled);
+    mockRuntime.running && (mockRuntime.system_proxy_enabled || effectiveTunEnabled);
   const proxyPreAccelActive = mockRuntime.running && mockConfig.preaccel.enabled;
   const globalActive = mockGlobalPreAccel.running;
   const isWindivertActive = globalActive && mockGlobalPreAccel.mode === "windivert";
@@ -2032,6 +2077,9 @@ function syncMockPreAccelRuntime(): void {
   };
   mockRuntime = {
     ...mockRuntime,
+    tun_enabled: effectiveTunEnabled,
+    tun_configured: tunConfigured,
+    tun_needs_elevation: tunNeedsElevation,
     preaccel_enabled: mockConfig.preaccel.enabled,
     preaccel_active: preaccelActive,
     preaccel_relay_name: activeRelays[0] ?? null,
@@ -2345,7 +2393,9 @@ export const catcloudApi = {
       ...mockRuntime,
       proxy_mode: next.proxy_mode,
       system_proxy_enabled: next.system_proxy_enabled,
-      tun_enabled: next.tun_enabled,
+      tun_enabled: next.tun_enabled && mockRuntime.tun_admin_ready,
+      tun_configured: next.tun_enabled,
+      tun_needs_elevation: next.tun_enabled && !mockRuntime.tun_admin_ready,
       mixed_port: next.mixed_port,
     };
     syncMockPreAccelRuntime();
@@ -2482,6 +2532,8 @@ export const catcloudApi = {
       running: false,
       system_proxy_enabled: false,
       tun_enabled: false,
+      tun_configured: false,
+      tun_needs_elevation: false,
     };
     if (mockConfig.preaccel.enabled && !mockGlobalPreAccel.running) {
       try {
@@ -2543,10 +2595,15 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<boolean>("set_tun_enabled", { enabled });
     }
+    if (enabled && !mockRuntime.tun_admin_ready) {
+      throw new Error("NEEDS_ADMIN: 需要管理员权限才能开启虚拟网卡");
+    }
     mockConfig.tun_enabled = enabled;
-    mockRuntime.tun_enabled = enabled;
+    mockRuntime.tun_configured = enabled;
+    mockRuntime.tun_enabled = enabled && mockRuntime.tun_admin_ready;
+    mockRuntime.tun_needs_elevation = enabled && !mockRuntime.tun_admin_ready;
     syncMockPreAccelRuntime();
-    return enabled;
+    return mockRuntime.tun_enabled;
   },
 
   async switchNextBestNode(groupId = "grp-ai"): Promise<SwitchResult> {
@@ -4257,7 +4314,7 @@ export const catcloudApi = {
       `- 版本与系统：猫猫云梯 v${mockRuntime.app_version}（${mockRuntime.os_label}）`,
       `- 节点与测速：已导入 **${mockNodes.length}** 个节点，来自 **${mockSubscriptions.length}** 个订阅来源，已有 **${mockGroups.length}** 个智能多选组`,
       `- 代理总开关：**${proxyOn ? "已开启" : "未开启"}**（核心：${mockRuntime.running ? "运行中" : "未启动"} | 模式：${modeLabel}）`,
-      `- 接管状态：系统代理 ${mockRuntime.system_proxy_enabled ? "已开启" : "未开启"} ｜ 虚拟网卡 ${mockRuntime.tun_enabled ? "已开启" : "未开启"}`,
+      `- 接管状态：系统代理 ${mockRuntime.system_proxy_enabled ? "已开启" : "未开启"} ｜ 虚拟网卡 ${mockRuntime.tun_enabled ? "已开启" : mockRuntime.tun_needs_elevation ? "未生效（需管理员权限）" : "未开启"}`,
       `- 当前路线：${routeSummary}`,
       `- 国内提速：${preaccelSummary}`,
       "",
@@ -4277,7 +4334,7 @@ export const catcloudApi = {
       "## 1. 当前运行状态摘要",
       `- 版本：v${mockRuntime.app_version}（${mockRuntime.os_label}）`,
       `- 代理核心：${mockRuntime.core_name} ${mockRuntime.core_version}（${mockRuntime.running ? "运行中" : "已停止"}）`,
-      `- 代理模式：${mockRuntime.proxy_mode} | 系统代理：${mockRuntime.system_proxy_enabled ? "已开启" : "未开启"} | 虚拟网卡：${mockRuntime.tun_enabled ? "已开启" : "未开启"}`,
+      `- 代理模式：${mockRuntime.proxy_mode} | 系统代理：${mockRuntime.system_proxy_enabled ? "已开启" : "未开启"} | 虚拟网卡：${mockRuntime.tun_enabled ? "已开启" : mockRuntime.tun_needs_elevation ? "未生效（需管理员权限）" : "未开启"}`,
       `- 当前路线：${mockRuntime.route_mode === "single" ? "单节点模式" : `智能多选组（${mockRuntime.active_group_name}）`} → ${mockRuntime.active_node_name}`,
       `- 国内提速：${mockRuntime.preaccel_active ? `已开启（${mockRuntime.preaccel_relay_name ?? "主力中转"}）` : "未开启"}`,
       `- 本地端口：混合 ${mockConfig.mixed_port} / 控制 127.0.0.1:${mockConfig.controller_port} / DNS ${mockConfig.dns_listen_port}`,
@@ -4340,10 +4397,18 @@ export const catcloudApi = {
       return tauriInvokeOrThrow<boolean>("relaunch_as_admin", { enableTun });
     }
     mockRuntime.tun_admin_ready = true;
+    mockGlobalPreAccel = {
+      ...mockGlobalPreAccel,
+      is_elevated: true,
+      install_state: mockGlobalPreAccel.windivert_available ? "ready" : mockGlobalPreAccel.install_state,
+    };
     if (enableTun) {
       mockConfig.tun_enabled = true;
-      mockRuntime.tun_enabled = true;
     }
+    mockRuntime.tun_configured = mockConfig.tun_enabled;
+    mockRuntime.tun_enabled = mockConfig.tun_enabled;
+    mockRuntime.tun_needs_elevation = false;
+    syncMockPreAccelRuntime();
     return true;
   },
 

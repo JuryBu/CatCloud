@@ -190,6 +190,7 @@ export function Sidebar() {
 
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const [localPetting, setLocalPetting] = useState(false);
+  const [disablingTunIntent, setDisablingTunIntent] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
   const petTimerRef = useRef<number | null>(null);
   const platformOs = resolvePlatformOs(runtime.os_label);
@@ -212,7 +213,8 @@ export function Sidebar() {
     ? "idle"
     : runtime.status === "error" ||
         runtime.captive_portal_required ||
-        runtime.active_group_circuit_open
+        runtime.active_group_circuit_open ||
+        runtime.tun_needs_elevation
       ? "approval"
       : isProbeRunning || runtime.probing_active
         ? "searching"
@@ -396,6 +398,19 @@ export function Sidebar() {
   const handleOpenAppearanceSettings = () => {
     setThemeMenuOpen(false);
     appActions.openSettingsTab("appearance");
+  };
+
+  const handleDisableTunIntent = async () => {
+    if (tunAdminPromptBusy || disablingTunIntent) return;
+    setDisablingTunIntent(true);
+    try {
+      const ok = await appActions.toggleTun(false);
+      if (ok) {
+        appActions.closeTunAdminPrompt();
+      }
+    } finally {
+      setDisablingTunIntent(false);
+    }
   };
 
   const resolveNavLabel = (id: NavRouteId): string => {
@@ -811,25 +826,39 @@ export function Sidebar() {
 
             <button
               type="button"
-              onClick={() => void appActions.toggleTun()}
+              onClick={() =>
+                runtime.tun_needs_elevation
+                  ? appActions.openTunAdminPrompt(null)
+                  : void appActions.toggleTun()
+              }
               className={`flex items-center justify-between rounded-xl border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
                 runtime.tun_enabled
                   ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
+                  : runtime.tun_needs_elevation
+                    ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)] hover:border-[var(--amber)]"
+                    : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
               title={
-                runtime.tun_admin_ready
-                  ? dict.home.tunMode
-                  : tunElevationCopy.buttonHint
+                runtime.tun_needs_elevation
+                  ? "配置已开启虚拟网卡但当前权限不足，点击一键以管理员重启生效"
+                  : runtime.tun_admin_ready
+                    ? dict.home.tunMode
+                    : tunElevationCopy.buttonHint
               }
             >
-              <span className="inline-flex items-center gap-1 truncate">
+              <span className="inline-flex min-w-0 items-center gap-1 truncate">
                 <ShieldCheck className="h-3 w-3 shrink-0" />
-                {dict.home.tunMode}
+                <span className="truncate">
+                  {runtime.tun_needs_elevation ? dict.home.tunNeedsAdminShort : dict.home.tunMode}
+                </span>
               </span>
               <span
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                  runtime.tun_enabled ? "bg-[var(--accent)]" : "bg-[var(--muted)]/50"
+                  runtime.tun_enabled
+                    ? "bg-[var(--accent)]"
+                    : runtime.tun_needs_elevation
+                      ? "bg-[var(--amber)]"
+                      : "bg-[var(--muted)]/50"
                 }`}
               />
             </button>
@@ -889,7 +918,7 @@ export function Sidebar() {
               aria-modal="true"
               aria-label={tunElevationCopy.ariaLabel}
               onClick={(e) => e.stopPropagation()}
-              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+              className="cc-surface w-full max-w-[468px] rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-start gap-3">
@@ -907,7 +936,7 @@ export function Sidebar() {
                 </div>
                 <button
                   type="button"
-                  disabled={tunAdminPromptBusy}
+                  disabled={tunAdminPromptBusy || disablingTunIntent}
                   onClick={() => appActions.closeTunAdminPrompt()}
                   className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
                   aria-label="关闭弹窗"
@@ -922,32 +951,48 @@ export function Sidebar() {
                 </div>
               )}
 
-              <div className="mt-5 flex items-center justify-end gap-2">
-                <button
-                  type="button"
-                  disabled={tunAdminPromptBusy}
-                  onClick={() => appActions.closeTunAdminPrompt()}
-                  className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)] disabled:opacity-50"
-                >
-                  暂不开启
-                </button>
-                <button
-                  type="button"
-                  disabled={tunAdminPromptBusy}
-                  onClick={() => void appActions.relaunchAsAdminForTun()}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
-                >
-                  {tunAdminPromptBusy ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <ShieldCheck className="h-3.5 w-3.5" />
-                  )}
-                  <span>
-                    {tunAdminPromptBusy
-                      ? tunElevationCopy.busyLabel
-                      : tunElevationCopy.actionLabel}
-                  </span>
-                </button>
+              <div
+                className={`mt-5 flex flex-wrap items-center gap-2 ${
+                  runtime.tun_needs_elevation ? "justify-between" : "justify-end"
+                }`}
+              >
+                {runtime.tun_needs_elevation && (
+                  <button
+                    type="button"
+                    disabled={tunAdminPromptBusy || disablingTunIntent}
+                    onClick={() => void handleDisableTunIntent()}
+                    className="rounded-xl border border-[var(--line)] bg-transparent px-3 py-2 text-xs font-medium text-[var(--muted)] transition-colors hover:border-[var(--amber)]/55 hover:bg-[var(--amber-soft)]/45 hover:text-[var(--text)] disabled:opacity-50"
+                  >
+                    {disablingTunIntent ? "正在关闭…" : "暂不开网卡（关闭此项）"}
+                  </button>
+                )}
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    disabled={tunAdminPromptBusy || disablingTunIntent}
+                    onClick={() => appActions.closeTunAdminPrompt()}
+                    className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)] disabled:opacity-50"
+                  >
+                    {runtime.tun_needs_elevation ? dict.common.cancel : "暂不开启"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={tunAdminPromptBusy || disablingTunIntent}
+                    onClick={() => void appActions.relaunchAsAdminForTun()}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
+                  >
+                    {tunAdminPromptBusy ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                    )}
+                    <span>
+                      {tunAdminPromptBusy
+                        ? tunElevationCopy.busyLabel
+                        : tunElevationCopy.actionLabel}
+                    </span>
+                  </button>
+                </div>
               </div>
             </div>
           </div>,

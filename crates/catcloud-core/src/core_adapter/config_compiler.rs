@@ -2176,6 +2176,20 @@ fn build_dns_section(
         "127.0.0.1"
     };
 
+    let mut effective_default_ns: Vec<String> = dns
+        .default_nameserver
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if effective_default_ns.is_empty() {
+        effective_default_ns = crate::config::DEFAULT_PURE_IP_DOH_NAMESERVERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+    }
+
     let mut effective_direct_ns: Vec<String> = dns
         .direct_nameserver
         .iter()
@@ -2184,7 +2198,10 @@ fn build_dns_section(
         .map(ToString::to_string)
         .collect();
     if effective_direct_ns.is_empty() {
-        effective_direct_ns = vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()];
+        effective_direct_ns = crate::config::DEFAULT_PURE_IP_DOH_NAMESERVERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
     }
 
     let mut effective_proxy_server_ns: Vec<String> = dns
@@ -2195,15 +2212,22 @@ fn build_dns_section(
         .map(ToString::to_string)
         .collect();
     if dns.respect_rules && effective_proxy_server_ns.is_empty() {
-        effective_proxy_server_ns = dns
+        let cleaned_default_ns: Vec<String> = dns
             .default_nameserver
             .iter()
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .collect();
-        if effective_proxy_server_ns.is_empty() {
-            effective_proxy_server_ns = effective_direct_ns.clone();
+        if !cleaned_default_ns.is_empty()
+            && !crate::config::is_legacy_plaintext_domestic_dns_list(&cleaned_default_ns)
+        {
+            effective_proxy_server_ns = cleaned_default_ns;
+        } else {
+            effective_proxy_server_ns = crate::config::DEFAULT_PURE_IP_DOH_NAMESERVERS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
         }
     }
 
@@ -2314,7 +2338,7 @@ fn build_dns_section(
 
     map.insert(
         str_val("default-nameserver"),
-        string_seq(dns.default_nameserver.iter().map(String::as_str)),
+        string_seq(effective_default_ns.iter().map(String::as_str)),
     );
     map.insert(
         str_val("direct-nameserver"),
@@ -2323,7 +2347,9 @@ fn build_dns_section(
 
     // Build nameserver-policy: user-configured patterns take precedence, then auto-route
     // sensitive AI / Google / GitHub / X domains through overseas DoH (`fallback`) to prevent
-    // domestic DNS leakage/pollution, plus `geosite:cn,private -> direct-nameserver` when geosite exists.
+    // domestic DNS leakage/pollution, route campus/LAN intranet suffixes via `system` first
+    // (preserving campus DHCP DNS without polluting public DoH 443 or causing TUN loops),
+    // plus `geosite:cn,private -> direct-nameserver` when geosite exists.
     let mut policy_map = Mapping::new();
     let mut configured_policy_keys: HashSet<String> = HashSet::new();
     for (pattern, servers) in &dns.nameserver_policy {
@@ -2373,6 +2399,43 @@ fn build_dns_section(
             configured_policy_keys.insert(key_lower);
         }
     }
+
+    let campus_policy_servers: [&str; 2] = if dns.respect_rules {
+        ["system", "https://223.5.5.5/dns-query#DIRECT"]
+    } else {
+        ["system", "https://223.5.5.5/dns-query"]
+    };
+    const CAMPUS_INTRANET_DNS_POLICY_DOMAINS: &[&str] = &[
+        "+.edu.cn",
+        "+.lan",
+        "+.local",
+        "+.localdomain",
+        "+.internal",
+        "+.home.arpa",
+    ];
+    for &domain in CAMPUS_INTRANET_DNS_POLICY_DOMAINS {
+        let key_lower = domain.to_ascii_lowercase();
+        if !configured_policy_keys.contains(&key_lower) {
+            policy_map.insert(
+                str_val(domain),
+                string_seq(campus_policy_servers.iter().copied()),
+            );
+            configured_policy_keys.insert(key_lower);
+        }
+    }
+    for raw_domain in &cfg.preaccel.campus_direct_domains {
+        if let Some(domain) = normalize_campus_policy_domain(raw_domain) {
+            let key_lower = domain.to_ascii_lowercase();
+            if !configured_policy_keys.contains(&key_lower) {
+                policy_map.insert(
+                    str_val(&domain),
+                    string_seq(campus_policy_servers.iter().copied()),
+                );
+                configured_policy_keys.insert(key_lower);
+            }
+        }
+    }
+
     if has_geosite && !configured_policy_keys.contains("geosite:cn,private") {
         policy_map.insert(
             str_val("geosite:cn,private"),
@@ -2410,6 +2473,59 @@ fn build_dns_section(
     map.insert(str_val("fallback-filter"), Value::Mapping(ff_map));
 
     map
+}
+
+fn normalize_campus_policy_domain(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Campus direct entries may be Mihomo rule lines such as `DOMAIN-SUFFIX,campus.edu,DIRECT`
+    // or `IP-CIDR,10.0.0.0/8,DIRECT,no-resolve`. Only extract domain payload from DOMAIN /
+    // DOMAIN-SUFFIX rules; reject all other comma-bearing rules so Mihomo never splits them
+    // into stray `nameserver-policy` keys.
+    let candidate = if trimmed.contains(',') {
+        let mut parts = trimmed.split(',').map(str::trim);
+        let rule_type = parts.next().unwrap_or_default();
+        let payload = parts.next().unwrap_or_default();
+        if rule_type.eq_ignore_ascii_case("DOMAIN") {
+            payload
+        } else if rule_type.eq_ignore_ascii_case("DOMAIN-SUFFIX") {
+            return normalize_campus_policy_domain(&format!("+.{payload}"));
+        } else {
+            return None;
+        }
+    } else {
+        trimmed
+    };
+    if candidate.is_empty()
+        || candidate.contains(',')
+        || candidate.contains("://")
+        || candidate.contains('/')
+        || candidate.contains(':')
+        || candidate.chars().any(char::is_whitespace)
+        || crate::preaccel::parse_server_ip(candidate).is_some()
+    {
+        return None;
+    }
+    let normalized = candidate.trim_end_matches('.').to_ascii_lowercase();
+    if normalized.is_empty() {
+        return None;
+    }
+    if let Some(suffix) = normalized
+        .strip_prefix("*.")
+        .or_else(|| normalized.strip_prefix("+."))
+    {
+        let clean = suffix.trim_start_matches('.');
+        if clean.is_empty() || clean.starts_with("geosite:") {
+            return None;
+        }
+        return Some(format!("+.{clean}"));
+    }
+    if normalized.starts_with("geosite:") {
+        return None;
+    }
+    Some(normalized)
 }
 
 fn is_domestic_default_nameserver(entry: &str) -> bool {
@@ -3882,8 +3998,9 @@ rules:
         let mut cfg = AppConfig::default();
         cfg.dns.respect_rules = true;
         cfg.dns.direct_nameserver = vec![
-            "223.5.5.5".to_string(),
-            "119.29.29.29#CUSTOM".to_string(),
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://1.12.12.12/dns-query#CUSTOM".to_string(),
+            "system".to_string(),
         ];
         cfg.dns.nameserver = vec![
             "https://223.5.5.5/dns-query".to_string(),
@@ -4001,7 +4118,14 @@ rules:
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(direct_ns, vec!["223.5.5.5#DIRECT", "119.29.29.29#CUSTOM"]);
+        assert_eq!(
+            direct_ns,
+            vec![
+                "https://223.5.5.5/dns-query#DIRECT",
+                "https://1.12.12.12/dns-query#CUSTOM",
+                "system",
+            ]
+        );
 
         let nameservers: Vec<&str> = compiled.value["dns"]["nameserver"]
             .as_sequence()
@@ -4070,7 +4194,14 @@ rules:
             .iter()
             .filter_map(Value::as_str)
             .collect();
-        assert_eq!(direct_ns_off, vec!["223.5.5.5", "119.29.29.29#CUSTOM"]);
+        assert_eq!(
+            direct_ns_off,
+            vec![
+                "https://223.5.5.5/dns-query",
+                "https://1.12.12.12/dns-query#CUSTOM",
+                "system",
+            ]
+        );
         let ns_off: Vec<&str> = compiled_no_respect.value["dns"]["nameserver"]
             .as_sequence()
             .unwrap()
@@ -5490,5 +5621,171 @@ rules:
         assert!(with_geoip.value["sniffer"]["sniff"].get("QUIC").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn campus_network_dns_defaults_fallbacks_and_intranet_system_policy() {
+        let ports = sample_ports();
+        let nodes = vec![sample_node("n1", "JP-Edge-01", 443, true)];
+        let empty = HashMap::new();
+
+        // 1. Default config compiles pure-IP DoH 443 across default/direct/proxy-server
+        //    nameservers and injects `system` policy for campus/LAN suffixes + campus_direct_domains.
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.campus_direct_domains = vec![
+            "portal.campus.example.org".to_string(),
+            "*.intranet.example.org".to_string(),
+            "DOMAIN-SUFFIX,rule-campus.example.org,DIRECT".to_string(),
+            "DOMAIN,auth.campus.example.org,DIRECT".to_string(),
+            "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve".to_string(), // non-domain rule must not pollute DNS policy
+            "172.28.255.155".to_string(), // IP must be ignored by nameserver-policy
+        ];
+        cfg.dns.nameserver_policy.insert(
+            "+.lan".to_string(),
+            vec!["10.0.0.53".to_string()], // User custom policy must never be overwritten
+        );
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile default campus-safe dns");
+
+        let seq_to_vec = |v: &Value| -> Vec<String> {
+            v.as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        };
+
+        let expected_doh = vec![
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://1.12.12.12/dns-query".to_string(),
+        ];
+        let expected_doh_direct = vec![
+            "https://223.5.5.5/dns-query#DIRECT".to_string(),
+            "https://1.12.12.12/dns-query#DIRECT".to_string(),
+        ];
+
+        assert_eq!(seq_to_vec(&compiled.value["dns"]["default-nameserver"]), expected_doh);
+        assert_eq!(seq_to_vec(&compiled.value["dns"]["direct-nameserver"]), expected_doh_direct);
+        assert_eq!(
+            seq_to_vec(&compiled.value["dns"]["proxy-server-nameserver"]),
+            expected_doh
+        );
+
+        let policy = &compiled.value["dns"]["nameserver-policy"];
+        let expected_campus_policy = vec![
+            "system".to_string(),
+            "https://223.5.5.5/dns-query#DIRECT".to_string(),
+        ];
+        for key in [
+            "+.edu.cn",
+            "+.local",
+            "+.localdomain",
+            "+.internal",
+            "+.home.arpa",
+            "portal.campus.example.org",
+            "+.intranet.example.org",
+            "+.rule-campus.example.org",
+            "auth.campus.example.org",
+        ] {
+            assert_eq!(
+                seq_to_vec(&policy[key]),
+                expected_campus_policy,
+                "unexpected nameserver-policy for `{key}`"
+            );
+        }
+        // User-defined `+.lan` takes precedence; raw IP and non-domain/comma rules are excluded.
+        assert_eq!(seq_to_vec(&policy["+.lan"]), vec!["10.0.0.53".to_string()]);
+        assert!(policy.get("172.28.255.155").is_none());
+        assert!(policy.get("ip-cidr,10.0.0.0/8,direct,no-resolve").is_none());
+        assert!(policy.get("domain-suffix,rule-campus.example.org,direct").is_none());
+
+        // 2. Empty arrays & legacy plaintext default_nameserver fall back to pure-IP DoH 443.
+        let mut cfg_empty = AppConfig::default();
+        cfg_empty.dns.respect_rules = true;
+        cfg_empty.dns.default_nameserver = vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()];
+        cfg_empty.dns.direct_nameserver.clear();
+        cfg_empty.dns.proxy_server_nameserver.clear();
+        let compiled_legacy_fallback = compile_mihomo_config(&CompileInput {
+            config: &cfg_empty,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile legacy fallback");
+        assert_eq!(
+            seq_to_vec(&compiled_legacy_fallback.value["dns"]["direct-nameserver"]),
+            expected_doh_direct
+        );
+        assert_eq!(
+            seq_to_vec(&compiled_legacy_fallback.value["dns"]["proxy-server-nameserver"]),
+            expected_doh
+        );
+
+        // 3. Empty default_nameserver gets DoH 443 fallback; custom non-legacy default_nameserver
+        //    is reused by empty proxy-server-nameserver without appending `#DIRECT`.
+        let mut cfg_custom_default = AppConfig::default();
+        cfg_custom_default.dns.respect_rules = true;
+        cfg_custom_default.dns.default_nameserver = vec!["https://1.12.12.12/dns-query".to_string()];
+        cfg_custom_default.dns.proxy_server_nameserver.clear();
+        let compiled_custom_default = compile_mihomo_config(&CompileInput {
+            config: &cfg_custom_default,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile custom default");
+        assert_eq!(
+            seq_to_vec(&compiled_custom_default.value["dns"]["proxy-server-nameserver"]),
+            vec!["https://1.12.12.12/dns-query".to_string()]
+        );
+
+        let mut cfg_blank_default = AppConfig::default();
+        cfg_blank_default.dns.respect_rules = false;
+        cfg_blank_default.dns.default_nameserver.clear();
+        let compiled_blank_default = compile_mihomo_config(&CompileInput {
+            config: &cfg_blank_default,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile blank default with respect_rules=false");
+        assert_eq!(
+            seq_to_vec(&compiled_blank_default.value["dns"]["default-nameserver"]),
+            expected_doh
+        );
+        assert_eq!(
+            seq_to_vec(&compiled_blank_default.value["dns"]["nameserver-policy"]["+.edu.cn"]),
+            vec![
+                "system".to_string(),
+                "https://223.5.5.5/dns-query".to_string(),
+            ]
+        );
     }
 }

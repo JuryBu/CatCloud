@@ -622,6 +622,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             let db = open_storage(paths)?;
             let plat = default_platform();
             let caps = plat.capabilities();
+            let mihomo_bin = resolve_mihomo_binary(&cfg, paths, &[], false)
+                .ok()
+                .and_then(|r| r.path);
+            let tun_privilege_ready = is_cli_tun_privilege_ready(&caps, mihomo_bin.as_deref());
+            let tun_configured = cfg.tun.enabled;
+            let tun_enabled = tun_configured && tun_privilege_ready;
+            let tun_needs_elevation = tun_configured && !tun_privilege_ready;
             let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
             let sub_count = db.list_subscriptions()?.len();
             let node_count = db.list_nodes()?.len();
@@ -637,6 +644,10 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 "instance_hash": paths.instance_hash,
                 "platform": caps,
                 "proxy_mode": cfg.proxy_mode,
+                "system_proxy_enabled": cfg.system_proxy.enabled,
+                "tun_enabled": tun_enabled,
+                "tun_configured": tun_configured,
+                "tun_needs_elevation": tun_needs_elevation,
                 "mixed_port": cfg.mixed_port,
                 "controller_addr": cfg.controller_addr(),
                 "dns_listen_addr": cfg.dns_listen_addr(),
@@ -656,12 +667,20 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "probes": probe_count,
                 }
             });
+            let tun_summary = if tun_needs_elevation {
+                "needs_elevation"
+            } else if tun_enabled {
+                "true"
+            } else {
+                "false"
+            };
             let human = format!(
-                "CatCloud CLI v{} | portable={} | mode={} | port={} | nodes={} | groups={} | global_preaccel={} (windivert={})",
+                "CatCloud CLI v{} | portable={} | mode={} | port={} | tun={} | nodes={} | groups={} | global_preaccel={} (windivert={})",
                 env!("CARGO_PKG_VERSION"),
                 paths.is_portable,
                 cfg.proxy_mode.as_str(),
                 cfg.mixed_port,
+                tun_summary,
                 node_count,
                 group_count,
                 cfg.preaccel.global_bypass_enabled,
@@ -2056,22 +2075,29 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     .path
                     .as_ref()
                     .map(|p| redact_path_for_display(&p.to_string_lossy()));
+                let caps = default_platform().capabilities();
+                let allow_tun = is_cli_tun_privilege_ready(&caps, bin_res.path.as_deref());
+                let tun_masked_no_elevation = cfg.tun.enabled && !allow_tun;
 
                 if dry_run {
                     let db = open_storage(paths)?;
                     let nodes = db.list_nodes()?;
                     let groups = db.list_multi_groups()?;
                     let relays = db.list_preaccel_relays(false)?;
-                    let bind_host = if cfg.allow_lan {
-                        cfg.bind_address.clone()
+                    let mut effective_cfg = cfg.clone();
+                    if !allow_tun && effective_cfg.tun.enabled {
+                        effective_cfg.tun.enabled = false;
+                    }
+                    let bind_host = if effective_cfg.allow_lan {
+                        effective_cfg.bind_address.clone()
                     } else {
                         "127.0.0.1".to_string()
                     };
                     let ports = AllocatedPorts {
                         bind_host,
-                        mixed_port: cfg.mixed_port,
-                        controller_port: cfg.controller_port,
-                        dns_port: cfg.dns_listen_port,
+                        mixed_port: effective_cfg.mixed_port,
+                        controller_port: effective_cfg.controller_port,
+                        dns_port: effective_cfg.dns_listen_port,
                         shifted: Vec::new(),
                     };
                     let secret = configured_secret
@@ -2079,7 +2105,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         .unwrap_or_else(generate_controller_secret);
                     let empty_filter = HashMap::new();
                     let compiled = compile_mihomo_config(&CompileInput {
-                        config: &cfg,
+                        config: &effective_cfg,
                         nodes: &nodes,
                         groups: &groups,
                         relays: &relays,
@@ -2170,6 +2196,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         "core_version": &live_controller_version,
                         "hot_reloaded": false,
                         "validated_and_written": false,
+                        "allow_tun": allow_tun,
+                        "tun_masked_no_elevation": tun_masked_no_elevation,
                         "binary_verified": binary_verified,
                         "binary_path": &redacted_bin_path,
                         "sha256": &compiled.sha256,
@@ -2222,6 +2250,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         force: true,
                         verify_with_binary: true,
                         allow_l3_restart: false,
+                        allow_tun,
                         ..DiskReloadOptions::default()
                     })
                     .await;
@@ -2267,6 +2296,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "core_version": &live_controller_version,
                     "hot_reloaded": core_running,
                     "validated_and_written": true,
+                    "allow_tun": allow_tun,
+                    "tun_masked_no_elevation": tun_masked_no_elevation,
                     "binary_verified": bin_res.found,
                     "binary_path": &redacted_bin_path,
                     "replayed_groups": sanitized_outcome.replayed_groups,
@@ -4545,7 +4576,10 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             false,
         ),
     };
-    let tun_needs_admin = cfg.tun.enabled && !caps.is_elevated;
+    let tun_privilege_ready = is_cli_tun_privilege_ready(&caps, bin_res.path.as_deref());
+    let tun_configured = cfg.tun.enabled;
+    let tun_effective_enabled = tun_configured && tun_privilege_ready;
+    let tun_needs_admin = tun_configured && !tun_privilege_ready;
     let proxy_tun_status = if os_proxy_dangling || os_proxy_mismatch || tun_needs_admin {
         if os_proxy_dangling {
             recommendations.push(
@@ -4561,7 +4595,7 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         }
         if tun_needs_admin {
             recommendations.push(
-                "TUN mode is enabled in config but current process is not elevated; run with administrator/root privileges for TUN."
+                "TUN mode is enabled in config but current process lacks TUN privilege; run with administrator/root privileges (or grant cap_net_admin on Linux) for TUN."
                     .to_string(),
             );
         }
@@ -4575,9 +4609,11 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         "name": "System Proxy & Virtual NIC (TUN)",
         "status": proxy_tun_status,
         "detail": format!(
-            "cfg_sys_proxy={}, cfg_tun={}, tun_stack={}, elevated={}, os_proxy_mismatch={}, os_proxy_dangling={}",
+            "cfg_sys_proxy={}, tun_configured={}, tun_enabled={}, tun_needs_elevation={}, tun_stack={}, elevated={}, os_proxy_mismatch={}, os_proxy_dangling={}",
             cfg.system_proxy.enabled,
-            cfg.tun.enabled,
+            tun_configured,
+            tun_effective_enabled,
+            tun_needs_admin,
             cfg.tun.stack_mode.as_str(),
             caps.is_elevated,
             os_proxy_mismatch,
@@ -4586,7 +4622,11 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         "data": {
             "config_system_proxy_enabled": cfg.system_proxy.enabled,
             "proxy_guard_enabled": cfg.system_proxy.proxy_guard.enabled,
-            "config_tun_enabled": cfg.tun.enabled,
+            "config_tun_enabled": tun_configured,
+            "tun_configured": tun_configured,
+            "tun_enabled": tun_effective_enabled,
+            "tun_needs_elevation": tun_needs_admin,
+            "tun_privilege_ready": tun_privilege_ready,
             "tun_stack": cfg.tun.stack_mode,
             "is_elevated": caps.is_elevated,
             "os_system_proxy": os_proxy_val,
@@ -5493,11 +5533,36 @@ fn build_global_preaccel_status_payload(paths: &AppPaths) -> Result<(Value, Stri
     Ok((out, human))
 }
 
+fn is_cli_tun_privilege_ready(
+    caps: &catcloud_core::platform::PlatformCapabilities,
+    mihomo_binary: Option<&Path>,
+) -> bool {
+    if caps.is_elevated {
+        return true;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(bin) = mihomo_binary {
+            return catcloud_core::platform::linux::has_mihomo_tun_capability(bin);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = mihomo_binary;
+    false
+}
+
 fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Value> {
     let cfg = config::load_or_init(paths)?;
     let db = open_storage(paths)?;
     let plat = default_platform();
     let caps = plat.capabilities();
+    let mihomo_bin = resolve_mihomo_binary(&cfg, paths, &[], false)
+        .ok()
+        .and_then(|r| r.path);
+    let tun_privilege_ready = is_cli_tun_privilege_ready(&caps, mihomo_bin.as_deref());
+    let tun_configured = cfg.tun.enabled;
+    let tun_enabled = tun_configured && tun_privilege_ready;
+    let tun_needs_elevation = tun_configured && !tun_privilege_ready;
     let geodata_status = collect_geodata_status(&paths.runtime_dir);
     let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
     let recent_logs = read_diag_log_tail(
@@ -5530,7 +5595,9 @@ fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Value> {
         "core_ipv6": cfg.core_ipv6,
         "dns_ipv6": cfg.dns.ipv6,
         "system_proxy_enabled": cfg.system_proxy.enabled,
-        "tun_enabled": cfg.tun.enabled,
+        "tun_enabled": tun_enabled,
+        "tun_configured": tun_configured,
+        "tun_needs_elevation": tun_needs_elevation,
         "tun_stack": cfg.tun.stack_mode,
         "domestic_direct_enabled": cfg.rules_override.domestic_direct_enabled,
         "block_quic_udp_443": cfg.rules_override.block_quic_udp_443,
@@ -5668,7 +5735,16 @@ mod tests {
         assert_eq!(diag["active_group_id"], json!("grp-tw"));
         assert_eq!(diag["active_single_node_id"], json!("node-tw-01"));
         assert_eq!(diag["system_proxy_enabled"], json!(true));
-        assert_eq!(diag["tun_enabled"], json!(true));
+        let expected_tun_ready = is_cli_tun_privilege_ready(
+            &default_platform().capabilities(),
+            resolve_mihomo_binary(&cfg, &paths, &[], false)
+                .ok()
+                .and_then(|r| r.path)
+                .as_deref(),
+        );
+        assert_eq!(diag["tun_configured"], json!(true));
+        assert_eq!(diag["tun_enabled"], json!(expected_tun_ready));
+        assert_eq!(diag["tun_needs_elevation"], json!(!expected_tun_ready));
         assert_eq!(diag["domestic_direct_enabled"], json!(true));
         assert_eq!(diag["block_quic_udp_443"], json!(true));
         assert_eq!(diag["preaccel_enabled"], json!(true));
@@ -5699,6 +5775,14 @@ mod tests {
                 .unwrap()
                 .contains("sec_16")
         );
+
+        // When tun.enabled is disabled in config, all three TUN truth fields must be false.
+        cfg.tun.enabled = false;
+        config::save(&paths, &cfg).expect("save tun disabled config");
+        let diag_tun_off = build_diag_payload(&paths, false).expect("diag with tun off");
+        assert_eq!(diag_tun_off["tun_configured"], json!(false));
+        assert_eq!(diag_tun_off["tun_enabled"], json!(false));
+        assert_eq!(diag_tun_off["tun_needs_elevation"], json!(false));
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

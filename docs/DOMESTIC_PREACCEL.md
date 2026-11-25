@@ -34,17 +34,17 @@ CatCloud 的 **国内提速（Domestic Pre-Acceleration）** 在客户端侧自�
 
 ## 2. 纯 IP 无 SNI `:443` 规范（分协议全检）
 
-在国内公有云轻量应用服务器上部署自用 `:443` 提速中继时，必须遵守 **放行安全组 TCP 443 + 纯 IP 自签 ECDSA 证书 + 空 SNI** 规范：
+在国内公有云轻量应用服务器上部署自用 `:443` 提速中继时，必须遵守 **放行安全组 TCP 443（双协议并挂 Hysteria2 时同步放行 UDP 443）+ 纯 IP 自签 ECDSA 证书 + 空 SNI** 规范：
 
-1. **先放行云安全组 TCP `:443` 入站**：在云厂商控制台防火墙/安全组中放行入站 TCP `443`。
-2. **禁止填写未备案第三方 SNI**：国内云机房网关对 TCP `:443` TLS ClientHello 中的 `SNI` 字段实施严格合规拦截。若在配置中填入未在该云厂商备案的第三方域名，TLS 握手将被直接阻断或重置。
+1. **先放行云安全组 `:443` 入站**：在云厂商控制台防火墙/安全组中放行入站 TCP `443`；若在同一台服务器上共存部署 **AnyTLS（TCP 443）+ Hysteria2（UDP 443）** 双协议，请同步放行入站 UDP `443`（两者共享同一份纯 IP 自签证书，互不端口冲突）。
+2. **禁止填写未备案第三方 SNI**：国内云机房网关对 `:443` TLS ClientHello 中的 `SNI` 字段实施严格合规拦截。若在配置中填入未在该云厂商备案的第三方域名，TLS 握手将被直接阻断或重置。
 3. **使用纯 IP 自签 ECDSA 证书**：服务端监听 `:443` 并签发仅绑定公网 IP SAN 的自签 ECDSA 证书；客户端显式留空 SNI 并开启 `skip_cert_verify: true`（证书验证跳过仅限自控纯 IP 中继，不影响终端目标 HTTPS 站点的端到端 TLS 校验）。
 4. **分协议字段全量强检**：CatCloud 校验器按代理协议分别核验 SNI 语义字段：
-   - **AnyTLS / Trojan**：校验 `sni` 必须为空（`""` 或 `null`）；
+   - **AnyTLS / Hysteria2 / Trojan**：校验 `sni` 必须为空（`""` 或 `null`）；其中 `hysteria2`（别名 `hy2`）编译时自动注入保守上行 `up: "100 Mbps"` 与 `down: "200 Mbps"`，防止校园网下 Brutal 过载抖动；
    - **VLESS**：校验 `servername`（同时兼容别名 `sni`）必须为空；
    - 若用户误填非空未备案域名或将 `skip_cert_verify` 设为 `false`，校验器立即在 GUI 与 CLI JSON 中输出强警示或阻断编译。
 
-> 需要开箱即用的 Ubuntu/Debian 一键服务端部署脚本（支持 AnyTLS / Trojan 并直接生成 `mmrelay://v1/...` 导入码），请执行 `catcloud docs export preaccel --format markdown` 或直接查阅随装手册 `agent_docs/zh-CN/02-domestic-preaccel.md`。
+> 需要开箱即用的 Ubuntu/Debian 一键服务端部署脚本（支持 AnyTLS / Hysteria2 UDP 443 / Trojan 并直接生成 `mmrelay://v1/...` 导入码），请执行 `catcloud docs export preaccel --format markdown` 或直接查阅随装手册 `agent_docs/zh-CN/02-domestic-preaccel.md`。
 
 ---
 
@@ -102,11 +102,13 @@ CatCloud 的 **国内提速（Domestic Pre-Acceleration）** 在客户端侧自�
 | `relays[].id` | `string` | 唯一中继标识 |
 | `relays[].server` | `string` | 中继纯 IPv4/IPv6 地址（推荐纯 IP） |
 | `relays[].port` | `u16` | 监听端口（推荐 `443`） |
-| `relays[].protocol` | `string` | `anytls` / `trojan` / `vless` 等支持 TLS 的转发协议 |
+| `relays[].protocol` | `string` | `anytls` / `hysteria2`（别名 `hy2`）/ `trojan` / `vless` 等支持 TLS 的转发协议 |
 | `relays[].sni` | `string` | 别名 `servername`；国内纯 IP `:443` 必须保持 `""` |
 | `relays[].skip_cert_verify` | `bool` | 自签纯 IP 证书须设为 `true` |
 | `relays[].priority` | `i32` | 数值越小优先级越高，决定双活主备顺序 |
 | `relays[].expires_at` | `string?` | 可选 `YYYY-MM-DD` 到期日；剩余 `<= 3` 天自动标黄提醒，到期自动标红预警 |
+
+> **TCP 443（`AnyTLS`）+ UDP 443（`Hysteria2`）双协议共存**：同一台 `sing-box` 轻量云实例可在 `listen_port: 443` 同时挂载 `anytls`（TCP）与 `hysteria2`（UDP）两个 `inbound`，共享同一份纯 IP 自签 ECDSA 证书（`203.0.113.10` / `<YOUR_PASSWORD>`）且互不冲突；安全组放行 `TCP 443` 与 `UDP 443` 后，客户端既可用 `Hysteria2` 彻底规避 TCP-over-TCP 拥塞，也能在屏蔽 UDP 443 的网络里无缝回落到 `AnyTLS`。
 
 ### 单行剪贴板 URI 与朋友 `.zip` 分享包
 

@@ -552,6 +552,14 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
                 Value::String(relay.password.clone()),
             );
             map.insert(
+                Value::String("up".to_string()),
+                Value::String("100 Mbps".to_string()),
+            );
+            map.insert(
+                Value::String("down".to_string()),
+                Value::String("200 Mbps".to_string()),
+            );
+            map.insert(
                 Value::String("skip-cert-verify".to_string()),
                 Value::Bool(relay.skip_cert_verify),
             );

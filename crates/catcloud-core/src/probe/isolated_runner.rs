@@ -24,8 +24,13 @@ pub const PROBE_CORE_PROCESS_NAME: &str = if cfg!(windows) {
     "catcloud-probe-core"
 };
 
-/// Plain-IP bootstrap resolvers for `dns.default-nameserver` inside isolated probe configs.
-pub const DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS: &[&str] = &["223.5.5.5", "119.29.29.29"];
+/// Pure-IP DoH (TCP 443) bootstrap resolvers for `dns.default-nameserver` inside isolated probe
+/// configs. Never include `"system"` here so an active primary-core TUN `dns-hijack: any:53`
+/// cannot loop or return Fake-IPs, while remaining immune to campus networks blocking UDP 53.
+pub const DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS: &[&str] = &[
+    "https://223.5.5.5/dns-query",
+    "https://1.12.12.12/dns-query",
+];
 
 /// Default pure-IP DoH resolvers used for `proxy-server-nameserver` / `nameserver` so isolated
 /// probe DNS completely avoids primary-core TUN `dns-hijack: any:53` interception.
@@ -1856,8 +1861,20 @@ mod tests {
         let dns_bootstrap = parsed["dns"]["default-nameserver"]
             .as_sequence()
             .expect("default-nameserver sequence");
-        assert_eq!(dns_bootstrap[0].as_str(), Some("223.5.5.5"));
-        assert_eq!(dns_bootstrap[1].as_str(), Some("119.29.29.29"));
+        assert_eq!(
+            dns_bootstrap[0].as_str(),
+            Some("https://223.5.5.5/dns-query")
+        );
+        assert_eq!(
+            dns_bootstrap[1].as_str(),
+            Some("https://1.12.12.12/dns-query")
+        );
+        assert!(
+            !dns_bootstrap
+                .iter()
+                .any(|v| v.as_str() == Some("system")),
+            "isolated probe default-nameserver must never include `system`"
+        );
         let psn = parsed["dns"]["proxy-server-nameserver"]
             .as_sequence()
             .expect("proxy-server-nameserver sequence");
@@ -1983,8 +2000,14 @@ mod tests {
         let cmp_bootstrap = parsed["dns"]["default-nameserver"]
             .as_sequence()
             .expect("comparison default-nameserver");
-        assert_eq!(cmp_bootstrap[0].as_str(), Some("223.5.5.5"));
-        assert_eq!(cmp_bootstrap[1].as_str(), Some("119.29.29.29"));
+        assert_eq!(
+            cmp_bootstrap[0].as_str(),
+            Some("https://223.5.5.5/dns-query")
+        );
+        assert_eq!(
+            cmp_bootstrap[1].as_str(),
+            Some("https://1.12.12.12/dns-query")
+        );
         let cmp_psn = parsed["dns"]["proxy-server-nameserver"]
             .as_sequence()
             .expect("comparison proxy-server-nameserver");
@@ -2381,6 +2404,100 @@ mod tests {
         assert_eq!(
             parsed_udp["listeners"][0]["proxy"].as_str(),
             Some("cc-rs-relay-0")
+        );
+    }
+
+    #[test]
+    fn isolated_probe_and_speed_yaml_compile_hysteria2_relay_with_bandwidth_and_pure_ip_doh() {
+        let hy2_relay = PreAccelRelay {
+            id: "relay-hy2-iso".to_string(),
+            name: "CN-HY2-443".to_string(),
+            provider: "cloud-a".to_string(),
+            region: "CN-East".to_string(),
+            server: "203.0.113.88".to_string(),
+            port: 443,
+            protocol: "hysteria2".to_string(),
+            password: "hy2-iso-password".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+        let mut tcp_node = sample_node("n-hy2-tcp", "JP-TCP-8443");
+        tcp_node.port = 8443;
+        tcp_node.is_443_native = false;
+        tcp_node.preaccel_eligible = true;
+        tcp_node.raw_config["port"] = serde_json::json!(8443);
+
+        let ports = allocate_ephemeral_ports(3).unwrap();
+        let bindings = vec![(ports[1], &tcp_node)];
+
+        // 1. Isolated node probe YAML with Hysteria2 preaccel relay
+        let probe_yaml = build_isolated_probe_yaml_with_preaccel(
+            ports[0],
+            "hy2-probe-secret-0123456789",
+            &bindings,
+            &[],
+            Some(&hy2_relay),
+            true,
+        )
+        .expect("build isolated probe yaml with hysteria2 relay");
+        let parsed_probe: YamlValue =
+            serde_yaml_ng::from_str(&probe_yaml).expect("valid probe yaml");
+        let probe_relay = &parsed_probe["proxies"][0];
+        assert_eq!(probe_relay["name"].as_str(), Some(PROBE_RELAY_PROXY_NAME));
+        assert_eq!(probe_relay["type"].as_str(), Some("hysteria2"));
+        assert_eq!(probe_relay["up"].as_str(), Some("100 Mbps"));
+        assert_eq!(probe_relay["down"].as_str(), Some("200 Mbps"));
+        assert_eq!(probe_relay["skip-cert-verify"].as_bool(), Some(true));
+        assert!(probe_relay.get("sni").is_none());
+        assert_eq!(
+            parsed_probe["proxies"][1]["dialer-proxy"].as_str(),
+            Some(PROBE_RELAY_PROXY_NAME)
+        );
+        assert_eq!(
+            parsed_probe["rules"][0].as_str(),
+            Some("IP-CIDR,203.0.113.88/32,DIRECT,no-resolve")
+        );
+        let bootstrap = parsed_probe["dns"]["default-nameserver"]
+            .as_sequence()
+            .expect("probe bootstrap dns");
+        assert_eq!(bootstrap[0].as_str(), Some("https://223.5.5.5/dns-query"));
+        assert_eq!(bootstrap[1].as_str(), Some("https://1.12.12.12/dns-query"));
+        assert!(!probe_yaml.contains("system"));
+
+        // 2. Relay speed YAML with Hysteria2 relay chained to reference TCP node
+        let speed_yaml = generate_preaccel_relay_speed_yaml(
+            &[hy2_relay],
+            Some(&tcp_node),
+            &[("relay-hy2-iso".to_string(), ports[2])],
+            ports[0],
+            "hy2-speed-secret-0123456789",
+            &[],
+        )
+        .expect("generate hysteria2 relay speed yaml");
+        let parsed_speed: YamlValue =
+            serde_yaml_ng::from_str(&speed_yaml).expect("valid speed yaml");
+        let speed_relay = &parsed_speed["proxies"][0];
+        assert_eq!(speed_relay["type"].as_str(), Some("hysteria2"));
+        assert_eq!(speed_relay["up"].as_str(), Some("100 Mbps"));
+        assert_eq!(speed_relay["down"].as_str(), Some("200 Mbps"));
+        assert!(speed_relay.get("sni").is_none());
+        let speed_bootstrap = parsed_speed["dns"]["default-nameserver"]
+            .as_sequence()
+            .expect("speed bootstrap dns");
+        assert_eq!(
+            speed_bootstrap[0].as_str(),
+            Some("https://223.5.5.5/dns-query")
+        );
+        assert_eq!(
+            speed_bootstrap[1].as_str(),
+            Some("https://1.12.12.12/dns-query")
         );
     }
 }

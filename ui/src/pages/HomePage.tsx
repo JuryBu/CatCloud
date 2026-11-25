@@ -755,6 +755,9 @@ export function HomePage() {
 
   const trafficStatusSentence = (() => {
     if (!isProxyEnabled) {
+      if (runtime.tun_needs_elevation) {
+        return "核心未运行 · 虚拟网卡需管理员";
+      }
       if (preaccelSummary.realWinDivertActive) {
         if (preaccelSummary.verifyState === "probing") {
           return "未开启猫猫代理 · 正在自动探测全局提速链路…";
@@ -797,6 +800,12 @@ export function HomePage() {
     if (runtime.tun_enabled) {
       return "已通过虚拟网卡接管电脑全部流量";
     }
+    if (runtime.tun_needs_elevation && runtime.system_proxy_enabled) {
+      return "仅系统代理生效 · 虚拟网卡需管理员";
+    }
+    if (runtime.tun_needs_elevation) {
+      return "虚拟网卡需管理员 · 点下方一键提权";
+    }
     return "已接管电脑网络流量";
   })();
 
@@ -825,13 +834,19 @@ export function HomePage() {
     return dict.home.preaccel;
   })();
 
-  const tunPillTitle = runtime.tun_admin_ready
-    ? "接管电脑全部软件和命令行流量"
-    : platformOs === "linux"
-      ? "开启虚拟网卡需要给代理核心授予网络权限，点击可一键授权"
+  const tunPillTitle = runtime.tun_needs_elevation
+    ? platformOs === "linux"
+      ? "配置已开启虚拟网卡但当前核心权限不足，点击一键授予核心网络权限"
       : platformOs === "macos"
-        ? "开启虚拟网卡需要系统安全授权，点击查看并一键授权"
-        : "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启";
+        ? "配置已开启虚拟网卡但尚未授权，点击查看并一键授权"
+        : "配置已开启虚拟网卡但当前缺少管理员权限，点击一键以管理员身份重启生效"
+    : runtime.tun_admin_ready
+      ? "接管电脑全部软件和命令行流量"
+      : platformOs === "linux"
+        ? "开启虚拟网卡需要给代理核心授予网络权限，点击可一键授权"
+        : platformOs === "macos"
+          ? "开启虚拟网卡需要系统安全授权，点击查看并一键授权"
+          : "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启";
 
   const handleTogglePreAccelQuick = async () => {
     if (togglingPreAccel) return;
@@ -846,6 +861,7 @@ export function HomePage() {
   // Real-time live state signals driving HomeMascotPanel (zero fake binary toggle)
   const needsMascotApproval = Boolean(
     tunAdminPromptOpen ||
+      runtime.tun_needs_elevation ||
       runtime.captive_portal_required ||
       runtime.status === "error" ||
       runtime.status === "warn" ||
@@ -888,11 +904,20 @@ export function HomePage() {
     setTogglingProxy(true);
     try {
       if (!isProxyEnabled) {
+        let needsTunAdmin = Boolean(runtime.tun_needs_elevation);
         if (!runtime.running) {
           const started = await catcloudApi.startCore();
           appActions.syncRuntime(started);
+          needsTunAdmin = Boolean(started.tun_needs_elevation ?? needsTunAdmin);
         }
-        await appActions.toggleSystemProxy(true);
+        const sysProxyOk = await appActions.toggleSystemProxy(true, needsTunAdmin);
+        if (sysProxyOk && needsTunAdmin) {
+          appActions.showToast(
+            "已启用系统代理；如需接管全部桌面软件请点击『虚拟网卡 · 需管理员』一键提权",
+            "info",
+            5200
+          );
+        }
       } else {
         await appActions.disableAllProxyAndStopCore();
       }
@@ -1195,11 +1220,13 @@ export function HomePage() {
                   <p
                     title={trafficStatusSentence}
                     className={`mt-0.5 truncate text-xs ${
-                      !isProxyEnabled && preaccelSummary.realWinDivertActive
-                        ? "font-medium text-[var(--accent)]"
-                        : !isProxyEnabled && preaccelSummary.enabled
-                          ? "font-medium text-[var(--amber)]"
-                          : "text-[var(--text-secondary)]"
+                      runtime.tun_needs_elevation && runtime.proxy_mode !== "direct"
+                        ? "font-medium text-[var(--amber)]"
+                        : !isProxyEnabled && preaccelSummary.realWinDivertActive
+                          ? "font-medium text-[var(--accent)]"
+                          : !isProxyEnabled && preaccelSummary.enabled
+                            ? "font-medium text-[var(--amber)]"
+                            : "text-[var(--text-secondary)]"
                     }`}
                   >
                     {trafficStatusSentence}
@@ -1254,16 +1281,34 @@ export function HomePage() {
 
                 <button
                   type="button"
-                  onClick={() => void appActions.toggleTun()}
+                  onClick={() =>
+                    runtime.tun_needs_elevation
+                      ? appActions.openTunAdminPrompt(null)
+                      : void appActions.toggleTun()
+                  }
                   className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
                     runtime.tun_enabled
                       ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+                      : runtime.tun_needs_elevation
+                        ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)] hover:border-[var(--amber)]"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
                   }`}
                   title={tunPillTitle}
                 >
-                  <ShieldCheck className="h-3.5 w-3.5" />
-                  <span>{dict.home.tunMode}</span>
+                  {runtime.tun_needs_elevation ? (
+                    <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+                  ) : (
+                    <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                  )}
+                  <span>
+                    {runtime.tun_needs_elevation ? dict.home.tunNeedsAdmin : dict.home.tunMode}
+                  </span>
+                  {runtime.tun_needs_elevation && (
+                    <span
+                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]"
+                      aria-hidden="true"
+                    />
+                  )}
                 </button>
 
                 <button

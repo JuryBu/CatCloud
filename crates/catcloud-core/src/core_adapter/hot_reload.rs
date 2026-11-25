@@ -151,7 +151,8 @@ pub fn classify_config_diff(old: &AppConfig, new: &AppConfig) -> ReloadLevel {
         || old.dns_listen_host != new.dns_listen_host
         || old.dns_listen_port != new.dns_listen_port
         || old.port_guard_auto_shift != new.port_guard_auto_shift
-        || old.tun != new.tun
+        || old.tun.enabled != new.tun.enabled
+        || (new.tun.enabled && old.tun != new.tun)
         || old.core_runtime.kernel_kind != new.core_runtime.kernel_kind
         || old.core_runtime.custom_binary_path != new.core_runtime.custom_binary_path
         || old.core_runtime.memory_tier != new.core_runtime.memory_tier
@@ -213,6 +214,10 @@ pub struct DiskReloadOptions {
     pub binary_verify_timeout: Duration,
     /// Allow L3 core subprocess restart when `classify_config_diff` returns `L3CoreRestart`.
     pub allow_l3_restart: bool,
+    /// Whether the current process has OS privileges/capabilities to enable TUN mode.
+    /// When `false`, any `tun.enabled = true` loaded from disk is masked to `false` in memory
+    /// during diffing, YAML compilation, and restart without mutating `config.json`.
+    pub allow_tun: bool,
     /// Optional override for nodes/groups/relays instead of reading SQLite.
     pub snapshot_override: Option<DiskReloadSnapshot>,
     /// Extra high-priority rules prepended after anti-loop rules (e.g., temporary campus portal rules).
@@ -230,6 +235,7 @@ impl Default for DiskReloadOptions {
             verify_with_binary: true,
             binary_verify_timeout: Duration::from_secs(8),
             allow_l3_restart: true,
+            allow_tun: true,
             snapshot_override: None,
             extra_prepend_rules: Vec::new(),
             extra_fake_ip_filters: Vec::new(),
@@ -351,6 +357,13 @@ impl HotReloadCoordinator {
             );
         }
 
+        // Mask `tun.enabled` in memory when the current process lacks TUN privilege, preserving
+        // the user's persisted intent in `config.json` without ever compiling `tun.enable: true`.
+        let mut effective_cfg = new_cfg;
+        if !options.allow_tun && effective_cfg.tun.enabled {
+            effective_cfg.tun.enabled = false;
+        }
+
         // 2. Load nodes, multi-groups, and domestic relays from override or SQLite.
         let snapshot = match options.snapshot_override.clone() {
             Some(s) => s,
@@ -399,17 +412,17 @@ impl HotReloadCoordinator {
         };
 
         let mut level = match &prev_cfg {
-            Some(old) => classify_config_diff(old, &new_cfg),
+            Some(old) => classify_config_diff(old, &effective_cfg),
             None => ReloadLevel::L2HotReload,
         };
 
         let snapshot_unchanged = prev_snapshot_fp.as_deref() == Some(current_snapshot_fp.as_str());
-        let requires_global_node_expansion = !new_cfg.core_runtime.compile_all_nodes
+        let requires_global_node_expansion = !effective_cfg.core_runtime.compile_all_nodes
             && snapshot.nodes.len() > 32
             && prev_cfg.as_ref().is_some_and(|old| {
-                old.proxy_mode != new_cfg.proxy_mode
+                old.proxy_mode != effective_cfg.proxy_mode
                     && (old.proxy_mode == crate::models::ProxyMode::Global
-                        || new_cfg.proxy_mode == crate::models::ProxyMode::Global)
+                        || effective_cfg.proxy_mode == crate::models::ProxyMode::Global)
             });
 
         // Fast L1 path when only `proxy_mode` changed, snapshot is identical, and not forced.
@@ -419,13 +432,17 @@ impl HotReloadCoordinator {
             && snapshot_unchanged
         {
             if let Some(ref old) = prev_cfg {
-                if old.proxy_mode != new_cfg.proxy_mode
+                if old.proxy_mode != effective_cfg.proxy_mode
                     && self.adapter.has_live_controller().await
                 {
-                    match self.adapter.patch_proxy_mode(new_cfg.proxy_mode.clone()).await {
+                    match self
+                        .adapter
+                        .patch_proxy_mode(effective_cfg.proxy_mode.clone())
+                        .await
+                    {
                         Ok(()) => {
                             let mut guard = self.state.lock().await;
-                            guard.last_applied_config = Some(new_cfg);
+                            guard.last_applied_config = Some(effective_cfg);
                             return ReloadOutcome {
                                 applied: true,
                                 level: ReloadLevel::L1Rest,
@@ -457,7 +474,7 @@ impl HotReloadCoordinator {
         }
 
         // 4. Resolve controller secret and active ports for compilation.
-        let secret = match new_cfg
+        let secret = match effective_cfg
             .controller_secret
             .as_deref()
             .map(str::trim)
@@ -479,7 +496,7 @@ impl HotReloadCoordinator {
 
         let current_status = self.adapter.runtime_status().await;
         let mut allocated_ports = if level == ReloadLevel::L3CoreRestart {
-            match allocate_l3_ports_respecting_running_core(&new_cfg, &current_status) {
+            match allocate_l3_ports_respecting_running_core(&effective_cfg, &current_status) {
                 Ok(p) => p,
                 Err(err) => {
                     return rejected_outcome(
@@ -490,21 +507,21 @@ impl HotReloadCoordinator {
             }
         } else {
             prev_ports.clone().unwrap_or_else(|| AllocatedPorts {
-                bind_host: if new_cfg.allow_lan {
-                    new_cfg.bind_address.clone()
+                bind_host: if effective_cfg.allow_lan {
+                    effective_cfg.bind_address.clone()
                 } else {
                     "127.0.0.1".to_string()
                 },
-                mixed_port: new_cfg.mixed_port,
-                controller_port: new_cfg.controller_port,
-                dns_port: new_cfg.dns_listen_port,
+                mixed_port: effective_cfg.mixed_port,
+                controller_port: effective_cfg.controller_port,
+                dns_port: effective_cfg.dns_listen_port,
                 shifted: Vec::new(),
             })
         };
 
         // 5. Compile candidate Mihomo YAML (includes optional YAML Merge Patch override).
         let compile_input = CompileInput {
-            config: &new_cfg,
+            config: &effective_cfg,
             nodes: &snapshot.nodes,
             groups: &snapshot.groups,
             relays: &snapshot.relays,
@@ -553,7 +570,7 @@ impl HotReloadCoordinator {
             && prev_hash.as_deref() == Some(compiled.sha256.as_str())
         {
             let mut guard = self.state.lock().await;
-            guard.last_applied_config = Some(new_cfg);
+            guard.last_applied_config = Some(effective_cfg);
             return ReloadOutcome {
                 applied: false,
                 level,
@@ -578,9 +595,10 @@ impl HotReloadCoordinator {
         }
 
         let extra_candidates = self.extra_binary_candidates_snapshot();
-        let resolved_binary = resolve_mihomo_binary(&new_cfg, &self.paths, &extra_candidates, false)
-            .ok()
-            .and_then(|r| r.path);
+        let resolved_binary =
+            resolve_mihomo_binary(&effective_cfg, &self.paths, &extra_candidates, false)
+                .ok()
+                .and_then(|r| r.path);
 
         if options.verify_with_binary {
             if let Some(ref bin_path) = resolved_binary {
@@ -712,18 +730,18 @@ impl HotReloadCoordinator {
                         .unwrap_or(false)
                 });
 
-            let proxy_host = if new_cfg.allow_lan {
-                new_cfg.bind_address.as_str()
+            let proxy_host = if effective_cfg.allow_lan {
+                effective_cfg.bind_address.as_str()
             } else {
                 "127.0.0.1"
             };
-            let controller_host = if new_cfg.allow_lan {
-                new_cfg.controller_host.clone()
+            let controller_host = if effective_cfg.allow_lan {
+                effective_cfg.controller_host.clone()
             } else {
                 "127.0.0.1".to_string()
             };
-            let dns_host = if new_cfg.allow_lan {
-                new_cfg.dns_listen_host.as_str()
+            let dns_host = if effective_cfg.allow_lan {
+                effective_cfg.dns_listen_host.as_str()
             } else {
                 "127.0.0.1"
             };
@@ -751,7 +769,7 @@ impl HotReloadCoordinator {
                 binary_path: bin_path.clone(),
                 working_dir: self.paths.runtime_dir.clone(),
                 config_path: runtime_yaml.clone(),
-                config: new_cfg.clone(),
+                config: effective_cfg.clone(),
                 allocated_ports: allocated_ports.clone(),
                 controller_host,
                 controller_secret: secret.clone(),
@@ -811,7 +829,7 @@ impl HotReloadCoordinator {
         let shifted = std::mem::take(&mut allocated_ports.shifted);
         {
             let mut guard = self.state.lock().await;
-            guard.last_applied_config = Some(new_cfg);
+            guard.last_applied_config = Some(effective_cfg);
             guard.last_compiled_hash = Some(compiled.sha256.clone());
             guard.last_snapshot_fingerprint = Some(current_snapshot_fp);
             guard.last_allocated_ports = Some(allocated_ports);
@@ -1489,10 +1507,26 @@ mod tests {
             ReloadLevel::L3CoreRestart
         );
 
-        let mut l3_tun = base.clone();
-        l3_tun.tun.stack_mode = TunStackMode::Gvisor;
+        // Editing TUN stack/MTU while TUN is disabled must NOT trigger an unnecessary L3 restart.
+        let mut l1_tun_inactive = base.clone();
+        l1_tun_inactive.tun.stack_mode = TunStackMode::Gvisor;
+        l1_tun_inactive.tun.mtu = 1400;
         assert_eq!(
-            classify_config_diff(&base, &l3_tun),
+            classify_config_diff(&base, &l1_tun_inactive),
+            ReloadLevel::L1Rest
+        );
+
+        // Enabling TUN or changing TUN stack/MTU while TUN is enabled MUST trigger L3 restart.
+        let mut l3_tun_on = base.clone();
+        l3_tun_on.tun.enabled = true;
+        assert_eq!(
+            classify_config_diff(&base, &l3_tun_on),
+            ReloadLevel::L3CoreRestart
+        );
+        let mut l3_tun_stack = l3_tun_on.clone();
+        l3_tun_stack.tun.stack_mode = TunStackMode::Gvisor;
+        assert_eq!(
+            classify_config_diff(&l3_tun_on, &l3_tun_stack),
             ReloadLevel::L3CoreRestart
         );
 
@@ -2012,6 +2046,87 @@ mod tests {
         assert_eq!(out3.level, ReloadLevel::L2HotReload);
         let yaml3 = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
         assert!(!yaml3.contains("DOMAIN-SUFFIX,openai.com,AI-Dedicated"));
+
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[tokio::test]
+    async fn disk_reload_masks_tun_when_not_allowed_without_mutating_disk_or_triggering_l3() {
+        let paths = temp_paths("allow-tun-gate");
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter = Arc::new(MihomoAdapter::new(guard).unwrap());
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        // 1. Persist `tun.enabled = true` on disk, then reload with `allow_tun = false`.
+        let mut disk_cfg = AppConfig::default();
+        disk_cfg.tun.enabled = true;
+        disk_cfg.tun.mtu = 1450;
+        save(&paths, &disk_cfg).unwrap();
+
+        let out1 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_tun: false,
+                ..Default::default()
+            })
+            .await;
+        assert!(out1.applied, "initial masked reload failed: {:?}", out1.error);
+        assert_eq!(out1.level, ReloadLevel::L2HotReload);
+
+        let yaml1: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            &std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap(),
+        )
+        .expect("parse runtime.yaml");
+        assert_eq!(yaml1["tun"]["enable"].as_bool(), Some(false));
+
+        // On-disk `config.json` must remain untouched with user intent `tun.enabled == true`.
+        let persisted = load_or_default(&paths).expect("re-read disk config.json");
+        assert!(persisted.tun.enabled);
+
+        // 2. Second reload with unchanged config -> cleanly deduplicated without L3 jitter.
+        let out2 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_tun: false,
+                ..Default::default()
+            })
+            .await;
+        assert!(!out2.applied);
+        assert!(out2.skipped_unchanged);
+        assert_ne!(out2.level, ReloadLevel::L3CoreRestart);
+
+        // 3. Changing TUN stack/MTU on disk while `allow_tun = false` must NOT trigger L3 restart.
+        disk_cfg.tun.stack_mode = TunStackMode::Gvisor;
+        disk_cfg.tun.mtu = 1400;
+        save(&paths, &disk_cfg).unwrap();
+        let out3 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_tun: false,
+                ..Default::default()
+            })
+            .await;
+        assert!(!out3.rejected, "unexpected rejection: {:?}", out3.error);
+        assert_ne!(out3.level, ReloadLevel::L3CoreRestart);
+
+        // 4. Subsequent L2 change keeps `tun.enable: false` in runtime.yaml without L3 restart.
+        disk_cfg.log_level = crate::models::CoreLogLevel::Warning;
+        save(&paths, &disk_cfg).unwrap();
+        let out4 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_tun: false,
+                ..Default::default()
+            })
+            .await;
+        assert!(out4.applied, "l2 reload under masked tun failed: {:?}", out4.error);
+        assert_eq!(out4.level, ReloadLevel::L2HotReload);
+        let yaml4: serde_yaml_ng::Value = serde_yaml_ng::from_str(
+            &std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap(),
+        )
+        .expect("parse runtime.yaml after l2");
+        assert_eq!(yaml4["tun"]["enable"].as_bool(), Some(false));
+        assert!(load_or_default(&paths).unwrap().tun.enabled);
 
         let _ = std::fs::remove_dir_all(&paths.root_data_dir);
     }

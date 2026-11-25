@@ -961,6 +961,8 @@ pub struct CoreRuntimeInfoDto {
     pub captive_portal_required: bool,
     pub system_proxy_enabled: bool,
     pub tun_enabled: bool,
+    pub tun_configured: bool,
+    pub tun_needs_elevation: bool,
     pub tun_admin_ready: bool,
     pub app_version: String,
     pub os_label: String,
@@ -1717,9 +1719,35 @@ fn select_tray_group_candidates<'a>(
 }
 
 /// Return `true` only when the main proxy core is genuinely taking over host traffic
-/// (core process is running AND either OS system proxy or TUN virtual NIC is enabled).
-pub(crate) fn is_proxy_takeover_active(core_running: bool, cfg: &AppConfig) -> bool {
-    core_running && (cfg.system_proxy.enabled || cfg.tun.enabled)
+/// (core process is running AND either OS system proxy or effective privileged TUN is enabled).
+pub(crate) fn is_proxy_takeover_active(
+    core_running: bool,
+    cfg: &AppConfig,
+    tun_admin_ready: bool,
+) -> bool {
+    let eff_tun = cfg.tun.enabled && tun_admin_ready;
+    core_running && (cfg.system_proxy.enabled || eff_tun)
+}
+
+/// Return `true` only when TUN is configured ON AND the current process/binary holds TUN privileges.
+pub fn effective_tun_enabled(state: &AppState, cfg: &AppConfig) -> bool {
+    cfg.tun.enabled && is_tun_privilege_ready(state)
+}
+
+/// Return `true` when the user configured TUN ON (`cfg.tun.enabled == true`) but current privileges
+/// are insufficient so TUN cannot genuinely take effect.
+pub fn tun_needs_elevation(state: &AppState, cfg: &AppConfig) -> bool {
+    cfg.tun.enabled && !is_tun_privilege_ready(state)
+}
+
+/// Build a runtime copy of `cfg` with `tun.enabled` clamped to `false` when TUN privileges are absent,
+/// without ever mutating the persisted `config.json` intent.
+fn effective_config_for_runtime(state: &AppState, cfg: &AppConfig) -> AppConfig {
+    let mut eff = cfg.clone();
+    if eff.tun.enabled && !is_tun_privilege_ready(state) {
+        eff.tun.enabled = false;
+    }
+    eff
 }
 
 pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState {
@@ -1871,7 +1899,10 @@ fn build_tray_menu_state_with_verify_override(
     let verify_ms = verify_override
         .map(|(_, ms)| ms)
         .unwrap_or(global_status.verify_latency_ms);
-    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
+    let tun_ready = is_tun_privilege_ready(state);
+    let eff_tun = cfg.tun.enabled && tun_ready;
+    let tun_need_elev = cfg.tun.enabled && !tun_ready;
+    let proxy_active = is_proxy_takeover_active(rt.running, &cfg, tun_ready);
     let global_mode_label = if !cfg.preaccel.enabled && !global_status.running {
         None
     } else if proxy_active && cfg.preaccel.enabled {
@@ -1904,7 +1935,8 @@ fn build_tray_menu_state_with_verify_override(
             ProxyMode::Direct => TrayProxyMode::Direct,
         },
         system_proxy_enabled: cfg.system_proxy.enabled,
-        tun_enabled: cfg.tun.enabled,
+        tun_enabled: eff_tun,
+        tun_needs_elevation: tun_need_elev,
         windowless_mode: win.windowless,
         capsule_open: win.capsule_open,
         autostart_enabled: cfg.behavior.autostart,
@@ -2036,7 +2068,10 @@ fn build_tray_visual_state_with_verify_override(
         cfg.proxy_mode.clone()
     };
     let is_direct_mode = effective_proxy_mode == ProxyMode::Direct;
-    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
+    let tun_ready = is_tun_privilege_ready(state);
+    let eff_tun = cfg.tun.enabled && tun_ready;
+    let tun_need_elev = cfg.tun.enabled && !tun_ready;
+    let proxy_active = is_proxy_takeover_active(rt.running, &cfg, tun_ready);
     let verify_state = verify_override
         .map(|(s, _)| s.to_string())
         .unwrap_or_else(|| global_status.verify_state.clone());
@@ -2164,7 +2199,8 @@ fn build_tray_visual_state_with_verify_override(
             ProxyMode::Global => TrayProxyMode::Global,
             ProxyMode::Direct => TrayProxyMode::Direct,
         },
-        tun_enabled: cfg.tun.enabled,
+        tun_enabled: eff_tun,
+        tun_needs_elevation: tun_need_elev,
         system_proxy_enabled: cfg.system_proxy.enabled,
         preaccel_summary,
         primary_group_summary,
@@ -2349,7 +2385,10 @@ fn build_runtime_info_dto_with_verify_override(
     let is_direct_mode = effective_proxy_mode == ProxyMode::Direct;
     let preaccel_verify_degraded = cfg.preaccel.enabled && verify_state_trimmed == "degraded";
     let preaccel_verify_probing = cfg.preaccel.enabled && verify_state_trimmed == "probing";
-    let proxy_active = is_proxy_takeover_active(rt.running, &cfg);
+    let tun_admin_ready = is_tun_privilege_ready(state);
+    let eff_tun = cfg.tun.enabled && tun_admin_ready;
+    let tun_need_elev = cfg.tun.enabled && !tun_admin_ready;
+    let proxy_active = is_proxy_takeover_active(rt.running, &cfg, tun_admin_ready);
     let has_enabled_relays = !relays.is_empty();
     let preaccel_active = !preaccel_verify_degraded
         && !preaccel_verify_probing
@@ -2448,8 +2487,10 @@ fn build_runtime_info_dto_with_verify_override(
         preaccel_relay_name: active_relay_name,
         captive_portal_required: portal_required,
         system_proxy_enabled: cfg.system_proxy.enabled,
-        tun_enabled: cfg.tun.enabled,
-        tun_admin_ready: is_tun_privilege_ready(state),
+        tun_enabled: eff_tun,
+        tun_configured: cfg.tun.enabled,
+        tun_needs_elevation: tun_need_elev,
+        tun_admin_ready,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         os_label: format!("{} {}", caps.os, caps.arch),
         autostart_enabled: cfg.behavior.autostart,
@@ -2560,7 +2601,8 @@ pub fn apply_configured_shortcuts(
             ShortcutAction::ToggleTun => {
                 tauri::async_runtime::spawn(async move {
                     if let Some(st) = app_async.try_state::<AppState>() {
-                        let next = !st.snapshot_config().tun.enabled;
+                        let cfg = st.snapshot_config();
+                        let next = !effective_tun_enabled(&st, &cfg);
                         if let Err(err) = set_tun_enabled_internal(&app_async, &st, next).await {
                             handle_tun_toggle_error(&app_async, &err);
                         }
@@ -3037,8 +3079,8 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
     state.stop_streams();
 
     let cfg = state.snapshot_config();
-    let may_have_tun =
-        cfg.tun.enabled || cfg.rules_override.override_mode != OverrideMode::Disabled;
+    let may_have_tun = effective_tun_enabled(state, &cfg)
+        || cfg.rules_override.override_mode != OverrideMode::Disabled;
     let global_status = state.global_preaccel.status();
     let may_have_global_preaccel = cfg.preaccel.enabled
         || global_status.running
@@ -3308,9 +3350,13 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         .map(str::to_string)
         .unwrap_or_else(generate_controller_secret);
 
+    let tun_ready = is_tun_privilege_ready(state);
+    let eff_cfg = effective_config_for_runtime(state, &cfg);
+    let eff_tun = eff_cfg.tun.enabled;
+    let tun_need_elev = cfg.tun.enabled && !tun_ready;
     let empty_filter = HashMap::new();
     let input = CompileInput {
-        config: &cfg,
+        config: &eff_cfg,
         nodes: &nodes,
         groups: &groups,
         relays: &relays,
@@ -3372,7 +3418,7 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         binary_path,
         working_dir: state.paths.runtime_dir.clone(),
         config_path: runtime_yaml,
-        config: cfg.clone(),
+        config: eff_cfg.clone(),
         allocated_ports: allocated.clone(),
         controller_host,
         controller_secret: secret.clone(),
@@ -3400,12 +3446,19 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
     ));
     state
         .hot_reload
-        .seed_active_state(cfg.clone(), compiled.sha256, allocated.clone(), secret.clone())
+        .seed_active_state(eff_cfg.clone(), compiled.sha256, allocated.clone(), secret.clone())
         .await;
     state.bump_core_session_generation();
     state.clear_group_backoffs();
     state.update_cached_runtime(status.clone());
     state.clear_app_error();
+    let tun_start_label = if eff_tun {
+        "开启"
+    } else if tun_need_elev {
+        "未生效（需管理员权限）"
+    } else {
+        "关闭"
+    };
     state.log_app_event(
         "info",
         "核心",
@@ -3417,10 +3470,17 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
             loaded_relays_count,
             total_library_nodes,
             status.rule_count,
-            if cfg.tun.enabled { "开启" } else { "关闭" },
+            tun_start_label,
             if cfg.preaccel.enabled { "开启" } else { "关闭" }
         ),
     );
+    if tun_need_elev {
+        state.log_app_event(
+            "warning",
+            "虚拟网卡",
+            "配置已勾选虚拟网卡（TUN），但当前为普通用户权限，虚拟网卡未生效（仅系统代理生效，部分桌面应用/终端可能无法走代理）；请点击一键以管理员身份重启",
+        );
+    }
 
     // Attach bounded background telemetry streams (`/traffic`, `/memory`, `/logs`).
     state.attach_streams(
@@ -3435,9 +3495,9 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         tracing::warn!("核心启动后同步系统代理端口失败：{err}");
     }
 
-    // Coordinate with standalone global pre-acceleration using the SAME launch-time `cfg`
-    // snapshot so startup logs and side effects never contradict each other across concurrent toggles.
-    let tun_active = status.running && cfg.tun.enabled;
+    // Coordinate with standalone global pre-acceleration using the SAME launch-time effective TUN
+    // state so unprivileged startup never falsely pauses the standalone 443 engine.
+    let tun_active = status.running && eff_tun;
     if tun_active && state.global_preaccel.status().running {
         let _ = state.global_preaccel.stop().await;
         state.log_app_event(
@@ -3485,8 +3545,8 @@ pub async fn start_core_internal(
 /// Caller must hold `state.core_lifecycle_lock`.
 async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
     let cfg = state.snapshot_config();
-    let may_have_tun =
-        cfg.tun.enabled || cfg.rules_override.override_mode != OverrideMode::Disabled;
+    let may_have_tun = effective_tun_enabled(state, &cfg)
+        || cfg.rules_override.override_mode != OverrideMode::Disabled;
     if may_have_tun && state.adapter.has_live_controller().await {
         let _ = state.adapter.disable_tun_gracefully().await;
     }
@@ -3520,17 +3580,20 @@ async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
 async fn stop_core_locked(
     app: &AppHandle,
     state: &AppState,
+    clear_tun_intent: bool,
 ) -> Result<CoreRuntimeInfoDto, String> {
     let old_cfg = state.snapshot_config();
     let was_sys_proxy_enabled = old_cfg.system_proxy.enabled;
-    let may_have_tun =
-        old_cfg.tun.enabled || old_cfg.rules_override.override_mode != OverrideMode::Disabled;
+    let may_have_tun = effective_tun_enabled(state, &old_cfg)
+        || old_cfg.rules_override.override_mode != OverrideMode::Disabled;
     let mut cfg = old_cfg;
-    let flags_changed = cfg.system_proxy.enabled || cfg.tun.enabled;
+    let flags_changed = cfg.system_proxy.enabled || (clear_tun_intent && cfg.tun.enabled);
 
     if flags_changed {
         cfg.system_proxy.enabled = false;
-        cfg.tun.enabled = false;
+        if clear_tun_intent {
+            cfg.tun.enabled = false;
+        }
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
         }
@@ -3655,7 +3718,17 @@ pub async fn stop_core_internal(
     state: &AppState,
 ) -> Result<CoreRuntimeInfoDto, String> {
     let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
-    stop_core_locked(app, state).await
+    stop_core_locked(app, state, true).await
+}
+
+/// Stop managed core when disabling system proxy under unprivileged mode while preserving
+/// any persisted `tun.enabled` user intent on disk.
+async fn stop_core_preserving_tun_intent_internal(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CoreRuntimeInfoDto, String> {
+    let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
+    stop_core_locked(app, state, false).await
 }
 
 /// Atomically disable OS system proxy and TUN virtual NIC, persist both flags as `false`, and
@@ -3667,7 +3740,7 @@ pub async fn disable_all_proxy_and_stop_core_internal(
 ) -> Result<CoreRuntimeInfoDto, String> {
     let _cfg_guard = state.config_transition_lock.lock().await;
     let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
-    stop_core_locked(app, state).await
+    stop_core_locked(app, state, true).await
 }
 
 fn format_reload_level_zh(level: ReloadLevel) -> &'static str {
@@ -3715,6 +3788,7 @@ pub async fn trigger_reload_if_running(
             force,
             verify_with_binary: true,
             allow_l3_restart: true,
+            allow_tun: is_tun_privilege_ready(state),
             extra_prepend_rules: extra_rules,
             extra_fake_ip_filters: extra_filters,
             ..DiskReloadOptions::default()
@@ -3869,7 +3943,7 @@ pub async fn apply_system_proxy_internal(
     let old_sys_proxy_enabled = old_cfg.system_proxy.enabled;
     let was_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let was_tun_active = was_core_running && old_cfg.tun.enabled;
+    let was_tun_active = was_core_running && effective_tun_enabled(state, &old_cfg);
 
     if !enabled {
         let was_enabled = old_sys_proxy_enabled;
@@ -3891,11 +3965,9 @@ pub async fn apply_system_proxy_internal(
         let latest_before_stop = state.snapshot_config();
         let now_core_running =
             state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-        if !latest_before_stop.system_proxy.enabled
-            && !latest_before_stop.tun.enabled
-            && now_core_running
-        {
-            stop_core_internal(app, state).await?;
+        let latest_eff_tun = effective_tun_enabled(state, &latest_before_stop);
+        if !latest_before_stop.system_proxy.enabled && !latest_eff_tun && now_core_running {
+            stop_core_preserving_tun_intent_internal(app, state).await?;
             state.log_app_event(
                 "info",
                 "系统代理",
@@ -3904,7 +3976,7 @@ pub async fn apply_system_proxy_internal(
             return Ok(false);
         }
 
-        let now_tun_active = now_core_running && latest_before_stop.tun.enabled;
+        let now_tun_active = now_core_running && latest_eff_tun;
         coordinate_global_preaccel_on_tun_transition(
             app,
             state,
@@ -3958,8 +4030,11 @@ pub async fn apply_system_proxy_internal(
             if let Ok(mut guard) = state.config.write() {
                 *guard = rollback.clone();
             }
-            if started_core_here && !rollback.system_proxy.enabled && !rollback.tun.enabled {
-                if let Err(stop_err) = stop_core_internal(app, state).await {
+            if started_core_here
+                && !rollback.system_proxy.enabled
+                && !effective_tun_enabled(state, &rollback)
+            {
+                if let Err(stop_err) = stop_core_preserving_tun_intent_internal(app, state).await {
                     tracing::warn!("保存系统代理配置失败回滚后停止新拉起核心异常：{stop_err}");
                 }
             }
@@ -4006,8 +4081,11 @@ pub async fn apply_system_proxy_internal(
         Ok(false) => {
             // Concurrent stop_core or shutdown disabled system proxy while we were enabling.
             let latest = state.snapshot_config();
-            if started_core_here && !latest.system_proxy.enabled && !latest.tun.enabled {
-                if let Err(stop_err) = stop_core_internal(app, state).await {
+            if started_core_here
+                && !latest.system_proxy.enabled
+                && !effective_tun_enabled(state, &latest)
+            {
+                if let Err(stop_err) = stop_core_preserving_tun_intent_internal(app, state).await {
                     tracing::warn!("系统代理取消后停止新拉起核心异常：{stop_err}");
                 }
             }
@@ -4023,9 +4101,12 @@ pub async fn apply_system_proxy_internal(
             if let Ok(mut guard) = state.config.write() {
                 *guard = rollback.clone();
             }
-            if started_core_here && !rollback.system_proxy.enabled && !rollback.tun.enabled {
+            if started_core_here
+                && !rollback.system_proxy.enabled
+                && !effective_tun_enabled(state, &rollback)
+            {
                 // Lock order: already holding outer `config_transition_lock` -> inner `core_lifecycle_lock`.
-                if let Err(stop_err) = stop_core_internal(app, state).await {
+                if let Err(stop_err) = stop_core_preserving_tun_intent_internal(app, state).await {
                     tracing::warn!("写入操作系统代理失败回滚后停止新拉起核心异常：{stop_err}");
                 }
             }
@@ -4044,7 +4125,7 @@ pub async fn apply_system_proxy_internal(
     let latest_cfg = state.snapshot_config();
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let now_tun_active = now_core_running && latest_cfg.tun.enabled;
+    let now_tun_active = now_core_running && effective_tun_enabled(state, &latest_cfg);
     coordinate_global_preaccel_on_tun_transition(
         app,
         state,
@@ -5107,7 +5188,7 @@ fn schedule_global_to_rule_heap_reclaim(app: &AppHandle, expected_gen: u64) {
             gen_matches: st.config_generation() == expected_gen,
             is_rule_mode: cfg.proxy_mode == ProxyMode::Rule,
             core_running,
-            tun_enabled: cfg.tun.enabled,
+            tun_enabled: effective_tun_enabled(&st, &cfg),
             active_connections,
             high_throughput,
             probing_active: st.probe_running.load(Ordering::SeqCst),
@@ -5177,11 +5258,14 @@ where
         normalize_ui_language(&next.personalization.language).to_string()
     };
 
+    let tun_ready = is_tun_privilege_ready(state);
+    let old_eff_tun = old.tun.enabled && tun_ready;
+    let next_eff_tun = next.tun.enabled && tun_ready;
     let was_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let was_tun_active = was_core_running && old.tun.enabled;
+    let was_tun_active = was_core_running && old_eff_tun;
 
-    if !old.tun.enabled && next.tun.enabled && !is_tun_privilege_ready(state) {
+    if !old.tun.enabled && next.tun.enabled && !tun_ready {
         return Err(tun_needs_admin_error_message());
     }
 
@@ -5193,11 +5277,11 @@ where
         }
     }
 
-    let disabling_all_proxy = (old.system_proxy.enabled || old.tun.enabled)
+    let disabling_all_proxy = (old.system_proxy.enabled || old_eff_tun)
         && !next.system_proxy.enabled
-        && !next.tun.enabled;
+        && !next_eff_tun;
 
-    if old.tun.enabled && !next.tun.enabled && state.adapter.has_live_controller().await {
+    if old_eff_tun && !next.tun.enabled && state.adapter.has_live_controller().await {
         let _ = state.adapter.disable_tun_gracefully().await;
     }
 
@@ -5207,20 +5291,25 @@ where
     }
 
     let needs_core_boot = ((!old.system_proxy.enabled && next.system_proxy.enabled)
-        || (!old.tun.enabled && next.tun.enabled))
+        || (!old_eff_tun && next_eff_tun))
         && !state.adapter.has_live_controller().await;
 
     let latest_before_stop = state.snapshot_config();
+    let latest_eff_tun = effective_tun_enabled(state, &latest_before_stop);
     if disabling_all_proxy
         && was_core_running
         && !latest_before_stop.system_proxy.enabled
-        && !latest_before_stop.tun.enabled
+        && !latest_eff_tun
     {
         // Clear OS proxy before stopping main core so host internet is never blackholed.
         if old.system_proxy.enabled {
             let _ = clear_system_proxy_if_owned_with_hint(state, true);
         }
-        stop_core_internal(app, state).await?;
+        if next.tun.enabled {
+            stop_core_preserving_tun_intent_internal(app, state).await?;
+        } else {
+            stop_core_internal(app, state).await?;
+        }
         if old.preaccel.enabled && !next.preaccel.enabled && state.global_preaccel.status().running
         {
             let _ = state.global_preaccel.stop().await;
@@ -5277,9 +5366,9 @@ where
             if let Ok(mut guard) = state.config.write() {
                 *guard = old.clone();
             }
-            if started_core_here && !old.system_proxy.enabled && !old.tun.enabled {
+            if started_core_here && !old.system_proxy.enabled && !old_eff_tun {
                 // Lock order: already holding outer `config_transition_lock` -> inner `core_lifecycle_lock`.
-                if let Err(stop_err) = stop_core_internal(app, state).await {
+                if let Err(stop_err) = stop_core_preserving_tun_intent_internal(app, state).await {
                     tracing::warn!("配置切换写入系统代理失败回滚后停止新拉起核心异常：{stop_err}");
                 }
             }
@@ -5292,7 +5381,7 @@ where
 
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let now_tun_active = now_core_running && next.tun.enabled;
+    let now_tun_active = now_core_running && effective_tun_enabled(state, &next);
     let relay_selection_changed = old.preaccel.active_relay_id != next.preaccel.active_relay_id;
     let windivert_policy_changed = old.preaccel.skip_443_native != next.preaccel.skip_443_native
         || old.preaccel.probe_url != next.preaccel.probe_url
@@ -5494,10 +5583,13 @@ async fn restart_core_locked(
             // so ProxyGuard cannot race back to `ProxyEnable=1` and host internet is never blackholed.
             let mut cfg = state.snapshot_config();
             let was_sys_proxy_enabled = cfg.system_proxy.enabled;
-            let flags_changed = cfg.system_proxy.enabled || cfg.tun.enabled;
+            let clear_tun = effective_tun_enabled(state, &cfg);
+            let flags_changed = cfg.system_proxy.enabled || clear_tun;
             if flags_changed {
                 cfg.system_proxy.enabled = false;
-                cfg.tun.enabled = false;
+                if clear_tun {
+                    cfg.tun.enabled = false;
+                }
                 if let Ok(mut guard) = state.config.write() {
                     *guard = cfg.clone();
                 }
@@ -5556,6 +5648,7 @@ pub async fn reload_core_config(
                 force,
                 verify_with_binary: true,
                 allow_l3_restart: false,
+                allow_tun: is_tun_privilege_ready(&state),
                 ..DiskReloadOptions::default()
             })
             .await
@@ -5646,7 +5739,7 @@ pub async fn set_tun_enabled_internal(
     let old_tun_enabled = old_cfg.tun.enabled;
     let was_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let was_tun_active = was_core_running && old_tun_enabled;
+    let was_tun_active = was_core_running && effective_tun_enabled(state, &old_cfg);
 
     if enabled {
         if !is_tun_privilege_ready(state) {
@@ -5730,7 +5823,7 @@ pub async fn set_tun_enabled_internal(
         let latest_cfg = state.snapshot_config();
         let now_core_running =
             state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-        let now_tun_active = now_core_running && latest_cfg.tun.enabled;
+        let now_tun_active = now_core_running && effective_tun_enabled(state, &latest_cfg);
         coordinate_global_preaccel_on_tun_transition(
             app,
             state,
@@ -5755,8 +5848,8 @@ pub async fn set_tun_enabled_internal(
         return Ok(true);
     }
 
-    // Disabling TUN: gracefully release Wintun adapter & OS routes first, then save.
-    if state.adapter.has_live_controller().await {
+    // Disabling TUN: gracefully release Wintun adapter & OS routes first (only if actually active), then save.
+    if was_tun_active && state.adapter.has_live_controller().await {
         let _ = state.adapter.disable_tun_gracefully().await;
     }
 
@@ -5797,22 +5890,24 @@ pub async fn set_tun_enabled_internal(
         return Ok(false);
     }
 
-    if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
-        if outcome.rejected {
-            let detail = outcome
-                .error
-                .as_deref()
-                .map(format_mihomo_error_for_user)
-                .unwrap_or_else(|| "关闭虚拟网卡时重载核心失败".to_string());
-            state.log_app_event("error", "虚拟网卡", &format!("关闭虚拟网卡重载失败：{detail}"));
-            return Err(detail);
+    if was_tun_active {
+        if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
+            if outcome.rejected {
+                let detail = outcome
+                    .error
+                    .as_deref()
+                    .map(format_mihomo_error_for_user)
+                    .unwrap_or_else(|| "关闭虚拟网卡时重载核心失败".to_string());
+                state.log_app_event("error", "虚拟网卡", &format!("关闭虚拟网卡重载失败：{detail}"));
+                return Err(detail);
+            }
         }
     }
 
     let latest_cfg = state.snapshot_config();
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let now_tun_active = now_core_running && latest_cfg.tun.enabled;
+    let now_tun_active = now_core_running && effective_tun_enabled(state, &latest_cfg);
     coordinate_global_preaccel_on_tun_transition(
         app,
         state,
@@ -6036,8 +6131,8 @@ async fn relaunch_self_with_elevation_flags(
                 .await;
             }
             let cfg = st.snapshot_config();
-            let may_have_tun =
-                cfg.tun.enabled || cfg.rules_override.override_mode != OverrideMode::Disabled;
+            let may_have_tun = effective_tun_enabled(&st, &cfg)
+                || cfg.rules_override.override_mode != OverrideMode::Disabled;
             if may_have_tun && st.adapter.has_live_controller().await {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(1200),
@@ -9076,7 +9171,7 @@ fn maybe_spawn_auto_windivert_download(app: &AppHandle, state: &AppState, cfg: &
                         let latest_rt = st.snapshot_runtime();
                         let tun_active = (latest_rt.running
                             || st.adapter.has_live_controller().await)
-                            && latest_cfg.tun.enabled;
+                            && effective_tun_enabled(&st, &latest_cfg);
                         if !st.shutting_down.load(Ordering::SeqCst)
                             && latest_cfg.preaccel.enabled
                             && !tun_active
@@ -9225,8 +9320,9 @@ pub async fn toggle_preaccel_internal(
     let mut cfg = old_cfg.clone();
     let core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let proxy_active = is_proxy_takeover_active(core_running, &cfg);
-    let tun_active = core_running && cfg.tun.enabled;
+    let tun_ready = is_tun_privilege_ready(state);
+    let proxy_active = is_proxy_takeover_active(core_running, &cfg, tun_ready);
+    let tun_active = core_running && cfg.tun.enabled && tun_ready;
 
     if enabled {
         cfg.preaccel.sync_unified_enabled(true);
@@ -9443,7 +9539,7 @@ pub async fn update_global_preaccel_settings(
     let was_running = state.global_preaccel.status().running;
     let core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
-    let tun_active = core_running && cfg.tun.enabled;
+    let tun_active = core_running && effective_tun_enabled(&state, &cfg);
     let status = if was_running && cfg.preaccel.enabled && !tun_active {
         let relays = load_enabled_preaccel_relays(&state)?;
         if relays.is_empty() {
@@ -9572,7 +9668,7 @@ pub async fn install_windivert_driver(
             let latest_cfg = state.snapshot_config();
             let latest_rt = state.snapshot_runtime();
             let tun_active = (latest_rt.running || state.adapter.has_live_controller().await)
-                && latest_cfg.tun.enabled;
+                && effective_tun_enabled(&state, &latest_cfg);
             let current = state.snapshot_global_preaccel();
             if !state.shutting_down.load(Ordering::SeqCst)
                 && latest_cfg.preaccel.enabled
@@ -9683,7 +9779,7 @@ pub async fn verify_global_preaccel(
     let cfg = state.snapshot_config();
     let rt = state.snapshot_runtime();
     let core_running = rt.running || state.adapter.has_live_controller().await;
-    let tun_active = core_running && cfg.tun.enabled;
+    let tun_active = core_running && effective_tun_enabled(&state, &cfg);
     if !cfg.preaccel.enabled || tun_active {
         return Ok(state.snapshot_global_preaccel());
     }
@@ -12183,6 +12279,7 @@ fn build_github_issue_draft(
     app_version: &str,
     os_label: &str,
     is_elevated: bool,
+    tun_privilege_ready: bool,
     is_portable: bool,
     cfg: &AppConfig,
     rt: &CoreRuntimeStatus,
@@ -12221,7 +12318,30 @@ fn build_github_issue_draft(
         (None, _) => "[反馈] 猫猫云梯使用问题反馈".to_string(),
     };
 
-    let tun_active = rt.running && cfg.tun.enabled;
+    let eff_tun = cfg.tun.enabled && tun_privilege_ready;
+    let tun_need_elev = cfg.tun.enabled && !tun_privilege_ready;
+    let tun_active = rt.running && eff_tun;
+    let tun_display_zh = if eff_tun {
+        "true"
+    } else if tun_need_elev {
+        "false (已勾选但需管理员权限)"
+    } else {
+        "false"
+    };
+    let tun_display_en = if eff_tun {
+        "true"
+    } else if tun_need_elev {
+        "false (configured, needs_elevation)"
+    } else {
+        "false"
+    };
+    let tun_url_flag = if eff_tun {
+        "true"
+    } else if tun_need_elev {
+        "needs_elevation"
+    } else {
+        "false"
+    };
     let preaccel_state = if !cfg.preaccel.enabled && !global_status.running {
         "off"
     } else if global_status.is_windivert_active {
@@ -12288,7 +12408,7 @@ fn build_github_issue_draft(
             cfg.proxy_mode.as_str(),
             cfg.route_mode.as_str(),
             cfg.system_proxy.enabled,
-            cfg.tun.enabled,
+            tun_display_zh,
             cfg.tun.stack_mode.as_str(),
             cfg.preaccel.enabled,
             global_status.verify_state,
@@ -12323,7 +12443,7 @@ fn build_github_issue_draft(
             cfg.proxy_mode.as_str(),
             cfg.route_mode.as_str(),
             cfg.system_proxy.enabled,
-            cfg.tun.enabled,
+            tun_display_en,
             cfg.tun.stack_mode.as_str(),
             cfg.preaccel.enabled,
             global_status.verify_state,
@@ -12346,7 +12466,7 @@ fn build_github_issue_draft(
         let env_line = format!(
             "Env: CatCloud v{app_version} | {os_label} | mode={} | core={core_state} | tun={} | preaccel={preaccel_state}",
             cfg.proxy_mode.as_str(),
-            cfg.tun.enabled,
+            tun_url_flag,
         );
         if is_zh {
             format!(
@@ -12463,11 +12583,13 @@ pub async fn build_github_issue_url(
         merge_diagnostic_key_events(ring_events, &merged_logs, GITHUB_ISSUE_KEY_EVENTS_LIMIT);
 
     let os_label = format!("{} {}", caps.os, caps.arch);
+    let tun_privilege_ready = is_tun_privilege_ready(&state);
     Ok(build_github_issue_draft(
         &cfg.update.repo,
         env!("CARGO_PKG_VERSION"),
         &os_label,
         caps.is_elevated,
+        tun_privilege_ready,
         state.paths.is_portable,
         &cfg,
         &rt,
@@ -13140,7 +13262,19 @@ fn build_ai_diagnostics_markdown(
     } else {
         "关闭"
     };
-    let tun_label = if cfg.tun.enabled { "已开启" } else { "关闭" };
+    let eff_tun = runtime_dto
+        .map(|d| d.tun_enabled)
+        .unwrap_or(cfg.tun.enabled && is_elevated);
+    let tun_need_elev = runtime_dto
+        .map(|d| d.tun_needs_elevation)
+        .unwrap_or(cfg.tun.enabled && !is_elevated);
+    let tun_label = if eff_tun {
+        "已开启"
+    } else if tun_need_elev {
+        "未生效（已勾选但需管理员权限）"
+    } else {
+        "关闭"
+    };
     let tun_stack_label = cfg.tun.stack_mode.as_str();
     let mem_tier_label = format_memory_tier_label(&cfg.core_runtime.memory_tier);
     let gogc_val = cfg.core_runtime.gogc;
@@ -13164,7 +13298,7 @@ fn build_ai_diagnostics_markdown(
     } else {
         "否"
     };
-    let tun_active = rt.running && cfg.tun.enabled;
+    let tun_active = rt.running && eff_tun;
     let global_preaccel_brief =
         format_global_preaccel_brief(global_status, cfg.preaccel.enabled, tun_active);
     let ipv6_core_label = if cfg.core_ipv6 { "开启" } else { "关闭" };
@@ -13428,8 +13562,16 @@ fn build_ai_onboarding_prompt_markdown(
     } else {
         "未开启"
     };
-    let tun_zh = if cfg.tun.enabled {
+    let eff_tun = runtime_dto
+        .map(|d| d.tun_enabled)
+        .unwrap_or(cfg.tun.enabled && is_elevated);
+    let tun_need_elev = runtime_dto
+        .map(|d| d.tun_needs_elevation)
+        .unwrap_or(cfg.tun.enabled && !is_elevated);
+    let tun_zh = if eff_tun {
         "已开启"
+    } else if tun_need_elev {
+        "未生效（需管理员权限）"
     } else {
         "未开启"
     };
@@ -13441,7 +13583,7 @@ fn build_ai_onboarding_prompt_markdown(
     let preaccel_brief = format_onboarding_preaccel_plain_zh(
         global_status,
         cfg.preaccel.enabled,
-        cfg.tun.enabled,
+        eff_tun,
         rt.running,
     );
     let security_guidance_line = global_status
@@ -13574,7 +13716,19 @@ fn build_web_ai_realtime_snapshot_section(
         } else {
             "未开启"
         };
-        let tun_zh = if cfg.tun.enabled { "已开启" } else { "未开启" };
+        let eff_tun = runtime_dto
+            .map(|d| d.tun_enabled)
+            .unwrap_or(cfg.tun.enabled && is_elevated);
+        let tun_need_elev = runtime_dto
+            .map(|d| d.tun_needs_elevation)
+            .unwrap_or(cfg.tun.enabled && !is_elevated);
+        let tun_zh = if eff_tun {
+            "已开启"
+        } else if tun_need_elev {
+            "未生效（需管理员权限）"
+        } else {
+            "未开启"
+        };
         let admin_zh = if is_elevated {
             "已是管理员权限"
         } else {
@@ -13583,7 +13737,7 @@ fn build_web_ai_realtime_snapshot_section(
         let preaccel_brief = format_onboarding_preaccel_plain_zh(
             global_status,
             cfg.preaccel.enabled,
-            cfg.tun.enabled,
+            eff_tun,
             rt.running,
         );
         let filtered_events =
@@ -13635,7 +13789,20 @@ fn build_web_ai_realtime_snapshot_section(
             events_sanitized.join("\n")
         };
         let err_text = clean_err.unwrap_or_else(|| "none".to_string());
-        let tun_active = rt.running && cfg.tun.enabled;
+        let eff_tun = runtime_dto
+            .map(|d| d.tun_enabled)
+            .unwrap_or(cfg.tun.enabled && is_elevated);
+        let tun_need_elev = runtime_dto
+            .map(|d| d.tun_needs_elevation)
+            .unwrap_or(cfg.tun.enabled && !is_elevated);
+        let tun_active = rt.running && eff_tun;
+        let tun_en = if eff_tun {
+            "true"
+        } else if tun_need_elev {
+            "false (needs_elevation)"
+        } else {
+            "false"
+        };
         let preaccel_brief =
             format_global_preaccel_brief(global_status, cfg.preaccel.enabled, tun_active);
         let (heading, ask_line) = match norm_lang {
@@ -13672,7 +13839,7 @@ fn build_web_ai_realtime_snapshot_section(
             rt.running,
             cfg.proxy_mode.as_str(),
             cfg.system_proxy.enabled,
-            cfg.tun.enabled,
+            tun_en,
         )
     }
 }
@@ -13913,6 +14080,14 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         &data_dir_display,
     );
 
+    let eff_tun = runtime_dto
+        .as_ref()
+        .map(|d| d.tun_enabled)
+        .unwrap_or(effective_tun_enabled(state, &cfg));
+    let tun_need_elev = runtime_dto
+        .as_ref()
+        .map(|d| d.tun_needs_elevation)
+        .unwrap_or(tun_needs_elevation(state, &cfg));
     Ok(serde_json::json!({
         "app_version": env!("CARGO_PKG_VERSION"),
         "os": caps.os,
@@ -13930,7 +14105,9 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         "dns_listen_port": if rt.running { rt.dns_listen_port } else { cfg.dns_listen_port },
         "core_ipv6": cfg.core_ipv6,
         "dns_ipv6": cfg.dns.ipv6,
-        "tun_enabled": cfg.tun.enabled,
+        "tun_enabled": eff_tun,
+        "tun_configured": cfg.tun.enabled,
+        "tun_needs_elevation": tun_need_elev,
         "tun_stack": cfg.tun.stack_mode,
         "preaccel_enabled": cfg.preaccel.enabled,
         "skip_443_native": cfg.preaccel.skip_443_native,
@@ -13946,7 +14123,9 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
             "active_node_name": active_node_name,
             "active_node_region": active_node_region,
             "system_proxy_enabled": cfg.system_proxy.enabled,
-            "tun_enabled": cfg.tun.enabled,
+            "tun_enabled": eff_tun,
+            "tun_configured": cfg.tun.enabled,
+            "tun_needs_elevation": tun_need_elev,
             "preaccel_active": cfg.preaccel.enabled,
             "preaccel_relay_name": preaccel_relay_name,
             "domestic_direct_enabled": cfg.rules_override.domestic_direct_enabled,
@@ -16902,23 +17081,26 @@ mod tests {
         cfg.tun.enabled = false;
 
         // Idle core (running without system proxy or TUN) must NOT count as active proxy takeover.
-        assert!(!is_proxy_takeover_active(false, &cfg));
-        assert!(!is_proxy_takeover_active(true, &cfg));
+        assert!(!is_proxy_takeover_active(false, &cfg, true));
+        assert!(!is_proxy_takeover_active(true, &cfg, true));
 
-        // System proxy enabled -> active only while core is running.
+        // System proxy enabled -> active only while core is running (regardless of TUN privilege).
         cfg.system_proxy.enabled = true;
-        assert!(!is_proxy_takeover_active(false, &cfg));
-        assert!(is_proxy_takeover_active(true, &cfg));
+        assert!(!is_proxy_takeover_active(false, &cfg, false));
+        assert!(is_proxy_takeover_active(true, &cfg, false));
+        assert!(is_proxy_takeover_active(true, &cfg, true));
 
-        // TUN enabled -> active only while core is running.
+        // TUN enabled -> active ONLY when core is running AND TUN privileges are satisfied.
         cfg.system_proxy.enabled = false;
         cfg.tun.enabled = true;
-        assert!(!is_proxy_takeover_active(false, &cfg));
-        assert!(is_proxy_takeover_active(true, &cfg));
+        assert!(!is_proxy_takeover_active(false, &cfg, true));
+        assert!(!is_proxy_takeover_active(true, &cfg, false));
+        assert!(is_proxy_takeover_active(true, &cfg, true));
 
-        // Both enabled -> active while core is running.
+        // Both enabled -> active while core is running even if TUN lacks privilege (via system proxy).
         cfg.system_proxy.enabled = true;
-        assert!(is_proxy_takeover_active(true, &cfg));
+        assert!(is_proxy_takeover_active(true, &cfg, false));
+        assert!(is_proxy_takeover_active(true, &cfg, true));
     }
 
     #[test]
@@ -18210,6 +18392,7 @@ mod tests {
             "0.1.0",
             "windows x86_64",
             false,
+            false,
             true,
             &cfg,
             &rt,
@@ -18315,6 +18498,7 @@ mod tests {
                 "JuryBu/CatCloud",
                 "0.1.0",
                 "windows x86_64",
+                false,
                 false,
                 true,
                 &cfg,

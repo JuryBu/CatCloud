@@ -766,4 +766,106 @@ mod tests {
         assert!(ali.id.starts_with("relay-"));
         assert_eq!(ali.name, "Aliyun-SH-Fresh");
     }
+
+    #[test]
+    fn hysteria2_and_hy2_alias_compile_and_mmrelay_v1_roundtrip() {
+        let now = DateTime::parse_from_rfc3339("2026-11-25T08:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let hy2_canonical = PreAccelRelay {
+            id: "relay-hy2-1".to_string(),
+            name: "CN-East-HY2-443".to_string(),
+            provider: "cloud-a".to_string(),
+            region: "CN-East".to_string(),
+            server: "203.0.113.44".to_string(),
+            port: 443,
+            protocol: "hysteria2".to_string(),
+            password: "demo-hy2-password-01".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: Some("2027-08-12".to_string()),
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+        let hy2_alias = PreAccelRelay {
+            id: "relay-hy2-2".to_string(),
+            name: "CN-South-HY2-443".to_string(),
+            provider: "cloud-b".to_string(),
+            region: "CN-South".to_string(),
+            server: "198.51.100.44".to_string(),
+            port: 443,
+            protocol: "hy2".to_string(),
+            password: "demo-hy2-password-02".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 20,
+            expires_at: Some("2027-08-12".to_string()),
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+
+        assert!(validate_relay_strict_at(&hy2_canonical, now).is_ok());
+        assert!(validate_relay_strict_at(&hy2_alias, now).is_ok());
+
+        // Domestic :443 Hysteria2 must still reject unfiled third-party SNI.
+        let mut hy2_bad_sni = hy2_canonical.clone();
+        hy2_bad_sni.sni = Some("forbidden.example.com".to_string());
+        let bad_issues = validate_relay_at(&hy2_bad_sni, now);
+        assert!(bad_issues.iter().any(|i| {
+            i.code == RelayValidationCode::ForbiddenSniOnDomestic443
+                && i.field == "sni"
+                && i.severity == RelayValidationSeverity::Error
+        }));
+
+        // Compile both `hysteria2` and `hy2` alias to Mihomo YAML with conservative Brutal limits.
+        for (relay, name) in [
+            (&hy2_canonical, "CN-East-HY2-443"),
+            (&hy2_alias, "CN-South-HY2-443"),
+        ] {
+            let yaml = compile_relay_to_mihomo_yaml(relay, name).expect("compile hy2 relay");
+            assert_eq!(yaml.get("type").and_then(Value::as_str), Some("hysteria2"));
+            assert_eq!(yaml.get("port").and_then(Value::as_u64), Some(443));
+            assert_eq!(
+                yaml.get("password").and_then(Value::as_str),
+                Some(relay.password.as_str())
+            );
+            assert_eq!(yaml.get("up").and_then(Value::as_str), Some("100 Mbps"));
+            assert_eq!(yaml.get("down").and_then(Value::as_str), Some("200 Mbps"));
+            assert_eq!(yaml.get("skip-cert-verify").and_then(Value::as_bool), Some(true));
+            assert!(yaml.get("sni").is_none());
+        }
+
+        // mmrelay/v1 JSON & URI roundtrip preserves both entries verbatim.
+        let bundle = bundle_from_relays(vec![hy2_canonical.clone(), hy2_alias.clone()]);
+        let uri = encode_mmrelay_uri(&bundle).expect("encode hy2 mmrelay URI");
+        let decoded = decode_mmrelay_uri(&uri).expect("decode hy2 mmrelay URI");
+        assert_eq!(decoded, bundle);
+
+        // Full compile plan wires fallback + pure-IP anti-loop rules cleanly.
+        let mut cfg = PreAccelConfig::default();
+        cfg.enabled = true;
+        let nodes = vec![sample_node("n-hy2-chain", "edge.example.invalid", 8443, false, None)];
+        let plan = build_preaccel_compile_plan(&cfg, &decoded.relays, &nodes)
+            .expect("compile hy2 preaccel plan");
+        assert!(plan.active);
+        assert_eq!(plan.relay_proxies.len(), 2);
+        assert_eq!(plan.relay_proxies[0]["type"].as_str(), Some("hysteria2"));
+        assert_eq!(plan.relay_proxies[0]["up"].as_str(), Some("100 Mbps"));
+        assert_eq!(plan.relay_proxies[0]["down"].as_str(), Some("200 Mbps"));
+        assert_eq!(plan.relay_proxies[1]["type"].as_str(), Some("hysteria2"));
+        assert!(plan
+            .anti_loop_rules
+            .contains(&"IP-CIDR,203.0.113.44/32,DIRECT,no-resolve".to_string()));
+        assert!(plan
+            .anti_loop_rules
+            .contains(&"IP-CIDR,198.51.100.44/32,DIRECT,no-resolve".to_string()));
+    }
 }

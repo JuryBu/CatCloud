@@ -142,11 +142,13 @@ const ZH_DOC_00_TROUBLESHOOTING: &str = r###"> 【语言锁定】请全程使用
 
 ### 第 3 层：猫猫云梯核心、端口与虚拟网卡（TUN 模式）
 - 浏览器正常但终端/游戏/桌面软件不通：去「总览」开启「虚拟网卡（TUN 模式）」（Windows 首次开启需点 UAC 管理员确认）。
+- Windows 普通权限启动后虚拟网卡未生效：若之前开过虚拟网卡但本次以普通用户启动，界面会显示「虚拟网卡 · 需管理员」（此时仅系统代理生效，桌面软件/终端可能超时而浏览器正常）；点击「虚拟网卡 · 需管理员」按提示一键以管理员权限重启即可生效，或先选「暂不开网卡」切回纯系统代理。
 - 端口被占导致启动失败：在「设置 → 网络与 DNS」确认已开启端口冲突自动顺延，或改换高位端口后在「总览」关开一次代理开关触发完整重载。
 - 检查命令：`catcloud status --json`、`catcloud config validate --json`。
 
 ### 第 4 层：分流规则、DNS 与 QUIC 策略
 - 国内网站走代理变慢：确认「分流与连接」已开启国内直连且已下载 `Country.mmdb` / `geosite.dat`（在「设置」可一键刷新地区数据库）。
+- 高校校园网 / 企业内网直连或节点域名解析超时：部分内网防火墙屏蔽外网明文 UDP 53；猫猫云梯已默认升级为纯 IP DoH 443（`223.5.5.5` / `1.12.12.12`），并通过 `nameserver-policy` 为 `+.edu.cn` / 内网后缀与校园直连域名保留 `system` 本地解析。若你曾手动填写明文 53 地址，请在「设置 → 网络与 DNS」改回纯 IP DoH 443。
 - QQ / 微信 / 国内应用传图或语音卡顿：猫猫云梯已在海外 QUIC 拦截规则前自动放行国内 QUIC，并将常用腾讯/QQ 域名加入 Fake-IP 跳过列表；若异常请检查自定义前置规则是否误拦 UDP 443。
 - 检查命令：`catcloud net match <域名> --json`、`catcloud net connections --json`。
 
@@ -312,6 +314,8 @@ const ZH_DOC_02_PREACCEL: &str = r###"> 【语言锁定】请全程使用简体�
 
 ### 2. 云厂商控制台防火墙 / 安全组（最常见踩坑点！）
 - 登录云厂商控制台 → 找到实例的**防火墙 / 安全组** → 添加入站放行规则：**协议 TCP，端口 `443`，来源 `0.0.0.0/0`**（未放行 TCP 443 时服务端跑起来客户端也连不上）。
+- 如需在同一台服务器上并行部署 **Hysteria2（UDP 443）** 与 `AnyTLS（TCP 443）` 双协议共存（互不冲突、共享同一份纯 IP 自签证书），请同步放行入站 **协议 UDP，端口 `443`，来源 `0.0.0.0/0`**。
+- `mmrelay/v1` 的 `protocol` 支持 `anytls` / `hysteria2`（别名 `hy2`）/ `trojan` / `vless`；选择 `hysteria2` 时同样须遵守纯 IP `:443` + 空 `sni` + `skip_cert_verify: true`，客户端编译会自动附带保守带宽提示（`up: 100 Mbps` / `down: 200 Mbps`）防止校园网拥塞抖动。
 
 ### 3. 三条硬红线（绝不能违背）
 1. **SNI 必须严格留空（`sni: ""` / VLESS `servername: ""`）**：国内云机房网关会直接阻断 TCP 443 上未备案的第三方域名 SNI！必须使用**纯 IP 自签 ECDSA 证书 + 空 SNI + `skip_cert_verify: true`**（只跳过到自己中转机的证书校验，不影响访问海外 HTTPS 网站的端到端加密）。
@@ -703,8 +707,8 @@ const EN_DOC_00_TROUBLESHOOTING: &str = r###"> [LANGUAGE LOCK] Reply strictly in
 ## 1. 6-Layer Bottom-Up Diagnostic Order
 1. **Layer 1 — Physical Network & Captive Portal**: Confirm direct domestic sites load with proxy off. On campus/hotel Wi-Fi returning HTTP 302 login portals, authenticate first (`catcloud preaccel test --campus --json`).
 2. **Layer 2 — Conflicting Proxy Apps & Residual Services**: Check for other running proxy clients, leftover system proxy entries, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env vars, or security software blocking core/driver binaries (`catcloud net doctor --json`).
-3. **Layer 3 — CatCloud Core, Ports & TUN Mode**: If browsers work but terminals/IDEs/games fail, enable **TUN Mode** on **Overview** (requires admin elevation on Windows). Check port auto-shift in **Settings → Network & DNS**, and verify config with `catcloud status --json` and `catcloud config validate --json`.
-4. **Layer 4 — Routing Rules, DNS & QUIC Policy**: Ensure domestic direct routing and `Country.mmdb` are present (**Rules & Conns** / **Settings → Network & DNS**). CatCloud allows domestic QUIC (UDP 443) before overseas QUIC blocking and bypasses Fake-IP for major domestic IM domains. Inspect with `catcloud net match <domain> --json` and `catcloud net connections --json`.
+3. **Layer 3 — CatCloud Core, Ports & TUN Mode**: If browsers work but terminals/IDEs/games fail, enable **TUN Mode** on **Overview** (requires admin elevation on Windows). If CatCloud was started without Windows elevation while TUN was configured, the UI honestly shows **TUN · Admin Required** (only System Proxy is active, so browsers work while desktop apps/terminals may time out); click it for one-click admin relaunch, or choose to turn TUN off. Check port auto-shift in **Settings → Network & DNS**, and verify config with `catcloud status --json` and `catcloud config validate --json`.
+4. **Layer 4 — Routing Rules, DNS & QUIC Policy**: Ensure domestic direct routing and `Country.mmdb` are present (**Rules & Conns** / **Settings → Network & DNS**). On campus/enterprise networks blocking outbound plaintext UDP 53, direct or proxy-node DNS can time out; CatCloud now defaults to pure-IP DoH 443 (`223.5.5.5` / `1.12.12.12`) while keeping `system` resolution in `nameserver-policy` for `+.edu.cn`/LAN suffixes and configured campus direct domains—switch back to pure-IP DoH 443 if you manually set plaintext UDP 53. CatCloud allows domestic QUIC (UDP 443) before overseas QUIC blocking and bypasses Fake-IP for major domestic IM domains. Inspect with `catcloud net match <domain> --json` and `catcloud net connections --json`.
 5. **Layer 5 — Domestic Boost**: Verify relay expiry, cloud firewall TCP 443 inbound allow rule, strictly EMPTY `sni`, domestic 204 health probe, real relay speeds, and standalone global tunnel status (`catcloud preaccel pool --json`, `catcloud preaccel test --json`, `catcloud preaccel test --speed --json`, `catcloud preaccel global-status --json`). Quick rollback: `catcloud preaccel bind --enabled false --json && catcloud config reload --json`.
 6. **Layer 6 — Overseas Nodes, Subscriptions & AI Unlock**: Run **Lite Test (L1)** on **Nodes & Speed** to check Google region cleanliness & AI unlocks, plus **60s Keep-Alive** for silent blackholes; use sticky mode in **Smart Groups**.
 
@@ -809,7 +813,7 @@ const EN_DOC_02_PREACCEL: &str = r###"> [LANGUAGE LOCK] Reply strictly in Englis
 
 ## 3. Route B — Self-Hosting a Domestic Pure-IP :443 Relay
 1. **Pick a nearby domestic lightweight cloud server** with `>= 30 Mbps` peak bandwidth and sufficient monthly traffic (optionally 2 instances with `priority: 10` and `20` for active-standby failover).
-2. **Open TCP `443` inbound** in the cloud provider's Firewall / Security Group.
+2. **Open TCP `443` inbound** in the cloud provider's Firewall / Security Group; to co-host **AnyTLS (TCP 443) + Hysteria2 (UDP 443)** on the same relay (sharing the same pure-IP self-signed cert with zero port conflict), also allow **UDP `443`** inbound. `mmrelay/v1` `protocol` supports `anytls`, `hysteria2` (alias `hy2`), `trojan`, and `vless` (pure-IP `:443`, empty `sni`, `skip_cert_verify: true`; CatCloud compiles `hysteria2` with conservative `up: "100 Mbps"` / `down: "200 Mbps"` limits to prevent campus Brutal congestion jitter).
 3. **Hard Compliance & Stability Rules**:
    - Keep `sni` (and VLESS `servername`) **strictly empty (`""`)** with a self-signed IP-SAN ECDSA certificate and `skip_cert_verify: true`; unfiled third-party SNIs on domestic `:443` are blocked by cloud gateways.
    - Keep health probes domestic (`http://connectivitycheck.platform.hicloud.com/generate_204` or `http://connect.rom.miui.com/generate_204`); overseas `gstatic` URLs are rejected.
@@ -1303,7 +1307,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
                 "AI 传图、推代码或校园网高位端口频繁卡顿断流时；日常上传已很快则保持关闭。",
             ]),
             external_prereqs_and_schema: svec(&[
-                "国内轻量云服务器放行安全组入站 TCP 443，监听 AnyTLS / Trojan / VLESS 并使用纯 IP 自签 ECDSA 证书。",
+                "国内轻量云服务器放行安全组入站 TCP 443（并挂 Hysteria2 需同时放行 UDP 443），监听 AnyTLS / Hysteria2 / Trojan / VLESS 并使用纯 IP 自签 ECDSA 证书。",
                 "硬红线：sni / servername 严格留空（\"\"）+ skip_cert_verify: true；健康探针必须保持国内 204（hicloud.com / miui.com）。",
             ]),
             gui_and_cli_verification: svec(&[

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Current configuration schema version.
-pub const CONFIG_SCHEMA_VERSION: u32 = 2;
+pub const CONFIG_SCHEMA_VERSION: u32 = 3;
 
 /// Supported UI localization codes (Simplified Chinese authoritative default).
 pub const SUPPORTED_UI_LANGUAGES: &[&str] = &["zh-CN", "en", "ja", "ru"];
@@ -329,7 +329,10 @@ impl Default for TunConfig {
 }
 
 fn default_direct_nameserver() -> Vec<String> {
-    vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()]
+    vec![
+        "https://223.5.5.5/dns-query".to_string(),
+        "https://1.12.12.12/dns-query".to_string(),
+    ]
 }
 
 fn default_true_bool() -> bool {
@@ -452,7 +455,10 @@ impl Default for DnsConfig {
                 "connectivitycheck.platform.hicloud.com".to_string(),
                 "connect.rom.miui.com".to_string(),
             ],
-            default_nameserver: vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()],
+            default_nameserver: vec![
+                "https://223.5.5.5/dns-query".to_string(),
+                "https://1.12.12.12/dns-query".to_string(),
+            ],
             direct_nameserver: default_direct_nameserver(),
             nameserver_policy: BTreeMap::new(),
             nameserver: vec![
@@ -463,7 +469,10 @@ impl Default for DnsConfig {
                 "https://1.1.1.1/dns-query".to_string(),
                 "https://8.8.8.8/dns-query".to_string(),
             ],
-            proxy_server_nameserver: vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()],
+            proxy_server_nameserver: vec![
+                "https://223.5.5.5/dns-query".to_string(),
+                "https://1.12.12.12/dns-query".to_string(),
+            ],
             fallback_filter: DnsFallbackFilter::default(),
         }
     }
@@ -1116,11 +1125,14 @@ mod tests {
         assert!(cfg.tun.auto_detect_interface);
 
         assert!(cfg.dns.respect_rules);
-        assert_eq!(cfg.dns.direct_nameserver, vec!["223.5.5.5", "119.29.29.29"]);
-        assert_eq!(
-            cfg.dns.nameserver,
-            vec!["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"]
-        );
+        let expected_doh = vec![
+            "https://223.5.5.5/dns-query",
+            "https://1.12.12.12/dns-query",
+        ];
+        assert_eq!(cfg.dns.default_nameserver, expected_doh);
+        assert_eq!(cfg.dns.direct_nameserver, expected_doh);
+        assert_eq!(cfg.dns.proxy_server_nameserver, expected_doh);
+        assert_eq!(cfg.dns.nameserver, expected_doh);
         assert_eq!(
             cfg.dns.fallback,
             vec!["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
@@ -1154,7 +1166,10 @@ mod tests {
             serde_json::from_str(r#"{"dns":{},"rules_override":{},"core_runtime":{},"preaccel":{},"behavior":{"hotkeys":{}}}"#).unwrap();
         assert_eq!(
             legacy.dns.direct_nameserver,
-            vec!["223.5.5.5", "119.29.29.29"]
+            vec![
+                "https://223.5.5.5/dns-query",
+                "https://1.12.12.12/dns-query",
+            ]
         );
         assert!(legacy.rules_override.block_quic_udp_443);
         assert!(legacy.rules_override.domestic_direct_enabled);
@@ -1255,9 +1270,9 @@ mod tests {
             Some("Alt+Shift+C")
         );
 
-        // Schema v2 default vs legacy missing schema_version field deserializing as v1.
-        assert_eq!(CONFIG_SCHEMA_VERSION, 2);
-        assert_eq!(cfg.schema_version, 2);
+        // Schema v3 default vs legacy missing schema_version field deserializing as v1.
+        assert_eq!(CONFIG_SCHEMA_VERSION, 3);
+        assert_eq!(cfg.schema_version, 3);
         assert_eq!(legacy.schema_version, 1);
     }
 

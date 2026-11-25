@@ -709,8 +709,9 @@ mod tests {
         assert!(yaml.contains("geodata-mode: false"));
         assert!(yaml.contains("enhanced-mode: redir-host"));
         assert!(yaml.contains("listen: 127.0.0.1"));
-        assert!(yaml.contains("223.5.5.5"));
-        assert!(yaml.contains("119.29.29.29"));
+        assert!(yaml.contains("https://223.5.5.5/dns-query"));
+        assert!(yaml.contains("https://1.12.12.12/dns-query"));
+        assert!(!yaml.contains("119.29.29.29"));
 
         let s5h = isolated_proxy_url(ports[1], IsolatedProxyScheme::Socks5h);
         assert!(s5h.starts_with("socks5h://127.0.0.1:"));

@@ -93,17 +93,64 @@ impl ConfigManager {
     }
 }
 
+/// Default pure-IP DoH (TCP 443) domestic resolvers safe on campus/enterprise networks
+/// that block outbound plaintext UDP 53.
+pub(crate) const DEFAULT_PURE_IP_DOH_NAMESERVERS: &[&str] = &[
+    "https://223.5.5.5/dns-query",
+    "https://1.12.12.12/dns-query",
+];
+
+const LEGACY_PLAINTEXT_DOMESTIC_DNS: &[&str] = &[
+    "223.5.5.5",
+    "119.29.29.29",
+    "223.6.6.6",
+    "223.5.5.5:53",
+    "119.29.29.29:53",
+];
+
+/// Return `true` only when `list` is non-empty and every trimmed entry belongs strictly to the
+/// legacy plaintext domestic UDP 53 default set (never matching encrypted or user-custom entries).
+pub(crate) fn is_legacy_plaintext_domestic_dns_list(list: &[String]) -> bool {
+    !list.is_empty()
+        && list.iter().all(|entry| {
+            let trimmed = entry.trim();
+            !trimmed.is_empty() && LEGACY_PLAINTEXT_DOMESTIC_DNS.contains(&trimmed)
+        })
+}
+
 /// Apply idempotent in-memory schema migrations on a loaded configuration.
 ///
-/// - Upgrades legacy `schema_version < 2` configs whose `core_runtime.gogc == 35` to `25`
-///   without ever overwriting user-customized `gogc` values or v2+ configs.
+/// - `schema_version < 2`: upgrades legacy `core_runtime.gogc == 35` to `25` without touching
+///   v2+ configs where the user manually chose `35`.
+/// - `schema_version < 3`: gently upgrades legacy plaintext domestic UDP 53 DNS lists in
+///   `default_nameserver`, `direct_nameserver`, and `proxy_server_nameserver` to pure-IP DoH 443
+///   without ever overwriting user-customized DNS entries.
 /// - Returns `true` if `schema_version` or any field was migrated.
 fn migrate_config_in_memory(cfg: &mut AppConfig) -> bool {
     let mut migrated = false;
-    if cfg.schema_version < CONFIG_SCHEMA_VERSION {
+    if cfg.schema_version < 2 {
         if cfg.core_runtime.gogc == 35 {
             cfg.core_runtime.gogc = 25;
         }
+    }
+    if cfg.schema_version < 3 {
+        let upgraded = || {
+            DEFAULT_PURE_IP_DOH_NAMESERVERS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<String>>()
+        };
+        if is_legacy_plaintext_domestic_dns_list(&cfg.dns.default_nameserver) {
+            cfg.dns.default_nameserver = upgraded();
+        }
+        if is_legacy_plaintext_domestic_dns_list(&cfg.dns.direct_nameserver) {
+            cfg.dns.direct_nameserver = upgraded();
+        }
+        if is_legacy_plaintext_domestic_dns_list(&cfg.dns.proxy_server_nameserver) {
+            cfg.dns.proxy_server_nameserver = upgraded();
+        }
+    }
+    if cfg.schema_version < CONFIG_SCHEMA_VERSION {
         cfg.schema_version = CONFIG_SCHEMA_VERSION;
         migrated = true;
     }
@@ -1014,13 +1061,16 @@ mod tests {
             "load_or_default must remain strictly read-only"
         );
 
-        // `load_or_init` atomically persists the migrated v2 config to disk.
+        // `load_or_init` atomically persists the migrated v3 config to disk.
         let loaded_init = mgr.load_or_init().expect("load_or_init legacy v1");
-        assert_eq!(loaded_init.schema_version, 2);
+        assert_eq!(loaded_init.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(loaded_init.core_runtime.gogc, 25);
         let disk_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.config_path).unwrap()).unwrap();
-        assert_eq!(disk_json["schema_version"].as_u64(), Some(2));
+        assert_eq!(
+            disk_json["schema_version"].as_u64(),
+            Some(u64::from(CONFIG_SCHEMA_VERSION))
+        );
         assert_eq!(disk_json["core_runtime"]["gogc"].as_u64(), Some(25));
 
         // 2. Legacy v1 config with user-customized gogc == 60 must NOT be overwritten.
@@ -1030,28 +1080,118 @@ mod tests {
         )
         .unwrap();
         let custom_v1 = mgr.load_or_init().expect("load_or_init custom gogc");
-        assert_eq!(custom_v1.schema_version, 2);
+        assert_eq!(custom_v1.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(custom_v1.core_runtime.gogc, 60);
 
-        // 3. Explicit v2 config where user manually chose gogc == 35 must stay 35.
+        // 3. Explicit v2 config where user manually chose gogc == 35 must stay 35 after v3 migration.
         std::fs::write(
             &paths.config_path,
             r#"{"schema_version":2,"core_runtime":{"gogc":35}}"#,
         )
         .unwrap();
         let explicit_v2 = mgr.load_or_default().expect("load v2 gogc=35");
-        assert_eq!(explicit_v2.schema_version, 2);
+        assert_eq!(explicit_v2.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(explicit_v2.core_runtime.gogc, 35);
 
-        // 4. `save()` unconditionally persists schema_version == 2.
+        // 4. `save()` unconditionally persists schema_version == CONFIG_SCHEMA_VERSION.
         let mut stale = AppConfig::default();
         stale.schema_version = 1;
         stale.core_runtime.gogc = 50;
         mgr.save(&stale).expect("save with stale schema_version");
         let saved_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&paths.config_path).unwrap()).unwrap();
-        assert_eq!(saved_json["schema_version"].as_u64(), Some(2));
+        assert_eq!(
+            saved_json["schema_version"].as_u64(),
+            Some(u64::from(CONFIG_SCHEMA_VERSION))
+        );
         assert_eq!(saved_json["core_runtime"]["gogc"].as_u64(), Some(50));
+
+        cleanup_dir(&paths);
+    }
+
+    #[test]
+    fn schema_v2_to_v3_migrates_legacy_plaintext_dns_while_preserving_custom_gogc_and_dns() {
+        let paths = temp_paths("v2-to-v3-dns-migration");
+        let mgr = ConfigManager::new(paths.clone());
+        let expected_doh = vec![
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://1.12.12.12/dns-query".to_string(),
+        ];
+
+        assert!(is_legacy_plaintext_domestic_dns_list(&[
+            "223.5.5.5".to_string(),
+            " 119.29.29.29:53 ".to_string(),
+            "223.6.6.6".to_string(),
+        ]));
+        assert!(!is_legacy_plaintext_domestic_dns_list(&[]));
+        assert!(!is_legacy_plaintext_domestic_dns_list(&[
+            "223.5.5.5".to_string(),
+            "114.114.114.114".to_string(),
+        ]));
+        assert!(!is_legacy_plaintext_domestic_dns_list(&[
+            "https://223.5.5.5/dns-query".to_string(),
+        ]));
+
+        // 1. v2 config with manual gogc=35 + legacy plaintext domestic UDP 53 defaults:
+        //    DNS upgrades cleanly to pure-IP DoH 443 while manual gogc=35 is strictly preserved.
+        let v2_legacy_dns_raw = r#"{
+            "schema_version": 2,
+            "core_runtime": { "gogc": 35 },
+            "dns": {
+                "default_nameserver": ["223.5.5.5", "119.29.29.29"],
+                "direct_nameserver": ["223.5.5.5:53", "223.6.6.6"],
+                "proxy_server_nameserver": ["119.29.29.29:53"]
+            }
+        }"#;
+        std::fs::write(&paths.config_path, v2_legacy_dns_raw).unwrap();
+
+        let migrated = mgr.load_or_init().expect("migrate v2 legacy dns to v3");
+        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.core_runtime.gogc, 35);
+        assert_eq!(migrated.dns.default_nameserver, expected_doh);
+        assert_eq!(migrated.dns.direct_nameserver, expected_doh);
+        assert_eq!(migrated.dns.proxy_server_nameserver, expected_doh);
+
+        // 2. v2 config with user-customized DNS entries (custom IP, mixed list, custom DoH) must
+        //    NEVER be overwritten during v2 -> v3 migration.
+        let v2_custom_dns_raw = r#"{
+            "schema_version": 2,
+            "core_runtime": { "gogc": 35 },
+            "dns": {
+                "default_nameserver": ["223.5.5.5", "10.0.0.53"],
+                "direct_nameserver": ["114.114.114.114"],
+                "proxy_server_nameserver": ["https://dns.alidns.com/dns-query"]
+            }
+        }"#;
+        std::fs::write(&paths.config_path, v2_custom_dns_raw).unwrap();
+
+        let preserved = mgr.load_or_init().expect("preserve custom dns on v2->v3");
+        assert_eq!(preserved.schema_version, 3);
+        assert_eq!(preserved.core_runtime.gogc, 35);
+        assert_eq!(
+            preserved.dns.default_nameserver,
+            vec!["223.5.5.5".to_string(), "10.0.0.53".to_string()]
+        );
+        assert_eq!(
+            preserved.dns.direct_nameserver,
+            vec!["114.114.114.114".to_string()]
+        );
+        assert_eq!(
+            preserved.dns.proxy_server_nameserver,
+            vec!["https://dns.alidns.com/dns-query".to_string()]
+        );
+
+        // 3. Explicit v3 config intentionally configured with plaintext 223.5.5.5 is not re-migrated.
+        let v3_manual_raw = r#"{
+            "schema_version": 3,
+            "dns": {
+                "direct_nameserver": ["223.5.5.5"]
+            }
+        }"#;
+        std::fs::write(&paths.config_path, v3_manual_raw).unwrap();
+        let v3_loaded = mgr.load_or_default().expect("load explicit v3");
+        assert_eq!(v3_loaded.schema_version, 3);
+        assert_eq!(v3_loaded.dns.direct_nameserver, vec!["223.5.5.5".to_string()]);
 
         cleanup_dir(&paths);
     }
@@ -1089,7 +1229,7 @@ mod tests {
             .import_backup(&backup_file)
             .expect("legacy raw-JSON digest backup must import cleanly");
         assert_eq!(restored.mixed_port, 17911);
-        assert_eq!(restored.schema_version, 2);
+        assert_eq!(restored.schema_version, CONFIG_SCHEMA_VERSION);
         assert_eq!(restored.core_runtime.gogc, 25);
         assert_eq!(restored.personalization.normalized_ui_language(), "ja");
 

@@ -248,6 +248,8 @@ pub struct TrayMenuState {
     pub proxy_mode: TrayProxyMode,
     pub system_proxy_enabled: bool,
     pub tun_enabled: bool,
+    #[serde(default)]
+    pub tun_needs_elevation: bool,
     pub windowless_mode: bool,
     pub capsule_open: bool,
     pub autostart_enabled: bool,
@@ -265,6 +267,7 @@ impl Default for TrayMenuState {
             proxy_mode: TrayProxyMode::Rule,
             system_proxy_enabled: false,
             tun_enabled: false,
+            tun_needs_elevation: false,
             windowless_mode: false,
             capsule_open: false,
             autostart_enabled: false,
@@ -284,6 +287,8 @@ pub struct TrayTooltipInfo {
     pub runtime_mode_label: String,
     pub proxy_mode: TrayProxyMode,
     pub tun_enabled: bool,
+    #[serde(default)]
+    pub tun_needs_elevation: bool,
     pub system_proxy_enabled: bool,
     pub preaccel_summary: Option<String>,
     pub primary_group_summary: Option<String>,
@@ -299,6 +304,7 @@ impl Default for TrayTooltipInfo {
             runtime_mode_label: "桌面模式".to_string(),
             proxy_mode: TrayProxyMode::Rule,
             tun_enabled: false,
+            tun_needs_elevation: false,
             system_proxy_enabled: false,
             preaccel_summary: None,
             primary_group_summary: None,
@@ -316,10 +322,17 @@ impl TrayTooltipInfo {
             "猫猫云梯 v{} · {}",
             self.version, self.runtime_mode_label
         ));
+        let tun_label = if self.tun_enabled {
+            "开"
+        } else if self.tun_needs_elevation {
+            "需提权"
+        } else {
+            "关"
+        };
         lines.push(format!(
             "模式: {} | TUN: {} | 代理: {}",
             self.proxy_mode.label_zh(),
-            if self.tun_enabled { "开" } else { "关" },
+            tun_label,
             if self.system_proxy_enabled { "开" } else { "关" },
         ));
         if let Some(ref notice) = self.status_notice {
@@ -919,10 +932,15 @@ pub fn build_tray_menu<R: Runtime>(
         state.system_proxy_enabled,
         None::<&str>,
     )?;
+    let tun_menu_label = if state.tun_needs_elevation && !state.tun_enabled {
+        "TUN 虚拟网卡模式（需管理员权限）"
+    } else {
+        "TUN 虚拟网卡模式"
+    };
     let tun_mode = CheckMenuItem::with_id(
         app,
         menu_id::TOGGLE_TUN,
-        "TUN 虚拟网卡模式",
+        tun_menu_label,
         true,
         state.tun_enabled,
         None::<&str>,
@@ -1367,6 +1385,7 @@ mod tests {
             runtime_mode_label: "便携模式".into(),
             proxy_mode: TrayProxyMode::Rule,
             tun_enabled: true,
+            tun_needs_elevation: false,
             system_proxy_enabled: false,
             preaccel_summary: Some("国内主节点 443 提速 (265 Mbps)".into()),
             primary_group_summary: Some("AI 专线: 节点 A (1x 零送中 · 超长描述测试文本测试文本测试文本测试文本)".into()),
@@ -1375,6 +1394,16 @@ mod tests {
         };
         let formatted = info.format_tooltip();
         assert!(formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
+
+        let needs_admin_info = TrayTooltipInfo {
+            tun_enabled: false,
+            tun_needs_elevation: true,
+            system_proxy_enabled: true,
+            ..Default::default()
+        };
+        let needs_admin_formatted = needs_admin_info.format_tooltip();
+        assert!(needs_admin_formatted.contains("TUN: 需提权"));
+        assert!(needs_admin_formatted.encode_utf16().count() <= WIN32_TOOLTIP_MAX_UTF16);
     }
 
     #[test]
@@ -1519,6 +1548,7 @@ mod tests {
             runtime_mode_label: "便携模式".into(),
             proxy_mode: TrayProxyMode::Rule,
             tun_enabled: false,
+            tun_needs_elevation: false,
             system_proxy_enabled: false,
             preaccel_summary: Some(
                 "全局提速中 · 杭州阿里云443高带宽中转节点超长名称测试测试测试 (127.0.0.1:17895)"

@@ -1904,11 +1904,17 @@ export function CapsuleWindow() {
     placement: "row1",
   };
 
-  const tunHint: CapsuleHoverHint = {
-    title: `${dict.home.tunMode}: ${runtime.tun_enabled ? dict.common.on : dict.common.off}`,
-    desc: isZh ? "接管桌面与终端全部流量" : "Routes all system & CLI traffic",
-    placement: "row1",
-  };
+  const tunHint: CapsuleHoverHint = runtime.tun_needs_elevation
+    ? {
+        title: dict.home.tunNeedsAdminHover,
+        desc: isZh ? "请打开主窗口一键提权生效" : "Open main window to elevate & enable",
+        placement: "row1",
+      }
+    : {
+        title: `${dict.home.tunMode}: ${runtime.tun_enabled ? dict.common.on : dict.common.off}`,
+        desc: isZh ? "接管桌面与终端全部流量" : "Routes all system & CLI traffic",
+        placement: "row1",
+      };
 
   const preAccelHint: CapsuleHoverHint = togglingPreAccel
     ? {
@@ -2220,7 +2226,9 @@ export function CapsuleWindow() {
                 } ${
                   runtime.tun_enabled
                     ? "border-[var(--accent)]/45 bg-[var(--accent-soft)] text-[var(--accent)]"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[var(--muted)]/55"
+                    : runtime.tun_needs_elevation
+                      ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)]"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[var(--muted)]/55"
                 }`}
                 aria-label={`${tunHint.title}：${tunHint.desc}`}
               >
@@ -2529,7 +2537,15 @@ export function CapsuleWindow() {
         <div className="mt-1 text-[11px] text-[var(--muted)]">
           {statusMeta.label} · {isSingleMode ? (isZh ? "单节点" : "Single") : displayGroupName} ·{" "}
           {dict.home.systemProxy}: {runtime.system_proxy_enabled ? dict.common.on : dict.common.off}{" "}
-          · {dict.home.tunMode}: {runtime.tun_enabled ? dict.common.on : dict.common.off} ·{" "}
+          · {dict.home.tunMode}:{" "}
+          {runtime.tun_enabled
+            ? dict.common.on
+            : runtime.tun_needs_elevation
+              ? isZh
+                ? "未生效（需管理员）"
+                : "Needs admin"
+              : dict.common.off}{" "}
+          ·{" "}
           {dict.home.preaccel}: {preaccelSummary.enabled ? dict.common.on : dict.common.off}
         </div>
       </div>

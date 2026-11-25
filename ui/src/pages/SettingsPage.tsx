@@ -150,7 +150,7 @@ const DEFAULT_EXTENDED: ExtendedSettings = {
   enhancedMode: "fake-ip",
   fakeIpRange: "198.18.0.1/16",
   fakeIpFilter: "*.lan, *.local, time.*.com, ntp.*.com, +.msftconnecttest.com",
-  defaultNameserver: "223.5.5.5, 119.29.29.29",
+  defaultNameserver: "https://223.5.5.5/dns-query, https://1.12.12.12/dns-query",
   nameserverPolicy: "geosite:cn,private: https://223.5.5.5/dns-query",
   nameserver: "https://223.5.5.5/dns-query, https://doh.pub/dns-query",
   fallback: "https://1.1.1.1/dns-query, https://dns.google/dns-query",
@@ -374,9 +374,10 @@ function parseNameserverPolicy(raw: string): Record<string, string[]> {
     if (!trimmed) continue;
     const colonIdx = trimmed.indexOf(":");
     if (colonIdx <= 0) continue;
-    const sepMatch = /^(.+?):\s+(https?:\/\/.+|tls:\/\/.+|quic:\/\/.+|\d+\.\d+\.\d+\.\d+.*)$/i.exec(
-      trimmed
-    );
+    const sepMatch =
+      /^(.+?):\s+(system(?:\s*,.*)?|https?:\/\/.+|tls:\/\/.+|quic:\/\/.+|\d+\.\d+\.\d+\.\d+.*)$/i.exec(
+        trimmed
+      );
     const key = (sepMatch ? sepMatch[1] : trimmed.slice(0, colonIdx)).trim();
     const valStr = (sepMatch ? sepMatch[2] : trimmed.slice(colonIdx + 1)).trim();
     const servers = valStr
@@ -1191,6 +1192,9 @@ export function SettingsPage() {
       const latestStoreConfig = appStore.getState().config;
       const payload: AppConfig = {
         ...draft,
+        proxy_mode: latestStoreConfig.proxy_mode,
+        system_proxy_enabled: latestStoreConfig.system_proxy_enabled,
+        tun_enabled: latestStoreConfig.tun_enabled,
         memory_tier: tierFromMb(draft.gomemlimit_mb),
         personalization: latestStoreConfig.personalization,
         preaccel: structuredClone(latestStoreConfig.preaccel),
@@ -1753,13 +1757,15 @@ export function SettingsPage() {
               <SwitchRow
                 title="虚拟网卡接管"
                 desc={
-                  runtime.tun_admin_ready
-                    ? "已具备虚拟网卡网络权限，可接管终端和桌面软件等全部流量"
-                    : platformOs === "linux"
-                      ? "需要为代理核心授予网络权限，开启时将弹出系统授权提示（界面保持普通用户）"
-                      : platformOs === "macos"
-                        ? "需要 macOS 系统安全授权，开启时将弹出授权指引"
-                        : "需要管理员权限，开启时将弹出系统授权提示（UAC）"
+                  runtime.tun_needs_elevation
+                    ? "你已勾选虚拟网卡，但当前普通权限未生效"
+                    : runtime.tun_admin_ready
+                      ? "已具备虚拟网卡网络权限，可接管终端和桌面软件等全部流量"
+                      : platformOs === "linux"
+                        ? "需要为代理核心授予网络权限，开启时将弹出系统授权提示（界面保持普通用户）"
+                        : platformOs === "macos"
+                          ? "需要 macOS 系统安全授权，开启时将弹出授权指引"
+                          : "需要管理员权限，开启时将弹出系统授权提示（UAC）"
                 }
                 checked={runtime.tun_enabled}
                 onChange={(v) => void appActions.toggleTun(v)}
@@ -1767,20 +1773,57 @@ export function SettingsPage() {
                   <span
                     className="rounded-md px-1.5 py-0.5 text-[10px]"
                     style={{
-                      backgroundColor: runtime.tun_admin_ready
-                        ? "var(--green-soft)"
-                        : "var(--amber-soft)",
-                      color: runtime.tun_admin_ready ? "var(--green)" : "var(--amber)",
+                      backgroundColor: runtime.tun_needs_elevation
+                        ? "var(--amber-soft)"
+                        : runtime.tun_admin_ready
+                          ? "var(--green-soft)"
+                          : "var(--amber-soft)",
+                      color: runtime.tun_needs_elevation
+                        ? "var(--amber)"
+                        : runtime.tun_admin_ready
+                          ? "var(--green)"
+                          : "var(--amber)",
                     }}
                   >
-                    {runtime.tun_admin_ready
-                      ? "权限就绪"
-                      : platformOs === "linux"
-                        ? "需授核心权限"
-                        : "需授权"}
+                    {runtime.tun_needs_elevation
+                      ? "未生效 · 需提权"
+                      : runtime.tun_admin_ready
+                        ? "权限就绪"
+                        : platformOs === "linux"
+                          ? "需授核心权限"
+                          : "需授权"}
                   </span>
                 }
               />
+              {runtime.tun_needs_elevation && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/55 bg-[var(--amber-soft)]/70 px-3 py-2 text-xs">
+                  <div className="flex min-w-0 items-center gap-2 text-[var(--amber)]">
+                    <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                    <span className="font-medium">
+                      {platformOs === "linux"
+                        ? "虚拟网卡未生效，需授予核心网络权限"
+                        : "虚拟网卡未生效，需以管理员身份重启"}
+                    </span>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => appActions.openTunAdminPrompt(null)}
+                      className="inline-flex items-center gap-1 rounded-lg bg-[var(--amber)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                    >
+                      <Shield className="h-3 w-3 shrink-0" />
+                      <span>{platformOs === "linux" ? "授权核心权限" : "以管理员重启生效"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => void appActions.toggleTun(false)}
+                      className="rounded-lg border border-[var(--amber)]/45 bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--amber)] hover:text-[var(--text)]"
+                    >
+                      关闭此配置
+                    </button>
+                  </div>
+                </div>
+              )}
               <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2">
                 <div className="text-xs font-medium text-[var(--text)]">虚拟网卡接管引擎</div>
                 <SegButtons<TunStackMode>

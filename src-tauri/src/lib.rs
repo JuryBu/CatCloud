@@ -419,7 +419,10 @@ pub fn run_with_paths(paths: AppPaths) {
                     TrayAction::ToggleTun => {
                         tauri::async_runtime::spawn(async move {
                             if let Some(st) = app_async.try_state::<AppState>() {
-                                let next_enabled = !st.snapshot_config().tun.enabled;
+                                let cfg = st.snapshot_config();
+                                // Use effective (privileged) TUN state so clicking TUN while unprivileged
+                                // triggers NEEDS_ADMIN elevation flow instead of silently disabling intent.
+                                let next_enabled = !commands::effective_tun_enabled(&st, &cfg);
                                 if let Err(err) = commands::set_tun_enabled_internal(
                                     &app_async,
                                     &st,
@@ -628,9 +631,17 @@ pub fn run_with_paths(paths: AppPaths) {
                         }
 
                         let cfg = st.snapshot_config();
-                        if !(cfg.system_proxy.enabled || cfg.tun.enabled) {
+                        let eff_tun = commands::effective_tun_enabled(&st, &cfg);
+                        if cfg.tun.enabled && !eff_tun {
+                            st.log_app_event(
+                                "warning",
+                                "虚拟网卡",
+                                "配置已启用虚拟网卡（TUN），但当前为普通用户权限未生效（依赖虚拟网卡的桌面应用/终端可能无法走代理）；如需启用请在界面点击「以管理员重启」",
+                            );
+                        }
+                        if !(cfg.system_proxy.enabled || eff_tun) {
                             tracing::info!(
-                                "auto-start core skipped: system_proxy and tun are both disabled"
+                                "auto-start core skipped: system_proxy and effective tun are both disabled"
                             );
                             if !enable_global_preaccel_flag
                                 && cfg.preaccel.enabled
@@ -666,7 +677,8 @@ pub fn run_with_paths(paths: AppPaths) {
                         if has_nodes {
                             let _cfg_guard = st.config_transition_lock.lock().await;
                             let latest_cfg = st.snapshot_config();
-                            if (latest_cfg.system_proxy.enabled || latest_cfg.tun.enabled)
+                            let latest_eff_tun = commands::effective_tun_enabled(&st, &latest_cfg);
+                            if (latest_cfg.system_proxy.enabled || latest_eff_tun)
                                 && !st.adapter.has_live_controller().await
                             {
                                 if let Err(err) = commands::start_core_internal(&auto_handle, &st).await {

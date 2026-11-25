@@ -30,6 +30,7 @@ import {
   catcloudApi,
   formatErrorMessage,
   generateSeedTrafficSamples,
+  hasPreviewTunNeedsAdminFlag,
   isTauriEnv,
 } from "../api/tauri";
 import { detectNavigatorOs, resolvePlatformOs } from "../utils/platform";
@@ -697,6 +698,7 @@ export function selectHasBackgroundActivity(s: AppState): {
 }
 
 const runningInTauri = isTauriEnv();
+const previewTunNeedsAdmin = !runningInTauri && hasPreviewTunNeedsAdminFlag();
 const initialPrefs = loadCachedUiPrefs();
 const initialConfig: AppConfig = runningInTauri
   ? {
@@ -716,6 +718,8 @@ const initialConfig: AppConfig = runningInTauri
     }
   : {
       ...structuredClone(DEFAULT_APP_CONFIG),
+      system_proxy_enabled: previewTunNeedsAdmin ? true : DEFAULT_APP_CONFIG.system_proxy_enabled,
+      tun_enabled: previewTunNeedsAdmin ? true : DEFAULT_APP_CONFIG.tun_enabled,
       personalization: {
         ...DEFAULT_APP_CONFIG.personalization,
         ...initialPrefs,
@@ -793,6 +797,8 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       captive_portal_required: false,
       system_proxy_enabled: false,
       tun_enabled: false,
+      tun_configured: false,
+      tun_needs_elevation: false,
       tun_admin_ready: false,
       app_version: "0.1.0",
       os_label: initialOsLabel,
@@ -832,8 +838,10 @@ const initialRuntime: CoreRuntimeInfo = runningInTauri
       node_health_hints: {},
       captive_portal_required: false,
       system_proxy_enabled: initialConfig.system_proxy_enabled,
-      tun_enabled: initialConfig.tun_enabled,
-      tun_admin_ready: true,
+      tun_enabled: initialConfig.tun_enabled && !previewTunNeedsAdmin,
+      tun_configured: initialConfig.tun_enabled,
+      tun_needs_elevation: initialConfig.tun_enabled && previewTunNeedsAdmin,
+      tun_admin_ready: !previewTunNeedsAdmin,
       app_version: "0.1.0",
       os_label: "Windows 11 x64",
       autostart_enabled: true,
@@ -1580,6 +1588,16 @@ function mergeIncomingAppConfig(
   };
 }
 
+function alignConfigWithRuntimeTun(config: AppConfig, runtime: CoreRuntimeInfo): AppConfig {
+  if (
+    typeof runtime.tun_configured === "boolean" &&
+    config.tun_enabled !== runtime.tun_configured
+  ) {
+    return { ...config, tun_enabled: runtime.tun_configured };
+  }
+  return config;
+}
+
 async function hydrateFromBackend(): Promise<void> {
   const inDesktop = isTauriEnv();
   // Never fire outbound network requests (exit IP / site checks) on startup in desktop mode
@@ -1721,7 +1739,7 @@ async function hydrateFromBackend(): Promise<void> {
     ...prev,
     initialized: true,
     activeNav: startupNav ?? prev.activeNav,
-    config: mergedConfig,
+    config: alignConfigWithRuntimeTun(mergedConfig, resolvedRuntime),
     resolvedTheme: resolved,
     runtime: resolvedRuntime,
     groups: groupsRes.status === "fulfilled" ? groupsRes.value : prev.groups,
@@ -1869,10 +1887,23 @@ export const appStore = {
           info.global_preaccel_verify_ms !== undefined
             ? info.global_preaccel_verify_ms
             : (prev.globalPreAccel.verify_latency_ms ?? null);
+        const nextTunConfigured =
+          typeof info.tun_configured === "boolean"
+            ? info.tun_configured
+            : prev.runtime.tun_configured;
+        const nextTunNeedsElevation =
+          typeof info.tun_needs_elevation === "boolean"
+            ? info.tun_needs_elevation
+            : typeof nextTunConfigured === "boolean"
+              ? nextTunConfigured && !info.tun_admin_ready
+              : prev.runtime.tun_needs_elevation;
         return {
           ...prev,
+          config: alignConfigWithRuntimeTun(prev.config, info),
           runtime: {
             ...info,
+            tun_configured: nextTunConfigured,
+            tun_needs_elevation: nextTunNeedsElevation,
             global_windivert_active: nextWinDivertActive,
             preaccel_install_state:
               info.preaccel_install_state ?? prev.runtime.preaccel_install_state,
@@ -2065,10 +2096,18 @@ export const appStore = {
                 rawReason = rawReason.slice(idx + prefix.length).trim() || null;
               }
             }
-            setState((prev) => ({
-              ...prev,
-              runtime: { ...prev.runtime, tun_admin_ready: false },
-            }));
+            setState((prev) => {
+              const configured = Boolean(prev.runtime.tun_configured ?? prev.config.tun_enabled);
+              return {
+                ...prev,
+                runtime: {
+                  ...prev.runtime,
+                  tun_admin_ready: false,
+                  tun_enabled: false,
+                  tun_needs_elevation: configured,
+                },
+              };
+            });
             appActions.openTunAdminPrompt(rawReason);
           })
         )
@@ -2418,6 +2457,11 @@ export const appActions = {
           rt.route_mode === "single"
             ? `单节点模式 → ${rt.active_node_name || "--"}`
             : `智能多选组（${rt.active_group_name || "--"}）→ ${rt.active_node_name || "--"}`;
+        const tunStatusLabel = rt.tun_enabled
+          ? "已开启"
+          : rt.tun_needs_elevation
+            ? "未生效（需管理员权限）"
+            : "未开启";
         markdown = [
           "# 请帮我排查猫猫云梯（CatCloud）当前问题",
           "",
@@ -2426,7 +2470,7 @@ export const appActions = {
           "## 1. 运行状态摘要",
           `- 版本：v${rt.app_version}（${rt.os_label}）`,
           `- 代理核心：${rt.core_name} ${rt.core_version}（${rt.running ? "运行中" : "已停止"}）`,
-          `- 代理模式：${rt.proxy_mode} | 系统代理：${rt.system_proxy_enabled ? "已开启" : "未开启"} | 虚拟网卡：${rt.tun_enabled ? "已开启" : "未开启"}`,
+          `- 代理模式：${rt.proxy_mode} | 系统代理：${rt.system_proxy_enabled ? "已开启" : "未开启"} | 虚拟网卡：${tunStatusLabel}`,
           `- 当前路线：${routeLine}`,
           `- 国内提速：${rt.preaccel_active ? `已开启（${rt.preaccel_relay_name ?? "已启用中转"}）` : "未开启"}`,
           `- 本地端口：混合 ${cfg.mixed_port} / 控制 127.0.0.1:${cfg.controller_port} / DNS ${cfg.dns_listen_port}`,
@@ -2487,7 +2531,11 @@ export const appActions = {
   },
 
   syncRuntime(nextRuntime: CoreRuntimeInfo): void {
-    setState((prev) => ({ ...prev, runtime: nextRuntime }));
+    setState((prev) => ({
+      ...prev,
+      config: alignConfigWithRuntimeTun(prev.config, nextRuntime),
+      runtime: nextRuntime,
+    }));
   },
 
   syncGroups(groups: MultiGroup[]): void {
@@ -3283,6 +3331,10 @@ export const appActions = {
   },
 
   async toggleTun(next?: boolean, silent = false): Promise<boolean> {
+    if (next === undefined && state.runtime.tun_needs_elevation) {
+      appActions.openTunAdminPrompt(null);
+      return false;
+    }
     const target = next ?? !state.runtime.tun_enabled;
     if (target && state.runtime.tun_admin_ready === false) {
       appActions.openTunAdminPrompt(null);
@@ -3290,13 +3342,27 @@ export const appActions = {
     }
     try {
       const applied = await catcloudApi.toggleTun(target);
-      setState((prev) => ({
-        ...prev,
-        config: { ...prev.config, tun_enabled: applied },
-        runtime: { ...prev.runtime, tun_enabled: applied },
-      }));
+      setState((prev) => {
+        const nextConfigured = target ? applied || prev.config.tun_enabled : false;
+        const nextEffective = target ? applied : false;
+        const nextNeedsElevation =
+          nextConfigured && !prev.runtime.tun_admin_ready && !nextEffective;
+        return {
+          ...prev,
+          config: { ...prev.config, tun_enabled: nextConfigured },
+          runtime: {
+            ...prev.runtime,
+            tun_enabled: nextEffective,
+            tun_configured: nextConfigured,
+            tun_needs_elevation: nextNeedsElevation,
+          },
+        };
+      });
       if (!silent) {
-        pushToast(applied ? "虚拟网卡已开启" : "虚拟网卡已关闭", applied ? "ok" : "info");
+        pushToast(
+          target && applied ? "虚拟网卡已开启" : "虚拟网卡已关闭",
+          target && applied ? "ok" : "info"
+        );
       }
       return true;
     } catch (err) {
@@ -3307,7 +3373,12 @@ export const appActions = {
         const detail = msg.slice(adminIdx + adminPrefix.length).trim() || null;
         setState((prev) => ({
           ...prev,
-          runtime: { ...prev.runtime, tun_admin_ready: false },
+          runtime: {
+            ...prev.runtime,
+            tun_admin_ready: false,
+            tun_enabled: false,
+            tun_needs_elevation: Boolean(prev.runtime.tun_configured ?? prev.config.tun_enabled),
+          },
           tunAdminPromptOpen: true,
           tunAdminPromptBusy: false,
           tunAdminPromptReason: detail,
@@ -3347,7 +3418,10 @@ export const appActions = {
         config: {
           ...prev.config,
           system_proxy_enabled: nextRt.system_proxy_enabled,
-          tun_enabled: nextRt.tun_enabled,
+          tun_enabled:
+            typeof nextRt.tun_configured === "boolean"
+              ? nextRt.tun_configured
+              : prev.config.tun_enabled,
         },
         runtime: nextRt,
         globalPreAccel: nextGlobal ?? prev.globalPreAccel,
