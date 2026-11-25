@@ -107,11 +107,12 @@ jobs:
             echo "generated_go_sum=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "=== mihomo v1.19.16 API diagnostic (go doc, GOOS=android GOARCH=arm64 -tags cmfa) ==="
+          echo "=== mihomo v1.19.16 API diagnostic (go doc, GOOS=android GOARCH=arm64 GOFLAGS=-tags=cmfa) ==="
           export GOOS=android
           export GOARCH=arm64
           export CGO_ENABLED=1
           export CC="$ANDROID_ARM64_CC"
+          export GOFLAGS="-tags=cmfa"
           for sym in \
             github.com/metacubex/mihomo/component/dialer.DefaultSocketHook \
             github.com/metacubex/mihomo/listener/config.Tun \
@@ -123,8 +124,9 @@ jobs:
             github.com/metacubex/mihomo/component/iface.FlushCache
           do
             echo "--- go doc $sym ---"
-            go doc -tags "cmfa" "$sym"
+            go doc "$sym" || true
           done
+          unset GOFLAGS
 
       - name: Upload generated go.sum (and tidied go.mod) artifact for lockfile backfill
         if: steps.go_deps.outputs.generated_go_sum == 'true'
