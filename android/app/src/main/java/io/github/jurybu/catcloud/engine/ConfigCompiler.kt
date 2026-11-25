@@ -333,7 +333,7 @@ object ConfigCompiler {
 
         // Proxies section
         val usedNames = HashSet<String>()
-        val compiledProxies = ArrayList<Map<String, Any?>>()
+        val compiledProxies = ArrayList<MutableMap<String, Any?>>()
         val relayIdToName = HashMap<String, String>()
         val relayNamesOrdered = ArrayList<String>()
 
@@ -341,7 +341,7 @@ object ConfigCompiler {
             for (relay in enabledRelays) {
                 val baseName = relay.name.trim().ifEmpty { "PreAccel-${relay.id}" }
                 val uniqueName = makeUniqueName(baseName, usedNames)
-                compiledProxies.add(buildRelayProxyMap(relay, uniqueName))
+                compiledProxies.add(buildRelayProxyMap(relay, uniqueName).toMutableMap())
                 relayIdToName[relay.id] = uniqueName
                 relayNamesOrdered.add(uniqueName)
             }

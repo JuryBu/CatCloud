@@ -50,7 +50,7 @@ data class ShareGroupRecord(
 )
 
 data class ShareGroupsDocument(
-    val schema: String = GROUPS_SCHEMA_V1,
+    val schema: String = ShareBundleCodec.GROUPS_SCHEMA_V1,
     val activeGroupName: String? = null,
     val routeMode: String? = null,
     val groups: List<ShareGroupRecord> = emptyList(),

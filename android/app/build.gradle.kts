@@ -21,7 +21,9 @@ android {
             abiFilters += "arm64-v8a"
         }
 
-        resourceConfigurations += listOf("zh", "en")
+        androidResources {
+            localeFilters += listOf("zh", "en")
+        }
     }
 
     buildFeatures {
