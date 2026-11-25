@@ -488,6 +488,19 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
                 Value::String(relay.password.clone()),
             );
             map.insert(Value::String("udp".to_string()), Value::Bool(true));
+            map.insert(Value::String("tfo".to_string()), Value::Bool(true));
+            map.insert(
+                Value::String("idle-session-check-interval".to_string()),
+                Value::Number(Number::from(30u64)),
+            );
+            map.insert(
+                Value::String("idle-session-timeout".to_string()),
+                Value::Number(Number::from(30u64)),
+            );
+            map.insert(
+                Value::String("min-idle-session".to_string()),
+                Value::Number(Number::from(2u64)),
+            );
             map.insert(
                 Value::String("skip-cert-verify".to_string()),
                 Value::Bool(relay.skip_cert_verify),
@@ -500,6 +513,7 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
                 Value::String(relay.password.clone()),
             );
             map.insert(Value::String("udp".to_string()), Value::Bool(true));
+            map.insert(Value::String("tfo".to_string()), Value::Bool(true));
             map.insert(
                 Value::String("skip-cert-verify".to_string()),
                 Value::Bool(relay.skip_cert_verify),
@@ -517,6 +531,7 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
             );
             map.insert(Value::String("tls".to_string()), Value::Bool(true));
             map.insert(Value::String("udp".to_string()), Value::Bool(true));
+            map.insert(Value::String("tfo".to_string()), Value::Bool(true));
             map.insert(
                 Value::String("skip-cert-verify".to_string()),
                 Value::Bool(relay.skip_cert_verify),

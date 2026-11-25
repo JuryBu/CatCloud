@@ -334,14 +334,49 @@ EXPIRES_AT="${EXPIRES_AT:-2027-08-12}"
 SERVER_IP="${SERVER_IP:-$(curl -4s --max-time 6 https://api.ipify.org || hostname -I | awk '{print $1}')}"
 PASSWORD="${PASSWORD:-$(openssl rand -hex 16)}"
 
-echo "[1/5] 安装依赖与官方 sing-box（支持 AnyTLS 与 Trojan）..."
+echo "[1/6] 开启内核 BBR + 在线热切网卡 fq 队列调度（防 pfifo_fast 丢包）..."
+IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+cat >/etc/sysctl.d/99-catcloud-relay-tune.conf <<'SYSCTL'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 131072 16777216
+net.core.netdev_max_backlog = 8192
+net.ipv4.tcp_max_syn_backlog = 4096
+net.core.somaxconn = 4096
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 16384
+SYSCTL
+sysctl -p /etc/sysctl.d/99-catcloud-relay-tune.conf >/dev/null || true
+if [ -n "${IFACE}" ]; then
+  tc qdisc replace dev "${IFACE}" root fq || true
+  cat >/etc/systemd/system/catcloud-fq-qdisc.service <<FQUNIT
+[Unit]
+Description=Apply fq qdisc on ${IFACE} for BBR pacing
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/sbin/tc qdisc replace dev ${IFACE} root fq
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+FQUNIT
+  systemctl daemon-reload && systemctl enable catcloud-fq-qdisc.service >/dev/null 2>&1 || true
+fi
+
+echo "[2/6] 安装依赖与官方 sing-box（支持 AnyTLS 与 Trojan）..."
 apt-get update -qq
 apt-get install -y -qq curl openssl jq python3 ca-certificates
 if ! command -v sing-box >/dev/null 2>&1; then
   curl -fsSL https://sing-box.app/install.sh | sh
 fi
 
-echo "[2/5] 为纯 IP (${SERVER_IP}) 生成自签 ECDSA 证书..."
+echo "[3/6] 为纯 IP (${SERVER_IP}) 生成自签 ECDSA 证书..."
 mkdir -p /etc/catcloud-relay
 openssl ecparam -name prime256v1 -genkey -noout -out /etc/catcloud-relay/key.pem
 openssl req -new -x509 -days 3650 -key /etc/catcloud-relay/key.pem \
@@ -350,7 +385,7 @@ openssl req -new -x509 -days 3650 -key /etc/catcloud-relay/key.pem \
   -addext "subjectAltName=IP:${SERVER_IP}"
 chmod 600 /etc/catcloud-relay/key.pem
 
-echo "[3/5] 写入 /etc/catcloud-relay/config.json (TCP 443, ${PROTO})..."
+echo "[4/6] 写入 /etc/catcloud-relay/config.json (TCP 443, ${PROTO})..."
 if [ "${PROTO}" = "trojan" ]; then
   INBOUND_JSON=$(jq -n --arg pw "${PASSWORD}" '{
     type: "trojan", tag: "relay-in", listen: "::", listen_port: 443,
@@ -371,7 +406,7 @@ jq -n --argjson inbound "${INBOUND_JSON}" '{
   outbounds: [{type: "direct", tag: "direct"}]
 }' > /etc/catcloud-relay/config.json
 
-echo "[4/5] 注册并启动 systemd 服务..."
+echo "[5/6] 注册并启动 systemd 服务..."
 cat >/etc/systemd/system/catcloud-relay.service <<'UNIT'
 [Unit]
 Description=CatCloud Domestic 443 Relay (sing-box)
@@ -391,7 +426,7 @@ systemctl daemon-reload
 systemctl enable --now catcloud-relay.service
 ss -tlnp | grep ':443 ' || echo "警告：未检测到 443 监听，请运行 journalctl -u catcloud-relay -n 30 检查"
 
-echo "[5/5] 生成猫猫云梯 mmrelay/v1 导入包（仅私用，勿公开分享）..."
+echo "[6/6] 生成猫猫云梯 mmrelay/v1 导入包（仅私用，勿公开分享）..."
 MMRELAY_JSON=$(jq -nc \
   --arg id "relay-$(date +%s)" --arg name "${RELAY_NAME}" \
   --arg provider "${RELAY_PROVIDER}" --arg region "${RELAY_REGION}" \
@@ -430,6 +465,21 @@ echo "${MMRELAY_URI}"
 3. **一键安全回退**：
    - 在「国内提速」关闭总开关，或执行：
      `catcloud preaccel bind --enabled false --json && catcloud config reload --json`
+
+---
+
+## 五、提速性能调优与实测避坑铁律（Agent 排障必查）
+
+1. **首查云服务器主网卡真实 `tc qdisc`（头号隐形大坑）**：
+   - 仅在 `/etc/sysctl.d/` 写 `net.core.default_qdisc = fq` **不会**自动套用到开机前已初始化的 `eth0`！若 `tc qdisc show dev eth0` 仍显示 `pfifo_fast`，BBR 会失去 pacing 发包整形导致丢包重传激增、4 并发经常卡死 1～2 条连接。
+   - **零断流在线修复**（不踢任何现役连接）：执行 `tc qdisc replace dev <iface> root fq` 并配置上文 `catcloud-fq-qdisc.service` 防止重启后退回 `pfifo_fast`。
+2. **协议首选 `AnyTLS`，宽带放行国内 UDP 443 可并挂 `Hysteria2`**：
+   - `AnyTLS` 原生支持空闲连接池复用（猫猫云梯编译时已自动开启 `tfo: true` 与 `min-idle-session: 2`），比逐连接重打握手的旧 `Trojan` 更抗并发丢包；
+   - 若用户宽带不屏蔽国内 UDP 443，可在同一台云服务器的 `UDP 443` 并行部署 `Hysteria2`（与 TCP 443 互不冲突），彻底消除 TCP-over-TCP 队头阻塞。
+3. **搭配轻加密非 443 海外节点，避开双层 TLS**：
+   - 外层国内 443 已提供完整 TLS 加密，内层优先搭配 `Shadowsocks` 等轻加密节点（单层 TLS 吞吐显著高于双层 TLS 嵌套且不易触发分片卡死）；原生 443 高速节点保持「自动跳过原生 443」直连。
+4. **双云中转坚持「主备秒切（`fallback`）」，勿盲目开启双云轮询**：
+   - 将实测上下行高、丢包低的中转排在首位作主力，另一台仅作故障秒切备援，避免丢包偏高的备机拖垮整体并发体验。
 "###;
 
 const ZH_DOC_03_MULTIGROUP: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
@@ -772,6 +822,10 @@ PROTO="${PROTO:-anytls}"
 RELAY_NAME="${RELAY_NAME:-CN-443-Primary}"
 SERVER_IP="${SERVER_IP:-$(curl -4s --max-time 6 https://api.ipify.org || hostname -I | awk '{print $1}')}"
 PASSWORD="${PASSWORD:-$(openssl rand -hex 16)}"
+IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.rmem_max = 16777216\nnet.core.wmem_max = 16777216\nnet.ipv4.tcp_rmem = 4096 131072 16777216\nnet.ipv4.tcp_wmem = 4096 131072 16777216\nnet.core.netdev_max_backlog = 8192\nnet.ipv4.tcp_max_syn_backlog = 4096\nnet.core.somaxconn = 4096\nnet.ipv4.tcp_fastopen = 3\nnet.ipv4.tcp_slow_start_after_idle = 0\nnet.ipv4.tcp_mtu_probing = 1\nnet.ipv4.tcp_notsent_lowat = 16384\n' >/etc/sysctl.d/99-catcloud-relay-tune.conf
+sysctl -p /etc/sysctl.d/99-catcloud-relay-tune.conf >/dev/null || true
+[ -n "${IFACE}" ] && tc qdisc replace dev "${IFACE}" root fq || true
 apt-get update -qq && apt-get install -y -qq curl openssl jq python3 ca-certificates
 command -v sing-box >/dev/null 2>&1 || curl -fsSL https://sing-box.app/install.sh | sh
 mkdir -p /etc/catcloud-relay
@@ -797,6 +851,10 @@ echo "mmrelay://v1/$(printf '%s' "${MMJSON}" | python3 -c 'import base64,sys; pr
 - Keep **Auto-skip native 443 nodes** enabled so native 443 nodes stay direct.
 - **Real Relay Upload/Download Speed Test**: In **Domestic Boost**, you can test real upload and download throughput for either a single relay or all relays (chained via a reference overseas node or direct).
 - **Standalone Global Boost**: Even with CatCloud's main proxy off, enabling **Domestic Boost** can transparently accelerate other proxy cores or `ssh`/`scp` via signed WinDivert on Windows (auto-bypassing domestic port 80 and regular chat apps, with automatic SOCKS5 fallback if blocked by local firewall) or local SOCKS5 on macOS/Linux.
+- **Performance Tuning Checklist (for Agents)**:
+  - Always check `tc qdisc show dev <iface>` on Linux relays: `sysctl` `default_qdisc=fq` does NOT retroactively replace `pfifo_fast` on an already-booted NIC. Run `tc qdisc replace dev <iface> root fq` (zero-downtime) and persist it via systemd so BBR pacing actually engages.
+  - Prefer `anytls` (session pooling; CatCloud auto-enables `tfo: true` and `min-idle-session: 2`) over legacy per-connection `trojan`; if domestic UDP 443 is open, co-hosting `hysteria2` on UDP 443 eliminates TCP-over-TCP congestion without conflicting with TCP 443.
+  - Pair domestic `:443` relays with lightweight non-443 overseas nodes (e.g. `ss`) to avoid TLS-in-TLS overhead, and keep dual relays in active-standby `fallback` rather than round-robin load-balancing.
 - CLI verification & rollback:
 ```bash
 catcloud preaccel pool --json

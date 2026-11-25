@@ -409,18 +409,21 @@ mod tests {
         );
         assert_eq!(plan.relay_proxies.len(), 2);
 
-        // Check AnyTLS proxy YAML has no `sni` and `skip-cert-verify: true`.
+        // Check AnyTLS proxy YAML has no `sni`, `skip-cert-verify: true`, `tfo: true`, and session pool settings.
         let anytls_yaml = &plan.relay_proxies[0];
         assert_eq!(anytls_yaml.get("type").and_then(Value::as_str), Some("anytls"));
         assert_eq!(anytls_yaml.get("server").and_then(Value::as_str), Some("203.0.113.10"));
         assert_eq!(anytls_yaml.get("skip-cert-verify").and_then(Value::as_bool), Some(true));
+        assert_eq!(anytls_yaml.get("tfo").and_then(Value::as_bool), Some(true));
+        assert_eq!(anytls_yaml.get("min-idle-session").and_then(Value::as_u64), Some(2));
         assert!(anytls_yaml.get("sni").is_none());
 
-        // Check VLESS proxy YAML explicitly writes empty `servername: ""` and `skip-cert-verify: true`.
+        // Check VLESS proxy YAML explicitly writes empty `servername: ""`, `tfo: true`, and `skip-cert-verify: true`.
         let vless_yaml = &plan.relay_proxies[1];
         assert_eq!(vless_yaml.get("type").and_then(Value::as_str), Some("vless"));
         assert_eq!(vless_yaml.get("uuid").and_then(Value::as_str), Some(DEMO_UUID));
         assert_eq!(vless_yaml.get("servername").and_then(Value::as_str), Some(""));
+        assert_eq!(vless_yaml.get("tfo").and_then(Value::as_bool), Some(true));
         assert_eq!(vless_yaml.get("skip-cert-verify").and_then(Value::as_bool), Some(true));
 
         // Check `select` group puts `PREACCEL_FALLBACK_GROUP` first by default.

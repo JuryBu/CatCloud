@@ -200,3 +200,11 @@ catcloud preaccel global-status --json
 catcloud preaccel bind --enabled false --json
 catcloud config reload --json
 ```
+
+---
+
+## 9. 服务端性能调优与实测避坑要点
+
+1. **必须在线实刷主网卡 `fq` 队列调度**：仅在 `/etc/sysctl.d/` 写入 `net.core.default_qdisc = fq` 不会对开机前已初始化的 `eth0` 生效；若 `tc qdisc show dev eth0` 仍为 `pfifo_fast`，BBR 将失去 pacing 整形并显著放大并发丢包。在服务端执行 `tc qdisc replace dev <iface> root fq`（在线零断流）并注册开机 `systemd` 服务持久化，同时配合 `tcp_fastopen = 3`、`tcp_notsent_lowat = 16384` 与 `16 MiB` TCP 缓冲区。
+2. **客户端 `tfo: true` 与 `AnyTLS` 连接池**：CatCloud 编译国内 443 中转时已自动启用 `tfo: true`，并为 `AnyTLS` 自动注入空闲连接池参数（`min-idle-session: 2`），显著降低短并发握手超时；宽带放行国内 UDP 443 时可在同机房 `UDP 443` 并行部署 `Hysteria2` 彻底消除 TCP-over-TCP 拥塞。
+3. **单层 TLS 优先与主备优于轮询**：外层 443 中转已有完整 TLS 加密，内层优先搭配 `Shadowsocks` 等轻量非 443 海外节点避免双重 TLS 分片损耗；双云中转优先使用主备秒切（`fallback`），避免将丢包较高的备机混入轮询造成木桶效应。
