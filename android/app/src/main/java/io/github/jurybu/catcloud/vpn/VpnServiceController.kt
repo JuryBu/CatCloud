@@ -16,6 +16,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
+/** Alias matching cross-module contract naming. */
+typealias VpnStatusSnapshot = VpnRuntimeStatus
+
 /**
  * `:ui` side AIDL client for [CatCloudVpnService].
  *
@@ -75,6 +78,7 @@ class VpnServiceController(private val appContext: Context) {
         perAppPackages: List<String>,
         activeNodeName: String,
         activeNodeCount: Int,
+        controllerGroupName: String = activeNodeName,
     ): String = withContext(Dispatchers.IO) {
         val intent = Intent(appContext, CatCloudVpnService::class.java)
         ContextCompat.startForegroundService(appContext, intent)
@@ -85,6 +89,7 @@ class VpnServiceController(private val appContext: Context) {
                 perAppMode,
                 perAppPackages.toTypedArray(),
                 activeNodeName,
+                controllerGroupName,
                 activeNodeCount,
             )
         }.getOrElse { "ERR:IPC:${it.message}" }
@@ -94,12 +99,19 @@ class VpnServiceController(private val appContext: Context) {
         configPath: String,
         activeNodeName: String,
         activeNodeCount: Int,
+        controllerGroupName: String = activeNodeName,
     ): String = withContext(Dispatchers.IO) {
         val stub = service ?: if (isSystemVpnTransportActive()) bindExistingOnly() else null
         if (stub == null) return@withContext "OK_NOT_RUNNING"
         runCatching {
-            stub.reloadVpn(configPath, activeNodeName, activeNodeCount)
+            stub.reloadVpn(configPath, activeNodeName, controllerGroupName, activeNodeCount)
         }.getOrElse { "ERR:IPC:${it.message}" }
+    }
+
+    suspend fun setWatchdogPaused(paused: Boolean) = withContext(Dispatchers.IO) {
+        val stub = service ?: if (isSystemVpnTransportActive()) bindExistingOnly() else null
+        runCatching { stub?.setWatchdogPaused(paused) }
+        Unit
     }
 
     suspend fun stopVpn() = withContext(Dispatchers.IO) {
@@ -162,6 +174,9 @@ class VpnServiceController(private val appContext: Context) {
             uptimeSec = o.optLong("uptime_sec", 0L),
             watchdogStatus = o.optString("watchdog_status", "idle"),
             lastError = o.optString("last_error", "").takeIf { it.isNotBlank() },
+            controllerGroupName = o.optString("controller_group_name", ""),
+            mixedPort = o.optInt("mixed_port", 0),
+            mixedSecret = o.optString("mixed_secret", ""),
         )
     }
 

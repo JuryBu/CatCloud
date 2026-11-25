@@ -432,6 +432,9 @@ fn schedule_destroy_flag_clear<R: Runtime>(
 /// Destroy the main WebView window completely so Windows releases `msedgewebview2.exe`
 /// memory immediately. If the floating capsule is closed, the app enters pure windowless mode.
 pub fn enter_windowless_mode<R: Runtime>(app: &AppHandle<R>) {
+    if let Some(st) = app.try_state::<crate::commands::AppState>() {
+        st.lan_sync.shutdown_all();
+    }
     if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         DESTROYING_MAIN.store(true, Ordering::SeqCst);
         LAST_MAIN_DESTROY_MS.store(monotonic_now_ms(), Ordering::SeqCst);
@@ -787,6 +790,9 @@ pub fn handle_window_event<R: Runtime>(
                     sync_macos_activation_policy(&app);
                     emit_window_mode_changed(&app);
                 } else {
+                    if let Some(st) = app.try_state::<crate::commands::AppState>() {
+                        st.lan_sync.shutdown_all();
+                    }
                     tauri::async_runtime::spawn(async move {
                         enter_windowless_mode(&app);
                     });

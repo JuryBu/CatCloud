@@ -401,12 +401,22 @@ object ShareBundleCodec {
             }
         }
 
-        // Resolve fallback_pool_name -> fallback_pool_id across final group set
+        // Resolve fallback_pool_name -> fallback_pool_id across final group set, rejecting self-references
         val nameToId = resultByName.values.associate { it.name.trim() to it.id }
         for ((groupName, fbName) in pendingFallbackNames) {
             val g = resultByName[groupName] ?: continue
-            val resolvedId = nameToId[fbName]
+            val resolvedId = nameToId[fbName]?.takeIf { it != g.id }
             resultByName[groupName] = g.copy(fallbackPoolId = resolvedId)
+        }
+
+        // Sanitize all groups: strip self-referential or dangling fallbackPoolId
+        val validGroupIds = resultByName.values.map { it.id }.toHashSet()
+        for ((groupName, g) in resultByName.entries.toList()) {
+            val sanitizedFb = g.fallbackPoolId?.trim()
+                ?.takeIf { it.isNotEmpty() && it != g.id && validGroupIds.contains(it) }
+            if (sanitizedFb != g.fallbackPoolId) {
+                resultByName[groupName] = g.copy(fallbackPoolId = sanitizedFb)
+            }
         }
 
         return GroupMergeResult(
@@ -860,6 +870,9 @@ object ShareBundleCodec {
     // ---- Internal ZIP / YAML / JSON helpers ----
 
     private fun scanCentralDirectoryForSecurity(bytes: ByteArray) {
+        if (bytes.size < 22) {
+            throw IllegalArgumentException("Invalid or truncated ZIP central directory")
+        }
         // Locate End of Central Directory (EOCD) signature 0x06054b50 from tail
         val minOffset = maxOf(0, bytes.size - 65557)
         var eocdPos = -1
@@ -873,37 +886,46 @@ object ShareBundleCodec {
                 break
             }
         }
-        if (eocdPos < 0) return
+        if (eocdPos < 0) {
+            throw IllegalArgumentException("Invalid or truncated ZIP central directory")
+        }
 
         val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         val totalEntries = buf.getShort(eocdPos + 10).toInt() and 0xFFFF
         if (totalEntries > MAX_ZIP_ENTRIES) {
             throw SecurityException("分享包条目数超限 ($totalEntries > $MAX_ZIP_ENTRIES)")
         }
+        val cdSize = buf.getInt(eocdPos + 12).toLong() and 0xFFFFFFFFL
         val cdOffset = buf.getInt(eocdPos + 16).toLong() and 0xFFFFFFFFL
-        if (cdOffset > bytes.size) return
+        if (cdOffset > eocdPos.toLong() || cdOffset + cdSize > eocdPos.toLong()) {
+            throw IllegalArgumentException("Invalid or truncated ZIP central directory")
+        }
 
         var pos = cdOffset.toInt()
         for (idx in 0 until totalEntries) {
-            if (pos + 46 > bytes.size) break
+            if (pos + 46 > eocdPos) {
+                throw IllegalArgumentException("Invalid or truncated ZIP central directory")
+            }
             val sig = buf.getInt(pos)
-            if (sig != 0x02014b50) break
+            if (sig != 0x02014b50) {
+                throw IllegalArgumentException("Invalid or truncated ZIP central directory")
+            }
             val versionMadeBy = buf.getShort(pos + 4).toInt() and 0xFFFF
             val hostOs = versionMadeBy ushr 8
             val nameLen = buf.getShort(pos + 28).toInt() and 0xFFFF
             val extraLen = buf.getShort(pos + 30).toInt() and 0xFFFF
             val commentLen = buf.getShort(pos + 32).toInt() and 0xFFFF
+            val nextPosLong = pos.toLong() + 46L + nameLen.toLong() + extraLen.toLong() + commentLen.toLong()
+            if (nextPosLong > eocdPos.toLong()) {
+                throw IllegalArgumentException("Invalid or truncated ZIP central directory")
+            }
             val extAttr = buf.getInt(pos + 38)
             val unixMode = (extAttr ushr 16) and 0xFFFF
-            val entryName = if (pos + 46 + nameLen <= bytes.size) {
-                String(bytes, pos + 46, nameLen, Charsets.UTF_8)
-            } else {
-                "<entry#$idx>"
-            }
+            val entryName = String(bytes, pos + 46, nameLen, Charsets.UTF_8)
             if ((hostOs == 3 || unixMode != 0) && (unixMode and UNIX_FILE_TYPE_MASK) == UNIX_SYMLINK_MODE) {
                 throw SecurityException("分享包包含非法符号链接条目「$entryName」，已拒绝解析")
             }
-            pos += 46 + nameLen + extraLen + commentLen
+            pos = nextPosLong.toInt()
         }
     }
 

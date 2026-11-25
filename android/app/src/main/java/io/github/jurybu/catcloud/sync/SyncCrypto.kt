@@ -140,7 +140,7 @@ object SyncCrypto {
         customNonce: ByteArray? = null,
     ): ByteArray {
         require(passwordUtf8.isNotEmpty()) { "password cannot be empty" }
-        require(iters > 0) { "PBKDF2 iterations must be positive" }
+        require(iters in 1_000..2_000_000) { "PBKDF2 iterations must be in 1000..2000000 (got $iters)" }
         val sidBytes = sid.toByteArray(Charsets.UTF_8)
         require(sidBytes.size <= MAX_SID_LEN) { "sid length exceeds 64 bytes" }
         val salt = customSalt ?: randomBytes(SALT_LEN)
@@ -474,10 +474,30 @@ object SyncCrypto {
             ?: emptyList()
         val port = queryMap["port"]?.toIntOrNull()?.takeIf { it in 1..65535 }
         val sid = queryMap["sid"]?.trim().orEmpty()
+        val sidByteLen = sid.toByteArray(Charsets.UTF_8).size
+        require(sidByteLen <= MAX_SID_LEN) {
+            "同步参数 sid 长度超过 64 字节上限 ($sidByteLen)"
+        }
         val ep = queryMap["ep"]?.trim()?.takeIf { it.isNotEmpty() }
         val relayUrl = queryMap["url"]?.trim()?.takeIf { it.isNotEmpty() }
-        val fpHex = queryMap["fp"]?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        val rawFp = queryMap["fp"]
+        val fpHex = if (rawFp != null) {
+            val cleanFp = rawFp.trim().lowercase()
+            require(cleanFp.length == 16 && cleanFp.all { it in '0'..'9' || it in 'a'..'f' }) {
+                "无效的指纹参数 fp（必须为 16 位十六进制）: $cleanFp"
+            }
+            cleanFp
+        } else {
+            null
+        }
 
+        if (role == SyncRole.PULL || role == SyncRole.PUSH) {
+            require(sid.isNotEmpty()) { "${role.wireValue} 模式缺少必需的 sid 参数" }
+            val hasLanTarget = hosts.isNotEmpty() && port != null
+            require(ep != null || hasLanTarget) {
+                "${role.wireValue} 模式至少需要提供 ep 或 hosts+port 之一"
+            }
+        }
         if (role == SyncRole.RELAY_URL) {
             val uStr = relayUrl ?: throw IllegalArgumentException("relay_url 模式缺少 url 参数")
             validatePublicHttpsUrl(uStr)
@@ -578,7 +598,7 @@ object SyncCrypto {
         return false
     }
 
-    private fun isSpecialOrPrivateIp(ip: InetAddress): Boolean {
+    fun isSpecialOrPrivateIp(ip: InetAddress): Boolean {
         if (ip.isAnyLocalAddress || ip.isLoopbackAddress || ip.isLinkLocalAddress ||
             ip.isSiteLocalAddress || ip.isMulticastAddress
         ) {
@@ -588,19 +608,51 @@ object SyncCrypto {
             val b = ip.address
             val o0 = b[0].toInt() and 0xFF
             val o1 = b[1].toInt() and 0xFF
+            val o2 = b[2].toInt() and 0xFF
             return o0 == 0 ||
                 o0 == 10 ||
                 o0 == 127 ||
                 (o0 == 100 && o1 in 64..127) ||
                 (o0 == 169 && o1 == 254) ||
                 (o0 == 172 && o1 in 16..31) ||
+                // RFC 6890 IETF protocol assignments & RFC 5737 TEST-NET-1
+                (o0 == 192 && o1 == 0 && (o2 == 0 || o2 == 2)) ||
                 (o0 == 192 && o1 == 168) ||
                 (o0 == 198 && (o1 == 18 || o1 == 19)) ||
+                // RFC 5737 TEST-NET-2 & TEST-NET-3
+                (o0 == 198 && o1 == 51 && o2 == 100) ||
+                (o0 == 203 && o1 == 0 && o2 == 113) ||
                 o0 >= 224
         }
         if (ip is Inet6Address) {
-            val b0 = ip.address[0].toInt() and 0xFF
-            return (b0 and 0xFE) == 0xFC // fc00::/7 ULA
+            val b = ip.address
+            if (b.size != 16) return true
+            val b0 = b[0].toInt() and 0xFF
+            val b1 = b[1].toInt() and 0xFF
+            val b2 = b[2].toInt() and 0xFF
+            val b3 = b[3].toInt() and 0xFF
+            val b4 = b[4].toInt() and 0xFF
+            val b5 = b[5].toInt() and 0xFF
+            // fc00::/7 ULA
+            if ((b0 and 0xFE) == 0xFC) return true
+            // 2001:db8::/32 documentation prefix (RFC 3849)
+            if (b0 == 0x20 && b1 == 0x01 && b2 == 0x0D && b3 == 0xB8) return true
+            // 64:ff9b::/96 well-known NAT64 (RFC 6052) and 64:ff9b:1::/48 local NAT64 (RFC 8215)
+            if (b0 == 0x00 && b1 == 0x64 && b2 == 0xFF && b3 == 0x9B) {
+                val isWellKnownNat64 = (4..11).all { b[it] == 0.toByte() }
+                val isLocalNat64 = b4 == 0x00 && b5 == 0x01
+                if (isWellKnownNat64 || isLocalNat64) return true
+            }
+            // ::w.x.y.z deprecated IPv4-compatible IPv6 (also encompasses :: and ::1)
+            if ((0..11).all { b[it] == 0.toByte() }) return true
+            // ::ffff:w.x.y.z IPv4-mapped IPv6
+            if ((0..9).all { b[it] == 0.toByte() } &&
+                (b[10].toInt() and 0xFF) == 0xFF &&
+                (b[11].toInt() and 0xFF) == 0xFF
+            ) {
+                val mappedV4 = runCatching { InetAddress.getByAddress(b.copyOfRange(12, 16)) }.getOrNull()
+                return mappedV4 == null || isSpecialOrPrivateIp(mappedV4)
+            }
         }
         return false
     }
@@ -634,9 +686,12 @@ object SyncCrypto {
             if (part.isBlank()) continue
             val eq = part.indexOf('=')
             if (eq > 0) {
-                val k = urlDecode(part.substring(0, eq))
+                val k = urlDecode(part.substring(0, eq)).trim().lowercase()
                 val v = urlDecode(part.substring(eq + 1))
-                map[k] = v
+                if (k.isNotEmpty()) map[k] = v
+            } else if (eq < 0) {
+                val k = urlDecode(part).trim().lowercase()
+                if (k.isNotEmpty()) map[k] = ""
             }
         }
         return map

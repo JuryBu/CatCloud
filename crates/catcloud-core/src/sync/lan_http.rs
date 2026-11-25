@@ -30,6 +30,9 @@ pub const MAX_AUTH_FAILURES: u32 = 5;
 /// Hard maximum request/response payload size (17 MiB).
 pub const MAX_HTTP_BODY_BYTES: usize = 17 * 1024 * 1024;
 const MAX_HTTP_HEADER_BYTES: usize = 16 * 1024;
+const MAX_CHUNK_LINE_BYTES: usize = 256;
+const MAX_CHUNK_TRAILER_BYTES: usize = 4 * 1024;
+const INITIAL_BODY_BUF_CAP: usize = 64 * 1024;
 const MAX_PIN_EXCHANGE_BODY_BYTES: usize = 8 * 1024;
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 const CONNECTION_IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -154,7 +157,7 @@ enum ServerMode {
         zip_bytes: Arc<Vec<u8>>,
     },
     Receive {
-        bundle_tx: mpsc::Sender<ReceivedSyncBundle>,
+        bundle_tx: std::sync::Mutex<Option<mpsc::Sender<ReceivedSyncBundle>>>,
         push_ephem_sessions: Mutex<Vec<(String, [u8; KEY_LEN])>>,
     },
 }
@@ -165,28 +168,51 @@ struct SharedServerState {
     master_key: [u8; KEY_LEN],
     pin: String,
     allow_multiple: bool,
+    consumed: AtomicBool,
     auth_failures: AtomicU32,
     destroyed: AtomicBool,
     is_closed: AtomicBool,
     shutdown_tx: watch::Sender<bool>,
+    close_reason_tx: watch::Sender<Option<String>>,
     pin_handshake: Mutex<PinHandshakeState>,
     mode: ServerMode,
 }
 
 impl SharedServerState {
+    fn set_close_reason_if_unset(&self, reason: &str) {
+        self.close_reason_tx.send_if_modified(|cur| {
+            if cur.is_none() {
+                *cur = Some(reason.to_string());
+                true
+            } else {
+                false
+            }
+        });
+    }
+
+    fn close_bundle_channel(&self) {
+        if let ServerMode::Receive { bundle_tx, .. } = &self.mode
+            && let Ok(mut guard) = bundle_tx.lock()
+        {
+            let _ = guard.take();
+        }
+    }
+
     fn record_auth_failure(&self) -> bool {
         let count = self.auth_failures.fetch_add(1, Ordering::SeqCst) + 1;
         if count >= MAX_AUTH_FAILURES {
-            self.trigger_shutdown();
+            self.trigger_shutdown_with_reason("destroyed");
             true
         } else {
             false
         }
     }
 
-    fn trigger_shutdown(&self) {
+    fn trigger_shutdown_with_reason(&self, reason: &str) {
+        self.set_close_reason_if_unset(reason);
         self.destroyed.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(true);
+        self.close_bundle_channel();
     }
 
     fn is_destroyed(&self) -> bool {
@@ -198,6 +224,7 @@ impl SharedServerState {
 pub struct LanSyncSendServer {
     info: LanSyncSendInfo,
     state: Arc<SharedServerState>,
+    close_reason: watch::Receiver<Option<String>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -240,16 +267,19 @@ impl LanSyncSendServer {
         let expires_at_unix = Utc::now().timestamp() + ttl_secs as i64;
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (close_reason_tx, close_reason_rx) = watch::channel(None);
         let state = Arc::new(SharedServerState {
             sid: sid.clone(),
             role: SyncRole::Pull,
             master_key,
             pin: pin.clone(),
             allow_multiple: opts.allow_multiple,
+            consumed: AtomicBool::new(false),
             auth_failures: AtomicU32::new(0),
             destroyed: AtomicBool::new(false),
             is_closed: AtomicBool::new(false),
             shutdown_tx,
+            close_reason_tx,
             pin_handshake: Mutex::new(PinHandshakeState::new_fresh()?),
             mode: ServerMode::Send {
                 zip_bytes: Arc::new(zip_bytes),
@@ -278,6 +308,7 @@ impl LanSyncSendServer {
         Ok(Self {
             info,
             state,
+            close_reason: close_reason_rx,
             task: Some(task),
         })
     }
@@ -294,9 +325,19 @@ impl LanSyncSendServer {
         self.state.auth_failures.load(Ordering::SeqCst)
     }
 
+    /// Subscribe to the session termination reason (`"completed"` / `"expired"` / `"destroyed"` / `"cancelled"`).
+    pub fn subscribe_close_reason(&self) -> watch::Receiver<Option<String>> {
+        self.close_reason.clone()
+    }
+
+    /// Current termination reason if the session has already closed.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason.borrow().clone()
+    }
+
     /// Deterministically stop the listener and release the bound TCP port.
     pub async fn cancel(&mut self) {
-        self.state.trigger_shutdown();
+        self.state.trigger_shutdown_with_reason("cancelled");
         if let Some(handle) = self.task.take() {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
@@ -306,7 +347,7 @@ impl LanSyncSendServer {
 
 impl Drop for LanSyncSendServer {
     fn drop(&mut self) {
-        self.state.trigger_shutdown();
+        self.state.trigger_shutdown_with_reason("cancelled");
         if let Some(handle) = self.task.take() {
             handle.abort();
         }
@@ -318,6 +359,7 @@ impl Drop for LanSyncSendServer {
 pub struct LanSyncReceiveServer {
     info: LanSyncReceiveInfo,
     state: Arc<SharedServerState>,
+    close_reason: watch::Receiver<Option<String>>,
     rx: Option<mpsc::Receiver<ReceivedSyncBundle>>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
@@ -354,19 +396,22 @@ impl LanSyncReceiveServer {
 
         let (bundle_tx, bundle_rx) = mpsc::channel(8);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (close_reason_tx, close_reason_rx) = watch::channel(None);
         let state = Arc::new(SharedServerState {
             sid: sid.clone(),
             role: SyncRole::Push,
             master_key,
             pin: pin.clone(),
             allow_multiple: opts.allow_multiple,
+            consumed: AtomicBool::new(false),
             auth_failures: AtomicU32::new(0),
             destroyed: AtomicBool::new(false),
             is_closed: AtomicBool::new(false),
             shutdown_tx,
+            close_reason_tx,
             pin_handshake: Mutex::new(PinHandshakeState::new_fresh()?),
             mode: ServerMode::Receive {
-                bundle_tx,
+                bundle_tx: std::sync::Mutex::new(Some(bundle_tx)),
                 push_ephem_sessions: Mutex::new(Vec::new()),
             },
         });
@@ -392,6 +437,7 @@ impl LanSyncReceiveServer {
         Ok(Self {
             info,
             state,
+            close_reason: close_reason_rx,
             rx: Some(bundle_rx),
             task: Some(task),
         })
@@ -409,6 +455,16 @@ impl LanSyncReceiveServer {
         self.state.auth_failures.load(Ordering::SeqCst)
     }
 
+    /// Subscribe to the session termination reason (`"completed"` / `"expired"` / `"destroyed"` / `"cancelled"`).
+    pub fn subscribe_close_reason(&self) -> watch::Receiver<Option<String>> {
+        self.close_reason.clone()
+    }
+
+    /// Current termination reason if the session has already closed.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason.borrow().clone()
+    }
+
     /// Take ownership of the received-bundle channel (e.g. to forward into a Tauri event emitter).
     pub fn take_receiver(&mut self) -> Option<mpsc::Receiver<ReceivedSyncBundle>> {
         self.rx.take()
@@ -424,7 +480,7 @@ impl LanSyncReceiveServer {
 
     /// Deterministically stop the listener and release the bound TCP port.
     pub async fn cancel(&mut self) {
-        self.state.trigger_shutdown();
+        self.state.trigger_shutdown_with_reason("cancelled");
         if let Some(handle) = self.task.take() {
             let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
         }
@@ -434,7 +490,7 @@ impl LanSyncReceiveServer {
 
 impl Drop for LanSyncReceiveServer {
     fn drop(&mut self) {
-        self.state.trigger_shutdown();
+        self.state.trigger_shutdown_with_reason("cancelled");
         if let Some(handle) = self.task.take() {
             handle.abort();
         }
@@ -488,7 +544,7 @@ fn spawn_accept_loop(
                     }
                 }
                 _ = &mut sleep => {
-                    state.trigger_shutdown();
+                    state.trigger_shutdown_with_reason("expired");
                     break;
                 }
                 accepted = listener.accept() => {
@@ -524,6 +580,8 @@ fn spawn_accept_loop(
         }
 
         drop(listener);
+        state.close_bundle_channel();
+        state.set_close_reason_if_unset("cancelled");
         state.is_closed.store(true, Ordering::SeqCst);
     })
 }
@@ -548,18 +606,26 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<ParsedHttpRequest, 
     let mut line = Vec::with_capacity(256);
 
     loop {
+        let remaining = MAX_HTTP_HEADER_BYTES.saturating_sub(head_bytes.len());
+        if remaining == 0 {
+            return Err(ReadRequestError::HeadersTooLarge);
+        }
         line.clear();
-        let n = reader
+        let n = (&mut reader)
+            .take((remaining + 1) as u64)
             .read_until(b'\n', &mut line)
             .await
             .map_err(|_| ReadRequestError::Closed)?;
         if n == 0 {
             return Err(ReadRequestError::Closed);
         }
-        head_bytes.extend_from_slice(&line);
-        if head_bytes.len() > MAX_HTTP_HEADER_BYTES {
+        if n > remaining {
             return Err(ReadRequestError::HeadersTooLarge);
         }
+        if !line.ends_with(b"\n") {
+            return Err(ReadRequestError::Closed);
+        }
+        head_bytes.extend_from_slice(&line);
         if line == b"\r\n" || line == b"\n" {
             break;
         }
@@ -624,11 +690,22 @@ async fn read_http_request(stream: &mut TcpStream) -> Result<ParsedHttpRequest, 
         if content_len > MAX_HTTP_BODY_BYTES {
             return Err(ReadRequestError::PayloadTooLarge);
         }
-        let mut buf = vec![0u8; content_len];
-        reader
-            .read_exact(&mut buf)
-            .await
-            .map_err(|_| ReadRequestError::BadRequest("truncated request body"))?;
+        let mut buf = Vec::with_capacity(content_len.min(INITIAL_BODY_BUF_CAP));
+        let mut limited = (&mut reader).take(content_len as u64);
+        let mut chunk = [0u8; 16 * 1024];
+        while buf.len() < content_len {
+            let n = limited
+                .read(&mut chunk)
+                .await
+                .map_err(|_| ReadRequestError::BadRequest("truncated request body"))?;
+            if n == 0 {
+                return Err(ReadRequestError::BadRequest("truncated request body"));
+            }
+            if buf.len().saturating_add(n) > MAX_HTTP_BODY_BYTES {
+                return Err(ReadRequestError::PayloadTooLarge);
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
         buf
     } else {
         Vec::new()
@@ -647,17 +724,27 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(
     max_bytes: usize,
 ) -> Result<Vec<u8>, ReadRequestError> {
     let mut out = Vec::new();
-    let mut size_line = String::new();
+    let mut size_line = Vec::with_capacity(64);
+    let mut chunk_buf = [0u8; 16 * 1024];
     loop {
         size_line.clear();
-        let n = reader
-            .read_line(&mut size_line)
+        let n = (&mut *reader)
+            .take((MAX_CHUNK_LINE_BYTES + 1) as u64)
+            .read_until(b'\n', &mut size_line)
             .await
             .map_err(|_| ReadRequestError::BadRequest("truncated chunk size"))?;
         if n == 0 {
             return Err(ReadRequestError::BadRequest("unexpected EOF in chunked body"));
         }
-        let size_hex = size_line
+        if n > MAX_CHUNK_LINE_BYTES {
+            return Err(ReadRequestError::BadRequest("chunk size line too long"));
+        }
+        if !size_line.ends_with(b"\n") {
+            return Err(ReadRequestError::BadRequest("truncated chunk size"));
+        }
+        let size_str = std::str::from_utf8(&size_line)
+            .map_err(|_| ReadRequestError::BadRequest("invalid utf-8 chunk size"))?;
+        let size_hex = size_str
             .trim()
             .split(';')
             .next()
@@ -666,25 +753,59 @@ async fn read_chunked_body<R: AsyncRead + Unpin>(
         let chunk_len = usize::from_str_radix(size_hex, 16)
             .map_err(|_| ReadRequestError::BadRequest("invalid chunk size hex"))?;
         if chunk_len == 0 {
-            // Drain trailing CRLF/trailers
-            let mut trailer = String::new();
-            let _ = reader.read_line(&mut trailer).await;
+            // Drain bounded trailing headers / CRLF
+            let mut trailer_total = 0usize;
+            let mut trailer = Vec::with_capacity(64);
+            loop {
+                trailer.clear();
+                let tn = (&mut *reader)
+                    .take((MAX_CHUNK_LINE_BYTES + 1) as u64)
+                    .read_until(b'\n', &mut trailer)
+                    .await
+                    .map_err(|_| ReadRequestError::BadRequest("truncated chunk trailer"))?;
+                if tn == 0 {
+                    break;
+                }
+                if tn > MAX_CHUNK_LINE_BYTES {
+                    return Err(ReadRequestError::BadRequest("chunk trailer line too long"));
+                }
+                if !trailer.ends_with(b"\n") {
+                    return Err(ReadRequestError::BadRequest("truncated chunk trailer"));
+                }
+                trailer_total = trailer_total.saturating_add(tn);
+                if trailer_total > MAX_CHUNK_TRAILER_BYTES {
+                    return Err(ReadRequestError::BadRequest("chunk trailers too large"));
+                }
+                if trailer == b"\r\n" || trailer == b"\n" {
+                    break;
+                }
+            }
             break;
         }
         if out.len().saturating_add(chunk_len) > max_bytes {
             return Err(ReadRequestError::PayloadTooLarge);
         }
-        let start = out.len();
-        out.resize(start + chunk_len, 0);
-        reader
-            .read_exact(&mut out[start..])
-            .await
-            .map_err(|_| ReadRequestError::BadRequest("truncated chunk payload"))?;
+        let target_len = out.len() + chunk_len;
+        out.reserve(chunk_len.min(INITIAL_BODY_BUF_CAP));
+        let mut limited = (&mut *reader).take(chunk_len as u64);
+        while out.len() < target_len {
+            let rn = limited
+                .read(&mut chunk_buf)
+                .await
+                .map_err(|_| ReadRequestError::BadRequest("truncated chunk payload"))?;
+            if rn == 0 {
+                return Err(ReadRequestError::BadRequest("truncated chunk payload"));
+            }
+            out.extend_from_slice(&chunk_buf[..rn]);
+        }
         let mut crlf = [0u8; 2];
         reader
             .read_exact(&mut crlf)
             .await
             .map_err(|_| ReadRequestError::BadRequest("missing chunk CRLF"))?;
+        if crlf != *b"\r\n" {
+            return Err(ReadRequestError::BadRequest("invalid chunk CRLF"));
+        }
     }
     Ok(out)
 }
@@ -857,6 +978,15 @@ async fn handle_pin_exchange(
 
     match &state.mode {
         ServerMode::Send { zip_bytes } => {
+            if !state.allow_multiple
+                && state
+                    .consumed
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+            {
+                let _ = write_json_error(stream, 410, "Gone", "sync session already consumed").await;
+                return;
+            }
             match seal_with_key(zip_bytes, &k_ephem, &state.sid) {
                 Ok(envelope) => {
                     let _ = write_http_response(
@@ -868,10 +998,13 @@ async fn handle_pin_exchange(
                     )
                     .await;
                     if !state.allow_multiple {
-                        state.trigger_shutdown();
+                        state.trigger_shutdown_with_reason("completed");
                     }
                 }
                 Err(_) => {
+                    if !state.allow_multiple {
+                        state.consumed.store(false, Ordering::SeqCst);
+                    }
                     let _ = write_json_error(stream, 500, "Internal Server Error", "encryption failed").await;
                 }
             }
@@ -927,14 +1060,27 @@ async fn handle_get_bundle(
         return;
     }
 
+    if !state.allow_multiple
+        && state
+            .consumed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        let _ = write_json_error(stream, 410, "Gone", "sync session already consumed").await;
+        return;
+    }
+
     match seal_with_key(zip_bytes, &state.master_key, &state.sid) {
         Ok(envelope) => {
             let _ = write_http_response(stream, 200, "OK", "application/octet-stream", &envelope).await;
             if !state.allow_multiple {
-                state.trigger_shutdown();
+                state.trigger_shutdown_with_reason("completed");
             }
         }
         Err(_) => {
+            if !state.allow_multiple {
+                state.consumed.store(false, Ordering::SeqCst);
+            }
             let _ = write_json_error(stream, 500, "Internal Server Error", "encryption failed").await;
         }
     }
@@ -1007,6 +1153,16 @@ async fn handle_post_bundle(
         }
     };
 
+    if !state.allow_multiple
+        && state
+            .consumed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+    {
+        let _ = write_json_error(stream, 410, "Gone", "sync session already consumed").await;
+        return;
+    }
+
     let fingerprint = plaintext_fingerprint(&zip_bytes);
     let byte_len = zip_bytes.len();
     let event = ReceivedSyncBundle {
@@ -1016,7 +1172,13 @@ async fn handle_post_bundle(
         via_pin,
     };
 
-    if bundle_tx.send(event).await.is_err() {
+    let tx_opt = bundle_tx.lock().ok().and_then(|g| g.as_ref().cloned());
+    let Some(tx) = tx_opt else {
+        let _ = write_json_error(stream, 410, "Gone", "receiver channel closed").await;
+        return;
+    };
+
+    if tx.send(event).await.is_err() {
         let _ = write_json_error(stream, 410, "Gone", "receiver channel closed").await;
         return;
     }
@@ -1031,7 +1193,7 @@ async fn handle_post_bundle(
     }
 
     if !state.allow_multiple {
-        state.trigger_shutdown();
+        state.trigger_shutdown_with_reason("completed");
     }
 }
 
@@ -1939,6 +2101,152 @@ mod tests {
             resp_text.starts_with("HTTP/1.1 413 "),
             "expected HTTP 413 Payload Too Large, got: {resp_text}"
         );
+        server.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn receive_server_ttl_expiry_closes_bundle_channel_with_expired_reason() {
+        let mut opts = loopback_opts(false);
+        opts.ttl_secs = 1;
+        let mut server = LanSyncReceiveServer::start(opts).await.unwrap();
+        let reason_rx = server.subscribe_close_reason();
+
+        let res = tokio::time::timeout(Duration::from_secs(3), server.recv_bundle())
+            .await
+            .expect("recv_bundle must not hang after TTL expiry");
+        assert!(res.is_none(), "expired receiver must yield None");
+        assert_eq!(reason_rx.borrow().as_deref(), Some("expired"));
+        assert_eq!(server.close_reason().as_deref(), Some("expired"));
+        server.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn receive_server_five_wrong_pins_closes_bundle_channel_with_destroyed_reason() {
+        let mut server = LanSyncReceiveServer::start(loopback_opts(true)).await.unwrap();
+        let addr = format!("127.0.0.1:{}", server.info().port);
+        let correct_pin = server.info().pin.clone();
+        let wrong_pin = if correct_pin == "000000" {
+            "999999"
+        } else {
+            "000000"
+        };
+        let reason_rx = server.subscribe_close_reason();
+
+        for _ in 0..MAX_AUTH_FAILURES {
+            let res = push_sync_bundle_via_pin(&addr, wrong_pin, b"payload").await;
+            assert!(res.is_err());
+        }
+
+        let res = tokio::time::timeout(Duration::from_secs(2), server.recv_bundle())
+            .await
+            .expect("recv_bundle must return immediately after 5 failed PIN attempts");
+        assert!(res.is_none(), "destroyed receiver must yield None");
+        assert_eq!(reason_rx.borrow().as_deref(), Some("destroyed"));
+        assert_eq!(server.close_reason().as_deref(), Some("destroyed"));
+        server.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn unbounded_header_line_without_newline_is_rejected_with_431() {
+        let mut server = LanSyncReceiveServer::start(loopback_opts(false)).await.unwrap();
+        let port = server.info().port;
+
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let giant_line = vec![b'A'; MAX_HTTP_HEADER_BYTES + 2048];
+        let _ = stream.write_all(&giant_line).await;
+        let _ = stream.flush().await;
+
+        let mut resp_buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut resp_buf))
+            .await
+            .expect("server must reject oversize header line promptly");
+        let resp_text = String::from_utf8_lossy(&resp_buf);
+        assert!(
+            resp_text.starts_with("HTTP/1.1 431 "),
+            "expected HTTP 431 Request Header Fields Too Large, got: {resp_text}"
+        );
+        server.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn oversized_chunk_size_line_and_truncated_large_cl_are_rejected_with_400() {
+        let mut server = LanSyncReceiveServer::start(loopback_opts(true)).await.unwrap();
+        let port = server.info().port;
+
+        // 1. Oversize chunk size line without newline
+        {
+            let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            let head = format!(
+                "POST /sync/v1/bundle HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nTransfer-Encoding: chunked\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            let giant_chunk_line = vec![b'f'; MAX_CHUNK_LINE_BYTES + 64];
+            let _ = stream.write_all(&giant_chunk_line).await;
+            let _ = stream.flush().await;
+
+            let mut resp_buf = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut resp_buf))
+                .await
+                .expect("oversize chunk size line must be rejected promptly");
+            let resp_text = String::from_utf8_lossy(&resp_buf);
+            assert!(
+                resp_text.starts_with("HTTP/1.1 400 "),
+                "expected HTTP 400 for oversize chunk size line, got: {resp_text}"
+            );
+        }
+
+        // 2. Declared 17 MiB Content-Length that closes immediately (must not preallocate 17 MiB)
+        {
+            let mut stream = TcpStream::connect(format!("127.0.0.1:{port}"))
+                .await
+                .unwrap();
+            let req = format!(
+                "POST /sync/v1/bundle HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {MAX_HTTP_BODY_BYTES}\r\n\r\n"
+            );
+            stream.write_all(req.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+
+            let mut resp_buf = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut resp_buf))
+                .await
+                .expect("truncated large body must return promptly");
+            let resp_text = String::from_utf8_lossy(&resp_buf);
+            assert!(
+                resp_text.starts_with("HTTP/1.1 400 "),
+                "expected HTTP 400 for truncated body, got: {resp_text}"
+            );
+        }
+
+        server.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn one_shot_send_concurrent_get_only_delivers_once() {
+        let payload = b"PK\x03\x04one-shot-concurrency-guard".to_vec();
+        let mut server = LanSyncSendServer::start(payload.clone(), loopback_opts(false))
+            .await
+            .unwrap();
+        let uri = server.info().uri.clone();
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..6 {
+            let u = uri.clone();
+            tasks.spawn(async move { fetch_sync_bundle_via_uri(&u).await });
+        }
+
+        let mut successes = 0usize;
+        while let Some(res) = tasks.join_next().await {
+            if let Ok(Ok(bytes)) = res {
+                assert_eq!(bytes, payload);
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 1, "one-shot send must deliver to exactly one client");
+        assert_eq!(server.close_reason().as_deref(), Some("completed"));
         server.cancel().await;
     }
 }

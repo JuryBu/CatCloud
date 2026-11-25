@@ -36,6 +36,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
 import java.net.Inet4Address
@@ -74,7 +75,15 @@ class CatCloudVpnService : VpnService() {
     @Volatile
     private var activeNodeName = ""
     @Volatile
+    private var controllerGroupName = ""
+    @Volatile
     private var activeNodeCount = 0
+    @Volatile
+    private var mixedPort = 0
+    @Volatile
+    private var mixedSecret = ""
+    @Volatile
+    private var lastAllocatedRestPort = 0
     @Volatile
     private var startedAtMs = 0L
     @Volatile
@@ -147,6 +156,7 @@ class CatCloudVpnService : VpnService() {
             perAppMode: String?,
             perAppPackages: Array<out String>?,
             activeNodeName: String?,
+            controllerGroupName: String?,
             activeNodeCount: Int,
         ): String {
             enforceSameUid()
@@ -155,6 +165,7 @@ class CatCloudVpnService : VpnService() {
                 perAppMode = perAppMode ?: "bypass",
                 perAppPackages = perAppPackages?.filterNotNull()?.toTypedArray() ?: emptyArray(),
                 nodeName = activeNodeName.orEmpty(),
+                groupName = controllerGroupName.orEmpty(),
                 nodeCount = activeNodeCount,
             )
         }
@@ -162,12 +173,14 @@ class CatCloudVpnService : VpnService() {
         override fun reloadVpn(
             configPath: String?,
             activeNodeName: String?,
+            controllerGroupName: String?,
             activeNodeCount: Int,
         ): String {
             enforceSameUid()
             return reloadVpnInternal(
                 configPath = configPath.orEmpty(),
                 nodeName = activeNodeName.orEmpty(),
+                groupName = controllerGroupName.orEmpty(),
                 nodeCount = activeNodeCount,
             )
         }
@@ -188,11 +201,17 @@ class CatCloudVpnService : VpnService() {
                 MihomoBridge.nativeForceGc()
             }
         }
+
+        override fun setWatchdogPaused(paused: Boolean) {
+            enforceSameUid()
+            watchdogRunner.setPaused(paused)
+            logStore.append("VPN", if (paused) "Watchdog paused via IPC" else "Watchdog resumed via IPC")
+        }
     }
 
     override fun onCreate() {
         super.onCreate()
-        logStore = LogRingStore(File(filesDir, "logs"))
+        logStore = LogRingStore(File(filesDir, "logs"), filePrefix = "catcloud-vpn")
         watchdogRunner = DualOriginWatchdogRunner(serviceScope) { status ->
             watchdogStatus = status
         }
@@ -205,16 +224,20 @@ class CatCloudVpnService : VpnService() {
 
         when (intent?.action) {
             ACTION_STOP -> {
-                stopVpnInternal(stopServiceAfter = true)
+                serviceScope.launch(Dispatchers.IO) {
+                    stopVpnInternal(stopServiceAfter = true)
+                }
                 return START_NOT_STICKY
             }
             ACTION_START_FROM_SNAPSHOT -> {
-                val res = startFromBootSnapshot()
-                if (!res.startsWith("OK")) {
-                    logStore.append("VPN", "Snapshot start failed: $res")
-                    stopVpnInternal(stopServiceAfter = true)
-                    return START_NOT_STICKY
+                serviceScope.launch(Dispatchers.IO) {
+                    val res = startFromBootSnapshot()
+                    if (!res.startsWith("OK")) {
+                        logStore.append("VPN", "Snapshot start failed: $res")
+                        stopVpnInternal(stopServiceAfter = true)
+                    }
                 }
+                return START_STICKY
             }
         }
         return START_STICKY
@@ -262,6 +285,7 @@ class CatCloudVpnService : VpnService() {
         perAppMode: String,
         perAppPackages: Array<String>,
         nodeName: String,
+        groupName: String,
         nodeCount: Int,
     ): String = synchronized(serviceLock) {
         startForegroundCompat(buildNotification(getString(R.string.vpn_notification_title_starting), nodeName))
@@ -273,6 +297,7 @@ class CatCloudVpnService : VpnService() {
         val yamlText = runCatching { cfgFile.readText(Charsets.UTF_8) }.getOrElse {
             return failAndReturn("ERR:READ_CONFIG_FAILED:${it.message}")
         }
+        val (parsedMixedPort, parsedMixedSecret) = extractLoopbackMixedConfig(yamlText)
 
         if (!MihomoBridge.ensureLoaded()) {
             return failAndReturn("ERR:NATIVE_LIB_MISSING:${MihomoBridge.lastLoadError()}")
@@ -307,7 +332,7 @@ class CatCloudVpnService : VpnService() {
         val pfd = establishTunInterface(perAppMode, perAppPackages)
         if (pfd == null) {
             runCatching { MihomoBridge.nativeStopTun() }
-            return failAndReturn("ERR:VPN_ESTABLISH_FAILED")
+            return failAndReturn("ERR:VPN_ESTABLISH_FAILED", stopService = true)
         }
 
         // Transfer FD ownership to Go sing_tun (NEVER call pfd.close() after detachFd -> prevents fdsan SIGABRT)
@@ -318,53 +343,71 @@ class CatCloudVpnService : VpnService() {
         val attachErr = MihomoBridge.nativeAttachTun(tunFd, VPN_MTU)
         if (attachErr.isNotBlank()) {
             runCatching { MihomoBridge.nativeStopTun() }
-            return failAndReturn("ERR:ATTACH_TUN:$attachErr")
+            return failAndReturn("ERR:ATTACH_TUN:$attachErr", stopService = true)
         }
 
+        val resolvedGroupName = groupName.trim().ifEmpty { nodeName.trim() }
         lastConfigPath = cfgFile.absolutePath
         lastPerAppMode = perAppMode
         lastPerAppPackages = perAppPackages.copyOf()
         restPort = port
         restSecret = secret
         activeNodeName = nodeName
+        controllerGroupName = resolvedGroupName
         activeNodeCount = nodeCount
+        mixedPort = parsedMixedPort
+        mixedSecret = parsedMixedSecret
         startedAtMs = System.currentTimeMillis()
         running = true
         stateText = "running"
 
         registerRuntimeObservers()
-        watchdogRunner.start(port, secret) { activeNodeName }
+        watchdogRunner.start(port, secret) { controllerGroupName.ifBlank { activeNodeName } }
         updateNotification(getString(R.string.vpn_notification_title_running), nodeName)
         requestTileRefresh()
-        logStore.append("VPN", "Tunnel started (nodes=$nodeCount, memLimitMiB=${memLimit / (1024 * 1024)}, perApp=$perAppMode)")
+        logStore.append("VPN", "Tunnel started (nodes=$nodeCount, memLimitMiB=${memLimit / (1024 * 1024)}, perApp=$perAppMode, group=$resolvedGroupName)")
         "OK"
     }
 
     private fun reloadVpnInternal(
         configPath: String,
         nodeName: String,
+        groupName: String,
         nodeCount: Int,
     ): String = synchronized(serviceLock) {
         if (!running) {
-            return startVpnInternal(configPath, lastPerAppMode, lastPerAppPackages, nodeName, nodeCount)
+            return startVpnInternal(configPath, lastPerAppMode, lastPerAppPackages, nodeName, groupName, nodeCount)
         }
-        val cfgFile = resolveSafeConfigFile(configPath)
-            ?: return failAndReturn("ERR:INVALID_CONFIG_PATH")
+        val cfgFile = resolveSafeConfigFile(configPath) ?: run {
+            lastError = "ERR:INVALID_CONFIG_PATH"
+            logStore.append("VPN", "Reload rejected: ERR:INVALID_CONFIG_PATH")
+            return "ERR:INVALID_CONFIG_PATH"
+        }
         val yamlText = runCatching { cfgFile.readText(Charsets.UTF_8) }.getOrElse {
-            return failAndReturn("ERR:READ_CONFIG_FAILED:${it.message}")
+            val err = "ERR:READ_CONFIG_FAILED:${it.message}"
+            lastError = err
+            logStore.append("VPN", "Reload failed: $err")
+            return err
         }
+        val (parsedMixedPort, parsedMixedSecret) = extractLoopbackMixedConfig(yamlText)
         val memLimit = MihomoBridge.computeMemoryLimitBytes(nodeCount)
         MihomoBridge.nativeSetMemoryLimit(memLimit, 25)
         val reloadErr = MihomoBridge.nativeReloadConfig(yamlText)
         if (reloadErr.isNotBlank()) {
             lastError = reloadErr
+            logStore.append("VPN", "Reload error: $reloadErr")
             return "ERR:RELOAD:$reloadErr"
         }
+        val resolvedGroupName = groupName.trim().ifEmpty { nodeName.trim() }
         lastConfigPath = cfgFile.absolutePath
         activeNodeName = nodeName
+        controllerGroupName = resolvedGroupName
         activeNodeCount = nodeCount
+        mixedPort = parsedMixedPort
+        mixedSecret = parsedMixedSecret
+        lastError = null
         updateNotification(getString(R.string.vpn_notification_title_running), nodeName)
-        logStore.append("VPN", "Hot-reloaded config (nodes=$nodeCount)")
+        logStore.append("VPN", "Hot-reloaded config (nodes=$nodeCount, group=$resolvedGroupName, mixedPort=$parsedMixedPort)")
         "OK"
     }
 
@@ -373,13 +416,14 @@ class CatCloudVpnService : VpnService() {
         val prevMode = lastPerAppMode
         val prevPkgs = lastPerAppPackages.copyOf()
         val prevNode = activeNodeName
+        val prevGroup = controllerGroupName
         val prevCount = activeNodeCount
 
         stopVpnInternal(stopServiceAfter = false)
         if (prevConfig.isBlank()) {
             return startFromBootSnapshot()
         }
-        return startVpnInternal(prevConfig, prevMode, prevPkgs, prevNode, prevCount)
+        return startVpnInternal(prevConfig, prevMode, prevPkgs, prevNode, prevGroup, prevCount)
     }
 
     private fun stopVpnInternal(stopServiceAfter: Boolean) = synchronized(serviceLock) {
@@ -393,6 +437,9 @@ class CatCloudVpnService : VpnService() {
         stateText = "stopped"
         restPort = 0
         restSecret = ""
+        controllerGroupName = ""
+        mixedPort = 0
+        mixedSecret = ""
         startedAtMs = 0L
         watchdogStatus = "idle"
         requestTileRefresh()
@@ -418,8 +465,9 @@ class CatCloudVpnService : VpnService() {
             }
         }
         val nodeName = obj.optString("active_node_name", "")
+        val groupName = obj.optString("controller_group_name", "").ifBlank { nodeName }
         val nodeCount = obj.optInt("active_node_count", 1)
-        return startVpnInternal(cfgPath, mode, pkgs.toTypedArray(), nodeName, nodeCount)
+        return startVpnInternal(cfgPath, mode, pkgs.toTypedArray(), nodeName, groupName, nodeCount)
     }
 
     private fun establishTunInterface(perAppMode: String, perAppPackages: Array<String>): ParcelFileDescriptor? {
@@ -448,28 +496,34 @@ class CatCloudVpnService : VpnService() {
             }
             "allow" -> {
                 val allowed = perAppPackages.map { it.trim() }.filter { it.isNotEmpty() && it != packageName }
-                if (allowed.isNotEmpty()) {
-                    // Android forbids mixing addAllowedApplication and addDisallowedApplication on the same Builder;
-                    // rebuild cleanly with allow-list only (omitting packageName already excludes CatCloud itself!).
-                    val allowBuilder = Builder()
-                        .setSession("CatCloud")
-                        .addAddress(TUN_ADDR_V4, TUN_PREFIX_V4)
-                        .addRoute("0.0.0.0", 0)
-                        .addDnsServer(TUN_DNS_V4)
-                        .setMtu(VPN_MTU)
-                    var addedAny = false
-                    for (pkg in allowed) {
-                        try {
-                            allowBuilder.addAllowedApplication(pkg)
-                            addedAny = true
-                        } catch (_: PackageManager.NameNotFoundException) {
-                            // Ignore uninstalled packages
-                        }
-                    }
-                    if (addedAny) {
-                        return runCatching { allowBuilder.establish() }.getOrNull()
+                if (allowed.isEmpty()) {
+                    // Fail-Closed: never silently fall back to global proxy when allow-list is empty
+                    logStore.append("VPN", "ERR:ALLOWLIST_EMPTY")
+                    return null
+                }
+                // Android forbids mixing addAllowedApplication and addDisallowedApplication on the same Builder;
+                // rebuild cleanly with allow-list only (omitting packageName already excludes CatCloud itself!).
+                val allowBuilder = Builder()
+                    .setSession("CatCloud")
+                    .addAddress(TUN_ADDR_V4, TUN_PREFIX_V4)
+                    .addRoute("0.0.0.0", 0)
+                    .addDnsServer(TUN_DNS_V4)
+                    .setMtu(VPN_MTU)
+                var addedAny = false
+                for (pkg in allowed) {
+                    try {
+                        allowBuilder.addAllowedApplication(pkg)
+                        addedAny = true
+                    } catch (_: PackageManager.NameNotFoundException) {
+                        // Ignore uninstalled packages
                     }
                 }
+                if (!addedAny) {
+                    // Fail-Closed: none of the configured allow-list packages are installed
+                    logStore.append("VPN", "ERR:ALLOWLIST_EMPTY")
+                    return null
+                }
+                return runCatching { allowBuilder.establish() }.getOrNull()
             }
         }
         return runCatching { builder.establish() }.getOrNull()
@@ -566,10 +620,31 @@ class CatCloudVpnService : VpnService() {
         return if (file.isFile) file else null
     }
 
-    private fun allocateLoopbackPort(): Int =
-        runCatching {
-            ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
-        }.getOrDefault(29090)
+    private fun allocateLoopbackPort(): Int {
+        val prevPort = lastAllocatedRestPort.takeIf { it > 0 } ?: restPort
+        var fallbackCandidate = 0
+        repeat(5) {
+            val cand = runCatching {
+                ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+            }.getOrDefault(0)
+            if (cand in 1..65535) {
+                fallbackCandidate = cand
+                if (cand != prevPort) {
+                    lastAllocatedRestPort = cand
+                    return cand
+                }
+            }
+        }
+        val finalPort = if (fallbackCandidate in 1..65535) {
+            fallbackCandidate
+        } else if (prevPort == 29090) {
+            29091
+        } else {
+            29090
+        }
+        lastAllocatedRestPort = finalPort
+        return finalPort
+    }
 
     private fun generateRandomHexSecret(bytesLen: Int): String {
         val buf = ByteArray(bytesLen)
@@ -577,11 +652,26 @@ class CatCloudVpnService : VpnService() {
         return NodeFingerprint.toHexLower(buf)
     }
 
-    private fun failAndReturn(err: String): String {
-        running = false
-        stateText = "error"
+    private fun failAndReturn(err: String, stopService: Boolean = !running): String {
+        val shouldTeardown = stopService || !running
         lastError = err
         logStore.append("VPN", "Error: $err")
+        if (shouldTeardown) {
+            watchdogRunner.stop()
+            unregisterRuntimeObservers()
+            running = false
+            stateText = "error"
+            restPort = 0
+            restSecret = ""
+            controllerGroupName = ""
+            mixedPort = 0
+            mixedSecret = ""
+            startedAtMs = 0L
+            watchdogStatus = "idle"
+            requestTileRefresh()
+            stopForegroundCompat()
+            stopSelf()
+        }
         return err
     }
 
@@ -597,7 +687,10 @@ class CatCloudVpnService : VpnService() {
             put("rest_port", restPort)
             put("rest_secret", restSecret)
             put("active_node_name", activeNodeName)
+            put("controller_group_name", controllerGroupName)
             put("active_node_count", activeNodeCount)
+            put("mixed_port", mixedPort)
+            put("mixed_secret", mixedSecret)
             put("uptime_sec", uptimeSec)
             put("watchdog_status", watchdogStatus)
             put("last_error", lastError ?: "")
@@ -694,5 +787,58 @@ class CatCloudVpnService : VpnService() {
         private const val FALLBACK_PHYSICAL_DNS = "223.5.5.5,1.12.12.12"
         private const val NOTIFICATION_CHANNEL_ID = "catcloud_vpn_tunnel"
         private const val NOTIFICATION_ID = 10443
+
+        private val MIXED_PORT_LINE_RE = Regex("^mixed-port:\\s*['\"]?(\\d{1,5})['\"]?(?:\\s+#.*)?$")
+        private val AUTH_INLINE_RE = Regex("catcloud:([^\\s'\",\\]]+)")
+
+        /**
+         * Extract top-level `mixed-port:` and `catcloud:<secret>` authentication credential
+         * from compiled Mihomo YAML without allocating a full YAML AST inside `:vpn`.
+         */
+        internal fun extractLoopbackMixedConfig(yamlText: String): Pair<Int, String> {
+            var parsedPort = 0
+            var parsedSecret = ""
+            var inAuthSection = false
+
+            for (rawLine in yamlText.lineSequence()) {
+                val trimmed = rawLine.trim()
+                if (trimmed.isEmpty() || trimmed.startsWith("#")) continue
+
+                if (inAuthSection && trimmed.startsWith("-")) {
+                    val item = trimmed.removePrefix("-").trim()
+                        .removeSurrounding("\"").removeSurrounding("'").trim()
+                    if (item.startsWith("catcloud:")) {
+                        val cand = item.substringAfter("catcloud:").trim()
+                        if (cand.isNotEmpty() && parsedSecret.isEmpty()) {
+                            parsedSecret = cand
+                        }
+                    }
+                    continue
+                }
+
+                val isTopLevel = !rawLine[0].isWhitespace()
+                if (isTopLevel) {
+                    inAuthSection = false
+                    val portMatch = MIXED_PORT_LINE_RE.matchEntire(trimmed)
+                    if (portMatch != null) {
+                        val p = portMatch.groupValues[1].toIntOrNull() ?: 0
+                        if (p in 1..65535) parsedPort = p
+                        continue
+                    }
+                    if (trimmed.startsWith("authentication:")) {
+                        val rest = trimmed.removePrefix("authentication:").trim()
+                        if (rest.isEmpty()) {
+                            inAuthSection = true
+                        } else {
+                            AUTH_INLINE_RE.find(rest)?.groupValues?.getOrNull(1)?.trim()?.let { s ->
+                                if (s.isNotEmpty() && parsedSecret.isEmpty()) parsedSecret = s
+                            }
+                        }
+                    }
+                }
+            }
+
+            return if (parsedPort in 1..65535) parsedPort to parsedSecret else 0 to ""
+        }
     }
 }

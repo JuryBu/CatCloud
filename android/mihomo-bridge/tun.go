@@ -66,9 +66,13 @@ func attachTun(tunFd int, mtu int) error {
 		FileDescriptor:      tunFd,
 	}
 
-	// Ownership of tunFd transfers to sing_tun.New (which wraps it in os.NewFile and
-	// closes it inside its own defer l.Close() if stack startup fails). Do not add a
-	// duplicate defer syscall.Close(tunFd) here to prevent double-close / fdsan SIGABRT.
+	// Security & FD-ownership invariant:
+	// - tunFd MUST come strictly from Android VpnService.Builder.establish().detachFd()
+	//   inside same-UID CatCloudVpnService (after tunFd > 0, configPrepared, and clamped MTU checks).
+	//   NEVER pass unvalidated external parameters or arbitrary file descriptors directly to sing_tun.New.
+	// - Ownership of tunFd transfers to sing_tun.New (which wraps it in os.NewFile and
+	//   closes it inside its own defer l.Close() if stack startup fails). Do not add a
+	//   duplicate defer syscall.Close(tunFd) here to prevent double-close / fdsan SIGABRT.
 	listener, err := sing_tun.New(tunCfg, tunnel.Tunnel)
 	if err != nil {
 		return fmt.Errorf("sing_tun.New failed: %w", err)

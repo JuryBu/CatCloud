@@ -1,11 +1,16 @@
 package io.github.jurybu.catcloud.ui
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraManager
 import android.net.Uri
+import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -140,6 +145,8 @@ fun QrScanScreen(
             AndroidView(
                 modifier = Modifier.fillMaxSize(),
                 factory = { ctx ->
+                    val sensorOrientation = resolveBackCameraSensorOrientation(ctx)
+                    var latestBufferSize: Size? = null
                     TextureView(ctx).apply {
                         surfaceTextureListener = object : TextureView.SurfaceTextureListener {
                             override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
@@ -155,6 +162,10 @@ fun QrScanScreen(
                                         activeSurface?.release()
                                         activeSurface = s
                                     },
+                                    onBufferResolutionReady = { res ->
+                                        latestBufferSize = res
+                                        post { applyTextureTransform(this@apply, res, sensorOrientation) }
+                                    },
                                     onDecoded = { text ->
                                         post { onResult(text) }
                                     },
@@ -164,7 +175,12 @@ fun QrScanScreen(
                                 )
                             }
 
-                            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) = Unit
+                            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, w: Int, h: Int) {
+                                latestBufferSize?.let { res ->
+                                    post { applyTextureTransform(this@apply, res, sensorOrientation) }
+                                }
+                            }
+
                             override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
                                 runCatching { boundProvider?.unbindAll() }
                                 activeSurface?.release()
@@ -233,7 +249,7 @@ fun QrScanScreen(
                 )
             }
             Text(
-                text = "支持猫云同步码、mmrelay 中转码及标准节点二维码",
+                text = "支持猫云同步码、中转码、订阅链接及标准节点二维码",
                 color = Color.White.copy(alpha = 0.85f),
                 fontSize = 13.sp,
             )
@@ -248,8 +264,71 @@ fun QrScanScreen(
     }
 }
 
+private fun resolveBackCameraSensorOrientation(context: Context): Int {
+    return runCatching {
+        val cm = context.getSystemService(Context.CAMERA_SERVICE) as? CameraManager ?: return@runCatching 90
+        for (cameraId in cm.cameraIdList) {
+            val chars = cm.getCameraCharacteristics(cameraId)
+            if (chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK) {
+                return@runCatching chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            }
+        }
+        90
+    }.getOrDefault(90)
+}
+
+/**
+ * Computes a center-crop aspect-ratio & display-rotation correction [Matrix] for a raw [TextureView]
+ * fed by CameraX [Preview].
+ *
+ * Camera2 applies a baseline sensor-orientation rotation into the BufferQueue so the image is upright
+ * in the device's natural orientation (`Surface.ROTATION_0`), while [bufferSize] remains in sensor
+ * coordinates. Using [sensorOrientation] we first derive the upright natural dimensions, undo
+ * TextureView's default stretch, counter-rotate by `-displayDegrees` for any display rotation, and
+ * finally center-crop uniformly so the viewfinder fills the container with zero distortion.
+ */
+private fun applyTextureTransform(
+    textureView: TextureView,
+    bufferSize: Size,
+    sensorOrientation: Int,
+) {
+    val viewW = textureView.width.toFloat()
+    val viewH = textureView.height.toFloat()
+    if (viewW <= 0f || viewH <= 0f || bufferSize.width <= 0 || bufferSize.height <= 0) return
+
+    val sensorSwapped = (sensorOrientation % 180) != 0
+    val naturalW = if (sensorSwapped) bufferSize.height.toFloat() else bufferSize.width.toFloat()
+    val naturalH = if (sensorSwapped) bufferSize.width.toFloat() else bufferSize.height.toFloat()
+
+    val displayRotation = textureView.display?.rotation ?: Surface.ROTATION_0
+    val displayDegrees = when (displayRotation) {
+        Surface.ROTATION_90 -> 90
+        Surface.ROTATION_180 -> 180
+        Surface.ROTATION_270 -> 270
+        else -> 0
+    }
+
+    val cx = viewW / 2f
+    val cy = viewH / 2f
+    val matrix = Matrix()
+    // 1. Undo TextureView's default non-uniform stretch back to true natural aspect ratio
+    matrix.postScale(naturalW / viewW, naturalH / viewH, cx, cy)
+    // 2. Counter-rotate for current display orientation
+    if (displayDegrees != 0) {
+        matrix.postRotate((-displayDegrees).toFloat(), cx, cy)
+    }
+    // 3. Uniform center-crop scale so the rotated preview fills the entire TextureView without bars
+    val displaySwapped = (displayDegrees % 180) != 0
+    val contentW = if (displaySwapped) naturalH else naturalW
+    val contentH = if (displaySwapped) naturalW else naturalH
+    val fillScale = maxOf(viewW / contentW, viewH / contentH)
+    matrix.postScale(fillScale, fillScale, cx, cy)
+
+    textureView.setTransform(matrix)
+}
+
 private fun bindCameraToTexture(
-    context: android.content.Context,
+    context: Context,
     lifecycleOwner: LifecycleOwner,
     surfaceTexture: SurfaceTexture,
     analysisExecutor: java.util.concurrent.ExecutorService,
@@ -257,6 +336,7 @@ private fun bindCameraToTexture(
     delivered: AtomicBoolean,
     onProviderReady: (ProcessCameraProvider) -> Unit,
     onSurfaceCreated: (Surface) -> Unit,
+    onBufferResolutionReady: (Size) -> Unit,
     onDecoded: (String) -> Unit,
     onError: (String) -> Unit,
 ) {
@@ -271,6 +351,7 @@ private fun bindCameraToTexture(
             preview.setSurfaceProvider { request ->
                 val res = request.resolution
                 surfaceTexture.setDefaultBufferSize(res.width, res.height)
+                onBufferResolutionReady(res)
                 val surface = Surface(surfaceTexture)
                 onSurfaceCreated(surface)
                 request.provideSurface(surface, mainExecutor) {

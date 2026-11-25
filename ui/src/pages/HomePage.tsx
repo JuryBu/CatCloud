@@ -1483,16 +1483,16 @@ export function HomePage() {
                                   : "未测"}
                           </strong>
                         </span>
-                        <span>
+                        <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
                           ↑{" "}
                           <strong className="cc-mono font-semibold text-[var(--coral)]">
-                            {displayUpMbps !== null ? `${displayUpMbps.toFixed(1)}M` : "未测"}
+                            {displayUpMbps !== null ? `${displayUpMbps.toFixed(1)} Mbps` : "未测"}
                           </strong>
                         </span>
-                        <span>
+                        <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
                           ↓{" "}
                           <strong className="cc-mono font-semibold text-[var(--sky)]">
-                            {displayDownMbps !== null ? `${displayDownMbps.toFixed(1)}M` : "未测"}
+                            {displayDownMbps !== null ? `${displayDownMbps.toFixed(1)} Mbps` : "未测"}
                           </strong>
                         </span>
                         {activeGoogleState === "clean" && (
@@ -1595,12 +1595,15 @@ export function HomePage() {
                                     : "未测"}
                             </strong>
                           </span>
-                          <span className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap cc-mono">
+                          <span
+                            className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap cc-mono"
+                            title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
+                          >
                             <strong className="font-semibold text-[var(--coral)]">
-                              ↑{displayUpMbps !== null ? `${displayUpMbps.toFixed(1)}M` : "--"}
+                              ↑{displayUpMbps !== null ? `${displayUpMbps.toFixed(1)} Mbps` : "--"}
                             </strong>
                             <strong className="font-semibold text-[var(--sky)]">
-                              ↓{displayDownMbps !== null ? `${displayDownMbps.toFixed(1)}M` : "--"}
+                              ↓{displayDownMbps !== null ? `${displayDownMbps.toFixed(1)} Mbps` : "--"}
                             </strong>
                           </span>
                           {activeGoogleState === "clean" && (

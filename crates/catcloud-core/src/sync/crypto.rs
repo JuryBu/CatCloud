@@ -756,27 +756,64 @@ pub fn validate_relay_url(raw_url: &str) -> CatResult<Url> {
     Ok(parsed)
 }
 
+fn is_cleartext_allowed_ipv4(v4: Ipv4Addr) -> bool {
+    let o = v4.octets();
+    v4.is_loopback()
+        || v4.is_private()
+        || v4.is_link_local()
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) // 100.64.0.0/10 CGNAT / Tailscale
+}
+
+fn is_cleartext_allowed_ipv6(v6: Ipv6Addr) -> bool {
+    if let Some(mapped) = v6.to_ipv4_mapped() {
+        return is_cleartext_allowed_ipv4(mapped);
+    }
+    let segs = v6.segments();
+    v6.is_loopback()
+        || (segs[0] & 0xfe00) == 0xfc00 // fc00::/7 Unique Local (ULA)
+        || (segs[0] & 0xffc0) == 0xfe80 // fe80::/10 Link-Local
+}
+
+fn is_cleartext_allowed_endpoint_host(host: &Host<&str>) -> bool {
+    match host {
+        Host::Ipv4(v4) => is_cleartext_allowed_ipv4(*v4),
+        Host::Ipv6(v6) => is_cleartext_allowed_ipv6(*v6),
+        Host::Domain(domain) => {
+            let lower = domain.trim_end_matches('.').to_ascii_lowercase();
+            lower == "localhost"
+                || lower.ends_with(".localhost")
+                || lower.ends_with(".local")
+                || lower.ends_with(".lan")
+        }
+    }
+}
+
 fn validate_endpoint_url(raw_url: &str) -> CatResult<Url> {
     let trimmed = raw_url.trim();
     let parsed = Url::parse(trimmed)
         .map_err(|err| CatError::Validation(format!("invalid sync endpoint '{trimmed}': {err}")))?;
-    match parsed.scheme() {
-        "http" | "https" => {}
-        other => {
-            return Err(CatError::Validation(format!(
-                "sync endpoint scheme '{other}' must be http or https"
-            )));
-        }
-    }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(CatError::Security(
             "sync endpoint must not contain embedded userinfo credentials".into(),
         ));
     }
-    if parsed.host().is_none() {
-        return Err(CatError::Validation("sync endpoint is missing host".into()));
+    let host = parsed
+        .host()
+        .ok_or_else(|| CatError::Validation("sync endpoint is missing host".into()))?;
+    match parsed.scheme() {
+        "https" => Ok(parsed),
+        "http" => {
+            if !is_cleartext_allowed_endpoint_host(&host) {
+                return Err(CatError::Security(format!(
+                    "public sync endpoint '{host}' must use https:// (cleartext http:// is restricted to loopback/LAN/link-local/CGNAT hosts)"
+                )));
+            }
+            Ok(parsed)
+        }
+        other => Err(CatError::Validation(format!(
+            "sync endpoint scheme '{other}' must be http or https"
+        ))),
     }
-    Ok(parsed)
 }
 
 fn validate_host_token(host: &str) -> CatResult<String> {
@@ -1240,6 +1277,83 @@ mod tests {
             assert!(
                 format_sync_uri(&bad_uri).is_err(),
                 "expected SSRF/scheme rejection for {bad_url}"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_url_rejects_public_cleartext_http_and_allows_lan_cgnat() {
+        let key = [0x33u8; KEY_LEN];
+
+        for allowed_ep in [
+            "https://sync.example.com:8443",
+            "https://203.0.113.10:8443",
+            "http://127.0.0.1:43210",
+            "http://localhost:43210",
+            "http://mybox.local:43210",
+            "http://nas.lan:43210",
+            "http://192.168.1.25:43210",
+            "http://10.0.0.8:43210",
+            "http://172.16.0.5:43210",
+            "http://169.254.1.2:43210",
+            "http://100.64.0.1:43210",
+            "http://100.100.10.2:43210",
+            "http://100.127.255.254:43210",
+            "http://[::1]:43210",
+            "http://[fd00::1]:43210",
+            "http://[fe80::1]:43210",
+            "http://[::ffff:192.168.1.10]:43210",
+        ] {
+            let uri = SyncUri {
+                role: SyncRole::Pull,
+                endpoint: Some(allowed_ep.into()),
+                hosts: vec![],
+                port: None,
+                sid: Some("0123456789abcdef".into()),
+                url: None,
+                fingerprint: None,
+                key,
+            };
+            let encoded = format_sync_uri(&uri)
+                .unwrap_or_else(|e| panic!("expected allowed endpoint {allowed_ep}, got err: {e}"));
+            let parsed = parse_sync_uri(&encoded)
+                .unwrap_or_else(|e| panic!("expected parse success for {allowed_ep}, got err: {e}"));
+            assert!(parsed.endpoint.is_some());
+        }
+
+        let outside_cgnat_ep = format!("http://{}.{}.{}.{}:43210", 100, 128, 0, 1);
+        let mapped_public_v6 = format!("http://[::ffff:{}.{}.{}.{}]:8080", 203, 0, 113, 10);
+        for rejected_ep in [
+            "http://sync.example.com:8080",
+            "http://sync.example.org/relay",
+            "http://203.0.113.10:8080",
+            "http://198.51.100.20:43210",
+            outside_cgnat_ep.as_str(),
+            "http://[2001:db8::1]:8080",
+            mapped_public_v6.as_str(),
+        ] {
+            let uri = SyncUri {
+                role: SyncRole::Pull,
+                endpoint: Some(rejected_ep.into()),
+                hosts: vec![],
+                port: None,
+                sid: Some("0123456789abcdef".into()),
+                url: None,
+                fingerprint: None,
+                key,
+            };
+            assert!(
+                format_sync_uri(&uri).is_err(),
+                "expected public cleartext endpoint rejection for {rejected_ep}"
+            );
+            let k_b64 = URL_SAFE_NO_PAD.encode(key);
+            let raw = format!(
+                "catcloud://sync/v1?role=pull&ep={}&sid=0123456789abcdef#k={k_b64}",
+                percent_encode_query_value(rejected_ep)
+            );
+            assert!(
+                parse_sync_uri(&raw).is_err(),
+                "expected parse rejection for public cleartext endpoint {rejected_ep}"
             );
         }
     }

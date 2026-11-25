@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
@@ -107,23 +108,52 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleExternalIntent(intent: Intent?) {
-        if (intent == null || intent.action != Intent.ACTION_VIEW) return
-        val data = intent.data ?: return
-        val scheme = data.scheme?.lowercase().orEmpty()
-        when (scheme) {
-            "catcloud", "catcloud-sync", "mmrelay" -> {
-                viewModel.handleScannedOrPastedText(data.toString(), sourceLabel = "外部唤起")
-            }
-            "clash" -> {
-                val urlParam = data.getQueryParameter("url")
-                if (!urlParam.isNullOrBlank()) {
-                    viewModel.showToast("已收到订阅链接，请在节点导入抽屉粘贴订阅内容或使用同步包")
+        if (intent == null) return
+        when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val streamUri: Uri? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
                 } else {
-                    viewModel.handleScannedOrPastedText(data.toString(), sourceLabel = "外部唤起")
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                } ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.uri
+                if (streamUri != null) {
+                    viewModel.importFromContentUri(streamUri)
+                    return
+                }
+                val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+                    ?: intent.clipData?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
+                if (!sharedText.isNullOrBlank()) {
+                    val installUrl = AppViewModel.extractInstallConfigSubscriptionUrl(sharedText)
+                    if (!installUrl.isNullOrBlank()) {
+                        viewModel.importSubscriptionUrl(installUrl, sourceLabel = "系统分享")
+                    } else {
+                        viewModel.handleScannedOrPastedText(sharedText, sourceLabel = "系统分享")
+                    }
                 }
             }
-            "content", "file" -> {
-                viewModel.importFromContentUri(data)
+            Intent.ACTION_VIEW -> {
+                val data = intent.data ?: return
+                val rawStr = data.toString()
+                when (data.scheme?.lowercase().orEmpty()) {
+                    "clash", "catcloud" -> {
+                        val subUrl = AppViewModel.extractInstallConfigSubscriptionUrl(rawStr)
+                        if (!subUrl.isNullOrBlank()) {
+                            viewModel.importSubscriptionUrl(subUrl, sourceLabel = "外部订阅")
+                        } else {
+                            viewModel.handleScannedOrPastedText(rawStr, sourceLabel = "外部唤起")
+                        }
+                    }
+                    "catcloud-sync", "mmrelay" -> {
+                        viewModel.handleScannedOrPastedText(rawStr, sourceLabel = "外部唤起")
+                    }
+                    "http", "https" -> {
+                        viewModel.importSubscriptionUrl(rawStr, sourceLabel = "外部订阅")
+                    }
+                    "content", "file" -> {
+                        viewModel.importFromContentUri(data)
+                    }
+                }
             }
         }
     }
@@ -232,7 +262,10 @@ private fun CatCloudRootScreen(
                 0 -> HomeTab(
                     state = state,
                     onToggleConnect = triggerVpnToggle,
-                    onOpenQrScan = { showQrScanner = true },
+                    onOpenQrScan = {
+                        viewModel.preparePushFromRelayBox(null)
+                        showQrScanner = true
+                    },
                     onSelectSingleNode = viewModel::selectSingleNode,
                     onSelectGroup = viewModel::selectMultiGroup,
                     onSetProxyMode = viewModel::setProxyMode,
@@ -255,14 +288,21 @@ private fun CatCloudRootScreen(
                     onSelectActiveRelay = viewModel::selectActiveRelay,
                     onTogglePreAccelAutoFailover = viewModel::togglePreAccelAutoFailover,
                     onDeleteRelay = viewModel::deleteRelay,
-                    onOpenQrScan = { showQrScanner = true },
+                    onProbeRelaysLatency = viewModel::probeAllRelaysLatency,
+                    onOpenQrScan = {
+                        viewModel.preparePushFromRelayBox(null)
+                        showQrScanner = true
+                    },
                     onOpenPinDialog = { showPinDialog = true },
                     onImportClipboard = viewModel::importFromClipboardOnDemand,
                     onPickFile = { filePickerLauncher.launch(arrayOf("*/*")) },
                 )
                 2 -> SettingsTab(
                     state = state,
-                    onOpenQrScan = { showQrScanner = true },
+                    onOpenQrScan = {
+                        viewModel.preparePushFromRelayBox(null)
+                        showQrScanner = true
+                    },
                     onOpenPinDialog = { showPinDialog = true },
                     onImportClipboard = viewModel::importFromClipboardOnDemand,
                     onPickFile = { filePickerLauncher.launch(arrayOf("*/*")) },
@@ -351,7 +391,7 @@ private fun CatCloudRootScreen(
                     Spacer(Modifier.height(8.dp))
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(checked = saveToBox, onCheckedChange = { saveToBox = it })
-                        Text("同时暂存到随身加密接力箱（7天有效，方便推给另一台电脑）", fontSize = 12.sp)
+                        Text("同时暂存到随身接力箱（传输端到端加密，7天有效，方便推给另一台电脑）", fontSize = 12.sp)
                     }
                 }
             },
@@ -367,7 +407,7 @@ private fun CatCloudRootScreen(
     }
 
     // Pending offline .ccsync decryption dialog
-    if (state.pendingCcsyncBytes != null) {
+    if (state.pendingCcsyncId != null) {
         var password by remember { mutableStateOf("") }
         AlertDialog(
             onDismissRequest = viewModel::dismissPendingCcsync,

@@ -7,6 +7,7 @@ import io.github.jurybu.catcloud.data.ProxyMode
 import io.github.jurybu.catcloud.data.ProxyNodeRecord
 import io.github.jurybu.catcloud.data.RouteMode
 import io.github.jurybu.catcloud.engine.ConfigCompiler
+import io.github.jurybu.catcloud.vpn.CatCloudVpnService
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -136,6 +137,8 @@ class ConfigCompilerTest {
         )
         assertEquals(3, compiled.relayCount)
         assertEquals(1, compiled.dialerWrappedCount) // n1 wrapped, n2 (443 native) skipped
+        assertEquals(ConfigCompiler.SINGLE_NODE_GROUP, compiled.controllerGroupName)
+        assertEquals("Node-8443", compiled.activeGroupOrNodeName)
 
         val doc = parseYaml(compiled.yaml)
         assertEquals("off", doc["find-process-mode"])
@@ -209,6 +212,7 @@ class ConfigCompilerTest {
         assertTrue(prunedCompiled.pruned)
         // Only n-1, n-3 (group members) + n-2 (transitive dialer-proxy of n-1) survive = 3 / 60 (~95% pruned!)
         assertEquals(3, prunedCompiled.activeNodeCount)
+        assertEquals("MainGroup", prunedCompiled.controllerGroupName)
         assertTrue(prunedCompiled.yaml.contains("node1.example.invalid"))
         assertTrue(prunedCompiled.yaml.contains("node2.example.invalid"))
         assertFalse(prunedCompiled.yaml.contains("node55.example.invalid"))
@@ -217,5 +221,93 @@ class ConfigCompilerTest {
         val globalCompiled = ConfigCompiler.compile(globalSettings, nodes, listOf(group), emptyList())
         assertFalse(globalCompiled.pruned)
         assertEquals(60, globalCompiled.activeNodeCount)
+        assertEquals("MainGroup", globalCompiled.controllerGroupName)
+    }
+
+    @Test
+    fun compilesLoopbackMixedProxyAuthAndRetainsExtraIncludedNodesInControllerGroup() {
+        val nodes = (1..60).map { i ->
+            sampleNode(id = "n-$i", name = "Node-$i", server = "node$i.example.invalid")
+        }
+        val group = MultiGroupRecord(
+            id = "g-main",
+            name = "MainGroup",
+            memberNodeIds = listOf("n-1"),
+            activeNodeId = "n-1",
+        )
+        val groupSettings = AppSettings(
+            proxyMode = ProxyMode.RULE,
+            routeMode = RouteMode.GROUP,
+            activeGroupId = "g-main",
+        )
+
+        val compiledGroup = ConfigCompiler.compile(
+            settings = groupSettings,
+            nodes = nodes,
+            groups = listOf(group),
+            relays = emptyList(),
+            extraIncludedNodeIds = setOf("n-45", "n-50"),
+            localMixedPort = 28888,
+            localMixedSecret = "demo-mixed-secret-01",
+        )
+        assertTrue(compiledGroup.pruned)
+        assertEquals(3, compiledGroup.activeNodeCount)
+        assertEquals("MainGroup", compiledGroup.controllerGroupName)
+        assertEquals(28888, compiledGroup.localMixedPort)
+        assertEquals("demo-mixed-secret-01", compiledGroup.localMixedSecret)
+
+        val doc = parseYaml(compiledGroup.yaml)
+        assertEquals(28888, doc["mixed-port"])
+        assertEquals("127.0.0.1", doc["bind-address"])
+        assertEquals(listOf("catcloud:demo-mixed-secret-01"), doc["authentication"])
+
+        @Suppress("UNCHECKED_CAST")
+        val proxyGroups = doc["proxy-groups"] as List<Map<String, Any?>>
+        val mainGroupMap = proxyGroups.first { it["name"] == "MainGroup" }
+        @Suppress("UNCHECKED_CAST")
+        val members = mainGroupMap["proxies"] as List<String>
+        assertEquals("Node-1", members.first())
+        assertTrue(members.contains("Node-45"))
+        assertTrue(members.contains("Node-50"))
+        assertFalse(members.contains("Node-55"))
+
+        // Verify CatCloudVpnService YAML extractor matches compiled mixed-port & secret accurately
+        assertEquals(28888 to "demo-mixed-secret-01", CatCloudVpnService.extractLoopbackMixedConfig(compiledGroup.yaml))
+
+        // RouteMode.SINGLE always exposes SINGLE_NODE_GROUP as controllerGroupName and includes extra nodes
+        val singleSettings = AppSettings(
+            proxyMode = ProxyMode.RULE,
+            routeMode = RouteMode.SINGLE,
+            activeSingleNodeId = "n-1",
+        )
+        val compiledSingle = ConfigCompiler.compile(
+            settings = singleSettings,
+            nodes = nodes,
+            groups = emptyList(),
+            relays = emptyList(),
+            extraIncludedNodeIds = setOf("n-40"),
+        )
+        assertEquals(ConfigCompiler.SINGLE_NODE_GROUP, compiledSingle.controllerGroupName)
+        assertEquals("Node-1", compiledSingle.activeGroupOrNodeName)
+        val singleDoc = parseYaml(compiledSingle.yaml)
+        @Suppress("UNCHECKED_CAST")
+        val singleGroups = singleDoc["proxy-groups"] as List<Map<String, Any?>>
+        val singleGroupMap = singleGroups.first { it["name"] == ConfigCompiler.SINGLE_NODE_GROUP }
+        @Suppress("UNCHECKED_CAST")
+        val singleMembers = singleGroupMap["proxies"] as List<String>
+        assertEquals("Node-1", singleMembers.first())
+        assertTrue(singleMembers.contains("Node-40"))
+
+        // RouteMode.GROUP with no groups falls back to DEFAULT_FALLBACK_GROUP
+        val fallbackCompiled = ConfigCompiler.compile(
+            settings = groupSettings,
+            nodes = nodes.take(3),
+            groups = emptyList(),
+            relays = emptyList(),
+        )
+        assertEquals(ConfigCompiler.DEFAULT_FALLBACK_GROUP, fallbackCompiled.controllerGroupName)
+
+        // Loopback port allocator yields valid ephemeral port
+        assertTrue(ConfigCompiler.allocateLoopbackPort() in 1..65535)
     }
 }

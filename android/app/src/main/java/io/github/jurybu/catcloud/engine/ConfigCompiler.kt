@@ -12,6 +12,7 @@ import org.json.JSONObject
 import org.yaml.snakeyaml.DumperOptions
 import org.yaml.snakeyaml.Yaml
 import java.net.InetAddress
+import java.net.ServerSocket
 import java.net.URI
 
 data class CompiledAndroidConfig(
@@ -22,7 +23,13 @@ data class CompiledAndroidConfig(
     val activeGroupOrNodeName: String,
     val pruned: Boolean,
     val warnings: List<String>,
+    val controllerGroupName: String = activeGroupOrNodeName,
+    val localMixedPort: Int = 0,
+    val localMixedSecret: String = "",
 )
+
+/** Alias matching cross-module contract naming. */
+typealias CompiledConfig = CompiledAndroidConfig
 
 /**
  * Android-native Mihomo YAML compiler maintaining 100% behavioral parity with desktop
@@ -219,6 +226,11 @@ object ConfigCompiler {
         }
     }
 
+    fun allocateLoopbackPort(): Int =
+        runCatching {
+            ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+        }.getOrDefault(29190)
+
     fun compile(
         settings: AppSettings,
         nodes: List<ProxyNodeRecord>,
@@ -226,6 +238,9 @@ object ConfigCompiler {
         relays: List<PreAccelRelayRecord>,
         extraPrependRules: List<String> = emptyList(),
         compileAllNodes: Boolean = false,
+        extraIncludedNodeIds: Set<String> = emptySet(),
+        localMixedPort: Int = 0,
+        localMixedSecret: String = "",
     ): CompiledAndroidConfig {
         val warnings = ArrayList<String>()
         val probeUrl = validateDomesticProbeUrl(settings.preaccelProbeUrl)
@@ -238,18 +253,30 @@ object ConfigCompiler {
             .sortedWith(compareBy<PreAccelRelayRecord> { it.priority }.thenBy { it.id })
         val preaccelActive = settings.preaccelEnabled && enabledRelays.isNotEmpty()
 
+        val normalizedExtraNodeIds = extraIncludedNodeIds
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .toSet()
+
         val (selectedNodes, allowedGroupIds, pruned) = selectNodesAndGroups(
             settings = settings,
             nodes = nodes,
             groups = groups,
             extraPrependRules = extraPrependRules,
             compileAllNodes = compileAllNodes,
+            extraIncludedNodeIds = normalizedExtraNodeIds,
         )
 
+        val effectiveMixedPort = if (localMixedPort in 1..65535) localMixedPort else 0
+        val effectiveMixedSecret = if (effectiveMixedPort > 0) localMixedSecret.trim() else ""
+
         val root = LinkedHashMap<String, Any>()
-        root["mixed-port"] = 0
+        root["mixed-port"] = effectiveMixedPort
         root["allow-lan"] = false
         root["bind-address"] = "127.0.0.1"
+        if (effectiveMixedPort > 0 && effectiveMixedSecret.isNotEmpty()) {
+            root["authentication"] = listOf("catcloud:$effectiveMixedSecret")
+        }
         root["mode"] = settings.proxyMode.wireValue
         root["log-level"] = "warning"
         root["ipv6"] = false
@@ -409,21 +436,24 @@ object ConfigCompiler {
             )
         }
 
-        var defaultMatchTarget: String? = null
-        var effectiveActiveGroupId: String? = null
         val preferredActiveGroupId = settings.activeGroupId?.trim()?.takeIf { it.isNotEmpty() }
+        val visibleGroups = groups.filter { g ->
+            (allowedGroupIds == null || allowedGroupIds.contains(g.id.trim())) &&
+                g.name.trim().ifEmpty { g.id.trim() }.isNotEmpty()
+        }
+        val effectiveActiveGroupId: String? = visibleGroups
+            .firstOrNull { it.id.trim() == preferredActiveGroupId }
+            ?.id?.trim()
+            ?: visibleGroups.firstOrNull()?.id?.trim()
 
-        for (group in groups) {
-            if (allowedGroupIds != null && !allowedGroupIds.contains(group.id.trim())) continue
-            val gName = group.name.trim().ifEmpty { group.id.trim() }
-            if (gName.isEmpty()) continue
+        var defaultMatchTarget: String? = null
 
-            if (preferredActiveGroupId == group.id.trim()) {
+        for (group in visibleGroups) {
+            val gid = group.id.trim()
+            val gName = group.name.trim().ifEmpty { gid }
+            val isEffectiveActive = gid == effectiveActiveGroupId
+            if (isEffectiveActive) {
                 defaultMatchTarget = gName
-                effectiveActiveGroupId = group.id.trim()
-            } else if (defaultMatchTarget == null) {
-                defaultMatchTarget = gName
-                effectiveActiveGroupId = group.id.trim()
             }
 
             val members = ArrayList<String>()
@@ -433,6 +463,11 @@ object ConfigCompiler {
                 }
             } else if (group.mode == "conditional_pool") {
                 allCompiledNodeNames.forEach { pushUnique(members, it) }
+            }
+            if (isEffectiveActive && settings.routeMode == RouteMode.GROUP && normalizedExtraNodeIds.isNotEmpty()) {
+                for (extraId in normalizedExtraNodeIds) {
+                    nodeIdToName[extraId]?.let { pushUnique(members, it) }
+                }
             }
             if (members.isEmpty()) members.add("DIRECT")
 
@@ -470,16 +505,21 @@ object ConfigCompiler {
             proxyGroups.add(groupMap)
         }
 
-        val resolvedSingleProxy = if (settings.routeMode == RouteMode.SINGLE) {
+        val singleModeActive = settings.routeMode == RouteMode.SINGLE
+        val resolvedSingleProxy = if (singleModeActive) {
             settings.activeSingleNodeId?.trim()?.let { nodeIdToName[it] }
+                ?: allCompiledNodeNames.firstOrNull()
         } else {
             null
         }
-        val singleModeActive = resolvedSingleProxy != null
-        val matchTarget = if (resolvedSingleProxy != null) {
+        val matchTarget = if (singleModeActive) {
             val singleMembers = ArrayList<String>()
-            singleMembers.add(resolvedSingleProxy)
+            resolvedSingleProxy?.let { pushUnique(singleMembers, it) }
             allCompiledNodeNames.forEach { pushUnique(singleMembers, it) }
+            for (extraId in normalizedExtraNodeIds) {
+                nodeIdToName[extraId]?.let { pushUnique(singleMembers, it) }
+            }
+            if (singleMembers.isEmpty()) singleMembers.add("DIRECT")
             proxyGroups.add(
                 linkedMapOf(
                     "name" to SINGLE_NODE_GROUP,
@@ -491,6 +531,9 @@ object ConfigCompiler {
         } else {
             defaultMatchTarget ?: run {
                 val defaultMembers = ArrayList<String>(allCompiledNodeNames)
+                for (extraId in normalizedExtraNodeIds) {
+                    nodeIdToName[extraId]?.let { pushUnique(defaultMembers, it) }
+                }
                 if (defaultMembers.isEmpty()) defaultMembers.add("DIRECT")
                 proxyGroups.add(
                     linkedMapOf(
@@ -586,6 +629,9 @@ object ConfigCompiler {
             activeGroupOrNodeName = activeLabel,
             pruned = pruned,
             warnings = warnings,
+            controllerGroupName = matchTarget,
+            localMixedPort = effectiveMixedPort,
+            localMixedSecret = effectiveMixedSecret,
         )
     }
 
@@ -601,6 +647,7 @@ object ConfigCompiler {
         groups: List<MultiGroupRecord>,
         extraPrependRules: List<String>,
         compileAllNodes: Boolean,
+        extraIncludedNodeIds: Set<String> = emptySet(),
     ): SelectionResult {
         val enabledNodes = nodes.filter { it.enabled }
         val shouldPrune = !compileAllNodes &&
@@ -649,6 +696,13 @@ object ConfigCompiler {
         } else {
             effectiveActiveGroupId?.let { queue.add(it) }
             groups.filter { it.independentRouting && it.id.isNotBlank() }.forEach { queue.add(it.id.trim()) }
+        }
+
+        // Force-retain explicitly requested nodes (e.g., temporarily included for serial throughput test)
+        for (extraId in extraIncludedNodeIds) {
+            if (enabledIds.contains(extraId)) {
+                activeNodeIds.add(extraId)
+            }
         }
 
         for (rawRule in extraPrependRules) {

@@ -38,7 +38,7 @@ import {
   catcloudApi,
   formatErrorMessage,
 } from "../api/tauri";
-import { type UiLanguage, normalizeUiLanguage, useUiDict } from "../i18n";
+import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, useAppSelector } from "../store/appStore";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
 import { AppSelect } from "./AppSelect";
@@ -64,154 +64,6 @@ export interface ShareBundleModalProps {
   allowModeSwitch?: boolean;
   initialTransport?: ShareBundleTransport;
 }
-
-interface SyncMicroDict {
-  pickCcsyncBtn: string;
-  copyQrUri: string;
-  copyKeyUri: string;
-  waitingPush: string;
-  sessionExpired: string;
-  reExportBtn: string;
-  backToEdit: string;
-  savedFileLabel: string;
-  fingerprintLabel: string;
-  customUrlTag: string;
-  syncSubTitle: string;
-  pullEmptyHint: string;
-  clearPreview: string;
-  fetchingPreview: string;
-  needSourceInput: string;
-  needExportSelection: string;
-  needImportSelection: string;
-  needTargetSub: string;
-  statusCompleted: string;
-  statusEnded: string;
-  groupsIncludedPrefix: string;
-  groupsTabBadge: string;
-  syncActionBusy: string;
-  listenActionBusy: string;
-  relayActionBusy: string;
-  importOkPrefix: string;
-}
-
-const SYNC_MICRO_TEXT: Record<UiLanguage, SyncMicroDict> = {
-  "zh-CN": {
-    pickCcsyncBtn: "导入加密文件 (.ccsync)",
-    copyQrUri: "复制同步链接",
-    copyKeyUri: "复制密钥链接",
-    waitingPush: "正在等待另一台设备扫码推送…",
-    sessionExpired: "本次加密通道已超时关闭，请重新生成",
-    reExportBtn: "重新导出",
-    backToEdit: "返回修改勾选",
-    savedFileLabel: "加密包已保存",
-    fingerprintLabel: "校验指纹",
-    customUrlTag: "穿透 / 组网",
-    syncSubTitle: "端到端加密传输 · 支持局域网扫码、6位配对码、公网穿透与 .ccsync 离线中转",
-    pullEmptyHint:
-      "输入发送端显示的局域网地址 + 6 位码，粘贴完整同步链接，或直接选择 .ccsync 加密文件，拉取后可先预览勾选再导入。",
-    clearPreview: "清除当前预览",
-    fetchingPreview: "正在安全拉取并解析…",
-    needSourceInput: "请输入发送方地址（ip:port）或同步链接",
-    needExportSelection: "请至少勾选 1 个节点或 1 条国内提速中转线路",
-    needImportSelection: "请至少勾选 1 个要导入的节点、中转或智能多选组",
-    needTargetSub: "请选择要并入的目标已有分组",
-    statusCompleted: "已完成传输",
-    statusEnded: "本次会话已结束",
-    groupsIncludedPrefix: "当前含智能多选组",
-    groupsTabBadge: "多选组",
-    syncActionBusy: "正在生成加密通道…",
-    listenActionBusy: "正在开启接收通道…",
-    relayActionBusy: "正在加密打包…",
-    importOkPrefix: "配置导入完成",
-  },
-  en: {
-    pickCcsyncBtn: "Import Encrypted File (.ccsync)",
-    copyQrUri: "Copy Sync URI",
-    copyKeyUri: "Copy Key URI",
-    waitingPush: "Waiting for another device to scan & push…",
-    sessionExpired: "This encrypted session has expired. Please generate a new code.",
-    reExportBtn: "Export Again",
-    backToEdit: "Back to Selection",
-    savedFileLabel: "Encrypted File Saved",
-    fingerprintLabel: "Fingerprint",
-    customUrlTag: "Custom URL",
-    syncSubTitle: "End-to-end encrypted · LAN QR, 6-digit PIN, overlay URL & .ccsync relay",
-    pullEmptyHint:
-      "Enter the sender's LAN address + 6-digit PIN, paste a sync URI, or choose a .ccsync file to safely preview and select items before importing.",
-    clearPreview: "Clear Preview",
-    fetchingPreview: "Fetching & decrypting…",
-    needSourceInput: "Please enter a sender address (ip:port) or sync URI",
-    needExportSelection: "Please select at least 1 node or domestic relay",
-    needImportSelection: "Please select at least 1 node, relay, or smart group to import",
-    needTargetSub: "Please select an existing target group",
-    statusCompleted: "Transfer completed",
-    statusEnded: "Session ended",
-    groupsIncludedPrefix: "Smart groups in bundle",
-    groupsTabBadge: "Groups",
-    syncActionBusy: "Starting encrypted channel…",
-    listenActionBusy: "Starting receive listener…",
-    relayActionBusy: "Encrypting bundle…",
-    importOkPrefix: "Import complete",
-  },
-  ja: {
-    pickCcsyncBtn: "暗号化ファイルを取込 (.ccsync)",
-    copyQrUri: "同期 URI をコピー",
-    copyKeyUri: "鍵 URI をコピー",
-    waitingPush: "別端末からのスキャン・送信を待機中…",
-    sessionExpired: "セッションの有効期限が切れました。再生成してください。",
-    reExportBtn: "もう一度出力",
-    backToEdit: "選択に戻る",
-    savedFileLabel: "暗号化ファイルを保存しました",
-    fingerprintLabel: "指紋",
-    customUrlTag: "外部 URL",
-    syncSubTitle: "E2E 暗号化転送 · LAN QR・6桁コード・外部 URL・.ccsync 中継に対応",
-    pullEmptyHint:
-      "送信元の LAN アドレスと 6桁コード、同期 URI、または .ccsync ファイルを選択して、安全にプレビュー・選択取込できます。",
-    clearPreview: "プレビューをクリア",
-    fetchingPreview: "取得・復号中…",
-    needSourceInput: "送信元アドレス（ip:port）または同期 URI を入力してください",
-    needExportSelection: "ノードまたは国内中継を 1 件以上選択してください",
-    needImportSelection: "取込むノード・中継・グループを 1 件以上選択してください",
-    needTargetSub: "統合先の既存グループを選択してください",
-    statusCompleted: "転送完了",
-    statusEnded: "セッション終了",
-    groupsIncludedPrefix: "同梱スマートグループ",
-    groupsTabBadge: "グループ",
-    syncActionBusy: "暗号化チャネルを作成中…",
-    listenActionBusy: "受信待機を開始中…",
-    relayActionBusy: "暗号化パックを作成中…",
-    importOkPrefix: "取込が完了しました",
-  },
-  ru: {
-    pickCcsyncBtn: "Импорт шифр-файла (.ccsync)",
-    copyQrUri: "Копировать URI",
-    copyKeyUri: "Копировать URI ключа",
-    waitingPush: "Ожидание сканирования и отправки с другого устройства…",
-    sessionExpired: "Сеанс истёк. Создайте новый QR-код.",
-    reExportBtn: "Экспортировать снова",
-    backToEdit: "Назад к выбору",
-    savedFileLabel: "Шифр-файл сохранён",
-    fingerprintLabel: "Отпечаток",
-    customUrlTag: "Внешний URL",
-    syncSubTitle: "Сквозное шифрование · LAN QR, 6-значный PIN, туннель и .ccsync",
-    pullEmptyHint:
-      "Введите LAN-адрес и 6-значный PIN отправителя, вставьте URI синхронизации или выберите .ccsync для предпросмотра перед импортом.",
-    clearPreview: "Сбросить предпросмотр",
-    fetchingPreview: "Загрузка и расшифровка…",
-    needSourceInput: "Введите адрес отправителя (ip:port) или URI синхронизации",
-    needExportSelection: "Выберите хотя бы 1 узел или реле",
-    needImportSelection: "Выберите хотя бы 1 узел, реле или умную группу",
-    needTargetSub: "Выберите существующую целевую группу",
-    statusCompleted: "Передача завершена",
-    statusEnded: "Сеанс завершён",
-    groupsIncludedPrefix: "Умные группы в пакете",
-    groupsTabBadge: "Группы",
-    syncActionBusy: "Запуск канала…",
-    listenActionBusy: "Открытие приёма…",
-    relayActionBusy: "Шифрование пакета…",
-    importOkPrefix: "Импорт завершён",
-  },
-};
 
 function formatCreatedAt(raw: string | null | undefined): string {
   if (!raw) return "--";
@@ -282,7 +134,6 @@ export function ShareBundleModal({
   const uiLang = useAppSelector((s) => s.config.personalization.ui_language);
   const normalizedLang = normalizeUiLanguage(uiLang);
   const dict = useUiDict(normalizedLang);
-  const micro = SYNC_MICRO_TEXT[normalizedLang];
 
   const [activeMode, setActiveMode] = useState<"export" | "import">(mode);
   const [exportTransport, setExportTransport] = useState<ExportTransport>(() =>
@@ -294,7 +145,7 @@ export function ShareBundleModal({
 
   // Export mode state
   const [exportTab, setExportTab] = useState<"nodes" | "relays">(defaultTab);
-  const [packName, setPackName] = useState<string>(defaultPackName || "猫猫云梯分享包");
+  const [packName, setPackName] = useState<string>(defaultPackName || dict.share.defaultPackName);
   const [packDesc, setPackDesc] = useState<string>("");
   const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(() => new Set());
   const [selectedRelayIds, setSelectedRelayIds] = useState<Set<string>>(() => new Set());
@@ -434,19 +285,22 @@ export function ShareBundleModal({
     }
   }, []);
 
-  const applySyncPreviewState = useCallback((res: SyncPreviewDto) => {
-    setSyncPreview(res);
-    setPreview(res.preview);
-    setImportGroups(res.group_count > 0);
-    setImportNodeIds(new Set(res.preview.nodes.map((n) => n.id)));
-    setImportRelayIds(new Set(res.preview.relays.map((r) => r.id)));
-    setImportNodeSearch("");
-    setImportNewSubName(res.preview.manifest.name?.trim() || "CatCloud Sync");
-    setImportTab(res.preview.nodes.length > 0 ? "nodes" : "relays");
-    if (subscriptionsLenRef.current === 0) {
-      setImportDestMode("new");
-    }
-  }, []);
+  const applySyncPreviewState = useCallback(
+    (res: SyncPreviewDto) => {
+      setSyncPreview(res);
+      setPreview(res.preview);
+      setImportGroups(res.group_count > 0);
+      setImportNodeIds(new Set(res.preview.nodes.map((n) => n.id)));
+      setImportRelayIds(new Set(res.preview.relays.map((r) => r.id)));
+      setImportNodeSearch("");
+      setImportNewSubName(res.preview.manifest.name?.trim() || dict.sync.defaultSyncPackName);
+      setImportTab(res.preview.nodes.length > 0 ? "nodes" : "relays");
+      if (subscriptionsLenRef.current === 0) {
+        setImportDestMode("new");
+      }
+    },
+    [dict.sync.defaultSyncPackName]
+  );
 
   // Ensure active backend sync sessions and timers are cleaned up on unmount
   useEffect(() => {
@@ -486,7 +340,7 @@ export function ShareBundleModal({
     setExportTransport(nextExportTransport);
     setImportTransport(nextImportTransport);
     setExportTab(defaultTab);
-    setPackName(defaultPackName?.trim() || "猫猫云梯分享包");
+    setPackName(defaultPackName?.trim() || dict.share.defaultPackName);
     setPackDesc("");
     setExportSubFilter("all");
     setExportRegionFilter("all");
@@ -633,6 +487,7 @@ export function ShareBundleModal({
           ev.status === "expired" ||
           ev.status === "destroyed" ||
           ev.status === "cancelled" ||
+          ev.status === "closed" ||
           (ev.status === "completed" && !activeSendAllowMultiRef.current)
         ) {
           activeSendSessionRef.current = null;
@@ -642,7 +497,8 @@ export function ShareBundleModal({
         if (
           ev.status === "expired" ||
           ev.status === "destroyed" ||
-          ev.status === "cancelled"
+          ev.status === "cancelled" ||
+          ev.status === "closed"
         ) {
           activeReceiveSessionRef.current = null;
         }
@@ -685,8 +541,11 @@ export function ShareBundleModal({
         count,
       }))
       .sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
-    return [{ value: "all", label: "全部地区" }, ...items.map(({ value, label }) => ({ value, label }))];
-  }, [nodes, exportSubFilter]);
+    return [
+      { value: "all", label: dict.share.allRegions },
+      ...items.map(({ value, label }) => ({ value, label })),
+    ];
+  }, [nodes, exportSubFilter, dict.share.allRegions]);
 
   const filteredExportNodes = useMemo(() => {
     const kw = exportNodeSearch.trim().toLowerCase();
@@ -805,7 +664,7 @@ export function ShareBundleModal({
     const nodeIds = Array.from(selectedNodeIds);
     const relayIds = Array.from(selectedRelayIds);
     if (nodeIds.length === 0 && relayIds.length === 0) {
-      setExportError(micro.needExportSelection);
+      setExportError(dict.sync.needExportSelection);
       return;
     }
 
@@ -813,7 +672,7 @@ export function ShareBundleModal({
     setExportError(null);
     try {
       const res = await catcloudApi.exportShareBundleDialog({
-        name: packName.trim() || "猫猫云梯分享包",
+        name: packName.trim() || dict.share.defaultPackName,
         description: packDesc.trim() || null,
         nodeIds,
         relayIds,
@@ -821,12 +680,11 @@ export function ShareBundleModal({
       if (res.cancelled) {
         return;
       }
-      const savedPath = res.path ? `：${res.path}` : "";
-      appActions.showToast(
-        `${dict.share.exportBtn} (${nodeIds.length} / ${relayIds.length})${savedPath}`,
-        "ok",
-        5200
-      );
+      const summary = formatI18nTemplate(dict.share.exportSavedToast, {
+        nodes: nodeIds.length,
+        relays: relayIds.length,
+      });
+      appActions.showToast(res.path ? `${summary}: ${res.path}` : summary, "ok", 5200);
       handleRequestClose();
     } catch (err) {
       const msg = formatErrorMessage(err);
@@ -842,7 +700,7 @@ export function ShareBundleModal({
     const nodeIds = Array.from(selectedNodeIds);
     const relayIds = Array.from(selectedRelayIds);
     if (nodeIds.length === 0 && relayIds.length === 0) {
-      setExportError(micro.needExportSelection);
+      setExportError(dict.sync.needExportSelection);
       return;
     }
 
@@ -852,7 +710,7 @@ export function ShareBundleModal({
     setExportError(null);
     try {
       const session = await catcloudApi.startSyncSendSession({
-        name: packName.trim() || "CatCloud Sync",
+        name: packName.trim() || dict.sync.defaultSyncPackName,
         description: packDesc.trim() || null,
         nodeIds,
         relayIds,
@@ -887,7 +745,7 @@ export function ShareBundleModal({
     const nodeIds = Array.from(selectedNodeIds);
     const relayIds = Array.from(selectedRelayIds);
     if (nodeIds.length === 0 && relayIds.length === 0) {
-      setExportError(micro.needExportSelection);
+      setExportError(dict.sync.needExportSelection);
       return;
     }
 
@@ -895,7 +753,7 @@ export function ShareBundleModal({
     setExportError(null);
     try {
       const res = await catcloudApi.exportEncryptedSyncFile({
-        name: packName.trim() || "CatCloud Sync",
+        name: packName.trim() || dict.sync.defaultSyncPackName,
         description: packDesc.trim() || null,
         nodeIds,
         relayIds,
@@ -906,7 +764,7 @@ export function ShareBundleModal({
       }
       setRelayExportResult(res);
       appActions.showToast(
-        res.path ? `${micro.savedFileLabel}: ${res.path}` : micro.savedFileLabel,
+        res.path ? `${dict.sync.savedFileLabel}: ${res.path}` : dict.sync.savedFileLabel,
         "ok",
         4600
       );
@@ -934,7 +792,7 @@ export function ShareBundleModal({
       setImportNodeIds(new Set(res.nodes.map((n) => n.id)));
       setImportRelayIds(new Set(res.relays.map((r) => r.id)));
       setImportNodeSearch("");
-      setImportNewSubName(res.manifest.name?.trim() || "朋友分享包");
+      setImportNewSubName(res.manifest.name?.trim() || dict.share.defaultFriendPackName);
       setImportTab(res.nodes.length > 0 ? "nodes" : "relays");
       if (subscriptions.length === 0) {
         setImportDestMode("new");
@@ -953,7 +811,7 @@ export function ShareBundleModal({
     const trimmedSource = syncSourceInput.trim();
     const cleanedPin = syncPinInput.replace(/\s+/g, "").trim();
     if (!pickCcsyncFile && !trimmedSource) {
-      setImportError(micro.needSourceInput);
+      setImportError(dict.sync.needSourceInput);
       return;
     }
 
@@ -1048,11 +906,11 @@ export function ShareBundleModal({
     const willImportGroups = Boolean(syncPreview && syncPreview.group_count > 0 && importGroups);
 
     if (pickedNodes.length === 0 && pickedRelays.length === 0 && !willImportGroups) {
-      setImportError(micro.needImportSelection);
+      setImportError(dict.sync.needImportSelection);
       return;
     }
     if (pickedNodes.length > 0 && importDestMode === "existing" && !importTargetSubId) {
-      setImportError(micro.needTargetSub);
+      setImportError(dict.sync.needTargetSub);
       return;
     }
 
@@ -1063,7 +921,9 @@ export function ShareBundleModal({
         pickedNodes.length > 0 && importDestMode === "existing" ? importTargetSubId : null;
       const newSubName =
         pickedNodes.length > 0 && importDestMode === "new"
-          ? importNewSubName.trim() || preview.manifest.name?.trim() || "CatCloud Sync"
+          ? importNewSubName.trim() ||
+            preview.manifest.name?.trim() ||
+            dict.sync.defaultSyncPackName
           : null;
 
       const outcome = syncPreview
@@ -1089,19 +949,38 @@ export function ShareBundleModal({
 
       const summaryParts: string[] = [];
       if (outcome.imported_nodes > 0) {
-        const subSuffix = outcome.target_sub_name ? ` (${outcome.target_sub_name})` : "";
-        summaryParts.push(`${outcome.imported_nodes} nodes${subSuffix}`);
+        const base = formatI18nTemplate(dict.share.importedNodesCount, {
+          count: outcome.imported_nodes,
+        });
+        summaryParts.push(
+          outcome.target_sub_name ? `${base} (${outcome.target_sub_name})` : base
+        );
       }
       if (outcome.imported_relays > 0) {
-        summaryParts.push(`${outcome.imported_relays} relays`);
+        summaryParts.push(
+          formatI18nTemplate(dict.share.importedRelaysCount, {
+            count: outcome.imported_relays,
+          })
+        );
       }
       if (willImportGroups && syncPreview) {
-        summaryParts.push(`${syncPreview.group_count} ${micro.groupsTabBadge}`);
+        summaryParts.push(
+          formatI18nTemplate(dict.share.importedGroupsCount, {
+            count: syncPreview.group_count,
+          })
+        );
       }
       const warnSuffix =
-        outcome.warnings.length > 0 ? ` (${outcome.warnings.length} warnings)` : "";
+        outcome.warnings.length > 0
+          ? formatI18nTemplate(dict.share.importWarningsSuffix, {
+              count: outcome.warnings.length,
+            })
+          : "";
       appActions.showToast(
-        `${micro.importOkPrefix}: ${summaryParts.join(" · ") || dict.common.confirm}${warnSuffix}`,
+        formatI18nTemplate(dict.share.importOkToast, {
+          summary: summaryParts.join(" · ") || dict.common.confirm,
+          warnings: warnSuffix,
+        }),
         "ok",
         5000
       );
@@ -1148,10 +1027,10 @@ export function ShareBundleModal({
 
   const modalSubtitle =
     (activeMode === "export" && isSyncExportTab) || (activeMode === "import" && isSyncImportTab)
-      ? micro.syncSubTitle
+      ? dict.sync.syncSubTitle
       : activeMode === "export"
-        ? "把精选节点或国内提速中转打包成单个 .zip，方便私发给信任的朋友一键导入"
-        : "选择朋友发来的猫云 .zip 分享包，预览并自由勾选要导入的节点与中转";
+        ? dict.share.exportSubtitle
+        : dict.share.importSubtitle;
 
   const sendUrlsToShow = sendSession
     ? [
@@ -1392,7 +1271,7 @@ export function ShareBundleModal({
                         title={sendSession.fingerprint}
                         className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 cc-mono text-[10.5px] text-[var(--text-secondary)]"
                       >
-                        {micro.fingerprintLabel}: {sendSession.fingerprint.slice(0, 10)}
+                        {dict.sync.fingerprintLabel}: {sendSession.fingerprint.slice(0, 10)}
                       </span>
                     )}
                   </div>
@@ -1412,8 +1291,8 @@ export function ShareBundleModal({
                       <span>
                         {sendSessionStatus.message ||
                           (sendSessionStatus.status === "completed"
-                            ? micro.statusCompleted
-                            : micro.statusEnded)}
+                            ? dict.sync.statusCompleted
+                            : dict.sync.statusEnded)}
                       </span>
                     </span>
                   )}
@@ -1423,7 +1302,7 @@ export function ShareBundleModal({
                   <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--red)]/45 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs text-[var(--red)]">
                     <div className="flex items-center gap-2">
                       <AlertTriangle className="h-4 w-4 shrink-0" />
-                      <span>{micro.sessionExpired}</span>
+                      <span>{dict.sync.sessionExpired}</span>
                     </div>
                     <button
                       type="button"
@@ -1461,7 +1340,7 @@ export function ShareBundleModal({
                         <Copy className="h-3.5 w-3.5" />
                       )}
                       <span>
-                        {copiedKey === "send-qr-uri" ? dict.common.copied : micro.copyQrUri}
+                        {copiedKey === "send-qr-uri" ? dict.common.copied : dict.sync.copyQrUri}
                       </span>
                     </button>
                   </div>
@@ -1510,7 +1389,7 @@ export function ShareBundleModal({
                               <div className="flex min-w-0 items-center gap-1.5">
                                 {item.isCustom && (
                                   <span className="shrink-0 rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
-                                    {micro.customUrlTag}
+                                    {dict.sync.customUrlTag}
                                   </span>
                                 )}
                                 <span
@@ -1555,10 +1434,10 @@ export function ShareBundleModal({
                   <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
                   <div className="min-w-0 flex-1">
                     <div className="font-semibold">
-                      {micro.savedFileLabel} · {formatBytesShort(relayExportResult.payload_bytes)} (
+                      {dict.sync.savedFileLabel} · {formatBytesShort(relayExportResult.payload_bytes)} (
                       {relayExportResult.node_count} / {relayExportResult.relay_count}
                       {relayExportResult.group_count > 0
-                        ? ` / ${relayExportResult.group_count} ${micro.groupsTabBadge}`
+                        ? ` / ${relayExportResult.group_count} ${dict.sync.groupsTabBadge}`
                         : ""}
                       )
                     </div>
@@ -1587,7 +1466,7 @@ export function ShareBundleModal({
 
                   {relayExportResult.fingerprint && (
                     <span className="mt-2.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-0.5 cc-mono text-[10.5px] text-[var(--muted)]">
-                      {micro.fingerprintLabel}: {relayExportResult.fingerprint.slice(0, 12)}
+                      {dict.sync.fingerprintLabel}: {relayExportResult.fingerprint.slice(0, 12)}
                     </span>
                   )}
 
@@ -1609,7 +1488,7 @@ export function ShareBundleModal({
                         <Copy className="h-3 w-3" />
                       )}
                       <span>
-                        {copiedKey === "relay-key-uri" ? dict.common.copied : micro.copyKeyUri}
+                        {copiedKey === "relay-key-uri" ? dict.common.copied : dict.sync.copyKeyUri}
                       </span>
                     </button>
                   </div>
@@ -1644,13 +1523,13 @@ export function ShareBundleModal({
                   </label>
 
                   <label className="block text-[11px] font-medium text-[var(--text-secondary)] sm:col-span-7">
-                    简短备注（可选）
+                    {dict.share.packDescLabel}
                     <input
                       type="text"
                       disabled={busy}
                       value={packDesc}
                       onChange={(e) => setPackDesc(e.target.value)}
-                      placeholder="例如：晚高峰延迟低，含日本与台湾节点"
+                      placeholder={dict.share.packDescPlaceholder}
                       className="mt-1 w-full rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--text)] outline-none transition-colors focus:border-[var(--accent)]"
                     />
                   </label>
@@ -1716,7 +1595,9 @@ export function ShareBundleModal({
                         }
                         className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-45"
                       >
-                        {allFilteredExportNodesSelected ? "清空当前筛选" : "全选当前筛选"}
+                        {allFilteredExportNodesSelected
+                          ? dict.share.clearFiltered
+                          : dict.share.selectFiltered}
                       </button>
                       {selectedNodeIds.size > 0 && (
                         <button
@@ -1724,7 +1605,7 @@ export function ShareBundleModal({
                           onClick={() => setSelectedNodeIds(new Set())}
                           className="rounded-lg px-2 py-1 text-[var(--muted)] hover:text-[var(--text)]"
                         >
-                          清空全部
+                          {dict.share.clearAll}
                         </button>
                       )}
                     </div>
@@ -1740,7 +1621,7 @@ export function ShareBundleModal({
                         }
                         className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-45"
                       >
-                        全选已启用
+                        {dict.share.selectEnabled}
                       </button>
                       <button
                         type="button"
@@ -1748,7 +1629,7 @@ export function ShareBundleModal({
                         onClick={() => setSelectedRelayIds(new Set(relays.map((r) => r.id)))}
                         className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-45"
                       >
-                        全选全部
+                        {dict.share.selectAll}
                       </button>
                       {selectedRelayIds.size > 0 && (
                         <button
@@ -1756,7 +1637,7 @@ export function ShareBundleModal({
                           onClick={() => setSelectedRelayIds(new Set())}
                           className="rounded-lg px-2 py-1 text-[var(--muted)] hover:text-[var(--text)]"
                         >
-                          清空
+                          {dict.share.clear}
                         </button>
                       )}
                     </div>
@@ -1768,7 +1649,7 @@ export function ShareBundleModal({
                   <div className="space-y-2.5">
                     <div className="flex flex-wrap items-center gap-2">
                       <AppSelect
-                        aria-label="按订阅来源筛选"
+                        aria-label={dict.share.filterBySubAria}
                         size="sm"
                         value={exportSubFilter}
                         onChange={(val) => {
@@ -1776,7 +1657,12 @@ export function ShareBundleModal({
                           setExportRegionFilter("all");
                         }}
                         options={[
-                          { value: "all", label: `全部来源 (${nodes.length})` },
+                          {
+                            value: "all",
+                            label: formatI18nTemplate(dict.share.allSourcesCount, {
+                              count: nodes.length,
+                            }),
+                          },
                           ...subscriptions.map((sub) => ({
                             value: sub.id,
                             label: `${sub.name} (${subNodeCounts.get(sub.id) ?? 0})`,
@@ -1786,7 +1672,7 @@ export function ShareBundleModal({
                       />
 
                       <AppSelect
-                        aria-label="按地区筛选"
+                        aria-label={dict.share.filterByRegionAria}
                         size="sm"
                         value={exportRegionFilter}
                         onChange={setExportRegionFilter}
@@ -1800,14 +1686,14 @@ export function ShareBundleModal({
                           type="text"
                           value={exportNodeSearch}
                           onChange={(e) => setExportNodeSearch(e.target.value)}
-                          placeholder="搜索节点名称、地区或协议…"
+                          placeholder={dict.share.searchNodesPlaceholder}
                           className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                         />
                         {exportNodeSearch && (
                           <button
                             type="button"
                             onClick={() => setExportNodeSearch("")}
-                            aria-label="清空搜索"
+                            aria-label={dict.share.clearSearchAria}
                             className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted)] hover:text-[var(--text)]"
                           >
                             <X className="h-3.5 w-3.5" />
@@ -1819,8 +1705,8 @@ export function ShareBundleModal({
                     {filteredExportNodes.length === 0 ? (
                       <div className="rounded-xl border border-dashed border-[var(--line)] px-4 py-8 text-center text-xs text-[var(--muted)]">
                         {nodes.length === 0
-                          ? "当前还没有可导出的节点，也可以切到「选择国内提速中转」仅打包中转线路"
-                          : "当前筛选条件下没有匹配节点"}
+                          ? dict.share.exportNodesEmpty
+                          : dict.share.exportNodesNoMatch}
                       </div>
                     ) : (
                       <div className="max-h-56 space-y-1 overflow-y-auto rounded-xl border border-[var(--line)] bg-[var(--card)]/70 p-2">
@@ -1877,7 +1763,7 @@ export function ShareBundleModal({
                   <div className="space-y-2">
                     {relays.length === 0 ? (
                       <div className="rounded-xl border border-dashed border-[var(--line)] px-4 py-8 text-center text-xs text-[var(--muted)]">
-                        还没有添加国内提速中转线路
+                        {dict.share.exportRelaysEmpty}
                       </div>
                     ) : (
                       <div className="max-h-56 space-y-1.5 overflow-y-auto rounded-xl border border-[var(--line)] bg-[var(--card)]/70 p-2">
@@ -1911,20 +1797,26 @@ export function ShareBundleModal({
                                           : "bg-[var(--card)] text-[var(--muted)]"
                                       }`}
                                     >
-                                      {relay.enabled ? "已启用" : "已停用"}
+                                      {relay.enabled
+                                        ? dict.share.relayEnabled
+                                        : dict.share.relayDisabled}
                                     </span>
                                   </div>
                                   <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[10.5px] text-[var(--muted)]">
-                                    <span>{relay.region || "国内"}</span>
+                                    <span>{relay.region || dict.share.relayDomesticFallback}</span>
                                     <span>·</span>
                                     <span className="cc-mono uppercase">{relay.protocol}</span>
                                     <span>·</span>
-                                    <span className="cc-mono">端口 {relay.port}</span>
+                                    <span className="cc-mono">
+                                      {formatI18nTemplate(dict.share.portLabel, {
+                                        port: relay.port,
+                                      })}
+                                    </span>
                                   </div>
                                 </div>
                               </div>
                               <span className="shrink-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 cc-mono text-[10px] text-[var(--muted)]">
-                                凭据已隐藏
+                                {dict.share.credentialsHidden}
                               </span>
                             </label>
                           );
@@ -2018,7 +1910,7 @@ export function ShareBundleModal({
                   <span className="shrink-0 cc-mono text-[11px]">
                     {receivedEventNotice.node_count} / {receivedEventNotice.relay_count}
                     {receivedEventNotice.group_count > 0
-                      ? ` / ${receivedEventNotice.group_count} ${micro.groupsTabBadge}`
+                      ? ` / ${receivedEventNotice.group_count} ${dict.sync.groupsTabBadge}`
                       : ""}
                   </span>
                 </div>
@@ -2033,7 +1925,9 @@ export function ShareBundleModal({
                     </span>
                     <div className="min-w-0">
                       <div className="truncate text-xs font-semibold text-[var(--text)]">
-                        {preview && !syncPreview ? preview.manifest.name : "选择朋友分享的 .zip 文件"}
+                        {preview && !syncPreview
+                          ? preview.manifest.name
+                          : dict.share.pickZipTitle}
                       </div>
                       <div
                         className="mt-0.5 truncate cc-mono text-[10.5px] text-[var(--muted)]"
@@ -2041,7 +1935,7 @@ export function ShareBundleModal({
                       >
                         {preview && !syncPreview
                           ? `${preview.zip_path} · ${formatCreatedAt(preview.manifest.created_at)}`
-                          : "支持 catcloud-share/v1 标准分享包（节点 + 国内中转）"}
+                          : dict.share.pickZipHint}
                       </div>
                     </div>
                   </div>
@@ -2061,7 +1955,7 @@ export function ShareBundleModal({
                       {pickingZip
                         ? dict.common.loading
                         : preview && !syncPreview
-                          ? "重新选择 .zip"
+                          ? dict.share.rePickZipBtn
                           : dict.share.pickZipBtn}
                     </span>
                   </button>
@@ -2124,7 +2018,7 @@ export function ShareBundleModal({
                           <Download className="h-3.5 w-3.5" />
                         )}
                         <span>
-                          {previewingSync ? micro.fetchingPreview : dict.sync.previewSourceBtn}
+                          {previewingSync ? dict.sync.fetchingPreview : dict.sync.previewSourceBtn}
                         </span>
                       </button>
 
@@ -2135,7 +2029,7 @@ export function ShareBundleModal({
                         className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-55"
                       >
                         <FileLock2 className="h-3.5 w-3.5" />
-                        <span>{micro.pickCcsyncBtn}</span>
+                        <span>{dict.sync.pickCcsyncBtn}</span>
                       </button>
                     </div>
 
@@ -2146,7 +2040,7 @@ export function ShareBundleModal({
                         onClick={handleClearImportPreview}
                         className="rounded-lg px-2 py-1 text-[11px] text-[var(--muted)] hover:text-[var(--text)]"
                       >
-                        {micro.clearPreview}
+                        {dict.sync.clearPreview}
                       </button>
                     )}
                   </div>
@@ -2192,7 +2086,7 @@ export function ShareBundleModal({
                           <QrCode className="h-3.5 w-3.5" />
                         )}
                         <span>
-                          {startingReceive ? micro.listenActionBusy : dict.sync.startListenBtn}
+                          {startingReceive ? dict.sync.listenActionBusy : dict.sync.startListenBtn}
                         </span>
                       </button>
                     </div>
@@ -2222,7 +2116,7 @@ export function ShareBundleModal({
                           )}
                           <span>
                             {receiveSessionStatus?.message ||
-                              (receiveExpired ? micro.sessionExpired : micro.waitingPush)}
+                              (receiveExpired ? dict.sync.sessionExpired : dict.sync.waitingPush)}
                           </span>
                         </span>
                       </div>
@@ -2240,7 +2134,7 @@ export function ShareBundleModal({
 
                     {receiveExpired && (
                       <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--red)]/45 bg-[var(--red-soft)] px-3.5 py-2.5 text-xs text-[var(--red)]">
-                        <span>{micro.sessionExpired}</span>
+                        <span>{dict.sync.sessionExpired}</span>
                         <button
                           type="button"
                           disabled={busy}
@@ -2278,7 +2172,7 @@ export function ShareBundleModal({
                             <Copy className="h-3.5 w-3.5" />
                           )}
                           <span>
-                            {copiedKey === "recv-qr-uri" ? dict.common.copied : micro.copyQrUri}
+                            {copiedKey === "recv-qr-uri" ? dict.common.copied : dict.sync.copyQrUri}
                           </span>
                         </button>
                       </div>
@@ -2327,7 +2221,7 @@ export function ShareBundleModal({
                                   <div className="flex min-w-0 items-center gap-1.5">
                                     {item.isCustom && (
                                       <span className="shrink-0 rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
-                                        {micro.customUrlTag}
+                                        {dict.sync.customUrlTag}
                                       </span>
                                     )}
                                     <span
@@ -2373,10 +2267,12 @@ export function ShareBundleModal({
               {!preview && importTransport === "zip" && (
                 <div className="space-y-3 rounded-xl border border-dashed border-[var(--line)] px-5 py-8 text-center">
                   <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-                    点击上方「{dict.share.pickZipBtn}」后，猫猫会先安全解析包内清单，供你自由挑选需要导入的节点或国内中转，确认后才会写入本地。
+                    {formatI18nTemplate(dict.share.importZipEmptyStep, {
+                      action: dict.share.pickZipBtn,
+                    })}
                   </p>
                   <p className="text-[11px] text-[var(--muted)]">
-                    只导入来自你信任的朋友的分享包，避免导入陌生来源配置。
+                    {dict.share.importZipTrustHint}
                   </p>
                 </div>
               )}
@@ -2384,7 +2280,7 @@ export function ShareBundleModal({
               {!preview && importTransport === "pull_input" && (
                 <div className="space-y-2 rounded-xl border border-dashed border-[var(--line)] px-5 py-6 text-center">
                   <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-                    {micro.pullEmptyHint}
+                    {dict.sync.pullEmptyHint}
                   </p>
                   <p className="text-[11px] text-[var(--muted)]">{dict.sync.ttlHint}</p>
                 </div>
@@ -2403,7 +2299,7 @@ export function ShareBundleModal({
                             <span>{preview.manifest.name}</span>
                             {syncPreview?.fingerprint && (
                               <span className="rounded bg-[var(--card)]/80 px-1.5 py-0.5 cc-mono text-[10px] font-normal text-[var(--text-secondary)]">
-                                {micro.fingerprintLabel}: {syncPreview.fingerprint.slice(0, 10)}
+                                {dict.sync.fingerprintLabel}: {syncPreview.fingerprint.slice(0, 10)}
                               </span>
                             )}
                           </div>
@@ -2419,7 +2315,7 @@ export function ShareBundleModal({
                           onClick={handleClearImportPreview}
                           className="shrink-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--text-secondary)] hover:text-[var(--text)]"
                         >
-                          {micro.clearPreview}
+                          {dict.sync.clearPreview}
                         </button>
                       )}
                     </div>
@@ -2485,14 +2381,14 @@ export function ShareBundleModal({
                           }
                           className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
                         >
-                          全选
+                          {dict.share.selectAll}
                         </button>
                         <button
                           type="button"
                           onClick={() => setImportNodeIds(new Set())}
                           className="rounded-lg px-2 py-1 text-[var(--muted)] hover:text-[var(--text)]"
                         >
-                          清空
+                          {dict.share.clear}
                         </button>
                       </div>
                     )}
@@ -2506,14 +2402,14 @@ export function ShareBundleModal({
                           }
                           className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
                         >
-                          全选
+                          {dict.share.selectAll}
                         </button>
                         <button
                           type="button"
                           onClick={() => setImportRelayIds(new Set())}
                           className="rounded-lg px-2 py-1 text-[var(--muted)] hover:text-[var(--text)]"
                         >
-                          清空
+                          {dict.share.clear}
                         </button>
                       </div>
                     )}
@@ -2529,7 +2425,7 @@ export function ShareBundleModal({
                             type="text"
                             value={importNodeSearch}
                             onChange={(e) => setImportNodeSearch(e.target.value)}
-                            placeholder="筛选包内节点…"
+                            placeholder={dict.share.filterBundleNodesPlaceholder}
                             className="w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] py-1.5 pl-8 pr-3 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                           />
                         </div>
@@ -2620,7 +2516,7 @@ export function ShareBundleModal({
                                       {relay.name}
                                     </div>
                                     <div className="text-[10.5px] text-[var(--muted)]">
-                                      {relay.region || "CN"} ·{" "}
+                                      {relay.region || dict.share.relayDomesticFallback} ·{" "}
                                       <span className="cc-mono uppercase">{relay.protocol}</span> · :
                                       <span className="cc-mono">{relay.port}</span>
                                     </div>
@@ -2652,7 +2548,7 @@ export function ShareBundleModal({
                           <span>{dict.sync.includeGroupsToggle}</span>
                         </span>
                         <span className="cc-mono rounded-full bg-[var(--accent)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
-                          {syncPreview.group_count} {micro.groupsTabBadge}
+                          {syncPreview.group_count} {dict.sync.groupsTabBadge}
                         </span>
                       </label>
                       {syncPreview.group_names.length > 0 && (
@@ -2678,7 +2574,9 @@ export function ShareBundleModal({
                   {/* Destination Grouping Selector (skip when only relays/groups are selected) */}
                   {importNodeIds.size > 0 ? (
                     <div className="space-y-2.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/70 p-3.5">
-                      <div className="text-xs font-semibold text-[var(--text)]">节点导入去向</div>
+                      <div className="text-xs font-semibold text-[var(--text)]">
+                        {dict.share.importDestTitle}
+                      </div>
                       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                         <button
                           type="button"
@@ -2693,7 +2591,7 @@ export function ShareBundleModal({
                           <div className="min-w-0">
                             <div className="font-semibold">{dict.nodes.captureSaveNew}</div>
                             <div className="mt-0.5 text-[10.5px] text-[var(--muted)]">
-                              单独建一个新分组存放，不影响旧订阅
+                              {dict.share.importDestNewDesc}
                             </div>
                           </div>
                         </button>
@@ -2713,8 +2611,8 @@ export function ShareBundleModal({
                             <div className="font-semibold">{dict.nodes.captureUpdateExisting}</div>
                             <div className="mt-0.5 text-[10.5px] text-[var(--muted)]">
                               {subscriptions.length === 0
-                                ? "当前暂无已有分组"
-                                : "合并进现有分组，可选择替换或去重"}
+                                ? dict.share.importDestNoExisting
+                                : dict.share.importDestExistingDesc}
                             </div>
                           </div>
                         </button>
@@ -2728,7 +2626,7 @@ export function ShareBundleModal({
                             disabled={importing}
                             value={importNewSubName}
                             onChange={(e) => setImportNewSubName(e.target.value)}
-                            placeholder={preview.manifest.name || "CatCloud Sync"}
+                            placeholder={preview.manifest.name || dict.sync.defaultSyncPackName}
                             className="mt-1 w-full rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                           />
                         </label>
@@ -2787,7 +2685,7 @@ export function ShareBundleModal({
                       <span>
                         {dict.share.selectRelaysTab}: {importRelayIds.size}
                         {effectiveGroupImportCount > 0
-                          ? ` · ${micro.groupsTabBadge}: ${effectiveGroupImportCount}`
+                          ? ` · ${dict.sync.groupsTabBadge}: ${effectiveGroupImportCount}`
                           : ""}
                       </span>
                     </div>
@@ -2820,7 +2718,7 @@ export function ShareBundleModal({
                   </strong>
                   {includeGroups && groups.length > 0 && (
                     <span className="ml-1.5 text-[var(--muted)]">
-                      · {groups.length} {micro.groupsTabBadge}
+                      · {groups.length} {dict.sync.groupsTabBadge}
                     </span>
                   )}
                 </div>
@@ -2857,7 +2755,7 @@ export function ShareBundleModal({
                     className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--card)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:text-[var(--text)] disabled:opacity-50"
                   >
                     <RotateCcw className="h-3.5 w-3.5" />
-                    <span>{micro.reExportBtn}</span>
+                    <span>{dict.sync.reExportBtn}</span>
                   </button>
                   <button
                     type="button"
@@ -2917,7 +2815,7 @@ export function ShareBundleModal({
                       ) : (
                         <QrCode className="h-3.5 w-3.5" />
                       )}
-                      <span>{startingSend ? micro.syncActionBusy : dict.sync.startSendBtn}</span>
+                      <span>{startingSend ? dict.sync.syncActionBusy : dict.sync.startSendBtn}</span>
                     </button>
                   )}
                   {exportTransport === "relay_file" && (
@@ -2933,7 +2831,7 @@ export function ShareBundleModal({
                         <KeyRound className="h-3.5 w-3.5" />
                       )}
                       <span>
-                        {exporting ? micro.relayActionBusy : dict.sync.exportEncryptedBtn}
+                        {exporting ? dict.sync.relayActionBusy : dict.sync.exportEncryptedBtn}
                       </span>
                     </button>
                   )}
@@ -2960,7 +2858,7 @@ export function ShareBundleModal({
                         <strong className="cc-mono font-semibold text-[var(--accent)]">
                           {effectiveGroupImportCount}
                         </strong>{" "}
-                        {micro.groupsTabBadge}
+                        {dict.sync.groupsTabBadge}
                       </>
                     )}
                   </>

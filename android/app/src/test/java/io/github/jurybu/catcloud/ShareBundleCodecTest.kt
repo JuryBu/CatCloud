@@ -259,6 +259,101 @@ class ShareBundleCodecTest {
         return copy
     }
 
+    @Test
+    fun previewRejectsMalformedOrTruncatedCentralDirectoryZip() {
+        // 1. Non-ZIP / missing EOCD must throw IllegalArgumentException (never silently skip security scan)
+        val noEocd = "PK\u0003\u0004not-a-valid-zip-archive-without-eocd".toByteArray(Charsets.UTF_8)
+        assertThrowsIllegalArg("Missing EOCD must be rejected") {
+            ShareBundleCodec.previewShareBundleZip(noEocd)
+        }
+
+        // 2. Truncated valid ZIP missing EOCD tail must throw IllegalArgumentException
+        val validZip = buildSingleEntryZip(
+            "manifest.json",
+            """{"schema":"catcloud-share/v1","name":"t","created_at":"","node_count":0,"relay_count":0}""".toByteArray(),
+        )
+        val truncatedNoEocd = validZip.copyOf(validZip.size - 20)
+        assertThrowsIllegalArg("Truncated ZIP missing EOCD must be rejected") {
+            ShareBundleCodec.previewShareBundleZip(truncatedNoEocd)
+        }
+
+        // 3. Corrupted EOCD central directory offset out of bounds must throw IllegalArgumentException
+        val badOffsetZip = validZip.copyOf()
+        val bufOffset = ByteBuffer.wrap(badOffsetZip).order(ByteOrder.LITTLE_ENDIAN)
+        val eocdPos = findEocdOffset(badOffsetZip)
+        assertTrue(eocdPos >= 0)
+        bufOffset.putInt(eocdPos + 16, badOffsetZip.size + 100)
+        assertThrowsIllegalArg("Out-of-bounds central directory offset must be rejected") {
+            ShareBundleCodec.previewShareBundleZip(badOffsetZip)
+        }
+
+        // 4. Corrupted central directory header signature must throw IllegalArgumentException
+        val badCdSigZip = validZip.copyOf()
+        val bufSig = ByteBuffer.wrap(badCdSigZip).order(ByteOrder.LITTLE_ENDIAN)
+        val cdOff = bufSig.getInt(eocdPos + 16)
+        bufSig.putInt(cdOff, 0x11223344)
+        assertThrowsIllegalArg("Corrupted central directory signature must be rejected") {
+            ShareBundleCodec.previewShareBundleZip(badCdSigZip)
+        }
+    }
+
+    @Test
+    fun mergeImportedGroupsStripsSelfReferenceAndDanglingFallbackPool() {
+        val n1 = demoNode("local-n1", "JP-1", "203.0.113.10", "00000000-0000-4000-8000-000000000001")
+        val fpMap = mapOf(n1.fingerprint to n1.id)
+
+        val existing = listOf(
+            MultiGroupRecord(
+                id = "grp-self-existing",
+                name = "SelfExisting",
+                memberNodeIds = listOf(n1.id),
+                fallbackPoolId = "grp-self-existing", // self-reference
+            ),
+            MultiGroupRecord(
+                id = "grp-dangling-existing",
+                name = "DanglingExisting",
+                memberNodeIds = listOf(n1.id),
+                fallbackPoolId = "grp-does-not-exist", // dangling reference
+            ),
+        )
+        val importedDoc = ShareGroupsDocument(
+            groups = listOf(
+                ShareGroupRecord(
+                    name = "SelfImported",
+                    memberFingerprints = listOf(n1.fingerprint),
+                    fallbackPoolName = "SelfImported", // self-reference by name
+                )
+            )
+        )
+
+        val merged = ShareBundleCodec.mergeImportedGroups(existing, importedDoc, fpMap)
+        assertNull(merged.mergedGroups.first { it.name == "SelfExisting" }.fallbackPoolId)
+        assertNull(merged.mergedGroups.first { it.name == "DanglingExisting" }.fallbackPoolId)
+        assertNull(merged.mergedGroups.first { it.name == "SelfImported" }.fallbackPoolId)
+    }
+
+    private fun findEocdOffset(zipBytes: ByteArray): Int {
+        for (i in (zipBytes.size - 22) downTo maxOf(0, zipBytes.size - 65557)) {
+            if (zipBytes[i] == 0x50.toByte() &&
+                zipBytes[i + 1] == 0x4b.toByte() &&
+                zipBytes[i + 2] == 0x05.toByte() &&
+                zipBytes[i + 3] == 0x06.toByte()
+            ) {
+                return i
+            }
+        }
+        return -1
+    }
+
+    private fun assertThrowsIllegalArg(msg: String, block: () -> Unit) {
+        try {
+            block()
+            fail(msg)
+        } catch (_: IllegalArgumentException) {
+            // Expected
+        }
+    }
+
     private fun assertThrowsSecurity(msg: String, block: () -> Unit) {
         try {
             block()

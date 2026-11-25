@@ -917,6 +917,9 @@ mod tests {
             qr.size,
             svg.len()
         );
+        assert_eq!(qr.version, 9);
+        assert_eq!(qr.size, 53);
+        assert_eq!(qr.modules.len(), qr.size * qr.size);
     }
 
     #[test]

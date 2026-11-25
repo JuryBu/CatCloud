@@ -503,12 +503,14 @@ class AppDatabase(private val appContext: Context) : SQLiteOpenHelper(
         activeNodeName: String,
         activeNodeCount: Int,
         wasRunning: Boolean,
+        controllerGroupName: String = activeNodeName,
     ): File {
         val obj = JSONObject().apply {
             put("config_path", configPath)
             put("per_app_mode", settings.perAppMode.wireValue)
             put("per_app_packages", JSONArray(settings.perAppPackages))
             put("active_node_name", activeNodeName)
+            put("controller_group_name", controllerGroupName)
             put("active_node_count", activeNodeCount)
             put("auto_start_on_boot", settings.autoStartOnBoot)
             put("was_running", wasRunning)

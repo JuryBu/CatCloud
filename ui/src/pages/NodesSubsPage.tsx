@@ -5218,20 +5218,20 @@ export function NodesSubsPage({
               type="button"
               onClick={openShareImport}
               className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-              title="从朋友发来的 .zip 分享包导入节点或国内中转"
+              title={dict.share.importZipTooltip}
             >
               <Package className="h-3.5 w-3.5 text-[var(--accent)]" />
-              <span>导入分享包 (.zip)</span>
+              <span>{dict.common.importShareBundle} (.zip)</span>
             </button>
 
             <button
               type="button"
-              onClick={() => openShareExport(undefined, "猫猫云梯分享包")}
+              onClick={() => openShareExport(undefined, dict.share.defaultPackName)}
               className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-              title="挑选节点或国内中转导出为 .zip 分享包"
+              title={dict.share.exportZipTooltip}
             >
               <Upload className="h-3.5 w-3.5 text-[var(--accent)]" />
-              <span>导出分享包 (.zip)</span>
+              <span>{dict.common.exportShareBundle} (.zip)</span>
             </button>
 
             <button
@@ -5250,8 +5250,8 @@ export function NodesSubsPage({
               onClick={openMergeModal}
               title={
                 subscriptions.length < 2
-                  ? "至少需要 2 个已导入分组才可合并"
-                  : "把一个分组安全整合进另一个分组，并保留原测速与多选组引用"
+                  ? dict.nodes.mergeSubsNeedTwoTip
+                  : dict.nodes.mergeSubsTooltip
               }
               className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
             >
@@ -5264,12 +5264,13 @@ export function NodesSubsPage({
                 type="button"
                 disabled={refreshingAll || subscriptions.length === 0}
                 onClick={() => void refreshAllSubscriptions()}
+                title={dict.nodes.refreshAllBtn}
                 className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] disabled:opacity-50"
               >
                 <RefreshCw
                   className={`h-3.5 w-3.5 text-[var(--accent)] ${refreshingAll ? "animate-spin" : ""}`}
                 />
-                全部刷新
+                {dict.nodes.refreshAllBtn}
               </button>
             )}
           </div>
@@ -6129,10 +6130,13 @@ export function NodesSubsPage({
                                   : "未测速"}
                             </span>
                             {(probe?.up_mbps != null || probe?.down_mbps != null) && (
-                              <div className="flex flex-col leading-tight text-[11px]">
+                              <div
+                                className="flex flex-col leading-tight text-[11px]"
+                                title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
+                              >
                                 {probe?.up_mbps != null && (
                                   <span className="whitespace-nowrap font-medium text-[var(--coral)]">
-                                    ↑{probe.up_mbps.toFixed(1)}M
+                                    ↑{probe.up_mbps.toFixed(1)} Mbps
                                   </span>
                                 )}
                                 {probe?.down_mbps != null && (
@@ -6140,8 +6144,8 @@ export function NodesSubsPage({
                                     ↓
                                     {probe.down_mbps >= 100
                                       ? Math.round(probe.down_mbps)
-                                      : probe.down_mbps.toFixed(1)}
-                                    M
+                                      : probe.down_mbps.toFixed(1)}{" "}
+                                    Mbps
                                   </span>
                                 )}
                               </div>

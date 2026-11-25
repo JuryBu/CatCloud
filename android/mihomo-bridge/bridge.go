@@ -171,7 +171,7 @@ func stopControllerLocked() {
 	lastControllerAddr = ""
 	lastControllerSecret = ""
 	route.ReCreateServer(&route.Config{})
-	waitLoopbackClosed(prevAddr, 200*time.Millisecond)
+	waitLoopbackClosed(prevAddr, 500*time.Millisecond)
 }
 
 func parseSystemDNSCSV(dnsCsv string) []string {

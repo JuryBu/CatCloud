@@ -184,6 +184,9 @@ data class VpnRuntimeStatus(
     val uptimeSec: Long = 0L,
     val watchdogStatus: String = "idle",
     val lastError: String? = null,
+    val controllerGroupName: String = "",
+    val mixedPort: Int = 0,
+    val mixedSecret: String = "",
 )
 
 @Immutable

@@ -9,6 +9,7 @@ use catcloud_core::sync::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 pub const EVENT_SYNC_SESSION_UPDATED: &str = "catcloud://sync-session-updated";
@@ -93,13 +94,13 @@ impl LanSyncManager {
         }
     }
 
-    pub async fn start_send_session(
+    async fn start_send_session_inner(
         &self,
         zip_bytes: Vec<u8>,
         custom_endpoint: Option<String>,
         ttl_secs: Option<u64>,
         allow_multiple: bool,
-    ) -> Result<SyncSendSessionDto, String> {
+    ) -> Result<(SyncSendSessionDto, watch::Receiver<Option<String>>), String> {
         let payload_bytes = zip_bytes.len();
         let opts = LanSyncServerOptions {
             bind_host: "0.0.0.0".to_string(),
@@ -113,6 +114,7 @@ impl LanSyncManager {
             .await
             .map_err(|e| format!("启动局域网发送同步失败：{e}"))?;
         let info: LanSyncSendInfo = server.info().clone();
+        let close_reason_rx = server.subscribe_close_reason();
         let qr_svg = render_qr_svg(&info.uri)
             .map_err(|e| format!("生成同步二维码失败：{e}"))?;
 
@@ -133,19 +135,88 @@ impl LanSyncManager {
             prev.cancel().await;
         }
 
-        Ok(SyncSendSessionDto {
-            session_id: info.sid,
-            pin_code: info.pin,
-            lan_urls,
-            custom_endpoint: info.custom_endpoint,
-            port: info.port,
-            fingerprint: info.fingerprint,
-            qr_uri: info.uri,
-            qr_svg,
-            expires_at_unix: info.expires_at_unix.max(0) as u64,
-            payload_bytes,
-            allow_multiple: info.allow_multiple,
-        })
+        Ok((
+            SyncSendSessionDto {
+                session_id: info.sid,
+                pin_code: info.pin,
+                lan_urls,
+                custom_endpoint: info.custom_endpoint,
+                port: info.port,
+                fingerprint: info.fingerprint,
+                qr_uri: info.uri,
+                qr_svg,
+                expires_at_unix: info.expires_at_unix.max(0) as u64,
+                payload_bytes,
+                allow_multiple: info.allow_multiple,
+            },
+            close_reason_rx,
+        ))
+    }
+
+    fn clear_send_slot_if_matches(&self, session_id: &str) {
+        let removed = if let Ok(mut guard) = self.active_send.lock() {
+            if guard.as_ref().is_some_and(|srv| srv.info().sid == session_id) {
+                guard.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(removed);
+    }
+
+    fn clear_receive_slot_if_matches(&self, session_id: &str) {
+        let removed = if let Ok(mut guard) = self.active_receive.lock() {
+            if guard.as_ref().is_some_and(|srv| srv.info().sid == session_id) {
+                guard.take()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        drop(removed);
+    }
+
+    pub async fn start_send_session(
+        self: &Arc<Self>,
+        app: AppHandle,
+        zip_bytes: Vec<u8>,
+        custom_endpoint: Option<String>,
+        ttl_secs: Option<u64>,
+        allow_multiple: bool,
+    ) -> Result<SyncSendSessionDto, String> {
+        let (dto, mut close_reason_rx) = self
+            .start_send_session_inner(zip_bytes, custom_endpoint, ttl_secs, allow_multiple)
+            .await?;
+
+        let mgr = Arc::clone(self);
+        let sid_for_task = dto.session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let reason = loop {
+                let current = close_reason_rx.borrow().clone();
+                if let Some(r) = current {
+                    break r;
+                }
+                if close_reason_rx.changed().await.is_err() {
+                    let final_reason = close_reason_rx.borrow().clone();
+                    break final_reason.unwrap_or_else(|| "closed".to_string());
+                }
+            };
+            mgr.clear_send_slot_if_matches(&sid_for_task);
+            let _ = app.emit(
+                EVENT_SYNC_SESSION_UPDATED,
+                SyncSessionEventPayload {
+                    session_id: sid_for_task,
+                    role: "pull".to_string(),
+                    status: reason,
+                    message: None,
+                },
+            );
+        });
+
+        Ok(dto)
     }
 
     pub async fn cancel_send_session(&self, session_id: Option<&str>) -> bool {
@@ -197,6 +268,7 @@ impl LanSyncManager {
             .map(|h| format!("http://{h}:{}", info.port))
             .collect();
 
+        let mut close_reason_rx = server.subscribe_close_reason();
         let rx_opt = server.take_receiver();
 
         let prev_server = if let Ok(mut guard) = self.active_receive.lock() {
@@ -257,12 +329,26 @@ impl LanSyncManager {
                         }
                     }
                 }
+                let initial_reason = close_reason_rx.borrow().clone();
+                let reason = match initial_reason {
+                    Some(r) => r,
+                    None => {
+                        let _ = tokio::time::timeout(
+                            Duration::from_millis(200),
+                            close_reason_rx.changed(),
+                        )
+                        .await;
+                        let final_reason = close_reason_rx.borrow().clone();
+                        final_reason.unwrap_or_else(|| "closed".to_string())
+                    }
+                };
+                mgr.clear_receive_slot_if_matches(&sid_for_task);
                 let _ = app.emit(
                     EVENT_SYNC_SESSION_UPDATED,
                     SyncSessionEventPayload {
                         session_id: sid_for_task,
                         role: "push".to_string(),
-                        status: "closed".to_string(),
+                        status: reason,
                         message: None,
                     },
                 );
@@ -412,7 +498,7 @@ mod tests {
         let expected_fp = plaintext_fingerprint(&zip);
 
         let dto = mgr
-            .start_send_session(
+            .start_send_session_inner(
                 zip.clone(),
                 Some("http://127.0.0.1:0".to_string()),
                 Some(60),
@@ -422,10 +508,10 @@ mod tests {
         // custom_endpoint with port 0 is valid syntax, let's test normal local pull without custom_endpoint override
         drop(dto);
 
-        let dto = mgr
-            .start_send_session(zip.clone(), None, Some(60), false)
+        let (dto, mut close_reason_rx) = mgr
+            .start_send_session_inner(zip.clone(), None, Some(60), false)
             .await
-            .expect("start_send_session");
+            .expect("start_send_session_inner");
         assert_eq!(dto.fingerprint, expected_fp);
         assert_eq!(dto.pin_code.len(), 6);
         assert!(dto.qr_svg.contains("<svg"));
@@ -439,6 +525,14 @@ mod tests {
             .await
             .expect("pull via uri");
         assert_eq!(pulled, zip);
+
+        // One-shot pull should report completed close_reason and allow slot cleanup
+        if close_reason_rx.borrow().is_none() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), close_reason_rx.changed()).await;
+        }
+        assert_eq!(close_reason_rx.borrow().as_deref(), Some("completed"));
+        mgr.clear_send_slot_if_matches(&dto.session_id);
+        assert!(mgr.active_send.lock().unwrap().is_none());
 
         let preview = preview_share_bundle_zip_bytes(&pulled).expect("preview");
         let token = mgr.store_pending_bundle(pulled, preview, expected_fp.clone());

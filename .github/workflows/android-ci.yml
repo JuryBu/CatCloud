@@ -44,7 +44,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: "1.25.x"
-          cache-dependency-path: android/mihomo-bridge/go.mod
+          cache-dependency-path: android/mihomo-bridge/go.sum
 
       - name: Setup Gradle 8.11.1 (wrapper-free)
         uses: gradle/actions/setup-gradle@v4
@@ -90,7 +90,7 @@ jobs:
             echo "ANDROID_LLVM_NM=$NM_BIN"
           } >> "$GITHUB_ENV"
 
-      - name: Gate 3 - Resolve Go dependencies and verify mihomo v1.19.16 API signatures
+      - name: Gate 3 - Enforce reproducible go.sum (-mod=readonly) and verify mihomo v1.19.16 API signatures
         id: go_deps
         working-directory: android/mihomo-bridge
         shell: bash
@@ -98,21 +98,19 @@ jobs:
           set -euo pipefail
           go version
           if [[ ! -f go.sum ]]; then
-            echo "go.sum not found; running go mod tidy to bootstrap reproducible lockfile."
-            go mod tidy
-            echo "generated_go_sum=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "go.sum found; enforcing -mod=readonly."
-            go mod download
-            echo "generated_go_sum=false" >> "$GITHUB_OUTPUT"
+            echo "ERROR: android/mihomo-bridge/go.sum is missing; refusing non-reproducible build. Commit go.sum before running CI." >&2
+            exit 1
           fi
+          echo "go.sum verified; enforcing reproducible -mod=readonly download."
+          go mod download -x >/dev/null
+          go list -mod=readonly -m all >/dev/null
 
           echo "=== mihomo v1.19.16 API diagnostic (go doc, GOOS=android GOARCH=arm64 GOFLAGS=-tags=cmfa) ==="
           export GOOS=android
           export GOARCH=arm64
           export CGO_ENABLED=1
           export CC="$ANDROID_ARM64_CC"
-          export GOFLAGS="-tags=cmfa"
+          export GOFLAGS="-tags=cmfa -mod=readonly"
           for sym in \
             github.com/metacubex/mihomo/component/dialer.DefaultSocketHook \
             github.com/metacubex/mihomo/listener/config.Tun \
@@ -127,16 +125,6 @@ jobs:
             go doc "$sym" || true
           done
           unset GOFLAGS
-
-      - name: Upload generated go.sum (and tidied go.mod) artifact for lockfile backfill
-        if: steps.go_deps.outputs.generated_go_sum == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: android-mihomo-bridge-go-sum
-          path: |
-            android/mihomo-bridge/go.mod
-            android/mihomo-bridge/go.sum
-          retention-days: 7
 
       - name: Gate 4 - Build libmihomo.so (arm64-v8a, cmfa) and enforce 16KB ELF alignment + JNI symbols
         working-directory: android/mihomo-bridge

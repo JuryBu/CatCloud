@@ -7,14 +7,17 @@ interface ICatCloudVpnControl {
         String perAppMode,
         in String[] perAppPackages,
         String activeNodeName,
+        String controllerGroupName,
         int activeNodeCount
     );
     String reloadVpn(
         String configPath,
         String activeNodeName,
+        String controllerGroupName,
         int activeNodeCount
     );
     void stopVpn();
     String forceRestartCore();
     void forceGc();
+    void setWatchdogPaused(boolean paused);
 }

@@ -3,6 +3,7 @@ package io.github.jurybu.catcloud.engine
 import io.github.jurybu.catcloud.data.ProxyNodeRecord
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -10,6 +11,8 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import okhttp3.Call
+import okhttp3.ConnectionPool
+import okhttp3.Credentials
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -18,6 +21,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okio.BufferedSink
 import org.json.JSONObject
 import java.net.InetSocketAddress
+import java.net.Proxy
 import java.net.Socket
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
@@ -87,11 +91,55 @@ class SpeedTester(
     }
 
     /**
-     * Serial multi-node real download/upload throughput test:
+     * Quick TCP handshake latency probe for domestic pre-acceleration relays.
+     */
+    suspend fun testRelayTcpLatencyMs(
+        host: String,
+        port: Int,
+        timeoutMs: Int = PING_TIMEOUT_MS,
+    ): Int? = withContext(Dispatchers.IO) {
+        probeTcpConnectRtt(host, port, timeoutMs)
+    }
+
+    /**
+     * Alias matching the frozen cross-module contract for serial multi-node throughput testing.
+     */
+    suspend fun runSerialThroughputTest(
+        nodes: List<ProxyNodeRecord>,
+        restPort: Int,
+        restSecret: String,
+        targetGroupName: String,
+        usePreAccel: Boolean,
+        onPauseWatchdog: suspend (paused: Boolean) -> Unit,
+        onProgress: (index: Int, total: Int, node: ProxyNodeRecord) -> Unit,
+        onNodeResult: (ThroughputResult) -> Unit,
+        mixedPort: Int = 0,
+        mixedSecret: String = "",
+        restoreNodeName: String? = null,
+        restorePreAccelTarget: String? = null,
+    ) = testThroughputSerial(
+        nodes = nodes,
+        restPort = restPort,
+        restSecret = restSecret,
+        targetGroupName = targetGroupName,
+        usePreAccel = usePreAccel,
+        onPauseWatchdog = onPauseWatchdog,
+        onProgress = onProgress,
+        onNodeResult = onNodeResult,
+        mixedPort = mixedPort,
+        mixedSecret = mixedSecret,
+        restoreNodeName = restoreNodeName,
+        restorePreAccelTarget = restorePreAccelTarget,
+    )
+
+    /**
+     * Serial multi-node real download/upload throughput test routed strictly through the Mihomo
+     * loopback `mixed-port` HTTP proxy (never falsely measuring direct ISP speed):
      * - Strictly serial (`concurrency = 1`)
      * - Per-node hard cap: `2 MiB` download, `1 MiB` upload
-     * - Early stop at `512 KiB` when slow (`> 3.5s`)
-     * - Invokes [onPauseWatchdog] before start and restores in `finally`
+     * - Early stop at `512 KiB` when slow (`> 3.5s`), chunked upload (`contentLength = -1L`)
+     * - Invokes [onPauseWatchdog] before start, restores original node/pre-accel selection and
+     *   resumes watchdog inside `finally` under [NonCancellable]
      * - Immediately cancels active OkHttp [Call] on pause/cancel while preserving completed results
      */
     suspend fun testThroughputSerial(
@@ -103,8 +151,62 @@ class SpeedTester(
         onPauseWatchdog: suspend (paused: Boolean) -> Unit,
         onProgress: (index: Int, total: Int, node: ProxyNodeRecord) -> Unit,
         onNodeResult: (ThroughputResult) -> Unit,
+        mixedPort: Int = 0,
+        mixedSecret: String = "",
+        restoreNodeName: String? = null,
+        restorePreAccelTarget: String? = null,
     ) = withContext(Dispatchers.IO) {
         cancelled.set(false)
+        if (mixedPort !in 1..65535) {
+            val errMsg = "未启用本地回环测速代理端口（mixedPort=$mixedPort），已拒绝直连假测"
+            for ((idx, node) in nodes.withIndex()) {
+                if (cancelled.get()) break
+                onProgress(idx, nodes.size, node)
+                onNodeResult(
+                    ThroughputResult(
+                        nodeId = node.id,
+                        latencyMs = null,
+                        downMbps = null,
+                        upMbps = null,
+                        error = errMsg,
+                    )
+                )
+            }
+            return@withContext
+        }
+
+        val tunnelPool = ConnectionPool(2, 15, TimeUnit.SECONDS)
+        val tunnelBuilder = httpClient.newBuilder()
+            .connectionPool(tunnelPool)
+            .proxy(Proxy(Proxy.Type.HTTP, InetSocketAddress("127.0.0.1", mixedPort)))
+        if (mixedSecret.isNotBlank()) {
+            val basicCred = Credentials.basic("catcloud", mixedSecret)
+            tunnelBuilder.proxyAuthenticator { _, response ->
+                if (response.request.header("Proxy-Authorization") != null) {
+                    null
+                } else {
+                    response.request.newBuilder()
+                        .header("Proxy-Authorization", basicCred)
+                        .build()
+                }
+            }
+        }
+        val tunnelClient = tunnelBuilder.build()
+
+        val canUseController = restPort in 1..65535 && restSecret.isNotBlank()
+        val effectiveRestoreNode = restoreNodeName?.trim()?.takeIf { it.isNotEmpty() }
+            ?: if (canUseController && targetGroupName.isNotBlank()) {
+                queryCurrentProxyNow(targetGroupName, restPort, restSecret)
+            } else {
+                null
+            }
+        val effectiveRestorePreAccel = restorePreAccelTarget?.trim()?.takeIf { it.isNotEmpty() }
+            ?: if (canUseController && !usePreAccel) {
+                queryCurrentProxyNow(ConfigCompiler.PREACCEL_SELECT_GROUP, restPort, restSecret)
+            } else {
+                null
+            }
+
         onPauseWatchdog(true)
         try {
             val total = nodes.size
@@ -112,27 +214,50 @@ class SpeedTester(
                 if (cancelled.get()) break
                 onProgress(idx, total, node)
 
-                // Switch active proxy in controller when connected
-                if (restPort > 0 && restSecret.isNotBlank() && targetGroupName.isNotBlank()) {
-                    runCatching {
+                // Switch active proxy in controller before tunneling through mixed-port
+                if (canUseController && targetGroupName.isNotBlank()) {
+                    val switched = runCatching {
                         selectProxyViaController(targetGroupName, node.name, restPort, restSecret)
-                        if (!usePreAccel) {
-                            // Optional comparison toggle: switch domestic pre-accel entry to DIRECT if present
+                    }.getOrDefault(false)
+                    if (!switched) {
+                        onNodeResult(
+                            ThroughputResult(
+                                nodeId = node.id,
+                                latencyMs = null,
+                                downMbps = null,
+                                upMbps = null,
+                                error = "无法在代理组「$targetGroupName」中切换到节点「${node.name}」",
+                            )
+                        )
+                        continue
+                    }
+                    if (!usePreAccel) {
+                        runCatching {
                             selectProxyViaController(ConfigCompiler.PREACCEL_SELECT_GROUP, "DIRECT", restPort, restSecret)
                         }
                     }
                 }
 
-                val latency = if (restPort > 0 && restSecret.isNotBlank()) {
+                // Evict pooled Keep-Alive connections so each node opens a fresh tunnel through Mihomo
+                tunnelPool.evictAll()
+
+                val latency = if (canUseController) {
                     probeViaController(node.name, restPort, restSecret)
                 } else {
                     probeTcpConnectRtt(node.server, node.port)
                 }
 
                 if (cancelled.get()) break
-                val downMbps = runCatching { measureDownloadMbps() }.getOrNull()
+                var nodeError: String? = null
+                val downMbps = runCatching { measureDownloadMbps(tunnelClient) }.getOrElse { err ->
+                    nodeError = err.message ?: "下载测速失败"
+                    null
+                }
                 if (cancelled.get()) break
-                val upMbps = runCatching { measureUploadMbps() }.getOrNull()
+                val upMbps = runCatching { measureUploadMbps(tunnelClient) }.getOrElse { err ->
+                    if (nodeError == null) nodeError = err.message ?: "上传测速失败"
+                    null
+                }
 
                 onNodeResult(
                     ThroughputResult(
@@ -140,6 +265,7 @@ class SpeedTester(
                         latencyMs = latency,
                         downMbps = downMbps,
                         upMbps = upMbps,
+                        error = if (downMbps == null && upMbps == null) nodeError else null,
                     )
                 )
             }
@@ -148,8 +274,51 @@ class SpeedTester(
             throw ce
         } finally {
             activeCall.getAndSet(null)?.cancel()
-            runCatching { onPauseWatchdog(false) }
+            tunnelPool.evictAll()
+            withContext(NonCancellable) {
+                if (canUseController) {
+                    if (!effectiveRestorePreAccel.isNullOrBlank()) {
+                        runCatching {
+                            selectProxyViaController(
+                                ConfigCompiler.PREACCEL_SELECT_GROUP,
+                                effectiveRestorePreAccel,
+                                restPort,
+                                restSecret,
+                            )
+                        }
+                    }
+                    if (targetGroupName.isNotBlank() && !effectiveRestoreNode.isNullOrBlank()) {
+                        runCatching {
+                            selectProxyViaController(
+                                targetGroupName,
+                                effectiveRestoreNode,
+                                restPort,
+                                restSecret,
+                            )
+                        }
+                    }
+                }
+                runCatching { onPauseWatchdog(false) }
+            }
         }
+    }
+
+    private fun queryCurrentProxyNow(groupName: String, restPort: Int, restSecret: String): String? {
+        val encGroup = URLEncoder.encode(groupName, "UTF-8").replace("+", "%20")
+        val req = Request.Builder()
+            .url("http://127.0.0.1:$restPort/proxies/$encGroup")
+            .header("Authorization", "Bearer $restSecret")
+            .get()
+            .build()
+        return runCatching {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@use null
+                JSONObject(resp.body?.string().orEmpty())
+                    .optString("now", "")
+                    .trim()
+                    .takeIf { it.isNotEmpty() }
+            }
+        }.getOrNull()
     }
 
     private fun probeViaController(proxyName: String, restPort: Int, restSecret: String): Int? {
@@ -170,7 +339,7 @@ class SpeedTester(
         }.getOrNull()
     }
 
-    private fun selectProxyViaController(groupName: String, proxyName: String, restPort: Int, restSecret: String) {
+    private fun selectProxyViaController(groupName: String, proxyName: String, restPort: Int, restSecret: String): Boolean {
         val encGroup = URLEncoder.encode(groupName, "UTF-8").replace("+", "%20")
         val payload = JSONObject().put("name", proxyName).toString()
         val req = Request.Builder()
@@ -178,26 +347,27 @@ class SpeedTester(
             .header("Authorization", "Bearer $restSecret")
             .put(payload.toRequestBody("application/json; charset=utf-8".toMediaType()))
             .build()
-        httpClient.newCall(req).execute().close()
+        return httpClient.newCall(req).execute().use { resp -> resp.isSuccessful }
     }
 
-    private fun probeTcpConnectRtt(host: String, port: Int): Int? {
+    private fun probeTcpConnectRtt(host: String, port: Int, timeoutMs: Int = PING_TIMEOUT_MS): Int? {
         if (host.isBlank() || port !in 1..65535) return null
         val startNs = System.nanoTime()
         return runCatching {
             Socket().use { sock ->
-                sock.connect(InetSocketAddress(host, port), PING_TIMEOUT_MS)
+                sock.connect(InetSocketAddress(host, port), timeoutMs.coerceIn(200, 30_000))
             }
             ((System.nanoTime() - startNs) / 1_000_000L).toInt().coerceAtLeast(1)
         }.getOrNull()
     }
 
-    private fun measureDownloadMbps(): Double? {
+    private fun measureDownloadMbps(client: OkHttpClient): Double? {
         val req = Request.Builder()
             .url("$DOWNLOAD_TEST_URL?bytes=$MAX_DOWNLOAD_BYTES")
+            .header("Connection", "close")
             .get()
             .build()
-        val call = httpClient.newCall(req)
+        val call = client.newCall(req)
         activeCall.set(call)
         try {
             call.execute().use { resp ->
@@ -223,13 +393,15 @@ class SpeedTester(
         }
     }
 
-    private fun measureUploadMbps(): Double? {
-        val startNs = System.nanoTime()
+    private fun measureUploadMbps(client: OkHttpClient): Double? {
+        var startNs = System.nanoTime()
         var sentBytes = 0L
         val body = object : RequestBody() {
             override fun contentType() = "application/octet-stream".toMediaType()
-            override fun contentLength(): Long = MAX_UPLOAD_BYTES.toLong()
+            // Chunked transfer encoding prevents ProtocolException when slow-link early stop triggers
+            override fun contentLength(): Long = -1L
             override fun writeTo(sink: BufferedSink) {
+                startNs = System.nanoTime()
                 val chunk = ByteArray(16 * 1024)
                 var remaining = MAX_UPLOAD_BYTES
                 while (remaining > 0 && !cancelled.get()) {
@@ -243,8 +415,12 @@ class SpeedTester(
                 }
             }
         }
-        val req = Request.Builder().url(UPLOAD_TEST_URL).post(body).build()
-        val call = httpClient.newCall(req)
+        val req = Request.Builder()
+            .url(UPLOAD_TEST_URL)
+            .header("Connection", "close")
+            .post(body)
+            .build()
+        val call = client.newCall(req)
         activeCall.set(call)
         try {
             call.execute().use { resp ->

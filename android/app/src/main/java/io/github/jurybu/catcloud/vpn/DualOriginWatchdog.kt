@@ -1,5 +1,6 @@
 package io.github.jurybu.catcloud.vpn
 
+import io.github.jurybu.catcloud.engine.ConfigCompiler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -81,17 +82,26 @@ class DualOriginWatchdogEngine {
     private var fullDownStreak = 0
     private var halfDeadStreak = 0
     private var allDeadBackoffUntilMs = 0L
+    @Volatile
     private var screenOff = false
+    @Volatile
     private var pausedBySpeedTest = false
+    @Volatile
     private var networkAvailable = true
 
     fun setScreenOff(off: Boolean) {
         screenOff = off
     }
 
-    fun setPausedBySpeedTest(paused: Boolean) {
+    fun setPaused(paused: Boolean) {
         pausedBySpeedTest = paused
     }
+
+    fun setPausedBySpeedTest(paused: Boolean) {
+        setPaused(paused)
+    }
+
+    fun isPaused(): Boolean = pausedBySpeedTest
 
     fun setNetworkAvailable(available: Boolean) {
         networkAvailable = available
@@ -367,6 +377,13 @@ class DualOriginWatchdogRunner(
         }
     }
 
+    fun setPaused(paused: Boolean) {
+        engine.setPaused(paused)
+        if (paused) {
+            onStatusUpdate("paused")
+        }
+    }
+
     fun stop() {
         job?.cancel()
         job = null
@@ -379,15 +396,27 @@ class DualOriginWatchdogRunner(
         groupName: String,
         nowMs: Long,
     ) {
-        if (restPort <= 0 || restSecret.isBlank() || groupName.isBlank()) return
-        val groupInfo = fetchProxyGroup(restPort, restSecret, groupName) ?: return
+        if (restPort <= 0 || restSecret.isBlank()) return
+        if (engine.isPaused()) {
+            onStatusUpdate("paused")
+            return
+        }
+        val (resolvedGroupName, groupInfo) = resolveControllerGroup(restPort, restSecret, groupName) ?: return
         val activeNode = groupInfo.first.takeIf { it.isNotBlank() && it != "DIRECT" && it != "REJECT" } ?: return
         val allCandidates = groupInfo.second.filter { it != "DIRECT" && it != "REJECT" }
 
         var (health, latency) = probeDualOrigin(restPort, restSecret, activeNode)
+        if (engine.isPaused()) {
+            onStatusUpdate("paused")
+            return
+        }
         // Retry-before-penalize: immediate 1500ms re-check when 0/2 failed
         if (health == DualHealth.FAILED) {
             delay(DualOriginWatchdogEngine.RETRY_RECHECK_DELAY_MS)
+            if (engine.isPaused()) {
+                onStatusUpdate("paused")
+                return
+            }
             val recheck = probeDualOrigin(restPort, restSecret, activeNode)
             health = recheck.first
             latency = recheck.second
@@ -405,18 +434,24 @@ class DualOriginWatchdogRunner(
             emptyList()
         }
 
+        // Re-verify pause gate before mutating group selection (prevents mid-speedtest switch race)
+        if (engine.isPaused()) {
+            onStatusUpdate("paused")
+            return
+        }
+
         val decision = engine.onActiveNodeChecked(activeNode, health, latency, candidateResults, nowMs)
         when (decision.switchMode) {
             WatchdogSwitchMode.FORCE_CLOSE_OLD -> {
                 decision.targetNode?.let { target ->
-                    switchGroupNode(restPort, restSecret, groupName, target)
+                    switchGroupNode(restPort, restSecret, resolvedGroupName, target)
                     closeAllConnections(restPort, restSecret)
                     onStatusUpdate("switched_force:$target")
                 }
             }
             WatchdogSwitchMode.GRACEFUL_NEW_ONLY -> {
                 decision.targetNode?.let { target ->
-                    switchGroupNode(restPort, restSecret, groupName, target)
+                    switchGroupNode(restPort, restSecret, resolvedGroupName, target)
                     // Intentionally keep existing connections alive for graceful half-dead migration
                     onStatusUpdate("switched_graceful:$target")
                 }
@@ -426,6 +461,29 @@ class DualOriginWatchdogRunner(
                 onStatusUpdate("${decision.reason} ($periodLabel)")
             }
         }
+    }
+
+    /**
+     * Resolve the effective selector group name in Mihomo REST API.
+     * Falls back to [ConfigCompiler.SINGLE_NODE_GROUP] and [ConfigCompiler.DEFAULT_FALLBACK_GROUP]
+     * if a legacy snapshot or caller supplied a leaf node name instead of a selector group.
+     */
+    private fun resolveControllerGroup(
+        restPort: Int,
+        restSecret: String,
+        requestedGroupName: String,
+    ): Pair<String, Pair<String, List<String>>>? {
+        val candidates = LinkedHashSet<String>()
+        requestedGroupName.trim().takeIf { it.isNotEmpty() }?.let { candidates.add(it) }
+        candidates.add(ConfigCompiler.SINGLE_NODE_GROUP)
+        candidates.add(ConfigCompiler.DEFAULT_FALLBACK_GROUP)
+        for (cand in candidates) {
+            val info = fetchProxyGroup(restPort, restSecret, cand)
+            if (info != null && info.first.isNotBlank() && info.second.isNotEmpty()) {
+                return cand to info
+            }
+        }
+        return null
     }
 
     private fun probeDualOrigin(restPort: Int, restSecret: String, nodeName: String): Pair<DualHealth, Double?> {

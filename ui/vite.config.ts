@@ -51,6 +51,9 @@ export default defineConfig({
           if (id.includes("assets/mascotSprites.json")) {
             return "mascot-sprites";
           }
+          if (id.includes("i18n/locales/zh-CN")) {
+            return "i18n-zh";
+          }
           return undefined;
         },
         entryFileNames: "assets/[name]-[hash].js",

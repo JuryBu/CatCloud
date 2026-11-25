@@ -9,14 +9,48 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Call
+import okhttp3.Dns
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import org.json.JSONObject
 import java.io.IOException
+import java.net.InetAddress
+import java.net.URI
+import java.net.UnknownHostException
 import java.util.Base64
 import java.util.concurrent.TimeUnit
+
+/**
+ * Hardened OkHttp [Dns] rejecting any hostname that resolves to even one private, loopback,
+ * link-local, metadata, NAT64, or reserved IP address (prevents DNS rebinding SSRF).
+ */
+class PublicOnlyDns(
+    private val resolver: (String) -> List<InetAddress> = { host ->
+        InetAddress.getAllByName(host).toList()
+    },
+) : Dns {
+    override fun lookup(hostname: String): List<InetAddress> {
+        val addresses = try {
+            resolver(hostname)
+        } catch (uhe: UnknownHostException) {
+            throw uhe
+        } catch (t: Throwable) {
+            throw UnknownHostException("DNS lookup failed for $hostname: ${t.message}").apply { initCause(t) }
+        }
+        if (addresses.isEmpty()) {
+            throw UnknownHostException("Empty DNS response for $hostname")
+        }
+        for (addr in addresses) {
+            if (SyncCrypto.isSpecialOrPrivateIp(addr)) {
+                throw IOException("Blocked non-public relay IP: ${addr.hostAddress} ($hostname)")
+            }
+        }
+        return addresses
+    }
+}
 
 data class SyncPullResult(
     val zipBytes: ByteArray,
@@ -39,12 +73,9 @@ class LanSyncClient(
         .readTimeout(12_000, TimeUnit.MILLISECONDS)
         .writeTimeout(12_000, TimeUnit.MILLISECONDS)
         .followRedirects(false)
+        .followSslRedirects(false)
         .build(),
-    private val relayClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(6000, TimeUnit.MILLISECONDS)
-        .readTimeout(20_000, TimeUnit.MILLISECONDS)
-        .followRedirects(true)
-        .build(),
+    private val relayClient: OkHttpClient = buildDefaultRelayClient(),
 ) {
 
     suspend fun pullBySyncUri(parsed: ParsedSyncUri): SyncPullResult = withContext(Dispatchers.IO) {
@@ -52,25 +83,27 @@ class LanSyncClient(
             SyncRole.PULL -> {
                 val baseUrls = buildCandidateBaseUrls(parsed.customEndpoint, parsed.hosts, parsed.port)
                 require(baseUrls.isNotEmpty()) { "同步二维码未提供可用的局域网或自定义地址" }
+                val winnerBase = raceWinnerBaseUrlByInfo(
+                    baseUrls = baseUrls,
+                    expectedSid = parsed.sid,
+                    expectedRole = SyncRole.PULL.wireValue,
+                )
                 val auth = SyncCrypto.computeAuthMac(parsed.keyBytes, "GET", "/sync/v1/bundle", parsed.sid)
-                val (baseUrl, envelope) = raceRequests(baseUrls) { base ->
-                    Request.Builder()
-                        .url("$base/sync/v1/bundle")
-                        .header("X-CatCloud-Sid", parsed.sid)
-                        .header("X-CatCloud-Auth", auth)
-                        .get()
-                        .build()
-                }
+                val req = Request.Builder()
+                    .url("$winnerBase/sync/v1/bundle")
+                    .header("X-CatCloud-Sid", parsed.sid)
+                    .header("X-CatCloud-Auth", auth)
+                    .get()
+                    .build()
+                val envelope = executeBounded(raceClient, req)
                 val zipBytes = SyncCrypto.openWithRawKey(envelope, parsed.keyBytes, expectedSid = parsed.sid)
-                verifyAndBuildPullResult(zipBytes, parsed.fpHex, baseUrl)
+                verifyAndBuildPullResult(zipBytes, parsed.fpHex, winnerBase)
             }
             SyncRole.RELAY_URL -> {
                 val url = parsed.relayUrl ?: throw IllegalArgumentException("缺少公网中转 URL")
-                SyncCrypto.validatePublicHttpsUrl(url)
-                val req = Request.Builder().url(url).get().build()
-                val envelope = executeBounded(relayClient, req)
+                val (finalUrl, envelope) = executeRelayGetWithRedirects(url)
                 val zipBytes = SyncCrypto.openWithRawKey(envelope, parsed.keyBytes, expectedSid = "")
-                verifyAndBuildPullResult(zipBytes, parsed.fpHex, url)
+                verifyAndBuildPullResult(zipBytes, parsed.fpHex, finalUrl)
             }
             else -> throw IllegalArgumentException("当前 URI 角色 `${parsed.role.wireValue}` 不支持拉取")
         }
@@ -84,16 +117,21 @@ class LanSyncClient(
         }
         val baseUrls = buildCandidateBaseUrls(parsed.customEndpoint, parsed.hosts, parsed.port)
         require(baseUrls.isNotEmpty()) { "反推二维码未提供可用的接收端地址" }
+        // First race read-only GET /sync/v1/info to elect a single winner, preventing duplicate POST delivery
+        val winnerBase = raceWinnerBaseUrlByInfo(
+            baseUrls = baseUrls,
+            expectedSid = parsed.sid,
+            expectedRole = SyncRole.PUSH.wireValue,
+        )
         val auth = SyncCrypto.computeAuthMac(parsed.keyBytes, "POST", "/sync/v1/bundle", parsed.sid)
-        val (winnerUrl, _) = raceRequests(baseUrls) { base ->
-            Request.Builder()
-                .url("$base/sync/v1/bundle")
-                .header("X-CatCloud-Sid", parsed.sid)
-                .header("X-CatCloud-Auth", auth)
-                .post(envelope.toRequestBody(OCTET_MEDIA_TYPE))
-                .build()
-        }
-        winnerUrl
+        val req = Request.Builder()
+            .url("$winnerBase/sync/v1/bundle")
+            .header("X-CatCloud-Sid", parsed.sid)
+            .header("X-CatCloud-Auth", auth)
+            .post(envelope.toRequestBody(OCTET_MEDIA_TYPE))
+            .build()
+        executeBounded(raceClient, req)
+        winnerBase
     }
 
     suspend fun pullWithPin(hostOrUrl: String, port: Int, pin: String): SyncPullResult = withContext(Dispatchers.IO) {
@@ -268,27 +306,83 @@ class LanSyncClient(
     }
 
     /**
-     * Race all candidate LAN/custom endpoints concurrently (1500ms connect timeout per candidate).
-     * The first valid 2xx response wins and immediately cancels all losing calls.
+     * Execute a public HTTPS relay GET with automatic redirects strictly disabled.
+     * Manually follows at most [MAX_RELAY_REDIRECTS] (3) 301/302/303/307/308 redirects,
+     * resolving each hop via [URI.resolve] and re-validating via [SyncCrypto.validatePublicHttpsUrl].
      */
-    private suspend fun raceRequests(
+    internal fun executeRelayGetWithRedirects(initialUrl: String): Pair<String, ByteArray> {
+        val strictClient = relayClient.newBuilder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .build()
+        var currentUrl = initialUrl.trim()
+        var hops = 0
+        while (true) {
+            SyncCrypto.validatePublicHttpsUrl(currentUrl)
+            val req = Request.Builder().url(currentUrl).get().build()
+            strictClient.newCall(req).execute().use { resp ->
+                if (resp.code in REDIRECT_STATUS_CODES) {
+                    if (hops >= MAX_RELAY_REDIRECTS) {
+                        throw IOException("公网中转重定向次数超过上限 ($MAX_RELAY_REDIRECTS)")
+                    }
+                    val location = resp.header("Location")?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                        ?: throw IOException("HTTP ${resp.code} 缺少 Location 重定向头")
+                    val resolved = runCatching { URI(currentUrl).resolve(location).toString() }.getOrElse {
+                        throw SecurityException("无效的重定向目标地址: $location")
+                    }
+                    SyncCrypto.validatePublicHttpsUrl(resolved)
+                    currentUrl = resolved
+                    hops++
+                } else {
+                    if (!resp.isSuccessful) {
+                        throw IOException("HTTP ${resp.code}: ${resp.message}")
+                    }
+                    return currentUrl to readResponseBodyBounded(resp)
+                }
+            }
+        }
+    }
+
+    /**
+     * Concurrently probe read-only `GET /sync/v1/info` across all candidate NICs/endpoints,
+     * verify `sid` (and optional `role`) match, and elect a single winning `baseUrl` before
+     * executing any stateful GET/POST `/sync/v1/bundle`.
+     */
+    private suspend fun raceWinnerBaseUrlByInfo(
         baseUrls: List<String>,
-        requestFactory: (String) -> Request,
-    ): Pair<String, ByteArray> = coroutineScope {
+        expectedSid: String,
+        expectedRole: String? = null,
+    ): String = coroutineScope {
         val activeCalls = ArrayList<Call>(baseUrls.size)
-        val channel = Channel<Result<Pair<String, ByteArray>>>(baseUrls.size)
+        val channel = Channel<Result<String>>(baseUrls.size)
 
         for (base in baseUrls) {
-            val call = raceClient.newCall(requestFactory(base))
+            val req = Request.Builder().url("$base/sync/v1/info").get().build()
+            val call = raceClient.newCall(req)
             synchronized(activeCalls) { activeCalls.add(call) }
             launch(Dispatchers.IO) {
-                val res = runCatching { base to executeCallBounded(call) }
+                val res = runCatching {
+                    val body = executeCallBounded(call)
+                    val obj = JSONObject(body.toString(Charsets.UTF_8))
+                    val actualSid = obj.optString("sid", "").trim()
+                    if (expectedSid.isNotEmpty() && actualSid != expectedSid) {
+                        throw SecurityException("对端同步会话 sid 不匹配 (expected=$expectedSid, got=$actualSid)")
+                    }
+                    if (!expectedRole.isNullOrBlank()) {
+                        val actualRole = obj.optString("role", "").trim()
+                        if (actualRole.isNotEmpty() && !actualRole.equals(expectedRole, ignoreCase = true)) {
+                            throw SecurityException("对端同步角色不匹配 (expected=$expectedRole, got=$actualRole)")
+                        }
+                    }
+                    base
+                }
                 channel.trySend(res)
             }
         }
 
         var lastError: Throwable? = null
-        var winner: Pair<String, ByteArray>? = null
+        var winner: String? = null
         for (i in baseUrls.indices) {
             val res = channel.receive()
             if (res.isSuccess) {
@@ -299,7 +393,7 @@ class LanSyncClient(
             }
         }
 
-        // Deterministically cancel any remaining in-flight sibling calls
+        // Deterministically cancel any remaining in-flight sibling probe calls
         synchronized(activeCalls) {
             for (c in activeCalls) {
                 if (!c.isCanceled()) c.cancel()
@@ -308,7 +402,7 @@ class LanSyncClient(
         coroutineContext.cancelChildren()
 
         winner ?: throw IOException(
-            "局域网多地址并发连接全部失败（共 ${baseUrls.size} 个候选）：${lastError?.message ?: "超时"}",
+            "局域网多地址 /sync/v1/info 探测全部失败（共 ${baseUrls.size} 个候选）：${lastError?.message ?: "超时"}",
             lastError,
         )
     }
@@ -321,29 +415,43 @@ class LanSyncClient(
             if (!resp.isSuccessful) {
                 throw IOException("HTTP ${resp.code}: ${resp.message}")
             }
-            val body = resp.body ?: throw IOException("空响应体")
-            val source = body.source()
-            val out = java.io.ByteArrayOutputStream()
-            val buf = ByteArray(8192)
-            var total = 0
-            source.inputStream().use { ins ->
-                while (true) {
-                    val n = ins.read(buf)
-                    if (n < 0) break
-                    total += n
-                    if (total > MAX_TRANSFER_BYTES) {
-                        throw SecurityException("响应体超过 17 MiB 安全上限")
-                    }
-                    out.write(buf, 0, n)
-                }
-            }
-            return out.toByteArray()
+            return readResponseBodyBounded(resp)
         }
+    }
+
+    private fun readResponseBodyBounded(resp: Response): ByteArray {
+        val body = resp.body ?: throw IOException("空响应体")
+        val source = body.source()
+        val out = java.io.ByteArrayOutputStream()
+        val buf = ByteArray(8192)
+        var total = 0
+        source.inputStream().use { ins ->
+            while (true) {
+                val n = ins.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > MAX_TRANSFER_BYTES) {
+                    throw SecurityException("响应体超过 17 MiB 安全上限")
+                }
+                out.write(buf, 0, n)
+            }
+        }
+        return out.toByteArray()
     }
 
     companion object {
         const val MAX_TRANSFER_BYTES = 17 * 1024 * 1024
+        const val MAX_RELAY_REDIRECTS = 3
+        private val REDIRECT_STATUS_CODES = setOf(301, 302, 303, 307, 308)
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private val OCTET_MEDIA_TYPE = "application/octet-stream".toMediaType()
+
+        fun buildDefaultRelayClient(): OkHttpClient = OkHttpClient.Builder()
+            .connectTimeout(6000, TimeUnit.MILLISECONDS)
+            .readTimeout(20_000, TimeUnit.MILLISECONDS)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .dns(PublicOnlyDns())
+            .build()
     }
 }

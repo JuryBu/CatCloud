@@ -65,6 +65,7 @@ fun NodesTab(
     onSelectActiveRelay: (String) -> Unit,
     onTogglePreAccelAutoFailover: (Boolean) -> Unit,
     onDeleteRelay: (String) -> Unit,
+    onProbeRelaysLatency: () -> Unit,
     onOpenQrScan: () -> Unit,
     onOpenPinDialog: () -> Unit,
     onImportClipboard: () -> Unit,
@@ -112,6 +113,15 @@ fun NodesTab(
                         if (!multiSelectMode) checkedIds = emptySet()
                     }) {
                         Text(if (multiSelectMode) "退出多选" else "测上下行")
+                    }
+                } else if (subTab == 1) {
+                    TextButton(
+                        enabled = state.relays.isNotEmpty() || state.speedTestProgress.running,
+                        onClick = {
+                            if (state.speedTestProgress.running) onStopSpeedTest() else onProbeRelaysLatency()
+                        },
+                    ) {
+                        Text(if (state.speedTestProgress.running) "停止" else "测延迟")
                     }
                 }
                 IconButton(onClick = { showImportSheet = true }) {
@@ -346,7 +356,7 @@ fun NodesTab(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("国内 204 自动双活", color = palette.textPrimary, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                            Text("纯 IP :443 禁 SNI，异常自动 fail-open 直连", color = palette.textSecondary, fontSize = 11.sp)
+                            Text("优先走 443 通道提速，异常时自动切回直连", color = palette.textSecondary, fontSize = 11.sp)
                         }
                         Switch(
                             checked = state.settings.preaccelAutoFailover,
@@ -397,6 +407,27 @@ fun NodesTab(
                                             fontSize = 12.sp,
                                         )
                                     }
+                                    val probeMs = relay.lastProbeMs
+                                    val badgeColor = when {
+                                        probeMs == null -> palette.textSecondary
+                                        probeMs < 80 -> palette.latencyGood
+                                        probeMs < 180 -> palette.latencyWarn
+                                        else -> palette.danger
+                                    }
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = badgeColor.copy(alpha = 0.14f),
+                                        border = BorderStroke(1.dp, badgeColor.copy(alpha = 0.35f)),
+                                    ) {
+                                        Text(
+                                            text = probeMs?.let { "$it ms" } ?: "--",
+                                            color = badgeColor,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                        )
+                                    }
+                                    Spacer(Modifier.width(4.dp))
                                     IconButton(onClick = { onDeleteRelay(relay.id) }) {
                                         Icon(CatIcons.Delete, contentDescription = "删除中转", tint = palette.textSecondary, modifier = Modifier.size(18.dp))
                                     }
@@ -450,7 +481,7 @@ fun NodesTab(
                                     }
                                     Spacer(Modifier.height(4.dp))
                                     Text(
-                                        text = "活跃节点：$activeNodeName · 模式：${group.mode}",
+                                        text = "活跃节点：$activeNodeName · 模式：${friendlyGroupModeLabel(group.mode)}",
                                         color = palette.textSecondary,
                                         fontSize = 12.sp,
                                     )
@@ -512,7 +543,7 @@ fun NodesTab(
                         onImportClipboard()
                     },
                 ) {
-                    Text("从剪贴板识别（节点 / 订阅 / mmrelay）")
+                    Text("从剪贴板识别（节点 / 订阅链接 / 中转码）")
                 }
                 OutlinedButton(
                     modifier = Modifier.fillMaxWidth(),
@@ -524,9 +555,23 @@ fun NodesTab(
                 ) {
                     Text("选择本地文件（.zip / .ccsync / .yaml）")
                 }
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = "安卓系统安全沙盒下不支持强行读取其他代理软件的加密数据；推荐电脑扫码同步、粘贴订阅链接，或直接系统分享 .zip / .yaml 文件导入。",
+                    color = palette.textSecondary,
+                    fontSize = 11.sp,
+                    lineHeight = 16.sp,
+                )
             }
         }
     }
+}
+
+private fun friendlyGroupModeLabel(mode: String): String = when (mode.trim().lowercase()) {
+    "sticky_best" -> "优选稳态"
+    "conditional_pool" -> "条件轮换"
+    "load_balance", "load_balance_consistent_hash", "load_balance_round_robin" -> "均衡分担"
+    else -> "智能优选"
 }
 
 @Composable

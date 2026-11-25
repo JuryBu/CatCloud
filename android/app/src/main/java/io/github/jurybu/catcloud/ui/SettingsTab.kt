@@ -96,7 +96,7 @@ fun SettingsTab(
                 HorizontalDivider(color = palette.border)
                 SettingsRowItem(
                     title = "输入 6 位配对码拉取",
-                    subtitle = "ECDH P-256 防嗅探握手同步桌面端配置",
+                    subtitle = "端到端加密配对，同步电脑端节点与设置",
                     onClick = onOpenPinDialog,
                 )
                 HorizontalDivider(color = palette.border)
@@ -121,11 +121,19 @@ fun SettingsTab(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(
-                            "随身接力箱 (${state.relayBoxItems.size}/3 · 7天自动过期)",
-                            color = palette.textSecondary,
-                            fontSize = 12.sp,
-                        )
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                "随身接力箱（传输端到端加密）",
+                                color = palette.textPrimary,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                "${state.relayBoxItems.size}/3 · 7天自动过期",
+                                color = palette.textSecondary,
+                                fontSize = 11.sp,
+                            )
+                        }
                         TextButton(onClick = onClearRelayBox) { Text("一键清空") }
                     }
                     state.relayBoxItems.forEach { box ->
@@ -242,7 +250,7 @@ fun SettingsTab(
                 HorizontalDivider(color = palette.border)
                 SettingsRowItem(
                     title = "关于猫猫云梯",
-                    subtitle = "v${BuildConfig.VERSION_NAME} · 纯 Kotlin 原生双进程 arm64-v8a",
+                    subtitle = "v${BuildConfig.VERSION_NAME} · 轻量双进程架构",
                     onClick = {},
                 )
             }

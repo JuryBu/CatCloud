@@ -766,10 +766,9 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             let mihomo_bin = resolve_mihomo_binary(&cfg, paths, &[], false)
                 .ok()
                 .and_then(|r| r.path);
-            let tun_privilege_ready = is_cli_tun_privilege_ready(&caps, mihomo_bin.as_deref());
             let tun_configured = cfg.tun.enabled;
-            let tun_enabled = tun_configured && tun_privilege_ready;
-            let tun_needs_elevation = tun_configured && !tun_privilege_ready;
+            let (tun_enabled, tun_needs_elevation, tun_runtime_source) =
+                resolve_cli_effective_tun_state(paths, &cfg, &caps, mihomo_bin.as_deref()).await;
             let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
             let sub_count = db.list_subscriptions()?.len();
             let node_count = db.list_nodes()?.len();
@@ -789,6 +788,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 "tun_enabled": tun_enabled,
                 "tun_configured": tun_configured,
                 "tun_needs_elevation": tun_needs_elevation,
+                "tun_source": tun_runtime_source,
                 "mixed_port": cfg.mixed_port,
                 "controller_addr": cfg.controller_addr(),
                 "dns_listen_addr": cfg.dns_listen_addr(),
@@ -2590,7 +2590,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             }
 
             ConfigCommand::Diag { reveal_secrets } => {
-                let out = build_diag_payload(paths, reveal_secrets)?;
+                let out = build_diag_payload(paths, reveal_secrets).await?;
                 emit_output(as_json, &out, &serde_json::to_string_pretty(&out)?)
             }
 
@@ -4418,8 +4418,21 @@ async fn handle_share_receive(
         }
 
         let received = server.recv_bundle().await;
+        let close_reason = server.close_reason();
         server.cancel().await;
-        let bundle = received.context("receiver closed before receiving a sync bundle")?;
+        let bundle = match received {
+            Some(b) => b,
+            None => {
+                let reason_msg = match close_reason.as_deref() {
+                    Some("expired") => "receiver timed out before receiving a sync bundle",
+                    Some("destroyed") => {
+                        "receiver self-destructed after too many failed authentication attempts"
+                    }
+                    _ => "receiver closed before receiving a sync bundle",
+                };
+                anyhow::bail!("{reason_msg}");
+            }
+        };
         (bundle.zip_bytes, "sync://listen".to_string())
     } else if let Some(ref addr) = args.addr {
         let pin = args
@@ -6859,7 +6872,30 @@ fn is_cli_tun_privilege_ready(
     false
 }
 
-fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Value> {
+async fn resolve_cli_effective_tun_state(
+    paths: &AppPaths,
+    cfg: &AppConfig,
+    caps: &catcloud_core::platform::PlatformCapabilities,
+    mihomo_binary: Option<&Path>,
+) -> (bool, bool, &'static str) {
+    let tun_privilege_ready = is_cli_tun_privilege_ready(caps, mihomo_binary);
+    let tun_configured = cfg.tun.enabled;
+    let (live_version, _, ctrl_ep) = probe_live_controller(paths, cfg).await;
+    let core_running = live_version.is_some();
+    let has_live_tun_connections = if core_running {
+        probe_live_tun_connections(&ctrl_ep).await
+    } else {
+        false
+    };
+    evaluate_doctor_tun_state(
+        tun_configured,
+        tun_privilege_ready,
+        core_running,
+        has_live_tun_connections,
+    )
+}
+
+async fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Value> {
     let cfg = config::load_or_init(paths)?;
     let db = open_storage(paths)?;
     let plat = default_platform();
@@ -6867,10 +6903,9 @@ fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Value> {
     let mihomo_bin = resolve_mihomo_binary(&cfg, paths, &[], false)
         .ok()
         .and_then(|r| r.path);
-    let tun_privilege_ready = is_cli_tun_privilege_ready(&caps, mihomo_bin.as_deref());
     let tun_configured = cfg.tun.enabled;
-    let tun_enabled = tun_configured && tun_privilege_ready;
-    let tun_needs_elevation = tun_configured && !tun_privilege_ready;
+    let (tun_enabled, tun_needs_elevation, tun_runtime_source) =
+        resolve_cli_effective_tun_state(paths, &cfg, &caps, mihomo_bin.as_deref()).await;
     let geodata_status = collect_geodata_status(&paths.runtime_dir);
     let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
     let recent_logs = read_diag_log_tail(
@@ -6906,6 +6941,7 @@ fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Value> {
         "tun_enabled": tun_enabled,
         "tun_configured": tun_configured,
         "tun_needs_elevation": tun_needs_elevation,
+        "tun_source": tun_runtime_source,
         "tun_stack": cfg.tun.stack_mode,
         "domestic_direct_enabled": cfg.rules_override.domestic_direct_enabled,
         "block_quic_udp_443": cfg.rules_override.block_quic_udp_443,
@@ -6987,8 +7023,8 @@ mod tests {
         assert!(sanitized.contains("2001:db8::*"));
     }
 
-    #[test]
-    fn diag_payload_aligns_country_mmdb_and_supports_reveal_secrets() {
+    #[tokio::test]
+    async fn diag_payload_aligns_country_mmdb_and_supports_reveal_secrets() {
         let temp_root = std::env::temp_dir().join(format!(
             "catcloud-cli-diag-test-{}",
             std::process::id()
@@ -6996,10 +7032,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_root);
         let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
 
+        let unused_ctrl_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("ephemeral port")
+            .local_addr()
+            .unwrap()
+            .port();
+
         let mut cfg = config::load_or_init(&paths).expect("init config");
         cfg.route_mode = RouteTargetMode::Single;
         cfg.active_group_id = Some("grp-tw".to_string());
         cfg.active_single_node_id = Some("node-tw-01".to_string());
+        cfg.controller_port = unused_ctrl_port;
         cfg.system_proxy.enabled = true;
         cfg.tun.enabled = true;
         cfg.rules_override.domestic_direct_enabled = true;
@@ -7011,7 +7054,9 @@ mod tests {
         // country-lite.mmdb alone must NOT produce a false green for country_mmdb.
         std::fs::write(paths.runtime_dir.join("country-lite.mmdb"), b"stub-lite").unwrap();
         std::fs::write(paths.runtime_dir.join("geosite.dat"), b"stub-geosite").unwrap();
-        let diag_before_mmdb = build_diag_payload(&paths, false).expect("diag before Country.mmdb");
+        let diag_before_mmdb = build_diag_payload(&paths, false)
+            .await
+            .expect("diag before Country.mmdb");
         assert_eq!(
             diag_before_mmdb["geodata_status"]["country_mmdb"]["exists"],
             json!(false)
@@ -7035,7 +7080,9 @@ mod tests {
         }
         std::fs::write(paths.logs_dir.join("catcloud.log"), log_content).unwrap();
 
-        let diag = build_diag_payload(&paths, false).expect("build sanitized diag payload");
+        let diag = build_diag_payload(&paths, false)
+            .await
+            .expect("build sanitized diag payload");
         assert_eq!(diag["ok"], json!(true));
         assert_eq!(diag["sanitized"], json!(true));
         assert!(diag.get("controller_secret").is_none());
@@ -7074,7 +7121,9 @@ mod tests {
             assert!(s.contains("203.0.113.*"));
         }
 
-        let revealed = build_diag_payload(&paths, true).expect("build revealed diag payload");
+        let revealed = build_diag_payload(&paths, true)
+            .await
+            .expect("build revealed diag payload");
         assert_eq!(revealed["sanitized"], json!(false));
         assert_eq!(revealed["controller_secret"], json!("diag_secret_token_demo"));
         assert!(
@@ -7087,11 +7136,79 @@ mod tests {
         // When tun.enabled is disabled in config, all three TUN truth fields must be false.
         cfg.tun.enabled = false;
         config::save(&paths, &cfg).expect("save tun disabled config");
-        let diag_tun_off = build_diag_payload(&paths, false).expect("diag with tun off");
+        let diag_tun_off = build_diag_payload(&paths, false)
+            .await
+            .expect("diag with tun off");
         assert_eq!(diag_tun_off["tun_configured"], json!(false));
         assert_eq!(diag_tun_off["tun_enabled"], json!(false));
         assert_eq!(diag_tun_off["tun_needs_elevation"], json!(false));
 
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn status_and_diag_align_live_tun_state_when_core_running_without_elevation() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock controller");
+        let mock_port = listener.local_addr().unwrap().port();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..8 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 2048];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let body = if req_str.starts_with("GET /version ") {
+                    r#"{"version":"v1.19.0"}"#
+                } else if req_str.starts_with("GET /connections ") {
+                    r#"{"downloadTotal":0,"uploadTotal":0,"connections":[{"id":"c1","metadata":{"network":"tcp","type":"Tun","sourceIP":"198.18.0.1","destinationIP":"203.0.113.10","sourcePort":"51234","destinationPort":"443","host":"example.com","dnsMode":"fake-ip","processPath":""},"upload":10,"download":20,"start":"2026-11-25T00:00:00Z","chains":["DIRECT"],"rule":"MATCH","rulePayload":""}]}"#
+                } else {
+                    r#"{}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-live-tun-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+        let mut cfg = config::load_or_init(&paths).expect("init config");
+        cfg.controller_port = mock_port;
+        cfg.controller_secret = None;
+        cfg.tun.enabled = true;
+        config::save(&paths, &cfg).expect("save config");
+
+        let mut unprivileged_caps = default_platform().capabilities();
+        unprivileged_caps.is_elevated = false;
+
+        let (tun_enabled, tun_needs_elevation, tun_source) =
+            resolve_cli_effective_tun_state(&paths, &cfg, &unprivileged_caps, None).await;
+        assert!(tun_enabled);
+        assert!(!tun_needs_elevation);
+        assert_eq!(tun_source, "live_tun_connections");
+
+        let diag = build_diag_payload(&paths, false)
+            .await
+            .expect("build diag with live core");
+        assert_eq!(diag["tun_configured"], json!(true));
+        assert_eq!(diag["tun_enabled"], json!(true));
+        assert_eq!(diag["tun_needs_elevation"], json!(false));
+        assert_eq!(diag["tun_source"], json!("live_tun_connections"));
+
+        server_task.abort();
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 

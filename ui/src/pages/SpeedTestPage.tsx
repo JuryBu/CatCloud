@@ -2729,13 +2729,13 @@ export function SpeedTestPage({
                     { key: "name", label: "节点名称", cls: "px-2" },
                     { key: "source", label: "来源", cls: "w-[78px] px-1.5" },
                     { key: "latency", label: "延迟", cls: "w-[68px] px-1.5" },
-                    { key: "up", label: "上传", cls: "w-[54px] px-1.5" },
-                    { key: "down", label: "下载", cls: "w-[58px] px-1.5" },
+                    { key: "up", label: "上传 (Mbps)", cls: "w-[82px] px-1.5", title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）" },
+                    { key: "down", label: "下载 (Mbps)", cls: "w-[86px] px-1.5", title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）" },
                     { key: "google", label: "谷歌地区", cls: "w-[80px] px-1.5" },
                     { key: "unlocks", label: "AI 解锁", cls: "w-[134px] px-1.5" },
-                  ] as ReadonlyArray<{ key: SortKey; label: string; cls: string }>
+                  ] as ReadonlyArray<{ key: SortKey; label: string; cls: string; title?: string }>
                 ).map((col) => (
-                  <th key={col.key} className={`whitespace-nowrap py-2.5 font-medium ${col.cls}`}>
+                  <th key={col.key} className={`whitespace-nowrap py-2.5 font-medium ${col.cls}`} title={col.title}>
                     <button
                       type="button"
                       onClick={() => handleSort(col.key)}
@@ -2942,12 +2942,15 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Upload Speed */}
-                      <td className="w-[54px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
+                      <td
+                        className="w-[82px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]"
+                        title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
+                      >
                         {snap?.up_mbps !== null && snap?.up_mbps !== undefined ? (
                           <span className="font-semibold text-[var(--coral)]">
                             {snap.up_mbps.toFixed(1)}
                             <span className="ml-0.5 text-[10px] font-normal text-[var(--muted)]">
-                              M
+                              Mbps
                             </span>
                           </span>
                         ) : (
@@ -2956,14 +2959,17 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Download Speed */}
-                      <td className="w-[58px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
+                      <td
+                        className="w-[86px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]"
+                        title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
+                      >
                         {snap?.down_mbps !== null && snap?.down_mbps !== undefined ? (
                           <span className="font-semibold text-[var(--sky)]">
                             {snap.down_mbps >= 100
                               ? Math.round(snap.down_mbps)
                               : snap.down_mbps.toFixed(1)}
                             <span className="ml-0.5 text-[10px] font-normal text-[var(--muted)]">
-                              M
+                              Mbps
                             </span>
                           </span>
                         ) : (

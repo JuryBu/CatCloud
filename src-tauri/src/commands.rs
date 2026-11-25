@@ -8441,6 +8441,7 @@ fn write_bytes_atomic(target_path: &std::path::Path, bytes: &[u8]) -> Result<(),
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn start_sync_send_session(
+    app: AppHandle,
     state: State<'_, AppState>,
     name: String,
     description: Option<String>,
@@ -8471,6 +8472,7 @@ pub async fn start_sync_send_session(
     let dto = state
         .lan_sync
         .start_send_session(
+            app,
             zip_bytes,
             custom_endpoint,
             ttl_sec,
