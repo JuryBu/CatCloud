@@ -165,16 +165,25 @@ function main() {
     staged.push(planned.appTarGz);
   }
 
-  // Verify bundled Mihomo presence if `.app` exists locally
+  // Verify bundled Mihomo & headless CLI presence if `.app` exists locally
   const appBundle = findSingleEntry(macosBundleDir, (n) => n.endsWith(".app"));
   if (appBundle) {
-    const candidates = [
+    const mihomoCandidates = [
       path.join(appBundle, "Contents", "Resources", "resources", "bin", "mihomo"),
       path.join(appBundle, "Contents", "Resources", "bin", "mihomo"),
     ];
-    if (!candidates.some((p) => fs.existsSync(p))) {
+    if (!mihomoCandidates.some((p) => fs.existsSync(p))) {
       console.warn(
         `[stage_macos] WARNING: Mihomo binary not detected inside ${appBundle}/Contents/Resources`
+      );
+    }
+    const cliCandidates = [
+      path.join(appBundle, "Contents", "Resources", "resources", "cli", "catcloud"),
+      path.join(appBundle, "Contents", "Resources", "cli", "catcloud"),
+    ];
+    if (!cliCandidates.some((p) => fs.existsSync(p))) {
+      console.warn(
+        `[stage_macos] WARNING: Headless catcloud CLI not detected inside ${appBundle}/Contents/Resources`
       );
     }
   }

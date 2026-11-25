@@ -43,6 +43,7 @@ pub const PACKAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 /// reside under that single top-level directory.
 const NON_STRIPPABLE_TOP_DIRS: &[&str] = &[
     "resources",
+    "cli",
     "bin",
     "data",
     "assets",
@@ -1440,18 +1441,21 @@ fn apply_staged_portable_update_internal(
                 continue;
             }
 
-            if dst.is_file() {
+            let existed_before = dst.is_file();
+            if existed_before {
                 let bak = backup_dir.join(&rel_path);
                 if let Some(bp) = bak.parent() {
                     std::fs::create_dir_all(bp)?;
                 }
                 std::fs::copy(&dst, &bak)?;
+            }
+
+            move_or_atomic_place_with_orphan_dir(&src, &dst, Some(backup_dir))?;
+            if existed_before {
                 replaced_files.push(rel_path.clone());
             } else {
                 created_files.push(rel_path.clone());
             }
-
-            move_or_atomic_place(&src, &dst)?;
             updated_count += 1;
         }
         Ok(())
@@ -1491,7 +1495,7 @@ fn apply_staged_portable_update_internal(
             let bak = backup_dir.join(rel);
             let dst = canonical_root.join(rel);
             if bak.is_file() {
-                if let Err(e) = copy_atomic_replace(&bak, &dst) {
+                if let Err(e) = copy_atomic_replace_with_orphan_dir(&bak, &dst, Some(backup_dir)) {
                     rollback_errors.push(format!("restore {}: {e}", rel.display()));
                 }
             }
@@ -1611,18 +1615,33 @@ fn rename_with_retry(src: &Path, dst: &Path) -> CatResult<()> {
 
 /// Place `src` into `dst` atomically: writes a sibling temp file in `dst.parent()` (same volume)
 /// and performs an atomic replace with retry, avoiding cross-device EXDEV issues and preserving
+static SWAP_BAK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// `src` intact in case an upstream rollback inspects staging.
-fn move_or_atomic_place(src: &Path, dst: &Path) -> CatResult<()> {
-    copy_atomic_replace(src, dst)
+fn move_or_atomic_place_with_orphan_dir(
+    src: &Path,
+    dst: &Path,
+    orphan_dir: Option<&Path>,
+) -> CatResult<()> {
+    copy_atomic_replace_with_orphan_dir(src, dst, orphan_dir)
 }
 
-fn copy_atomic_replace(src: &Path, dst: &Path) -> CatResult<()> {
+fn move_or_atomic_place(src: &Path, dst: &Path) -> CatResult<()> {
+    copy_atomic_replace_with_orphan_dir(src, dst, None)
+}
+
+fn copy_atomic_replace_with_orphan_dir(
+    src: &Path,
+    dst: &Path,
+    orphan_dir: Option<&Path>,
+) -> CatResult<()> {
     let pid = std::process::id();
+    let seq = SWAP_BAK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = dst
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("update_file");
-    let tmp = dst.with_file_name(format!("{name}.upd.{pid}.tmp"));
+    let tmp = dst.with_file_name(format!("{name}.upd.{pid}.{seq}.tmp"));
     let copy_res = std::fs::copy(src, &tmp);
     if let Err(e) = copy_res {
         let _ = std::fs::remove_file(&tmp);
@@ -1631,7 +1650,7 @@ fn copy_atomic_replace(src: &Path, dst: &Path) -> CatResult<()> {
 
     #[cfg(target_os = "windows")]
     {
-        let swap_bak = dst.with_file_name(format!("{name}.swap_bak.{pid}"));
+        let swap_bak = dst.with_file_name(format!("{name}.swap_bak.{pid}.{seq}"));
         let mut last_err = None;
 
         for attempt in 0..3 {
@@ -1660,7 +1679,16 @@ fn copy_atomic_replace(src: &Path, dst: &Path) -> CatResult<()> {
                 Ok(()) => {
                     if moved_existing {
                         clear_readonly(&swap_bak);
-                        let _ = std::fs::remove_file(&swap_bak);
+                        if std::fs::remove_file(&swap_bak).is_err() {
+                            // If a running sibling PE (e.g. `cli/catcloud.exe`) prevents immediate
+                            // deletion, relocate it into `.update_backup/` so `--post-update-cleanup`
+                            // sweeps it cleanly instead of leaving an orphan next to the live binary.
+                            if let Some(dir) = orphan_dir {
+                                let _ = std::fs::create_dir_all(dir);
+                                let deferred = dir.join(format!("{name}.{pid}.{seq}.old"));
+                                let _ = std::fs::rename(&swap_bak, &deferred);
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -1683,6 +1711,7 @@ fn copy_atomic_replace(src: &Path, dst: &Path) -> CatResult<()> {
 
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = orphan_dir;
         let mut last_err = None;
         for attempt in 0..3 {
             match std::fs::rename(&tmp, dst) {
@@ -2332,7 +2361,7 @@ mod tests {
         let dst_file = tmp.join("target.bin");
         std::fs::write(&src_file, b"NEW_DATA").unwrap();
         std::fs::write(&dst_file, b"OLD_DATA").unwrap();
-        copy_atomic_replace(&src_file, &dst_file).unwrap();
+        copy_atomic_replace_with_orphan_dir(&src_file, &dst_file, None).unwrap();
         assert_eq!(std::fs::read(&dst_file).unwrap(), b"NEW_DATA");
         let leftover_swap = std::fs::read_dir(&tmp)
             .unwrap()
@@ -2654,6 +2683,115 @@ mod tests {
         assert!(missing_err.is_err());
         assert!(!staging_dir.exists());
         assert_eq!(std::fs::read(&exe_path).unwrap(), b"CURRENT_V030_EXE");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn apply_portable_update_installs_replaces_and_rolls_back_bundled_cli_cleanly() {
+        let root = make_temp_dir("portable-cli-bundle");
+        let app_root = root.join("app");
+        let staging_dir = app_root.join(".update_staging");
+        let backup_dir = app_root.join(".update_backup");
+        std::fs::create_dir_all(&app_root).unwrap();
+
+        let exe_path = app_root.join("CatCloud.exe");
+        let cli_path = app_root.join("cli").join("catcloud.exe");
+        let quickstart_path = app_root.join("README-QuickStart.txt");
+        let flag_path = app_root.join("portable.flag");
+        std::fs::write(&exe_path, b"EXE_V010").unwrap();
+        std::fs::write(&flag_path, b"portable").unwrap();
+
+        // 1. First update introduces `cli/catcloud.exe` + `README-QuickStart.txt` inside wrapper folder.
+        let v020_zip = build_zip(&[
+            ("CatCloud-0.2.0-windows-x64-portable/CatCloud.exe", b"EXE_V020", None),
+            (
+                "CatCloud-0.2.0-windows-x64-portable/cli/catcloud.exe",
+                b"CLI_V020",
+                None,
+            ),
+            (
+                "CatCloud-0.2.0-windows-x64-portable/README-QuickStart.txt",
+                b"QuickStart v0.2.0",
+                None,
+            ),
+            (
+                "CatCloud-0.2.0-windows-x64-portable/portable.flag",
+                b"SHOULD_NOT_OVERWRITE",
+                None,
+            ),
+        ]);
+        let v020_hash = compute_sha256_hex(&v020_zip);
+        stage_verified_archive(&v020_zip, &v020_hash, "0.1.0", "0.2.0", &staging_dir).unwrap();
+
+        let outcome = apply_staged_portable_update_internal(
+            &app_root,
+            &exe_path,
+            &staging_dir,
+            &backup_dir,
+            "0.1.0",
+            None,
+        )
+        .expect("v0.2.0 portable update introducing cli/ should succeed");
+        assert!(outcome.applied);
+        assert_eq!(std::fs::read(&exe_path).unwrap(), b"EXE_V020");
+        assert_eq!(std::fs::read(&cli_path).unwrap(), b"CLI_V020");
+        assert_eq!(std::fs::read(&quickstart_path).unwrap(), b"QuickStart v0.2.0");
+        assert_eq!(std::fs::read(&flag_path).unwrap(), b"portable");
+
+        // 2. Subsequent update fails partway after replacing `cli/catcloud.exe`; rollback must
+        //    restore `CLI_V020` cleanly without leaving any `.swap_bak` or `.upd.*.tmp` orphans.
+        let v030_zip = build_zip(&[
+            ("CatCloud-0.3.0-windows-x64-portable/cli/catcloud.exe", b"CLI_V030", None),
+            (
+                "CatCloud-0.3.0-windows-x64-portable/version.json",
+                br#"{"version":"0.3.0"}"#,
+                None,
+            ),
+        ]);
+        let v030_hash = compute_sha256_hex(&v030_zip);
+        stage_verified_archive(&v030_zip, &v030_hash, "0.2.0", "0.3.0", &staging_dir).unwrap();
+
+        let hook = |rel: &str| {
+            if rel == "version.json" {
+                Err(CatError::Process("injected failure after cli replace".into()))
+            } else {
+                Ok(())
+            }
+        };
+        let err = apply_staged_portable_update_internal(
+            &app_root,
+            &exe_path,
+            &staging_dir,
+            &backup_dir,
+            "0.2.0",
+            Some(&hook),
+        );
+        assert!(err.is_err());
+        assert_eq!(
+            std::fs::read(&cli_path).unwrap(),
+            b"CLI_V020",
+            "cli/catcloud.exe must be restored on rollback"
+        );
+        let cli_entries: Vec<String> = std::fs::read_dir(app_root.join("cli"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            cli_entries,
+            vec!["catcloud.exe".to_string()],
+            "cli/ must contain zero swap_bak or tmp orphan files after rollback"
+        );
+
+        // 3. `NON_STRIPPABLE_TOP_DIRS` protects a flat archive containing only `cli/catcloud.exe`.
+        let cli_only_zip = build_zip(&[("cli/catcloud.exe", b"CLI_ONLY_V031", None)]);
+        let cli_only_hash = compute_sha256_hex(&cli_only_zip);
+        stage_verified_archive(&cli_only_zip, &cli_only_hash, "0.2.0", "0.3.1", &staging_dir)
+            .unwrap();
+        let pending_cli_only = read_pending_staged_update(&staging_dir).unwrap();
+        assert_eq!(pending_cli_only.files.len(), 1);
+        assert_eq!(pending_cli_only.files[0].rel_path, "cli/catcloud.exe");
 
         let _ = std::fs::remove_dir_all(&root);
     }

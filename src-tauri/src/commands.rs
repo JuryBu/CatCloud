@@ -11946,30 +11946,49 @@ fn resolve_effective_doc_lang(state: &AppState, lang: Option<&str>) -> &'static 
     }
 }
 
-fn resolve_local_cli_path(state: &AppState) -> std::path::PathBuf {
+fn resolve_local_cli_path_from(
+    exe_dir: Option<&std::path::Path>,
+    resource_dir: Option<&std::path::Path>,
+    bin_dir: &std::path::Path,
+    root_data_dir: &std::path::Path,
+) -> std::path::PathBuf {
     let cli_bin = if cfg!(target_os = "windows") {
         "catcloud.exe"
     } else {
         "catcloud"
     };
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
-        .map(|p| catcloud_core::paths::normalize_os_path(&p));
+    let norm_exe_dir = exe_dir.map(catcloud_core::paths::normalize_os_path);
 
-    if let Some(ref dir) = exe_dir {
+    if let Some(ref dir) = norm_exe_dir {
         candidates.push(dir.join("cli").join(cli_bin));
+        candidates.push(dir.join("resources").join("cli").join(cli_bin));
         candidates.push(dir.join(cli_bin));
     }
-    let bin_dir = catcloud_core::paths::normalize_os_path(&state.paths.bin_dir);
-    candidates.push(bin_dir.join(cli_bin));
-    let root_data = catcloud_core::paths::normalize_os_path(&state.paths.root_data_dir);
-    candidates.push(root_data.join("cli").join(cli_bin));
-    if let Some(ref dir) = exe_dir {
+    if let Some(res_dir) = resource_dir {
+        let norm_res = catcloud_core::paths::normalize_os_path(res_dir);
+        candidates.push(norm_res.join("resources").join("cli").join(cli_bin));
+        candidates.push(norm_res.join("cli").join(cli_bin));
+        candidates.push(norm_res.join(cli_bin));
+    }
+    let norm_bin_dir = catcloud_core::paths::normalize_os_path(bin_dir);
+    candidates.push(norm_bin_dir.join(cli_bin));
+    let norm_root_data = catcloud_core::paths::normalize_os_path(root_data_dir);
+    candidates.push(norm_root_data.join("cli").join(cli_bin));
+    if let Some(ref dir) = norm_exe_dir {
         if let Some(parent) = dir.parent() {
             candidates.push(parent.join("cli").join(cli_bin));
+            candidates.push(parent.join("Resources").join("resources").join("cli").join(cli_bin));
+            candidates.push(parent.join("Resources").join("cli").join(cli_bin));
+            candidates.push(parent.join("lib").join("CatCloud").join("resources").join("cli").join(cli_bin));
+            candidates.push(parent.join("share").join("CatCloud").join("resources").join("cli").join(cli_bin));
+            candidates.push(parent.join("share").join("catcloud").join("resources").join("cli").join(cli_bin));
         }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        candidates.push(std::path::PathBuf::from("/usr/lib/CatCloud/resources/cli").join(cli_bin));
+        candidates.push(std::path::PathBuf::from("/usr/share/CatCloud/resources/cli").join(cli_bin));
     }
 
     for candidate in &candidates {
@@ -11978,11 +11997,28 @@ fn resolve_local_cli_path(state: &AppState) -> std::path::PathBuf {
         }
     }
 
-    if let Some(dir) = exe_dir {
+    if let Some(dir) = norm_exe_dir {
         catcloud_core::paths::normalize_os_path(&dir.join("cli").join(cli_bin))
     } else {
-        catcloud_core::paths::normalize_os_path(&bin_dir.join(cli_bin))
+        catcloud_core::paths::normalize_os_path(&norm_bin_dir.join(cli_bin))
     }
+}
+
+fn resolve_local_cli_path(state: &AppState) -> std::path::PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf));
+    let resource_dir = state
+        .resource_dir
+        .read()
+        .ok()
+        .and_then(|guard| guard.clone());
+    resolve_local_cli_path_from(
+        exe_dir.as_deref(),
+        resource_dir.as_deref(),
+        &state.paths.bin_dir,
+        &state.paths.root_data_dir,
+    )
 }
 
 #[tauri::command]
@@ -18744,5 +18780,67 @@ mod tests {
         assert!(vis_direct.tooltip.contains("直连"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_local_cli_path_finds_portable_installer_resource_dir_and_unix_layouts() {
+        let cli_bin = if cfg!(target_os = "windows") {
+            "catcloud.exe"
+        } else {
+            "catcloud"
+        };
+        let root = std::env::temp_dir().join(format!(
+            "catcloud_cli_resolve_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let bin_dir = root.join("data").join("bin");
+        let root_data = root.join("data");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+
+        // 1. Portable layout: `<exe_dir>/cli/catcloud(.exe)`
+        let portable_exe_dir = root.join("portable");
+        let portable_cli = portable_exe_dir.join("cli").join(cli_bin);
+        std::fs::create_dir_all(portable_cli.parent().unwrap()).unwrap();
+        std::fs::write(&portable_cli, b"cli").unwrap();
+        assert_eq!(
+            resolve_local_cli_path_from(Some(&portable_exe_dir), None, &bin_dir, &root_data),
+            catcloud_core::paths::normalize_os_path(&portable_cli)
+        );
+
+        // 2. Tauri `resource_dir`: `<res>/resources/cli/catcloud(.exe)` (Linux AppImage / macOS / MSI)
+        let isolated_exe_dir = root.join("isolated_bin");
+        let res_dir = root.join("tauri_res");
+        let res_cli = res_dir.join("resources").join("cli").join(cli_bin);
+        std::fs::create_dir_all(&isolated_exe_dir).unwrap();
+        std::fs::create_dir_all(res_cli.parent().unwrap()).unwrap();
+        std::fs::write(&res_cli, b"cli").unwrap();
+        assert_eq!(
+            resolve_local_cli_path_from(
+                Some(&isolated_exe_dir),
+                Some(&res_dir),
+                &bin_dir,
+                &root_data
+            ),
+            catcloud_core::paths::normalize_os_path(&res_cli)
+        );
+
+        // 3. macOS `.app` layout without explicit resource_dir: `Contents/MacOS -> ../Resources/resources/cli/catcloud`
+        let mac_exe_dir = root.join("CatCloud.app").join("Contents").join("MacOS");
+        let mac_cli = root
+            .join("CatCloud.app")
+            .join("Contents")
+            .join("Resources")
+            .join("resources")
+            .join("cli")
+            .join(cli_bin);
+        std::fs::create_dir_all(&mac_exe_dir).unwrap();
+        std::fs::create_dir_all(mac_cli.parent().unwrap()).unwrap();
+        std::fs::write(&mac_cli, b"cli").unwrap();
+        assert_eq!(
+            resolve_local_cli_path_from(Some(&mac_exe_dir), None, &bin_dir, &root_data),
+            catcloud_core::paths::normalize_os_path(&mac_cli)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -2,7 +2,6 @@
 
 # Local planning, review ledgers & scratch (never push private dev notes)
 /plans/
-/plans_agy/
 /scratch/
 /backups/
 *.local.*
@@ -26,6 +25,7 @@
 /src-tauri/binaries/mihomo*
 /src-tauri/binaries/catcloud-mihomo*
 /src-tauri/resources/bin/
+/src-tauri/resources/cli/
 /src-tauri/resources/geoip.*
 /src-tauri/resources/geosite.*
 /src-tauri/resources/country.mmdb

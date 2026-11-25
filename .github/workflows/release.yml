@@ -183,6 +183,14 @@ jobs:
             --target "${{ matrix.target }}" `
             --version "${{ needs.preflight.outputs.mihomo_version }}"
 
+      - name: Build headless catcloud CLI & bundle resource
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
+          New-Item -ItemType Directory -Force -Path "src-tauri/resources/cli" | Out-Null
+          Copy-Item -Force "target/${{ matrix.target }}/release/catcloud.exe" "src-tauri/resources/cli/catcloud.exe"
+
       - name: Build Tauri bundles (MSI & NSIS)
         shell: pwsh
         env:
@@ -203,6 +211,7 @@ jobs:
               createUpdaterArtifacts = $enableUpdater
               resources = @{
                 "resources/bin/mihomo.exe" = "resources/bin/mihomo.exe"
+                "resources/cli/catcloud.exe" = "resources/cli/catcloud.exe"
               }
             }
           }
@@ -228,10 +237,6 @@ jobs:
             --config src-tauri/tauri.prebuilt-frontend.conf.json `
             --config $overridePath `
             '--' --locked
-
-      - name: Build headless catcloud CLI
-        shell: pwsh
-        run: cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
 
       - name: Stage Windows artifacts (MSI, NSIS, Portable ZIP, CLI ZIP)
         shell: pwsh
@@ -300,6 +305,14 @@ jobs:
             --target "${{ matrix.target }}" \
             --version "${{ needs.preflight.outputs.mihomo_version }}"
 
+      - name: Build headless catcloud CLI & bundle resource
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
+          mkdir -p src-tauri/resources/cli
+          cp "target/${{ matrix.target }}/release/catcloud" src-tauri/resources/cli/catcloud
+          chmod +x src-tauri/resources/cli/catcloud
+
       - name: Build Tauri bundles (.app & .dmg)
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -330,6 +343,7 @@ jobs:
                 createUpdaterArtifacts: enable,
                 resources: {
                   "resources/bin/mihomo": "resources/bin/mihomo",
+                  "resources/cli/catcloud": "resources/cli/catcloud",
                 },
               },
             };
@@ -355,9 +369,6 @@ jobs:
             --config src-tauri/tauri.prebuilt-frontend.conf.json \
             --config "$OVERRIDE_PATH" \
             -- --locked
-
-      - name: Build headless catcloud CLI
-        run: cargo build --release --locked --target "${{ matrix.target }}" -p catcloud-cli --bin catcloud
 
       - name: Stage macOS artifacts (.dmg, .app.tar.gz, CLI .tar.gz)
         run: |
@@ -433,6 +444,24 @@ jobs:
             --target "x86_64-unknown-linux-gnu" \
             --version "${{ needs.preflight.outputs.mihomo_version }}"
 
+      - name: Build headless catcloud CLI & bundle resource
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target x86_64-unknown-linux-gnu -p catcloud-cli --bin catcloud
+          mkdir -p src-tauri/resources/cli
+          cp target/x86_64-unknown-linux-gnu/release/catcloud src-tauri/resources/cli/catcloud
+          chmod +x src-tauri/resources/cli/catcloud
+
+      - name: Assert zero GTK/WebKit dependencies on Linux headless CLI
+        run: |
+          LDD_OUT="$(ldd ./target/x86_64-unknown-linux-gnu/release/catcloud)"
+          echo "$LDD_OUT"
+          if echo "$LDD_OUT" | grep -iE 'libgtk|libwebkit|libgdk|libjavascriptcore|libappindicator|libayatana'; then
+            echo "ERROR: Linux headless catcloud CLI linked against forbidden GUI/WebKit libraries." >&2
+            exit 1
+          fi
+          echo "PASS: Linux headless catcloud CLI has zero GTK/WebKit dependencies."
+
       - name: Build Tauri bundles (AppImage, DEB, RPM)
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
@@ -464,6 +493,7 @@ jobs:
                 createUpdaterArtifacts: enable,
                 resources: {
                   "resources/bin/mihomo": "resources/bin/mihomo",
+                  "resources/cli/catcloud": "resources/cli/catcloud",
                 },
               },
             };
@@ -489,19 +519,6 @@ jobs:
             --config src-tauri/tauri.prebuilt-frontend.conf.json \
             --config "$OVERRIDE_PATH" \
             -- --locked
-
-      - name: Build headless catcloud CLI
-        run: cargo build --release --locked --target x86_64-unknown-linux-gnu -p catcloud-cli --bin catcloud
-
-      - name: Assert zero GTK/WebKit dependencies on Linux headless CLI
-        run: |
-          LDD_OUT="$(ldd ./target/x86_64-unknown-linux-gnu/release/catcloud)"
-          echo "$LDD_OUT"
-          if echo "$LDD_OUT" | grep -iE 'libgtk|libwebkit|libgdk|libjavascriptcore|libappindicator|libayatana'; then
-            echo "ERROR: Linux headless catcloud CLI linked against forbidden GUI/WebKit libraries." >&2
-            exit 1
-          fi
-          echo "PASS: Linux headless catcloud CLI has zero GTK/WebKit dependencies."
 
       - name: Stage Linux artifacts (AppImage, DEB, RPM, CLI .tar.gz)
         run: |

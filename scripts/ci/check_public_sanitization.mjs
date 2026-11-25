@@ -117,7 +117,12 @@ function listCandidateFiles() {
       if (!fs.existsSync(full) || !fs.statSync(full).isFile()) return false;
       const ext = path.extname(full).toLowerCase();
       const base = path.basename(full);
-      return TEXT_EXTS.has(ext) || base === "LICENSE" || base === "Makefile";
+      return (
+        TEXT_EXTS.has(ext) ||
+        TEXT_EXTS.has(base.toLowerCase()) ||
+        base === "LICENSE" ||
+        base === "Makefile"
+      );
     });
 }
 

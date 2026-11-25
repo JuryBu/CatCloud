@@ -1,50 +1,69 @@
 # 猫猫云梯（CatCloud）
 
-**面向现代开发与 AI 工作流的跨平台智能代理桌面客户端与无头 CLI**
+**面向日常使用、校园网与 AI 开发工作流的跨平台智能代理桌面客户端与无头 CLI**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.92%2B-orange.svg)](https://www.rust-lang.org/)
 [![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB.svg)](https://v2.tauri.app/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/JuryBu/CatCloud/releases)
 
-> **English Quick Overview**: **CatCloud** is a performance-focused, extensible, Agent-friendly, and highly personalizable cross-platform intelligent proxy desktop client (Windows / macOS / Linux) and headless CLI (`catcloud`). Built with a decoupled **Forwarding Engine (Mihomo) × Rust Control Brain (`catcloud-core`) × Destroyable Desktop UI (Tauri v2 + React 19)** architecture, CatCloud achieves a `<= 70 MB` windowless tray memory budget, zero-interference isolated probing, per-site smart multi-node orchestration with safe AST scoring formulas, domestic `:443` pre-acceleration chaining, and zero-GUI Linux CLI operation.
+> **English Quick Overview**: **CatCloud** is a performance-focused, extensible, Agent-friendly, and highly personalizable cross-platform intelligent proxy desktop client (Windows / macOS / Linux) and headless CLI (`catcloud`). Built with a decoupled **Forwarding Engine (Mihomo) × Rust Control Brain (`catcloud-core`) × Destroyable Desktop UI (Tauri v2 + React 19)** architecture, CatCloud delivers a `<= 70 MB` windowless tray memory footprint, zero-interference isolated probing, smart per-site multi-node orchestration, domestic `:443` pre-acceleration (AnyTLS / Hysteria2 / Trojan / VLESS), campus-network DoH-443 protection, one-click `.zip` share bundles, and a built-in AI assistant with four-language guides.
 
 ---
 
-## 核心理念
+## 下载与内测快速上手
 
-1. **极致优化（Performance First）**：通过可销毁 WebView 窗口架构实现纯无窗托盘态 `<= 70 MB` 常驻内存、三档自适应 Mihomo `GOMEMLIMIT` 内存封顶、零重型 UI/图表库（纯原生 SVG 环形缓冲区波形）、以及基于 OS 原生机制的 `500 ms` 零僵尸子进程回收。
-2. **高度可扩展（Extensible by Design）**：内嵌核心适配抽象（`CoreAdapter`）、可动态注册的隔离探针注册表（`ProbeRegistry`，支持 7 类内置与外部脚本探针）、无 `eval` 安全 AST 评分公式引擎，以及开放的外部订阅适配器协议 `catcloud-adapter/v1`。
-3. **Agent 辅助友好（Agent-First Tooling）**：全核心模块内置四段式人机双读指南（何时启用 / 前置契约 / GUI 与 CLI 验真 / 回退排障），配套零 GUI 依赖的无头 `catcloud` CLI（统一 `--json` 输出）与三级配置热加载防断流机制。
-4. **一切皆可个性化（Personalizable Experience）**：支持按时段三段自动昼夜主题切换（暖纸浅色 / 深苔暖金 / 午夜星蓝）、自定义壁纸与受控局部毛玻璃、全局与分项动效开关、多套可自定义托盘状态图标映射及独立轻量悬浮胶囊窗。
+前往 [GitHub Releases](https://github.com/JuryBu/CatCloud/releases) 下载对应平台安装包（全部桌面包均已内置官方 `mihomo` 核心与无头 `catcloud` 命令行工具，开箱即用）：
+
+| 操作系统 | 推荐安装包 | 架构说明 | 当前实测状态 |
+|---|---|---|---|
+| **Windows** | `CatCloud-*-windows-x64-portable.zip`（推荐绿色便携）或 `*-setup.exe` / `*.msi` | 常见电脑选 `x64`；骁龙 ARM 选 `arm64` | **深度实测主力可用**（含高校校园网、虚拟网卡、底层全局国内提速） |
+| **macOS** | `CatCloud-*-macos-aarch64.dmg`（M 系列芯片）或 `*-x64.dmg`（Intel） | Apple Silicon 选 `aarch64` | 已通过云端真机构建与自动化测试，欢迎首批内测反馈 |
+| **Linux 桌面** | `CatCloud-*-linux-x86_64.AppImage` / `*.deb` / `*.rpm` | 64 位 x86_64 桌面 | 已通过云端构建与自动化测试，欢迎首批内测反馈 |
+| **服务器 / 无头 CLI** | `catcloud-windows-*.zip` / `catcloud-macos-*.tar.gz` / `catcloud-linux-x86_64.tar.gz` | Linux 零 GTK/WebKit 依赖 | 全平台自动化门禁验证通过 |
+
+### 首次运行安全提示放行说明
+- **Windows**：当前内测包暂未购置商业代码签名证书。首次双击若弹出 Windows SmartScreen 蓝色提示框，点击 **「更多信息」→「仍要运行」** 即可。使用绿色便携版时请先完整解压到可写目录再运行 `CatCloud.exe`。
+- **macOS**：当前内测包尚未做 Apple Developer ID 公证，且 `CatCloud.app` 内部包含随包 `mihomo` 核心与 `catcloud` CLI。将应用拖入「应用程序」后，**推荐在终端执行一次以下命令统一移除主程序与内置二进制的隔离属性**：
+  ```bash
+  xattr -dr com.apple.quarantine /Applications/CatCloud.app
+  ```
+  （注：macOS 15 Sequoia 及以上已取消 Finder 右键直接放行未签名应用；如系统仍有拦截，请在「系统设置 → 隐私与安全性」底部点击「仍要打开」。）
+- **管理员权限说明**：仅开启系统代理（浏览器等）无需管理员权限；开启 **「虚拟网卡（接管全部桌面应用与 IDE）」** 或 Windows 下点击 **「开启国内提速」** 启用底层全局透明提速时，界面会明确提示并在你点击确认后拉起系统提权。
+
+### 30 秒上手路径（小白 / 朋友内测推荐）
+1. **收到朋友发的 `.zip` 分享包**：打开左侧 **「节点与测速 → 订阅与导入」**，在「已导入订阅」标题栏点击 **「导入分享包 (.zip)」**（或在 **「国内提速」** 页中转列表头部点击 **「分享包」**），选中 `.zip` 预览并一键导入（可同时导入节点与国内提速中转，自动去重且不覆盖原有线路）。需要给朋友打包导出时，在「节点与测速」主表勾选目标节点后点击顶部 **「导出已选 (.zip)」**，或在「国内提速」页点击 **「分享包」**。
+2. **已有订阅链接或其它客户端**：打开 **「节点与测速 → 订阅与导入」**，粘贴订阅链接、只读迁移本机开源客户端配置，或使用 `1→2→3` 实时捕捉向导。
+3. **让自己的 AI 帮你配置或排障**：点击左侧 **「AI 助手」** 一级菜单：
+   - **发给网页 AI（ChatGPT / Gemini / Claude 等）**：在左卡点击 **「复制新手上手指南」** 或 **「复制排障诊断包」**（亦支持 **「导出单文件 (.md)」**）直接粘贴发问；
+   - **发给本机 AI Agent（Codex / Claude Code 等）**：在右卡点击 **「复制本机 Agent 引导」** 或 **「复制完整排障包」**，会自动附带随包 `catcloud` CLI 精确路径与手册树以便 Agent 自主听诊（注：Linux AppImage 运行时该路径位于临时挂载目录，仅在本次应用运行期间有效）；
+   - **反馈问题与建议**：点击顶栏 **「反馈问题到 GitHub」** 或页底 **「复制脱敏摘要并打开 GitHub Issue」**（自动预填脱敏环境摘要）。
 
 ---
 
 ## 核心特性亮点
 
-### 智能多选组与安全 AST 公式引擎
-- **四种按站点独立模式**：`sticky_best`（AI 专线默认粘性锁定防 IP 跳变）、`conditional_pool`（按倍率/地区/干净度动态纳新）、`load_balance_consistent_hash` 与 `load_balance_round_robin`（经硬门禁过滤后的受控均衡）。
-- **无 `eval` 安全递归下降公式引擎**：支持主探针标量（`up_mbps`、`down_mbps`、`ping_ms`、`jitter_ms`、`loss_pct`、`multiplier`、`keepalive_ok`、`google_clean`）及按探针 ID 寻址函数（`probe_up("id")`、`probe_ping("id")`、`probe_ok("id")`）。内置「低倍率性价比优先」与「纯性能最快」两套开箱模板。
-- **全员低于门槛三选一兜底**：
-  - `degrade_best_warn`（默认）：保留最高分合规节点不断网并缩短复检间隔；
-  - `cross_pool_escalate`：自动临时借道备用池，后台低频探活主池并在主池连续达标恢复后滞回自动切回，避免长期消耗高倍率流量；
-  - `strict_circuit_break`：全员未通过关键合规门禁时立即切至内置 `REJECT` 槽位并按组断开旧连接。
-- **按组独立旧连接处置**：支持 `force_close_old`（精准断开当前组僵尸长连接，不影响其他业务组）与 `graceful_new_only`。
+### 1. 朋友分享包（`catcloud-share/v1` 人类 & Agent 双友好 `.zip`）
+- 在界面自由勾选指定节点与国内加速中转，一键导出标准 `.zip` 分享包（内置结构化清单 `manifest.json`、人类与 Agent 均可直读的 `README.md` 与去敏规范结构）。
+- 导入端支持预览内容、自动指纹去重、保留本机冲突线路，并内建 Zip Slip / 符号链接 / Zip Bomb 防护；命令行同步支持 `catcloud share export / inspect / import`。
 
-### 零干扰临时隔离探针引擎
-- **现役业务零断流**：测速按需拉起临时隔离 Mihomo 子进程（严格仅监听 `127.0.0.1`、`tun.enable: false`、`redir-host` + 直连物理 DNS 防现役 TUN Fake-IP 污染、`GOMEMLIMIT=32MiB`），测完立即销毁回收。
-- **三级省流漏斗**：`L0` 延迟/抖动/丢包 → `L1` Google 侧真值区域检测（避免仅凭 CDN 差异误杀正常海外节点）与 AI/自定义正则站点解锁 → `L2` 真实上下行吞吐（`512 KB` 慢链路快速熔断省流）与 `20s / 40s / 60s` 静默 Keep-Alive 黑洞复检。
-- **动态可扩展**：支持 GUI/CLI 增删自定义 HTTP 探针及外部可执行脚本探针（`external_cmd`）。
+### 2. 智能多选组与常驻轻量健康池
+- **四种按站点独立模式**：`sticky_best`（AI 专线默认粘性锁定防 IP 跳变）、`conditional_pool`（按倍率/地区/干净度动态纳新）、`load_balance_consistent_hash` 与 `load_balance_round_robin`。
+- **无 `eval` 安全 AST 评分公式与三选一兜底**：内置「低倍率性价比优先」与「纯性能最快」模板；支持 `degrade_best_warn`、`cross_pool_escalate`（借道备用池并滞回回切）与 `strict_circuit_break`。
+- **双源防半残守护**：结合 Google + Cloudflare 并发双源探活、1.5 秒失败即时复测（避免误杀）、渐进冷却恢复观察态与 EWMA 平滑防乒乓切换。
 
-### 国内预加速技术（Domestic Pre-Acceleration）
-- 针对非 `:443` 端口跨境单流上行受限场景，通过前端国内纯 IP 无 SNI `:443` 中继链（`dialer-proxy`）显著改善长连接与大体积上传吞吐。
-- **底层全局国内预代理（免开代理/免开 TUN）**：支持在不启动 CatCloud 自身代理与虚拟网卡的情况下，通过独立轻量 `:443` 双活隧道与 Windows 按需加载官方签名 WinDivert 透明重定向（macOS / Linux 提供独立本地 `socks5h://` 入口），直接为其他代理软件与 SSH/SCP 工具提供底层 `:443` 提速，并实现首页、悬浮胶囊、国内提速页与系统托盘四端实时联动。
-- 内置 `mmrelay/v1` JSON 与单行 `mmrelay://v1/<base64url>` 剪贴板格式导入、分协议无 SNI 强校验（Trojan/AnyTLS `sni` 与 VLESS `servername`）、原生 443 节点智能跳过、国内 204 双活秒切、自动防环规则生成与高校校园网 Captive Portal 防假连。
-- 详见 [docs/DOMESTIC_PREACCEL.md](./docs/DOMESTIC_PREACCEL.md)。
+### 3. 零干扰临时隔离测速引擎
+- **现役业务零断流**：按需拉起临时隔离 Mihomo 子进程（严格仅监听 `127.0.0.1`、`tun.enable: false`、`redir-host` + 纯 IP DoH 443 防现役 TUN 劫持、`GOMEMLIMIT=32MiB`），测完立即销毁回收。
+- **实时流式出结果 & 真暂停保留**：支持延迟/抖动、Google 侧真值区域检测、Claude / ChatGPT（含 `ab.chatgpt.com`）/ Gemini / Windsurf 零风控语义解锁、512 KB 慢链路快速熔断上下行实测与 60 秒静默断流复检；支持按住 Ctrl 滑动多选与后台切页不中断。
 
-### 全面专业网络控制与实时监控
-- 首页内置 10 分钟原生 SVG 流量波形（定长 300 点 `Float64Array` 环形缓冲）、上传/下载速率与累计流量、活跃连接数、实时内核内存、自定义快捷网站测活与脱敏出口信息卡。
-- 完整支持系统代理、PAC 模式、Proxy Guard 守护、TUN 虚拟网卡（`mixed / system / gvisor`）、核心与 DNS IPv6 独立开关、完整进阶 DNS 与 Fallback Filter、UWP 回环解除工具、GeoIP/GeoSite/MMDB/ASN 独立与一键更新、YAML Merge Patch 覆写管线、实时日志流与按进程/域名单条踢断连接。
+### 4. 国内 `:443` 预加速与高校校园网深度适配
+- **多协议支持与真实上下行测速**：支持 `AnyTLS`（空闲连接池低延迟复用）、`Hysteria2`（UDP 443 抗丢包高上行）、`Trojan` 与 `VLESS`，内置纯 IP 无 SNI 强校验、`mmrelay://v1/...` 剪贴板导入及每条中转的独立隔离上下行实测。
+- **底层全局国内提速（免开猫云代理）**：即使关闭猫云系统代理与虚拟网卡，也可通过独立轻量 `:443` 隧道 + Windows 官方签名 WinDivert 透明重定向（带启动实测探测、自动防断网保护回退与安全软件放行指引）为本机其它代理软件与 SSH/SCP 提速。
+- **高校校园网防阻断**：针对封杀外网明文 UDP 53 的校园网环境，默认并自动无损迁移至纯 IP 加密 DoH 443，同时为 `*.edu.cn` 与局域网后缀保留系统校内解析，配合 Captive Portal 302 检测防假连。
+
+### 5. 独立 AI 助手、四语界面与零僵尸低内存架构
+- **独立「AI 助手」一级菜单**：内置 8 篇四语（简体中文 / English / 日本語 / Русский）随装权威手册、一键脱敏诊断包与一键提交 GitHub Issue；无头 `catcloud` CLI 自动安全识别桌面端运行期控制口令，免去手动配置密码即可执行 `net doctor`、`net connections`、`net match`、`logs tail` 与热重载。
+- **极简低内存与个性化体验**：可销毁 WebView 窗口架构实现关窗托盘态 `<= 70 MB` 内存、按需裁剪活跃节点 YAML、纯原生 SVG 10 分钟流量波形、三段自动昼夜主题、自定义本地壁纸、四边磁吸可缩放悬浮胶囊与全站界面偏好持久化。
 
 ---
 
@@ -52,137 +71,78 @@
 
 | 维度 | 传统桌面代理客户端（Electron / 常驻 WebView） | 猫猫云梯（CatCloud） |
 |---|---|---|
-| **后台托盘内存** | 窗口隐藏后常驻完整渲染进程，通常 `400 ~ 800 MB` | 关窗即销毁 WebView，纯无窗托盘态 **`<= 70 MB`**，唤醒 `< 600 ms` |
-| **节点测速方式** | 常复用现役核心或简单 HTTP Ping，难以识别上行限速与静默断流 | 临时隔离核心 + `redir-host` 防污染，支持真实上下行、Keep-Alive 与自定义解锁探针 |
-| **选点与均衡** | 手动选点或全局黑盒均衡，易出现 IP 跳变或混入受限出口 | 按站点 4 种模式、安全 AST 公式打分、滞回防抖与 3 选 1 兜底自动回切 |
-| **热加载与防断流** | 外部修改配置常需整体重启或导致现役连接全断 | L1/L2/L3 三级热加载 + `300 ms` 防抖去重 + 静态/内核预检拒载 + 选组态重放 |
-| **自动化与 AI 协同** | 强耦合图形界面，无统一机器可读协议 | 原生无头 `catcloud` CLI（Linux 零 GTK/WebKit）、`--json` 输出与四段式 Agent 文档 |
-| **进程与更新治理** | 异常退出偶留僵尸内核进程；便携版更新易遇文件锁冲突 | OS 原生 JobObject / `PR_SET_PDEATHSIG` 零僵尸回收 + 便携版同卷换轨自动回滚 |
+| **后台托盘内存** | 窗口隐藏后常驻完整渲染进程，通常 `400 ~ 800 MB` | 关窗即销毁 WebView，纯无窗托盘态内存预算 **`<= 70 MB`**，唤醒目标 `< 600 ms` |
+| **节点测速方式** | 常复用现役核心或仅测简单 Ping，难检上行限速与静默断流 | 临时隔离核心 + 纯 IP DoH 防污染，支持真实上下行、AI 语义解锁与长连复检 |
+| **朋友分享与迁移** | 手工传明文订阅链接或复杂 YAML，中转与节点割裂 | 一键勾选节点 + 国内中转导出 `.zip` 分享包，人机双读、安全去重导入 |
+| **校园网与弱网适应** | 明文 53 解析常被校园网阻断，普通权限开网卡易假状态 | 默认纯 IP DoH 443 + 校内系统解析 + 虚拟网卡真实权限诚实门禁 |
+| **自动化与 AI 协同** | 强耦合图形界面，排障靠人工截屏 | 独立 AI 助手菜单 + 内置无头 `catcloud` CLI（自动鉴权、`--json`、默认脱敏） |
+| **进程与更新治理** | 异常退出偶留僵尸内核；便携版覆盖易冲突 | OS 原生 JobObject / `PR_SET_PDEATHSIG` 零僵尸回收 + 同卷换轨自动回滚 |
 
 ---
 
 ## 安装模式与绿色便携模式
 
-CatCloud 在 Windows、macOS 与 Linux 上提供完整安装包与便携形态，运行时数据目录按严格优先级解析：
-
-1. 命令行参数 `--data-dir <PATH>`（最高优先级，支持多实例隔离运行）
+运行时数据目录按严格优先级解析：
+1. 命令行参数 `--data-dir <PATH>`（最高优先级，支持多实例物理隔离）
 2. 环境变量 `CATCLOUD_DATA_DIR`
-3. 便携标记：可执行文件同级目录存在 `portable.flag` 或 `data/` 目录时自动进入便携模式，将配置、SQLite 数据库、日志、内核二进制与 WebView2 用户数据全部收敛至 `data/` 子目录
-4. 平台标准应用数据目录：
-   - Windows: `%APPDATA%\CatCloud`
-   - macOS: `~/Library/Application Support/CatCloud`
-   - Linux: `$XDG_DATA_HOME/catcloud`（默认 `~/.local/share/catcloud`）
-
-- **单实例按数据目录隔离**：通过规范化 `data_dir` 的 SHA-256 前 8 位生成独立实例锁，主力实例与独立 `--data-dir` 测试实例互不冲突。
-- **下次启动自动更新**：消费 GitHub Releases 的 `latest.json` 与 `SHA256SUMS.txt`（严格每跳 HTTPS 白名单校验），Windows 绿色便携版采用同卷 `.exe.old` 换轨与延迟清理，严格保护 `data/`、`portable.flag` 与 `*.sqlite*` 不被覆盖，任意步骤异常自动从 `.update_backup/` 全量回滚。
-
----
-
-## 国内预加速概览
-
-```text
-应用流量 -> CatCloud 本地代理 -> 业务节点 (dialer-proxy)
-                                    │
-                                    ▼
-                        ⚡ 国内预加速入口 (select)
-                                    │
-                                    ▼
-                     🔄 预加速自动双活 (fallback, lazy: false)
-                        ├── 主用国内 :443 纯 IP 无 SNI 中继
-                        └── 备用国内 :443 纯 IP 无 SNI 中继
-                                    │
-                       (国内 204 探针健康监测 + 自动防环)
-```
-
-完整协议规范（`mmrelay/v1`）、纯 IP 无 SNI 安全说明与高校校园网 Captive Portal 防护请阅读 [docs/DOMESTIC_PREACCEL.md](./docs/DOMESTIC_PREACCEL.md)。
+3. 便携标记：可执行文件同级目录存在 `portable.flag` 或 `data/`（或从便携包 `cli/catcloud(.exe)` 启动时自动向上识别 `../portable.flag`）即进入便携模式，全部配置、数据库、日志与 WebView2 数据收敛至 `./data/`
+4. 平台标准应用数据目录（Windows `%APPDATA%\CatCloud` / macOS `~/Library/Application Support/CatCloud` / Linux `~/.local/share/catcloud`）
 
 ---
 
 ## 无头 `catcloud` CLI 速览
 
-`catcloud` 是独立编译的纯 Rust 无头命令行工具，Linux 发布包通过 CI `ldd` 强制门禁验证**零 GTK / WebKit 共享库依赖**，适合服务器、WSL、SSH 终端与 AI Agent 自动化调用。
+桌面安装包与绿色便携包均已内置无头 `catcloud` CLI（Linux 版经 CI `ldd` 强制验证**零 GTK / WebKit 共享库依赖**），所有只读命令默认脱敏，适合终端与 AI Agent 协同听诊：
 
 ```bash
-# 查看运行状态、便携模式与隔离实例哈希
+# 查看运行状态、权限与便携路径
 catcloud status --json
 
-# 指定独立数据目录（隔离多实例）
-catcloud --data-dir /tmp/catcloud-sandbox status --json
+# 一键分层只读听诊（自动对接桌面端运行期控制口令）
+catcloud net doctor --json
+catcloud net connections --limit 25 --json
+catcloud net match api.openai.com --json
+catcloud logs tail --lines 80 --json
 
-# 导出内置四段式人机双读 Agent 指南（支持 markdown / json）
-catcloud docs export preaccel --format markdown
+# 分享包导出 / 预览 / 导入
+catcloud share inspect friend-bundle.zip --json
+catcloud share import friend-bundle.zip --apply --json
+
+# 国内提速校验与真实上下行实测
+catcloud preaccel pool --json
+catcloud preaccel test --speed --json
+
+# 导出内置四语权威手册
+catcloud docs list --lang zh-CN --json
 catcloud docs export all --format json
-
-# 常用管理与验证命令（详见 docs/AGENT_GUIDE.md）
-catcloud config validate --json
-catcloud config reload --json
-catcloud node list --region TW --max-multiplier 1.0 --json
-catcloud group list --json
-catcloud preaccel test --json
-catcloud update check --json
 ```
 
-完整 CLI 契约、`--json` 输出规范与 `catcloud-adapter/v1` 外部适配器开发指南请参阅 [docs/AGENT_GUIDE.md](./docs/AGENT_GUIDE.md)。
+完整 CLI 契约、外部适配器与国内预加速部署指引请参阅 [docs/AGENT_GUIDE.md](./docs/AGENT_GUIDE.md) 与 [docs/DOMESTIC_PREACCEL.md](./docs/DOMESTIC_PREACCEL.md)。
 
 ---
 
 ## 从源码构建与开发
 
 ### 前置依赖
-- **Rust**：`1.92+`（见 [`rust-toolchain.toml`](./rust-toolchain.toml)）
+- **Rust**：`1.92+`（最低版本声明见 [`Cargo.toml`](./Cargo.toml)）
 - **Node.js**：`20+`（推荐 `22 LTS`）与 **pnpm** `10.30.3`
-- **Linux 桌面构建额外系统库**：`libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `patchelf`, `libssl-dev`, `libxdo-dev`（仅构建无头 `catcloud-cli` 时**无需**上述 GUI 依赖）
+- **Linux 桌面构建额外系统库**：`libwebkit2gtk-4.1-dev`, `libappindicator3-dev`, `librsvg2-dev`, `patchelf`, `libssl-dev`, `libxdo-dev`（仅构建无头 `catcloud-cli` 无需上述库）
 
 ### 常用开发命令
-
 ```bash
-# 1. 安装前端依赖并验证构建
 pnpm install --frozen-lockfile
 pnpm build
-
-# 2. 拉取并校验当前平台对应的官方 Mihomo 二进制（写入 src-tauri/resources/bin/）
 node scripts/release/fetch_mihomo.mjs
-
-# 3. 运行 Rust Workspace 测试（受控并发）
 CARGO_BUILD_JOBS=2 cargo test --workspace
-
-# 4. 构建无头 CLI
 cargo build --release -p catcloud-cli --bin catcloud
-
-# 5. 运行桌面开发模式或生产打包
-pnpm exec tauri dev
 pnpm exec tauri build
-
-# 6. 提交前运行公开仓脱敏门禁与脚本语法检查
 pnpm check:sanitize
 node --check scripts/release/*.mjs
 ```
-
-### 发布产物矩阵（GitHub Actions）
-
-打入 `v*` Tag 或通过 `workflow_dispatch` 触发 [`.github/workflows/release.yml`](./.github/workflows/release.yml) 后，流水线将自动产出并校验以下产物，并生成 `SHA256SUMS.txt`、`latest.json` 与 Draft GitHub Release：
-
-- **Windows (`x86_64` / `aarch64`)**：`.msi`、NSIS `-setup.exe`、绿色便携 `-portable.zip`（内置 `portable.flag` 与 `resources/bin/mihomo.exe`）、`catcloud-windows-<arch>.zip`
-- **macOS (`aarch64` / `x86_64`)**：`.dmg`、`.app.tar.gz`、`catcloud-macos-<arch>.tar.gz`
-- **Linux (`x86_64`)**：`.AppImage`、`.deb`、`.rpm`、`catcloud-linux-x86_64.tar.gz`（含 `ldd` 零 GTK/WebKit 门禁断言）
+> 说明：`pnpm exec tauri build` 使用默认的 `src-tauri/tauri.conf.json` 生成本地开发构建；如需像 GitHub Releases 一样将 `mihomo` 核心与无头 `catcloud` CLI 打包进安装包，请参考 [`.github/workflows/release.yml`](./.github/workflows/release.yml) 通过 `--config` 临时覆盖配置挂载 `resources/bin/` 与 `resources/cli/`。
 
 ---
-
-## 文档导航
-
-- [系统架构与三态内存治理](./docs/ARCHITECTURE.md)
-- [Agent 辅助友好指南、CLI 契约与 Adapter 规范](./docs/AGENT_GUIDE.md)
-- [国内预加速技术与校园网 Captive Portal 防护](./docs/DOMESTIC_PREACCEL.md)
-- [更新日志（CHANGELOG）](./CHANGELOG.md)
-
----
-
-## 贡献与行为规范
-
-欢迎通过 Issue 与 Pull Request 参与改进：
-- 所有提交须通过公开仓脱敏检查（`node scripts/ci/check_public_sanitization.mjs`），禁止提交任何个人路径、真实订阅链接、私有密钥或非 RFC 5737 示例公网 IP；
-- 禁止在主仓库引入任何第三方闭源商业客户端的逆向或私有解密逻辑，动态源接入请统一使用公开的 `catcloud-adapter/v1` 槽位。
 
 ## 开源许可
 
-本项目基于 [MIT License](./LICENSE) 开源。
+本项目采用 [MIT License](./LICENSE) 开源。欢迎提交 Issue 与 Pull Request，提交日志或配置前请确认使用应用内置的自动脱敏诊断功能，切勿公开任何私人服务器地址、订阅链接或凭据。

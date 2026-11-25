@@ -208,8 +208,15 @@ pub fn resolve_mihomo_binary_with_exe_dir(
         {
             if let Some(parent) = dir.parent() {
                 if parent.parent().is_some() {
+                    // Portable layout: `<root>/cli/catcloud(.exe)` -> `<root>/resources/bin/mihomo(.exe)`
                     ordered_candidates.push((
                         parent.join("resources").join("bin").join(bin_name),
+                        BinarySource::BundledResourcesBin,
+                    ));
+                    // Bundled installer layout (Windows MSI/NSIS, macOS .app, Linux AppImage/deb/rpm):
+                    // `<resources>/cli/catcloud(.exe)` -> `<resources>/bin/mihomo(.exe)`
+                    ordered_candidates.push((
+                        parent.join("bin").join(bin_name),
                         BinarySource::BundledResourcesBin,
                     ));
                 }
@@ -617,6 +624,31 @@ mod tests {
             .unwrap();
         assert!(r_user.found);
         assert_eq!(r_user.source, BinarySource::UserDataBin);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn resolves_sibling_bin_when_launched_from_bundled_resources_cli_subdir() {
+        let (root, paths, _) = make_temp_env("bundled-resources-cli");
+        let bin_name = mihomo_binary_name();
+        let res_root = root.join("AppBundle").join("resources");
+        let cli_dir = res_root.join("cli");
+        let sibling_bin = res_root.join("bin").join(bin_name);
+
+        std::fs::create_dir_all(&cli_dir).unwrap();
+        std::fs::create_dir_all(sibling_bin.parent().unwrap()).unwrap();
+        std::fs::write(&sibling_bin, b"sibling-res-mihomo").unwrap();
+
+        let cfg = AppConfig::default();
+        let res = resolve_mihomo_binary_with_exe_dir(&cfg, &paths, Some(&cli_dir), &[], false)
+            .unwrap();
+        assert!(res.found);
+        assert_eq!(res.source, BinarySource::BundledResourcesBin);
+        assert_eq!(
+            res.path.unwrap(),
+            crate::paths::normalize_os_path(&std::fs::canonicalize(&sibling_bin).unwrap())
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -3,7 +3,7 @@
  * Stage Windows release artifacts into unified `release-assets/`:
  *   - MSI installer (+ optional `.sig`)
  *   - NSIS setup installer (+ optional `.sig`)
- *   - Portable ZIP bundle (with `portable.flag`, `resources/bin/mihomo.exe`, `version.json`)
+ *   - Portable ZIP bundle (with `portable.flag`, `cli/catcloud.exe`, `resources/bin/mihomo.exe`, `README-QuickStart.txt`, `version.json`)
  *   - Headless `catcloud` CLI ZIP archive
  *
  * Zero external npm dependencies (Node.js 20+ ESM, includes built-in RFC 1951 Deflate ZIP writer).
@@ -265,14 +265,46 @@ function main() {
   }
   copyWithOptionalSig(nsisSrc, path.join(opts.outDir, planned.nsis), staged);
 
-  // 3. Portable ZIP archive (with top-level folder, portable.flag, mihomo.exe, and version.json)
-  const exeCandidates = [
-    path.join(releaseDir, "CatCloud.exe"),
-    path.join(releaseDir, "catcloud-desktop.exe"),
-  ];
-  const desktopExe = exeCandidates.find((p) => fs.existsSync(p));
-  if (!desktopExe) {
-    throw new Error(`Desktop binary not found (checked: ${exeCandidates.join(", ")})`);
+  // 3. Portable ZIP archive (with top-level folder, portable.flag, cli/catcloud.exe, mihomo.exe, quickstart, and version.json)
+  // NOTE: On case-insensitive Windows NTFS, `fs.existsSync("CatCloud.exe")` matches `catcloud.exe` (headless CLI)!
+  // Always prefer `catcloud-desktop.exe`, verify exact directory entry casing, and enforce PE Subsystem=2 (GUI).
+  const releaseEntries = fs.existsSync(releaseDir) ? fs.readdirSync(releaseDir) : [];
+  let desktopExe = null;
+  if (releaseEntries.includes("catcloud-desktop.exe")) {
+    desktopExe = path.join(releaseDir, "catcloud-desktop.exe");
+  } else if (releaseEntries.includes("CatCloud.exe")) {
+    desktopExe = path.join(releaseDir, "CatCloud.exe");
+  }
+  if (!desktopExe || !fs.existsSync(desktopExe)) {
+    throw new Error(`Desktop binary not found in ${releaseDir} (expected catcloud-desktop.exe or exact-case CatCloud.exe)`);
+  }
+  const cliBin = path.join(releaseDir, "catcloud.exe");
+  if (!fs.existsSync(cliBin)) {
+    throw new Error(`Headless CLI binary not found: ${cliBin}`);
+  }
+  if (path.resolve(desktopExe).toLowerCase() === path.resolve(cliBin).toLowerCase()) {
+    throw new Error(`Desktop binary resolved to headless CLI (${desktopExe}); refusing to package CLI as CatCloud.exe`);
+  }
+  const desktopBuf = fs.readFileSync(desktopExe);
+  if (desktopBuf.length < 0x40 || desktopBuf[0] !== 0x4d || desktopBuf[1] !== 0x5a) {
+    throw new Error(`Refusing to package ${path.basename(desktopExe)} as CatCloud.exe: invalid DOS/MZ PE header`);
+  }
+  const peOff = desktopBuf.readUInt32LE(0x3c);
+  if (
+    peOff + 24 + 70 > desktopBuf.length ||
+    desktopBuf[peOff] !== 0x50 ||
+    desktopBuf[peOff + 1] !== 0x45 ||
+    desktopBuf[peOff + 2] !== 0x00 ||
+    desktopBuf[peOff + 3] !== 0x00
+  ) {
+    throw new Error(`Refusing to package ${path.basename(desktopExe)} as CatCloud.exe: truncated or invalid PE signature`);
+  }
+  const subsys = desktopBuf.readUInt16LE(peOff + 24 + 68);
+  if (subsys !== 2) {
+    throw new Error(`Refusing to package ${path.basename(desktopExe)} as CatCloud.exe: PE Subsystem=${subsys} (expected 2 = Windows GUI)`);
+  }
+  if (!desktopBuf.includes(Buffer.from("assets/index-", "ascii"))) {
+    throw new Error(`Refusing to package ${path.basename(desktopExe)}: missing embedded custom-protocol frontend assets`);
   }
   if (!fs.existsSync(opts.mihomoBin)) {
     throw new Error(`Bundled Mihomo binary missing: ${opts.mihomoBin}`);
@@ -288,9 +320,33 @@ function main() {
     }
   }
 
+  const quickStartText = [
+    `猫猫云梯（CatCloud）v${opts.version} Windows 绿色便携版快速上手`,
+    "================================================================",
+    "",
+    "1. 开箱即用：",
+    "   - 完整解压本压缩包到任意可写目录（勿直接在压缩包内双击）。",
+    "   - 双击 CatCloud.exe 启动；全部配置与数据库保存在同级 ./data/ 目录，不污染系统目录。",
+    "   - 首次运行若 Windows SmartScreen 弹出未签名提醒，点击「更多信息」->「仍要运行」即可。",
+    "",
+    "2. 两种最快的上手方式：",
+    "   - 朋友分享包导入：打开「节点与测速 -> 订阅与导入」点击「导入分享包 (.zip)」，或在「国内提速」页点击「分享包」一键导入。",
+    "   - 订阅链接 / 本地迁移：打开「节点与测速 -> 订阅与导入」，粘贴订阅链接或只读导入其它开源客户端配置。",
+    "",
+    "3. 管理员权限说明（按需）：",
+    "   - 仅使用系统代理（浏览器等）无需管理员权限。",
+    "   - 开启「虚拟网卡（接管全部桌面软件 / IDE）」或点击「开启国内提速」（含底层全局透明提速）时，按界面提示点击允许管理员权限重启即可。",
+    "",
+    "4. AI 助手与问题反馈：",
+    "   - 左侧点击「AI 助手」：发给网页 AI 点左卡「复制新手上手指南 / 复制排障诊断包」；发给本机 AI Agent 点右卡「复制本机 Agent 引导 / 复制完整排障包」（会自动附带本目录内置的 cli\\catcloud.exe 精确路径）。",
+    "   - 遇到任何问题或建议，可在「AI 助手」页顶栏点击「反馈问题到 GitHub」或底部「复制脱敏摘要并打开 GitHub Issue」。",
+    "",
+  ].join("\r\n");
+
   const portableRoot = `CatCloud-${opts.version}-windows-${shortArch}-portable`;
   const portableEntries = [
-    { name: `${portableRoot}/CatCloud.exe`, data: fs.readFileSync(desktopExe) },
+    { name: `${portableRoot}/CatCloud.exe`, data: desktopBuf },
+    { name: `${portableRoot}/cli/catcloud.exe`, data: fs.readFileSync(cliBin) },
     {
       name: `${portableRoot}/portable.flag`,
       data: Buffer.from("CatCloud portable mode marker. User data is stored in ./data/\n", "utf8"),
@@ -298,6 +354,10 @@ function main() {
     {
       name: `${portableRoot}/resources/bin/mihomo.exe`,
       data: fs.readFileSync(opts.mihomoBin),
+    },
+    {
+      name: `${portableRoot}/README-QuickStart.txt`,
+      data: Buffer.from(quickStartText, "utf8"),
     },
     {
       name: `${portableRoot}/version.json`,
@@ -308,6 +368,7 @@ function main() {
             target: opts.target,
             arch: shortArch,
             edition: "portable",
+            cli_bundled: true,
             mihomo_version: mihomoVersion,
             built_at: new Date().toISOString(),
           },
@@ -340,10 +401,6 @@ function main() {
   staged.push(planned.portableZip);
 
   // 4. Headless CLI ZIP archive
-  const cliBin = path.join(releaseDir, "catcloud.exe");
-  if (!fs.existsSync(cliBin)) {
-    throw new Error(`Headless CLI binary not found: ${cliBin}`);
-  }
   const cliEntries = [{ name: "catcloud.exe", data: fs.readFileSync(cliBin) }];
   if (fs.existsSync(licensePath)) {
     cliEntries.push({ name: "LICENSE", data: fs.readFileSync(licensePath) });
