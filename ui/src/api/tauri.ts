@@ -190,6 +190,7 @@ export interface UpdateConfig {
   check_interval_min: number;
   include_prerelease: boolean;
   auto_download?: boolean;
+  skipped_version?: string | null;
 }
 
 export interface AppConfig {
@@ -1093,6 +1094,8 @@ export interface AppUpdateCheckResult {
   platform_key?: string;
   can_auto_stage?: boolean;
   download_url?: string | null;
+  skipped?: boolean;
+  skipped_version?: string | null;
   error?: string | null;
 }
 
@@ -1105,6 +1108,45 @@ export interface DownloadAndStageUpdateResult {
   release_url?: string | null;
   download_url?: string | null;
   message?: string;
+}
+
+export type StagedUpdateKind = "portable_zip" | "installer_package";
+export type StagedUpdateApplyAction =
+  | "portable_restart"
+  | "installer_launch"
+  | "reveal_archive";
+
+export interface PendingUpdatePromptDto {
+  current_version: string;
+  target_version: string;
+  kind: StagedUpdateKind;
+  apply_action: StagedUpdateApplyAction;
+  archive_sha256: string;
+  package_size_bytes: number;
+  staged_at: string;
+  release_notes: string;
+  release_url: string | null;
+  platform_key: string | null;
+  installer_filename: string | null;
+  dismissed_in_session: boolean;
+  is_elevated: boolean;
+}
+
+export interface SkipUpdateResultDto {
+  skipped_version: string;
+  purged_staged: boolean;
+  freed_bytes: number;
+  message: string;
+}
+
+export interface ApplyUpdateRestartResultDto {
+  started: boolean;
+  exiting: boolean;
+  cancelled: boolean;
+  kind: StagedUpdateKind;
+  apply_action: StagedUpdateApplyAction;
+  target_version: string;
+  message: string;
 }
 
 export interface ExportBackupResult {
@@ -1468,6 +1510,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     check_interval_min: 360,
     include_prerelease: false,
     auto_download: true,
+    skipped_version: null,
   },
 };
 
@@ -1559,162 +1602,83 @@ const MOCK_NODES: ProxyNode[] = [
   },
 ];
 
+const MOCK_UNLOCKED_ALL: Record<string, boolean> = {
+  gemini: true,
+  google_ai: true,
+  chatgpt: true,
+  claude: true,
+  windsurf: true,
+};
+const MOCK_PROBE_BASE = {
+  tested_at: "2026-11-23T04:48:00+08:00",
+  ok: true,
+  loss_pct: 0,
+  google_clean: true,
+  google_risk_mismatch: false,
+  keepalive_60s_ok: true,
+  unlocked_sites: MOCK_UNLOCKED_ALL,
+  per_probe_ok: { builtin_unlock_windsurf: true },
+};
+const makeMockProbe = (
+  node_id: string,
+  latency_ms: number,
+  jitter_ms: number,
+  up_mbps: number,
+  down_mbps: number,
+  cf_loc: string,
+  yt_gl: string,
+  chatgptPing: number
+): ProbeSnapshot => ({
+  ...MOCK_PROBE_BASE,
+  node_id,
+  latency_ms,
+  jitter_ms,
+  up_mbps,
+  down_mbps,
+  cf_loc,
+  yt_gl,
+  per_probe_up_mbps: { antigravity: up_mbps },
+  per_probe_down_mbps: { dl: down_mbps },
+  per_probe_ping_ms: { chatgpt: chatgptPing },
+});
+
 const MOCK_PROBES: Record<string, ProbeSnapshot> = {
-  "node-jp-01": {
-    node_id: "node-jp-01",
-    tested_at: "2026-11-23T04:48:00+08:00",
-    ok: true,
-    latency_ms: 68,
-    jitter_ms: 4.2,
-    loss_pct: 0,
-    up_mbps: 14.8,
-    down_mbps: 186.4,
-    cf_loc: "NRT",
-    yt_gl: "JP",
-    google_clean: true,
-    google_risk_mismatch: false,
-    keepalive_60s_ok: true,
-    unlocked_sites: { gemini: true, google_ai: true, chatgpt: true, claude: true, windsurf: true },
-    per_probe_ok: { builtin_unlock_windsurf: true },
-    per_probe_up_mbps: { antigravity: 14.8 },
-    per_probe_down_mbps: { dl: 186.4 },
-    per_probe_ping_ms: { chatgpt: 72 },
-  },
-  "node-sg-02": {
-    node_id: "node-sg-02",
-    tested_at: "2026-11-23T04:48:00+08:00",
-    ok: true,
-    latency_ms: 82,
-    jitter_ms: 5.8,
-    loss_pct: 0,
-    up_mbps: 12.1,
-    down_mbps: 162.0,
-    cf_loc: "SIN",
-    yt_gl: "SG",
-    google_clean: true,
-    google_risk_mismatch: false,
-    keepalive_60s_ok: true,
-    unlocked_sites: { gemini: true, google_ai: true, chatgpt: true, claude: true, windsurf: true },
-    per_probe_ok: { builtin_unlock_windsurf: true },
-    per_probe_up_mbps: { antigravity: 12.1 },
-    per_probe_down_mbps: { dl: 162.0 },
-    per_probe_ping_ms: { chatgpt: 88 },
-  },
-  "node-us-03": {
-    node_id: "node-us-03",
-    tested_at: "2026-11-23T04:48:00+08:00",
-    ok: true,
-    latency_ms: 144,
-    jitter_ms: 7.5,
-    loss_pct: 0,
-    up_mbps: 11.4,
-    down_mbps: 154.2,
-    cf_loc: "SJC",
-    yt_gl: "US",
-    google_clean: true,
-    google_risk_mismatch: false,
-    keepalive_60s_ok: true,
-    unlocked_sites: { gemini: true, google_ai: true, chatgpt: true, claude: true, windsurf: true },
-    per_probe_ok: { builtin_unlock_windsurf: true },
-    per_probe_up_mbps: { antigravity: 11.4 },
-    per_probe_down_mbps: { dl: 154.2 },
-    per_probe_ping_ms: { chatgpt: 148 },
-  },
-  "node-tw-04": {
-    node_id: "node-tw-04",
-    tested_at: "2026-11-23T04:48:00+08:00",
-    ok: true,
-    latency_ms: 56,
-    jitter_ms: 3.1,
-    loss_pct: 0,
-    up_mbps: 24.5,
-    down_mbps: 248.0,
-    cf_loc: "TPE",
-    yt_gl: "TW",
-    google_clean: true,
-    google_risk_mismatch: false,
-    keepalive_60s_ok: true,
-    unlocked_sites: { gemini: true, google_ai: true, chatgpt: true, claude: true, windsurf: true },
-    per_probe_ok: { builtin_unlock_windsurf: true },
-    per_probe_up_mbps: { antigravity: 24.5 },
-    per_probe_down_mbps: { dl: 248.0 },
-    per_probe_ping_ms: { chatgpt: 61 },
-  },
+  "node-jp-01": makeMockProbe("node-jp-01", 68, 4.2, 14.8, 186.4, "NRT", "JP", 72),
+  "node-sg-02": makeMockProbe("node-sg-02", 82, 5.8, 12.1, 162.0, "SIN", "SG", 88),
+  "node-us-03": makeMockProbe("node-us-03", 144, 7.5, 11.4, 154.2, "SJC", "US", 148),
+  "node-tw-04": makeMockProbe("node-tw-04", 56, 3.1, 24.5, 248.0, "TPE", "TW", 61),
 };
 
+const makeMockProbeDef = (
+  id: string,
+  name: string,
+  kind: ProbeKind,
+  target_url: string,
+  timeout_ms: number,
+  expected_status = 204,
+  method = "GET",
+  body_regex: string | null = null,
+  payload_bytes: number | null = null
+): ProbeDefinition => ({
+  id,
+  name,
+  kind,
+  target_url,
+  method,
+  expected_status,
+  body_regex,
+  payload_bytes,
+  timeout_ms,
+  builtin: true,
+});
+
 const MOCK_PROBE_DEFINITIONS: ProbeDefinition[] = [
-  {
-    id: "builtin_latency",
-    name: "标准连通延迟 204",
-    kind: "latency",
-    target_url: "https://cp.cloudflare.com/generate_204",
-    method: "GET",
-    expected_status: 204,
-    body_regex: null,
-    payload_bytes: null,
-    timeout_ms: 5000,
-    builtin: true,
-  },
-  {
-    id: "builtin_google_cn",
-    name: "Google 侧真值防送中",
-    kind: "google_cn",
-    target_url: "https://www.google.com/generate_204",
-    method: "GET",
-    expected_status: 204,
-    body_regex: null,
-    payload_bytes: null,
-    timeout_ms: 6000,
-    builtin: true,
-  },
-  {
-    id: "builtin_upload",
-    name: "上行吞吐 (512KB 快熔断)",
-    kind: "upload",
-    target_url: "https://speed.cloudflare.com/__up",
-    method: "POST",
-    expected_status: 200,
-    body_regex: null,
-    payload_bytes: 512 * 1024,
-    timeout_ms: 12000,
-    builtin: true,
-  },
-  {
-    id: "builtin_download",
-    name: "下行吞吐测速",
-    kind: "download",
-    target_url: "https://speed.cloudflare.com/__down?bytes=2097152",
-    method: "GET",
-    expected_status: 200,
-    body_regex: null,
-    payload_bytes: 2 * 1024 * 1024,
-    timeout_ms: 12000,
-    builtin: true,
-  },
-  {
-    id: "builtin_keepalive_60s",
-    name: "60s 静默长连接黑洞检测",
-    kind: "keepalive",
-    target_url: "https://cp.cloudflare.com/generate_204",
-    method: "GET",
-    expected_status: 204,
-    body_regex: null,
-    payload_bytes: null,
-    timeout_ms: 65000,
-    builtin: true,
-  },
-  {
-    id: "builtin_unlock_windsurf",
-    name: "Windsurf / Codeium 解锁",
-    kind: "unlock_regex",
-    target_url: "https://windsurf.com",
-    method: "GET",
-    expected_status: 200,
-    body_regex: "windsurf|codeium",
-    payload_bytes: null,
-    timeout_ms: 8000,
-    builtin: true,
-  },
+  makeMockProbeDef("builtin_latency", "标准连通延迟 204", "latency", "https://cp.cloudflare.com/generate_204", 5000),
+  makeMockProbeDef("builtin_google_cn", "Google 侧真值防送中", "google_cn", "https://www.google.com/generate_204", 6000),
+  makeMockProbeDef("builtin_upload", "上行吞吐 (512KB 快熔断)", "upload", "https://speed.cloudflare.com/__up", 12000, 200, "POST", null, 512 * 1024),
+  makeMockProbeDef("builtin_download", "下行吞吐测速", "download", "https://speed.cloudflare.com/__down?bytes=2097152", 12000, 200, "GET", null, 2 * 1024 * 1024),
+  makeMockProbeDef("builtin_keepalive_60s", "60s 静默长连接黑洞检测", "keepalive", "https://cp.cloudflare.com/generate_204", 65000),
+  makeMockProbeDef("builtin_unlock_windsurf", "Windsurf / Codeium 解锁", "unlock_regex", "https://windsurf.com", 8000, 200, "GET", "windsurf|codeium"),
 ];
 
 const MOCK_GROUPS: MultiGroup[] = [
@@ -1849,24 +1813,89 @@ const MOCK_QUICK_SITES: SiteCheckItem[] = [
   { id: "site-chatgpt", name: "OpenAI", url: "https://chatgpt.com/cdn-cgi/trace", latency_ms: 95, ok: true },
 ];
 
-export function hasPreviewTunNeedsAdminFlag(): boolean {
-  if (typeof window === "undefined") return false;
+function getPreviewQueryParam(key: string): string | null {
+  if (typeof window === "undefined") return null;
   try {
-    const searchParams = new URLSearchParams(window.location.search);
-    if (searchParams.get("preview_tun_needs_admin") === "1") return true;
-    const hash = window.location.hash || "";
-    const qIdx = hash.indexOf("?");
-    if (qIdx >= 0) {
-      const hashParams = new URLSearchParams(hash.slice(qIdx + 1));
-      if (hashParams.get("preview_tun_needs_admin") === "1") return true;
-    }
-    return /(?:^|[?&#])preview_tun_needs_admin=1(?:$|&|#)/.test(hash);
+    const v = new URLSearchParams(window.location.search).get(key);
+    if (v !== null) return v;
+    const h = window.location.hash || "";
+    const i = h.indexOf("?");
+    return i >= 0 ? new URLSearchParams(h.slice(i + 1)).get(key) : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
+export function hasPreviewTunNeedsAdminFlag(): boolean {
+  return (
+    getPreviewQueryParam("preview_tun_needs_admin") === "1" ||
+    (typeof window !== "undefined" &&
+      /(?:^|[?&#])preview_tun_needs_admin=1(?:$|&|#)/.test(window.location.hash || ""))
+  );
+}
+
+export function hasPreviewUpdateModalFlag(): boolean {
+  return getPreviewQueryParam("update_modal") === "1";
+}
+
 const previewTunNeedsAdmin = !isTauriEnv() && hasPreviewTunNeedsAdminFlag();
+const previewUpdateModal = !isTauriEnv() && hasPreviewUpdateModalFlag();
+
+const MOCK_UPDATE_VERSION = "0.1.1";
+const MOCK_UPDATE_SHA256 =
+  "8f4e2a91c6d07b3f5e1a84c29d0b7e63f1a24c8b9e0d3f5a7c1b2d4e6f8a9012";
+const MOCK_UPDATE_SIZE_BYTES = 28_521_267;
+const MOCK_UPDATE_NOTES =
+  "• 新增后台静默预下载与开屏更新询问弹窗，支持便携版热更新与安装版向导拉起。\n• 支持「跳过此版本」并立即删除预下载包释放磁盘空间。\n• Added SHA-256 verified background pre-download & launch update prompt.";
+
+function setMockSkippedVersion(ver: string | null): void {
+  mockConfig.update.skipped_version = ver;
+  if (mockFullConfig.update) mockFullConfig.update.skipped_version = ver;
+}
+
+function buildMockPendingUpdateDto(
+  currentVersion: string,
+  repo: string
+): PendingUpdatePromptDto {
+  const os = detectNavigatorOs();
+  const useInstaller = getPreviewQueryParam("update_modal_kind") === "installer" || os !== "windows";
+  const cleanRepo = repo.trim().replace(/^\/+|\/+$/g, "") || "JuryBu/CatCloud";
+  const platformKey =
+    os === "macos"
+      ? "darwin-aarch64"
+      : os === "linux"
+        ? "linux-x86_64"
+        : useInstaller
+          ? "windows-x86_64"
+          : "windows-x86_64-portable";
+  const installerFilename = useInstaller
+    ? `CatCloud-${MOCK_UPDATE_VERSION}-${os === "macos" ? "darwin-arm64.dmg" : os === "linux" ? "linux-x86_64.AppImage" : "windows-x64-setup.exe"}`
+    : null;
+  return {
+    current_version: currentVersion,
+    target_version: MOCK_UPDATE_VERSION,
+    kind: useInstaller ? "installer_package" : "portable_zip",
+    apply_action: !useInstaller
+      ? "portable_restart"
+      : os === "linux"
+        ? "reveal_archive"
+        : "installer_launch",
+    archive_sha256: MOCK_UPDATE_SHA256,
+    package_size_bytes: MOCK_UPDATE_SIZE_BYTES,
+    staged_at: new Date().toISOString(),
+    release_notes: MOCK_UPDATE_NOTES,
+    release_url: `https://github.com/${cleanRepo}/releases/tag/v${MOCK_UPDATE_VERSION}`,
+    platform_key: platformKey,
+    installer_filename: installerFilename,
+    dismissed_in_session: false,
+    is_elevated: getPreviewQueryParam("update_modal_elevated") === "1",
+  };
+}
+
+let mockPendingUpdate: PendingUpdatePromptDto | null = previewUpdateModal
+  ? buildMockPendingUpdateDto("0.1.0", DEFAULT_APP_CONFIG.update.repo)
+  : null;
+const mockUpdateReadyListeners = new Set<(payload: PendingUpdatePromptDto) => void>();
 
 let mockConfig: AppConfig = {
   ...structuredClone(DEFAULT_APP_CONFIG),
@@ -2538,17 +2567,28 @@ export const catcloudApi = {
 
   async saveConfig(next: AppConfig): Promise<AppConfig> {
     if (isTauriEnv()) {
+      const wireUpdate: AppConfig["update"] = {
+        repo: next.update.repo,
+        mode: next.update.mode,
+        check_interval_min: next.update.check_interval_min,
+        include_prerelease: next.update.include_prerelease,
+        auto_download: next.update.auto_download ?? true,
+      };
       const wireConfig: AppConfig = {
         ...next,
-        update: {
-          ...next.update,
-          auto_download: next.update.auto_download ?? true,
-        },
+        update: wireUpdate,
       };
       delete wireConfig.behavior;
       return tauriInvokeOrThrow<AppConfig>("save_app_config", { config: wireConfig });
     }
-    mockConfig = structuredClone(next);
+    const preservedSkippedVersion = mockConfig.update.skipped_version ?? null;
+    mockConfig = {
+      ...structuredClone(next),
+      update: {
+        ...structuredClone(next.update),
+        skipped_version: preservedSkippedVersion,
+      },
+    };
     if (!next.preaccel.enabled) {
       stopMockGlobalPreAccel();
     }
@@ -4822,19 +4862,26 @@ export const catcloudApi = {
         ? "darwin-aarch64"
         : os === "linux"
           ? "linux-x86_64"
-          : "windows-x86_64-portable";
-    const canAutoStage = os === "windows" && mockRuntime.portable_mode;
+          : mockRuntime.portable_mode
+            ? "windows-x86_64-portable"
+            : "windows-x86_64";
+    const skippedVersion = mockConfig.update.skipped_version ?? null;
+    const baseUrl = `https://github.com/${mockConfig.update.repo}/releases`;
+    const simulate = previewUpdateModal || mockPendingUpdate !== null || skippedVersion !== null;
+    const tagUrl = `${baseUrl}/tag/v${MOCK_UPDATE_VERSION}`;
     return {
-      has_update: false,
+      has_update: simulate,
       current_version: mockRuntime.app_version,
-      latest_version: mockRuntime.app_version,
-      release_url: `https://github.com/${mockConfig.update.repo}/releases`,
-      notes: "",
+      latest_version: simulate ? MOCK_UPDATE_VERSION : mockRuntime.app_version,
+      release_url: simulate ? tagUrl : baseUrl,
+      notes: simulate ? MOCK_UPDATE_NOTES : "",
       checked_at: new Date().toISOString(),
-      staged_version: null,
-      platform_key: platformKey,
-      can_auto_stage: canAutoStage,
-      download_url: null,
+      staged_version: simulate ? (mockPendingUpdate?.target_version ?? null) : null,
+      platform_key: mockPendingUpdate?.platform_key ?? platformKey,
+      can_auto_stage: true,
+      download_url: simulate ? tagUrl : null,
+      skipped: simulate && skippedVersion === MOCK_UPDATE_VERSION,
+      skipped_version: skippedVersion,
     };
   },
 
@@ -4842,30 +4889,92 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<DownloadAndStageUpdateResult>("download_and_stage_update");
     }
-    const os = detectNavigatorOs();
-    const canAutoStage = os === "windows" && mockRuntime.portable_mode;
-    const releaseUrl = `https://github.com/${mockConfig.update.repo}/releases`;
-    if (!canAutoStage) {
-      return {
-        staged: false,
-        already_latest: false,
-        can_auto_stage: false,
-        target_version: mockRuntime.app_version,
-        archive_sha256: null,
-        release_url: releaseUrl,
-        download_url: releaseUrl,
-        message: "浏览器预览模式：当前平台为安装包形态，请前往官方下载页获取对应系统安装包",
-      };
+    const nextPending = buildMockPendingUpdateDto(mockRuntime.app_version, mockConfig.update.repo);
+    mockPendingUpdate = nextPending;
+    setMockSkippedVersion(null);
+    for (const cb of mockUpdateReadyListeners) {
+      try {
+        cb(structuredClone(nextPending));
+      } catch {
+        /* ignore */
+      }
     }
+    const releaseUrl =
+      nextPending.release_url ?? `https://github.com/${mockConfig.update.repo}/releases`;
     return {
       staged: true,
       already_latest: false,
       can_auto_stage: true,
-      target_version: mockRuntime.app_version,
-      archive_sha256: "preview-sha256-verified",
+      target_version: nextPending.target_version,
+      archive_sha256: nextPending.archive_sha256,
       release_url: releaseUrl,
-      download_url: `${releaseUrl}/latest`,
-      message: `浏览器预览模式：已模拟下载并校验 v${mockRuntime.app_version}（下次重启自动应用）`,
+      download_url: releaseUrl,
+      message: `预览：已校验 v${nextPending.target_version}，可确认更新`,
+    };
+  },
+
+  async getPendingStagedUpdate(): Promise<PendingUpdatePromptDto | null> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<PendingUpdatePromptDto | null>("get_pending_staged_update");
+    }
+    return mockPendingUpdate ? structuredClone(mockPendingUpdate) : null;
+  },
+
+  async dismissUpdatePromptForSession(version: string): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("dismiss_update_prompt_for_session", { version });
+    }
+    const v = version.trim().replace(/^[vV]/, "");
+    if (mockPendingUpdate && (!v || mockPendingUpdate.target_version === v)) {
+      mockPendingUpdate = { ...mockPendingUpdate, dismissed_in_session: true };
+    }
+    return true;
+  },
+
+  async skipUpdateVersion(version: string): Promise<SkipUpdateResultDto> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<SkipUpdateResultDto>("skip_update_version", { version });
+    }
+    const v = version.trim().replace(/^[vV]/, "") || MOCK_UPDATE_VERSION;
+    const purged = mockPendingUpdate !== null;
+    const freed_bytes = mockPendingUpdate?.package_size_bytes ?? 0;
+    mockPendingUpdate = null;
+    setMockSkippedVersion(v);
+    return {
+      skipped_version: v,
+      purged_staged: purged,
+      freed_bytes,
+      message: purged ? `已跳过 v${v} 并删除预下载包` : `已跳过 v${v}`,
+    };
+  },
+
+  async clearSkippedUpdateVersion(): Promise<boolean> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<boolean>("clear_skipped_update_version");
+    }
+    setMockSkippedVersion(null);
+    return true;
+  },
+
+  async applyStagedUpdateAndRestart(): Promise<ApplyUpdateRestartResultDto> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<ApplyUpdateRestartResultDto>("apply_staged_update_and_restart");
+    }
+    if (!mockPendingUpdate) throw new Error("当前没有已校验的预下载更新包");
+    if (getPreviewQueryParam("update_modal_error") === "1") {
+      throw new Error("预览模拟：安装包被占用");
+    }
+    const cancelled = getPreviewQueryParam("update_modal_cancel") === "1";
+    return {
+      started: !cancelled,
+      exiting: false,
+      cancelled,
+      kind: mockPendingUpdate.kind,
+      apply_action: mockPendingUpdate.apply_action,
+      target_version: mockPendingUpdate.target_version,
+      message: cancelled
+        ? "已取消安装，当前代理未受影响"
+        : `预览：已模拟启动 v${mockPendingUpdate.target_version} 更新流程`,
     };
   },
 
@@ -5074,5 +5183,15 @@ export const catcloudApi = {
 
   subscribeSyncSessionUpdated(onUpdate: (ev: SyncSessionUpdatedEvent) => void): () => void {
     return subscribeTauriEvent("catcloud://sync-session-updated", onUpdate);
+  },
+
+  subscribeUpdateReady(cb: (payload: PendingUpdatePromptDto) => void): () => void {
+    if (isTauriEnv()) {
+      return subscribeTauriEvent<PendingUpdatePromptDto>("catcloud://update-ready", cb);
+    }
+    mockUpdateReadyListeners.add(cb);
+    return () => {
+      mockUpdateReadyListeners.delete(cb);
+    };
   },
 };

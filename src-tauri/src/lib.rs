@@ -57,6 +57,89 @@ fn has_cli_flag(flag: &str) -> bool {
     std::env::args().skip(1).any(|a| a == flag)
 }
 
+fn is_one_shot_launch_flag(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--apply-staged-update" | "--silent" | "--enable-tun" | "--enable-global-preaccel"
+    )
+}
+
+fn build_post_update_cleanup_relaunch_args(
+    outcome_args: &[String],
+    current_raw_args: &[std::ffi::OsString],
+) -> Vec<String> {
+    let mut relaunch_args: Vec<String> = Vec::new();
+    let mut has_data_dir = false;
+
+    let mut i = 0usize;
+    while i < outcome_args.len() {
+        let arg = outcome_args[i].as_str();
+        if is_one_shot_launch_flag(arg) {
+            i += 1;
+            continue;
+        }
+        if arg == "--data-dir" {
+            if let Some(val) = outcome_args.get(i + 1) {
+                if !val.trim().is_empty() {
+                    relaunch_args.push("--data-dir".to_string());
+                    relaunch_args.push(val.clone());
+                    has_data_dir = true;
+                }
+                i += 2;
+            } else {
+                // Drop a dangling trailing `--data-dir` without a value argument.
+                i += 1;
+            }
+            continue;
+        } else if let Some(rest) = arg.strip_prefix("--data-dir=") {
+            if !rest.trim().is_empty() {
+                relaunch_args.push(arg.to_string());
+                has_data_dir = true;
+            }
+            i += 1;
+            continue;
+        }
+        if !relaunch_args.iter().any(|existing| existing == arg) {
+            relaunch_args.push(arg.to_string());
+        }
+        i += 1;
+    }
+
+    if !has_data_dir {
+        let mut j = 0usize;
+        while j < current_raw_args.len() {
+            let arg = current_raw_args[j].to_string_lossy();
+            if arg == "--data-dir" {
+                if let Some(val) = current_raw_args.get(j + 1) {
+                    let val_str = val.to_string_lossy().into_owned();
+                    if !val_str.trim().is_empty() {
+                        relaunch_args.push("--data-dir".to_string());
+                        relaunch_args.push(val_str);
+                        break;
+                    }
+                }
+                j += 2;
+                continue;
+            } else if let Some(rest) = arg.strip_prefix("--data-dir=") {
+                if !rest.trim().is_empty() {
+                    relaunch_args.push(arg.into_owned());
+                    break;
+                }
+            }
+            j += 1;
+        }
+    }
+
+    if !relaunch_args.iter().any(|a| a == "--post-update-cleanup") {
+        relaunch_args.push("--post-update-cleanup".to_string());
+    }
+    if !relaunch_args.iter().any(|a| a == "--restarting") {
+        relaunch_args.push("--restarting".to_string());
+    }
+
+    relaunch_args
+}
+
 fn try_apply_staged_portable_update(paths: &AppPaths) -> bool {
     if !paths.is_self_updatable_portable() {
         return false;
@@ -74,13 +157,11 @@ fn try_apply_staged_portable_update(paths: &AppPaths) -> bool {
         &paths.backup_dir,
     ) {
         Ok(outcome) if outcome.applied && outcome.needs_post_update_cleanup_relaunch => {
-            let mut relaunch_args = outcome.relaunch_args;
-            if !relaunch_args.iter().any(|a| a == "--post-update-cleanup") {
-                relaunch_args.push("--post-update-cleanup".to_string());
-            }
-            if !relaunch_args.iter().any(|a| a == "--restarting") {
-                relaunch_args.push("--restarting".to_string());
-            }
+            let current_raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+            let relaunch_args = build_post_update_cleanup_relaunch_args(
+                &outcome.relaunch_args,
+                &current_raw_args,
+            );
             if let Err(err) = spawn_detached_self(&current_exe, &relaunch_args, app_root) {
                 tracing::error!("portable update applied but relaunch failed: {err}");
                 return false;
@@ -107,6 +188,7 @@ pub fn run_with_paths(paths: AppPaths) {
     let restarting = has_cli_flag("--restarting");
     let silent_flag = has_cli_flag("--silent");
     let post_update_cleanup = has_cli_flag("--post-update-cleanup");
+    let apply_staged_update_flag = has_cli_flag("--apply-staged-update");
     let enable_tun_flag = has_cli_flag("--enable-tun");
     let enable_global_preaccel_flag = has_cli_flag("--enable-global-preaccel");
 
@@ -129,8 +211,10 @@ pub fn run_with_paths(paths: AppPaths) {
             }
         };
 
-    // Apply any verified staged portable update before starting core or opening SQLite.
-    if !post_update_cleanup
+    // Apply any verified staged portable update ONLY when explicitly invoked via
+    // `--apply-staged-update` (after user confirmation in the update prompt or settings).
+    if apply_staged_update_flag
+        && !post_update_cleanup
         && paths.is_self_updatable_portable()
         && try_apply_staged_portable_update(&paths)
     {
@@ -321,6 +405,11 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::refresh_geo_db,
             commands::check_app_update,
             commands::download_and_stage_update,
+            commands::get_pending_staged_update,
+            commands::dismiss_update_prompt_for_session,
+            commands::skip_update_version,
+            commands::clear_skipped_update_version,
+            commands::apply_staged_update_and_restart,
             commands::export_backup_bundle,
             commands::import_backup_bundle,
             commands::launch_uwp_loopback,
@@ -2755,12 +2844,19 @@ fn spawn_auto_update_loop(app: &tauri::AppHandle) {
                     &app_h,
                     &st,
                     allow_auto_stage,
+                    true,
                 )
                 .await
                 {
                     Ok(res) => {
+                        let is_skipped = res
+                            .get("skipped")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
                         if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
                             tracing::debug!("background auto-update check skipped/failed: {err}");
+                        } else if is_skipped {
+                            tracing::debug!("background auto-update check matched skipped version");
                         } else if res
                             .get("has_update")
                             .and_then(|v| v.as_bool())
@@ -2774,8 +2870,23 @@ fn spawn_auto_update_loop(app: &tauri::AppHandle) {
                                 .get("auto_staged")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false);
+                            let auto_stage_reused = res
+                                .get("auto_stage_reused")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
                             let staged_ver = res.get("staged_version").and_then(|v| v.as_str());
-                            if !auto_staged && staged_ver.is_none() && !latest.is_empty() {
+                            if auto_staged && !auto_stage_reused {
+                                if !st.shutting_down.load(Ordering::SeqCst) {
+                                    if let Ok(Some(prompt_dto)) =
+                                        commands::get_pending_staged_update_internal(&st).await
+                                    {
+                                        let _ = app_h.emit(
+                                            commands::EVENT_UPDATE_READY,
+                                            &prompt_dto,
+                                        );
+                                    }
+                                }
+                            } else if !auto_staged && staged_ver.is_none() && !latest.is_empty() {
                                 st.log_app_event(
                                     "info",
                                     "软件更新",
@@ -3307,5 +3418,89 @@ mod tests {
         assert!(sanitized.payload.contains("198.18.0.*"));
         assert!(sanitized.payload.contains("223.5.5.*"));
         assert!(sanitized.payload.contains("token=<REDACTED>"));
+    }
+
+    #[test]
+    fn post_update_cleanup_relaunch_args_preserves_data_dir_and_strips_one_shot_flags() {
+        use std::ffi::OsString;
+
+        let current_args = vec![
+            OsString::from("--data-dir"),
+            OsString::from(r"D:\CustomData\CatCloud"),
+            OsString::from("--apply-staged-update"),
+            OsString::from("--silent"),
+            OsString::from("--enable-tun"),
+            OsString::from("--enable-global-preaccel"),
+            OsString::from("--restarting"),
+        ];
+        let outcome_args = vec![
+            "--apply-staged-update".to_string(),
+            "--silent".to_string(),
+            "--enable-tun".to_string(),
+            "--enable-global-preaccel".to_string(),
+            "--post-update-cleanup".to_string(),
+        ];
+
+        let built = build_post_update_cleanup_relaunch_args(&outcome_args, &current_args);
+        assert_eq!(
+            built,
+            vec![
+                "--post-update-cleanup".to_string(),
+                "--data-dir".to_string(),
+                r"D:\CustomData\CatCloud".to_string(),
+                "--restarting".to_string(),
+            ]
+        );
+
+        // Supports `--data-dir=<path>` form as well and never duplicates `--data-dir`.
+        let eq_current_args = vec![OsString::from("--data-dir=/tmp/catcloud-portable")];
+        let built_eq = build_post_update_cleanup_relaunch_args(&[], &eq_current_args);
+        assert_eq!(
+            built_eq,
+            vec![
+                "--data-dir=/tmp/catcloud-portable".to_string(),
+                "--post-update-cleanup".to_string(),
+                "--restarting".to_string(),
+            ]
+        );
+
+        // When outcome_args already carries `--data-dir`, current_args must not append a duplicate.
+        let outcome_with_dir = vec![
+            "--data-dir".to_string(),
+            "/var/lib/catcloud".to_string(),
+        ];
+        let built_dedup =
+            build_post_update_cleanup_relaunch_args(&outcome_with_dir, &eq_current_args);
+        assert_eq!(
+            built_dedup,
+            vec![
+                "--data-dir".to_string(),
+                "/var/lib/catcloud".to_string(),
+                "--post-update-cleanup".to_string(),
+                "--restarting".to_string(),
+            ]
+        );
+
+        // A dangling trailing `--data-dir` without a following value must be dropped rather than
+        // forwarded verbatim (and still allows fallback to `current_raw_args` when available).
+        let dangling_outcome = vec!["--post-update-cleanup".to_string(), "--data-dir".to_string()];
+        let built_dangling_empty = build_post_update_cleanup_relaunch_args(&dangling_outcome, &[]);
+        assert_eq!(
+            built_dangling_empty,
+            vec![
+                "--post-update-cleanup".to_string(),
+                "--restarting".to_string(),
+            ]
+        );
+        let built_dangling_fallback =
+            build_post_update_cleanup_relaunch_args(&dangling_outcome, &eq_current_args);
+        assert_eq!(
+            built_dangling_fallback,
+            vec![
+                "--post-update-cleanup".to_string(),
+                "--data-dir=/tmp/catcloud-portable".to_string(),
+                "--restarting".to_string(),
+            ]
+        );
     }
 }

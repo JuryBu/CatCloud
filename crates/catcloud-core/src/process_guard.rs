@@ -1025,6 +1025,160 @@ pub fn relaunch_self_as_admin(exe: &Path, args: &[String], workdir: &Path) -> Ca
     }
 }
 
+/// Launch a verified Windows `.exe` or `.msi` installer via `ShellExecuteW`.
+///
+/// - Returns `Ok(true)` when Windows accepted the launch (`rc > 32`).
+/// - Returns `Ok(false)` when the user cancelled elevation (`ERROR_CANCELLED = 1223`,
+///   `ERROR_ACCESS_DENIED = 5`, or `SE_ERR_ACCESSDENIED = 5`).
+/// - Returns `Err(_)` on non-Windows platforms, missing/non-regular/symlink files,
+///   unsupported extensions (anything other than `.exe` / `.msi`), or unexpected launch errors.
+pub fn launch_windows_installer(installer_path: &Path) -> CatResult<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+
+        const SW_SHOWNORMAL: i32 = 1;
+        const SE_ERR_ACCESSDENIED: isize = 5;
+        const ERROR_ACCESS_DENIED_CODE: u32 = 5;
+        const ERROR_CANCELLED_CODE: u32 = 1223;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+        let meta = std::fs::symlink_metadata(installer_path).map_err(|_| {
+            CatError::Validation(format!(
+                "Windows installer does not exist: {}",
+                installer_path.display()
+            ))
+        })?;
+        if meta.file_type().is_symlink()
+            || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+            || !meta.is_file()
+        {
+            return Err(CatError::Validation(format!(
+                "Windows installer path must be an existing regular file: {}",
+                installer_path.display()
+            )));
+        }
+
+        let ext = installer_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase());
+        let is_msi = match ext.as_deref() {
+            Some("exe") => false,
+            Some("msi") => true,
+            _ => {
+                return Err(CatError::Validation(format!(
+                    "unsupported Windows installer extension (expected .exe or .msi): {}",
+                    installer_path.display()
+                )));
+            }
+        };
+
+        let clean_path = strip_verbatim_prefix(installer_path);
+        let path_str = clean_path.to_string_lossy();
+        if path_str.is_empty() || path_str.contains('\0') {
+            return Err(CatError::Validation(
+                "Windows installer path is empty or contains NUL characters".into(),
+            ));
+        }
+
+        let wide_verb = to_wide_null("open");
+        let (wide_file, wide_params) = if is_msi {
+            let msiexec = windows_msiexec_exe();
+            let params = format_msiexec_install_params(&path_str)?;
+            (
+                to_wide_null(&msiexec.to_string_lossy()),
+                Some(to_wide_null(&params)),
+            )
+        } else {
+            (to_wide_null(&path_str), None)
+        };
+
+        let parent_dir = clean_path.parent().map(strip_verbatim_prefix);
+        let wide_dir = parent_dir
+            .as_ref()
+            .map(|d| d.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .map(|s| to_wide_null(&s));
+
+        let params_ptr = wide_params.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+        let dir_ptr = wide_dir.as_ref().map_or(std::ptr::null(), |v| v.as_ptr());
+
+        let _com_guard = ComApartmentGuard::init_sta();
+
+        // SAFETY: Clear any stale Win32 thread error code before ShellExecuteW so a subsequent
+        // GetLastError() check cannot misattribute a prior ERROR_CANCELLED. All non-null pointers
+        // reference NUL-terminated UTF-16 buffers that outlive this call.
+        let rc = unsafe {
+            SetLastError(0);
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                wide_verb.as_ptr(),
+                wide_file.as_ptr(),
+                params_ptr,
+                dir_ptr,
+                SW_SHOWNORMAL,
+            )
+        };
+
+        if rc > 32 {
+            return Ok(true);
+        }
+
+        let last_err = unsafe { GetLastError() };
+        if last_err == ERROR_CANCELLED_CODE
+            || last_err == ERROR_ACCESS_DENIED_CODE
+            || rc == SE_ERR_ACCESSDENIED
+        {
+            return Ok(false);
+        }
+
+        Err(CatError::Process(format!(
+            "ShellExecuteW(open, `{}`) failed with rc={rc}, win32_err={last_err}",
+            clean_path.display()
+        )))
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = installer_path;
+        Err(CatError::Validation(
+            "launch_windows_installer is only supported on Windows".into(),
+        ))
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn format_msiexec_install_params(path_str: &str) -> CatResult<String> {
+    if path_str.is_empty() || path_str.contains('\0') {
+        return Err(CatError::Validation(
+            "Windows MSI installer path is empty or contains NUL characters".into(),
+        ));
+    }
+    if path_str.contains('"') {
+        return Err(CatError::Validation(
+            "Windows MSI installer path must not contain double quotes".into(),
+        ));
+    }
+    Ok(format!("/i \"{path_str}\""))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_msiexec_exe() -> PathBuf {
+    if let Ok(root) = std::env::var("SystemRoot") {
+        let candidate = PathBuf::from(root).join("System32").join("msiexec.exe");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    let fallback = PathBuf::from(r"C:\Windows\System32\msiexec.exe");
+    if fallback.is_file() {
+        return fallback;
+    }
+    PathBuf::from("msiexec.exe")
+}
+
 #[cfg(target_os = "windows")]
 const MAX_WMI_OUTPUT_BYTES: usize = 32 * 1024;
 
@@ -2055,5 +2209,78 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&tmp_appimage);
+    }
+
+    #[test]
+    fn launch_windows_installer_rejects_missing_and_non_installer_paths() {
+        let dir = make_temp_dir("win-installer-guard");
+
+        // 1. Missing `.exe` / `.msi` paths must fail without invoking ShellExecuteW.
+        let missing_exe = dir.join("missing-setup.exe");
+        let err_missing = launch_windows_installer(&missing_exe).unwrap_err();
+        assert!(
+            matches!(err_missing, CatError::Validation(_)),
+            "expected Validation error for missing installer, got {err_missing:?}"
+        );
+
+        let missing_msi = dir.join("missing-setup.msi");
+        assert!(matches!(
+            launch_windows_installer(&missing_msi),
+            Err(CatError::Validation(_))
+        ));
+
+        // 2. Existing files with disallowed extensions (`.zip`, `.bat`, `.ps1`, `.dmg`, no ext)
+        //    must be rejected before any shell invocation.
+        for bad_name in [
+            "CatCloud-0.2.0-portable.zip",
+            "install.bat",
+            "install.ps1",
+            "CatCloud.dmg",
+            "installer_without_ext",
+        ] {
+            let file_path = dir.join(bad_name);
+            std::fs::write(&file_path, b"dummy-payload").unwrap();
+            let err = launch_windows_installer(&file_path).unwrap_err();
+            assert!(
+                matches!(err, CatError::Validation(_)),
+                "expected Validation error for '{bad_name}', got {err:?}"
+            );
+        }
+
+        // 3. A directory disguised with `.exe` suffix must also be rejected.
+        let fake_exe_dir = dir.join("disguised.exe");
+        std::fs::create_dir_all(&fake_exe_dir).unwrap();
+        assert!(matches!(
+            launch_windows_installer(&fake_exe_dir),
+            Err(CatError::Validation(_))
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn msiexec_install_params_always_quotes_and_rejects_embedded_quotes() {
+        // Paths without spaces containing `=` or `;` must still be wrapped in double quotes
+        // so msiexec cannot split them as MSI property assignments.
+        assert_eq!(
+            format_msiexec_install_params(r"C:\Temp\a=b;c\CatCloud-0.2.0.msi").unwrap(),
+            r#"/i "C:\Temp\a=b;c\CatCloud-0.2.0.msi""#
+        );
+        assert_eq!(
+            format_msiexec_install_params(r"C:\Program Files\CatCloud\setup.msi").unwrap(),
+            r#"/i "C:\Program Files\CatCloud\setup.msi""#
+        );
+        assert!(matches!(
+            format_msiexec_install_params(r#"C:\Temp\evil" /qn.msi"#),
+            Err(CatError::Validation(_))
+        ));
+        assert!(matches!(
+            format_msiexec_install_params(""),
+            Err(CatError::Validation(_))
+        ));
+        assert!(matches!(
+            format_msiexec_install_params("C:\\Temp\\bad\0.msi"),
+            Err(CatError::Validation(_))
+        ));
     }
 }

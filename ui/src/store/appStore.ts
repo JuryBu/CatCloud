@@ -3,6 +3,7 @@ import {
   type AgentPromptMode,
   type AppConfig,
   type AppUpdateCheckResult,
+  type ApplyUpdateRestartResultDto,
   type CampusPortalStatus,
   type CoreRuntimeInfo,
   DEFAULT_APP_CONFIG,
@@ -16,6 +17,7 @@ import {
   type LiveCaptureStartDto,
   type LiveCaptureStatusDto,
   type MultiGroup,
+  type PendingUpdatePromptDto,
   type PreAccelComparisonResult,
   type PreAccelRelay,
   type PreAccelSpeedTestResult,
@@ -25,6 +27,7 @@ import {
   type ProxyNode,
   type ResolvedTheme,
   type SiteCheckItem,
+  type SkipUpdateResultDto,
   type SubscriptionRecord,
   type ThemeMode,
   type ThemeSchedule,
@@ -33,11 +36,14 @@ import {
   formatErrorMessage,
   generateSeedTrafficSamples,
   hasPreviewTunNeedsAdminFlag,
+  hasPreviewUpdateModalFlag,
   isTauriEnv,
 } from "../api/tauri";
 import { detectNavigatorOs, resolvePlatformOs } from "../utils/platform";
 import {
   ensureUiLocaleLoaded,
+  formatI18nTemplate,
+  getUiDictSync,
   normalizeUiLanguage,
   type UiLanguage,
 } from "../i18n";
@@ -628,6 +634,8 @@ export interface AppState {
   tunAdminPromptOpen: boolean;
   tunAdminPromptBusy: boolean;
   tunAdminPromptReason: string | null;
+  pendingUpdate: PendingUpdatePromptDto | null;
+  updateModalVisible: boolean;
   bgTasks: BgTasksState;
   sessionDrafts: SessionDraftsState;
 }
@@ -1079,6 +1087,8 @@ let state: AppState = {
   tunAdminPromptOpen: false,
   tunAdminPromptBusy: false,
   tunAdminPromptReason: null,
+  pendingUpdate: null,
+  updateModalVisible: false,
   bgTasks: createInitialBgTasks(),
   sessionDrafts: createInitialSessionDrafts(),
 };
@@ -1427,6 +1437,95 @@ function buildReleasesFallbackUrl(repo: string): string {
   return `https://github.com/${cleanRepo || "JuryBu/CatCloud"}/releases`;
 }
 
+async function writeTextToClipboard(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    /* fallback to textarea execCommand */
+  }
+  if (typeof document === "undefined") return false;
+  try {
+    const el = document.createElement("textarea");
+    el.value = text;
+    el.style.position = "fixed";
+    el.style.left = "-9999px";
+    el.style.opacity = "0";
+    document.body.appendChild(el);
+    el.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(el);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
+function patchUpdateSlice(patch: {
+  pendingUpdate?: PendingUpdatePromptDto | null;
+  updateModalVisible?: boolean;
+  skippedVersion?: string | null;
+  settingsPatch?: Partial<BgTasksState["settings"]>;
+}): void {
+  setState((prev) => ({
+    ...prev,
+    ...(patch.pendingUpdate !== undefined ? { pendingUpdate: patch.pendingUpdate } : {}),
+    ...(patch.updateModalVisible !== undefined
+      ? { updateModalVisible: patch.updateModalVisible }
+      : {}),
+    ...(patch.skippedVersion !== undefined
+      ? {
+          config: {
+            ...prev.config,
+            update: { ...prev.config.update, skipped_version: patch.skippedVersion },
+          },
+        }
+      : {}),
+    ...(patch.settingsPatch
+      ? {
+          bgTasks: {
+            ...prev.bgTasks,
+            settings: { ...prev.bgTasks.settings, ...patch.settingsPatch },
+          },
+        }
+      : {}),
+  }));
+}
+
+let pendingUpdateRefreshSeq = 0;
+
+const patchSettingsBg = (settingsPatch: Partial<BgTasksState["settings"]>) =>
+  patchUpdateSlice({ settingsPatch });
+
+const IDLE_CAPTURE_BG: BgTasksState["capture"] = {
+  sessionId: null,
+  active: false,
+  timedOut: false,
+  finishing: false,
+  targetName: null,
+  status: null,
+  outcome: null,
+};
+
+const resetCaptureBg = (patch?: Partial<BgTasksState["capture"]>) =>
+  updateBgTasks((bg) => ({ ...bg, capture: { ...IDLE_CAPTURE_BG, ...patch } }));
+
+const stripVer = (v: string) => v.trim().replace(/^[vV]/, "");
+
+const pickUpdateMsg = (lang: UiLanguage, localized: string, raw?: string | null) =>
+  lang !== "zh-CN" ? localized : raw?.trim() || localized;
+
+const fmtUpdateErr = (tpl: string, err: unknown) =>
+  formatI18nTemplate(tpl, { error: formatErrorMessage(err) });
+
+async function loadUpdateI18n() {
+  const lang = normalizeUiLanguage(state.config.personalization.ui_language);
+  const d = await ensureUiLocaleLoaded(lang).catch(() => getUiDictSync(lang));
+  return [lang, d.updateModal] as const;
+}
+
 const PROBE_TIER_LABELS: Record<"latency" | "unlock" | "full", string> = {
   latency: "仅快测延迟",
   unlock: "测延迟 + 送中/AI",
@@ -1443,6 +1542,7 @@ let disposeProbeProgress: (() => void) | null = null;
 let disposeStrategySwitch: (() => void) | null = null;
 let disposeConfigUpdate: (() => void) | null = null;
 let disposeTunNeedsAdmin: (() => void) | null = null;
+let disposeUpdateReady: (() => void) | null = null;
 let themeClockTimer: number | null = null;
 let trafficBackfillInFlight = false;
 let globalPreAccelRefreshInFlight = false;
@@ -1594,12 +1694,17 @@ function mergeIncomingAppConfig(
       : typeof fallbackAutoDownload === "boolean"
         ? fallbackAutoDownload
         : (prev.update.auto_download ?? true);
+  const skippedVersion =
+    incoming.update?.skipped_version !== undefined
+      ? incoming.update.skipped_version
+      : (prev.update.skipped_version ?? null);
   return {
     ...incoming,
     behavior: incoming.behavior ?? prev.behavior,
     update: {
       ...incoming.update,
       auto_download: autoDownload,
+      skipped_version: skippedVersion,
     },
   };
 }
@@ -1616,6 +1721,7 @@ function alignConfigWithRuntimeTun(config: AppConfig, runtime: CoreRuntimeInfo):
 
 async function hydrateFromBackend(): Promise<void> {
   const inDesktop = isTauriEnv();
+  const isMainWindow = state.windowMode === "main";
   // Never fire outbound network requests (exit IP / site checks) on startup in desktop mode
   // so launching the app consumes 0 B of unexpected traffic until the user explicitly requests a check.
   const results = await Promise.allSettled([
@@ -1630,6 +1736,7 @@ async function hydrateFromBackend(): Promise<void> {
     catcloudApi.getGlobalPreAccelStatus(),
     inDesktop ? Promise.resolve(null) : catcloudApi.getExitIpInfo(),
     inDesktop ? Promise.resolve(null) : catcloudApi.checkQuickSites(),
+    isMainWindow ? catcloudApi.getPendingStagedUpdate() : Promise.resolve(null),
   ]);
 
   const [
@@ -1644,6 +1751,7 @@ async function hydrateFromBackend(): Promise<void> {
     globalPreAccelRes,
     exitIpRes,
     quickSitesRes,
+    pendingUpdateRes,
   ] = results;
 
   const cfg = cfgRes.status === "fulfilled" ? cfgRes.value : state.config;
@@ -1654,6 +1762,13 @@ async function hydrateFromBackend(): Promise<void> {
           typeof fullCfgRes.value?.update?.auto_download === "boolean"
         ? fullCfgRes.value.update.auto_download
         : (state.config.update.auto_download ?? true);
+  const hydratedSkippedVersion =
+    cfg.update?.skipped_version !== undefined
+      ? cfg.update.skipped_version
+      : fullCfgRes.status === "fulfilled" &&
+          fullCfgRes.value?.update?.skipped_version !== undefined
+        ? fullCfgRes.value.update.skipped_version
+        : (state.config.update.skipped_version ?? null);
   const hydratedMinimizeToTray =
     fullCfgRes.status === "fulfilled" &&
     fullCfgRes.value?.behavior?.minimize_to_tray_on_close !== undefined
@@ -1671,6 +1786,7 @@ async function hydrateFromBackend(): Promise<void> {
         update: {
           ...cfg.update,
           auto_download: hydratedAutoDownload,
+          skipped_version: hydratedSkippedVersion,
         },
       }
     : {
@@ -1682,6 +1798,7 @@ async function hydrateFromBackend(): Promise<void> {
         update: {
           ...cfg.update,
           auto_download: hydratedAutoDownload,
+          skipped_version: hydratedSkippedVersion,
         },
         personalization: {
           ...cfg.personalization,
@@ -1768,30 +1885,52 @@ async function hydrateFromBackend(): Promise<void> {
   const shouldAutoSkipOnboarding =
     !forcePreviewOnboarding && !alreadyCompletedOnboarding && hasExistingUserData;
 
-  setState((prev) => ({
-    ...prev,
-    initialized: true,
-    activeNav: startupNav ?? prev.activeNav,
-    config: alignConfigWithRuntimeTun(mergedConfig, resolvedRuntime),
-    resolvedTheme: resolved,
-    runtime: resolvedRuntime,
-    groups: resolvedGroups,
-    nodes: resolvedNodes,
-    probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
-    subscriptions: resolvedSubs,
-    preAccelRelays: resolvedRelays,
-    globalPreAccel:
-      globalPreAccelRes.status === "fulfilled"
-        ? globalPreAccelRes.value
-        : prev.globalPreAccel,
-    exitIp:
-      !inDesktop && exitIpRes.status === "fulfilled" && exitIpRes.value
-        ? exitIpRes.value
-        : prev.exitIp,
-    quickSites: hydratedSites,
-    onboardingAutoSkipped: prev.onboardingAutoSkipped || shouldAutoSkipOnboarding,
-    onboardingModalOpen: prev.onboardingModalOpen || forcePreviewOnboarding,
-  }));
+  const hasAuthoritativePendingUpdate =
+    isMainWindow && pendingUpdateRes.status === "fulfilled";
+  const authoritativePendingUpdate = hasAuthoritativePendingUpdate
+    ? pendingUpdateRes.value
+    : null;
+
+  setState((prev) => {
+    const resolvedPendingUpdate = hasAuthoritativePendingUpdate
+      ? authoritativePendingUpdate
+      : prev.pendingUpdate;
+    const shouldOpenUpdateModal =
+      isMainWindow &&
+      resolvedPendingUpdate !== null &&
+      (!resolvedPendingUpdate.dismissed_in_session ||
+        (!inDesktop && hasPreviewUpdateModalFlag()));
+    const resolvedUpdateModalVisible =
+      resolvedPendingUpdate === null
+        ? false
+        : prev.updateModalVisible || shouldOpenUpdateModal;
+    return {
+      ...prev,
+      initialized: true,
+      activeNav: startupNav ?? prev.activeNav,
+      config: alignConfigWithRuntimeTun(mergedConfig, resolvedRuntime),
+      resolvedTheme: resolved,
+      runtime: resolvedRuntime,
+      groups: resolvedGroups,
+      nodes: resolvedNodes,
+      probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
+      subscriptions: resolvedSubs,
+      preAccelRelays: resolvedRelays,
+      globalPreAccel:
+        globalPreAccelRes.status === "fulfilled"
+          ? globalPreAccelRes.value
+          : prev.globalPreAccel,
+      exitIp:
+        !inDesktop && exitIpRes.status === "fulfilled" && exitIpRes.value
+          ? exitIpRes.value
+          : prev.exitIp,
+      quickSites: hydratedSites,
+      onboardingAutoSkipped: prev.onboardingAutoSkipped || shouldAutoSkipOnboarding,
+      onboardingModalOpen: prev.onboardingModalOpen || forcePreviewOnboarding,
+      pendingUpdate: resolvedPendingUpdate,
+      updateModalVisible: resolvedUpdateModalVisible,
+    };
+  });
 }
 
 export const appStore = {
@@ -2125,10 +2264,13 @@ export const appStore = {
         );
       }
       const prevPreAccel = state.config.preaccel;
+      const prevIncludePrerelease = Boolean(state.config.update.include_prerelease);
       const preAccelChanged =
         mergedConfig.preaccel.enabled !== prevPreAccel.enabled ||
         mergedConfig.preaccel.global_bypass_enabled !== prevPreAccel.global_bypass_enabled ||
         mergedConfig.preaccel.global_scope !== prevPreAccel.global_scope;
+      const includePrereleaseChanged =
+        Boolean(mergedConfig.update.include_prerelease) !== prevIncludePrerelease;
       setState((prev) => ({
         ...prev,
         config: mergedConfig,
@@ -2137,7 +2279,21 @@ export const appStore = {
       if (preAccelChanged && isTauriEnv() && state.windowMode === "main") {
         void appActions.refreshGlobalPreAccelStatus();
       }
+      if (includePrereleaseChanged && isTauriEnv() && state.windowMode === "main") {
+        void appActions.refreshPendingUpdate();
+      }
     });
+
+    if (state.windowMode === "main") {
+      disposeUpdateReady = catcloudApi.subscribeUpdateReady((dto) => {
+        if (state.windowMode !== "main") return;
+        setState((prev) => ({
+          ...prev,
+          pendingUpdate: dto,
+          updateModalVisible: !dto.dismissed_in_session ? true : prev.updateModalVisible,
+        }));
+      });
+    }
 
     if (isTauriEnv()) {
       let tunAdminDisposed = false;
@@ -2215,6 +2371,8 @@ export const appStore = {
     disposeConfigUpdate = null;
     disposeTunNeedsAdmin?.();
     disposeTunNeedsAdmin = null;
+    disposeUpdateReady?.();
+    disposeUpdateReady = null;
     if (typeof window !== "undefined") {
       window.removeEventListener("hashchange", handleHashChange);
       window.removeEventListener("storage", handleStorageSync);
@@ -2333,32 +2491,6 @@ export const appActions = {
   },
 
   async copyAiOnboardingForUser(lang?: UiLanguage, moduleId?: string | null): Promise<boolean> {
-    const writeClipboard = async (text: string): Promise<boolean> => {
-      try {
-        if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-          await navigator.clipboard.writeText(text);
-          return true;
-        }
-      } catch {
-        /* fallback to textarea execCommand */
-      }
-      if (typeof document === "undefined") return false;
-      try {
-        const el = document.createElement("textarea");
-        el.value = text;
-        el.style.position = "fixed";
-        el.style.left = "-9999px";
-        el.style.opacity = "0";
-        document.body.appendChild(el);
-        el.select();
-        const ok = document.execCommand("copy");
-        document.body.removeChild(el);
-        return ok;
-      } catch {
-        return false;
-      }
-    };
-
     try {
       const targetLang = normalizeUiLanguage(lang ?? state.config.personalization.ui_language);
       const prompt = await catcloudApi.buildAiOnboardingPrompt(targetLang, moduleId ?? null);
@@ -2367,7 +2499,7 @@ export const appActions = {
         pushToast("新手上手指南生成为空，请稍后重试", "warn");
         return false;
       }
-      const copied = await writeClipboard(text);
+      const copied = await writeTextToClipboard(text);
       if (copied) {
         pushToast(
           "已复制网页 AI 指南与当前脱敏进度，直接粘贴给 DeepSeek / 豆包 / ChatGPT 就能一步步带你操作",
@@ -2388,6 +2520,18 @@ export const appActions = {
     setState((prev) => (prev.onboardingModalOpen ? prev : { ...prev, onboardingModalOpen: true }));
   },
 
+  async markOnboardingCompleted(): Promise<void> {
+    if (state.config.personalization.onboarding_completed === true) {
+      return;
+    }
+    setState((prev) => ({
+      ...prev,
+      onboardingModalOpen: true,
+      onboardingAutoSkipped: true,
+    }));
+    await appActions.updatePersonalization({ onboarding_completed: true });
+  },
+
   async closeOnboardingModal(markCompleted = true): Promise<void> {
     setState((prev) => ({
       ...prev,
@@ -2404,32 +2548,6 @@ export const appActions = {
     mode: AgentPromptMode = "autopilot",
     explicitLang?: UiLanguage
   ): Promise<boolean> {
-    const writeClipboard = async (text: string): Promise<boolean> => {
-      try {
-        if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-          await navigator.clipboard.writeText(text);
-          return true;
-        }
-      } catch {
-        /* fallback */
-      }
-      if (typeof document === "undefined") return false;
-      try {
-        const el = document.createElement("textarea");
-        el.value = text;
-        el.style.position = "fixed";
-        el.style.left = "-9999px";
-        el.style.opacity = "0";
-        document.body.appendChild(el);
-        el.select();
-        const ok = document.execCommand("copy");
-        document.body.removeChild(el);
-        return ok;
-      } catch {
-        return false;
-      }
-    };
-
     try {
       const knownLangs = new Set(["zh-CN", "en", "ja", "ru"]);
       const isLangArg = typeof langOrPage === "string" && knownLangs.has(langOrPage);
@@ -2448,7 +2566,7 @@ export const appActions = {
         pushToast("本机 Agent 引导语生成为空，请稍后重试", "warn");
         return false;
       }
-      const copied = await writeClipboard(text);
+      const copied = await writeTextToClipboard(text);
       if (copied) {
         pushToast(
           resolvedMode === "readonly"
@@ -2471,32 +2589,9 @@ export const appActions = {
     try {
       const targetLang = normalizeUiLanguage(state.config.personalization.ui_language);
       const draft = await catcloudApi.buildGithubIssueUrl(summary ?? null, targetLang);
-      let copied = false;
-      if (draft.clipboard_markdown.trim()) {
-        try {
-          if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-            await navigator.clipboard.writeText(draft.clipboard_markdown);
-            copied = true;
-          }
-        } catch {
-          copied = false;
-        }
-        if (!copied && typeof document !== "undefined") {
-          try {
-            const el = document.createElement("textarea");
-            el.value = draft.clipboard_markdown;
-            el.style.position = "fixed";
-            el.style.left = "-9999px";
-            el.style.opacity = "0";
-            document.body.appendChild(el);
-            el.select();
-            copied = document.execCommand("copy");
-            document.body.removeChild(el);
-          } catch {
-            copied = false;
-          }
-        }
-      }
+      const copied = draft.clipboard_markdown.trim()
+        ? await writeTextToClipboard(draft.clipboard_markdown)
+        : false;
       await catcloudApi.openExternalUrl(draft.issue_url);
       pushToast(
         copied
@@ -2513,31 +2608,7 @@ export const appActions = {
   },
 
   async copySanitizedDiagnosticsForAi(extraSanitizedLogs?: string): Promise<boolean> {
-    const writeClipboard = async (text: string): Promise<boolean> => {
-      try {
-        if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-          await navigator.clipboard.writeText(text);
-          return true;
-        }
-      } catch {
-        /* fallback to textarea execCommand */
-      }
-      if (typeof document === "undefined") return false;
-      try {
-        const el = document.createElement("textarea");
-        el.value = text;
-        el.style.position = "fixed";
-        el.style.left = "-9999px";
-        el.style.opacity = "0";
-        document.body.appendChild(el);
-        el.select();
-        const ok = document.execCommand("copy");
-        document.body.removeChild(el);
-        return ok;
-      } catch {
-        return false;
-      }
-    };
+    const writeClipboard = writeTextToClipboard;
 
     try {
       const diag = await catcloudApi.exportSanitizedDiagnostics();
@@ -4993,23 +5064,13 @@ export const appActions = {
       return;
     }
     return runInFlight("settings:geoStatus", async () => {
-      updateBgTasks((bg) => ({
-        ...bg,
-        settings: { ...bg.settings, geoLoading: true },
-      }));
+      patchSettingsBg({ geoLoading: true });
       try {
-        const status = await catcloudApi.getGeodataStatus();
-        updateBgTasks((bg) => ({
-          ...bg,
-          settings: { ...bg.settings, geoStatus: status },
-        }));
+        patchSettingsBg({ geoStatus: await catcloudApi.getGeodataStatus() });
       } catch {
         /* preserve previous geodata status on transient failure */
       } finally {
-        updateBgTasks((bg) => ({
-          ...bg,
-          settings: { ...bg.settings, geoLoading: false },
-        }));
+        patchSettingsBg({ geoLoading: false });
       }
     });
   },
@@ -5025,18 +5086,11 @@ export const appActions = {
     return runInFlight(
       "settings:geoRefresh",
       async () => {
-        updateBgTasks((bg) => ({
-          ...bg,
-          settings: { ...bg.settings, geoBusy: target },
-        }));
+        patchSettingsBg({ geoBusy: target });
         try {
           const res = await catcloudApi.refreshGeoDb(target === "all" ? null : [target]);
           try {
-            const latest = await catcloudApi.getGeodataStatus();
-            updateBgTasks((bg) => ({
-              ...bg,
-              settings: { ...bg.settings, geoStatus: latest },
-            }));
+            patchSettingsBg({ geoStatus: await catcloudApi.getGeodataStatus() });
           } catch {
             /* ignore secondary status refresh error */
           }
@@ -5044,72 +5098,169 @@ export const appActions = {
         } catch (err) {
           pushToast(`更新地理数据库失败：${formatErrorMessage(err)}`, "warn");
         } finally {
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: { ...bg.settings, geoBusy: null },
-          }));
+          patchSettingsBg({ geoBusy: null });
         }
       },
       { mascot: true }
     );
   },
 
+  openUpdateModal(): void {
+    if (state.pendingUpdate && !state.updateModalVisible) {
+      patchUpdateSlice({ updateModalVisible: true });
+    }
+  },
+
+  async refreshPendingUpdate(): Promise<PendingUpdatePromptDto | null> {
+    if (state.windowMode !== "main") return state.pendingUpdate;
+    const seq = ++pendingUpdateRefreshSeq;
+    try {
+      const pending = await catcloudApi.getPendingStagedUpdate();
+      if (seq !== pendingUpdateRefreshSeq) return state.pendingUpdate;
+      const prevInfo = state.bgTasks.settings.updateInfo;
+      patchUpdateSlice({
+        pendingUpdate: pending,
+        updateModalVisible: pending ? state.updateModalVisible : false,
+        settingsPatch:
+          !pending && prevInfo?.staged_version
+            ? { updateInfo: { ...prevInfo, staged_version: null } }
+            : undefined,
+      });
+      return pending;
+    } catch {
+      return state.pendingUpdate;
+    }
+  },
+
+  async dismissUpdatePrompt(): Promise<void> {
+    const version = state.pendingUpdate?.target_version ?? "";
+    patchUpdateSlice({
+      updateModalVisible: false,
+      pendingUpdate: state.pendingUpdate
+        ? { ...state.pendingUpdate, dismissed_in_session: true }
+        : null,
+    });
+    if (version) {
+      await catcloudApi.dismissUpdatePromptForSession(version).catch(() => false);
+    }
+  },
+
+  async skipPendingUpdateVersion(
+    version?: string,
+    opts?: { silentError?: boolean }
+  ): Promise<SkipUpdateResultDto | null> {
+    const targetVersion = (version ?? state.pendingUpdate?.target_version ?? "").trim();
+    if (!targetVersion) return null;
+    try {
+      const res = await catcloudApi.skipUpdateVersion(targetVersion);
+      const [, u] = await loadUpdateI18n();
+      const skippedVer = stripVer(res.skipped_version || targetVersion);
+      const toastText = formatI18nTemplate(
+        res.purged_staged ? u.skippedToast : u.skippedToastNoPurge,
+        { version: skippedVer }
+      );
+      const prevInfo = state.bgTasks.settings.updateInfo;
+      patchUpdateSlice({
+        pendingUpdate: null,
+        updateModalVisible: false,
+        skippedVersion: skippedVer,
+        settingsPatch: {
+          updateInfo: prevInfo
+            ? {
+                ...prevInfo,
+                staged_version: null,
+                skipped: prevInfo.latest_version === skippedVer || Boolean(prevInfo.skipped),
+                skipped_version: skippedVer,
+              }
+            : prevInfo,
+          updateMessage: toastText,
+        },
+      });
+      pushToast(toastText, "ok", 4500);
+      return res;
+    } catch (err) {
+      if (!opts?.silentError) {
+        const [, u] = await loadUpdateI18n();
+        pushToast(fmtUpdateErr(u.skipFailedToast, err), "warn");
+      }
+      throw err;
+    }
+  },
+
+  async clearSkippedUpdateVersion(): Promise<boolean> {
+    try {
+      const ok = await catcloudApi.clearSkippedUpdateVersion();
+      const [, u] = await loadUpdateI18n();
+      const prevInfo = state.bgTasks.settings.updateInfo;
+      patchUpdateSlice({
+        skippedVersion: null,
+        settingsPatch: {
+          updateInfo: prevInfo ? { ...prevInfo, skipped: false, skipped_version: null } : prevInfo,
+        },
+      });
+      pushToast(u.clearSkippedToast, "info", 3200);
+      await appActions.runCheckAppUpdate();
+      return ok;
+    } catch (err) {
+      const [, u] = await loadUpdateI18n();
+      pushToast(fmtUpdateErr(u.clearSkipFailedToast, err), "warn");
+      return false;
+    }
+  },
+
+  async applyPendingUpdateAndRestart(): Promise<ApplyUpdateRestartResultDto> {
+    return catcloudApi.applyStagedUpdateAndRestart();
+  },
+
   async runCheckAppUpdate(): Promise<void> {
     return runInFlight(
       "settings:checkUpdate",
       async () => {
-        updateBgTasks((bg) => ({
-          ...bg,
-          settings: { ...bg.settings, checkingUpdate: true },
-        }));
+        patchSettingsBg({ checkingUpdate: true });
         try {
           const res = await catcloudApi.checkAppUpdate();
-          const autoDownloadOn = state.config.update.auto_download ?? true;
+          const pending =
+            state.windowMode === "main"
+              ? await catcloudApi.getPendingStagedUpdate().catch(() => state.pendingUpdate)
+              : state.pendingUpdate;
+          const [, u] = await loadUpdateI18n();
           let message: string;
           if (res.error) {
-            message = `检查失败：${res.error}`;
-            pushToast(`检查更新失败：${res.error}`, "warn");
-          } else if (res.staged_version) {
-            message = `已下载并校验完成 v${res.staged_version}，下次重启自动生效`;
-            pushToast(
-              `v${res.staged_version} 已准备就绪，下次重启猫猫云梯时自动生效`,
-              "ok"
-            );
+            message = formatI18nTemplate(u.checkFailedMsg, { error: res.error });
+            pushToast(message, "warn");
+          } else if (pending || res.staged_version) {
+            message = formatI18nTemplate(u.checkReadyMsg, {
+              version: stripVer(pending?.target_version ?? res.staged_version ?? res.latest_version),
+            });
+            pushToast(message, "ok");
           } else if (res.has_update) {
-            if (res.can_auto_stage && autoDownloadOn && state.config.update.mode !== "manual") {
-              message = `发现新版本 v${res.latest_version}（当前 v${res.current_version}），点击下方即可一键下载预置`;
-              pushToast(
-                `发现新版本 v${res.latest_version}，可一键下载并在下次启动自动应用`,
-                "ok"
-              );
-            } else {
-              message = `发现新版本 v${res.latest_version}（当前 v${res.current_version}）`;
-              pushToast(`发现新版本 v${res.latest_version}`, "ok");
-            }
+            const latestVer = stripVer(res.latest_version);
+            message = res.skipped
+              ? formatI18nTemplate(u.checkFoundSkippedMsg, { version: latestVer })
+              : formatI18nTemplate(u.checkFoundMsg, {
+                  version: latestVer,
+                  current: stripVer(res.current_version),
+                });
+            pushToast(message, res.skipped ? "info" : "ok");
           } else {
-            message = `当前 v${res.current_version} 已是最新版本`;
-            pushToast("当前已是最新版本", "info");
+            message = formatI18nTemplate(u.alreadyLatestMsg, {
+              version: stripVer(res.current_version),
+            });
+            pushToast(u.alreadyLatestToast, "info");
           }
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: {
-              ...bg.settings,
-              updateInfo: res,
-              updateMessage: message,
-            },
-          }));
+          patchUpdateSlice({
+            pendingUpdate: pending,
+            updateModalVisible: pending ? state.updateModalVisible : false,
+            skippedVersion: res.skipped_version,
+            settingsPatch: { updateInfo: res, updateMessage: message },
+          });
         } catch (err) {
-          const msg = formatErrorMessage(err);
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: { ...bg.settings, updateMessage: `检查更新异常：${msg}` },
-          }));
-          pushToast(`检查更新失败：${msg}`, "warn");
+          const [, u] = await loadUpdateI18n();
+          const msg = fmtUpdateErr(u.checkFailedMsg, err);
+          patchSettingsBg({ updateMessage: msg });
+          pushToast(msg, "warn");
         } finally {
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: { ...bg.settings, checkingUpdate: false },
-          }));
+          patchSettingsBg({ checkingUpdate: false });
         }
       },
       { mascot: true }
@@ -5120,95 +5271,85 @@ export const appActions = {
     return runInFlight(
       "settings:downloadUpdate",
       async () => {
-        updateBgTasks((bg) => ({
-          ...bg,
-          settings: { ...bg.settings, downloadingUpdate: true },
-        }));
+        patchSettingsBg({ downloadingUpdate: true });
         try {
           const res = await catcloudApi.downloadAndStageUpdate();
+          const prevInfo = state.bgTasks.settings.updateInfo;
+          const [uiLang, u] = await loadUpdateI18n();
           if (res.staged) {
-            const prevInfo = state.bgTasks.settings.updateInfo;
-            const targetVersion =
-              res.target_version || prevInfo?.latest_version || state.runtime.app_version;
+            const pendingDto =
+              state.windowMode === "main"
+                ? await catcloudApi.getPendingStagedUpdate().catch(() => null)
+                : null;
+            const targetVersion = stripVer(
+              pendingDto?.target_version ||
+                res.target_version ||
+                prevInfo?.latest_version ||
+                state.runtime.app_version
+            );
+            const readyMsg = formatI18nTemplate(u.downloadReadyMsg, { version: targetVersion });
             const nextInfo: AppUpdateCheckResult = {
               has_update: true,
               current_version: prevInfo?.current_version ?? state.runtime.app_version,
               latest_version: targetVersion,
               release_url:
+                pendingDto?.release_url ||
                 res.release_url ||
                 prevInfo?.release_url ||
                 buildReleasesFallbackUrl(state.config.update.repo),
               download_url: res.download_url ?? prevInfo?.download_url ?? null,
-              notes: prevInfo?.notes ?? "",
+              notes: pendingDto?.release_notes || prevInfo?.notes || "",
               checked_at: prevInfo?.checked_at ?? new Date().toISOString(),
-              platform_key: prevInfo?.platform_key,
+              platform_key: pendingDto?.platform_key ?? prevInfo?.platform_key,
               can_auto_stage: true,
               staged_version: targetVersion,
+              skipped: false,
+              skipped_version: null,
               error: null,
             };
-            updateBgTasks((bg) => ({
-              ...bg,
-              settings: {
-                ...bg.settings,
-                updateInfo: nextInfo,
-                updateMessage: `已下载并校验完成 v${targetVersion}，下次重启时自动生效`,
-              },
-            }));
-            pushToast(
-              res.message ||
-                `已下载并校验完成 v${targetVersion}，下次重启猫猫云梯时自动生效`,
-              "ok",
-              4200
-            );
+            patchUpdateSlice({
+              pendingUpdate: pendingDto ?? state.pendingUpdate,
+              skippedVersion: null,
+              settingsPatch: { updateInfo: nextInfo, updateMessage: readyMsg },
+            });
+            pushToast(pickUpdateMsg(uiLang, readyMsg, res.message), "ok", 4500);
           } else if (res.already_latest) {
-            updateBgTasks((bg) => ({
-              ...bg,
-              settings: {
-                ...bg.settings,
-                updateInfo: bg.settings.updateInfo
-                  ? { ...bg.settings.updateInfo, has_update: false }
-                  : bg.settings.updateInfo,
-                updateMessage: res.message || `当前 v${state.runtime.app_version} 已是最新版本`,
-              },
-            }));
-            pushToast(res.message || "当前已是最新版本", "info");
+            const msg = pickUpdateMsg(
+              uiLang,
+              formatI18nTemplate(u.alreadyLatestMsg, { version: stripVer(state.runtime.app_version) }),
+              res.message
+            );
+            patchSettingsBg({
+              updateInfo: prevInfo ? { ...prevInfo, has_update: false } : prevInfo,
+              updateMessage: msg,
+            });
+            pushToast(msg, "info");
           } else {
-            const prevInfo = state.bgTasks.settings.updateInfo;
             const releaseUrl =
               res.release_url ||
               prevInfo?.release_url ||
               buildReleasesFallbackUrl(state.config.update.repo);
-            const hint = res.message || "当前版本形态需通过官方下载页获取对应系统安装包";
-            updateBgTasks((bg) => ({
-              ...bg,
-              settings: {
-                ...bg.settings,
-                updateInfo: bg.settings.updateInfo
-                  ? {
-                      ...bg.settings.updateInfo,
-                      can_auto_stage:
-                        res.can_auto_stage ?? bg.settings.updateInfo.can_auto_stage,
-                      release_url: releaseUrl,
-                      download_url: res.download_url ?? bg.settings.updateInfo.download_url,
-                    }
-                  : bg.settings.updateInfo,
-                updateMessage: hint,
-              },
-            }));
+            const hint = pickUpdateMsg(uiLang, u.downloadManualHint, res.message);
+            patchSettingsBg({
+              updateInfo: prevInfo
+                ? {
+                    ...prevInfo,
+                    can_auto_stage: res.can_auto_stage ?? prevInfo.can_auto_stage,
+                    release_url: releaseUrl,
+                    download_url: res.download_url ?? prevInfo.download_url,
+                  }
+                : prevInfo,
+              updateMessage: hint,
+            });
             pushToast(hint, "info");
           }
         } catch (err) {
-          const msg = formatErrorMessage(err);
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: { ...bg.settings, updateMessage: `下载更新失败：${msg}` },
-          }));
-          pushToast(`下载更新失败：${msg}`, "warn");
+          const [, u] = await loadUpdateI18n();
+          const msg = fmtUpdateErr(u.downloadFailedMsg, err);
+          patchSettingsBg({ updateMessage: msg });
+          pushToast(msg, "warn");
         } finally {
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: { ...bg.settings, downloadingUpdate: false },
-          }));
+          patchSettingsBg({ downloadingUpdate: false });
         }
       },
       { mascot: true }
@@ -5233,10 +5374,7 @@ export const appActions = {
     return runInFlight(
       "settings:coreOp",
       async () => {
-        updateBgTasks((bg) => ({
-          ...bg,
-          settings: { ...bg.settings, coreOpBusy: op },
-        }));
+        patchSettingsBg({ coreOpBusy: op });
         try {
           if (op === "reload") {
             const outcome = await catcloudApi.reloadCoreConfig(false);
@@ -5287,10 +5425,7 @@ export const appActions = {
           );
           return false;
         } finally {
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: { ...bg.settings, coreOpBusy: null },
-          }));
+          patchSettingsBg({ coreOpBusy: null });
         }
       },
       { mascot: "thinking", celebrate: true }
@@ -5309,17 +5444,11 @@ export const appActions = {
     return runInFlight(
       "settings:backupOp",
       async () => {
-        updateBgTasks((bg) => ({
-          ...bg,
-          settings: { ...bg.settings, backupBusy: op },
-        }));
+        patchSettingsBg({ backupBusy: op });
         try {
           await fn();
         } finally {
-          updateBgTasks((bg) => ({
-            ...bg,
-            settings: { ...bg.settings, backupBusy: null },
-          }));
+          patchSettingsBg({ backupBusy: null });
         }
       },
       { mascot: "typing", celebrate: true }
@@ -5331,18 +5460,7 @@ export const appActions = {
     const myGen = captureGen;
     const prevSid = state.bgTasks.capture.sessionId;
     stopLiveCapturePolling();
-    updateBgTasks((bg) => ({
-      ...bg,
-      capture: {
-        sessionId: null,
-        active: false,
-        timedOut: false,
-        finishing: false,
-        targetName: null,
-        status: null,
-        outcome: null,
-      },
-    }));
+    resetCaptureBg();
     if (prevSid) {
       void catcloudApi.cancelLiveCaptureSession(prevSid).catch(() => {
         /* ignore cleanup error of superseded capture session */
@@ -5379,36 +5497,19 @@ export const appActions = {
         preview_nodes: [],
         unsupported_reason: null,
       };
-      updateBgTasks((bg) => ({
-        ...bg,
-        capture: {
-          sessionId: started.session_id,
-          active: true,
-          timedOut: false,
-          finishing: false,
-          targetName,
-          status: initialStatus,
-          outcome: null,
-        },
-      }));
+      resetCaptureBg({
+        sessionId: started.session_id,
+        active: true,
+        targetName,
+        status: initialStatus,
+      });
       startLiveCapturePolling(started.session_id, myGen);
       return started;
     } catch (err) {
       if (myGen !== captureGen) {
         return null;
       }
-      updateBgTasks((bg) => ({
-        ...bg,
-        capture: {
-          sessionId: null,
-          active: false,
-          timedOut: false,
-          finishing: false,
-          targetName: null,
-          status: null,
-          outcome: null,
-        },
-      }));
+      resetCaptureBg();
       pushToast(`启动实时捕捉失败：${formatErrorMessage(err)}`, "warn");
       return null;
     }
@@ -5425,12 +5526,8 @@ export const appActions = {
         updateBgTasks((bg) => ({
           ...bg,
           capture: {
-            sessionId: null,
-            active: false,
-            timedOut: false,
-            finishing: false,
+            ...IDLE_CAPTURE_BG,
             targetName: bg.capture.outcome ? bg.capture.targetName : null,
-            status: null,
             outcome: bg.capture.outcome,
           },
         }));
@@ -5452,12 +5549,8 @@ export const appActions = {
         updateBgTasks((bg) => ({
           ...bg,
           capture: {
-            sessionId: null,
-            active: false,
-            timedOut: false,
-            finishing: false,
+            ...IDLE_CAPTURE_BG,
             targetName: outcome.target_name || bg.capture.targetName,
-            status: null,
             outcome,
           },
         }));
@@ -5466,18 +5559,7 @@ export const appActions = {
         if (myGen !== captureGen) {
           return null;
         }
-        updateBgTasks((bg) => ({
-          ...bg,
-          capture: {
-            sessionId: null,
-            active: false,
-            timedOut: false,
-            finishing: false,
-            targetName: null,
-            status: null,
-            outcome: null,
-          },
-        }));
+        resetCaptureBg();
         pushToast(`结束捕捉并整理失败：${formatErrorMessage(err)}`, "warn");
         return null;
       }
@@ -5491,18 +5573,7 @@ export const appActions = {
       state.bgTasks.capture.status?.session_id ??
       null;
     stopLiveCapturePolling();
-    updateBgTasks((bg) => ({
-      ...bg,
-      capture: {
-        sessionId: null,
-        active: false,
-        timedOut: false,
-        finishing: false,
-        targetName: null,
-        status: null,
-        outcome: null,
-      },
-    }));
+    resetCaptureBg();
     if (sid) {
       try {
         await catcloudApi.cancelLiveCaptureSession(sid);

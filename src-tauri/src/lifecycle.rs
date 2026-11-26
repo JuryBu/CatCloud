@@ -181,6 +181,103 @@ pub fn resolve_webview2_browser_args(existing: Option<&str>) -> Option<&'static 
     }
 }
 
+fn normalize_dir_components(path: &Path) -> Vec<String> {
+    let normalized = catcloud_core::paths::normalize_os_path(path);
+    let mut parts = Vec::new();
+    for comp in normalized.components() {
+        match comp {
+            Component::Prefix(prefix) => {
+                let s = prefix.as_os_str().to_string_lossy();
+                parts.push(if cfg!(target_os = "windows") {
+                    s.to_ascii_lowercase()
+                } else {
+                    s.into_owned()
+                });
+            }
+            Component::RootDir => parts.push("/".to_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let poppable = parts.len() > 1
+                    && parts
+                        .last()
+                        .is_some_and(|last| last != "/" && !last.ends_with(':'));
+                if poppable {
+                    parts.pop();
+                } else {
+                    parts.push("..".to_string());
+                }
+            }
+            Component::Normal(seg) => {
+                let s = seg.to_string_lossy();
+                parts.push(if cfg!(target_os = "windows") {
+                    s.to_ascii_lowercase()
+                } else {
+                    s.into_owned()
+                });
+            }
+        }
+    }
+    parts
+}
+
+fn is_path_inside_dir(candidate: &Path, root: &Path) -> bool {
+    let cand_canon = std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    let root_canon = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let cand_parts = normalize_dir_components(&cand_canon);
+    let root_parts = normalize_dir_components(&root_canon);
+    if root_parts.is_empty() || cand_parts.len() < root_parts.len() {
+        return false;
+    }
+    cand_parts[..root_parts.len()] == root_parts[..]
+}
+
+/// Decide whether `WEBVIEW2_USER_DATA_FOLDER` must be set/overwritten to
+/// `paths.effective_webview_dir(is_elevated)`.
+///
+/// - Elevated processes always enforce `webview2_elevated` (High IL isolation).
+/// - Portable builds always pin WebView2 data inside `paths.root_data_dir`.
+/// - Missing or blank env vars are always initialized.
+/// - Non-elevated standard installs preserve a user-specified external custom directory, EXCEPT
+///   when the inherited value points to `webview2_elevated` (case-insensitive segment or suffix,
+///   e.g. inherited from an elevated installer/parent process) or lies inside `paths.root_data_dir`,
+///   in which case it MUST be overwritten back to `paths.webview_dir` to prevent High-IL ACL blank
+///   WebView2 screens.
+pub fn should_override_webview2_user_data_folder(
+    is_elevated: bool,
+    paths: &AppPaths,
+    existing: Option<&std::ffi::OsStr>,
+) -> bool {
+    if is_elevated || paths.is_portable {
+        return true;
+    }
+    let Some(raw) = existing else {
+        return true;
+    };
+    let lossy = raw.to_string_lossy();
+    let trimmed = lossy.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    let stripped = trimmed.trim_end_matches(['\\', '/']);
+    let candidate = Path::new(stripped);
+    let points_to_elevated = candidate
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("webview2_elevated"))
+        || stripped
+            .split(['\\', '/'])
+            .any(|seg| seg.eq_ignore_ascii_case("webview2_elevated"))
+        || stripped
+            .to_ascii_lowercase()
+            .ends_with("webview2_elevated");
+    if points_to_elevated {
+        return true;
+    }
+
+    is_path_inside_dir(candidate, &paths.root_data_dir)
+}
+
 /// Helper for single-threaded bootstrap paths to set `WEBVIEW2_USER_DATA_FOLDER` and lightweight
 /// WebView2 browser arguments before Tauri initializes on Windows. Elevated processes always receive
 /// an isolated `webview2_elevated` directory so High IL and Medium IL WebView2 instances never
@@ -196,9 +293,13 @@ pub unsafe fn set_webview2_user_data_env(paths: &AppPaths) {
             .capabilities()
             .is_elevated;
         let webview_dir = paths.effective_webview_dir(is_elevated);
-        let _ = std::fs::create_dir_all(&webview_dir);
-        if is_elevated || paths.is_portable || std::env::var_os("WEBVIEW2_USER_DATA_FOLDER").is_none()
-        {
+        let existing_folder = std::env::var_os("WEBVIEW2_USER_DATA_FOLDER");
+        if should_override_webview2_user_data_folder(
+            is_elevated,
+            paths,
+            existing_folder.as_deref(),
+        ) {
+            let _ = std::fs::create_dir_all(&webview_dir);
             unsafe {
                 std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &webview_dir);
             }
@@ -1073,6 +1174,75 @@ mod tests {
             resolve_webview2_browser_args(Some("--remote-debugging-port=9222")),
             None
         );
+    }
+
+    #[test]
+    fn should_override_webview2_folder_recovers_from_elevated_and_internal_pollution() {
+        use std::ffi::OsStr;
+
+        let std_paths = make_temp_paths("wv2_std", false);
+        let portable_paths = make_temp_paths("wv2_portable", true);
+
+        // Missing or blank env var -> always initialize.
+        assert!(should_override_webview2_user_data_folder(false, &std_paths, None));
+        assert!(should_override_webview2_user_data_folder(
+            false,
+            &std_paths,
+            Some(OsStr::new("   "))
+        ));
+
+        // Non-elevated standard build with inherited `webview2_elevated` (any casing / trailing slash)
+        // MUST override back to `paths.webview_dir` to prevent High-IL ACL blank WebView2 screens.
+        let elevated_under_root = std_paths.root_data_dir.join("webview2_elevated");
+        assert!(should_override_webview2_user_data_folder(
+            false,
+            &std_paths,
+            Some(elevated_under_root.as_os_str())
+        ));
+        assert!(should_override_webview2_user_data_folder(
+            false,
+            &std_paths,
+            Some(OsStr::new(r"D:\CatCloudFixture\AppData\CatCloud\WEBVIEW2_ELEVATED\"))
+        ));
+        assert!(should_override_webview2_user_data_folder(
+            false,
+            &std_paths,
+            Some(OsStr::new("/tmp/other/webview2_elevated/EBWebView"))
+        ));
+
+        // Any path inside `paths.root_data_dir` on a non-elevated launch is normalized back to `paths.webview_dir`.
+        let inside_root = std_paths.root_data_dir.join("custom_webview_cache");
+        assert!(should_override_webview2_user_data_folder(
+            false,
+            &std_paths,
+            Some(inside_root.as_os_str())
+        ));
+
+        // User-specified external custom directory outside `root_data_dir` is preserved when non-elevated & non-portable.
+        let external_dir = std::env::temp_dir().join(format!(
+            "catcloud_external_wv2_profile_{}",
+            std::process::id()
+        ));
+        assert!(!should_override_webview2_user_data_folder(
+            false,
+            &std_paths,
+            Some(external_dir.as_os_str())
+        ));
+
+        // Elevated processes and portable builds always enforce `effective_webview_dir`.
+        assert!(should_override_webview2_user_data_folder(
+            true,
+            &std_paths,
+            Some(external_dir.as_os_str())
+        ));
+        assert!(should_override_webview2_user_data_folder(
+            false,
+            &portable_paths,
+            Some(external_dir.as_os_str())
+        ));
+
+        let _ = std::fs::remove_dir_all(&std_paths.root_data_dir);
+        let _ = std::fs::remove_dir_all(&portable_paths.root_data_dir);
     }
 
     #[test]

@@ -1046,6 +1046,9 @@ pub struct UpdateConfig {
     pub include_prerelease: bool,
     pub auto_download: bool,
     pub last_checked_at: Option<String>,
+    /// Normalized SemVer string (without leading `v`/`V`) explicitly skipped by the user.
+    #[serde(default)]
+    pub skipped_version: Option<String>,
 }
 
 impl Default for UpdateConfig {
@@ -1057,6 +1060,7 @@ impl Default for UpdateConfig {
             include_prerelease: false,
             auto_download: true,
             last_checked_at: None,
+            skipped_version: None,
         }
     }
 }
@@ -1398,5 +1402,24 @@ mod tests {
         assert!(is_supported_ui_language("en"));
         assert!(is_supported_ui_language("ja"));
         assert!(is_supported_ui_language("ru"));
+    }
+
+    #[test]
+    fn update_config_skipped_version_default_and_serde_roundtrip() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.update.skipped_version, None);
+
+        // Legacy JSON missing `skipped_version` deserializes cleanly to `None`.
+        let legacy: AppConfig =
+            serde_json::from_str(r#"{"update":{"repo":"JuryBu/CatCloud","auto_download":true}}"#)
+                .expect("deserialize legacy UpdateConfig");
+        assert_eq!(legacy.update.skipped_version, None);
+
+        // Explicit `skipped_version` round-trips identically.
+        let mut with_skip = UpdateConfig::default();
+        with_skip.skipped_version = Some("0.1.1".to_string());
+        let json = serde_json::to_string(&with_skip).expect("serialize UpdateConfig");
+        let parsed: UpdateConfig = serde_json::from_str(&json).expect("deserialize UpdateConfig");
+        assert_eq!(parsed.skipped_version.as_deref(), Some("0.1.1"));
     }
 }

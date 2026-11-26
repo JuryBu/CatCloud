@@ -2475,6 +2475,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         "is_self_updatable_portable": is_self_updatable_portable,
                         "platform_key": platform_key,
                         "download_url": Value::Null,
+                        "skipped_version": &cfg.update.skipped_version,
                         "staged_version": &staged_version,
                         "staging_dir": &display_staging_dir,
                     });
@@ -2506,6 +2507,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             "is_self_updatable_portable": is_self_updatable_portable,
                             "platform_key": platform_key,
                             "download_url": Value::Null,
+                            "skipped_version": &cfg.update.skipped_version,
                             "staged_version": &staged_version,
                             "staging_dir": &display_staging_dir,
                             "error": &msg,
@@ -2545,6 +2547,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             "is_self_updatable_portable": is_self_updatable_portable,
                             "platform_key": platform_key,
                             "download_url": &download_url,
+                            "skipped_version": &cfg.update.skipped_version,
                             "staged_version": &staged_version,
                             "staging_dir": &display_staging_dir,
                             "platforms": platforms,
@@ -2584,6 +2587,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             "is_self_updatable_portable": is_self_updatable_portable,
                             "platform_key": platform_key,
                             "download_url": Value::Null,
+                            "skipped_version": &cfg.update.skipped_version,
                             "staged_version": &staged_version,
                             "staging_dir": &display_staging_dir,
                             "error": &msg,
@@ -2640,7 +2644,10 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 emit_output(
                     as_json,
                     &out,
-                    &format!("Staged verified update v{} for next launch.", parsed_manifest.version),
+                    &format!(
+                        "Staged verified update v{} (ready to apply on user confirmation/restart).",
+                        parsed_manifest.version
+                    ),
                 )
             }
         },

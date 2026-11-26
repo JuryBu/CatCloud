@@ -30,10 +30,12 @@ import {
   RotateCw,
   Save,
   Shield,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Square,
   Terminal,
+  Trash2,
   Upload,
   X,
   type LucideIcon,
@@ -58,6 +60,8 @@ import { ShareBundleModal } from "../components/ShareBundleModal";
 import {
   UI_LANGUAGE_OPTIONS,
   type UiLanguage,
+  formatI18nTemplate,
+  getUiDictSync,
   normalizeUiLanguage,
   useUiDict,
 } from "../i18n";
@@ -623,10 +627,15 @@ function buildMergedSettingsPatch(
 }
 
 async function copyText(text: string, label: string): Promise<void> {
+  const dict = getUiDictSync(
+    normalizeUiLanguage(appStore.getState().config.personalization.ui_language)
+  );
+  const copiedMsg = formatI18nTemplate(dict.settings.copiedItemToast, { label });
+  const copyFailedMsg = formatI18nTemplate(dict.settings.copyFailedToast, { label });
   try {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       await navigator.clipboard.writeText(text);
-      appActions.showToast(`已复制${label}`, "ok");
+      appActions.showToast(copiedMsg, "ok");
       return;
     }
   } catch {
@@ -645,13 +654,13 @@ async function copyText(text: string, label: string): Promise<void> {
     const ok = document.execCommand("copy");
     document.body.removeChild(el);
     if (ok) {
-      appActions.showToast(`已复制${label}`, "ok");
+      appActions.showToast(copiedMsg, "ok");
       return;
     }
   } catch {
     /* ignore legacy copy failure */
   }
-  appActions.showToast(`剪贴板不可用，请手动复制${label}`, "warn");
+  appActions.showToast(copyFailedMsg, "warn");
 }
 
 function buildFallbackYaml(cfg: AppConfig, ext: ExtendedSettings): string {
@@ -885,6 +894,7 @@ export function SettingsPage() {
   const downloadingUpdate = useAppSelector((s) => s.bgTasks.settings.downloadingUpdate);
   const updateInfo = useAppSelector((s) => s.bgTasks.settings.updateInfo);
   const updateMsg = useAppSelector((s) => s.bgTasks.settings.updateMessage);
+  const pendingUpdate = useAppSelector((s) => s.pendingUpdate);
   const coreOpBusy = useAppSelector((s) => s.bgTasks.settings.coreOpBusy);
   const backupBusy = useAppSelector((s) => s.bgTasks.settings.backupBusy);
   const inTauri = isTauriEnv();
@@ -940,6 +950,10 @@ export function SettingsPage() {
         system_proxy_enabled: storeConfig.system_proxy_enabled,
         tun_enabled: storeConfig.tun_enabled,
         proxy_mode: storeConfig.proxy_mode,
+        update: {
+          ...settingsDraftCache.draft.update,
+          skipped_version: storeConfig.update.skipped_version ?? null,
+        },
       };
     }
     return structuredClone(storeConfig);
@@ -984,6 +998,9 @@ export function SettingsPage() {
   const [confirmImportBackupOpen, setConfirmImportBackupOpen] = useState(false);
   const [syncModalOpen, setSyncModalOpen] = useState(false);
   const [openingIssue, setOpeningIssue] = useState(false);
+  const [updateActionBusy, setUpdateActionBusy] = useState<
+    "apply" | "skip" | "clear_skip" | null
+  >(null);
 
   const dirty = draftDirty || extDirty;
   const dirtyRef = useRef(dirty);
@@ -1042,6 +1059,10 @@ export function SettingsPage() {
         system_proxy_enabled: storeConfig.system_proxy_enabled,
         tun_enabled: storeConfig.tun_enabled,
         proxy_mode: storeConfig.proxy_mode,
+        update: {
+          ...prev.update,
+          skipped_version: storeConfig.update.skipped_version ?? null,
+        },
       }));
       return;
     }
@@ -1201,6 +1222,7 @@ export function SettingsPage() {
     try {
       const normalizedRepo = normalizeUpdateRepo(draft.update.repo);
       const latestStoreConfig = appStore.getState().config;
+      const prevIncludePrerelease = Boolean(latestStoreConfig.update.include_prerelease);
       const payload: AppConfig = {
         ...draft,
         proxy_mode: latestStoreConfig.proxy_mode,
@@ -1210,8 +1232,10 @@ export function SettingsPage() {
         personalization: latestStoreConfig.personalization,
         preaccel: structuredClone(latestStoreConfig.preaccel),
         update: {
-          ...draft.update,
           repo: normalizedRepo,
+          mode: draft.update.mode,
+          check_interval_min: draft.update.check_interval_min,
+          include_prerelease: draft.update.include_prerelease,
           auto_download: draft.update.auto_download ?? true,
         },
       };
@@ -1233,6 +1257,10 @@ export function SettingsPage() {
         ...savedBasic.update,
         auto_download:
           savedBasic.update.auto_download ?? payload.update.auto_download ?? true,
+        skipped_version:
+          savedBasic.update.skipped_version !== undefined
+            ? savedBasic.update.skipped_version
+            : (latestStoreConfig.update.skipped_version ?? null),
       };
       const syncedConfig: AppConfig = extDirty
         ? {
@@ -1247,6 +1275,7 @@ export function SettingsPage() {
             ...savedBasic,
             update: syncedUpdate,
           };
+      const nextIncludePrerelease = Boolean(syncedConfig.update.include_prerelease);
       dirtyRef.current = false;
       extDirtyRef.current = false;
       clearSettingsDirtyDraftCache();
@@ -1257,6 +1286,9 @@ export function SettingsPage() {
       }
       appActions.patchSessionDraft("settings", { hasDirtyDrafts: false });
       appActions.syncConfig(syncedConfig);
+      if (prevIncludePrerelease !== nextIncludePrerelease) {
+        void appActions.refreshPendingUpdate();
+      }
       const rt = await catcloudApi.getRuntimeInfo();
       appActions.syncRuntime(rt);
       appActions.showToast("设置已保存并生效", "ok");
@@ -1362,10 +1394,74 @@ export function SettingsPage() {
     await appActions.runDownloadAppUpdate();
   };
 
+  const handleApplyPendingUpdate = async () => {
+    if (updateActionBusy !== null) return;
+    setUpdateActionBusy("apply");
+    let exitingNow = false;
+    try {
+      const res = await appActions.applyPendingUpdateAndRestart();
+      if (res.cancelled) {
+        appActions.showToast(dict.updateModal.cancelledHint, "info");
+      } else if (res.exiting) {
+        exitingNow = true;
+      } else if (res.started) {
+        const localizedStartedHint =
+          res.apply_action === "reveal_archive"
+            ? dict.updateModal.revealOpenedHint
+            : dict.updateModal.installerMacHint;
+        appActions.showToast(
+          uiLang !== "zh-CN"
+            ? localizedStartedHint
+            : res.message?.trim() || localizedStartedHint,
+          "ok"
+        );
+      } else {
+        appActions.showToast(
+          `${dict.updateModal.applyErrorPrefix}${res.message || "unknown error"}`,
+          "warn"
+        );
+      }
+    } catch (err) {
+      appActions.showToast(
+        `${dict.updateModal.applyErrorPrefix}${formatErrorMessage(err)}`,
+        "warn"
+      );
+    } finally {
+      if (!exitingNow) {
+        setUpdateActionBusy(null);
+      }
+    }
+  };
+
+  const handleSkipPendingUpdate = async () => {
+    if (updateActionBusy !== null || !pendingUpdate) return;
+    setUpdateActionBusy("skip");
+    try {
+      await appActions.skipPendingUpdateVersion(pendingUpdate.target_version);
+    } catch {
+      /* toast already shown by appActions.skipPendingUpdateVersion */
+    } finally {
+      setUpdateActionBusy(null);
+    }
+  };
+
+  const handleClearSkippedUpdate = async () => {
+    if (updateActionBusy !== null) return;
+    setUpdateActionBusy("clear_skip");
+    try {
+      await appActions.clearSkippedUpdateVersion();
+    } finally {
+      setUpdateActionBusy(null);
+    }
+  };
+
   const handleOpenReleasePage = async () => {
     const cleanRepo = draft.update.repo.trim().replace(/^\/+|\/+$/g, "");
     const fallbackUrl = `https://github.com/${cleanRepo || "JuryBu/CatCloud"}/releases`;
-    const targetUrl = updateInfo?.release_url?.trim() || fallbackUrl;
+    const targetUrl =
+      updateInfo?.release_url?.trim() ||
+      pendingUpdate?.release_url?.trim() ||
+      fallbackUrl;
     try {
       await catcloudApi.openExternalUrl(targetUrl);
       if (inTauri) {
@@ -1374,13 +1470,18 @@ export function SettingsPage() {
         } catch {
           /* clipboard optional when browser opens directly */
         }
-        appActions.showToast(`已在浏览器打开官方下载页：${targetUrl}`, "ok");
+        appActions.showToast(
+          formatI18nTemplate(dict.settings.updateOpenedReleaseToast, {
+            url: targetUrl,
+          }),
+          "ok"
+        );
         return;
       }
     } catch {
       /* fall back to copying link below */
     }
-    await copyText(targetUrl, "官方下载页链接");
+    await copyText(targetUrl, dict.settings.updateReleaseLinkLabel);
   };
 
   const handleExportBackup = async () => {
@@ -3141,8 +3242,12 @@ export function SettingsPage() {
       {tab === "updates" && (
         <div className="space-y-4">
           <Card
-            title="关于猫猫云梯与软件更新"
-            sub={`当前版本 v${runtime.app_version} · ${runtime.os_label} · 更新来源 ${draft.update.repo}`}
+            title={dict.settings.updateCardTitle}
+            sub={formatI18nTemplate(dict.settings.updateCardSub, {
+              version: runtime.app_version,
+              os: runtime.os_label,
+              repo: draft.update.repo,
+            })}
             action={
               <button
                 type="button"
@@ -3155,13 +3260,17 @@ export function SettingsPage() {
                 ) : (
                   <CloudDownload className="h-3.5 w-3.5" />
                 )}
-                <span>{checkingUpdate ? "检查中..." : "检查更新"}</span>
+                <span>
+                  {checkingUpdate
+                    ? dict.settings.updateCheckingBtn
+                    : dict.settings.updateCheckBtn}
+                </span>
               </button>
             }
           >
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
               <label className="text-[11px] text-[var(--muted)]">
-                更新源仓库
+                {dict.settings.updateRepoLabel}
                 <input
                   value={draft.update.repo}
                   onChange={(e) =>
@@ -3171,9 +3280,9 @@ export function SettingsPage() {
                 />
               </label>
               <div className="text-[11px] text-[var(--muted)]">
-                <span className="block">自动更新模式</span>
+                <span className="block">{dict.settings.updateModeLabel}</span>
                 <AppSelect
-                  aria-label="自动更新模式"
+                  aria-label={dict.settings.updateModeLabel}
                   size="sm"
                   value={draft.update.mode}
                   onChange={(v) =>
@@ -3185,13 +3294,13 @@ export function SettingsPage() {
                     })
                   }
                   options={[
-                    { value: "next_launch", label: "下次启动自动生效（默认）" },
-                    { value: "manual", label: "仅手动检查" },
+                    { value: "next_launch", label: dict.settings.updateModePrompt },
+                    { value: "manual", label: dict.settings.updateModeManual },
                     ...(draft.update.mode === "auto_restart"
                       ? [
                           {
                             value: "auto_restart",
-                            label: "自动重启（暂未实现，等同下次启动生效）",
+                            label: dict.settings.updateModeAutoRestartLegacy,
                           },
                         ]
                       : []),
@@ -3200,7 +3309,7 @@ export function SettingsPage() {
                 />
               </div>
               <label className="text-[11px] text-[var(--muted)]">
-                自动检查间隔（分钟）
+                {dict.settings.updateIntervalLabel}
                 <input
                   type="number"
                   min={30}
@@ -3219,16 +3328,16 @@ export function SettingsPage() {
             </div>
             <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
               <SwitchRow
-                title="自动下载新版本（下次启动自动生效）"
-                desc="发现新版后自动校验预置，下次重启猫猫云梯无缝更新，不打断当前上网"
+                title={dict.settings.updateAutoDownloadTitle}
+                desc={dict.settings.updateAutoDownloadDesc}
                 checked={draft.update.auto_download ?? true}
                 onChange={(v) =>
                   patchDraft({ update: { ...draft.update, auto_download: v } })
                 }
               />
               <SwitchRow
-                title="接收测试版更新"
-                desc="提前体验新功能预览版，日常稳定使用建议保持关闭"
+                title={dict.settings.updatePrereleaseTitle}
+                desc={dict.settings.updatePrereleaseDesc}
                 checked={draft.update.include_prerelease}
                 onChange={(v) =>
                   patchDraft({ update: { ...draft.update, include_prerelease: v } })
@@ -3236,36 +3345,132 @@ export function SettingsPage() {
               />
             </div>
 
-            {updateInfo?.staged_version && (
-              <div className="flex items-start gap-2.5 rounded-xl border border-[var(--green)]/45 bg-[var(--green-soft)] px-3.5 py-2.5 text-xs text-[var(--green)]">
-                <Shield className="mt-0.5 h-4 w-4 shrink-0" />
-                <div className="min-w-0 leading-relaxed font-medium">
-                  已下载并校验完成 v{updateInfo.staged_version}，下次重启猫猫云梯时自动生效（保留全部配置与订阅）
+            {pendingUpdate && (
+              <div className="space-y-2.5 rounded-xl border border-[var(--green)]/45 bg-[var(--green-soft)] px-3.5 py-3">
+                <div className="flex flex-wrap items-start justify-between gap-2.5">
+                  <div className="flex min-w-0 items-start gap-2.5">
+                    <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-[var(--green)]" />
+                    <div className="min-w-0 space-y-0.5">
+                      <div className="text-xs font-semibold text-[var(--text)]">
+                        {formatI18nTemplate(dict.settings.updateReadyTitle, {
+                          version: pendingUpdate.target_version,
+                        })}
+                      </div>
+                      <p className="text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                        {formatI18nTemplate(dict.settings.updateReadyDesc, {
+                          size: formatGeoFileSize(pendingUpdate.package_size_bytes),
+                          kind:
+                            pendingUpdate.kind === "portable_zip"
+                              ? dict.updateModal.kindPortable
+                              : dict.updateModal.kindInstaller,
+                          sha: pendingUpdate.archive_sha256.slice(0, 10),
+                        })}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 pl-6">
+                  <button
+                    type="button"
+                    disabled={updateActionBusy !== null}
+                    onClick={() => void handleApplyPendingUpdate()}
+                    className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {updateActionBusy === "apply" ? (
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    ) : pendingUpdate.apply_action === "reveal_archive" ? (
+                      <FolderOpen className="h-3.5 w-3.5" />
+                    ) : pendingUpdate.apply_action === "installer_launch" ? (
+                      <Download className="h-3.5 w-3.5" />
+                    ) : (
+                      <RotateCw className="h-3.5 w-3.5" />
+                    )}
+                    <span>
+                      {pendingUpdate.apply_action === "installer_launch"
+                        ? dict.settings.updateApplyInstallerBtn
+                        : pendingUpdate.apply_action === "reveal_archive"
+                          ? dict.settings.updateApplyRevealBtn
+                          : dict.settings.updateApplyPortableBtn}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={updateActionBusy !== null}
+                    onClick={() => appActions.openUpdateModal()}
+                    className={BTN_CLS}
+                  >
+                    <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
+                    <span>{dict.settings.updatePreviewModalBtn}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={updateActionBusy !== null}
+                    onClick={() => void handleSkipPendingUpdate()}
+                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)]/80 px-3 py-1.5 text-xs font-medium text-[var(--muted)] transition-colors hover:border-[var(--amber)]/55 hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {updateActionBusy === "skip" ? (
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Trash2 className="h-3.5 w-3.5" />
+                    )}
+                    <span>{dict.settings.updateSkipPurgeBtn}</span>
+                  </button>
                 </div>
               </div>
             )}
 
-            {updateInfo?.has_update && !updateInfo.staged_version && (
+            {storeConfig.update.skipped_version && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/35 bg-[var(--amber-soft)]/40 px-3.5 py-2 text-xs text-[var(--text-secondary)]">
+                <span className="min-w-0 leading-relaxed">
+                  {formatI18nTemplate(dict.settings.updateSkippedBanner, {
+                    version: storeConfig.update.skipped_version
+                      .trim()
+                      .replace(/^[vV]/, ""),
+                  })}
+                </span>
+                <button
+                  type="button"
+                  disabled={updateActionBusy !== null || checkingUpdate}
+                  onClick={() => void handleClearSkippedUpdate()}
+                  className={BTN_CLS}
+                >
+                  {updateActionBusy === "clear_skip" ? (
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <RotateCcw className="h-3.5 w-3.5" />
+                  )}
+                  <span>{dict.settings.updateClearSkipBtn}</span>
+                </button>
+              </div>
+            )}
+
+            {updateInfo?.has_update && !pendingUpdate && (
               <div className="space-y-2.5 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)]/45 px-3.5 py-3">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="min-w-0 space-y-0.5">
                     <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-[var(--text)]">
-                      <span>发现新版本 v{updateInfo.latest_version}</span>
-                      <span className="rounded-md bg-[var(--surface)] px-1.5 py-0.5 cc-mono text-[10px] font-normal text-[var(--muted)]">
-                        当前 v{updateInfo.current_version}
+                      <span>
+                        {formatI18nTemplate(dict.settings.updateFoundTitle, {
+                          version: updateInfo.latest_version,
+                        })}
                       </span>
+                      <span className="rounded-md bg-[var(--surface)] px-1.5 py-0.5 cc-mono text-[10px] font-normal text-[var(--muted)]">
+                        {formatI18nTemplate(dict.settings.updateCurrentBadge, {
+                          version: updateInfo.current_version,
+                        })}
+                      </span>
+                      {updateInfo.skipped && (
+                        <span className="rounded-md border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                          {dict.settings.updateFoundSkippedBadge}
+                        </span>
+                      )}
                     </div>
                     <p className="text-[11px] leading-relaxed text-[var(--text-secondary)]">
                       {updateInfo.can_auto_stage
-                        ? (draft.update.auto_download ?? true) &&
-                          draft.update.mode !== "manual"
-                          ? "你已开启下次启动自动更新，点击右侧按钮即可立即下载并校验更新包，下次重启自动生效（保留全部配置与订阅）。"
-                          : "当前便携版支持一键下载并校验更新包，下次重启猫猫云梯时自动应用（保留全部配置与订阅）。"
-                        : platformOs === "macos"
-                          ? "当前为 macOS 版本，请打开官方下载页获取对应芯片（Apple Silicon / Intel）的 .dmg 安装包替换应用，配置与订阅会自动保留。"
-                          : platformOs === "linux"
-                            ? "当前为 Linux 版本，请打开官方下载页获取最新的 AppImage / .deb / .rpm 安装包完成更新，配置与订阅会自动保留。"
-                            : "当前为系统安装版，请打开官方下载页下载最新 .exe / .msi 安装包覆盖安装，原有配置与订阅会自动保留。"}
+                        ? dict.settings.updateFoundDescAuto
+                        : dict.settings.updateFoundDescManual}
                     </p>
                   </div>
 
@@ -3284,8 +3489,8 @@ export function SettingsPage() {
                         )}
                         <span>
                           {downloadingUpdate
-                            ? "正在下载并校验..."
-                            : "一键下载更新（下次启动自动应用）"}
+                            ? dict.settings.updateDownloadingBtn
+                            : dict.settings.updateDownloadBtn}
                         </span>
                       </button>
                     ) : (
@@ -3296,7 +3501,7 @@ export function SettingsPage() {
                           className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
                         >
                           <ExternalLink className="h-3.5 w-3.5" />
-                          <span>打开官方下载页</span>
+                          <span>{dict.settings.updateOpenReleaseBtn}</span>
                         </button>
                         <button
                           type="button"
@@ -3304,25 +3509,28 @@ export function SettingsPage() {
                             void copyText(
                               updateInfo.release_url ||
                                 buildReleasesFallbackUrl(draft.update.repo),
-                              "官方下载页链接"
+                              dict.settings.updateReleaseLinkLabel
                             )
                           }
                           className={BTN_CLS}
                         >
                           <Copy className="h-3.5 w-3.5" />
-                          <span>复制链接</span>
+                          <span>{dict.settings.updateCopyReleaseBtn}</span>
                         </button>
                         {updateInfo.download_url &&
                           updateInfo.download_url !== updateInfo.release_url && (
                             <button
                               type="button"
                               onClick={() =>
-                                void copyText(updateInfo.download_url ?? "", "安装包直链")
+                                void copyText(
+                                  updateInfo.download_url ?? "",
+                                  dict.settings.updateDirectLinkLabel
+                                )
                               }
                               className={BTN_CLS}
                             >
                               <Download className="h-3.5 w-3.5" />
-                              <span>复制安装包直链</span>
+                              <span>{dict.settings.updateCopyDirectBtn}</span>
                             </button>
                           )}
                       </>
@@ -3333,7 +3541,7 @@ export function SettingsPage() {
                 {updateInfo.notes?.trim() && (
                   <div className="rounded-lg border border-[var(--line)] bg-[var(--surface)]/80 px-3 py-2">
                     <div className="mb-1 text-[10px] font-medium text-[var(--muted)]">
-                      更新说明
+                      {dict.settings.updateNotesTitle}
                     </div>
                     <div className="cc-selectable max-h-24 overflow-y-auto whitespace-pre-wrap text-[11px] leading-relaxed text-[var(--text-secondary)]">
                       {updateInfo.notes.trim()}
@@ -3345,16 +3553,19 @@ export function SettingsPage() {
 
             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--muted)]">
               <span>
-                {updateMsg ?? `上次检查：${runtime.last_update_check ?? "尚未检查"}`}
+                {updateMsg ??
+                  formatI18nTemplate(dict.settings.updateLastChecked, {
+                    time: runtime.last_update_check ?? dict.settings.updateNeverChecked,
+                  })}
               </span>
-              {updateInfo?.release_url && (
+              {(updateInfo?.release_url || pendingUpdate?.release_url) && (
                 <button
                   type="button"
                   onClick={() => void handleOpenReleasePage()}
                   className="inline-flex items-center gap-1 text-[var(--accent)] hover:underline"
                 >
                   <ExternalLink className="h-3 w-3" />
-                  <span>查看发布说明</span>
+                  <span>{dict.settings.updateViewReleaseNotes}</span>
                 </button>
               )}
             </div>
@@ -3372,7 +3583,7 @@ export function SettingsPage() {
                 </div>
                 <p className="mt-0.5 text-[11px] text-[var(--muted)]">
                   {isZh
-                    ? "新手上手指南、脱敏排障诊断包、8 篇本地详尽手册与本机 Agent 只读命令已统一迁移至侧边栏「AI 助手」。"
+                    ? "新手上手指南、脱敏排障诊断包、8 篇本地详尽手册与本机 Agent 只读命令已统一迁移至侧边栏「AI 全权代管」。"
                     : dict.aiHub.subtitle}
                 </p>
               </div>

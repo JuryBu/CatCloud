@@ -656,10 +656,10 @@ const ZH_DOC_06_NETWORK_LIFECYCLE: &str = r###"> 【语言锁定】请全程使�
 - **L2（校验后热应用）**：修改规则、DNS、多选组、订阅或国内提速配置后，先做语法、防环与内核预检；无效配置原子拒载绝不断网，通过后无缝热应用并恢复选组状态。
 - **L3（核心轻量重启）**：仅在变更端口、TUN 栈或更换内核二进制时重启转发核心进程，界面与数据保持不变；端口冲突时支持 TCP/UDP 自动顺延。
 
-## 三、无窗托盘省内存、便携隔离与下次启动安全更新
+## 三、无窗托盘省内存、便携隔离与后台预下载安全更新
 - **关窗进托盘省内存**：点击主窗口右上角关闭时彻底销毁界面渲染进程，转入纯无窗托盘态（后台常驻目标 `<= 70 MB`）；点击托盘图标或快捷键瞬间重建窗口。
 - **数据隔离与便携 CLI**：支持 `--data-dir <PATH>`、`CATCLOUD_DATA_DIR` 与绿色便携版 `portable.flag`；便携版 `cli/catcloud(.exe)` 会自动向上识别同包根目录 `../portable.flag` 并复用同一份 `data/` 与随包内核，且不影响主程序便携自更新判定。
-- **安全自动更新（`JuryBu/CatCloud`）**：仅允许 HTTPS 443 访问 GitHub 官方域名，强制核验 `latest.json` 与 `SHA256SUMS.txt` 后暂存至 `.update_staging/` 于下次启动应用，更新时绝对保留 `data/`、`portable.flag` 与数据库文件，任意失败自动全量回滚。
+- **安全后台预下载与询问更新（`JuryBu/CatCloud`）**：仅允许 HTTPS 443 访问 GitHub 官方域名，强制核验 `latest.json` 与 `SHA256SUMS.txt` 后流式预下载至 `.update_staging/`（支持绿色便携版与系统安装版）。每次打开主窗口或后台校验就绪时弹窗询问：用户可点击「立即重启并更新」（便携版无感热换轨、安装版拉起已校验安装向导）、点击「稍后提醒」（保留预下载包下次打开再问），或点击「跳过此版本」（记录跳过版本并立即删除预下载包释放磁盘，该版本不再提醒）；更新全程绝对保留 `data/`、`portable.flag` 与数据库文件，任意失败自动全量回滚。
 
 ## 四、配置校验、备份恢复与更新 CLI 命令
 
@@ -1026,7 +1026,7 @@ const EN_DOC_06_NETWORK_LIFECYCLE: &str = r###"> [LANGUAGE LOCK] Reply strictly 
 ## 3. Windowless Tray Mode, Portable CLI & Safe Updates (`Settings → About & Updates`)
 - Closing the main window destroys WebView2 (`<= 70 MB` background tray target) and rebuilds smoothly on click/hotkey.
 - Portable `cli/catcloud(.exe)` detects `../portable.flag` automatically to share the same `data/` and bundled core without breaking desktop self-update checks.
-- Next-launch updater (`JuryBu/CatCloud`) enforces GitHub HTTPS `:443` allowlist + `latest.json` + `SHA256SUMS.txt` verification, preserves `data/`, `portable.flag`, and databases, and rolls back atomically on error.
+- Background pre-download updater (`JuryBu/CatCloud`) enforces GitHub HTTPS `:443` allowlist + `latest.json` + `SHA256SUMS.txt` verification into `.update_staging/` (supporting both portable ZIP and platform installers), prompts on launch/ready to restart & apply, remind later, or skip version (purging the staged package), preserves `data/`, `portable.flag`, and databases, and rolls back atomically on error.
 
 ## 4. CLI Reference
 ```bash
@@ -1447,7 +1447,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
         AgentModuleDoc {
             module_id: NETWORK_LIFECYCLE_DOC_ID.into(),
             title: "网络设置、三级热加载、省内存与安全更新".into(),
-            summary: "涵盖系统代理、Proxy Guard、TUN、高级 DNS、L1/L2/L3 零断流热载、无窗托盘省内存（<= 70 MB）、便携 CLI 与 JuryBu/CatCloud 下次启动安全更新。".into(),
+            summary: "涵盖系统代理、Proxy Guard、TUN、高级 DNS、L1/L2/L3 零断流热载、无窗托盘省内存（<= 70 MB）、便携 CLI 与 JuryBu/CatCloud 后台预下载安全更新。".into(),
             when_to_use_and_signals: svec(&[
                 "外部工具或 AI Agent 编辑配置后需要预检与零断流热载，或配置备份恢复、终端环境变量导出时。",
                 "希望长期低内存后台常驻，或从 GitHub Releases 检查与校验暂存新版本时。",

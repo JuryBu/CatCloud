@@ -64,6 +64,7 @@ export function OnboardingModal() {
       const ok = await appActions.copyAgentBootstrapPrompt("onboarding", "autopilot", uiLang);
       if (ok) {
         setCopiedMode("local");
+        void appActions.markOnboardingCompleted();
       }
     } finally {
       setBusyAction(null);
@@ -77,6 +78,7 @@ export function OnboardingModal() {
       const ok = await appActions.copyAiOnboardingForUser(uiLang, "onboarding");
       if (ok) {
         setCopiedMode("web");
+        void appActions.markOnboardingCompleted();
       }
     } finally {
       setBusyAction(null);

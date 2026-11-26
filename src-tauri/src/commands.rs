@@ -103,6 +103,7 @@ pub const EVENT_PROBE_PROGRESS: &str = "catcloud://probe-progress";
 pub const EVENT_TUN_NEEDS_ADMIN: &str = "catcloud://tun-needs-admin";
 pub const EVENT_STRATEGY_SWITCH: &str = "catcloud://strategy-switch";
 pub const EVENT_CONFIG_UPDATED: &str = "catcloud://config-updated";
+pub const EVENT_UPDATE_READY: &str = "catcloud://update-ready";
 
 /// Physical-pixel anchor tracked during custom Win32 floating capsule dragging (zero HTCAPTION / Aero Snap).
 #[derive(Debug, Clone, Copy)]
@@ -151,6 +152,11 @@ pub struct AppState {
     pub config_transition_lock: Arc<tokio::sync::Mutex<()>>,
     pub core_lifecycle_lock: Arc<tokio::sync::Mutex<()>>,
     pub update_staging_lock: Arc<tokio::sync::Mutex<()>>,
+    pub update_download_lock: Arc<tokio::sync::Mutex<()>>,
+    pub update_download_cancel: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    pub dismissed_update_prompt_version: RwLock<Option<String>>,
+    pub update_apply_in_progress: AtomicBool,
+    pub exit_cleanup_done: AtomicBool,
     pub system_proxy_lock: Arc<std::sync::Mutex<()>>,
     pub node_proxy_name_map: RwLock<HashMap<String, String>>,
     pub compiled_group_ids: RwLock<Option<HashSet<String>>>,
@@ -291,6 +297,11 @@ impl AppState {
             config_transition_lock: Arc::new(tokio::sync::Mutex::new(())),
             core_lifecycle_lock: Arc::new(tokio::sync::Mutex::new(())),
             update_staging_lock: Arc::new(tokio::sync::Mutex::new(())),
+            update_download_lock: Arc::new(tokio::sync::Mutex::new(())),
+            update_download_cancel: Mutex::new(None),
+            dismissed_update_prompt_version: RwLock::new(None),
+            update_apply_in_progress: AtomicBool::new(false),
+            exit_cleanup_done: AtomicBool::new(false),
             system_proxy_lock: Arc::new(std::sync::Mutex::new(())),
             node_proxy_name_map: RwLock::new(HashMap::new()),
             compiled_group_ids: RwLock::new(None),
@@ -298,6 +309,15 @@ impl AppState {
             app_logger,
             last_app_error: RwLock::new(None),
             started_at: Instant::now(),
+        }
+    }
+
+    /// Signal any in-flight update package download to abort immediately.
+    pub fn cancel_in_flight_update_download(&self) {
+        if let Ok(guard) = self.update_download_cancel.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(true);
+            }
         }
     }
 
@@ -787,6 +807,8 @@ pub struct UiUpdateDto {
     pub include_prerelease: bool,
     #[serde(default)]
     pub auto_download: Option<bool>,
+    #[serde(default)]
+    pub skipped_version: Option<String>,
 }
 
 impl From<&AppConfig> for UiAppConfigDto {
@@ -851,6 +873,7 @@ impl From<&AppConfig> for UiAppConfigDto {
                 check_interval_min: cfg.update.check_interval_min,
                 include_prerelease: cfg.update.include_prerelease,
                 auto_download: Some(cfg.update.auto_download),
+                skipped_version: cfg.update.skipped_version.clone(),
             },
         }
     }
@@ -967,9 +990,13 @@ fn apply_ui_dto(cfg: &mut AppConfig, dto: &UiAppConfigDto) {
         sparkline_enabled: dto.personalization.sparkline_enabled,
         tray_icon_mode: dto.personalization.tray_icon_mode.clone(),
         language: resolved_ui_language,
-        onboarding_completed: dto.personalization.onboarding_completed,
+        onboarding_completed: cfg.personalization.onboarding_completed
+            || dto.personalization.onboarding_completed,
         ..cfg.personalization.clone()
     };
+    // NOTE: `skipped_version` and `last_checked_at` are intentionally NOT copied from `dto.update`;
+    // `skipped_version` may only be mutated via dedicated `skip_update_version` /
+    // `clear_skipped_update_version` IPCs (or cleared upon explicit manual download).
     cfg.update = UpdateConfig {
         repo: dto.update.repo.clone(),
         mode: dto.update.mode.clone(),
@@ -3219,18 +3246,24 @@ fn emergency_stop_windivert_service_fallback() -> bool {
     false
 }
 
-/// Deterministic exit safety hook invoked before `JobGuard::terminate_all()` on `RunEvent::Exit`.
+/// Deterministic, idempotent exit safety hook invoked before `JobGuard::terminate_all()` on `RunEvent::Exit`.
 ///
-/// 1. Stops background `ProxyGuard` ticks immediately via `shutting_down`.
-/// 2. Gracefully stops domestic global acceleration (2.0s bounded timeout) whenever enabled,
+/// 1. Atomically guards against duplicate execution via `exit_cleanup_done`.
+/// 2. Stops background `ProxyGuard` ticks and cancels any in-flight update download immediately.
+/// 3. Gracefully stops domestic global acceleration (2.0s bounded timeout) whenever enabled,
 ///    running, or mid-probing, with a Windows SCM fallback stopping the `WinDivert` service if
 ///    exit occurs during the 4s self-test window.
-/// 3. Gracefully disables TUN (1.5s bounded timeout) whenever TUN or external overrides may have
-///    activated Wintun & OS routes, so they are released cleanly.
-/// 4. Clears Windows WinINet system proxy under `system_proxy_lock` (only if owned by CatCloud)
+/// 4. Gracefully disables TUN (1.5s bounded timeout) when active, and ALWAYS gracefully stops a
+///    live Mihomo core (1.5s bounded timeout) regardless of TUN so `mihomo.exe` releases all
+///    ports and file handles before portable swap or installer execution.
+/// 5. Clears Windows WinINet system proxy under `system_proxy_lock` (only if owned by CatCloud)
 ///    WITHOUT mutating `config.json` remembered preferences.
 pub fn emergency_cleanup_on_exit(state: &AppState) {
+    if state.exit_cleanup_done.swap(true, Ordering::SeqCst) {
+        return;
+    }
     state.shutting_down.store(true, Ordering::SeqCst);
+    state.cancel_in_flight_update_download();
     state.stop_streams();
     state.lan_sync.shutdown_all();
 
@@ -3242,7 +3275,7 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
         || global_status.running
         || global_status.verify_state == "probing";
 
-    if may_have_tun || may_have_global_preaccel {
+    {
         let adapter = Arc::clone(&state.adapter);
         let global_preaccel = Arc::clone(&state.global_preaccel);
         let global_stop_needs_fallback = Arc::new(AtomicBool::new(false));
@@ -3268,11 +3301,16 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
                         }
                     }
                 }
-                if may_have_tun {
+                let core_alive = adapter.has_live_controller().await;
+                if core_alive && may_have_tun {
                     let _ = tokio::time::timeout(Duration::from_millis(1500), async {
-                        if adapter.has_live_controller().await {
-                            let _ = adapter.disable_tun_gracefully().await;
-                        }
+                        let _ = adapter.disable_tun_gracefully().await;
+                    })
+                    .await;
+                }
+                if core_alive {
+                    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+                        let _ = adapter.stop().await;
                     })
                     .await;
                 }
@@ -3284,7 +3322,7 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
                 run_teardown();
                 let _ = tx.send(());
             });
-            rx.recv_timeout(Duration::from_millis(3800)).is_err()
+            rx.recv_timeout(Duration::from_millis(5300)).is_err()
         } else {
             run_teardown();
             false
@@ -16177,6 +16215,28 @@ fn can_auto_stage_portable_update(is_portable_install: bool) -> bool {
     is_portable_install && cfg!(target_os = "windows")
 }
 
+fn derive_manifest_asset_filename(asset: &catcloud_core::updater::PlatformAsset) -> Option<String> {
+    if let Some(name) = asset
+        .filename
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(name.to_string());
+    }
+    let without_query = asset
+        .url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(asset.url.as_str());
+    let last_seg = without_query.rsplit('/').next()?.trim();
+    if last_seg.is_empty() {
+        None
+    } else {
+        Some(last_seg.to_string())
+    }
+}
+
 fn manifest_asset_is_zip(asset: &catcloud_core::updater::PlatformAsset) -> bool {
     let candidate = asset
         .filename
@@ -16189,26 +16249,138 @@ fn manifest_asset_is_zip(asset: &catcloud_core::updater::PlatformAsset) -> bool 
 }
 
 fn resolve_can_auto_stage_for_manifest(
-    is_portable_install: bool,
+    is_self_updatable_portable: bool,
     platform_key: Option<&str>,
     manifest: Option<&catcloud_core::updater::LatestManifest>,
 ) -> bool {
-    if !can_auto_stage_portable_update(is_portable_install) {
-        return false;
-    }
     let Some(key) = platform_key else {
         return false;
     };
-    manifest
-        .and_then(|m| m.platforms.get(key))
-        .is_some_and(manifest_asset_is_zip)
+    let Some(asset) = manifest.and_then(|m| m.platforms.get(key)) else {
+        return false;
+    };
+    if is_self_updatable_portable {
+        can_auto_stage_portable_update(true) && manifest_asset_is_zip(asset)
+    } else {
+        derive_manifest_asset_filename(asset)
+            .is_some_and(|name| catcloud_core::updater::is_supported_installer_filename(&name))
+    }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingUpdatePromptDto {
+    pub current_version: String,
+    pub target_version: String,
+    pub kind: String,
+    pub apply_action: String,
+    pub archive_sha256: String,
+    pub package_size_bytes: u64,
+    pub staged_at: String,
+    pub release_notes: String,
+    pub release_url: Option<String>,
+    pub platform_key: Option<String>,
+    pub installer_filename: Option<String>,
+    pub dismissed_in_session: bool,
+    pub is_elevated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkipUpdateResultDto {
+    pub skipped_version: String,
+    pub purged_staged: bool,
+    pub freed_bytes: u64,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApplyUpdateRestartResultDto {
+    pub started: bool,
+    pub exiting: bool,
+    pub cancelled: bool,
+    pub kind: String,
+    pub apply_action: String,
+    pub target_version: String,
+    pub message: String,
+}
+
+fn staged_update_kind_str(kind: catcloud_core::updater::StagedUpdateKind) -> &'static str {
+    match kind {
+        catcloud_core::updater::StagedUpdateKind::PortableZip => "portable_zip",
+        catcloud_core::updater::StagedUpdateKind::InstallerPackage => "installer_package",
+    }
+}
+
+fn expected_staged_kind_for_install(
+    is_self_updatable_portable: bool,
+) -> catcloud_core::updater::StagedUpdateKind {
+    if is_self_updatable_portable {
+        catcloud_core::updater::StagedUpdateKind::PortableZip
+    } else {
+        catcloud_core::updater::StagedUpdateKind::InstallerPackage
+    }
+}
+
+fn extract_installer_filename(
+    pending: &catcloud_core::updater::PendingUpdateMetadata,
+) -> Option<String> {
+    if pending.kind != catcloud_core::updater::StagedUpdateKind::InstallerPackage {
+        return None;
+    }
+    let rel = pending.installer_rel_path.as_deref()?.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    let normalized = rel.replace('\\', "/");
+    let name = normalized.rsplit('/').next()?.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn resolve_apply_action_for_os(
+    kind: catcloud_core::updater::StagedUpdateKind,
+    installer_filename: Option<&str>,
+    target_os: &str,
+) -> &'static str {
+    match kind {
+        catcloud_core::updater::StagedUpdateKind::PortableZip => "portable_restart",
+        catcloud_core::updater::StagedUpdateKind::InstallerPackage => {
+            let lower = installer_filename
+                .map(str::trim)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let is_direct_installer = match target_os {
+                "windows" => lower.ends_with(".exe") || lower.ends_with(".msi"),
+                "macos" => lower.ends_with(".dmg"),
+                _ => false,
+            };
+            if is_direct_installer {
+                "installer_launch"
+            } else {
+                "reveal_archive"
+            }
+        }
+    }
+}
+
+fn resolve_apply_action(
+    kind: catcloud_core::updater::StagedUpdateKind,
+    installer_filename: Option<&str>,
+) -> &'static str {
+    resolve_apply_action_for_os(kind, installer_filename, std::env::consts::OS)
+}
+
+#[cfg(test)]
 fn resolve_staged_update_version(
     staging_dir: &std::path::Path,
     current_version: &str,
     include_prerelease: bool,
 ) -> Option<String> {
+    if !staging_dir.exists() {
+        return None;
+    }
     let pending = catcloud_core::updater::verify_staged_payload_integrity(staging_dir).ok()?;
     if catcloud_core::updater::is_update_available_for_channel(
         &pending.target_version,
@@ -16223,7 +16395,137 @@ fn resolve_staged_update_version(
     }
 }
 
-fn persist_last_update_check_time(app: &AppHandle, state: &AppState, checked_at: &str) {
+fn resolve_staged_update_version_checked(
+    staging_dir: &std::path::Path,
+    current_version: &str,
+    include_prerelease: bool,
+    skipped_version: Option<&str>,
+    expected_kind: catcloud_core::updater::StagedUpdateKind,
+) -> Option<String> {
+    if !staging_dir.exists() {
+        return None;
+    }
+    let pending = catcloud_core::updater::verify_staged_payload_integrity(staging_dir).ok()?;
+    if pending.kind != expected_kind {
+        return None;
+    }
+    if catcloud_core::updater::is_version_skipped(&pending.target_version, skipped_version) {
+        return None;
+    }
+    if catcloud_core::updater::is_update_available_for_channel(
+        &pending.target_version,
+        current_version,
+        include_prerelease,
+    )
+    .unwrap_or(false)
+    {
+        Some(pending.target_version)
+    } else {
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_and_reconcile_staged_update(
+    staging_dir: &std::path::Path,
+    current_version: &str,
+    include_prerelease: bool,
+    skipped_version: Option<&str>,
+    expected_kind: catcloud_core::updater::StagedUpdateKind,
+    dismissed_version: Option<&str>,
+    default_release_repo: &str,
+    is_elevated: bool,
+) -> Option<PendingUpdatePromptDto> {
+    if !staging_dir.exists() {
+        return None;
+    }
+    let pending = match catcloud_core::updater::verify_staged_payload_integrity(staging_dir) {
+        Ok(meta) => meta,
+        Err(err) => {
+            tracing::warn!(
+                staging_dir = %staging_dir.display(),
+                "staged update failed integrity verification, auto-purging: {err}"
+            );
+            let _ = catcloud_core::updater::purge_staged_update(staging_dir);
+            return None;
+        }
+    };
+
+    if pending.kind != expected_kind {
+        tracing::info!(
+            staged_kind = ?pending.kind,
+            expected_kind = ?expected_kind,
+            "staged update kind does not match current installation mode; auto-purging"
+        );
+        let _ = catcloud_core::updater::purge_staged_update(staging_dir);
+        return None;
+    }
+
+    let is_newer = catcloud_core::updater::is_update_available_for_channel(
+        &pending.target_version,
+        current_version,
+        include_prerelease,
+    )
+    .unwrap_or(false);
+    if !is_newer {
+        tracing::info!(
+            current = %current_version,
+            staged = %pending.target_version,
+            "staged update is no longer newer than current build/channel; auto-purging"
+        );
+        let _ = catcloud_core::updater::purge_staged_update(staging_dir);
+        return None;
+    }
+
+    if catcloud_core::updater::is_version_skipped(&pending.target_version, skipped_version) {
+        tracing::info!(
+            staged = %pending.target_version,
+            skipped = ?skipped_version,
+            "staged update matches skipped version; auto-purging"
+        );
+        let _ = catcloud_core::updater::purge_staged_update(staging_dir);
+        return None;
+    }
+
+    let installer_filename = extract_installer_filename(&pending);
+    let apply_action = resolve_apply_action(pending.kind, installer_filename.as_deref()).to_string();
+    let package_size_bytes = if pending.package_size_bytes > 0 {
+        pending.package_size_bytes
+    } else {
+        pending.files.iter().map(|f| f.size_bytes).sum()
+    };
+    let release_url = pending.release_url.or_else(|| {
+        let repo_clean = default_release_repo.trim().trim_matches('/');
+        if repo_clean.is_empty() {
+            return None;
+        }
+        let candidate = format!("https://github.com/{repo_clean}/releases/latest");
+        catcloud_core::updater::validate_https_url(&candidate)
+            .ok()
+            .map(|_| candidate)
+    });
+    let dismissed_in_session =
+        catcloud_core::updater::is_version_skipped(&pending.target_version, dismissed_version);
+
+    Some(PendingUpdatePromptDto {
+        current_version: current_version.to_string(),
+        target_version: pending.target_version,
+        kind: staged_update_kind_str(pending.kind).to_string(),
+        apply_action,
+        archive_sha256: pending.archive_sha256,
+        package_size_bytes,
+        staged_at: pending.staged_at,
+        release_notes: pending.release_notes,
+        release_url,
+        platform_key: pending.platform_key,
+        installer_filename,
+        dismissed_in_session,
+        is_elevated,
+    })
+}
+
+async fn persist_last_update_check_time_core(state: &AppState, checked_at: &str) {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let updated_cfg = if let Ok(mut guard) = state.config.write() {
         guard.update.last_checked_at = Some(checked_at.to_string());
         guard.clone()
@@ -16232,8 +16534,215 @@ fn persist_last_update_check_time(app: &AppHandle, state: &AppState, checked_at:
         fallback.update.last_checked_at = Some(checked_at.to_string());
         fallback
     };
-    let _ = config::save(&state.paths, &updated_cfg);
+    if let Err(err) = config::save(&state.paths, &updated_cfg) {
+        tracing::warn!("failed to persist update last_checked_at: {err}");
+    }
+}
+
+async fn persist_last_update_check_time(app: &AppHandle, state: &AppState, checked_at: &str) {
+    persist_last_update_check_time_core(state, checked_at).await;
     emit_runtime_snapshot(app, state);
+}
+
+struct UpdateDownloadCancelGuard<'a> {
+    slot: &'a Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+}
+
+impl<'a> UpdateDownloadCancelGuard<'a> {
+    fn register(
+        slot: &'a Mutex<Option<tokio::sync::watch::Sender<bool>>>,
+    ) -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(tx);
+        }
+        (Self { slot }, rx)
+    }
+}
+
+impl Drop for UpdateDownloadCancelGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.slot.lock() {
+            *guard = None;
+        }
+    }
+}
+
+struct TempFileCleanupGuard(PathBuf);
+
+impl Drop for TempFileCleanupGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct ApplyInProgressGuard<'a> {
+    flag: &'a AtomicBool,
+    release_on_drop: bool,
+}
+
+impl<'a> ApplyInProgressGuard<'a> {
+    fn acquire(flag: &'a AtomicBool) -> Result<Self, String> {
+        if flag
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err("更新流程正在执行中，请勿重复点击".to_string());
+        }
+        Ok(Self {
+            flag,
+            release_on_drop: true,
+        })
+    }
+
+    fn keep_locked(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for ApplyInProgressGuard<'_> {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.flag.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+fn should_abort_stage_due_to_skip(
+    silent_background: bool,
+    target_version: &str,
+    initial_skipped_version: Option<&str>,
+    current_skipped_version: Option<&str>,
+) -> bool {
+    if !catcloud_core::updater::is_version_skipped(target_version, current_skipped_version) {
+        return false;
+    }
+    if silent_background {
+        return true;
+    }
+    // Manual download: only abort if `skipped_version` was concurrently modified after
+    // the download started (meaning the user explicitly clicked Skip mid-download).
+    current_skipped_version != initial_skipped_version
+}
+
+/// Clear a previously skipped version when a manual download commits that version.
+/// Caller MUST hold `state.config_transition_lock` (and, during staging commit, also
+/// `state.update_staging_lock` in `config_transition_lock -> update_staging_lock` order).
+fn clear_skipped_for_manual_download_locked(
+    state: &AppState,
+    target_version: &str,
+) -> Result<Option<AppConfig>, String> {
+    if let Ok(mut dismissed_guard) = state.dismissed_update_prompt_version.write() {
+        if catcloud_core::updater::is_version_skipped(target_version, dismissed_guard.as_deref()) {
+            *dismissed_guard = None;
+        }
+    }
+    let mut next_cfg = state.snapshot_config();
+    if !catcloud_core::updater::is_version_skipped(
+        target_version,
+        next_cfg.update.skipped_version.as_deref(),
+    ) {
+        return Ok(None);
+    }
+    next_cfg.update.skipped_version = None;
+    config::save(&state.paths, &next_cfg)
+        .map_err(|e| format!("清除已跳过版本设置失败：{e}"))?;
+    if let Ok(mut guard) = state.config.write() {
+        *guard = next_cfg.clone();
+    }
+    state.bump_config_generation();
+    if let Ok(mut dismissed_guard) = state.dismissed_update_prompt_version.write() {
+        *dismissed_guard = None;
+    }
+    Ok(Some(next_cfg))
+}
+
+enum CommitStagedOutcome {
+    Staged {
+        metadata: catcloud_core::updater::PendingUpdateMetadata,
+        cleared_config: Option<AppConfig>,
+    },
+    Skipped,
+    ShuttingDown,
+}
+
+struct CommitStagedError {
+    message: String,
+    cleared_config: Option<AppConfig>,
+}
+
+async fn commit_staged_update_atomically<F>(
+    state: &AppState,
+    silent_background: bool,
+    initial_skipped_version: Option<&str>,
+    target_version: &str,
+    stage_fn: F,
+) -> Result<CommitStagedOutcome, CommitStagedError>
+where
+    F: FnOnce() -> Result<catcloud_core::updater::PendingUpdateMetadata, String> + Send + 'static,
+{
+    // Strictly follow global lock ordering:
+    // `config_transition_lock` (manual mode only) -> `update_staging_lock`.
+    let _cfg_guard = if silent_background {
+        None
+    } else {
+        Some(state.config_transition_lock.lock().await)
+    };
+    let _staging_guard = state.update_staging_lock.lock().await;
+
+    if state.shutting_down.load(Ordering::SeqCst) {
+        return Ok(CommitStagedOutcome::ShuttingDown);
+    }
+
+    let current_skipped = state.snapshot_config().update.skipped_version;
+    if should_abort_stage_due_to_skip(
+        silent_background,
+        target_version,
+        initial_skipped_version,
+        current_skipped.as_deref(),
+    ) {
+        return Ok(CommitStagedOutcome::Skipped);
+    }
+
+    let cleared_config = if !silent_background {
+        clear_skipped_for_manual_download_locked(state, target_version).map_err(|message| {
+            CommitStagedError {
+                message,
+                cleared_config: None,
+            }
+        })?
+    } else {
+        None
+    };
+
+    let metadata = tokio::task::spawn_blocking(stage_fn)
+        .await
+        .map_err(|e| CommitStagedError {
+            message: format!("写入校验更新包任务异常中止：{e}"),
+            cleared_config: cleared_config.clone(),
+        })?
+        .map_err(|message| CommitStagedError {
+            message,
+            cleared_config: cleared_config.clone(),
+        })?;
+
+    Ok(CommitStagedOutcome::Staged {
+        metadata,
+        cleared_config,
+    })
+}
+
+fn reconcile_check_result_staged_version(
+    staged_version: Option<String>,
+    final_skipped: bool,
+    stage_branch_skipped: bool,
+    final_skipped_version: Option<&str>,
+) -> Option<String> {
+    if final_skipped || stage_branch_skipped {
+        return None;
+    }
+    staged_version
+        .filter(|ver| !catcloud_core::updater::is_version_skipped(ver, final_skipped_version))
 }
 
 async fn resolve_expected_archive_sha256(
@@ -16279,10 +16788,16 @@ async fn resolve_expected_archive_sha256(
     catcloud_core::updater::resolve_asset_sha256(asset, Some(&sums_map)).ok()
 }
 
-/// Download, SHA256-verify, and stage a portable update archive from an already-fetched manifest.
-/// Caller MUST hold `state.update_staging_lock`.
+/// Download, SHA256-verify, and stage an update archive or installer from an already-fetched manifest.
+///
+/// Lock discipline (global lock ordering: `update_download_lock` -> `config_transition_lock` -> `update_staging_lock`):
+/// - Serializes downloads via `state.update_download_lock` ONLY.
+/// - NEVER holds `state.config_transition_lock` or `state.update_staging_lock` during network I/O.
+/// - Streams into `root_data_dir/.update_download.tmp` with live cancel listening, then acquires
+///   `config_transition_lock` (manual mode only) -> `update_staging_lock` strictly for the atomic
+///   skip-state check/clear + disk verification/commit step.
 #[allow(clippy::too_many_arguments)]
-async fn stage_update_from_manifest_locked(
+async fn stage_update_from_manifest(
     app: &AppHandle,
     state: &AppState,
     updater: &Updater,
@@ -16293,6 +16808,9 @@ async fn stage_update_from_manifest_locked(
     release_url: &str,
     silent_background: bool,
 ) -> Result<serde_json::Value, String> {
+    let _download_guard = state.update_download_lock.lock().await;
+    let initial_skipped_version = state.snapshot_config().update.skipped_version;
+
     let can_auto_stage =
         resolve_can_auto_stage_for_manifest(is_portable_install, platform_key, Some(&res.manifest));
     let download_url = platform_key
@@ -16303,6 +16821,7 @@ async fn stage_update_from_manifest_locked(
         return Ok(serde_json::json!({
             "staged": false,
             "reused": false,
+            "skipped": false,
             "already_latest": true,
             "can_auto_stage": can_auto_stage,
             "current_version": res.current_version,
@@ -16330,6 +16849,7 @@ async fn stage_update_from_manifest_locked(
         return Ok(serde_json::json!({
             "staged": false,
             "reused": false,
+            "skipped": false,
             "already_latest": false,
             "can_auto_stage": false,
             "current_version": res.current_version,
@@ -16344,14 +16864,14 @@ async fn stage_update_from_manifest_locked(
     };
 
     if !can_auto_stage {
-        let guide_msg = if cfg!(target_os = "windows") {
+        let guide_msg = if is_portable_install {
             format!(
-                "当前为安装版或未提供便携 ZIP 更新包，请前往官方 Release 页面下载 v{} 安装包",
+                "当前便携版清单未提供 ZIP 更新包，请前往官方 Release 页面下载 v{} 更新包",
                 res.latest_version
             )
         } else {
             format!(
-                "当前平台（{key}）请前往官方 Release 页面下载 v{} 安装包完成更新",
+                "当前平台（{key}）清单暂未提供受支持的安装包格式，请前往官方 Release 页面下载 v{} 安装包",
                 res.latest_version
             )
         };
@@ -16361,6 +16881,7 @@ async fn stage_update_from_manifest_locked(
         return Ok(serde_json::json!({
             "staged": false,
             "reused": false,
+            "skipped": false,
             "already_latest": false,
             "can_auto_stage": false,
             "current_version": res.current_version,
@@ -16374,90 +16895,379 @@ async fn stage_update_from_manifest_locked(
         }));
     }
 
+    if silent_background
+        && catcloud_core::updater::is_version_skipped(
+            &res.latest_version,
+            state.snapshot_config().update.skipped_version.as_deref(),
+        )
+    {
+        return Ok(serde_json::json!({
+            "staged": false,
+            "reused": false,
+            "skipped": true,
+            "already_latest": false,
+            "can_auto_stage": true,
+            "current_version": res.current_version,
+            "latest_version": res.latest_version,
+            "target_version": res.latest_version,
+            "archive_sha256": null,
+            "platform_key": Some(key),
+            "release_url": release_url,
+            "download_url": download_url,
+            "message": format!("已跳过 v{}，不再后台预下载", res.latest_version),
+        }));
+    }
+
     let expected_sha = resolve_expected_archive_sha256(updater, &res.manifest, asset).await;
-    if state.paths.staging_dir.exists() {
-        match catcloud_core::updater::verify_staged_payload_integrity(&state.paths.staging_dir) {
-            Ok(existing) => {
-                let version_matches = existing.target_version == res.latest_version;
-                let sha_matches = expected_sha
-                    .as_deref()
-                    .is_some_and(|exp| existing.archive_sha256.eq_ignore_ascii_case(exp));
-                if version_matches && sha_matches {
-                    let msg = format!(
-                        "v{} 更新包已在本地完成校验，下次重启猫猫云梯时自动生效",
-                        existing.target_version
-                    );
-                    if !silent_background {
-                        state.log_app_event("info", "软件更新", &msg);
+    let expected_kind = expected_staged_kind_for_install(is_portable_install);
+
+    enum ExistingStageProbe {
+        None,
+        Reuse(catcloud_core::updater::PendingUpdateMetadata),
+        PurgedMismatch(String),
+        PurgedCorrupt(String),
+    }
+
+    let probe = {
+        let _staging_guard = state.update_staging_lock.lock().await;
+        let staging_dir = state.paths.staging_dir.clone();
+        let latest_ver = res.latest_version.clone();
+        let exp_sha = expected_sha.clone();
+        tokio::task::spawn_blocking(move || {
+            if !staging_dir.exists() {
+                return ExistingStageProbe::None;
+            }
+            match catcloud_core::updater::verify_staged_payload_integrity(&staging_dir) {
+                Ok(existing) => {
+                    let kind_matches = existing.kind == expected_kind;
+                    let version_matches = existing.target_version == latest_ver;
+                    let sha_matches = exp_sha
+                        .as_deref()
+                        .is_some_and(|exp| existing.archive_sha256.eq_ignore_ascii_case(exp));
+                    if kind_matches && version_matches && sha_matches {
+                        ExistingStageProbe::Reuse(existing)
+                    } else if !kind_matches || (version_matches && exp_sha.is_some() && !sha_matches)
+                    {
+                        let ver_label = existing.target_version.clone();
+                        let _ = catcloud_core::updater::purge_staged_update(&staging_dir);
+                        ExistingStageProbe::PurgedMismatch(ver_label)
+                    } else {
+                        ExistingStageProbe::None
                     }
+                }
+                Err(err) => {
+                    let _ = catcloud_core::updater::purge_staged_update(&staging_dir);
+                    ExistingStageProbe::PurgedCorrupt(err.to_string())
+                }
+            }
+        })
+        .await
+        .unwrap_or(ExistingStageProbe::None)
+    };
+
+    match probe {
+        ExistingStageProbe::Reuse(existing) => {
+            if silent_background {
+                if should_abort_stage_due_to_skip(
+                    true,
+                    &existing.target_version,
+                    initial_skipped_version.as_deref(),
+                    state.snapshot_config().update.skipped_version.as_deref(),
+                ) {
                     return Ok(serde_json::json!({
-                        "staged": true,
-                        "reused": true,
+                        "staged": false,
+                        "reused": false,
+                        "skipped": true,
                         "already_latest": false,
                         "can_auto_stage": true,
                         "current_version": res.current_version,
                         "latest_version": res.latest_version,
                         "target_version": existing.target_version,
-                        "archive_sha256": existing.archive_sha256,
+                        "archive_sha256": null,
                         "platform_key": Some(key),
                         "release_url": release_url,
                         "download_url": download_url,
-                        "message": msg,
+                        "message": format!("已跳过 v{}，不再后台预下载", existing.target_version),
                     }));
                 }
-                if version_matches && expected_sha.is_some() && !sha_matches {
-                    state.log_app_event(
-                        "warning",
-                        "软件更新",
-                        &format!(
-                            "检测到本地预置的 v{} 更新包摘要与最新清单不一致，已清理缓存并重新下载校验",
-                            existing.target_version
-                        ),
-                    );
-                    let _ = std::fs::remove_dir_all(&state.paths.staging_dir);
+            } else {
+                let reuse_clear_outcome = {
+                    let _cfg_guard = state.config_transition_lock.lock().await;
+                    let _staging_guard = state.update_staging_lock.lock().await;
+                    let current_skipped = state.snapshot_config().update.skipped_version;
+                    if should_abort_stage_due_to_skip(
+                        false,
+                        &existing.target_version,
+                        initial_skipped_version.as_deref(),
+                        current_skipped.as_deref(),
+                    ) {
+                        None
+                    } else {
+                        Some(clear_skipped_for_manual_download_locked(
+                            state,
+                            &existing.target_version,
+                        )?)
+                    }
+                };
+                match reuse_clear_outcome {
+                    None => {
+                        return Ok(serde_json::json!({
+                            "staged": false,
+                            "reused": false,
+                            "skipped": true,
+                            "already_latest": false,
+                            "can_auto_stage": true,
+                            "current_version": res.current_version,
+                            "latest_version": res.latest_version,
+                            "target_version": existing.target_version,
+                            "archive_sha256": null,
+                            "platform_key": Some(key),
+                            "release_url": release_url,
+                            "download_url": download_url,
+                            "message": format!("已跳过 v{}，已取消复用更新包", existing.target_version),
+                        }));
+                    }
+                    Some(Some(updated_cfg)) => {
+                        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&updated_cfg));
+                        emit_runtime_snapshot(app, state);
+                    }
+                    Some(None) => {}
                 }
             }
-            Err(err) => {
-                state.log_app_event(
-                    "warning",
-                    "软件更新",
-                    &format!("检测到本地预置更新包损坏或缺失（{err}），已清理并重新下载"),
-                );
-                let _ = std::fs::remove_dir_all(&state.paths.staging_dir);
+            let msg = format!(
+                "v{} 更新包已在本地完成校验，可立即重启应用或启动安装更新",
+                existing.target_version
+            );
+            if !silent_background {
+                state.log_app_event("info", "软件更新", &msg);
             }
+            return Ok(serde_json::json!({
+                "staged": true,
+                "reused": true,
+                "skipped": false,
+                "already_latest": false,
+                "can_auto_stage": true,
+                "current_version": res.current_version,
+                "latest_version": res.latest_version,
+                "target_version": existing.target_version,
+                "archive_sha256": existing.archive_sha256,
+                "platform_key": Some(key),
+                "release_url": release_url,
+                "download_url": download_url,
+                "message": msg,
+            }));
         }
+        ExistingStageProbe::PurgedMismatch(ver_label) => {
+            state.log_app_event(
+                "warning",
+                "软件更新",
+                &format!(
+                    "检测到本地预置的 v{ver_label} 更新包摘要或安装形态与最新清单不一致，已清理缓存并重新下载校验"
+                ),
+            );
+        }
+        ExistingStageProbe::PurgedCorrupt(err) => {
+            state.log_app_event(
+                "warning",
+                "软件更新",
+                &format!("检测到本地预置更新包损坏或缺失（{err}），已清理并重新下载"),
+            );
+        }
+        ExistingStageProbe::None => {}
     }
 
     if state.shutting_down.load(Ordering::SeqCst) {
         return Err("应用正在退出，已取消更新包下载".to_string());
     }
 
+    let pkg_label = if is_portable_install {
+        "便携更新包"
+    } else {
+        "安装包"
+    };
     state.log_app_event(
         "info",
         "软件更新",
         &format!(
-            "{}下载并校验 v{} 便携更新包（平台：{key}）",
+            "{}下载并校验 v{} {pkg_label}（平台：{key}）",
             if silent_background { "后台自动" } else { "开始" },
             res.latest_version
         ),
     );
 
-    let staged = updater
-        .download_and_stage(&res.manifest, key, &state.paths.staging_dir)
+    let (cancel_guard, cancel_rx) =
+        UpdateDownloadCancelGuard::register(&state.update_download_cancel);
+
+    if should_abort_stage_due_to_skip(
+        silent_background,
+        &res.latest_version,
+        initial_skipped_version.as_deref(),
+        state.snapshot_config().update.skipped_version.as_deref(),
+    ) {
+        drop(cancel_guard);
+        return Ok(serde_json::json!({
+            "staged": false,
+            "reused": false,
+            "skipped": true,
+            "already_latest": false,
+            "can_auto_stage": true,
+            "current_version": res.current_version,
+            "latest_version": res.latest_version,
+            "target_version": res.latest_version,
+            "archive_sha256": null,
+            "platform_key": Some(key),
+            "release_url": release_url,
+            "download_url": download_url,
+            "message": format!("已跳过 v{}，已取消更新包下载", res.latest_version),
+        }));
+    }
+
+    let temp_file_path = state.paths.root_data_dir.join(".update_download.tmp");
+    let temp_cleanup = TempFileCleanupGuard(temp_file_path.clone());
+
+    let downloaded = match updater
+        .download_asset_to_temp_file(&res.manifest, key, &temp_file_path, Some(cancel_rx))
         .await
-        .map_err(|e| {
+    {
+        Ok(dl) => dl,
+        Err(e) => {
+            drop(cancel_guard);
+            drop(temp_cleanup);
+            if should_abort_stage_due_to_skip(
+                silent_background,
+                &res.latest_version,
+                initial_skipped_version.as_deref(),
+                state.snapshot_config().update.skipped_version.as_deref(),
+            ) {
+                return Ok(serde_json::json!({
+                    "staged": false,
+                    "reused": false,
+                    "skipped": true,
+                    "already_latest": false,
+                    "can_auto_stage": true,
+                    "current_version": res.current_version,
+                    "latest_version": res.latest_version,
+                    "target_version": res.latest_version,
+                    "archive_sha256": null,
+                    "platform_key": Some(key),
+                    "release_url": release_url,
+                    "download_url": download_url,
+                    "message": format!("已跳过 v{}，已中止更新包下载", res.latest_version),
+                }));
+            }
             let err_msg = format!("下载或校验 v{} 更新包失败：{e}", res.latest_version);
+            if !state.shutting_down.load(Ordering::SeqCst) {
+                state.log_app_event(
+                    if silent_background { "warning" } else { "error" },
+                    "软件更新",
+                    &err_msg,
+                );
+            }
+            return Err(err_msg);
+        }
+    };
+    drop(cancel_guard);
+
+    let staging_dir = state.paths.staging_dir.clone();
+    let temp_path_for_stage = temp_file_path.clone();
+    let expected_sha_owned = downloaded.expected_sha256.clone();
+    let filename_owned = downloaded.filename.clone();
+    let current_ver_owned = res.current_version.clone();
+    let target_ver_owned = downloaded.target_version.clone();
+    let notes_owned = if res.notes.trim().is_empty() {
+        downloaded.release_notes.clone()
+    } else {
+        res.notes.clone()
+    };
+    let release_url_owned = Some(release_url.to_string());
+    let platform_key_owned = Some(key.to_string());
+
+    let commit_outcome = commit_staged_update_atomically(
+        state,
+        silent_background,
+        initial_skipped_version.as_deref(),
+        &downloaded.target_version,
+        move || {
+            if is_portable_install {
+                let zip_bytes = std::fs::read(&temp_path_for_stage)
+                    .map_err(|e| format!("读取临时便携更新包失败：{e}"))?;
+                catcloud_core::updater::stage_verified_archive_with_meta(
+                    &zip_bytes,
+                    &expected_sha_owned,
+                    &current_ver_owned,
+                    &target_ver_owned,
+                    &notes_owned,
+                    release_url_owned.as_deref(),
+                    platform_key_owned.as_deref(),
+                    &staging_dir,
+                )
+                .map_err(|e| e.to_string())
+            } else {
+                catcloud_core::updater::stage_verified_installer_file(
+                    &temp_path_for_stage,
+                    &expected_sha_owned,
+                    &filename_owned,
+                    &current_ver_owned,
+                    &target_ver_owned,
+                    &notes_owned,
+                    release_url_owned.as_deref(),
+                    platform_key_owned.as_deref(),
+                    &staging_dir,
+                )
+                .map_err(|e| e.to_string())
+            }
+        },
+    )
+    .await;
+    drop(temp_cleanup);
+
+    let (staged, cleared_config) = match commit_outcome {
+        Ok(CommitStagedOutcome::Staged {
+            metadata,
+            cleared_config,
+        }) => (metadata, cleared_config),
+        Ok(CommitStagedOutcome::Skipped) => {
+            return Ok(serde_json::json!({
+                "staged": false,
+                "reused": false,
+                "skipped": true,
+                "already_latest": false,
+                "can_auto_stage": true,
+                "current_version": res.current_version,
+                "latest_version": res.latest_version,
+                "target_version": downloaded.target_version,
+                "archive_sha256": null,
+                "platform_key": Some(key),
+                "release_url": release_url,
+                "download_url": download_url,
+                "message": format!("已跳过 v{}，已清理下载临时文件", downloaded.target_version),
+            }));
+        }
+        Ok(CommitStagedOutcome::ShuttingDown) => {
+            return Err("应用正在退出，已取消更新包写入".to_string());
+        }
+        Err(err) => {
+            if let Some(updated_cfg) = err.cleared_config {
+                let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&updated_cfg));
+                emit_runtime_snapshot(app, state);
+            }
+            let err_msg = format!("写入或校验 v{} 更新包失败：{}", res.latest_version, err.message);
             state.log_app_event(
                 if silent_background { "warning" } else { "error" },
                 "软件更新",
                 &err_msg,
             );
-            err_msg
-        })?;
+            return Err(err_msg);
+        }
+    };
+
+    if let Some(updated_cfg) = cleared_config {
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&updated_cfg));
+    }
 
     let short_sha: String = staged.archive_sha256.chars().take(12).collect();
     let ok_msg = format!(
-        "已{}下载并完成 SHA256 校验 v{}（{short_sha}），下次重启猫猫云梯时自动替换生效",
+        "已{}下载并完成 SHA256 校验 v{}（{short_sha}），可立即重启应用或启动安装更新",
         if silent_background { "在后台自动" } else { "" },
         staged.target_version
     );
@@ -16467,6 +17277,7 @@ async fn stage_update_from_manifest_locked(
     Ok(serde_json::json!({
         "staged": true,
         "reused": false,
+        "skipped": false,
         "already_latest": false,
         "can_auto_stage": true,
         "current_version": res.current_version,
@@ -16484,6 +17295,7 @@ pub(crate) async fn check_and_optionally_stage_update_internal(
     app: &AppHandle,
     state: &AppState,
     allow_auto_stage: bool,
+    is_background: bool,
 ) -> Result<serde_json::Value, String> {
     let cfg = state.snapshot_config();
     let current = env!("CARGO_PKG_VERSION").to_string();
@@ -16491,21 +17303,28 @@ pub(crate) async fn check_and_optionally_stage_update_internal(
     let repo_clean = cfg.update.repo.trim().trim_matches('/');
     let release_url = format!("https://github.com/{repo_clean}/releases/latest");
     let is_portable_install = state.paths.is_self_updatable_portable();
+    let expected_kind = expected_staged_kind_for_install(is_portable_install);
     let platform_key = catcloud_core::updater::current_update_platform_key_opt(is_portable_install);
 
     let updater = Updater::new(cfg.update.repo.clone(), current.clone())
         .map_err(|e| e.to_string())?;
     match updater.check_latest(None).await {
         Ok(res) => {
-            persist_last_update_check_time(app, state, &checked_at);
+            persist_last_update_check_time(app, state, &checked_at).await;
 
             let latest_cfg = state.snapshot_config();
+            let skipped_version = latest_cfg.update.skipped_version.clone();
             let update_available = catcloud_core::updater::is_update_available_for_channel(
                 &res.latest_version,
                 &current,
                 latest_cfg.update.include_prerelease,
             )
             .unwrap_or(false);
+            let is_skipped = update_available
+                && catcloud_core::updater::is_version_skipped(
+                    &res.latest_version,
+                    skipped_version.as_deref(),
+                );
             let can_auto_stage = resolve_can_auto_stage_for_manifest(
                 is_portable_install,
                 platform_key,
@@ -16516,21 +17335,32 @@ pub(crate) async fn check_and_optionally_stage_update_internal(
                 .map(|asset| asset.url.clone());
 
             let mut staged_version = if let Ok(_guard) = state.update_staging_lock.try_lock() {
-                resolve_staged_update_version(
-                    &state.paths.staging_dir,
-                    &current,
-                    latest_cfg.update.include_prerelease,
-                )
+                let staging_dir = state.paths.staging_dir.clone();
+                let cur = current.clone();
+                let inc_pre = latest_cfg.update.include_prerelease;
+                let skipped = skipped_version.clone();
+                tokio::task::spawn_blocking(move || {
+                    resolve_staged_update_version_checked(
+                        &staging_dir,
+                        &cur,
+                        inc_pre,
+                        skipped.as_deref(),
+                        expected_kind,
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
             } else {
                 None
             };
 
             let mut auto_staged = false;
             let mut auto_stage_reused = false;
-            if allow_auto_stage && update_available && can_auto_stage {
-                let _staging_guard = state.update_staging_lock.lock().await;
+            let mut stage_reported_skipped = false;
+            if allow_auto_stage && update_available && can_auto_stage && !is_skipped {
                 if !state.shutting_down.load(Ordering::SeqCst) {
-                    match stage_update_from_manifest_locked(
+                    match stage_update_from_manifest(
                         app,
                         state,
                         &updater,
@@ -16539,12 +17369,19 @@ pub(crate) async fn check_and_optionally_stage_update_internal(
                         is_portable_install,
                         platform_key,
                         &release_url,
-                        true,
+                        is_background,
                     )
                     .await
                     {
                         Ok(stage_val) => {
                             if stage_val
+                                .get("skipped")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false)
+                            {
+                                stage_reported_skipped = true;
+                                staged_version = None;
+                            } else if stage_val
                                 .get("staged")
                                 .and_then(|v| v.as_bool())
                                 .unwrap_or(false)
@@ -16568,8 +17405,23 @@ pub(crate) async fn check_and_optionally_stage_update_internal(
                 }
             }
 
+            let final_skipped_version = state.snapshot_config().update.skipped_version;
+            let final_skipped = update_available
+                && catcloud_core::updater::is_version_skipped(
+                    &res.latest_version,
+                    final_skipped_version.as_deref(),
+                );
+            let staged_version = reconcile_check_result_staged_version(
+                staged_version,
+                final_skipped,
+                stage_reported_skipped,
+                final_skipped_version.as_deref(),
+            );
+
             Ok(serde_json::json!({
                 "has_update": update_available,
+                "skipped": final_skipped,
+                "skipped_version": final_skipped_version,
                 "current_version": res.current_version,
                 "latest_version": res.latest_version,
                 "release_url": release_url,
@@ -16585,17 +17437,31 @@ pub(crate) async fn check_and_optionally_stage_update_internal(
             }))
         }
         Err(err) => {
+            let skipped_version = cfg.update.skipped_version.clone();
             let staged_version = if let Ok(_guard) = state.update_staging_lock.try_lock() {
-                resolve_staged_update_version(
-                    &state.paths.staging_dir,
-                    &current,
-                    cfg.update.include_prerelease,
-                )
+                let staging_dir = state.paths.staging_dir.clone();
+                let cur = current.clone();
+                let inc_pre = cfg.update.include_prerelease;
+                let skipped = skipped_version.clone();
+                tokio::task::spawn_blocking(move || {
+                    resolve_staged_update_version_checked(
+                        &staging_dir,
+                        &cur,
+                        inc_pre,
+                        skipped.as_deref(),
+                        expected_kind,
+                    )
+                })
+                .await
+                .ok()
+                .flatten()
             } else {
                 None
             };
             Ok(serde_json::json!({
                 "has_update": false,
+                "skipped": false,
+                "skipped_version": skipped_version,
                 "current_version": current,
                 "latest_version": current,
                 "release_url": release_url,
@@ -16617,7 +17483,6 @@ pub(crate) async fn download_and_stage_update_internal(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<serde_json::Value, String> {
-    let _staging_guard = state.update_staging_lock.lock().await;
     if state.shutting_down.load(Ordering::SeqCst) {
         return Err("应用正在退出，已取消下载更新".to_string());
     }
@@ -16638,7 +17503,7 @@ pub(crate) async fn download_and_stage_update_internal(
         msg
     })?;
 
-    persist_last_update_check_time(app, state, &checked_at);
+    persist_last_update_check_time(app, state, &checked_at).await;
 
     let latest_cfg = state.snapshot_config();
     let update_available = catcloud_core::updater::is_update_available_for_channel(
@@ -16648,7 +17513,7 @@ pub(crate) async fn download_and_stage_update_internal(
     )
     .unwrap_or(false);
 
-    stage_update_from_manifest_locked(
+    stage_update_from_manifest(
         app,
         state,
         &updater,
@@ -16667,7 +17532,7 @@ pub async fn check_app_update(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    check_and_optionally_stage_update_internal(&app, &state, false).await
+    check_and_optionally_stage_update_internal(&app, &state, false, false).await
 }
 
 #[tauri::command]
@@ -16676,6 +17541,552 @@ pub async fn download_and_stage_update(
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
     download_and_stage_update_internal(&app, &state).await
+}
+
+pub(crate) async fn get_pending_staged_update_internal(
+    state: &AppState,
+) -> Result<Option<PendingUpdatePromptDto>, String> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let is_portable = state.paths.is_self_updatable_portable();
+    let expected_kind = expected_staged_kind_for_install(is_portable);
+    let staging_dir = state.paths.staging_dir.clone();
+    let is_elevated = default_platform().capabilities().is_elevated;
+
+    // Acquire `update_staging_lock` BEFORE reading config/dismissed state so this reader can
+    // never observe a stale pre-clear `skipped_version` paired with a newly committed package.
+    let _staging_guard = state.update_staging_lock.lock().await;
+    let cfg = state.snapshot_config();
+    let include_prerelease = cfg.update.include_prerelease;
+    let skipped_version = cfg.update.skipped_version.clone();
+    let default_repo = cfg.update.repo.clone();
+    let dismissed_version = state
+        .dismissed_update_prompt_version
+        .read()
+        .ok()
+        .and_then(|g| g.clone());
+
+    tokio::task::spawn_blocking(move || {
+        inspect_and_reconcile_staged_update(
+            &staging_dir,
+            &current_version,
+            include_prerelease,
+            skipped_version.as_deref(),
+            expected_kind,
+            dismissed_version.as_deref(),
+            &default_repo,
+            is_elevated,
+        )
+    })
+    .await
+    .map_err(|e| format!("检查本地预下载更新包任务异常中止：{e}"))
+}
+
+#[tauri::command]
+pub async fn get_pending_staged_update(
+    state: State<'_, AppState>,
+) -> Result<Option<PendingUpdatePromptDto>, String> {
+    get_pending_staged_update_internal(&state).await
+}
+
+fn dismiss_update_prompt_for_session_state(
+    state: &AppState,
+    version: &str,
+) -> Result<bool, String> {
+    let norm = catcloud_core::updater::normalize_semver_version(version)
+        .map_err(|e| format!("版本号格式无效：{e}"))?;
+    let mut guard = state
+        .dismissed_update_prompt_version
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    let should_update = match guard.as_deref() {
+        Some(existing) => !catcloud_core::updater::is_version_skipped(&norm, Some(existing)),
+        None => true,
+    };
+    if should_update {
+        *guard = Some(norm);
+    }
+    Ok(true)
+}
+
+#[tauri::command]
+pub fn dismiss_update_prompt_for_session(
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<bool, String> {
+    dismiss_update_prompt_for_session_state(&state, &version)
+}
+
+async fn skip_update_version_core(
+    state: &AppState,
+    version: &str,
+) -> Result<(SkipUpdateResultDto, AppConfig), String> {
+    let norm = catcloud_core::updater::normalize_semver_version(version)
+        .map_err(|e| format!("版本号格式无效：{e}"))?;
+
+    // 1. Cancel any in-flight update package download immediately.
+    state.cancel_in_flight_update_download();
+
+    // 2. Strictly follow global lock ordering: `config_transition_lock` -> `update_staging_lock`.
+    let (next_cfg, purge_outcome) = {
+        let _cfg_guard = state.config_transition_lock.lock().await;
+        let mut next_cfg = state.snapshot_config();
+        next_cfg.update.skipped_version = Some(norm.clone());
+        config::save(&state.paths, &next_cfg)
+            .map_err(|e| format!("保存跳过版本设置失败：{e}"))?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = next_cfg.clone();
+        }
+        state.bump_config_generation();
+
+        let purge_outcome = {
+            let _staging_guard = state.update_staging_lock.lock().await;
+            let staging_dir = state.paths.staging_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                catcloud_core::updater::purge_staged_update(&staging_dir)
+            })
+            .await
+            .map_err(|e| format!("清理预下载更新包任务异常中止：{e}"))?
+            .map_err(|e| format!("删除已预下载更新包失败：{e}"))?
+        };
+
+        if let Ok(mut dismissed_guard) = state.dismissed_update_prompt_version.write() {
+            *dismissed_guard = None;
+        }
+        (next_cfg, purge_outcome)
+    };
+
+    let message = if purge_outcome.removed {
+        let mb = (purge_outcome.freed_bytes as f64) / (1024.0 * 1024.0);
+        format!("已跳过 v{norm}，并彻底删除已预下载更新包（释放 {mb:.1} MB 磁盘空间）")
+    } else {
+        format!("已跳过 v{norm}，此版本将不再自动预下载或弹窗提醒")
+    };
+    state.log_app_event("info", "软件更新", &message);
+
+    Ok((
+        SkipUpdateResultDto {
+            skipped_version: norm,
+            purged_staged: purge_outcome.removed,
+            freed_bytes: purge_outcome.freed_bytes,
+            message,
+        },
+        next_cfg,
+    ))
+}
+
+#[tauri::command]
+pub async fn skip_update_version(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    version: String,
+) -> Result<SkipUpdateResultDto, String> {
+    let (result, next_cfg) = skip_update_version_core(&state, &version).await?;
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&next_cfg));
+    emit_runtime_snapshot(&app, &state);
+    Ok(result)
+}
+
+async fn clear_skipped_update_version_core(state: &AppState) -> Result<AppConfig, String> {
+    let (next_cfg, prev_skipped) = {
+        let _cfg_guard = state.config_transition_lock.lock().await;
+        let mut next_cfg = state.snapshot_config();
+        let prev = next_cfg.update.skipped_version.take();
+        config::save(&state.paths, &next_cfg)
+            .map_err(|e| format!("取消跳过版本保存失败：{e}"))?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = next_cfg.clone();
+        }
+        state.bump_config_generation();
+        if let Ok(mut dismissed_guard) = state.dismissed_update_prompt_version.write() {
+            *dismissed_guard = None;
+        }
+        (next_cfg, prev)
+    };
+
+    if let Some(prev) = prev_skipped {
+        state.log_app_event(
+            "info",
+            "软件更新",
+            &format!("已取消跳过 v{prev}，后续将恢复该版本的更新提醒"),
+        );
+    }
+
+    Ok(next_cfg)
+}
+
+#[tauri::command]
+pub async fn clear_skipped_update_version(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<bool, String> {
+    let next_cfg = clear_skipped_update_version_core(&state).await?;
+    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&next_cfg));
+    emit_runtime_snapshot(&app, &state);
+    Ok(true)
+}
+
+fn collect_portable_update_relaunch_args(raw_args: &[std::ffi::OsString]) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in raw_args {
+        let s = raw.to_string_lossy();
+        if matches!(
+            s.as_ref(),
+            "--silent"
+                | "--restarting"
+                | "--post-update-cleanup"
+                | "--apply-staged-update"
+                | "--enable-tun"
+                | "--enable-global-preaccel"
+        ) {
+            continue;
+        }
+        out.push(s.into_owned());
+    }
+    out.push("--apply-staged-update".to_string());
+    out.push("--restarting".to_string());
+    out
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn reap_or_detach_child_with_grace(
+    mut child: std::process::Child,
+    grace: Duration,
+    fail_prefix: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let code_desc = status
+                    .code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "信号中止".to_string());
+                return Err(format!("{fail_prefix}（退出码：{code_desc}）"));
+            }
+            Ok(None) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                let remaining = deadline.saturating_duration_since(now);
+                std::thread::sleep(remaining.min(Duration::from_millis(25)));
+            }
+            Err(err) => {
+                return Err(format!("{fail_prefix}（检查进程状态失败：{err}）"));
+            }
+        }
+    }
+    // Hand still-running child ownership to a background reaper thread so it never becomes
+    // a `<defunct>` zombie process on Linux.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn apply_staged_update_and_restart(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ApplyUpdateRestartResultDto, String> {
+    let apply_guard = ApplyInProgressGuard::acquire(&state.update_apply_in_progress)?;
+
+    let is_portable = state.paths.is_self_updatable_portable();
+    let expected_kind = expected_staged_kind_for_install(is_portable);
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let include_prerelease = state.snapshot_config().update.include_prerelease;
+    let staging_dir = state.paths.staging_dir.clone();
+
+    // Perform full SHA-256 + anti-downgrade + install-kind re-verification under a short
+    // `update_staging_lock` BEFORE launching anything; never hold the lock while spawning/exiting.
+    let verified = {
+        let _staging_guard = state.update_staging_lock.lock().await;
+        tokio::task::spawn_blocking(
+            move || -> Result<catcloud_core::updater::PendingUpdateMetadata, String> {
+                if !staging_dir.exists() {
+                    return Err("未找到已预下载的更新包，请先重新检查并下载更新".to_string());
+                }
+                let pending = catcloud_core::updater::verify_staged_payload_integrity(&staging_dir)
+                    .map_err(|e| {
+                        let _ = catcloud_core::updater::purge_staged_update(&staging_dir);
+                        format!("本地预下载更新包完整性校验未通过，已自动清理，请重新下载：{e}")
+                    })?;
+                if pending.kind != expected_kind {
+                    let _ = catcloud_core::updater::purge_staged_update(&staging_dir);
+                    return Err(
+                        "本地预下载更新包与当前安装形态不匹配，已自动清理，请重新下载"
+                            .to_string(),
+                    );
+                }
+                if !catcloud_core::updater::is_update_available_for_channel(
+                    &pending.target_version,
+                    &current_version,
+                    include_prerelease,
+                )
+                .unwrap_or(false)
+                {
+                    let _ = catcloud_core::updater::purge_staged_update(&staging_dir);
+                    return Err(format!(
+                        "预下载版本 v{} 不高于当前版本 v{}，已自动清理",
+                        pending.target_version, current_version
+                    ));
+                }
+                Ok(pending)
+            },
+        )
+        .await
+        .map_err(|e| format!("更新包二次校验任务异常中止：{e}"))??
+    };
+
+    let kind_str = staged_update_kind_str(verified.kind).to_string();
+    let installer_filename = extract_installer_filename(&verified);
+    let apply_action =
+        resolve_apply_action(verified.kind, installer_filename.as_deref()).to_string();
+    let target_version = verified.target_version.clone();
+
+    match verified.kind {
+        catcloud_core::updater::StagedUpdateKind::PortableZip => {
+            let exe = std::env::current_exe()
+                .map_err(|e| format!("无法获取当前程序路径：{e}"))?;
+            let app_root = exe
+                .parent()
+                .map(|p| p.to_path_buf())
+                .ok_or_else(|| "无法定位当前程序所在目录".to_string())?;
+            let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+            let args = collect_portable_update_relaunch_args(&raw_args);
+            let exe_clone = exe.clone();
+            let app_root_clone = app_root.clone();
+            tokio::task::spawn_blocking(move || {
+                catcloud_core::process_guard::spawn_detached_self(
+                    &exe_clone,
+                    &args,
+                    &app_root_clone,
+                )
+            })
+            .await
+            .map_err(|e| format!("拉起重启更新进程任务异常中止：{e}"))?
+            .map_err(|e| format!("拉起重启更新进程失败：{e}"))?;
+
+            let msg = format!("已拉起 v{target_version} 便携更新换轨进程，应用即将优雅退出并重启");
+            state.log_app_event("info", "软件更新", &msg);
+
+            apply_guard.keep_locked();
+            let app_exit = app.clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                lifecycle::request_graceful_exit(&app_exit);
+            });
+
+            Ok(ApplyUpdateRestartResultDto {
+                started: true,
+                exiting: true,
+                cancelled: false,
+                kind: kind_str,
+                apply_action,
+                target_version,
+                message: msg,
+            })
+        }
+        catcloud_core::updater::StagedUpdateKind::InstallerPackage => {
+            let rel = verified
+                .installer_rel_path
+                .as_deref()
+                .ok_or_else(|| "安装包元数据缺少安装文件路径".to_string())?;
+            let mut installer_path = state.paths.staging_dir.clone();
+            for seg in rel.replace('\\', "/").split('/') {
+                if !seg.is_empty() {
+                    installer_path.push(seg);
+                }
+            }
+            if !installer_path.is_file() {
+                return Err(format!(
+                    "预下载的安装包文件不存在：{}",
+                    installer_path.display()
+                ));
+            }
+
+            #[cfg(target_os = "windows")]
+            {
+                if apply_action == "installer_launch" {
+                    let path_for_launch = installer_path.clone();
+                    let launched = tokio::task::spawn_blocking(move || {
+                        catcloud_core::process_guard::launch_windows_installer(&path_for_launch)
+                    })
+                    .await
+                    .map_err(|e| format!("启动安装向导任务异常中止：{e}"))?
+                    .map_err(|e| format!("启动安装包失败：{e}"))?;
+
+                    if !launched {
+                        let msg = "已取消安装向导授权，当前代理与连接未受影响".to_string();
+                        state.log_app_event("info", "软件更新", &msg);
+                        return Ok(ApplyUpdateRestartResultDto {
+                            started: false,
+                            exiting: false,
+                            cancelled: true,
+                            kind: kind_str,
+                            apply_action,
+                            target_version,
+                            message: msg,
+                        });
+                    }
+
+                    let msg = format!(
+                        "已启动 v{target_version} 安装向导，应用即将优雅退出以释放程序文件"
+                    );
+                    state.log_app_event("info", "软件更新", &msg);
+
+                    apply_guard.keep_locked();
+                    let app_exit = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        lifecycle::request_graceful_exit(&app_exit);
+                    });
+
+                    Ok(ApplyUpdateRestartResultDto {
+                        started: true,
+                        exiting: true,
+                        cancelled: false,
+                        kind: kind_str,
+                        apply_action,
+                        target_version,
+                        message: msg,
+                    })
+                } else {
+                    let parent_dir = installer_path
+                        .parent()
+                        .unwrap_or(state.paths.staging_dir.as_path());
+                    open_directory_in_os(parent_dir)?;
+                    let msg = format!("已打开 v{target_version} 更新包所在目录，请手动运行安装");
+                    state.log_app_event("info", "软件更新", &msg);
+                    Ok(ApplyUpdateRestartResultDto {
+                        started: true,
+                        exiting: false,
+                        cancelled: false,
+                        kind: kind_str,
+                        apply_action,
+                        target_version,
+                        message: msg,
+                    })
+                }
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let launch_installer = apply_action == "installer_launch";
+                let path_for_open = installer_path.clone();
+                let status = tokio::task::spawn_blocking(move || {
+                    let mut cmd = std::process::Command::new("open");
+                    if !launch_installer {
+                        cmd.arg("-R");
+                    }
+                    cmd.arg(&path_for_open)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                })
+                .await
+                .map_err(|e| {
+                    if launch_installer {
+                        format!("打开 macOS 安装镜像任务异常中止：{e}")
+                    } else {
+                        format!("在 Finder 中显示更新包任务异常中止：{e}")
+                    }
+                })?
+                .map_err(|e| {
+                    if launch_installer {
+                        format!("打开 macOS 安装镜像失败：{e}")
+                    } else {
+                        format!("在 Finder 中显示更新包失败：{e}")
+                    }
+                })?;
+
+                if !status.success() {
+                    let code_desc = status
+                        .code()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "信号中止".to_string());
+                    return Err(if launch_installer {
+                        format!("打开 macOS 安装镜像失败（退出码：{code_desc}）")
+                    } else {
+                        format!("在 Finder 中显示更新包失败（退出码：{code_desc}）")
+                    });
+                }
+
+                let msg = if launch_installer {
+                    format!(
+                        "已打开 v{target_version} 安装镜像，请将应用拖入「应用程序」目录完成更新"
+                    )
+                } else {
+                    format!("已在 Finder 中定位 v{target_version} 更新包，请解压并替换应用")
+                };
+                state.log_app_event("info", "软件更新", &msg);
+                Ok(ApplyUpdateRestartResultDto {
+                    started: true,
+                    exiting: false,
+                    cancelled: false,
+                    kind: kind_str,
+                    apply_action,
+                    target_version,
+                    message: msg,
+                })
+            }
+
+            #[cfg(target_os = "linux")]
+            {
+                let parent_dir = installer_path
+                    .parent()
+                    .unwrap_or(state.paths.staging_dir.as_path())
+                    .to_path_buf();
+                tokio::task::spawn_blocking(move || -> Result<(), String> {
+                    let child = std::process::Command::new("xdg-open")
+                        .arg(&parent_dir)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn()
+                        .map_err(|e| format!("打开更新包目录失败：{e}"))?;
+                    reap_or_detach_child_with_grace(
+                        child,
+                        Duration::from_millis(250),
+                        "打开更新包目录失败",
+                    )
+                })
+                .await
+                .map_err(|e| format!("打开更新包目录任务异常中止：{e}"))??;
+
+                let msg = format!(
+                    "已打开 v{target_version} 安装包所在目录，请手动完成安装替换"
+                );
+                state.log_app_event("info", "软件更新", &msg);
+                Ok(ApplyUpdateRestartResultDto {
+                    started: true,
+                    exiting: false,
+                    cancelled: false,
+                    kind: kind_str,
+                    apply_action,
+                    target_version,
+                    message: msg,
+                })
+            }
+
+            #[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+            {
+                let _ = (
+                    &app,
+                    &apply_guard,
+                    &installer_path,
+                    &kind_str,
+                    &apply_action,
+                    &target_version,
+                );
+                Err("当前平台暂不支持自动打开安装包，请前往官方下载页手动更新".to_string())
+            }
+        }
+    }
 }
 
 #[tauri::command]
@@ -19161,7 +20572,7 @@ mod tests {
             assert_eq!(current_portable_key, current_standard_key);
         }
 
-        // Verify unified `can_auto_stage` rules across `check_app_update` and `download_and_stage_update`.
+        // Verify unified `can_auto_stage` rules across portable ZIP and all-platform installers.
         let mut platforms = HashMap::new();
         platforms.insert(
             "windows-x86_64-portable".to_string(),
@@ -19183,6 +20594,26 @@ mod tests {
                 filename: Some("CatCloud-setup.exe".to_string()),
             },
         );
+        platforms.insert(
+            "darwin-aarch64".to_string(),
+            catcloud_core::updater::PlatformAsset {
+                url: "https://github.com/JuryBu/CatCloud/releases/download/v0.2.0/CatCloud_0.2.0_aarch64.dmg"
+                    .to_string(),
+                signature: None,
+                sha256: Some("c".repeat(64)),
+                filename: None,
+            },
+        );
+        platforms.insert(
+            "linux-x86_64".to_string(),
+            catcloud_core::updater::PlatformAsset {
+                url: "https://github.com/JuryBu/CatCloud/releases/download/v0.2.0/CatCloud_0.2.0_amd64.AppImage"
+                    .to_string(),
+                signature: None,
+                sha256: Some("d".repeat(64)),
+                filename: Some("CatCloud_0.2.0_amd64.AppImage".to_string()),
+            },
+        );
         let manifest = catcloud_core::updater::LatestManifest {
             version: "0.2.0".to_string(),
             notes: String::new(),
@@ -19198,11 +20629,29 @@ mod tests {
             ),
             cfg!(target_os = "windows")
         );
+        // Installer mode rejects portable `.zip` assets to prevent cross-mode confusion.
         assert!(!resolve_can_auto_stage_for_manifest(
             false,
             Some("windows-x86_64-portable"),
             Some(&manifest)
         ));
+        // Installer mode enables pre-download on Windows (.exe/.msi), macOS (.dmg), and Linux (.AppImage).
+        assert!(resolve_can_auto_stage_for_manifest(
+            false,
+            Some("windows-x86_64"),
+            Some(&manifest)
+        ));
+        assert!(resolve_can_auto_stage_for_manifest(
+            false,
+            Some("darwin-aarch64"),
+            Some(&manifest)
+        ));
+        assert!(resolve_can_auto_stage_for_manifest(
+            false,
+            Some("linux-x86_64"),
+            Some(&manifest)
+        ));
+        // Portable mode rejects non-ZIP installer assets.
         assert!(!resolve_can_auto_stage_for_manifest(
             true,
             Some("windows-x86_64"),
@@ -19247,6 +20696,12 @@ mod tests {
                 sha256: version_sha.clone(),
                 size_bytes: version_payload.len() as u64,
             }],
+            kind: catcloud_core::updater::StagedUpdateKind::PortableZip,
+            installer_rel_path: None,
+            release_notes: String::new(),
+            release_url: None,
+            platform_key: Some("windows-x86_64-portable".to_string()),
+            package_size_bytes: version_payload.len() as u64,
         };
         let bytes = serde_json::to_vec_pretty(&pending).expect("serialize pending manifest");
         std::fs::write(
@@ -21341,5 +22796,792 @@ mod tests {
         )
         .expect_err("only IPv6-only node with IPv4 relay should error");
         assert!(err.contains("IPv6"));
+    }
+
+    #[test]
+    fn stage20_apply_ui_dto_protects_skipped_version_and_latches_onboarding_completed() {
+        let mut cfg = AppConfig::default();
+        cfg.update.skipped_version = Some("0.1.1".to_string());
+        cfg.personalization.onboarding_completed = false;
+
+        let mut dto = UiAppConfigDto::from(&cfg);
+        assert_eq!(dto.update.skipped_version.as_deref(), Some("0.1.1"));
+        assert!(!dto.personalization.onboarding_completed);
+
+        // Saving UI DTO with cleared or altered `skipped_version` MUST NOT mutate `cfg.update.skipped_version`.
+        dto.update.skipped_version = None;
+        dto.personalization.onboarding_completed = true;
+        apply_ui_dto(&mut cfg, &dto);
+        assert_eq!(cfg.update.skipped_version.as_deref(), Some("0.1.1"));
+        assert!(cfg.personalization.onboarding_completed);
+
+        // Attempt to overwrite `skipped_version` or regress `onboarding_completed` back to `false` MUST be blocked.
+        dto.update.skipped_version = Some("9.9.9".to_string());
+        dto.personalization.onboarding_completed = false;
+        apply_ui_dto(&mut cfg, &dto);
+        assert_eq!(cfg.update.skipped_version.as_deref(), Some("0.1.1"));
+        assert!(
+            cfg.personalization.onboarding_completed,
+            "onboarding_completed must stay one-way latched once true"
+        );
+    }
+
+    #[test]
+    fn stage20_resolve_apply_action_maps_all_platform_packages() {
+        use catcloud_core::updater::StagedUpdateKind;
+
+        for os in ["windows", "macos", "linux", "freebsd"] {
+            assert_eq!(
+                resolve_apply_action_for_os(StagedUpdateKind::PortableZip, None, os),
+                "portable_restart"
+            );
+            assert_eq!(
+                resolve_apply_action_for_os(
+                    StagedUpdateKind::PortableZip,
+                    Some("CatCloud-portable.zip"),
+                    os
+                ),
+                "portable_restart"
+            );
+        }
+
+        for win_launch in [
+            "CatCloud-0.2.0-windows-x64-setup.exe",
+            "CatCloud-0.2.0-SETUP.EXE",
+            "CatCloud-0.2.0-x64.msi",
+            "CatCloud-0.2.0-x64.MSI",
+        ] {
+            assert_eq!(
+                resolve_apply_action_for_os(
+                    StagedUpdateKind::InstallerPackage,
+                    Some(win_launch),
+                    "windows"
+                ),
+                "installer_launch",
+                "expected windows installer_launch for {win_launch}"
+            );
+            assert_eq!(
+                resolve_apply_action_for_os(
+                    StagedUpdateKind::InstallerPackage,
+                    Some(win_launch),
+                    "macos"
+                ),
+                "reveal_archive",
+                "expected macos reveal_archive for windows package {win_launch}"
+            );
+            assert_eq!(
+                resolve_apply_action_for_os(
+                    StagedUpdateKind::InstallerPackage,
+                    Some(win_launch),
+                    "linux"
+                ),
+                "reveal_archive",
+                "expected linux reveal_archive for windows package {win_launch}"
+            );
+        }
+
+        for mac_launch in ["CatCloud-0.2.0-aarch64.dmg", "CatCloud-0.2.0-X64.DMG"] {
+            assert_eq!(
+                resolve_apply_action_for_os(
+                    StagedUpdateKind::InstallerPackage,
+                    Some(mac_launch),
+                    "macos"
+                ),
+                "installer_launch",
+                "expected macos installer_launch for {mac_launch}"
+            );
+            assert_eq!(
+                resolve_apply_action_for_os(
+                    StagedUpdateKind::InstallerPackage,
+                    Some(mac_launch),
+                    "windows"
+                ),
+                "reveal_archive",
+                "expected windows reveal_archive for mac package {mac_launch}"
+            );
+            assert_eq!(
+                resolve_apply_action_for_os(
+                    StagedUpdateKind::InstallerPackage,
+                    Some(mac_launch),
+                    "linux"
+                ),
+                "reveal_archive",
+                "expected linux reveal_archive for mac package {mac_launch}"
+            );
+        }
+
+        for os in ["windows", "macos", "linux"] {
+            for reveal in [
+                Some("CatCloud-0.2.0-aarch64.app.tar.gz"),
+                Some("CatCloud-0.2.0-amd64.AppImage"),
+                Some("CatCloud-0.2.0-amd64.AppImage.tar.gz"),
+                Some("CatCloud-0.2.0-amd64.deb"),
+                Some("CatCloud-0.2.0-x86_64.rpm"),
+                None,
+            ] {
+                assert_eq!(
+                    resolve_apply_action_for_os(StagedUpdateKind::InstallerPackage, reveal, os),
+                    "reveal_archive",
+                    "expected reveal_archive on {os} for {reveal:?}"
+                );
+            }
+        }
+
+        assert_eq!(
+            resolve_apply_action(
+                StagedUpdateKind::InstallerPackage,
+                Some("CatCloud-0.2.0-windows-x64-setup.exe")
+            ),
+            resolve_apply_action_for_os(
+                StagedUpdateKind::InstallerPackage,
+                Some("CatCloud-0.2.0-windows-x64-setup.exe"),
+                std::env::consts::OS
+            )
+        );
+    }
+
+    #[test]
+    fn stage20_collect_portable_update_relaunch_args_strips_transient_flags_and_preserves_data_dir() {
+        use std::ffi::OsString;
+
+        let raw = vec![
+            OsString::from("--data-dir"),
+            OsString::from(r"E:\CatCloud\data"),
+            OsString::from("--silent"),
+            OsString::from("--restarting"),
+            OsString::from("--post-update-cleanup"),
+            OsString::from("--apply-staged-update"),
+            OsString::from("--enable-tun"),
+            OsString::from("--enable-global-preaccel"),
+        ];
+        assert_eq!(
+            collect_portable_update_relaunch_args(&raw),
+            vec![
+                "--data-dir".to_string(),
+                r"E:\CatCloud\data".to_string(),
+                "--apply-staged-update".to_string(),
+                "--restarting".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stage20_dismiss_skip_clear_and_reconcile_update_state_machine() {
+        use catcloud_core::updater::{StagedUpdateKind, compute_sha256_hex, stage_verified_installer_file};
+
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s20_state_machine_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        let state = AppState::new(
+            paths.clone(),
+            AppConfig::default(),
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+
+        let installer_bytes = b"fake-signed-catcloud-installer-payload-bytes";
+        let installer_sha = compute_sha256_hex(installer_bytes);
+        let temp_download = tmp.join(".tmp_installer.exe");
+        std::fs::write(&temp_download, installer_bytes).expect("write temp installer");
+
+        stage_verified_installer_file(
+            &temp_download,
+            &installer_sha,
+            "CatCloud-0.2.0-windows-x64-setup.exe",
+            "0.1.0",
+            "0.2.0",
+            "## What's New\n- Stage 20 update modal",
+            Some("https://github.com/JuryBu/CatCloud/releases/tag/v0.2.0"),
+            Some("windows-x86_64"),
+            &paths.staging_dir,
+        )
+        .expect("stage verified installer");
+
+        let prompt = inspect_and_reconcile_staged_update(
+            &paths.staging_dir,
+            "0.1.0",
+            false,
+            None,
+            StagedUpdateKind::InstallerPackage,
+            None,
+            "JuryBu/CatCloud",
+            false,
+        )
+        .expect("staged installer should produce pending prompt");
+        assert_eq!(prompt.current_version, "0.1.0");
+        assert_eq!(prompt.target_version, "0.2.0");
+        assert_eq!(prompt.kind, "installer_package");
+        assert_eq!(
+            prompt.apply_action,
+            if cfg!(target_os = "windows") {
+                "installer_launch"
+            } else {
+                "reveal_archive"
+            }
+        );
+        assert_eq!(
+            prompt.installer_filename.as_deref(),
+            Some("CatCloud-0.2.0-windows-x64-setup.exe")
+        );
+        assert_eq!(prompt.package_size_bytes, installer_bytes.len() as u64);
+        assert!(prompt.release_notes.contains("Stage 20"));
+        assert!(!prompt.dismissed_in_session);
+
+        // Session dismiss rejects invalid versions and tracks `<=` semantics cleanly.
+        assert!(dismiss_update_prompt_for_session_state(&state, "0.0.0").is_err());
+        assert!(dismiss_update_prompt_for_session_state(&state, "not-semver").is_err());
+        assert!(dismiss_update_prompt_for_session_state(&state, "v0.2.0").expect("dismiss v0.2.0"));
+        let dismissed_ver = state
+            .dismissed_update_prompt_version
+            .read()
+            .unwrap()
+            .clone();
+        assert_eq!(dismissed_ver.as_deref(), Some("0.2.0"));
+
+        let prompt_dismissed = inspect_and_reconcile_staged_update(
+            &paths.staging_dir,
+            "0.1.0",
+            false,
+            None,
+            StagedUpdateKind::InstallerPackage,
+            dismissed_ver.as_deref(),
+            "JuryBu/CatCloud",
+            true,
+        )
+        .expect("staged installer remains ready after session dismiss");
+        assert!(prompt_dismissed.dismissed_in_session);
+        assert!(prompt_dismissed.is_elevated);
+
+        // Register an active download cancel watcher, then skip `v0.2.0`:
+        // must cancel download, persist `skipped_version`, purge staged files, and clear dismiss.
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        *state.update_download_cancel.lock().unwrap() = Some(cancel_tx);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+        let (skip_res, saved_cfg) = rt
+            .block_on(skip_update_version_core(&state, "v0.2.0"))
+            .expect("skip_update_version_core succeeds");
+        assert!(*cancel_rx.borrow(), "skip must trigger in-flight download cancel");
+        assert_eq!(skip_res.skipped_version, "0.2.0");
+        assert!(skip_res.purged_staged);
+        assert!(skip_res.freed_bytes >= installer_bytes.len() as u64);
+        assert!(!paths.staging_dir.exists(), "staging_dir must be purged");
+        assert_eq!(saved_cfg.update.skipped_version.as_deref(), Some("0.2.0"));
+        assert_eq!(
+            state.snapshot_config().update.skipped_version.as_deref(),
+            Some("0.2.0")
+        );
+        assert!(
+            state
+                .dismissed_update_prompt_version
+                .read()
+                .unwrap()
+                .is_none()
+        );
+        let reloaded = config::load_or_init(&paths).expect("reload config.json");
+        assert_eq!(reloaded.update.skipped_version.as_deref(), Some("0.2.0"));
+
+        // Re-stage the same version: reconcile must auto-purge it because `skipped_version` covers 0.2.0.
+        std::fs::write(&temp_download, installer_bytes).expect("rewrite temp installer");
+        stage_verified_installer_file(
+            &temp_download,
+            &installer_sha,
+            "CatCloud-0.2.0-windows-x64-setup.exe",
+            "0.1.0",
+            "0.2.0",
+            "",
+            None,
+            Some("windows-x86_64"),
+            &paths.staging_dir,
+        )
+        .expect("re-stage installer");
+        assert!(
+            inspect_and_reconcile_staged_update(
+                &paths.staging_dir,
+                "0.1.0",
+                false,
+                Some("0.2.0"),
+                StagedUpdateKind::InstallerPackage,
+                None,
+                "JuryBu/CatCloud",
+                false,
+            )
+            .is_none()
+        );
+        assert!(
+            !paths.staging_dir.exists(),
+            "reconcile must auto-purge staged package matching skipped_version"
+        );
+
+        // Re-stage again and verify kind mismatch also auto-purges.
+        std::fs::write(&temp_download, installer_bytes)
+            .expect("rewrite temp installer for kind mismatch check");
+        stage_verified_installer_file(
+            &temp_download,
+            &installer_sha,
+            "CatCloud-0.2.0-windows-x64-setup.exe",
+            "0.1.0",
+            "0.2.0",
+            "",
+            None,
+            Some("windows-x86_64"),
+            &paths.staging_dir,
+        )
+        .expect("re-stage installer for kind mismatch check");
+        assert!(
+            inspect_and_reconcile_staged_update(
+                &paths.staging_dir,
+                "0.1.0",
+                false,
+                None,
+                StagedUpdateKind::PortableZip,
+                None,
+                "JuryBu/CatCloud",
+                false,
+            )
+            .is_none()
+        );
+        assert!(!paths.staging_dir.exists());
+
+        // Clear skipped version persists `None`.
+        let cleared_cfg = rt
+            .block_on(clear_skipped_update_version_core(&state))
+            .expect("clear_skipped_update_version_core succeeds");
+        assert_eq!(cleared_cfg.update.skipped_version, None);
+        assert_eq!(state.snapshot_config().update.skipped_version, None);
+        let reloaded_after_clear = config::load_or_init(&paths).expect("reload cleared config");
+        assert_eq!(reloaded_after_clear.update.skipped_version, None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage20_emergency_cleanup_on_exit_is_idempotent_and_cancels_download() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s20_exit_idempotent_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        let mut isolated_cfg = AppConfig::default();
+        isolated_cfg.system_proxy.enabled = false;
+        isolated_cfg.tun.enabled = false;
+        isolated_cfg.preaccel.enabled = false;
+        isolated_cfg.mixed_port = 59997;
+        isolated_cfg.controller_port = 59998;
+        isolated_cfg.dns_listen_port = 59999;
+        let state = AppState::new(
+            paths,
+            isolated_cfg,
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        *state.update_download_cancel.lock().unwrap() = Some(cancel_tx);
+
+        assert!(!state.exit_cleanup_done.load(Ordering::SeqCst));
+        emergency_cleanup_on_exit(&state);
+        assert!(state.exit_cleanup_done.load(Ordering::SeqCst));
+        assert!(state.shutting_down.load(Ordering::SeqCst));
+        assert!(*cancel_rx.borrow());
+
+        // Second invocation is a guaranteed no-op.
+        emergency_cleanup_on_exit(&state);
+        assert!(state.exit_cleanup_done.load(Ordering::SeqCst));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage21_atomic_manual_stage_eliminates_toctou_and_respects_mid_download_skip() {
+        use catcloud_core::updater::{compute_sha256_hex, stage_verified_installer_file};
+
+        // 1. Decision helper truth table across background & manual download modes.
+        assert!(!should_abort_stage_due_to_skip(true, "0.2.0", None, None));
+        assert!(should_abort_stage_due_to_skip(
+            true,
+            "0.2.0",
+            None,
+            Some("0.2.0")
+        ));
+        assert!(should_abort_stage_due_to_skip(
+            true,
+            "0.2.0",
+            Some("0.2.0"),
+            Some("0.2.0")
+        ));
+        assert!(!should_abort_stage_due_to_skip(
+            true,
+            "0.2.0",
+            None,
+            Some("0.1.9")
+        ));
+        assert!(!should_abort_stage_due_to_skip(
+            false,
+            "0.2.0",
+            Some("0.2.0"),
+            Some("0.2.0")
+        ));
+        assert!(!should_abort_stage_due_to_skip(
+            false,
+            "0.2.0",
+            Some("0.2.0"),
+            None
+        ));
+        assert!(should_abort_stage_due_to_skip(
+            false,
+            "0.2.0",
+            None,
+            Some("0.2.0")
+        ));
+        assert!(should_abort_stage_due_to_skip(
+            false,
+            "0.2.0",
+            Some("0.1.9"),
+            Some("0.2.0")
+        ));
+        assert!(should_abort_stage_due_to_skip(
+            false,
+            "0.2.0",
+            Some("0.2.0"),
+            Some("0.3.0")
+        ));
+
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s21_atomic_stage_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        let mut init_cfg = AppConfig::default();
+        init_cfg.update.skipped_version = Some("99.0.0".to_string());
+        config::save(&paths, &init_cfg).expect("persist initial config");
+        let state = Arc::new(AppState::new(
+            paths.clone(),
+            init_cfg,
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        ));
+        *state.dismissed_update_prompt_version.write().unwrap() = Some("99.0.0".to_string());
+
+        let installer_bytes = b"stage21-signed-installer-payload-bytes";
+        let installer_sha = compute_sha256_hex(installer_bytes);
+        let temp_download = tmp.join(".tmp_s21_installer.exe");
+        std::fs::write(&temp_download, installer_bytes).expect("write temp installer");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build multi-thread tokio runtime");
+
+        rt.block_on(async {
+            // 2a. Pre-hold `config_transition_lock` -> `update_staging_lock` while `skipped_version`
+            // is still `Some("99.0.0")`, spawn a concurrent `get_pending_staged_update_internal`
+            // waiter, then clear skip + commit the package before releasing locks.
+            // The waiter MUST read config AFTER acquiring `update_staging_lock` and MUST NOT purge it.
+            let pre_cfg_lock = state.config_transition_lock.lock().await;
+            let pre_staging_lock = state.update_staging_lock.lock().await;
+            let state_reader = Arc::clone(&state);
+            let pending_waiter = tokio::spawn(async move {
+                get_pending_staged_update_internal(&state_reader).await
+            });
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let cleared = clear_skipped_for_manual_download_locked(&state, "99.0.0")
+                .expect("clear skipped");
+            assert!(cleared.is_some());
+            stage_verified_installer_file(
+                &temp_download,
+                &installer_sha,
+                "CatCloud-99.0.0-windows-x64-setup.exe",
+                "0.1.0",
+                "99.0.0",
+                "## Stage 21",
+                None,
+                Some("windows-x86_64"),
+                &paths.staging_dir,
+            )
+            .expect("stage installer under locks");
+            drop(pre_staging_lock);
+            drop(pre_cfg_lock);
+
+            let prompt_after_wait = pending_waiter
+                .await
+                .expect("join pending waiter")
+                .expect("get_pending_staged_update_internal ok")
+                .expect("staged package must survive concurrent reader");
+            assert_eq!(prompt_after_wait.target_version, "99.0.0");
+            assert!(!prompt_after_wait.dismissed_in_session);
+            assert!(paths.staging_dir.exists());
+
+            // 2b. Full `commit_staged_update_atomically` in manual mode starting from
+            // `skipped_version = Some("99.0.0")` alongside concurrent `get_pending_staged_update_internal`.
+            let _ = catcloud_core::updater::purge_staged_update(&paths.staging_dir);
+            {
+                let _cfg_guard = state.config_transition_lock.lock().await;
+                let mut cfg = state.snapshot_config();
+                cfg.update.skipped_version = Some("99.0.0".to_string());
+                config::save(&state.paths, &cfg).expect("save skipped 99.0.0");
+                *state.config.write().unwrap() = cfg;
+                *state.dismissed_update_prompt_version.write().unwrap() =
+                    Some("99.0.0".to_string());
+            }
+            std::fs::write(&temp_download, installer_bytes).expect("rewrite temp installer");
+
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+            let temp_for_commit = temp_download.clone();
+            let sha_for_commit = installer_sha.clone();
+            let staging_for_commit = paths.staging_dir.clone();
+            let commit_fut = commit_staged_update_atomically(
+                &state,
+                false,
+                Some("99.0.0"),
+                "99.0.0",
+                move || {
+                    let _ = entered_tx.send(());
+                    std::thread::sleep(Duration::from_millis(30));
+                    stage_verified_installer_file(
+                        &temp_for_commit,
+                        &sha_for_commit,
+                        "CatCloud-99.0.0-windows-x64-setup.exe",
+                        "0.1.0",
+                        "99.0.0",
+                        "## Stage 21 atomic",
+                        None,
+                        Some("windows-x86_64"),
+                        &staging_for_commit,
+                    )
+                    .map_err(|e| e.to_string())
+                },
+            );
+            let inspect_fut = async {
+                let _ = entered_rx.await;
+                get_pending_staged_update_internal(&state).await
+            };
+            let (commit_res, inspect_res) = tokio::join!(commit_fut, inspect_fut);
+            match commit_res.unwrap_or_else(|e| panic!("atomic commit failed: {}", e.message)) {
+                CommitStagedOutcome::Staged {
+                    metadata,
+                    cleared_config,
+                } => {
+                    assert_eq!(metadata.target_version, "99.0.0");
+                    assert_eq!(cleared_config.and_then(|c| c.update.skipped_version), None);
+                }
+                _ => panic!("expected CommitStagedOutcome::Staged"),
+            }
+            let prompt_concurrent = inspect_res
+                .expect("concurrent get_pending ok")
+                .expect("concurrent get_pending must see newly committed package");
+            assert_eq!(prompt_concurrent.target_version, "99.0.0");
+            assert!(!prompt_concurrent.dismissed_in_session);
+            assert_eq!(state.snapshot_config().update.skipped_version, None);
+            assert_eq!(
+                config::load_or_init(&paths).unwrap().update.skipped_version,
+                None
+            );
+
+            // 2c. Manual download aborted when user explicitly skips mid-download.
+            let _ = skip_update_version_core(&state, "99.0.0")
+                .await
+                .expect("skip 99.0.0 mid-download");
+            assert!(!paths.staging_dir.exists());
+            let mid_skip_outcome = commit_staged_update_atomically(
+                &state,
+                false,
+                None,
+                "99.0.0",
+                || panic!("stage_fn must not execute when mid-download skip wins"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unexpected error: {}", e.message));
+            assert!(matches!(mid_skip_outcome, CommitStagedOutcome::Skipped));
+            assert!(!paths.staging_dir.exists());
+            assert_eq!(
+                state.snapshot_config().update.skipped_version.as_deref(),
+                Some("99.0.0")
+            );
+
+            // 2d. Silent background commit aborts when version is skipped.
+            let bg_skip_outcome = commit_staged_update_atomically(
+                &state,
+                true,
+                None,
+                "99.0.0",
+                || panic!("background stage_fn must not execute when version is skipped"),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("unexpected error: {}", e.message));
+            assert!(matches!(bg_skip_outcome, CommitStagedOutcome::Skipped));
+            assert!(!paths.staging_dir.exists());
+        });
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage21_persist_last_update_check_time_serializes_under_config_transition_lock() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s21_persist_check_time_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        let state = Arc::new(AppState::new(
+            paths.clone(),
+            AppConfig::default(),
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        ));
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async {
+            let cfg_guard = state.config_transition_lock.lock().await;
+            let state_writer = Arc::clone(&state);
+            let check_time_task = tokio::spawn(async move {
+                persist_last_update_check_time_core(&state_writer, "2026-11-27T04:00:00Z").await;
+            });
+
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            assert!(
+                !check_time_task.is_finished(),
+                "persist_last_update_check_time_core must wait for config_transition_lock"
+            );
+            let mut next_cfg = state.snapshot_config();
+            next_cfg.update.skipped_version = Some("9.9.9".to_string());
+            config::save(&state.paths, &next_cfg).expect("save skipped_version under lock");
+            *state.config.write().unwrap() = next_cfg;
+            drop(cfg_guard);
+
+            check_time_task
+                .await
+                .expect("join persist_last_update_check_time_core");
+
+            let mem_cfg = state.snapshot_config();
+            assert_eq!(mem_cfg.update.skipped_version.as_deref(), Some("9.9.9"));
+            assert_eq!(
+                mem_cfg.update.last_checked_at.as_deref(),
+                Some("2026-11-27T04:00:00Z")
+            );
+            let disk_cfg = config::load_or_init(&paths).expect("reload config.json");
+            assert_eq!(disk_cfg.update.skipped_version.as_deref(), Some("9.9.9"));
+            assert_eq!(
+                disk_cfg.update.last_checked_at.as_deref(),
+                Some("2026-11-27T04:00:00Z")
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage21_reconcile_check_result_staged_version_clears_when_skipped() {
+        assert_eq!(
+            reconcile_check_result_staged_version(
+                Some("0.2.0".to_string()),
+                false,
+                false,
+                None
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+        assert_eq!(
+            reconcile_check_result_staged_version(
+                Some("0.2.0".to_string()),
+                true,
+                false,
+                Some("0.2.0")
+            ),
+            None
+        );
+        assert_eq!(
+            reconcile_check_result_staged_version(
+                Some("0.2.0".to_string()),
+                false,
+                true,
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            reconcile_check_result_staged_version(
+                Some("0.1.9".to_string()),
+                false,
+                false,
+                Some("0.1.9")
+            ),
+            None
+        );
+        assert_eq!(
+            reconcile_check_result_staged_version(
+                Some("0.2.0".to_string()),
+                false,
+                false,
+                Some("0.1.9")
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+    }
+
+    #[test]
+    fn stage21_reap_or_detach_child_with_grace_checks_exit_status() {
+        use std::process::{Command, Stdio};
+
+        let spawn_exit = |code: i32| -> std::process::Child {
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+                Command::new("cmd")
+                    .args(["/C", &format!("exit {code}")])
+                    .creation_flags(CREATE_NO_WINDOW)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn cmd exit helper")
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                Command::new("sh")
+                    .args(["-c", &format!("exit {code}")])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("spawn sh exit helper")
+            }
+        };
+
+        assert!(
+            reap_or_detach_child_with_grace(
+                spawn_exit(0),
+                Duration::from_millis(1500),
+                "打开更新包目录失败",
+            )
+            .is_ok()
+        );
+
+        let err = reap_or_detach_child_with_grace(
+            spawn_exit(7),
+            Duration::from_millis(1500),
+            "打开更新包目录失败",
+        )
+        .expect_err("non-zero exit code must return Err");
+        assert!(err.contains("打开更新包目录失败"));
+        assert!(err.contains("7"));
     }
 }

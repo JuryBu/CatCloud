@@ -54,6 +54,9 @@ const CapsuleWindow = lazy(() =>
 const OnboardingModal = lazy(() =>
   import("./components/OnboardingModal").then((m) => ({ default: m.OnboardingModal }))
 );
+const UpdateReadyModal = lazy(() =>
+  import("./components/UpdateReadyModal").then((m) => ({ default: m.UpdateReadyModal }))
+);
 
 function PageLoadingFallback({ label }: { label: string }) {
   return (
@@ -93,10 +96,20 @@ export function App() {
   );
   const onboardingModalOpen = useAppSelector((s) => s.onboardingModalOpen);
   const onboardingAutoSkipped = useAppSelector((s) => s.onboardingAutoSkipped);
+  const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
+  const pendingUpdate = useAppSelector((s) => s.pendingUpdate);
+  const updateModalVisible = useAppSelector((s) => s.updateModalVisible);
   const showOnboardingModal =
     windowMode === "main" &&
     initialized &&
     (onboardingModalOpen || (!onboardingCompleted && !onboardingAutoSkipped));
+  const showUpdateReadyModal =
+    windowMode === "main" &&
+    initialized &&
+    !showOnboardingModal &&
+    !tunAdminPromptOpen &&
+    pendingUpdate !== null &&
+    updateModalVisible;
   const activeNav = useAppSelector((s) => s.activeNav);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
@@ -350,6 +363,12 @@ export function App() {
       {showOnboardingModal && (
         <Suspense fallback={null}>
           <OnboardingModal />
+        </Suspense>
+      )}
+
+      {showUpdateReadyModal && (
+        <Suspense fallback={null}>
+          <UpdateReadyModal />
         </Suspense>
       )}
 
