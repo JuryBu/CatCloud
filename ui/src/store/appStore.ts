@@ -1,5 +1,6 @@
 import { useSyncExternalStore } from "react";
 import {
+  type AgentPromptMode,
   type AppConfig,
   type AppUpdateCheckResult,
   type CampusPortalStatus,
@@ -18,6 +19,7 @@ import {
   type PreAccelComparisonResult,
   type PreAccelRelay,
   type PreAccelSpeedTestResult,
+  type ProbeRunSummary,
   type ProbeSnapshot,
   type ProxyMode,
   type ProxyNode,
@@ -49,12 +51,17 @@ import {
 export type { UiLanguage };
 
 export type {
+  AgentPromptMode,
   AppConfig,
   CoreRuntimeInfo,
+  DnsTlsDiagnostics,
   GlobalPreAccelMode,
   GlobalPreAccelScope,
   GlobalPreAccelStatus,
+  PreAccelDispatchStrategy,
+  PreAccelLbStrategy,
   PreAccelVerifyState,
+  ProbeRunSummary,
   ProxyMode,
   ResolvedTheme,
   RouteTargetMode,
@@ -270,6 +277,7 @@ function saveCachedUiPrefs(p: AppConfig["personalization"]): void {
         sparkline_enabled: p.sparkline_enabled,
         wallpaper_opacity: p.wallpaper_opacity,
         glass_blur_px: p.glass_blur_px,
+        onboarding_completed: p.onboarding_completed,
       })
     );
   } catch {
@@ -605,14 +613,18 @@ export interface AppState {
   nodes: ProxyNode[];
   probes: Record<string, ProbeSnapshot>;
   probeProgress: ProbeRunProgressState;
+  lastProbeSummary: ProbeRunSummary | null;
   subscriptions: SubscriptionRecord[];
   preAccelRelays: PreAccelRelay[];
+  relayChainLatencies: Record<string, number | null>;
   globalPreAccel: GlobalPreAccelStatus;
   exitIp: ExitIpInfo;
   quickSites: SiteCheckItem[];
   latestTraffic: TrafficSample;
   trafficVersion: number;
   toast: ToastNotice | null;
+  onboardingModalOpen: boolean;
+  onboardingAutoSkipped: boolean;
   tunAdminPromptOpen: boolean;
   tunAdminPromptBusy: boolean;
   tunAdminPromptReason: string | null;
@@ -1052,14 +1064,18 @@ let state: AppState = {
     currentNodeName: null,
     cancelled: false,
   },
+  lastProbeSummary: null,
   subscriptions: [],
   preAccelRelays: [],
+  relayChainLatencies: {},
   globalPreAccel: { ...DEFAULT_GLOBAL_PREACCEL_STATUS },
   exitIp: initialExitIp,
   quickSites: [],
   latestTraffic: initialTraffic,
   trafficVersion: initialTrafficVersion,
   toast: null,
+  onboardingModalOpen: false,
+  onboardingAutoSkipped: false,
   tunAdminPromptOpen: false,
   tunAdminPromptBusy: false,
   tunAdminPromptReason: null,
@@ -1735,6 +1751,23 @@ async function hydrateFromBackend(): Promise<void> {
     await backfillTrafficHistory(true);
   }
 
+  const resolvedGroups = groupsRes.status === "fulfilled" ? groupsRes.value : state.groups;
+  const resolvedNodes = nodesRes.status === "fulfilled" ? nodesRes.value : state.nodes;
+  const resolvedSubs = subsRes.status === "fulfilled" ? subsRes.value : state.subscriptions;
+  const resolvedRelays = relaysRes.status === "fulfilled" ? relaysRes.value : state.preAccelRelays;
+  const hasExistingUserData =
+    resolvedNodes.length > 0 ||
+    resolvedSubs.length > 0 ||
+    resolvedRelays.length > 0 ||
+    resolvedGroups.length > 0;
+  const forcePreviewOnboarding =
+    !inDesktop &&
+    typeof window !== "undefined" &&
+    new URLSearchParams(window.location.search).get("onboarding") === "1";
+  const alreadyCompletedOnboarding = mergedConfig.personalization.onboarding_completed === true;
+  const shouldAutoSkipOnboarding =
+    !forcePreviewOnboarding && !alreadyCompletedOnboarding && hasExistingUserData;
+
   setState((prev) => ({
     ...prev,
     initialized: true,
@@ -1742,11 +1775,11 @@ async function hydrateFromBackend(): Promise<void> {
     config: alignConfigWithRuntimeTun(mergedConfig, resolvedRuntime),
     resolvedTheme: resolved,
     runtime: resolvedRuntime,
-    groups: groupsRes.status === "fulfilled" ? groupsRes.value : prev.groups,
-    nodes: nodesRes.status === "fulfilled" ? nodesRes.value : prev.nodes,
+    groups: resolvedGroups,
+    nodes: resolvedNodes,
     probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
-    subscriptions: subsRes.status === "fulfilled" ? subsRes.value : prev.subscriptions,
-    preAccelRelays: relaysRes.status === "fulfilled" ? relaysRes.value : prev.preAccelRelays,
+    subscriptions: resolvedSubs,
+    preAccelRelays: resolvedRelays,
     globalPreAccel:
       globalPreAccelRes.status === "fulfilled"
         ? globalPreAccelRes.value
@@ -1756,6 +1789,8 @@ async function hydrateFromBackend(): Promise<void> {
         ? exitIpRes.value
         : prev.exitIp,
     quickSites: hydratedSites,
+    onboardingAutoSkipped: prev.onboardingAutoSkipped || shouldAutoSkipOnboarding,
+    onboardingModalOpen: prev.onboardingModalOpen || forcePreviewOnboarding,
   }));
 }
 
@@ -1913,6 +1948,16 @@ export const appStore = {
               info.global_preaccel_verify_ms !== undefined
                 ? info.global_preaccel_verify_ms
                 : prev.runtime.global_preaccel_verify_ms,
+            preaccel_effective_carrier:
+              info.preaccel_effective_carrier ?? prev.runtime.preaccel_effective_carrier,
+            standalone_tunnel_suspended_for_tun:
+              info.standalone_tunnel_suspended_for_tun !== undefined
+                ? info.standalone_tunnel_suspended_for_tun
+                : prev.runtime.standalone_tunnel_suspended_for_tun,
+            dns_tls_diagnostics:
+              info.dns_tls_diagnostics !== undefined
+                ? info.dns_tls_diagnostics
+                : prev.runtime.dns_tls_diagnostics,
             node_health_hints: info.node_health_hints ?? prev.runtime.node_health_hints,
           },
           globalPreAccel: hasGlobalRuntimePatch
@@ -1978,10 +2023,31 @@ export const appStore = {
               : "complete"
           : "searching";
 
+        const hasEventSummary =
+          ev.latency_ok_count !== undefined ||
+          ev.bandwidth_ok_count !== undefined ||
+          ev.keepalive_ok_count !== undefined ||
+          ev.failed_count !== undefined ||
+          ev.exec_error_count !== undefined ||
+          ev.untested_count !== undefined;
+        const nextLastProbeSummary: ProbeRunSummary | null = hasEventSummary
+          ? {
+              latency_ok_count: ev.latency_ok_count ?? prev.lastProbeSummary?.latency_ok_count ?? 0,
+              bandwidth_ok_count:
+                ev.bandwidth_ok_count ?? prev.lastProbeSummary?.bandwidth_ok_count ?? 0,
+              keepalive_ok_count:
+                ev.keepalive_ok_count ?? prev.lastProbeSummary?.keepalive_ok_count ?? 0,
+              failed_count: ev.failed_count ?? prev.lastProbeSummary?.failed_count ?? 0,
+              exec_error_count: ev.exec_error_count ?? prev.lastProbeSummary?.exec_error_count ?? 0,
+              untested_count: ev.untested_count ?? prev.lastProbeSummary?.untested_count ?? 0,
+            }
+          : prev.lastProbeSummary;
+
         return {
           ...prev,
           probes: nextProbes,
           mascotState: nextMascot,
+          lastProbeSummary: nextLastProbeSummary,
           probeProgress: {
             running: !ev.done,
             completed: ev.completed,
@@ -2318,7 +2384,26 @@ export const appActions = {
     }
   },
 
-  async copyAgentBootstrapPrompt(lang?: UiLanguage): Promise<boolean> {
+  openOnboardingModal(): void {
+    setState((prev) => (prev.onboardingModalOpen ? prev : { ...prev, onboardingModalOpen: true }));
+  },
+
+  async closeOnboardingModal(markCompleted = true): Promise<void> {
+    setState((prev) => ({
+      ...prev,
+      onboardingModalOpen: false,
+      onboardingAutoSkipped: prev.onboardingAutoSkipped || markCompleted,
+    }));
+    if (markCompleted && state.config.personalization.onboarding_completed !== true) {
+      await appActions.updatePersonalization({ onboarding_completed: true });
+    }
+  },
+
+  async copyAgentBootstrapPrompt(
+    langOrPage?: UiLanguage | string,
+    mode: AgentPromptMode = "autopilot",
+    explicitLang?: UiLanguage
+  ): Promise<boolean> {
     const writeClipboard = async (text: string): Promise<boolean> => {
       try {
         if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
@@ -2346,8 +2431,18 @@ export const appActions = {
     };
 
     try {
-      const targetLang = normalizeUiLanguage(lang ?? state.config.personalization.ui_language);
-      const dto = await catcloudApi.buildAgentBootstrapPrompt(targetLang, state.activeNav);
+      const knownLangs = new Set(["zh-CN", "en", "ja", "ru"]);
+      const isLangArg = typeof langOrPage === "string" && knownLangs.has(langOrPage);
+      const targetLang = normalizeUiLanguage(
+        explicitLang ??
+          (isLangArg ? (langOrPage as UiLanguage) : state.config.personalization.ui_language)
+      );
+      const targetPage =
+        !isLangArg && typeof langOrPage === "string" && langOrPage.trim().length > 0
+          ? langOrPage.trim()
+          : state.activeNav;
+      const resolvedMode: AgentPromptMode = mode === "readonly" ? "readonly" : "autopilot";
+      const dto = await catcloudApi.buildAgentBootstrapPrompt(targetLang, targetPage, resolvedMode);
       const text = dto.prompt.trim();
       if (!text) {
         pushToast("本机 Agent 引导语生成为空，请稍后重试", "warn");
@@ -2356,9 +2451,11 @@ export const appActions = {
       const copied = await writeClipboard(text);
       if (copied) {
         pushToast(
-          "已复制本机 Agent 引导指令（含精确 CLI 路径与手册索引），粘贴给 Antigravity / Codex / Claude Code 即可协助排查",
+          resolvedMode === "readonly"
+            ? "已复制只读体检指令（仅查不改），直接粘贴发给 Codex / Claude Code / Antigravity 即可"
+            : "已复制本机 AI 全权托管指令（含精确 CLI 路径与手册索引），直接粘贴发给 Codex / Claude Code / Antigravity 即可开始代配",
           "ok",
-          5200
+          5400
         );
         return true;
       }
@@ -3856,13 +3953,25 @@ export const appActions = {
             targetNodeId
           );
 
+          const chainPatch: Record<string, number | null> = {};
+          for (const res of results) {
+            if (res.chain_latency_ms !== undefined) {
+              chainPatch[res.relay_id] = res.chain_latency_ms ?? null;
+            }
+          }
+
           if (inDesktop) {
             const latestRelays = await catcloudApi.listPreAccelRelays();
-            setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+            setState((prev) => ({
+              ...prev,
+              preAccelRelays: latestRelays,
+              relayChainLatencies: { ...prev.relayChainLatencies, ...chainPatch },
+            }));
           } else {
             const resultMap = new Map(results.map((r) => [r.relay_id, r]));
             setState((prev) => ({
               ...prev,
+              relayChainLatencies: { ...prev.relayChainLatencies, ...chainPatch },
               preAccelRelays: prev.preAccelRelays.map((r) => {
                 const matched = resultMap.get(r.id);
                 if (!matched) return r;
@@ -3900,14 +4009,19 @@ export const appActions = {
             } else {
               const speedParts: string[] = [];
               if (hasValidSpeed(item.up_mbps)) {
-                speedParts.push(`↑${item.up_mbps.toFixed(1)} M`);
+                speedParts.push(`↑${item.up_mbps.toFixed(1)} Mbps`);
               }
               if (hasValidSpeed(item.down_mbps)) {
-                speedParts.push(`↓${item.down_mbps.toFixed(1)} M`);
+                speedParts.push(`↓${item.down_mbps.toFixed(1)} Mbps`);
               }
-              const msText = hasValidPositiveLatency(item.latency_ms)
-                ? `（${formatMsShort(item.latency_ms)}）`
-                : "";
+              const msPieces: string[] = [];
+              if (hasValidPositiveLatency(item.latency_ms)) {
+                msPieces.push(`直连 ${formatMsShort(item.latency_ms)}`);
+              }
+              if (hasValidPositiveLatency(item.chain_latency_ms)) {
+                msPieces.push(`经海外对比 ${formatMsShort(item.chain_latency_ms)}`);
+              }
+              const msText = msPieces.length > 0 ? `（${msPieces.join(" / ")}）` : "";
               if (speedParts.length > 0) {
                 pushToast(
                   `「${relayName}」测速完成：${speedParts.join(" · ")}${msText}`,
@@ -4170,6 +4284,25 @@ export const appActions = {
               ? `（已走 443 提速${result.preaccel_relay_name ? `：${result.preaccel_relay_name}` : ""}）`
               : "";
 
+            const snapVals = Object.values(result.snapshots ?? {});
+            const computedSummary: ProbeRunSummary = {
+              latency_ok_count:
+                result.latency_ok_count ??
+                snapVals.filter((s) => s.ok && s.latency_ms !== null).length,
+              bandwidth_ok_count:
+                result.bandwidth_ok_count ??
+                snapVals.filter((s) => s.ok && s.up_mbps !== null && s.down_mbps !== null).length,
+              keepalive_ok_count:
+                result.keepalive_ok_count ??
+                snapVals.filter((s) => s.keepalive_60s_ok === true).length,
+              failed_count:
+                result.failed_count ?? snapVals.filter((s) => !s.ok).length,
+              exec_error_count: result.exec_error_count ?? result.errors.length,
+              untested_count:
+                result.untested_count ??
+                Math.max(0, (result.total_count ?? targetNodeIds.length) - finalCompleted),
+            };
+
             setState((prev) => {
               let nextProbes = prev.probes;
               if (result.snapshots && Object.keys(result.snapshots).length > 0) {
@@ -4181,6 +4314,7 @@ export const appActions = {
               return {
                 ...prev,
                 probes: nextProbes,
+                lastProbeSummary: computedSummary,
                 probeProgress: {
                   running: false,
                   completed: finalCompleted,
@@ -4210,15 +4344,26 @@ export const appActions = {
               );
             } else if (result.errors.length > 0 && result.probed_count === 0) {
               pushToast(`测速未能完成：${result.errors[0]}`, "warn");
-            } else if (result.errors.length > 0) {
-              pushToast(
-                `${PROBE_TIER_LABELS[tier]}完成${preaccelTag}：已更新 ${result.probed_count} 个节点（${result.errors.length} 个超时或跳过）`,
-                "info"
-              );
             } else {
+              const summaryParts = [`延迟可达 ${computedSummary.latency_ok_count}`];
+              if (tier === "full" || computedSummary.bandwidth_ok_count > 0) {
+                summaryParts.push(`双向带宽通过 ${computedSummary.bandwidth_ok_count}`);
+              }
+              if (includeKeepalive || computedSummary.keepalive_ok_count > 0) {
+                summaryParts.push(`60 秒保活 ${computedSummary.keepalive_ok_count}`);
+              }
+              if (computedSummary.failed_count > 0) {
+                summaryParts.push(`失败 ${computedSummary.failed_count}`);
+              }
+              if (computedSummary.exec_error_count > 0) {
+                summaryParts.push(`异常 ${computedSummary.exec_error_count}`);
+              }
               pushToast(
-                `${PROBE_TIER_LABELS[tier]}完成${preaccelTag}，已更新 ${result.probed_count} 个节点结果`,
-                "ok"
+                `${PROBE_TIER_LABELS[tier]}完成${preaccelTag}：${summaryParts.join(" · ")}`,
+                computedSummary.failed_count > 0 || computedSummary.exec_error_count > 0
+                  ? "info"
+                  : "ok",
+                5200
               );
             }
           } catch (err) {

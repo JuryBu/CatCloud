@@ -236,6 +236,52 @@ mod tests {
                 "--mode",
                 "sticky_best",
             ],
+            &["catcloud", "group", "create", "--id", "g1", "--nodes", "n1,n2"],
+            &[
+                "catcloud",
+                "group",
+                "members",
+                "--id",
+                "g1",
+                "add",
+                "--nodes",
+                "n1,n2",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "group",
+                "members",
+                "--id",
+                "g1",
+                "remove",
+                "--nodes",
+                "n2",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "group",
+                "members",
+                "--id",
+                "g1",
+                "set",
+                "--nodes",
+                "n1,n3",
+                "--json",
+            ],
+            &[
+                "catcloud",
+                "group",
+                "policy",
+                "g1",
+                "--match-rules",
+                "DOMAIN-SUFFIX,openai.com;DOMAIN,chatgpt.com",
+                "--add-match-rule",
+                "DOMAIN-SUFFIX,claude.ai",
+                "--clear-match-rules",
+                "--json",
+            ],
             &["catcloud", "preaccel", "pool", "--json"],
             &[
                 "catcloud",
@@ -252,6 +298,10 @@ mod tests {
                 "true",
                 "--skip-443-native",
                 "true",
+                "--dispatch-strategy",
+                "load_balance",
+                "--lb-strategy",
+                "consistent_hashing",
             ],
             &["catcloud", "preaccel", "global-status", "--json"],
             &["catcloud", "preaccel", "test", "--json"],
@@ -347,6 +397,15 @@ mod tests {
             &["catcloud", "net", "doctor", "--json"],
             &["catcloud", "net", "connections", "--json"],
             &["catcloud", "net", "connections", "--limit", "25", "--json"],
+            &[
+                "catcloud",
+                "net",
+                "connections",
+                "--limit",
+                "25",
+                "--reveal-secrets",
+                "--json",
+            ],
             &["catcloud", "net", "match", "api.openai.com", "--json"],
             &[
                 "catcloud",
@@ -368,6 +427,11 @@ mod tests {
                 "120",
                 "--level",
                 "warning",
+                "--since",
+                "30m",
+                "--until",
+                "2026-11-26 04:00",
+                "--reveal-secrets",
                 "--json",
             ],
             &["catcloud", "sub", "list", "--json"],
@@ -543,6 +607,25 @@ mod tests {
             panic!("expected Probe::Run");
         };
         assert!(!args.reveal_secrets);
+
+        let conns_cli =
+            Cli::try_parse_from(["catcloud", "net", "connections"]).expect("net connections");
+        let Commands::Net {
+            action: commands::NetCommand::Connections { reveal_secrets, .. },
+        } = conns_cli.command
+        else {
+            panic!("expected Net::Connections");
+        };
+        assert!(!reveal_secrets);
+
+        let logs_cli = Cli::try_parse_from(["catcloud", "logs", "tail"]).expect("logs tail");
+        let Commands::Logs {
+            action: commands::LogsCommand::Tail { reveal_secrets, .. },
+        } = logs_cli.command
+        else {
+            panic!("expected Logs::Tail");
+        };
+        assert!(!reveal_secrets);
     }
 
     #[test]

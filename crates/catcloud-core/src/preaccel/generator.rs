@@ -1,22 +1,26 @@
 use crate::config::is_forbidden_domestic_probe_host;
 use crate::error::{CatError, CatResult};
 use crate::models::group::PreAccelRelay;
-use crate::models::node::ProxyNode;
-use crate::models::settings::PreAccelConfig;
+use crate::models::node::{ProxyNode, is_ipv6_only_node};
+use crate::models::settings::{PreAccelConfig, PreAccelDispatchStrategy};
 use crate::preaccel::schema::{
-    RelayProtocol, RelayValidationSeverity, parse_server_ip, validate_relay,
+    PREACCEL_LB_GROUP_NAME, RelayProtocol, RelayValidationSeverity, parse_server_ip,
+    relays_support_ipv6, select_physical_host_relays, validate_relay,
 };
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Number, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::IpAddr;
 use url::Url;
 
 /// Mihomo `select` proxy group name serving as the unified `dialer-proxy` target.
 pub const PREACCEL_SELECT_GROUP: &str = "⚡ 国内预加速入口";
 
-/// Mihomo `fallback` proxy group name providing active-standby dual-relay failover.
+/// Mihomo outer `fallback` proxy group name providing multi-cloud failover + `DIRECT` safety net.
 pub const PREACCEL_FALLBACK_GROUP: &str = "🔄 预加速自动双活";
+
+/// Re-export inner `load-balance` group name for multi-cloud physical host aggregation.
+pub const PREACCEL_LB_GROUP: &str = PREACCEL_LB_GROUP_NAME;
 
 /// Primary domestic 204 health-check URL (Huawei Cloud).
 pub const DEFAULT_DOMESTIC_204_PRIMARY: &str =
@@ -34,6 +38,164 @@ const EXTRA_FORBIDDEN_OVERSEAS_PROBE_SUFFIXES: &[&str] = &[
     "msftncsi.com",
 ];
 
+/// Compiled Mihomo proxy-group bundle produced by [`build_preaccel_proxy_groups`] and shared
+/// identically between the primary core compiler (`config_compiler.rs`) and standalone `:443`
+/// tunnel compiler (`generator.rs` / `global_tunnel.rs`).
+#[derive(Debug, Clone)]
+pub struct BuiltPreAccelGroups {
+    /// Compiled proxy-group mappings: `[select, fallback]` (single-layer) or
+    /// `[select, fallback, lb]` (two-layer multi-cloud load-balance inside outer fallback).
+    pub proxy_groups: Vec<Value>,
+    /// Default head target selected for `PREACCEL_SELECT_GROUP`.
+    pub default_select_target: String,
+    /// True when the two-layer nested `load-balance` group is emitted.
+    pub load_balance_active: bool,
+    /// Number of distinct physical cloud hosts represented across enabled relays.
+    pub distinct_host_count: usize,
+}
+
+/// Shared two-layer multi-cloud pre-acceleration proxy-group builder used by both the main
+/// Mihomo config compiler and the standalone `:443` tunnel compiler.
+///
+/// Invariants:
+/// - Inner `PREACCEL_LB_GROUP_NAME` (`type: load-balance`) NEVER contains `"DIRECT"`.
+/// - Outer `PREACCEL_FALLBACK_GROUP` (`type: fallback`) ALWAYS terminates with `"DIRECT"`.
+/// - When `distinct_host_count >= 2` and `dispatch_strategy` resolves to load-balancing
+///   (`LoadBalance`, or `Auto` without a manually pinned `active_relay_id`), builds:
+///   - `PREACCEL_LB_GROUP_NAME`: `load-balance`, `strategy: cfg.lb_strategy.as_str()`,
+///     `proxies: [deduplicated physical-host TCP representatives]`, `lazy: false`;
+///   - `PREACCEL_FALLBACK_GROUP`: `fallback`,
+///     `proxies: [PREACCEL_LB_GROUP_NAME, same-host secondary protocols..., "DIRECT"]`, `lazy: false`.
+/// - Otherwise builds single-layer `PREACCEL_FALLBACK_GROUP` (`fallback`,
+///   `proxies: [ordered_relays..., "DIRECT"]`, `lazy: false`, promoting `active_relay_id` to index 0).
+pub fn build_preaccel_proxy_groups(
+    cfg: &PreAccelConfig,
+    enabled_relays: &[PreAccelRelay],
+    relay_id_to_name: &HashMap<String, String>,
+    relay_names_ordered: &[String],
+    probe_url: &str,
+    interval_sec: u64,
+) -> BuiltPreAccelGroups {
+    let clamped_interval = interval_sec.clamp(10, 300);
+    let trimmed_probe_url = probe_url.trim();
+    let selection = select_physical_host_relays(enabled_relays);
+
+    let active_relay_name = cfg
+        .active_relay_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|id| relay_id_to_name.get(id))
+        .cloned();
+
+    let use_two_layer_lb = selection.distinct_host_count >= 2
+        && match cfg.dispatch_strategy {
+            PreAccelDispatchStrategy::LoadBalance => true,
+            PreAccelDispatchStrategy::Auto => active_relay_name.is_none(),
+            PreAccelDispatchStrategy::Fallback => false,
+        };
+
+    let mut proxy_groups: Vec<Value> = Vec::with_capacity(if use_two_layer_lb { 3 } else { 2 });
+
+    // Build `select` entry group referenced by `dialer-proxy` / standalone `MATCH`.
+    let mut select_members: Vec<String> = Vec::with_capacity(relay_names_ordered.len() + 2);
+    let mut select_seen: HashSet<String> = HashSet::new();
+    if let Some(ref chosen) = active_relay_name {
+        if !cfg.auto_failover {
+            push_unique_exact(&mut select_members, &mut select_seen, chosen.clone());
+        }
+    }
+    push_unique_exact(
+        &mut select_members,
+        &mut select_seen,
+        PREACCEL_FALLBACK_GROUP.to_string(),
+    );
+    if let Some(ref chosen) = active_relay_name {
+        push_unique_exact(&mut select_members, &mut select_seen, chosen.clone());
+    }
+    for name in relay_names_ordered {
+        push_unique_exact(&mut select_members, &mut select_seen, name.clone());
+    }
+    push_unique_exact(&mut select_members, &mut select_seen, "DIRECT".to_string());
+
+    let default_select_target = select_members
+        .first()
+        .cloned()
+        .unwrap_or_else(|| PREACCEL_FALLBACK_GROUP.to_string());
+    proxy_groups.push(build_select_group_yaml(&select_members));
+
+    if use_two_layer_lb {
+        // Inner `load-balance` group: strictly physical-host representatives, NEVER `"DIRECT"`.
+        let mut lb_members: Vec<String> = Vec::with_capacity(selection.primary_host_relays.len());
+        let mut lb_seen: HashSet<String> = HashSet::new();
+        for relay in &selection.primary_host_relays {
+            if let Some(name) = relay_id_to_name.get(&relay.id) {
+                if !name.eq_ignore_ascii_case("DIRECT") {
+                    push_unique_exact(&mut lb_members, &mut lb_seen, name.clone());
+                }
+            }
+        }
+
+        // Outer `fallback` group: [PREACCEL_LB_GROUP_NAME, secondary_protocol_relays..., "DIRECT"].
+        let mut fallback_members: Vec<String> =
+            Vec::with_capacity(selection.secondary_protocol_relays.len() + 2);
+        let mut fb_seen: HashSet<String> = HashSet::new();
+        push_unique_exact(
+            &mut fallback_members,
+            &mut fb_seen,
+            PREACCEL_LB_GROUP_NAME.to_string(),
+        );
+        for relay in &selection.secondary_protocol_relays {
+            if let Some(name) = relay_id_to_name.get(&relay.id) {
+                push_unique_exact(&mut fallback_members, &mut fb_seen, name.clone());
+            }
+        }
+        push_unique_exact(&mut fallback_members, &mut fb_seen, "DIRECT".to_string());
+
+        proxy_groups.push(build_fallback_group_yaml(
+            &fallback_members,
+            trimmed_probe_url,
+            clamped_interval,
+        ));
+        proxy_groups.push(build_load_balance_group_yaml(
+            PREACCEL_LB_GROUP_NAME,
+            cfg.lb_strategy.as_str(),
+            &lb_members,
+            trimmed_probe_url,
+            clamped_interval,
+        ));
+    } else {
+        // Single physical host or Fallback mode (or pinned active relay in Auto mode):
+        // single-layer `fallback` with `active_relay_id` promoted to index 0 + `"DIRECT"` safety net.
+        let mut ordered: Vec<String> = relay_names_ordered.to_vec();
+        if let Some(ref chosen) = active_relay_name {
+            if let Some(pos) = ordered.iter().position(|n| n == chosen) {
+                let item = ordered.remove(pos);
+                ordered.insert(0, item);
+            }
+        }
+        let mut fallback_members: Vec<String> = Vec::with_capacity(ordered.len() + 1);
+        let mut fb_seen: HashSet<String> = HashSet::new();
+        for name in ordered {
+            push_unique_exact(&mut fallback_members, &mut fb_seen, name);
+        }
+        push_unique_exact(&mut fallback_members, &mut fb_seen, "DIRECT".to_string());
+
+        proxy_groups.push(build_fallback_group_yaml(
+            &fallback_members,
+            trimmed_probe_url,
+            clamped_interval,
+        ));
+    }
+
+    BuiltPreAccelGroups {
+        proxy_groups,
+        default_select_target,
+        load_balance_active: use_two_layer_lb,
+        distinct_host_count: selection.distinct_host_count,
+    }
+}
+
 /// Compiled domestic pre-acceleration artifacts ready to be merged into Mihomo YAML.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PreAccelCompilePlan {
@@ -41,9 +203,15 @@ pub struct PreAccelCompilePlan {
     pub active: bool,
     /// Name of the user-facing `select` entry group (`PREACCEL_SELECT_GROUP`).
     pub select_group_name: String,
-    /// Name of the active-standby `fallback` group (`PREACCEL_FALLBACK_GROUP`).
+    /// Name of the outer `fallback` group (`PREACCEL_FALLBACK_GROUP`).
     pub fallback_group_name: String,
-    /// Validated domestic 204 probe URL used by the `fallback` group.
+    /// Optional inner `load-balance` group name (`PREACCEL_LB_GROUP_NAME`) when active.
+    #[serde(default)]
+    pub lb_group_name: Option<String>,
+    /// Number of distinct physical domestic cloud hosts represented in the relay pool.
+    #[serde(default)]
+    pub distinct_host_count: usize,
+    /// Validated domestic 204 probe URL used by the `fallback` / `load-balance` groups.
     pub effective_probe_url: String,
     /// Clamped probe interval in seconds (`10..=300`).
     pub effective_probe_interval_sec: u64,
@@ -53,14 +221,17 @@ pub struct PreAccelCompilePlan {
     pub ordered_relay_names: Vec<String>,
     /// Compiled Mihomo proxy YAML entries for enabled relays (pure IP, no SNI, skip-cert-verify).
     pub relay_proxies: Vec<Value>,
-    /// Compiled Mihomo proxy-group YAML entries (`select` + `fallback`).
+    /// Compiled Mihomo proxy-group YAML entries (`select` + `fallback` [+ inner `load-balance`]).
     pub proxy_groups: Vec<Value>,
     /// Per-node `dialer-proxy` assignment keyed by `node.id` (`Some(PREACCEL_SELECT_GROUP)` or `None`).
     pub node_dialer_map: BTreeMap<String, Option<String>>,
     /// Node IDs that will be routed through `PREACCEL_SELECT_GROUP`.
     pub dialer_node_ids: Vec<String>,
-    /// Node IDs that bypass pre-acceleration (e.g. native 443 nodes or overridden off).
+    /// Node IDs that bypass pre-acceleration (e.g. native 443 nodes, IPv6-only nodes, or overridden off).
     pub skipped_node_ids: Vec<String>,
+    /// IPv6-only business node IDs skipped because enabled relays lack public IPv6 egress.
+    #[serde(default)]
+    pub skipped_ipv6_node_ids: Vec<String>,
     /// Top-priority `DIRECT` anti-loop rules (deduplicated while preserving order).
     pub anti_loop_rules: Vec<String>,
     /// `dns.fake-ip-filter` entries for relay/node/probe/campus domains (deduplicated in order).
@@ -222,6 +393,8 @@ pub fn build_preaccel_compile_plan(
         active: false,
         select_group_name: PREACCEL_SELECT_GROUP.to_string(),
         fallback_group_name: PREACCEL_FALLBACK_GROUP.to_string(),
+        lb_group_name: None,
+        distinct_host_count: 0,
         effective_probe_url: primary_probe.as_str().to_string(),
         effective_probe_interval_sec: effective_interval,
         ordered_relay_ids: Vec::new(),
@@ -231,6 +404,7 @@ pub fn build_preaccel_compile_plan(
         node_dialer_map: BTreeMap::new(),
         dialer_node_ids: Vec::new(),
         skipped_node_ids: Vec::new(),
+        skipped_ipv6_node_ids: Vec::new(),
         anti_loop_rules: Vec::new(),
         fake_ip_filter: Vec::new(),
         warnings: Vec::new(),
@@ -260,8 +434,18 @@ pub fn build_preaccel_compile_plan(
     // Sort deterministically: lower numeric `priority` comes first, tie-broken by `id`.
     enabled_relays.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
 
-    let mut used_proxy_names: HashSet<String> = HashSet::new();
-    let mut id_to_proxy_name: BTreeMap<String, String> = BTreeMap::new();
+    let mut used_proxy_names: HashSet<String> = [
+        "DIRECT",
+        "REJECT",
+        "PASS",
+        PREACCEL_SELECT_GROUP,
+        PREACCEL_FALLBACK_GROUP,
+        PREACCEL_LB_GROUP,
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect();
+    let mut id_to_proxy_name: HashMap<String, String> = HashMap::new();
 
     for (idx, relay) in enabled_relays.iter().enumerate() {
         let issues = validate_relay(relay);
@@ -300,74 +484,53 @@ pub fn build_preaccel_compile_plan(
         id_to_proxy_name.insert(relay.id.clone(), proxy_name);
     }
 
-    // Build `fallback` active-standby group (explicit `lazy: false`, domestic 204 URL, clamped interval).
-    let fallback_group = build_fallback_group_yaml(
-        &plan.ordered_relay_names,
-        &plan.effective_probe_url,
-        effective_interval,
-    );
-
-    // Build `select` entry group.
-    let mut select_members: Vec<String> = Vec::with_capacity(plan.ordered_relay_names.len() + 1);
-    let mut select_seen: HashSet<String> = HashSet::new();
-
     if let Some(active_id) = cfg
         .active_relay_id
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        if let Some(active_name) = id_to_proxy_name.get(active_id) {
-            push_unique_exact(&mut select_members, &mut select_seen, active_name.clone());
-            push_unique_exact(
-                &mut select_members,
-                &mut select_seen,
-                PREACCEL_FALLBACK_GROUP.to_string(),
-            );
-        } else {
+        if !id_to_proxy_name.contains_key(active_id) {
             plan.warnings.push(format!(
                 "configured active_relay_id `{active_id}` was not found among enabled relays; falling back to `{PREACCEL_FALLBACK_GROUP}`"
             ));
-            push_unique_exact(
-                &mut select_members,
-                &mut select_seen,
-                PREACCEL_FALLBACK_GROUP.to_string(),
-            );
         }
-    } else if cfg.auto_failover {
-        push_unique_exact(
-            &mut select_members,
-            &mut select_seen,
-            PREACCEL_FALLBACK_GROUP.to_string(),
-        );
-    } else if let Some(first_name) = plan.ordered_relay_names.first() {
-        push_unique_exact(&mut select_members, &mut select_seen, first_name.clone());
-        push_unique_exact(
-            &mut select_members,
-            &mut select_seen,
-            PREACCEL_FALLBACK_GROUP.to_string(),
-        );
     }
 
-    for name in &plan.ordered_relay_names {
-        push_unique_exact(&mut select_members, &mut select_seen, name.clone());
-    }
-
-    let select_group = build_select_group_yaml(&select_members);
-    plan.proxy_groups.push(select_group);
-    plan.proxy_groups.push(fallback_group);
+    let enabled_owned: Vec<PreAccelRelay> = enabled_relays.iter().map(|r| (*r).clone()).collect();
+    let built_groups = build_preaccel_proxy_groups(
+        cfg,
+        &enabled_owned,
+        &id_to_proxy_name,
+        &plan.ordered_relay_names,
+        &plan.effective_probe_url,
+        effective_interval,
+    );
+    plan.proxy_groups = built_groups.proxy_groups;
+    plan.distinct_host_count = built_groups.distinct_host_count;
+    plan.lb_group_name = built_groups
+        .load_balance_active
+        .then(|| PREACCEL_LB_GROUP_NAME.to_string());
     plan.active = true;
 
-    // Determine per-node `dialer-proxy` wrapping via `ProxyNode::should_apply_preaccel`.
+    // Determine per-node `dialer-proxy` wrapping via `ProxyNode::should_apply_preaccel` + IPv6 guard.
+    let relays_ipv6 = relays_support_ipv6(&enabled_owned);
     for node in nodes {
-        let apply = node.enabled && node.should_apply_preaccel(cfg.skip_443_native);
-        if apply {
+        let wants = node.enabled && node.should_apply_preaccel(cfg.skip_443_native);
+        let skip_for_ipv6 = wants
+            && !relays_ipv6
+            && is_ipv6_only_node(node)
+            && node.preaccel_override != Some(true);
+        if wants && !skip_for_ipv6 {
             plan.node_dialer_map
                 .insert(node.id.clone(), Some(PREACCEL_SELECT_GROUP.to_string()));
             plan.dialer_node_ids.push(node.id.clone());
         } else {
             plan.node_dialer_map.insert(node.id.clone(), None);
             plan.skipped_node_ids.push(node.id.clone());
+            if skip_for_ipv6 {
+                plan.skipped_ipv6_node_ids.push(node.id.clone());
+            }
         }
     }
 
@@ -626,6 +789,42 @@ fn build_fallback_group_yaml(
     map.insert(
         Value::String("type".to_string()),
         Value::String("fallback".to_string()),
+    );
+    map.insert(
+        Value::String("proxies".to_string()),
+        Value::Sequence(relay_names.iter().cloned().map(Value::String).collect()),
+    );
+    map.insert(
+        Value::String("url".to_string()),
+        Value::String(probe_url.to_string()),
+    );
+    map.insert(
+        Value::String("interval".to_string()),
+        Value::Number(Number::from(interval_sec)),
+    );
+    map.insert(Value::String("lazy".to_string()), Value::Bool(false));
+    Value::Mapping(map)
+}
+
+fn build_load_balance_group_yaml(
+    group_name: &str,
+    strategy: &str,
+    relay_names: &[String],
+    probe_url: &str,
+    interval_sec: u64,
+) -> Value {
+    let mut map = Mapping::new();
+    map.insert(
+        Value::String("name".to_string()),
+        Value::String(group_name.to_string()),
+    );
+    map.insert(
+        Value::String("type".to_string()),
+        Value::String("load-balance".to_string()),
+    );
+    map.insert(
+        Value::String("strategy".to_string()),
+        Value::String(strategy.to_string()),
     );
     map.insert(
         Value::String("proxies".to_string()),

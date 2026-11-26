@@ -25,15 +25,17 @@ use catcloud_core::core_adapter::stream_client::{
 };
 use catcloud_core::core_adapter::{
     ConnectionsSnapshot, CoreAdapter, CoreLogLine, CoreRuntimeStatus, CoreStartRequest,
-    ReloadLevel, ReloadOutcome, SINGLE_NODE_GROUP_NAME, TrafficTick,
+    DNS_TLS_STATUS_HEALTHY, DnsTlsDiagnostics, ReloadLevel, ReloadOutcome, SINGLE_NODE_GROUP_NAME,
+    TrafficTick, analyze_dns_tls_diagnostics, analyze_dns_tls_diagnostics_from_log_file,
 };
 use catcloud_core::models::{
     AppConfig, CoreLogLevel, GlobalPreAccelScope, MemoryLimitTier, MultiGroup, MultiGroupMode,
-    MultiGroupState, OverrideMode, PersonalizationConfig, PreAccelConfig, PreAccelRelay,
-    ProbeDefinition, ProbeSnapshot, ProxyMode, ProxyNode, RouteTargetMode, SubscriptionKind,
-    SubscriptionRecord, SwitchMode, ThemeDaySchedule, ThemeMode,
-    TrayClickAction as CoreTrayClickAction, TrayIconMode, TunStackMode, UpdateApplyMode,
-    UpdateConfig, normalize_ui_language,
+    MultiGroupState, OverrideMode, PersonalizationConfig, PreAccelConfig,
+    PreAccelDispatchStrategy, PreAccelLbStrategy, PreAccelRelay, ProbeDefinition, ProbeSnapshot,
+    ProxyMode, ProxyNode, RouteTargetMode, SubscriptionKind, SubscriptionRecord, SwitchMode,
+    ThemeDaySchedule, ThemeMode, TrayClickAction as CoreTrayClickAction, TrayIconMode,
+    TunStackMode, UpdateApplyMode, UpdateConfig, is_info_proxy_node, is_ipv6_only_node,
+    normalize_ui_language, pick_smart_default_node_id,
 };
 use catcloud_core::platform::{SystemProxySpec, default_platform};
 use catcloud_core::preaccel::campus::{
@@ -213,6 +215,23 @@ pub fn summarize_connections(
     out
 }
 
+/// Auto-mark `onboarding_completed = true` for existing users upgrading from prior versions
+/// whose SQLite store already holds any nodes, subscriptions, domestic relays, or multi-groups.
+fn reconcile_legacy_onboarding_completed(cfg: &mut AppConfig, storage: &Storage) -> bool {
+    if cfg.personalization.onboarding_completed {
+        return false;
+    }
+    let has_existing_assets = storage.list_nodes().is_ok_and(|v| !v.is_empty())
+        || storage.list_subscriptions().is_ok_and(|v| !v.is_empty())
+        || storage.list_preaccel_relays(false).is_ok_and(|v| !v.is_empty())
+        || storage.list_multi_groups().is_ok_and(|v| !v.is_empty());
+    if has_existing_assets {
+        cfg.personalization.onboarding_completed = true;
+        return true;
+    }
+    false
+}
+
 impl AppState {
     pub fn new(
         paths: AppPaths,
@@ -221,6 +240,9 @@ impl AppState {
         job_guard: Arc<JobGuard>,
     ) -> Self {
         cfg.preaccel.reconcile_unified_enabled();
+        if reconcile_legacy_onboarding_completed(&mut cfg, &storage) {
+            let _ = config::save(&paths, &cfg);
+        }
         let adapter = Arc::new(
             MihomoAdapter::new(Arc::clone(&job_guard))
                 .expect("failed to initialize MihomoAdapter"),
@@ -721,6 +743,12 @@ pub struct UiPreAccelDto {
     pub global_target_processes: Option<Vec<String>>,
     #[serde(default)]
     pub windivert_dir: Option<String>,
+    #[serde(default)]
+    pub active_relay_id: Option<String>,
+    #[serde(default)]
+    pub dispatch_strategy: Option<PreAccelDispatchStrategy>,
+    #[serde(default)]
+    pub lb_strategy: Option<PreAccelLbStrategy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -747,6 +775,8 @@ pub struct UiPersonalizationDto {
     pub mascot_enabled: bool,
     pub sparkline_enabled: bool,
     pub tray_icon_mode: TrayIconMode,
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -794,6 +824,9 @@ impl From<&AppConfig> for UiAppConfigDto {
                 global_scope: Some(cfg.preaccel.global_scope),
                 global_target_processes: Some(cfg.preaccel.global_target_processes.clone()),
                 windivert_dir: cfg.preaccel.windivert_dir.clone(),
+                active_relay_id: cfg.preaccel.active_relay_id.clone(),
+                dispatch_strategy: Some(cfg.preaccel.dispatch_strategy),
+                lb_strategy: Some(cfg.preaccel.lb_strategy),
             },
             personalization: UiPersonalizationDto {
                 ui_language: cfg.personalization.normalized_ui_language().to_string(),
@@ -810,6 +843,7 @@ impl From<&AppConfig> for UiAppConfigDto {
                 mascot_enabled: cfg.personalization.mascot_enabled,
                 sparkline_enabled: cfg.personalization.sparkline_enabled,
                 tray_icon_mode: cfg.personalization.tray_icon_mode.clone(),
+                onboarding_completed: cfg.personalization.onboarding_completed,
             },
             update: UiUpdateDto {
                 repo: cfg.update.repo.clone(),
@@ -847,11 +881,44 @@ fn apply_ui_dto(cfg: &mut AppConfig, dto: &UiAppConfigDto) {
             _ => MemoryLimitTier::Mb96,
         }
     };
+    let next_dispatch_strategy = dto
+        .preaccel
+        .dispatch_strategy
+        .unwrap_or(cfg.preaccel.dispatch_strategy);
+    let next_lb_strategy = dto
+        .preaccel
+        .lb_strategy
+        .unwrap_or(cfg.preaccel.lb_strategy);
+    let normalized_dto_active_relay_id = dto
+        .preaccel
+        .active_relay_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    // Keep `active_relay_id` strictly synchronized with `dispatch_strategy`:
+    // - `LoadBalance` always clears `active_relay_id` to `None`.
+    // - `Auto` / `Fallback` synchronize the normalized `dto.preaccel.active_relay_id` (empty -> `None`)
+    //   so returning to multi-cloud LB via `(Auto, None)` clears a pinned relay even if the stored
+    //   strategy was already `Auto`; legacy payloads omitting both fields retain the prior value.
+    let next_active_relay_id = match next_dispatch_strategy {
+        PreAccelDispatchStrategy::LoadBalance => None,
+        PreAccelDispatchStrategy::Auto | PreAccelDispatchStrategy::Fallback => {
+            if dto.preaccel.dispatch_strategy.is_some() || dto.preaccel.active_relay_id.is_some() {
+                normalized_dto_active_relay_id
+            } else {
+                cfg.preaccel.active_relay_id.clone()
+            }
+        }
+    };
     cfg.preaccel = PreAccelConfig {
         enabled: dto.preaccel.enabled,
         skip_443_native: dto.preaccel.skip_443_native,
         probe_url: dto.preaccel.probe_url.clone(),
         fallback_probe_url: dto.preaccel.fallback_probe_url.clone(),
+        active_relay_id: next_active_relay_id,
+        dispatch_strategy: next_dispatch_strategy,
+        lb_strategy: next_lb_strategy,
         campus_portal_guard: dto
             .preaccel
             .campus_portal_guard
@@ -900,6 +967,7 @@ fn apply_ui_dto(cfg: &mut AppConfig, dto: &UiAppConfigDto) {
         sparkline_enabled: dto.personalization.sparkline_enabled,
         tray_icon_mode: dto.personalization.tray_icon_mode.clone(),
         language: resolved_ui_language,
+        onboarding_completed: dto.personalization.onboarding_completed,
         ..cfg.personalization.clone()
     };
     cfg.update = UpdateConfig {
@@ -938,6 +1006,10 @@ pub struct CoreRuntimeInfoDto {
     #[serde(default)]
     pub preaccel_enabled: bool,
     #[serde(default)]
+    pub preaccel_effective_carrier: String,
+    #[serde(default)]
+    pub standalone_tunnel_suspended_for_tun: bool,
+    #[serde(default)]
     pub global_preaccel_active: bool,
     #[serde(default)]
     pub global_preaccel_mode: String,
@@ -953,6 +1025,8 @@ pub struct CoreRuntimeInfoDto {
     pub global_preaccel_verify_state: String,
     #[serde(default)]
     pub global_preaccel_verify_ms: Option<u64>,
+    #[serde(default)]
+    pub dns_tls_diagnostics: Option<DnsTlsDiagnostics>,
     #[serde(default)]
     pub node_health_hints: HashMap<String, NodeHealthHintDto>,
     #[serde(default)]
@@ -2267,6 +2341,53 @@ fn tun_needs_admin_error_message() -> String {
     }
 }
 
+/// Resolve the unified domestic pre-acceleration effective carrier contract across all modes:
+/// `"main_core_tun_suspended_standalone" | "main_core_proxy_only" | "standalone_windivert" | "standalone_socks5" | "off"`.
+fn resolve_preaccel_effective_carrier(
+    preaccel_enabled: bool,
+    has_enabled_relays: bool,
+    core_running: bool,
+    eff_tun: bool,
+    proxy_active: bool,
+    is_direct_mode: bool,
+    global_status: &GlobalPreAccelStatus,
+) -> (&'static str, bool) {
+    if global_status.is_windivert_active {
+        return ("standalone_windivert", false);
+    }
+    if global_status.running {
+        return ("standalone_socks5", false);
+    }
+    if is_direct_mode || !preaccel_enabled || !has_enabled_relays {
+        return ("off", false);
+    }
+    let suspended_for_tun =
+        global_status.mode == "suspended_for_tun" || (core_running && eff_tun);
+    if suspended_for_tun {
+        return ("main_core_tun_suspended_standalone", true);
+    }
+    if proxy_active {
+        return ("main_core_proxy_only", false);
+    }
+    ("off", false)
+}
+
+/// Align multi-cloud load-balance activation with `preaccel::generator::build_preaccel_proxy_groups`:
+/// requires `distinct_host_count >= 2` and either explicit `LoadBalance` or `Auto` with no pinned
+/// `active_relay_id`.
+fn is_preaccel_pool_lb_effective(
+    strategy: PreAccelDispatchStrategy,
+    active_relay_id: Option<&str>,
+    distinct_host_count: usize,
+) -> bool {
+    let has_active_relay = active_relay_id
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    distinct_host_count >= 2
+        && (strategy == PreAccelDispatchStrategy::LoadBalance
+            || (strategy == PreAccelDispatchStrategy::Auto && !has_active_relay))
+}
+
 pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, String> {
     build_runtime_info_dto_with_verify_override(state, None)
 }
@@ -2322,7 +2443,10 @@ fn build_runtime_info_dto_with_verify_override(
         } else {
             let group_node = match primary_group {
                 Some(g) => resolve_valid_group_active_node(g, &nodes),
-                None => nodes.iter().find(|n| n.enabled).or_else(|| nodes.first()),
+                None => pick_smart_default_node_id(&nodes, None)
+                    .and_then(|id| nodes.iter().find(|n| n.id == id))
+                    .or_else(|| nodes.iter().find(|n| n.enabled))
+                    .or_else(|| nodes.first()),
             };
             (
                 RouteTargetMode::Group,
@@ -2441,6 +2565,26 @@ fn build_runtime_info_dto_with_verify_override(
         "idle".to_string()
     };
 
+    let (preaccel_effective_carrier, standalone_tunnel_suspended_for_tun) =
+        resolve_preaccel_effective_carrier(
+            cfg.preaccel.enabled,
+            has_enabled_relays,
+            rt.running,
+            eff_tun,
+            proxy_active,
+            is_direct_mode,
+            &global_status,
+        );
+    let dns_diag_raw = analyze_dns_tls_diagnostics_from_log_file(
+        &state.app_logger.active_log_path(),
+        64 * 1024,
+    );
+    let dns_tls_diagnostics = if dns_diag_raw.status != DNS_TLS_STATUS_HEALTHY {
+        Some(dns_diag_raw)
+    } else {
+        None
+    };
+
     Ok(CoreRuntimeInfoDto {
         running: rt.running,
         status: status_label,
@@ -2477,6 +2621,8 @@ fn build_runtime_info_dto_with_verify_override(
         active_node_up_mbps: active_snap.as_ref().and_then(|s| s.up_mbps),
         preaccel_active,
         preaccel_enabled: cfg.preaccel.enabled,
+        preaccel_effective_carrier: preaccel_effective_carrier.to_string(),
+        standalone_tunnel_suspended_for_tun,
         global_preaccel_active: global_status.running,
         global_preaccel_mode: global_status.mode,
         global_preaccel_socks_port: global_status.socks_port,
@@ -2485,6 +2631,7 @@ fn build_runtime_info_dto_with_verify_override(
         preaccel_install_state: global_status.install_state,
         global_preaccel_verify_state: verify_state,
         global_preaccel_verify_ms: verify_ms,
+        dns_tls_diagnostics,
         node_health_hints,
         probing_active,
         switching_active,
@@ -2654,12 +2801,14 @@ fn ensure_default_group_if_empty(state: &AppState) -> bool {
         if nodes.is_empty() {
             return false;
         }
-        let member_node_ids: Vec<String> = nodes
-            .iter()
-            .filter(|n| n.enabled)
-            .map(|n| n.id.clone())
-            .collect();
-        let active_node_id = member_node_ids.first().cloned();
+        let enabled_nodes: Vec<ProxyNode> =
+            nodes.iter().filter(|n| n.enabled).cloned().collect();
+        let member_node_ids: Vec<String> = enabled_nodes.iter().map(|n| n.id.clone()).collect();
+        let snaps = db
+            .get_probe_snapshots_batch(&member_node_ids, None)
+            .unwrap_or_default();
+        let active_node_id = pick_smart_default_node_id(&enabled_nodes, Some(&snaps))
+            .or_else(|| member_node_ids.first().cloned());
         let group = MultiGroup {
             id: format!("grp-{}", uuid::Uuid::new_v4().simple()),
             name: "默认路线".to_string(),
@@ -3506,13 +3655,29 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
     // Coordinate with standalone global pre-acceleration using the SAME launch-time effective TUN
     // state so unprivileged startup never falsely pauses the standalone 443 engine.
     let tun_active = status.running && eff_tun;
-    if tun_active && state.global_preaccel.status().running {
-        let _ = state.global_preaccel.stop().await;
-        state.log_app_event(
-            "info",
-            "国内提速",
-            "虚拟网卡（TUN）已启动接管全机流量，已暂挂独立底层 443 隧道以避免重复占用内存，改由主核心统一提供国内提速",
-        );
+    if tun_active {
+        if cfg.preaccel.enabled {
+            let active_relays: Vec<String> = load_enabled_preaccel_relays(state)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+            let was_running = state.global_preaccel.status().running;
+            if was_running || !active_relays.is_empty() {
+                let _ = state.global_preaccel.suspend_for_tun(active_relays).await;
+                if was_running {
+                    state.log_app_event(
+                        "info",
+                        "国内提速",
+                        "虚拟网卡（TUN）已启动接管全机流量，已暂挂独立底层 443 隧道以避免重复占用内存，改由主核心统一提供国内提速",
+                    );
+                }
+            }
+        } else if state.global_preaccel.status().running
+            || state.global_preaccel.status().mode == "suspended_for_tun"
+        {
+            let _ = state.global_preaccel.stop().await;
+        }
     } else {
         let main_pid = if status.running {
             status.pid.filter(|&p| p > 0)
@@ -3895,15 +4060,29 @@ async fn coordinate_global_preaccel_on_tun_transition(
         return;
     }
     if !was_tun_active && now_tun_active {
-        if state.global_preaccel.status().running {
+        if cfg.preaccel.enabled {
+            let active_relays: Vec<String> = load_enabled_preaccel_relays(state)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+            let was_running = state.global_preaccel.status().running;
+            if was_running || !active_relays.is_empty() {
+                let _ = state.global_preaccel.suspend_for_tun(active_relays).await;
+                if was_running {
+                    state.log_app_event(
+                        "info",
+                        "国内提速",
+                        &format!(
+                            "{trigger_label}已生效接管全机流量，已暂挂独立底层 443 隧道以避免双跑 443，改由主核心统一提供国内提速"
+                        ),
+                    );
+                }
+            }
+        } else if state.global_preaccel.status().running
+            || state.global_preaccel.status().mode == "suspended_for_tun"
+        {
             let _ = state.global_preaccel.stop().await;
-            state.log_app_event(
-                "info",
-                "国内提速",
-                &format!(
-                    "{trigger_label}已生效接管全机流量，已暂挂独立底层 443 隧道以避免双跑 443，改由主核心统一提供国内提速"
-                ),
-            );
         }
     } else if !now_tun_active && cfg.preaccel.enabled {
         let has_relays = load_enabled_preaccel_relays(state).is_ok_and(|relays| !relays.is_empty());
@@ -5049,7 +5228,17 @@ pub fn copy_text_to_clipboard(text: &str) -> Result<(), String> {
 
 #[tauri::command]
 pub fn get_app_config(state: State<'_, AppState>) -> Result<UiAppConfigDto, String> {
-    let cfg = state.snapshot_config();
+    let mut cfg = state.snapshot_config();
+    if !cfg.personalization.onboarding_completed {
+        if let Ok(db) = state.storage.lock() {
+            if reconcile_legacy_onboarding_completed(&mut cfg, &db) {
+                let _ = config::save(&state.paths, &cfg);
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = cfg.clone();
+                }
+            }
+        }
+    }
     Ok(UiAppConfigDto::from(&cfg))
 }
 
@@ -5318,7 +5507,10 @@ where
         } else {
             stop_core_internal(app, state).await?;
         }
-        if old.preaccel.enabled && !next.preaccel.enabled && state.global_preaccel.status().running
+        if old.preaccel.enabled
+            && !next.preaccel.enabled
+            && (state.global_preaccel.status().running
+                || state.global_preaccel.status().mode == "suspended_for_tun")
         {
             let _ = state.global_preaccel.stop().await;
         }
@@ -5390,14 +5582,19 @@ where
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
     let now_tun_active = now_core_running && effective_tun_enabled(state, &next);
-    let relay_selection_changed = old.preaccel.active_relay_id != next.preaccel.active_relay_id;
+    let relay_selection_changed = old.preaccel.active_relay_id != next.preaccel.active_relay_id
+        || old.preaccel.dispatch_strategy != next.preaccel.dispatch_strategy
+        || old.preaccel.lb_strategy != next.preaccel.lb_strategy;
     let windivert_policy_changed = old.preaccel.skip_443_native != next.preaccel.skip_443_native
         || old.preaccel.probe_url != next.preaccel.probe_url
         || old.preaccel.global_scope != next.preaccel.global_scope
         || old.preaccel.global_target_processes != next.preaccel.global_target_processes
         || old.preaccel.windivert_dir != next.preaccel.windivert_dir;
 
-    if !next.preaccel.enabled && state.global_preaccel.status().running {
+    if !next.preaccel.enabled
+        && (state.global_preaccel.status().running
+            || state.global_preaccel.status().mode == "suspended_for_tun")
+    {
         let _ = state.global_preaccel.stop().await;
     } else if was_tun_active != now_tun_active || (old.preaccel.enabled != next.preaccel.enabled) {
         coordinate_global_preaccel_on_tun_transition(
@@ -6890,7 +7087,7 @@ pub async fn run_isolated_probes(
     let keepalive_enabled = include_keepalive.unwrap_or(false);
     let want_preaccel = use_preaccel.unwrap_or(cfg.preaccel.enabled);
 
-    let (target_nodes, probe_defs, active_relay) = {
+    let (target_nodes, probe_defs, preaccel_relays) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let all_nodes = db.list_nodes().map_err(|e| e.to_string())?;
         let target_nodes: Vec<ProxyNode> = if node_ids.is_empty() {
@@ -6916,22 +7113,67 @@ pub async fn run_isolated_probes(
             .into_iter()
             .filter(|d| keepalive_enabled || d.kind != catcloud_core::models::ProbeKind::Keepalive)
             .collect();
-        let active_relay = if want_preaccel {
-            let enabled_relays = db.list_preaccel_relays(true).unwrap_or_default();
-            cfg.preaccel
+        let preaccel_relays: Vec<PreAccelRelay> = if want_preaccel {
+            let mut enabled_relays = db.list_preaccel_relays(true).unwrap_or_default();
+            enabled_relays.retain(|r| !r.server.trim().is_empty() && r.port > 0);
+            enabled_relays.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+            if let Some(aid) = cfg
+                .preaccel
                 .active_relay_id
                 .as_deref()
-                .and_then(|aid| enabled_relays.iter().find(|r| r.id == aid).cloned())
-                .or_else(|| enabled_relays.into_iter().next())
-                .filter(|r| !r.server.trim().is_empty() && r.port > 0)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(pos) = enabled_relays.iter().position(|r| r.id == aid) {
+                    let chosen = enabled_relays.remove(pos);
+                    enabled_relays.insert(0, chosen);
+                }
+            }
+            enabled_relays
         } else {
-            None
+            Vec::new()
         };
-        (target_nodes, filtered_defs, active_relay)
+        (target_nodes, filtered_defs, preaccel_relays)
     };
 
-    let used_preaccel = active_relay.is_some();
-    let preaccel_relay_name = active_relay.as_ref().map(|r| r.name.clone());
+    let used_preaccel = !preaccel_relays.is_empty();
+    let preaccel_host_selection = catcloud_core::preaccel::select_physical_host_relays(&preaccel_relays);
+    let preaccel_lb_active = is_preaccel_pool_lb_effective(
+        cfg.preaccel.dispatch_strategy,
+        cfg.preaccel.active_relay_id.as_deref(),
+        preaccel_host_selection.distinct_host_count,
+    );
+    let effective_probe_dispatch_strategy = if preaccel_lb_active {
+        cfg.preaccel.dispatch_strategy
+    } else if cfg.preaccel.dispatch_strategy == PreAccelDispatchStrategy::Auto
+        && cfg
+            .preaccel
+            .active_relay_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    {
+        PreAccelDispatchStrategy::Fallback
+    } else {
+        cfg.preaccel.dispatch_strategy
+    };
+    let preaccel_relay_name = if preaccel_relays.is_empty() {
+        None
+    } else if preaccel_relays.len() == 1 {
+        Some(preaccel_relays[0].name.clone())
+    } else if preaccel_lb_active {
+        Some(format!(
+            "多云均衡池（{} 台物理云 / {} 条中转）",
+            preaccel_host_selection.distinct_host_count,
+            preaccel_relays.len()
+        ))
+    } else {
+        Some(format!(
+            "{}（自动主备共 {} 条）",
+            preaccel_relays[0].name,
+            preaccel_relays.len()
+        ))
+    };
 
     if target_nodes.is_empty() {
         return Err("请先选择至少一个节点后再开始测速".to_string());
@@ -6939,6 +7181,12 @@ pub async fn run_isolated_probes(
     if probe_defs.is_empty() {
         return Err("当前没有可用的测速项目".to_string());
     }
+
+    let latency_probe_ids: HashSet<String> = probe_defs
+        .iter()
+        .filter(|d| d.kind == catcloud_core::models::ProbeKind::Latency)
+        .map(|d| d.id.clone())
+        .collect();
 
     let mut registry = ProbeRegistry::new();
     for def in probe_defs {
@@ -6958,6 +7206,9 @@ pub async fn run_isolated_probes(
     let mut completed_count: usize = 0;
     let mut cancelled = false;
     let mut snapshots: HashMap<String, ProbeSnapshot> = HashMap::new();
+    let mut run_snapshots: HashMap<String, ProbeSnapshot> = HashMap::new();
+    let mut run_records_by_node: HashMap<String, Vec<catcloud_core::models::ProbeResultRecord>> =
+        HashMap::new();
     let mut errors: Vec<String> = Vec::new();
     state.log_app_event(
         "info",
@@ -6986,12 +7237,16 @@ pub async fn run_isolated_probes(
         let probe_core = match tokio::select! {
             biased;
             _ = cancel_rx.wait_for(|&c| c) => Err("cancelled".to_string()),
-            res = IsolatedProbeCore::spawn_with_preaccel(
+            res = IsolatedProbeCore::spawn_with_options_and_preaccel_pool(
                 &mihomo_bin,
                 &temp_root,
                 &state.job_guard,
                 chunk,
-                active_relay.as_ref(),
+                &[],
+                DEFAULT_READY_TIMEOUT,
+                &preaccel_relays,
+                effective_probe_dispatch_strategy,
+                cfg.preaccel.lb_strategy,
                 cfg.preaccel.skip_443_native,
             ) => {
                 res.map_err(|e| e.to_string())
@@ -7079,6 +7334,9 @@ pub async fn run_isolated_probes(
 
             match outcome {
                 Ok(report) => {
+                    let this_run_snap = report.snapshot.clone();
+                    run_records_by_node.insert(nid.clone(), report.records.clone());
+                    run_snapshots.insert(nid.clone(), this_run_snap);
                     // Persist new probe records then read back the merged full snapshot from SQLite
                     // so fast latency checks never wipe previously measured upload/download/unlock data.
                     let snap = if let Ok(mut db) = state.storage.lock() {
@@ -7164,6 +7422,16 @@ pub async fn run_isolated_probes(
         }
     }
 
+    let summary = summarize_isolated_probe_run(
+        total_count,
+        completed_count,
+        &run_snapshots,
+        &run_records_by_node,
+        &latency_probe_ids,
+        errors.len(),
+    );
+    let ok_count = snapshots.values().filter(|s| s.ok).count();
+
     let _ = app.emit(
         EVENT_PROBE_PROGRESS,
         serde_json::json!({
@@ -7174,7 +7442,14 @@ pub async fn run_isolated_probes(
             "cancelled": cancelled,
             "done": true,
             "snapshot": null,
-            "error": null
+            "error": null,
+            "ok_count": ok_count,
+            "latency_ok_count": summary.latency_ok_count,
+            "bandwidth_ok_count": summary.bandwidth_ok_count,
+            "keepalive_ok_count": summary.keepalive_ok_count,
+            "failed_count": summary.failed_count,
+            "exec_error_count": summary.exec_error_count,
+            "untested_count": summary.untested_count
         }),
     );
 
@@ -7219,15 +7494,23 @@ pub async fn run_isolated_probes(
     let latest_cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &latest_cfg);
 
-    let ok_count = snapshots.values().filter(|s| s.ok).count();
     let status_text = if cancelled { "已手动取消" } else { "已完成" };
-    let summary_level = if errors.is_empty() { "info" } else { "warning" };
+    let summary_level = if summary.exec_error_count == 0 {
+        "info"
+    } else {
+        "warning"
+    };
     state.log_app_event(
         summary_level,
         "后台测速",
         &format!(
-            "后台测速{status_text}：完成 {completed_count}/{total_count}，可用 {ok_count} 个，异常 {} 条",
-            errors.len()
+            "后台测速{status_text}：完成 {completed_count}/{total_count}，延迟可达 {}，双向带宽通过 {}，60秒保活通过 {}，未通过 {}，执行异常 {}，未测 {}",
+            summary.latency_ok_count,
+            summary.bandwidth_ok_count,
+            summary.keepalive_ok_count,
+            summary.failed_count,
+            summary.exec_error_count,
+            summary.untested_count,
         ),
     );
 
@@ -7235,12 +7518,83 @@ pub async fn run_isolated_probes(
         "probed_count": snapshots.len(),
         "total_count": total_count,
         "cancelled": cancelled,
+        "ok_count": ok_count,
+        "latency_ok_count": summary.latency_ok_count,
+        "bandwidth_ok_count": summary.bandwidth_ok_count,
+        "keepalive_ok_count": summary.keepalive_ok_count,
+        "failed_count": summary.failed_count,
+        "exec_error_count": summary.exec_error_count,
+        "untested_count": summary.untested_count,
         "snapshots": snapshots,
         "errors": errors,
         "core_available": true,
         "used_preaccel": used_preaccel,
         "preaccel_relay_name": preaccel_relay_name
     }))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct IsolatedProbeBatchSummary {
+    latency_ok_count: usize,
+    bandwidth_ok_count: usize,
+    keepalive_ok_count: usize,
+    failed_count: usize,
+    exec_error_count: usize,
+    untested_count: usize,
+}
+
+/// Split isolated batch probe results into distinct, non-conflated metrics:
+/// latency reachability, bidirectional bandwidth pass, 60s keepalive pass, failed probes,
+/// execution errors, and untested nodes.
+fn summarize_isolated_probe_run(
+    total_count: usize,
+    completed_count: usize,
+    run_snapshots: &HashMap<String, ProbeSnapshot>,
+    run_records_by_node: &HashMap<String, Vec<catcloud_core::models::ProbeResultRecord>>,
+    latency_probe_ids: &HashSet<String>,
+    exec_error_count: usize,
+) -> IsolatedProbeBatchSummary {
+    let mut latency_ok_count = 0usize;
+    let mut bandwidth_ok_count = 0usize;
+    let mut keepalive_ok_count = 0usize;
+    let mut failed_count = 0usize;
+
+    for (node_id, snap) in run_snapshots {
+        let latency_ok = if !latency_probe_ids.is_empty() {
+            run_records_by_node
+                .get(node_id)
+                .is_some_and(|recs| {
+                    recs.iter()
+                        .any(|r| latency_probe_ids.contains(&r.probe_id) && r.ok)
+                })
+        } else {
+            snap.ok && snap.latency_ms.is_some_and(|v| v.is_finite() && v > 0.0)
+        };
+        if latency_ok {
+            latency_ok_count += 1;
+        }
+        let bw_ok = snap.up_mbps.is_some_and(|v| v.is_finite() && v > 0.0)
+            && snap.down_mbps.is_some_and(|v| v.is_finite() && v > 0.0);
+        if bw_ok {
+            bandwidth_ok_count += 1;
+        }
+        if snap.keepalive_60s_ok == Some(true) {
+            keepalive_ok_count += 1;
+        }
+        if !snap.ok && !latency_ok {
+            failed_count += 1;
+        }
+    }
+
+    let untested_count = total_count.saturating_sub(completed_count);
+    IsolatedProbeBatchSummary {
+        latency_ok_count,
+        bandwidth_ok_count,
+        keepalive_ok_count,
+        failed_count,
+        exec_error_count,
+        untested_count,
+    }
 }
 
 fn prune_wallpaper_cache(cache_dir: &std::path::Path, max_files: usize) {
@@ -7683,13 +8037,21 @@ fn remap_active_single_node_id_if_needed(
             .storage
             .lock()
             .ok()
-            .and_then(|db| db.list_nodes().ok())
-            .and_then(|nodes| {
-                nodes
-                    .iter()
-                    .find(|n| n.enabled)
-                    .or_else(|| nodes.first())
-                    .map(|n| n.id.clone())
+            .and_then(|db| {
+                let nodes = db.list_nodes().ok()?;
+                let enabled_nodes: Vec<ProxyNode> =
+                    nodes.iter().filter(|n| n.enabled).cloned().collect();
+                let ids: Vec<String> = enabled_nodes.iter().map(|n| n.id.clone()).collect();
+                let snaps = db
+                    .get_probe_snapshots_batch(&ids, None)
+                    .unwrap_or_default();
+                pick_smart_default_node_id(&enabled_nodes, Some(&snaps)).or_else(|| {
+                    nodes
+                        .iter()
+                        .find(|n| n.enabled)
+                        .or_else(|| nodes.first())
+                        .map(|n| n.id.clone())
+                })
             })
     };
 
@@ -10427,6 +10789,12 @@ pub async fn toggle_preaccel_internal(
                 }
             }
         } else {
+            let active_relays: Vec<String> = load_enabled_preaccel_relays(state)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| r.name)
+                .collect();
+            let _ = state.global_preaccel.suspend_for_tun(active_relays).await;
             state.log_app_event("info", "国内提速", "已开启国内 443 提速（虚拟网卡主核心统一生效）");
             maybe_spawn_auto_windivert_download(app, state, &cfg);
         }
@@ -10436,7 +10804,9 @@ pub async fn toggle_preaccel_internal(
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
         }
-        if state.global_preaccel.status().running {
+        if state.global_preaccel.status().running
+            || state.global_preaccel.status().mode == "suspended_for_tun"
+        {
             let _ = state.global_preaccel.stop().await;
         }
         if core_running {
@@ -10837,38 +11207,126 @@ pub async fn relaunch_as_admin_for_global_preaccel(
     }
 }
 
-/// Switch active pre-acceleration relay. Caller MUST already hold outer `state.config_transition_lock`.
+/// Apply a manual domestic pre-acceleration relay selection without bypassing the automatic
+/// failover pool:
+/// - Selecting `""` / `"auto"` / `"load_balance"` clears `active_relay_id` and restores multi-cloud
+///   automatic dispatch (`Auto` or `LoadBalance`).
+/// - Selecting a concrete relay sets `active_relay_id` with `auto_failover = true` so
+///   `PREACCEL_SELECT_GROUP` continues pointing to `PREACCEL_FALLBACK_GROUP` (promoting this relay
+///   to index 0 while retaining automatic failover + `DIRECT` safety net), and ALWAYS sets
+///   `dispatch_strategy` to `PreAccelDispatchStrategy::Fallback` so strategy enum and actual
+///   behavior remain 100% consistent (never leaving a misleading `Auto + Some(id)` pair).
+fn apply_preaccel_relay_selection_to_config(
+    cfg: &mut AppConfig,
+    relay: Option<&PreAccelRelay>,
+    explicit_auto_strategy: Option<PreAccelDispatchStrategy>,
+) -> bool {
+    cfg.preaccel.auto_failover = true;
+    if let Some(target) = relay {
+        let had_active_relay = cfg
+            .preaccel
+            .active_relay_id
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let switched_from_lb = cfg.preaccel.dispatch_strategy
+            == PreAccelDispatchStrategy::LoadBalance
+            || (cfg.preaccel.dispatch_strategy == PreAccelDispatchStrategy::Auto
+                && !had_active_relay);
+        cfg.preaccel.active_relay_id = Some(target.id.clone());
+        cfg.preaccel.dispatch_strategy = PreAccelDispatchStrategy::Fallback;
+        switched_from_lb
+    } else {
+        cfg.preaccel.active_relay_id = None;
+        cfg.preaccel.dispatch_strategy =
+            explicit_auto_strategy.unwrap_or(PreAccelDispatchStrategy::Auto);
+        false
+    }
+}
+
+/// Switch active pre-acceleration relay while strictly preserving automatic failover fallback.
+/// Caller MUST already hold outer `state.config_transition_lock`.
 async fn select_preaccel_relay_locked(
     app: &AppHandle,
     state: &AppState,
     relay_id: String,
 ) -> Result<String, String> {
+    let trimmed_id = relay_id.trim();
+    let restore_auto_mode = trimmed_id.is_empty()
+        || trimmed_id.eq_ignore_ascii_case("auto")
+        || trimmed_id.eq_ignore_ascii_case("load_balance");
+
+    if restore_auto_mode {
+        let target_strategy = if trimmed_id.eq_ignore_ascii_case("load_balance") {
+            PreAccelDispatchStrategy::LoadBalance
+        } else {
+            PreAccelDispatchStrategy::Auto
+        };
+        let mut cfg = state.snapshot_config();
+        apply_preaccel_relay_selection_to_config(&mut cfg, None, Some(target_strategy));
+        config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = cfg.clone();
+        }
+        if state.adapter.has_live_controller().await {
+            let _ = trigger_reload_if_running(app, state, true).await;
+            let _ = state
+                .adapter
+                .select_group_proxy(
+                    catcloud_core::core_adapter::PREACCEL_SELECT_GROUP_NAME,
+                    catcloud_core::core_adapter::PREACCEL_FALLBACK_GROUP_NAME,
+                )
+                .await;
+        }
+        sync_running_global_preaccel_if_active(state, &cfg).await;
+        state.log_app_event(
+            "info",
+            "国内提速",
+            &format!(
+                "已恢复国内提速自动多云调度（模式：{}，入口保持指向自动容灾池）",
+                target_strategy.as_str()
+            ),
+        );
+        sync_app_side_effects(app, state, &cfg);
+        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+        return Ok(target_strategy.as_str().to_string());
+    }
+
     let relay = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        db.get_preaccel_relay(&relay_id)
+        db.get_preaccel_relay(trimmed_id)
             .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("未找到指定国内中转（{relay_id}）"))?
+            .ok_or_else(|| format!("未找到指定国内中转（{trimmed_id}）"))?
     };
     let mut cfg = state.snapshot_config();
-    cfg.preaccel.active_relay_id = Some(relay.id.clone());
+    let switched_from_lb = apply_preaccel_relay_selection_to_config(&mut cfg, Some(&relay), None);
     config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
     if let Ok(mut guard) = state.config.write() {
         *guard = cfg.clone();
     }
     if state.adapter.has_live_controller().await {
+        // Trigger L2 hot reload so `PREACCEL_FALLBACK_GROUP` promotes this relay to index 0
+        // while `PREACCEL_SELECT_GROUP` continues pointing to `PREACCEL_FALLBACK_GROUP` for
+        // automatic failover + DIRECT safety net (never locking a single relay bare).
+        let _ = trigger_reload_if_running(app, state, true).await;
         let _ = state
             .adapter
             .select_group_proxy(
                 catcloud_core::core_adapter::PREACCEL_SELECT_GROUP_NAME,
-                &relay.name,
+                catcloud_core::core_adapter::PREACCEL_FALLBACK_GROUP_NAME,
             )
             .await;
     }
     sync_running_global_preaccel_if_active(state, &cfg).await;
+    let mode_note = if switched_from_lb {
+        "（已从多云均衡切为主备置顶模式，保留其余中转与直连自动兜底；可随时一键切回多云均衡）"
+    } else {
+        "（已置顶至主备优先顺位，保留其余中转与直连自动故障转移兜底）"
+    };
     state.log_app_event(
         "info",
         "国内提速",
-        &format!("已切换国内提速中转至「{}」", relay.name),
+        &format!("已切换国内提速优先中转至「{}」{mode_note}", relay.name),
     );
     sync_app_side_effects(app, state, &cfg);
     let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
@@ -11368,6 +11826,9 @@ struct PreAccelSideSpeedDto {
 }
 
 fn is_info_placeholder_node(node: &ProxyNode) -> bool {
+    if is_info_proxy_node(node) {
+        return true;
+    }
     const HINTS: &[&str] = &[
         "剩余流量",
         "剩餘流量",
@@ -11382,6 +11843,19 @@ fn is_info_placeholder_node(node: &ProxyNode) -> bool {
         "更新订阅",
     ];
     HINTS.iter().any(|h| node.name.contains(h))
+}
+
+fn is_preferred_comparison_region(region_code: &str) -> bool {
+    matches!(
+        region_code.trim().to_ascii_uppercase().as_str(),
+        "TW" | "HK" | "SG" | "JP" | "US" | "KR"
+    )
+}
+
+fn is_obscure_high_multiplier_node(node: &ProxyNode) -> bool {
+    node.multiplier.is_finite()
+        && node.multiplier >= 3.0 - 1e-9
+        && !is_preferred_comparison_region(&node.region_code)
 }
 
 fn resolve_homepage_node<'a>(
@@ -11409,8 +11883,20 @@ fn resolve_homepage_node<'a>(
 
     match primary_group {
         Some(g) => resolve_valid_group_active_node(g, nodes),
-        None => nodes.iter().find(|n| n.enabled).or_else(|| nodes.first()),
+        None => pick_smart_default_node_id(nodes, None)
+            .and_then(|id| nodes.iter().find(|n| n.id == id))
+            .or_else(|| nodes.iter().find(|n| n.enabled))
+            .or_else(|| nodes.first()),
     }
+}
+
+fn pick_smart_from_refs<'a>(candidates: &[&'a ProxyNode]) -> Option<&'a ProxyNode> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let owned: Vec<ProxyNode> = candidates.iter().map(|n| (*n).clone()).collect();
+    pick_smart_default_node_id(&owned, None)
+        .and_then(|best_id| candidates.iter().copied().find(|n| n.id == best_id))
 }
 
 fn select_comparison_overseas_node(
@@ -11420,6 +11906,7 @@ fn select_comparison_overseas_node(
     active_single_node_id: Option<&str>,
     active_group_id: Option<&str>,
     requested_node_id: Option<&str>,
+    relay_supports_ipv6: bool,
 ) -> Result<(ProxyNode, Option<String>), String> {
     if let Some(nid) = requested_node_id.map(str::trim).filter(|s| !s.is_empty()) {
         let node = nodes
@@ -11436,6 +11923,10 @@ fn select_comparison_overseas_node(
         return Ok((node, None));
     }
 
+    let is_ipv6_incompatible = |n: &ProxyNode| -> bool {
+        !relay_supports_ipv6 && is_ipv6_only_node(n) && n.preaccel_override != Some(true)
+    };
+
     let homepage_node = resolve_homepage_node(
         groups,
         nodes,
@@ -11445,7 +11936,12 @@ fn select_comparison_overseas_node(
     );
 
     if let Some(home) = homepage_node {
-        if home.enabled && !home.is_udp_only_transport() {
+        if home.enabled
+            && !home.is_udp_only_transport()
+            && !is_info_placeholder_node(home)
+            && !is_obscure_high_multiplier_node(home)
+            && !is_ipv6_incompatible(home)
+        {
             return Ok((home.clone(), None));
         }
     }
@@ -11487,20 +11983,53 @@ fn select_comparison_overseas_node(
 
     let tcp_enabled: Vec<&ProxyNode> = ordered
         .into_iter()
-        .filter(|n| n.enabled && !n.is_udp_only_transport())
+        .filter(|n| n.enabled && !n.is_udp_only_transport() && !is_ipv6_incompatible(n))
         .collect();
 
-    let picked = tcp_enabled
+    let preferred_non443: Vec<&ProxyNode> = tcp_enabled
         .iter()
-        .find(|n| !n.is_443_native && !is_info_placeholder_node(n))
-        .or_else(|| tcp_enabled.iter().find(|n| !n.is_443_native))
-        .or_else(|| tcp_enabled.iter().find(|n| !is_info_placeholder_node(n)))
-        .or_else(|| tcp_enabled.first())
         .copied()
+        .filter(|n| {
+            !n.is_443_native
+                && !is_info_placeholder_node(n)
+                && !is_obscure_high_multiplier_node(n)
+        })
+        .collect();
+    let preferred_any_tcp: Vec<&ProxyNode> = tcp_enabled
+        .iter()
+        .copied()
+        .filter(|n| !is_info_placeholder_node(n) && !is_obscure_high_multiplier_node(n))
+        .collect();
+
+    let picked = pick_smart_from_refs(&preferred_non443)
+        .or_else(|| pick_smart_from_refs(&preferred_any_tcp))
+        .or_else(|| {
+            tcp_enabled
+                .iter()
+                .copied()
+                .find(|n| !n.is_443_native && !is_info_placeholder_node(n))
+        })
+        .or_else(|| tcp_enabled.iter().copied().find(|n| !n.is_443_native))
+        .or_else(|| {
+            tcp_enabled
+                .iter()
+                .copied()
+                .find(|n| !is_info_placeholder_node(n))
+        })
+        .or_else(|| tcp_enabled.first().copied())
         .cloned()
         .ok_or_else(|| {
-            "暂无可用于对比测速的海外节点（请先导入至少 1 个已启用的非纯 UDP 海外节点）"
-                .to_string()
+            if !relay_supports_ipv6
+                && nodes
+                    .iter()
+                    .any(|n| n.enabled && !n.is_udp_only_transport() && is_ipv6_incompatible(n))
+            {
+                "暂无可用于对比测速的 IPv4/双栈海外节点（当前国内中转未启用 IPv6 出口，已跳过纯 IPv6 节点；请先导入 IPv4/双栈非纯 UDP 节点或开启中转 IPv6 开关）"
+                    .to_string()
+            } else {
+                "暂无可用于对比测速的海外节点（请先导入至少 1 个已启用的非纯 UDP 海外节点）"
+                    .to_string()
+            }
         })?;
 
     let fallback_reason = match homepage_node {
@@ -11508,10 +12037,24 @@ fn select_comparison_overseas_node(
             "首页当前节点「{}」是纯 UDP 协议无法套 TCP 中转，已自动改测「{}」",
             home.name, picked.name
         )),
+        Some(home) if is_ipv6_incompatible(home) && picked.id != home.id => Some(format!(
+            "首页当前节点「{}」为纯 IPv6 节点，当前国内中转未启用 IPv6 出口，已自动改测「{}」",
+            home.name, picked.name
+        )),
         Some(home) if !home.enabled => Some(format!(
             "首页当前节点「{}」已禁用，已自动改测「{}」",
             home.name, picked.name
         )),
+        Some(home) if is_info_placeholder_node(home) && picked.id != home.id => Some(format!(
+            "首页当前节点「{}」为信息提示节点，已自动改测优选节点「{}」",
+            home.name, picked.name
+        )),
+        Some(home) if is_obscure_high_multiplier_node(home) && picked.id != home.id => {
+            Some(format!(
+                "首页当前节点「{}」为冷门高倍率（{:.1}x），已自动改测常用低倍率节点「{}」",
+                home.name, home.multiplier, picked.name
+            ))
+        }
         _ => None,
     };
 
@@ -11855,6 +12398,7 @@ pub async fn benchmark_preaccel_comparison(
             cfg.active_single_node_id.as_deref(),
             cfg.active_group_id.as_deref(),
             node_id.as_deref(),
+            relay.supports_ipv6,
         )?;
         (relay, target_node, fallback_reason)
     };
@@ -11900,9 +12444,11 @@ pub async fn benchmark_preaccel_comparison(
 
     let _ = probe_core.shutdown().await;
 
+    // Never pollute domestic relay `last_probe_ms` with two-hop overseas latency; only update
+    // from direct `measure_relay_real_rtt_ms` (SQLite COALESCE retains existing valid direct RTT).
     let recorded_relay_ms = relay_real_rtt_ms
-        .or(accelerated.latency_ms.filter(|&v| v.is_finite() && v > 0.0))
-        .or(relay.last_probe_ms.filter(|&v| v.is_finite() && v > 0.0));
+        .filter(|&v| v.is_finite() && v > 0.0)
+        .map(|ms| ((ms * 10.0).round() / 10.0).max(0.1));
     let recorded_up_mbps = accelerated
         .up_mbps
         .filter(|&v| v.is_finite() && v > 0.0)
@@ -12000,6 +12546,42 @@ fn select_target_relays_ordered(
         .collect()
 }
 
+/// Strongly-typed per-relay speed benchmark result keeping direct domestic relay RTT
+/// strictly separated from two-hop overseas chain latency (`chain_latency_ms`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PreAccelRelaySpeedResultDto {
+    pub relay_id: String,
+    pub relay_name: String,
+    pub ok: bool,
+    pub latency_ms: Option<f64>,
+    #[serde(default)]
+    pub chain_latency_ms: Option<u64>,
+    pub up_mbps: Option<f64>,
+    pub down_mbps: Option<f64>,
+    pub mode: String,
+    pub reference_node_name: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Separate direct domestic relay RTT from two-hop overseas chain latency:
+/// returns `(db_direct_update_ms, dto_direct_latency_ms, chain_latency_ms)`.
+/// Never falls back `last_probe_ms` to overseas `side_latency_ms`.
+fn split_relay_direct_and_chain_latency(
+    relay_real_rtt_ms: Option<f64>,
+    existing_last_probe_ms: Option<f64>,
+    side_latency_ms: Option<f64>,
+) -> (Option<f64>, Option<f64>, Option<u64>) {
+    let direct_new = relay_real_rtt_ms
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|ms| ((ms * 10.0).round() / 10.0).max(0.1));
+    let existing_valid = existing_last_probe_ms.filter(|v| v.is_finite() && *v > 0.0);
+    let dto_direct_ms = direct_new.or(existing_valid);
+    let chain_ms = side_latency_ms
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .map(|ms| ms.round().max(1.0) as u64);
+    (direct_new, dto_direct_ms, chain_ms)
+}
+
 #[tauri::command]
 pub async fn test_preaccel_relay_speeds(
     app: AppHandle,
@@ -12034,6 +12616,12 @@ pub async fn test_preaccel_relay_speeds(
 
         let groups = db.list_multi_groups().map_err(|e| e.to_string())?;
         let nodes = db.list_nodes().map_err(|e| e.to_string())?;
+        let valid_relays_for_v6: Vec<&PreAccelRelay> = target_relays
+            .iter()
+            .filter(|r| !r.server.trim().is_empty() && r.port > 0)
+            .collect();
+        let relays_support_ipv6 = !valid_relays_for_v6.is_empty()
+            && valid_relays_for_v6.iter().all(|r| r.supports_ipv6);
         let reference_node = select_comparison_overseas_node(
             &groups,
             &nodes,
@@ -12041,6 +12629,7 @@ pub async fn test_preaccel_relay_speeds(
             cfg.active_single_node_id.as_deref(),
             cfg.active_group_id.as_deref(),
             node_id.as_deref(),
+            relays_support_ipv6,
         )
         .ok()
         .or_else(|| {
@@ -12056,6 +12645,7 @@ pub async fn test_preaccel_relay_speeds(
                     cfg.active_single_node_id.as_deref(),
                     cfg.active_group_id.as_deref(),
                     None,
+                    relays_support_ipv6,
                 )
                 .ok()
             } else {
@@ -12081,20 +12671,19 @@ pub async fn test_preaccel_relay_speeds(
         .collect();
 
     if valid_relays.is_empty() {
-        let results: Vec<serde_json::Value> = target_relays
+        let results: Vec<PreAccelRelaySpeedResultDto> = target_relays
             .iter()
-            .map(|relay| {
-                serde_json::json!({
-                    "relay_id": relay.id,
-                    "relay_name": relay.name,
-                    "ok": false,
-                    "latency_ms": null,
-                    "up_mbps": null,
-                    "down_mbps": null,
-                    "mode": mode_str,
-                    "reference_node_name": reference_node_name,
-                    "error": "中转缺少有效的服务器地址或端口"
-                })
+            .map(|relay| PreAccelRelaySpeedResultDto {
+                relay_id: relay.id.clone(),
+                relay_name: relay.name.clone(),
+                ok: false,
+                latency_ms: relay.last_probe_ms.filter(|v| v.is_finite() && *v > 0.0),
+                chain_latency_ms: None,
+                up_mbps: None,
+                down_mbps: None,
+                mode: mode_str.to_string(),
+                reference_node_name: reference_node_name.clone(),
+                error: Some("中转缺少有效的服务器地址或端口".to_string()),
             })
             .collect();
         state.log_app_event(
@@ -12105,7 +12694,7 @@ pub async fn test_preaccel_relay_speeds(
                 target_relays.len()
             ),
         );
-        return Ok(serde_json::Value::Array(results));
+        return serde_json::to_value(results).map_err(|e| e.to_string());
     }
 
     let mode_desc = match reference_node_name.as_deref() {
@@ -12144,44 +12733,42 @@ pub async fn test_preaccel_relay_speeds(
 
     let total_count = target_relays.len();
     let mut ok_count = 0usize;
-    let mut results = Vec::with_capacity(total_count);
+    let mut results: Vec<PreAccelRelaySpeedResultDto> = Vec::with_capacity(total_count);
 
     // Run strictly sequentially per relay to prevent local uplink bandwidth contention.
     for relay in &target_relays {
         if relay.server.trim().is_empty() || relay.port == 0 {
-            results.push(serde_json::json!({
-                "relay_id": relay.id,
-                "relay_name": relay.name,
-                "ok": false,
-                "latency_ms": null,
-                "up_mbps": null,
-                "down_mbps": null,
-                "mode": mode_str,
-                "reference_node_name": reference_node_name,
-                "error": "中转缺少有效的服务器地址或端口"
-            }));
+            results.push(PreAccelRelaySpeedResultDto {
+                relay_id: relay.id.clone(),
+                relay_name: relay.name.clone(),
+                ok: false,
+                latency_ms: relay.last_probe_ms.filter(|v| v.is_finite() && *v > 0.0),
+                chain_latency_ms: None,
+                up_mbps: None,
+                down_mbps: None,
+                mode: mode_str.to_string(),
+                reference_node_name: reference_node_name.clone(),
+                error: Some("中转缺少有效的服务器地址或端口".to_string()),
+            });
             continue;
         }
         let Some(&port) = port_map.get(&relay.id) else {
-            results.push(serde_json::json!({
-                "relay_id": relay.id,
-                "relay_name": relay.name,
-                "ok": false,
-                "latency_ms": null,
-                "up_mbps": null,
-                "down_mbps": null,
-                "mode": mode_str,
-                "reference_node_name": reference_node_name,
-                "error": "未能为该中转分配测速通道，请检查协议与参数配置"
-            }));
+            results.push(PreAccelRelaySpeedResultDto {
+                relay_id: relay.id.clone(),
+                relay_name: relay.name.clone(),
+                ok: false,
+                latency_ms: relay.last_probe_ms.filter(|v| v.is_finite() && *v > 0.0),
+                chain_latency_ms: None,
+                up_mbps: None,
+                down_mbps: None,
+                mode: mode_str.to_string(),
+                reference_node_name: reference_node_name.clone(),
+                error: Some("未能为该中转分配测速通道，请检查协议与参数配置".to_string()),
+            });
             continue;
         };
 
-        let relay_real_rtt_ms = measure_relay_real_rtt_ms(relay)
-            .await
-            .ok()
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|ms| ((ms * 10.0).round() / 10.0).max(0.1));
+        let relay_real_rtt_ms = measure_relay_real_rtt_ms(relay).await.ok();
 
         let side = run_preaccel_comparison_side(
             port,
@@ -12190,11 +12777,12 @@ pub async fn test_preaccel_relay_speeds(
         )
         .await;
 
-        let side_latency_ms = side
-            .latency_ms
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .map(|ms| ((ms * 10.0).round() / 10.0).max(0.1));
-        let recorded_ms = relay_real_rtt_ms.or(side_latency_ms);
+        let (recorded_direct_ms, display_direct_ms, chain_latency_ms) =
+            split_relay_direct_and_chain_latency(
+                relay_real_rtt_ms,
+                relay.last_probe_ms,
+                side.latency_ms,
+            );
         let recorded_up = side.up_mbps.filter(|v| v.is_finite() && *v > 0.0);
         let recorded_down = side.down_mbps.filter(|v| v.is_finite() && *v > 0.0);
         let ok = side.ok;
@@ -12202,28 +12790,29 @@ pub async fn test_preaccel_relay_speeds(
             ok_count += 1;
         }
 
-        if recorded_ms.is_some() || recorded_up.is_some() || recorded_down.is_some() {
+        if recorded_direct_ms.is_some() || recorded_up.is_some() || recorded_down.is_some() {
             if let Ok(db) = state.storage.lock() {
                 let _ = db.update_preaccel_speed_metrics(
                     &relay.id,
-                    recorded_ms,
+                    recorded_direct_ms,
                     recorded_up,
                     recorded_down,
                 );
             }
         }
 
-        results.push(serde_json::json!({
-            "relay_id": relay.id,
-            "relay_name": relay.name,
-            "ok": ok,
-            "latency_ms": recorded_ms,
-            "up_mbps": recorded_up,
-            "down_mbps": recorded_down,
-            "mode": mode_str,
-            "reference_node_name": reference_node_name,
-            "error": side.error
-        }));
+        results.push(PreAccelRelaySpeedResultDto {
+            relay_id: relay.id.clone(),
+            relay_name: relay.name.clone(),
+            ok,
+            latency_ms: display_direct_ms,
+            chain_latency_ms,
+            up_mbps: recorded_up,
+            down_mbps: recorded_down,
+            mode: mode_str.to_string(),
+            reference_node_name: reference_node_name.clone(),
+            error: side.error,
+        });
     }
 
     let _ = probe_core.shutdown().await;
@@ -12240,7 +12829,7 @@ pub async fn test_preaccel_relay_speeds(
         ),
     );
 
-    Ok(serde_json::Value::Array(results))
+    serde_json::to_value(results).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -12801,18 +13390,30 @@ pub async fn close_all_connections(state: State<'_, AppState>) -> Result<usize, 
     Ok(count)
 }
 
-#[tauri::command]
-pub fn get_recent_logs(
-    state: State<'_, AppState>,
+pub(crate) fn sanitize_core_log_line(mut line: CoreLogLine) -> CoreLogLine {
+    line.payload = app_log::sanitize_log_line(&line.payload);
+    line
+}
+
+fn collect_sanitized_recent_log_lines(
+    state: &AppState,
     limit: Option<usize>,
-) -> Result<Vec<CoreLogLine>, String> {
+) -> Vec<CoreLogLine> {
     let mut logs = state.telemetry.logs_snapshot();
     if let Some(lim) = limit {
         if logs.len() > lim {
             logs = logs.split_off(logs.len() - lim);
         }
     }
-    Ok(logs)
+    logs.into_iter().map(sanitize_core_log_line).collect()
+}
+
+#[tauri::command]
+pub fn get_recent_logs(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<CoreLogLine>, String> {
+    Ok(collect_sanitized_recent_log_lines(&state, limit))
 }
 
 fn build_traffic_history(state: &AppState) -> Vec<TrafficEventPayload> {
@@ -13038,6 +13639,7 @@ pub async fn build_agent_bootstrap_prompt(
     state: State<'_, AppState>,
     lang: Option<String>,
     current_page: Option<String>,
+    mode: Option<String>,
 ) -> Result<AgentBootstrapPromptDto, String> {
     let norm_lang = resolve_effective_doc_lang(&state, lang.as_deref());
     let cli_path = resolve_local_cli_path(&state).to_string_lossy().to_string();
@@ -13055,12 +13657,14 @@ pub async fn build_agent_bootstrap_prompt(
 
     let docs_index_path = docs_index_pb.to_string_lossy().to_string();
     let page = current_page.as_deref().unwrap_or("overview");
-    let prompt = catcloud_core::agent_docs::render_agent_bootstrap_prompt(
+    let prompt_mode = catcloud_core::agent_docs::AgentPromptMode::from_opt_str(mode.as_deref());
+    let prompt = catcloud_core::agent_docs::render_agent_bootstrap_prompt_with_mode(
         &cli_path,
         &data_dir,
         &docs_index_path,
         page,
         norm_lang,
+        prompt_mode,
     );
 
     Ok(AgentBootstrapPromptDto {
@@ -14178,6 +14782,62 @@ fn format_global_preaccel_brief(
     format!("{mode_desc} ｜ 探测状态：{verify_desc} ｜ 物理出口网卡：{iface} ｜ 安全环境：{security}")
 }
 
+fn format_dns_diagnostics_markdown_section(diag: &DnsTlsDiagnostics) -> String {
+    let status_label = match diag.status.as_str() {
+        "healthy" => "正常（未检出加密 DNS 证书校验失败）",
+        "degraded_recovered" => "曾遇证书校验失败，已自动切备用加密 DNS 恢复",
+        "cert_verification_failed" => "告警：加密 DNS 上游证书校验失败（尚未恢复）",
+        other => other,
+    };
+    let paths_text = if diag.affected_paths.is_empty() {
+        "无".to_string()
+    } else {
+        diag.affected_paths.join(" / ")
+    };
+    let upstreams_text = if diag.affected_upstreams.is_empty() {
+        "无".to_string()
+    } else {
+        diag.affected_upstreams.join(" / ")
+    };
+    let time_range = match (diag.first_seen_at.as_deref(), diag.last_seen_at.as_deref()) {
+        (Some(a), Some(b)) if a != b => format!("{a} ~ {b}"),
+        (Some(a), _) => a.to_string(),
+        _ => "无".to_string(),
+    };
+    let recovery_or_retry = if diag.recovered {
+        format!(
+            "已自动恢复（恢复时间：{}）",
+            diag.recovery_time.as_deref().unwrap_or("未知")
+        )
+    } else if let Some(next_ts) = diag.next_retry_at.as_deref() {
+        format!("尚未恢复（建议下次重试时间：{next_ts}）")
+    } else {
+        "无需重试".to_string()
+    };
+    let tls_policy = if diag.tls_verification_preserved {
+        "严格保留（绝不跳过证书校验）"
+    } else {
+        "已放宽"
+    };
+    let window_desc = if diag.scanned_window_desc.trim().is_empty() {
+        "最近 256 KiB 日志".to_string()
+    } else {
+        diag.scanned_window_desc.clone()
+    };
+    format!(
+        "## 3.5 DNS 加密解析与证书校验诊断\n\n\
+- 诊断状态：{status_label}（分类：{}，扫描窗口：{window_desc}）\n\
+- 证书失败次数：{} 次（时间范围：{time_range}；纯 853/DoT 网络超时：{} 次）\n\
+- 受影响路径：{paths_text} ｜ 受影响上游：{upstreams_text}\n\
+- TLS 证书校验策略：{tls_policy} ｜ 恢复状态：{recovery_or_retry}\n\
+- 建议说明：{}\n",
+        diag.category,
+        diag.failure_count,
+        diag.network_timeout_only_count,
+        diag.next_retry_hint,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_ai_diagnostics_markdown(
     app_version: &str,
@@ -14192,6 +14852,7 @@ fn build_ai_diagnostics_markdown(
     conn_summary: ConnectionSummaryCounts,
     core_mem_bytes: u64,
     geodata_status: &serde_json::Value,
+    dns_diagnostics: &DnsTlsDiagnostics,
     last_error: Option<&str>,
     key_event_logs: &[String],
     tail_logs: &[String],
@@ -14320,11 +14981,12 @@ fn build_ai_diagnostics_markdown(
     let tunnel_conns = conn_summary.tunnel_connections;
     let key_count = key_event_logs.len();
     let tail_count = tail_logs.len();
+    let dns_diag_section = format_dns_diagnostics_markdown_section(dns_diagnostics);
 
     format!(
         "请帮我排查猫猫云梯（CatCloud）当前问题。\n\
 \n\
-> 以下诊断包已自动完成隐私脱敏（订阅凭据、密码、Token、Secret 与公网 IP 末段均已隐藏），请先基于状态与关键事件日志定位根因并给出清晰步骤。\n\
+> 以下诊断包已自动完成隐私脱敏（订阅凭据、密码、Token、Secret 与公网/私网 IP 末段均已隐藏），请先基于状态与关键事件日志定位根因并给出清晰步骤。\n\
 \n\
 ## 1. 运行状态摘要\n\
 \n\
@@ -14353,6 +15015,7 @@ fn build_ai_diagnostics_markdown(
 - 真实应用连接：{app_conns} 条（直连 {direct_conns} 条 · 代理 {proxied_conns} 条）\n\
 - 底层提速隧道（`Inner`）：{tunnel_conns} 条（已从应用连接数中排除）\n\
 \n\
+{dns_diag_section}\n\
 ## 4. 脱敏运行日志（智能采样：近 {key_count} 条关键事件 + 近 {tail_count} 条全量尾日志）\n\
 \n\
 ### 4.1 关键非连接流水事件（近 {key_count} 条，已排除普通 TCP/UDP 转发）\n\
@@ -15069,6 +15732,26 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         &catcloud_core::paths::normalize_os_path(&state.paths.root_data_dir).to_string_lossy(),
     );
 
+    let dns_diagnostics = {
+        let disk_diag = analyze_dns_tls_diagnostics_from_log_file(
+            &state.app_logger.active_log_path(),
+            256 * 1024,
+        );
+        if disk_diag.failure_count > 0 || all_merged_logs.is_empty() {
+            disk_diag
+        } else {
+            let mem_diag = analyze_dns_tls_diagnostics(
+                &all_merged_logs,
+                "diagnostics merged logs (tail <= 256 KiB)",
+            );
+            if mem_diag.failure_count > 0 || mem_diag.network_timeout_only_count > 0 {
+                mem_diag
+            } else {
+                disk_diag
+            }
+        }
+    };
+
     let os_label = format!("{} {}", caps.os, caps.arch);
     let ai_prompt_markdown = build_ai_diagnostics_markdown(
         env!("CARGO_PKG_VERSION"),
@@ -15083,6 +15766,7 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         conn_summary,
         core_mem_bytes,
         &geodata_status,
+        &dns_diagnostics,
         last_error.as_deref(),
         &key_event_logs,
         &tail_logs,
@@ -15098,7 +15782,7 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         .as_ref()
         .map(|d| d.tun_needs_elevation)
         .unwrap_or(tun_needs_elevation(state, &cfg));
-    Ok(serde_json::json!({
+    let mut report = serde_json::json!({
         "app_version": env!("CARGO_PKG_VERSION"),
         "os": caps.os,
         "arch": caps.arch,
@@ -15138,11 +15822,20 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
             "tun_needs_elevation": tun_need_elev,
             "preaccel_active": cfg.preaccel.enabled,
             "preaccel_relay_name": preaccel_relay_name,
+            "preaccel_effective_carrier": runtime_dto
+                .as_ref()
+                .map(|d| d.preaccel_effective_carrier.as_str())
+                .unwrap_or("off"),
+            "standalone_tunnel_suspended_for_tun": runtime_dto
+                .as_ref()
+                .map(|d| d.standalone_tunnel_suspended_for_tun)
+                .unwrap_or(false),
             "domestic_direct_enabled": cfg.rules_override.domestic_direct_enabled,
             "block_quic_udp_443": cfg.rules_override.block_quic_udp_443,
             "memory_tier": cfg.core_runtime.memory_tier,
         },
         "geodata_status": geodata_status,
+        "dns_diagnostics": dns_diagnostics,
         "connection_summary": {
             "app_connections": conn_summary.app_connections,
             "tunnel_connections": conn_summary.tunnel_connections,
@@ -15154,7 +15847,10 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         "recent_logs": recent_logs,
         "ai_prompt_markdown": ai_prompt_markdown,
         "sanitized": true
-    }))
+    });
+    // Final whole-tree sanitization safety pass guaranteeing zero leaked full public/private/TUN/DNS IPs.
+    catcloud_core::sanitize::sanitize_json_value(&mut report);
+    Ok(report)
 }
 
 #[tauri::command]
@@ -16653,6 +17349,7 @@ mod tests {
             Some("n-443"),
             None,
             None,
+            false,
         )
         .expect("single mode must follow native 443 homepage node");
         assert_eq!(picked_single_443.id, "n-443");
@@ -16673,6 +17370,7 @@ mod tests {
             None,
             Some("g-main"),
             None,
+            false,
         )
         .expect("group mode must follow active_node_id even if native 443");
         assert_eq!(picked_grp_443.id, "n-443");
@@ -16693,6 +17391,7 @@ mod tests {
             None,
             Some("g-first"),
             None,
+            false,
         )
         .expect("group mode should follow first member when active_node_id is None");
         assert_eq!(picked_first.id, "n-443");
@@ -16706,6 +17405,7 @@ mod tests {
             Some("n-hy2"),
             None,
             None,
+            false,
         )
         .expect("UDP-only homepage node must fallback to TCP node");
         assert_eq!(picked_udp_fallback.id, "n-8443");
@@ -16729,6 +17429,7 @@ mod tests {
             None,
             Some("g-udp"),
             None,
+            false,
         )
         .expect("should fallback to 443 TCP node when no non-443 TCP exists");
         assert_eq!(picked_443_fallback.id, "n-443");
@@ -16745,6 +17446,7 @@ mod tests {
                 None,
                 None,
                 Some("n-hy2"),
+                false,
             )
             .is_err()
         );
@@ -16755,6 +17457,7 @@ mod tests {
             None,
             None,
             Some("n-443"),
+            false,
         )
         .expect("explicit TCP node should succeed");
         assert_eq!(explicit_443.id, "n-443");
@@ -19815,5 +20518,828 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn smart_default_node_and_comparison_node_avoid_obscure_high_mult_and_info_banners() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_smart_default_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        storage
+            .upsert_subscription(&SubscriptionRecord {
+                id: "sub-test".to_string(),
+                name: "Test Sub".to_string(),
+                ..Default::default()
+            })
+            .expect("upsert subscription");
+
+        let info_node = ProxyNode {
+            id: "n-info".to_string(),
+            sub_id: "sub-test".to_string(),
+            name: "剩余流量：120 GB · 到期 2027-01-01".to_string(),
+            protocol: "trojan".to_string(),
+            server: "info.example.invalid".to_string(),
+            port: 443,
+            region_code: "UNK".to_string(),
+            multiplier: 1.0,
+            enabled: true,
+            ..Default::default()
+        };
+        let andorra_3x = ProxyNode {
+            id: "n-ad".to_string(),
+            sub_id: "sub-test".to_string(),
+            name: "AD 安道尔 | 3x AD".to_string(),
+            protocol: "vless".to_string(),
+            server: "ad.example.invalid".to_string(),
+            port: 8443,
+            region_code: "AD".to_string(),
+            multiplier: 3.0,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let jp_1x = ProxyNode {
+            id: "n-jp".to_string(),
+            sub_id: "sub-test".to_string(),
+            name: "JP 东京 01".to_string(),
+            protocol: "vless".to_string(),
+            server: "jp.example.invalid".to_string(),
+            port: 8443,
+            region_code: "JP".to_string(),
+            multiplier: 1.0,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let tw_1x = ProxyNode {
+            id: "n-tw".to_string(),
+            sub_id: "sub-test".to_string(),
+            name: "TW 台北 01".to_string(),
+            protocol: "trojan".to_string(),
+            server: "tw.example.invalid".to_string(),
+            port: 8443,
+            region_code: "TW".to_string(),
+            multiplier: 1.0,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+
+        for n in [&info_node, &andorra_3x, &jp_1x, &tw_1x] {
+            storage.upsert_node(n).expect("upsert node");
+        }
+
+        let mut cfg = AppConfig::default();
+        cfg.active_single_node_id = Some("deleted-stale-node".to_string());
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, cfg, storage, job_guard);
+
+        // 1. Default group auto-creation must pick preferred low-multiplier node (TW), never AD 3x or info banner.
+        assert!(ensure_default_group_if_empty(&state));
+        let created_groups = state
+            .storage
+            .lock()
+            .unwrap()
+            .list_multi_groups()
+            .expect("list groups");
+        assert_eq!(created_groups.len(), 1);
+        assert_eq!(created_groups[0].active_node_id.as_deref(), Some("n-tw"));
+
+        // 2. Single-node stale fallback must also pick smart preferred node (TW), never AD 3x or info banner.
+        let remapped = remap_active_single_node_id_if_needed(&state, &HashMap::new())
+            .expect("remap stale single node");
+        assert!(remapped);
+        assert_eq!(
+            state.snapshot_config().active_single_node_id.as_deref(),
+            Some("n-tw")
+        );
+
+        // 3. Comparison node auto-selection must avoid obscure >= 3x homepage node and info banner,
+        // while strictly honoring explicit user selection.
+        let all_nodes = vec![
+            info_node.clone(),
+            andorra_3x.clone(),
+            jp_1x.clone(),
+            tw_1x.clone(),
+        ];
+        let (picked_auto, reason_auto) = select_comparison_overseas_node(
+            &[],
+            &all_nodes,
+            RouteTargetMode::Single,
+            Some("n-ad"),
+            None,
+            None,
+            false,
+        )
+        .expect("auto comparison selection avoids obscure 3x node");
+        assert_eq!(picked_auto.id, "n-tw");
+        assert!(reason_auto
+            .as_deref()
+            .is_some_and(|r| r.contains("冷门高倍率") && r.contains("TW 台北 01")));
+
+        let (picked_info_fallback, reason_info) = select_comparison_overseas_node(
+            &[],
+            &all_nodes,
+            RouteTargetMode::Single,
+            Some("n-info"),
+            None,
+            None,
+            false,
+        )
+        .expect("auto comparison selection avoids info banner");
+        assert_eq!(picked_info_fallback.id, "n-tw");
+        assert!(reason_info
+            .as_deref()
+            .is_some_and(|r| r.contains("信息提示节点")));
+
+        let (picked_explicit, reason_explicit) = select_comparison_overseas_node(
+            &[],
+            &all_nodes,
+            RouteTargetMode::Single,
+            Some("n-tw"),
+            None,
+            Some("n-ad"),
+            false,
+        )
+        .expect("explicit selection must honor AD 3x");
+        assert_eq!(picked_explicit.id, "n-ad");
+        assert!(reason_explicit.is_none());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn relay_speed_latency_split_never_pollutes_last_probe_ms_with_two_hop_latency() {
+        // Case 1: direct RTT failed (None), prior direct RTT was 35ms, two-hop overseas latency was 258.4ms.
+        let (db_update, display_direct, chain_ms) =
+            split_relay_direct_and_chain_latency(None, Some(35.0), Some(258.4));
+        assert_eq!(db_update, None, "must not overwrite DB last_probe_ms with overseas latency");
+        assert_eq!(display_direct, Some(35.0), "must retain prior direct RTT");
+        assert_eq!(chain_ms, Some(258), "two-hop latency goes to chain_latency_ms");
+
+        // Case 2: direct RTT failed and no prior RTT -> stays None (never 251ms).
+        let (db_update2, display_direct2, chain_ms2) =
+            split_relay_direct_and_chain_latency(None, None, Some(251.2));
+        assert_eq!(db_update2, None);
+        assert_eq!(display_direct2, None);
+        assert_eq!(chain_ms2, Some(251));
+
+        // Case 3: direct RTT succeeded (34.66ms) -> updates DB & display direct RTT cleanly.
+        let (db_update3, display_direct3, chain_ms3) =
+            split_relay_direct_and_chain_latency(Some(34.66), Some(50.0), Some(220.6));
+        assert_eq!(db_update3, Some(34.7));
+        assert_eq!(display_direct3, Some(34.7));
+        assert_eq!(chain_ms3, Some(221));
+
+        let dto = PreAccelRelaySpeedResultDto {
+            relay_id: "r-1".to_string(),
+            relay_name: "Relay-SH".to_string(),
+            ok: true,
+            latency_ms: display_direct3,
+            chain_latency_ms: chain_ms3,
+            up_mbps: Some(88.5),
+            down_mbps: Some(172.0),
+            mode: "via_node".to_string(),
+            reference_node_name: Some("TW 台北 01".to_string()),
+            error: None,
+        };
+        let serialized = serde_json::to_value(&dto).expect("serialize speed dto");
+        assert_eq!(serialized["latency_ms"], 34.7);
+        assert_eq!(serialized["chain_latency_ms"], 221);
+    }
+
+    #[test]
+    fn select_preaccel_relay_preserves_auto_failover_and_switches_lb_to_fallback() {
+        let relay_a = PreAccelRelay {
+            id: "r-ali".to_string(),
+            name: "Aliyun-SH".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN-SH".to_string(),
+            server: "198.51.100.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-password-1".to_string(),
+            skip_cert_verify: true,
+            priority: 10,
+            enabled: true,
+            ..Default::default()
+        };
+        let relay_b = PreAccelRelay {
+            id: "r-tx".to_string(),
+            name: "Tencent-GZ".to_string(),
+            provider: "tencent".to_string(),
+            region: "CN-GZ".to_string(),
+            server: "203.0.113.20".to_string(),
+            port: 443,
+            protocol: "trojan".to_string(),
+            password: "demo-password-2".to_string(),
+            skip_cert_verify: true,
+            priority: 20,
+            enabled: true,
+            ..Default::default()
+        };
+
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.dispatch_strategy = PreAccelDispatchStrategy::LoadBalance;
+
+        let switched_from_lb =
+            apply_preaccel_relay_selection_to_config(&mut cfg, Some(&relay_b), None);
+        assert!(switched_from_lb);
+        assert_eq!(cfg.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Fallback);
+        assert_eq!(cfg.preaccel.active_relay_id.as_deref(), Some("r-tx"));
+        assert!(cfg.preaccel.auto_failover);
+
+        // Compiled plan must keep PREACCEL_FALLBACK_GROUP at index 0 of PREACCEL_SELECT_GROUP
+        // and promote Tencent-GZ to index 0 of PREACCEL_FALLBACK_GROUP with Aliyun-SH + DIRECT backup.
+        let plan = catcloud_core::preaccel::build_preaccel_compile_plan(
+            &cfg.preaccel,
+            &[relay_a.clone(), relay_b.clone()],
+            &[],
+        )
+        .expect("compile fallback plan");
+        let select_json =
+            serde_json::to_value(&plan.proxy_groups[0]).expect("serialize select group");
+        let select_proxies: Vec<&str> = select_json["proxies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(
+            select_proxies[0],
+            catcloud_core::core_adapter::PREACCEL_FALLBACK_GROUP_NAME
+        );
+        let fb_json =
+            serde_json::to_value(&plan.proxy_groups[1]).expect("serialize fallback group");
+        let fb_proxies: Vec<&str> = fb_json["proxies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(fb_proxies, vec!["Tencent-GZ", "Aliyun-SH", "DIRECT"]);
+
+        // Switching back to Auto restores multi-cloud load-balance pool.
+        let _ = apply_preaccel_relay_selection_to_config(
+            &mut cfg,
+            None,
+            Some(PreAccelDispatchStrategy::Auto),
+        );
+        assert_eq!(cfg.preaccel.active_relay_id, None);
+        assert_eq!(cfg.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Auto);
+        let lb_plan = catcloud_core::preaccel::build_preaccel_compile_plan(
+            &cfg.preaccel,
+            &[relay_a, relay_b],
+            &[],
+        )
+        .expect("compile restored LB plan");
+        assert!(lb_plan.lb_group_name.is_some());
+    }
+
+    #[test]
+    fn isolated_probe_batch_summary_splits_all_six_metrics_cleanly() {
+        let mut run_snapshots = HashMap::new();
+        let mut run_records = HashMap::new();
+        let latency_ids: HashSet<String> = ["builtin_latency".to_string()].into_iter().collect();
+
+        // Node 1: latency ok, both up & down ok, keepalive ok.
+        run_snapshots.insert(
+            "n1".to_string(),
+            ProbeSnapshot {
+                node_id: "n1".to_string(),
+                ok: true,
+                latency_ms: Some(45.0),
+                up_mbps: Some(20.0),
+                down_mbps: Some(150.0),
+                keepalive_60s_ok: Some(true),
+                ..Default::default()
+            },
+        );
+        run_records.insert(
+            "n1".to_string(),
+            vec![catcloud_core::models::ProbeResultRecord {
+                node_id: "n1".to_string(),
+                probe_id: "builtin_latency".to_string(),
+                ok: true,
+                latency_ms: Some(45.0),
+                ..Default::default()
+            }],
+        );
+
+        // Node 2: latency ok, ONLY download ok (upload missing -> NOT bidirectional bandwidth ok).
+        run_snapshots.insert(
+            "n2".to_string(),
+            ProbeSnapshot {
+                node_id: "n2".to_string(),
+                ok: true,
+                latency_ms: Some(68.0),
+                up_mbps: None,
+                down_mbps: Some(90.0),
+                keepalive_60s_ok: Some(false),
+                ..Default::default()
+            },
+        );
+        run_records.insert(
+            "n2".to_string(),
+            vec![catcloud_core::models::ProbeResultRecord {
+                node_id: "n2".to_string(),
+                probe_id: "builtin_latency".to_string(),
+                ok: true,
+                latency_ms: Some(68.0),
+                ..Default::default()
+            }],
+        );
+
+        // Node 3: latency failed.
+        run_snapshots.insert(
+            "n3".to_string(),
+            ProbeSnapshot {
+                node_id: "n3".to_string(),
+                ok: false,
+                ..Default::default()
+            },
+        );
+        run_records.insert(
+            "n3".to_string(),
+            vec![catcloud_core::models::ProbeResultRecord {
+                node_id: "n3".to_string(),
+                probe_id: "builtin_latency".to_string(),
+                ok: false,
+                ..Default::default()
+            }],
+        );
+
+        // Total 5 nodes, completed 4 (3 snapshots + 1 exec error), 1 untested.
+        let summary =
+            summarize_isolated_probe_run(5, 4, &run_snapshots, &run_records, &latency_ids, 1);
+        assert_eq!(summary.latency_ok_count, 2);
+        assert_eq!(summary.bandwidth_ok_count, 1);
+        assert_eq!(summary.keepalive_ok_count, 1);
+        assert_eq!(summary.failed_count, 1);
+        assert_eq!(summary.exec_error_count, 1);
+        assert_eq!(summary.untested_count, 1);
+    }
+
+    #[test]
+    fn legacy_onboarding_reconcile_ui_dto_roundtrip_and_five_carrier_states() {
+        // 1. Fresh empty DB keeps onboarding_completed = false.
+        let tmp_fresh = std::env::temp_dir().join(format!(
+            "catcloud_onboard_fresh_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths_fresh = AppPaths::from_data_dir(tmp_fresh.clone(), true).unwrap();
+        let storage_fresh = Storage::open_in_memory().unwrap();
+        let state_fresh = AppState::new(
+            paths_fresh,
+            AppConfig::default(),
+            storage_fresh,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+        assert!(!state_fresh.snapshot_config().personalization.onboarding_completed);
+
+        // 2. Existing user with at least one relay automatically gets onboarding_completed = true.
+        let tmp_legacy = std::env::temp_dir().join(format!(
+            "catcloud_onboard_legacy_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths_legacy = AppPaths::from_data_dir(tmp_legacy.clone(), true).unwrap();
+        let storage_legacy = Storage::open_in_memory().unwrap();
+        storage_legacy
+            .upsert_preaccel_relay(&PreAccelRelay {
+                id: "r-legacy".to_string(),
+                name: "Legacy-Relay".to_string(),
+                server: "203.0.113.10".to_string(),
+                port: 443,
+                protocol: "anytls".to_string(),
+                password: "pw".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let state_legacy = AppState::new(
+            paths_legacy,
+            AppConfig::default(),
+            storage_legacy,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+        assert!(state_legacy.snapshot_config().personalization.onboarding_completed);
+
+        // 3. UiAppConfigDto roundtrip preserves onboarding_completed, dispatch_strategy, lb_strategy.
+        let mut cfg = AppConfig::default();
+        cfg.personalization.onboarding_completed = true;
+        cfg.preaccel.dispatch_strategy = PreAccelDispatchStrategy::LoadBalance;
+        cfg.preaccel.lb_strategy = PreAccelLbStrategy::ConsistentHashing;
+        let dto = UiAppConfigDto::from(&cfg);
+        assert!(dto.personalization.onboarding_completed);
+        assert_eq!(
+            dto.preaccel.dispatch_strategy,
+            Some(PreAccelDispatchStrategy::LoadBalance)
+        );
+        assert_eq!(
+            dto.preaccel.lb_strategy,
+            Some(PreAccelLbStrategy::ConsistentHashing)
+        );
+        let mut applied = AppConfig::default();
+        applied.preaccel.active_relay_id = Some("r-pinned".to_string());
+        apply_ui_dto(&mut applied, &dto);
+        assert!(applied.personalization.onboarding_completed);
+        assert_eq!(
+            applied.preaccel.dispatch_strategy,
+            PreAccelDispatchStrategy::LoadBalance
+        );
+        assert_eq!(
+            applied.preaccel.lb_strategy,
+            PreAccelLbStrategy::ConsistentHashing
+        );
+        assert_eq!(
+            applied.preaccel.active_relay_id, None,
+            "switching strategy to LoadBalance clears pinned relay"
+        );
+
+        // 4. Five locked effective_carrier states.
+        let mut st_wd = GlobalPreAccelStatus::default();
+        st_wd.running = true;
+        st_wd.mode = "windivert".to_string();
+        st_wd.is_windivert_active = true;
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, true, false, false, false, false, &st_wd),
+            ("standalone_windivert", false)
+        );
+
+        let mut st_socks = GlobalPreAccelStatus::default();
+        st_socks.running = true;
+        st_socks.mode = "local_socks5".to_string();
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, true, false, false, false, false, &st_socks),
+            ("standalone_socks5", false)
+        );
+
+        let mut st_susp = GlobalPreAccelStatus::default();
+        st_susp.running = false;
+        st_susp.mode = "suspended_for_tun".to_string();
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, true, true, true, true, false, &st_susp),
+            ("main_core_tun_suspended_standalone", true)
+        );
+
+        let st_off = GlobalPreAccelStatus::default();
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, true, true, false, true, false, &st_off),
+            ("main_core_proxy_only", false)
+        );
+        assert_eq!(
+            resolve_preaccel_effective_carrier(false, true, true, false, true, false, &st_off),
+            ("off", false)
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_fresh);
+        let _ = std::fs::remove_dir_all(&tmp_legacy);
+    }
+
+    #[test]
+    fn diagnostics_report_and_recent_logs_leak_zero_fictional_ips_and_include_dns_diagnostics() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_strict_diag_ip_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+        let job_guard = Arc::new(JobGuard::new().expect("job guard"));
+        let state = AppState::new(paths, AppConfig::default(), storage, job_guard);
+
+        // Inject raw unsanitized log lines directly into telemetry ring buffer (simulating Mihomo WS stream)
+        // AND DNS TLS certificate rejection lines into disk logger.
+        state.telemetry.push_log(CoreLogLine {
+            level: "warning".to_string(),
+            payload: "[TCP] 192.168.77.66:51234 --> 203.0.113.42:443 dial error via 10.42.8.19 tun 198.18.0.15 corp 172.18.9.33".to_string(),
+            timestamp: "2026-11-26T03:44:50Z".to_string(),
+        });
+        state.app_logger.append_formatted(
+            "2026-11-26T03:44:51Z",
+            "warning",
+            "mihomo",
+            r#"[DNS] direct-nameserver Post "https://223.5.5.5/dns-query": tls: failed to verify certificate: x509: cannot validate certificate for 223.5.5.5 because it doesn't contain any IP SANs"#,
+        );
+        state.app_logger.append_formatted(
+            "2026-11-26T03:45:43Z",
+            "warning",
+            "mihomo",
+            r#"[DNS] proxy-server-nameserver Post "https://1.12.12.12/dns-query": tls: failed to verify certificate: x509: cannot validate certificate for 1.12.12.12 because it doesn't contain any IP SANs"#,
+        );
+
+        // 1. `get_recent_logs` backing helper must strictly sanitize every emitted CoreLogLine.
+        let recent = collect_sanitized_recent_log_lines(&state, Some(50));
+        assert!(!recent.is_empty());
+        let recent_joined = serde_json::to_string(&recent).unwrap();
+        for leaked in [
+            "192.168.77.66",
+            "203.0.113.42",
+            "10.42.8.19",
+            "198.18.0.15",
+            "172.18.9.33",
+        ] {
+            assert!(
+                !recent_joined.contains(leaked),
+                "get_recent_logs leaked full IP `{leaked}`: {recent_joined}"
+            );
+        }
+        assert!(recent_joined.contains("192.168.77.*"));
+        assert!(recent_joined.contains("203.0.113.*"));
+        assert!(recent_joined.contains("198.18.0.*"));
+
+        // 2. Runtime DTO surfaces non-healthy `dns_tls_diagnostics`.
+        let rt_dto = build_runtime_info_dto(&state).expect("build runtime dto");
+        let rt_dns = rt_dto
+            .dns_tls_diagnostics
+            .expect("runtime dto must expose dns_tls_diagnostics when failing");
+        assert_eq!(rt_dns.status, "cert_verification_failed");
+        assert!(rt_dns.tls_verification_preserved);
+        assert_eq!(rt_dns.failure_count, 2);
+
+        // 3. Full sanitized diagnostics report includes `dns_diagnostics` + Markdown section and leaks 0 full IPs.
+        let report =
+            build_sanitized_diagnostics_report(&state, None).expect("build diagnostics report");
+        assert_eq!(report["sanitized"], true);
+        assert_eq!(
+            report["dns_diagnostics"]["status"],
+            "cert_verification_failed"
+        );
+        assert_eq!(report["dns_diagnostics"]["tls_verification_preserved"], true);
+        assert_eq!(report["dns_diagnostics"]["failure_count"], 2);
+
+        let md = report["ai_prompt_markdown"].as_str().unwrap();
+        assert!(md.contains("DNS 加密解析与证书校验诊断"));
+        assert!(md.contains("AliDNS DoH/DoT (223.5.5.*)"));
+        assert!(md.contains("DNSPod DoH/DoT (1.12.12.*)"));
+
+        let whole_json = serde_json::to_string(&report).unwrap();
+        for leaked in [
+            "192.168.77.66",
+            "203.0.113.42",
+            "10.42.8.19",
+            "198.18.0.15",
+            "172.18.9.33",
+            "223.5.5.5",
+            "1.12.12.12",
+        ] {
+            assert!(
+                !whole_json.contains(leaked),
+                "sanitized diagnostics report leaked full IP `{leaked}`"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn preaccel_active_relay_id_dto_roundtrip_and_auto_to_fallback_contract() {
+        let relay_a = PreAccelRelay {
+            id: "r-ali".to_string(),
+            name: "Aliyun-SH".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN-SH".to_string(),
+            server: "198.51.100.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-password-1".to_string(),
+            priority: 10,
+            enabled: true,
+            ..Default::default()
+        };
+        let relay_b = PreAccelRelay {
+            id: "r-tx".to_string(),
+            name: "Tencent-GZ".to_string(),
+            provider: "tencent".to_string(),
+            region: "CN-GZ".to_string(),
+            server: "203.0.113.20".to_string(),
+            port: 443,
+            protocol: "trojan".to_string(),
+            password: "demo-password-2".to_string(),
+            priority: 20,
+            enabled: true,
+            ..Default::default()
+        };
+
+        // 1. Selecting a pinned relay under `Auto` MUST switch dispatch_strategy to `Fallback`.
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.dispatch_strategy = PreAccelDispatchStrategy::Auto;
+        cfg.preaccel.active_relay_id = None;
+        let switched = apply_preaccel_relay_selection_to_config(&mut cfg, Some(&relay_a), None);
+        assert!(switched, "switching from Auto multi-cloud pool to pinned relay marks switched_from_lb");
+        assert_eq!(cfg.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Fallback);
+        assert_eq!(cfg.preaccel.active_relay_id.as_deref(), Some("r-ali"));
+
+        // 2. UiAppConfigDto::from exposes `active_relay_id` cleanly.
+        let dto_pinned = UiAppConfigDto::from(&cfg);
+        assert_eq!(dto_pinned.preaccel.active_relay_id.as_deref(), Some("r-ali"));
+        assert_eq!(
+            dto_pinned.preaccel.dispatch_strategy,
+            Some(PreAccelDispatchStrategy::Fallback)
+        );
+
+        // 3. Even if legacy stored config has `Auto + Some(id)`, `apply_ui_dto(Auto, None)` clears
+        //    `active_relay_id` so multi-cloud LB activates cleanly.
+        let mut legacy_auto_pinned = AppConfig::default();
+        legacy_auto_pinned.preaccel.enabled = true;
+        legacy_auto_pinned.preaccel.dispatch_strategy = PreAccelDispatchStrategy::Auto;
+        legacy_auto_pinned.preaccel.active_relay_id = Some("r-ali".to_string());
+
+        assert!(
+            !is_preaccel_pool_lb_effective(
+                legacy_auto_pinned.preaccel.dispatch_strategy,
+                legacy_auto_pinned.preaccel.active_relay_id.as_deref(),
+                2
+            ),
+            "Auto + pinned active_relay_id must NOT report multi-cloud LB"
+        );
+
+        let mut dto_restore_auto = UiAppConfigDto::from(&legacy_auto_pinned);
+        dto_restore_auto.preaccel.dispatch_strategy = Some(PreAccelDispatchStrategy::Auto);
+        dto_restore_auto.preaccel.active_relay_id = None;
+        apply_ui_dto(&mut legacy_auto_pinned, &dto_restore_auto);
+        assert_eq!(legacy_auto_pinned.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Auto);
+        assert_eq!(legacy_auto_pinned.preaccel.active_relay_id, None);
+        assert!(is_preaccel_pool_lb_effective(
+            legacy_auto_pinned.preaccel.dispatch_strategy,
+            legacy_auto_pinned.preaccel.active_relay_id.as_deref(),
+            2
+        ));
+
+        // Blank string `Some("  ")` under Auto also normalizes to `None`.
+        legacy_auto_pinned.preaccel.active_relay_id = Some("r-ali".to_string());
+        let mut dto_blank = UiAppConfigDto::from(&legacy_auto_pinned);
+        dto_blank.preaccel.dispatch_strategy = Some(PreAccelDispatchStrategy::Auto);
+        dto_blank.preaccel.active_relay_id = Some("   ".to_string());
+        apply_ui_dto(&mut legacy_auto_pinned, &dto_blank);
+        assert_eq!(legacy_auto_pinned.preaccel.active_relay_id, None);
+
+        // 4. Fallback synchronizes `active_relay_id` (non-empty or None), while LoadBalance forces None.
+        let mut dto_fb = UiAppConfigDto::from(&legacy_auto_pinned);
+        dto_fb.preaccel.dispatch_strategy = Some(PreAccelDispatchStrategy::Fallback);
+        dto_fb.preaccel.active_relay_id = Some(relay_b.id.clone());
+        apply_ui_dto(&mut legacy_auto_pinned, &dto_fb);
+        assert_eq!(legacy_auto_pinned.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Fallback);
+        assert_eq!(legacy_auto_pinned.preaccel.active_relay_id.as_deref(), Some("r-tx"));
+        assert!(!is_preaccel_pool_lb_effective(
+            legacy_auto_pinned.preaccel.dispatch_strategy,
+            legacy_auto_pinned.preaccel.active_relay_id.as_deref(),
+            2
+        ));
+
+        let mut dto_lb = UiAppConfigDto::from(&legacy_auto_pinned);
+        dto_lb.preaccel.dispatch_strategy = Some(PreAccelDispatchStrategy::LoadBalance);
+        dto_lb.preaccel.active_relay_id = Some("r-tx".to_string());
+        apply_ui_dto(&mut legacy_auto_pinned, &dto_lb);
+        assert_eq!(
+            legacy_auto_pinned.preaccel.dispatch_strategy,
+            PreAccelDispatchStrategy::LoadBalance
+        );
+        assert_eq!(legacy_auto_pinned.preaccel.active_relay_id, None);
+        assert!(is_preaccel_pool_lb_effective(
+            PreAccelDispatchStrategy::LoadBalance,
+            Some("r-tx"),
+            2
+        ));
+        assert!(!is_preaccel_pool_lb_effective(
+            PreAccelDispatchStrategy::LoadBalance,
+            None,
+            1
+        ));
+    }
+
+    #[test]
+    fn resolve_preaccel_effective_carrier_returns_off_in_direct_mode_including_eff_tun() {
+        let mut st_susp = GlobalPreAccelStatus::default();
+        st_susp.running = false;
+        st_susp.mode = "suspended_for_tun".to_string();
+
+        let st_off = GlobalPreAccelStatus::default();
+
+        // Direct mode MUST return ("off", false) even when core is running with eff_tun=true
+        // or global_status.mode == "suspended_for_tun".
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, true, true, true, true, true, &st_susp),
+            ("off", false)
+        );
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, true, true, true, true, true, &st_off),
+            ("off", false)
+        );
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, true, true, false, true, true, &st_off),
+            ("off", false)
+        );
+
+        // Zero enabled relays also returns ("off", false) across both TUN and proxy-only modes.
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, false, true, true, true, false, &st_susp),
+            ("off", false)
+        );
+        assert_eq!(
+            resolve_preaccel_effective_carrier(true, false, true, false, true, false, &st_off),
+            ("off", false)
+        );
+    }
+
+    #[test]
+    fn select_comparison_overseas_node_skips_ipv6_only_for_ipv4_relay_without_breaking_dual_stack() {
+        let ipv6_only = ProxyNode {
+            id: "n-v6-only".to_string(),
+            name: "🇯🇵 东京 纯IPv6".to_string(),
+            protocol: "vless".to_string(),
+            server: "2001:db8:cafe::1".to_string(),
+            port: 8443,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let dual_stack_named_ipv6 = ProxyNode {
+            id: "n-hk-dual".to_string(),
+            name: "HK-01-IPv6".to_string(),
+            protocol: "trojan".to_string(),
+            server: "hk01.example.com".to_string(),
+            port: 8443,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let all_nodes = vec![ipv6_only.clone(), dual_stack_named_ipv6.clone()];
+
+        // 1. Homepage node is IPv6-only and relay does NOT support IPv6 -> gracefully falls back
+        //    to dual-stack `HK-01-IPv6` without misclassifying it as IPv6-only.
+        let (picked_fallback, reason_fallback) = select_comparison_overseas_node(
+            &[],
+            &all_nodes,
+            RouteTargetMode::Single,
+            Some("n-v6-only"),
+            None,
+            None,
+            false,
+        )
+        .expect("IPv6-only homepage node must fallback to dual-stack node");
+        assert_eq!(picked_fallback.id, "n-hk-dual");
+        assert!(reason_fallback
+            .as_deref()
+            .is_some_and(|r| r.contains("纯 IPv6") && r.contains("HK-01-IPv6")));
+
+        // 2. Dual-stack node named `HK-01-IPv6` is NOT skipped when selected on homepage.
+        let (picked_dual, reason_dual) = select_comparison_overseas_node(
+            &[],
+            &all_nodes,
+            RouteTargetMode::Single,
+            Some("n-hk-dual"),
+            None,
+            None,
+            false,
+        )
+        .expect("dual-stack node named HK-01-IPv6 must remain usable");
+        assert_eq!(picked_dual.id, "n-hk-dual");
+        assert!(reason_dual.is_none());
+
+        // 3. When relay supports IPv6, IPv6-only homepage node is kept without fallback.
+        let (picked_v6_supported, reason_v6_supported) = select_comparison_overseas_node(
+            &[],
+            &all_nodes,
+            RouteTargetMode::Single,
+            Some("n-v6-only"),
+            None,
+            None,
+            true,
+        )
+        .expect("IPv6-capable relay should allow IPv6-only homepage node");
+        assert_eq!(picked_v6_supported.id, "n-v6-only");
+        assert!(reason_v6_supported.is_none());
+
+        // 4. Explicit `requested_node_id` honors user choice even for IPv6-only node.
+        let (picked_explicit, reason_explicit) = select_comparison_overseas_node(
+            &[],
+            &all_nodes,
+            RouteTargetMode::Single,
+            Some("n-hk-dual"),
+            None,
+            Some("n-v6-only"),
+            false,
+        )
+        .expect("explicit requested_node_id must be honored");
+        assert_eq!(picked_explicit.id, "n-v6-only");
+        assert!(reason_explicit.is_none());
+
+        // 5. Only IPv6-only nodes available with IPv4-only relay returns descriptive error.
+        let err = select_comparison_overseas_node(
+            &[],
+            &[ipv6_only],
+            RouteTargetMode::Single,
+            Some("n-v6-only"),
+            None,
+            None,
+            false,
+        )
+        .expect_err("only IPv6-only node with IPv4 relay should error");
+        assert!(err.contains("IPv6"));
     }
 }

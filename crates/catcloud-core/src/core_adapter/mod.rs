@@ -1,5 +1,6 @@
 pub mod binary_resolver;
 pub mod config_compiler;
+pub mod dns_diag;
 pub mod hot_reload;
 pub mod mihomo;
 pub mod port_guard;
@@ -28,16 +29,23 @@ pub use config_compiler::{
     compile_mihomo_config, compile_mihomo_config_with_runtime_dir, expand_group_match_rule,
     redact_compiled_yaml_for_preview, validate_compiled_yaml,
 };
+pub use dns_diag::{
+    DNS_TLS_CATEGORY, DNS_TLS_STATUS_CERT_FAILED, DNS_TLS_STATUS_DEGRADED_RECOVERED,
+    DNS_TLS_STATUS_HEALTHY, DnsTlsDiagnostics, analyze_dns_tls_diagnostics,
+    analyze_dns_tls_diagnostics_from_log_file,
+};
 pub use hot_reload::{
     ConfigWatcherHandle, DEFAULT_DEBOUNCE_WINDOW, DebounceDecision, DiskReloadOptions,
     DiskReloadSnapshot, HotReloadCoordinator, HotReloadDebouncer, classify_config_diff,
     has_core_config_changes,
 };
 pub use mihomo::{
-    MihomoAdapter, RUNTIME_CONTROLLER_META_FILENAME, ResolvedControllerEndpoint,
-    generate_controller_secret, remove_runtime_controller_meta,
-    resolve_effective_controller_endpoint, resolve_effective_controller_endpoint_info,
-    verify_config_with_binary,
+    ControllerEndpointSource, LiveCoreConfigSnapshot, MihomoAdapter,
+    RUNTIME_CONTROLLER_META_FILENAME, ResolvedControllerEndpoint, RuntimeControllerMeta,
+    generate_controller_secret, is_internal_or_preaccel_connection,
+    is_trusted_loopback_secret_endpoint, read_live_runtime_controller_meta,
+    remove_runtime_controller_meta, resolve_effective_controller_endpoint,
+    resolve_effective_controller_endpoint_info, verify_config_with_binary,
 };
 pub use port_guard::{
     AllocatedPorts as CoreAllocatedPorts, PortShiftNotice as CorePortShiftNotice,

@@ -12,15 +12,20 @@ use std::time::{Duration, Instant};
 
 use catcloud_core::config;
 use catcloud_core::models::{
-    MultiGroup, MultiGroupMode, ProxyMode, ProxyNode, RouteTargetMode, UpdateApplyMode,
-    UpdateConfig,
+    MultiGroup, MultiGroupMode, ProbeSnapshot, ProxyMode, ProxyNode, RouteTargetMode, SwitchMode,
+    UpdateApplyMode, UpdateConfig,
 };
 use catcloud_core::platform::default_platform;
 use catcloud_core::process_guard::{
     AcquireOutcome, JobGuard, SingleInstanceGuard, spawn_detached_self,
 };
 use catcloud_core::storage::Storage;
-use catcloud_core::strategy::health_pool::RuntimeDualHealth;
+use catcloud_core::strategy::evaluator::evaluate_group_candidates_with_runtime;
+use catcloud_core::strategy::health_pool::{
+    NodeHealthPool, RuntimeDualHealth, WatchdogCandidateTrace, WatchdogCooldownNodeEntry,
+    WatchdogDecisionEvent, WatchdogGroupBackoffEntry, WatchdogStateSnapshot,
+    read_watchdog_state_snapshot, write_watchdog_state_snapshot,
+};
 use catcloud_core::AppPaths;
 use tauri::{Emitter, Manager};
 
@@ -996,6 +1001,402 @@ fn resolve_node_compiled_proxy(st: &AppState, nodes: &[ProxyNode], node_id: &str
     st.resolve_compiled_proxy_name(node_id, fallback)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WatchdogTickDecision {
+    HoldHealthy,
+    HoldTransient { count: u32, threshold: u32 },
+    HoldCooldown,
+    Trigger(WatchdogFailoverTrigger),
+}
+
+/// Pure watchdog state-transition evaluator for one active-node dual-probe tick:
+/// - `FullHealthy`: clears both failure/degraded counters and holds sticky.
+/// - `TotalFailure`: increments `consecutive_failures`, clears `consecutive_degraded`; triggers
+///   only when `count >= required_failures` AND `cooldown_elapsed`.
+/// - `Degraded`: increments `consecutive_degraded`, clears `consecutive_failures`; triggers
+///   only when `count >= WATCHDOG_DEGRADED_THRESHOLD_ROUNDS` AND `cooldown_elapsed`.
+fn evaluate_watchdog_active_health_tick(
+    health: DualProbeHealth,
+    consecutive_failures: &mut u32,
+    consecutive_degraded: &mut u32,
+    required_failures: u32,
+    cooldown_elapsed: bool,
+) -> WatchdogTickDecision {
+    let min_failures = required_failures.max(2);
+    match health {
+        DualProbeHealth::FullHealthy(_) => {
+            *consecutive_failures = 0;
+            *consecutive_degraded = 0;
+            WatchdogTickDecision::HoldHealthy
+        }
+        DualProbeHealth::TotalFailure => {
+            *consecutive_degraded = 0;
+            *consecutive_failures = consecutive_failures.saturating_add(1);
+            let fail_count = *consecutive_failures;
+            if fail_count < min_failures {
+                WatchdogTickDecision::HoldTransient {
+                    count: fail_count,
+                    threshold: min_failures,
+                }
+            } else if !cooldown_elapsed {
+                WatchdogTickDecision::HoldCooldown
+            } else {
+                WatchdogTickDecision::Trigger(WatchdogFailoverTrigger::TotalOutage { fail_count })
+            }
+        }
+        DualProbeHealth::Degraded { failed_source, .. } => {
+            *consecutive_failures = 0;
+            *consecutive_degraded = consecutive_degraded.saturating_add(1);
+            let degraded_rounds = *consecutive_degraded;
+            if degraded_rounds < WATCHDOG_DEGRADED_THRESHOLD_ROUNDS {
+                WatchdogTickDecision::HoldTransient {
+                    count: degraded_rounds,
+                    threshold: WATCHDOG_DEGRADED_THRESHOLD_ROUNDS,
+                }
+            } else if !cooldown_elapsed {
+                WatchdogTickDecision::HoldCooldown
+            } else {
+                WatchdogTickDecision::Trigger(WatchdogFailoverTrigger::SustainedDegraded {
+                    degraded_rounds,
+                    failed_source,
+                })
+            }
+        }
+    }
+}
+
+fn format_dual_probe_summary(health: DualProbeHealth) -> String {
+    match health {
+        DualProbeHealth::FullHealthy(ms) => format!("双源全绿（均 {ms} ms）"),
+        DualProbeHealth::Degraded {
+            passed_delay_ms,
+            failed_source,
+        } => format!("单源超时（{failed_source} 失败，另一侧通过 {passed_delay_ms} ms）"),
+        DualProbeHealth::TotalFailure => "双源全挂（Google 与 Cloudflare 均失败）".to_string(),
+    }
+}
+
+fn format_trigger_reason(trigger: WatchdogFailoverTrigger) -> String {
+    match trigger {
+        WatchdogFailoverTrigger::TotalOutage { fail_count } => {
+            format!("当前节点连续 {fail_count} 次双源健康探活全挂")
+        }
+        WatchdogFailoverTrigger::SustainedDegraded {
+            degraded_rounds,
+            failed_source,
+        } => {
+            format!("当前节点连续 {degraded_rounds} 轮对 {failed_source} 单源超时（持续半残）")
+        }
+    }
+}
+
+/// Build per-candidate decision traces across every enabled member in `group`, recording why each
+/// candidate was selected, passed/degraded/failed live probing, or skipped due to cooldown,
+/// recent switch-out anti-ping-pong protection, hard gates, or lower rank.
+#[allow(clippy::too_many_arguments)]
+fn build_watchdog_candidate_traces(
+    group: &MultiGroup,
+    nodes: &[ProxyNode],
+    snaps: &HashMap<String, ProbeSnapshot>,
+    health_pool: &NodeHealthPool,
+    now: Instant,
+    active_node_id: &str,
+    recently_switched_out: &HashSet<String>,
+    probed_results: &[((String, String), DualProbeHealth)],
+    selected_node_id: Option<&str>,
+) -> Vec<WatchdogCandidateTrace> {
+    let member_ids = collect_enabled_group_member_ids(group, nodes);
+    let eval_report = evaluate_group_candidates_with_runtime(
+        group,
+        nodes,
+        snaps,
+        Some(health_pool),
+        now,
+    )
+    .ok();
+
+    let mut score_map: HashMap<&str, (Option<f64>, bool, Vec<String>)> = HashMap::new();
+    if let Some(ref rep) = eval_report {
+        for c in rep.gate_passed.iter().chain(rep.gate_rejected.iter()) {
+            score_map.insert(
+                c.node_id.as_str(),
+                (
+                    c.score.is_finite().then_some(c.score),
+                    c.passed_hard_gates,
+                    c.failed_hard_gates.clone(),
+                ),
+            );
+        }
+    }
+
+    let probed_map: HashMap<&str, DualProbeHealth> = probed_results
+        .iter()
+        .map(|((id, _), h)| (id.as_str(), *h))
+        .collect();
+
+    let mut traces = Vec::with_capacity(member_ids.len());
+    for mid in member_ids {
+        let node_name = nodes
+            .iter()
+            .find(|n| n.id == mid)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| mid.clone());
+        let (score, passed_gates, failed_gates) = score_map
+            .get(mid.as_str())
+            .cloned()
+            .unwrap_or((None, true, Vec::new()));
+
+        if mid == active_node_id {
+            traces.push(WatchdogCandidateTrace {
+                node_id: mid,
+                node_name,
+                status: "active_current".to_string(),
+                score,
+                latency_ms: health_pool.live_latency_ms(active_node_id),
+                reason: "触发切换的原当前节点".to_string(),
+            });
+            continue;
+        }
+
+        if let Some(&cand_health) = probed_map.get(mid.as_str()) {
+            let is_selected = selected_node_id == Some(mid.as_str());
+            let (status, latency_ms, reason) = match cand_health {
+                DualProbeHealth::FullHealthy(ms) => (
+                    if is_selected { "selected" } else { "probed_passed" },
+                    Some(ms as f64),
+                    if is_selected {
+                        format!("双源实测通过（{ms} ms），已选为切换目标")
+                    } else {
+                        format!("双源实测通过（{ms} ms）")
+                    },
+                ),
+                DualProbeHealth::Degraded {
+                    passed_delay_ms,
+                    failed_source,
+                } => (
+                    if is_selected {
+                        "selected_degraded_fallback"
+                    } else {
+                        "probed_degraded"
+                    },
+                    Some(passed_delay_ms as f64),
+                    if is_selected {
+                        format!(
+                            "无双源全绿备用，仅 {failed_source} 单侧超时（{passed_delay_ms} ms），作为全挂兜底切换目标"
+                        )
+                    } else {
+                        format!("单源半残（{failed_source} 超时，另一侧 {passed_delay_ms} ms），未达到双源全绿标准")
+                    },
+                ),
+                DualProbeHealth::TotalFailure => (
+                    "probed_failed",
+                    None,
+                    "实测双源探测均失败，已记入退避冷却".to_string(),
+                ),
+            };
+            traces.push(WatchdogCandidateTrace {
+                node_id: mid,
+                node_name,
+                status: status.to_string(),
+                score,
+                latency_ms,
+                reason,
+            });
+            continue;
+        }
+
+        let live_latency = health_pool.live_latency_ms(&mid);
+
+        if recently_switched_out.contains(&mid) {
+            traces.push(WatchdogCandidateTrace {
+                node_id: mid,
+                node_name,
+                status: "skipped_recently_switched_out".to_string(),
+                score,
+                latency_ms: live_latency,
+                reason: "刚切出的旧节点处于冷却防乒乓保护窗内，本次跳过切回".to_string(),
+            });
+            continue;
+        }
+
+        if let Some(entry) = health_pool.get(&mid) {
+            if entry.is_in_cooldown(now) {
+                traces.push(WatchdogCandidateTrace {
+                    node_id: mid,
+                    node_name,
+                    status: "skipped_cooldown".to_string(),
+                    score,
+                    latency_ms: None,
+                    reason: entry.reason_zh(now),
+                });
+                continue;
+            }
+        }
+
+        if !passed_gates {
+            let gate_desc = if failed_gates.is_empty() {
+                "未通过硬门槛约束".to_string()
+            } else {
+                format!("未通过硬门槛：{}", failed_gates.join("；"))
+            };
+            traces.push(WatchdogCandidateTrace {
+                node_id: mid,
+                node_name,
+                status: "skipped_hard_gate".to_string(),
+                score,
+                latency_ms: live_latency,
+                reason: gate_desc,
+            });
+            continue;
+        }
+
+        traces.push(WatchdogCandidateTrace {
+            node_id: mid,
+            node_name,
+            status: "skipped_unprobed".to_string(),
+            score,
+            latency_ms: live_latency,
+            reason: if selected_node_id.is_some() {
+                "顺位靠后，更高顺位备用已实测通过".to_string()
+            } else {
+                "顺位超出本轮探活上限（前 4 名）".to_string()
+            },
+        });
+    }
+
+    traces
+}
+
+fn build_watchdog_cooldown_entries(
+    health_pool: &NodeHealthPool,
+    nodes: &[ProxyNode],
+    now: Instant,
+) -> Vec<WatchdogCooldownNodeEntry> {
+    let name_map: HashMap<&str, &str> = nodes
+        .iter()
+        .map(|n| (n.id.as_str(), n.name.as_str()))
+        .collect();
+    let hints = health_pool.build_hints_snapshot(now);
+    let mut entries: Vec<WatchdogCooldownNodeEntry> = hints
+        .into_iter()
+        .filter(|(_, h)| h.status != "healthy" || h.cooldown_remaining_sec > 0)
+        .map(|(node_id, h)| {
+            let node_name = name_map
+                .get(node_id.as_str())
+                .copied()
+                .unwrap_or(node_id.as_str())
+                .to_string();
+            WatchdogCooldownNodeEntry {
+                node_id,
+                node_name,
+                stage: h.stage,
+                cooldown_remaining_sec: h.cooldown_remaining_sec,
+                reason: h.reason,
+            }
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        b.cooldown_remaining_sec
+            .cmp(&a.cooldown_remaining_sec)
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    entries
+}
+
+fn build_watchdog_backoff_entries(
+    failed_group_backoff_until: &HashMap<String, Instant>,
+    groups: &[MultiGroup],
+    consecutive_fail_counts: &HashMap<String, u32>,
+    now: Instant,
+    now_utc: chrono::DateTime<chrono::Utc>,
+) -> Vec<WatchdogGroupBackoffEntry> {
+    let mut out = Vec::new();
+    for (gid, until) in failed_group_backoff_until {
+        if let Some(rem) = until.checked_duration_since(now) {
+            if rem.is_zero() {
+                continue;
+            }
+            let gname = groups
+                .iter()
+                .find(|g| &g.id == gid)
+                .map(|g| g.name.clone())
+                .unwrap_or_else(|| gid.clone());
+            let backoff_at = now_utc
+                + chrono::Duration::seconds(rem.as_secs().min(i64::MAX as u64) as i64);
+            out.push(WatchdogGroupBackoffEntry {
+                group_id: gid.clone(),
+                group_name: gname,
+                consecutive_failures: consecutive_fail_counts.get(gid).copied().unwrap_or(0),
+                backoff_until: Some(backoff_at.to_rfc3339()),
+                reason: "全组顺位候选实测未通过，进入 180 秒退避保护".to_string(),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+    out
+}
+
+fn format_watchdog_decision_log_line(event: &WatchdogDecisionEvent) -> String {
+    let target_desc = match (&event.from_node_name, &event.to_node_name) {
+        (Some(from), Some(to)) => format!("{from} -> {to}"),
+        (Some(from), None) => format!("保持 {from}（进入退避）"),
+        _ => event.action.clone(),
+    };
+    let cand_briefs: Vec<String> = event
+        .candidates
+        .iter()
+        .filter(|c| c.status != "active_current")
+        .take(8)
+        .map(|c| {
+            let score_txt = c
+                .score
+                .map(|s| format!(" score={s:.1}"))
+                .unwrap_or_default();
+            let lat_txt = c
+                .latency_ms
+                .map(|ms| format!(" {ms:.0}ms"))
+                .unwrap_or_default();
+            format!("{}[{}]{score_txt}{lat_txt}:{}", c.node_name, c.status, c.reason)
+        })
+        .collect();
+    let cand_section = if cand_briefs.is_empty() {
+        "无备选".to_string()
+    } else {
+        cand_briefs.join(" | ")
+    };
+    let next_check = event.next_recheck_at.as_deref().unwrap_or("下轮周期");
+    let conn_policy = if event.keep_existing_connections {
+        "保留存量连接"
+    } else {
+        "断开旧节点存量连接"
+    };
+    format!(
+        "分组「{}」调度决策[{}]：{} ｜ 触发：{} ｜ 当前探测：{} ｜ 存量连接：{} ｜ 下次复检：{} ｜ 备选轨迹：[{}]",
+        event.group_name,
+        event.action,
+        target_desc,
+        event.trigger_reason,
+        event.current_probe_summary,
+        conn_policy,
+        next_check,
+        cand_section,
+    )
+}
+
+fn record_watchdog_decision_event_and_persist(
+    data_dir: &std::path::Path,
+    state_snapshot: &mut WatchdogStateSnapshot,
+    event: WatchdogDecisionEvent,
+    active_backoffs: Vec<WatchdogGroupBackoffEntry>,
+    cooldown_nodes: Vec<WatchdogCooldownNodeEntry>,
+) -> Result<(), String> {
+    state_snapshot.updated_at = chrono::Utc::now().to_rfc3339();
+    state_snapshot.active_backoffs = active_backoffs;
+    state_snapshot.cooldown_nodes = cooldown_nodes;
+    state_snapshot.push_event(event);
+    write_watchdog_state_snapshot(data_dir, state_snapshot).map_err(|e| e.to_string())
+}
+
 /// Decide whether a probed backup candidate should be accepted for the given trigger.
 /// - For `SustainedDegraded`, ONLY a `FullHealthy` (2/2) candidate may replace a degraded node
 ///   so two half-broken nodes never ping-pong into each other.
@@ -1236,6 +1637,8 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
         let mut last_auto_switch_at: HashMap<String, Instant> = HashMap::new();
         let mut failed_group_backoff_until: HashMap<String, Instant> = HashMap::new();
         let mut last_checked_node: HashMap<String, String> = HashMap::new();
+        let mut recently_switched_out_until: HashMap<(String, String), Instant> = HashMap::new();
+        let mut watchdog_snapshot: Option<WatchdogStateSnapshot> = None;
 
         loop {
             tokio::time::sleep(Duration::from_secs(WATCHDOG_INTERVAL_SECS)).await;
@@ -1380,6 +1783,10 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                 Instant::now() < *until && failover_groups.iter().any(|g| &g.id == gid)
             });
             last_checked_node.retain(|gid, _| failover_groups.iter().any(|g| &g.id == gid));
+            let retain_now = Instant::now();
+            recently_switched_out_until.retain(|(gid, _), until| {
+                retain_now < *until && failover_groups.iter().any(|g| &g.id == gid)
+            });
 
             if failover_groups.is_empty() && readonly_groups.is_empty() {
                 continue;
@@ -1496,73 +1903,62 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                         .is_none_or(|last| last.elapsed() >= cooldown);
                     let required_failures = commands::group_watchdog_failure_threshold(&group);
 
-                    let failover_trigger = match health {
-                        DualProbeHealth::FullHealthy(_) => {
-                            // Both Google & Cloudflare succeeded: clear counters and stay sticky.
-                            consecutive_fail_counts.remove(&group.id);
-                            consecutive_degraded_counts.remove(&group.id);
+                    let mut cur_fails = consecutive_fail_counts.get(&group.id).copied().unwrap_or(0);
+                    let mut cur_degraded = consecutive_degraded_counts
+                        .get(&group.id)
+                        .copied()
+                        .unwrap_or(0);
+                    let tick_decision = evaluate_watchdog_active_health_tick(
+                        health,
+                        &mut cur_fails,
+                        &mut cur_degraded,
+                        required_failures,
+                        cooldown_elapsed,
+                    );
+                    if cur_fails == 0 {
+                        consecutive_fail_counts.remove(&group.id);
+                    } else {
+                        consecutive_fail_counts.insert(group.id.clone(), cur_fails);
+                    }
+                    if cur_degraded == 0 {
+                        consecutive_degraded_counts.remove(&group.id);
+                    } else {
+                        consecutive_degraded_counts.insert(group.id.clone(), cur_degraded);
+                    }
+
+                    let failover_trigger = match tick_decision {
+                        WatchdogTickDecision::HoldHealthy => None,
+                        WatchdogTickDecision::HoldTransient { count, threshold } => {
+                            tracing::debug!(
+                                group = %group.name,
+                                node = %active_node.name,
+                                count,
+                                threshold,
+                                "group strategy watchdog observed transient anomaly (holding)"
+                            );
                             None
                         }
-                        DualProbeHealth::TotalFailure => {
-                            consecutive_degraded_counts.remove(&group.id);
-                            let fail_count = {
-                                let entry =
-                                    consecutive_fail_counts.entry(group.id.clone()).or_insert(0);
-                                *entry = entry.saturating_add(1);
-                                *entry
-                            };
-                            if fail_count < required_failures || !cooldown_elapsed {
-                                tracing::debug!(
-                                    group = %group.name,
-                                    node = %active_node.name,
-                                    fail_count,
-                                    required_failures,
-                                    cooldown_elapsed,
-                                    "group strategy watchdog recorded dual-origin outage (holding)"
-                                );
-                                None
-                            } else {
-                                Some(WatchdogFailoverTrigger::TotalOutage { fail_count })
-                            }
+                        WatchdogTickDecision::HoldCooldown => {
+                            tracing::debug!(
+                                group = %group.name,
+                                node = %active_node.name,
+                                "group strategy watchdog holding failover during cooldown"
+                            );
+                            None
                         }
-                        DualProbeHealth::Degraded { failed_source, .. } => {
-                            // Single-origin timeout does NOT count as total outage (prevents
-                            // single-CDN blip false failovers), but sustained partial failure
-                            // across 4 rounds smoothly migrates to a verified 2/2 backup.
-                            consecutive_fail_counts.remove(&group.id);
-                            let degraded_rounds = {
-                                let entry = consecutive_degraded_counts
-                                    .entry(group.id.clone())
-                                    .or_insert(0);
-                                *entry = entry.saturating_add(1);
-                                *entry
-                            };
-                            if degraded_rounds < WATCHDOG_DEGRADED_THRESHOLD_ROUNDS
-                                || !cooldown_elapsed
-                            {
-                                tracing::debug!(
-                                    group = %group.name,
-                                    node = %active_node.name,
-                                    degraded_rounds,
-                                    failed_source,
-                                    "group strategy watchdog observed partial single-origin timeout (holding)"
-                                );
-                                None
-                            } else {
-                                Some(WatchdogFailoverTrigger::SustainedDegraded {
-                                    degraded_rounds,
-                                    failed_source,
-                                })
-                            }
-                        }
+                        WatchdogTickDecision::Trigger(trigger) => Some(trigger),
                     };
 
                     if let Some(trigger) = failover_trigger {
-                        // Guard #2: use `NodeHealthPool` exponential backoff, gradual penalties,
-                        // and 2/2 recovery probation as the single cooldown & ranking authority.
-                        let empty_cooldowns: HashSet<String> = HashSet::new();
-                        let health_pool_snap = st.snapshot_node_health_pool();
+                        // Guard #2: combine `NodeHealthPool` exponential backoff with per-group
+                        // recently-switched-out anti-ping-pong cooldowns inside `cooldown_sec`.
                         let rank_now = Instant::now();
+                        let switch_out_cooldowns: HashSet<String> = recently_switched_out_until
+                            .iter()
+                            .filter(|((gid, _), until)| gid == &group.id && rank_now < **until)
+                            .map(|((_, nid), _)| nid.clone())
+                            .collect();
+                        let health_pool_snap = st.snapshot_node_health_pool();
 
                         // Re-read latest group, nodes, and probe snapshots under a brief sync lock
                         // before ranking up to 4 backup candidates fused with runtime health pool.
@@ -1590,7 +1986,7 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                     &latest_nodes,
                                     &snaps,
                                     Some(&active_node.id),
-                                    &empty_cooldowns,
+                                    &switch_out_cooldowns,
                                     Some(&health_pool_snap),
                                     rank_now,
                                     MAX_FAILOVER_CANDIDATES,
@@ -1610,10 +2006,17 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                     (cid, cname, compiled)
                                 })
                                 .collect();
-                            Some((latest_group.id, latest_group.name, candidates))
+                            Some((latest_group, latest_nodes, snaps, candidates))
                         });
 
-                        if let Some((gid, gname, candidates)) = candidate_plan {
+                        if let Some((latest_group, latest_nodes, latest_snaps, candidates)) =
+                            candidate_plan
+                        {
+                            let gid = latest_group.id.clone();
+                            let gname = latest_group.name.clone();
+                            let current_probe_summary = format_dual_probe_summary(health);
+                            let trigger_reason_text = format_trigger_reason(trigger);
+
                             // Guard #3: sequentially dual-probe top 4 candidates outside sync locks
                             // with retry-before-penalize (`timeout=3500ms`).
                             let probed_total = candidates.len();
@@ -1677,12 +2080,12 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                         .lock()
                                         .ok()
                                         .and_then(|db| db.get_multi_group(&gid).ok().flatten())
-                                        .map(|latest_group| {
+                                        .map(|db_group| {
                                             let unchanged_explicit =
-                                                latest_group.active_node_id.as_deref()
+                                                db_group.active_node_id.as_deref()
                                                     == Some(active_node.id.as_str());
                                             let unchanged_implicit = group.active_node_id.is_none()
-                                                && latest_group.active_node_id.is_none();
+                                                && db_group.active_node_id.is_none();
                                             unchanged_explicit || unchanged_implicit
                                         })
                                         .unwrap_or(false);
@@ -1702,13 +2105,18 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                     } else {
                                         // Guard #5: smooth migration on partial degradation never
                                         // force-kills live streams; total outage respects group's switch_mode.
-                                        // (`next_id` was already recorded once into `node_health_pool`
-                                        // during candidate probing above.)
                                         let close_old_override = match trigger {
                                             WatchdogFailoverTrigger::SustainedDegraded { .. } => {
                                                 Some(false)
                                             }
                                             WatchdogFailoverTrigger::TotalOutage { .. } => None,
+                                        };
+                                        let keep_existing_connections = match close_old_override {
+                                            Some(close_old) => !close_old,
+                                            None => matches!(
+                                                latest_group.switch_mode,
+                                                SwitchMode::GracefulNewOnly
+                                            ),
                                         };
                                         let switch_res = commands::select_group_node_in_place_internal(
                                             &app_h,
@@ -1722,16 +2130,24 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
 
                                         match switch_res {
                                             Ok(_) => {
+                                                let now_inst = Instant::now();
+                                                let now_utc = chrono::Utc::now();
                                                 consecutive_fail_counts.remove(&gid);
                                                 consecutive_degraded_counts.remove(&gid);
                                                 failed_group_backoff_until.remove(&gid);
                                                 st.set_group_backoff_until(&gid, None);
-                                                last_auto_switch_at
-                                                    .insert(gid.clone(), Instant::now());
+                                                last_auto_switch_at.insert(gid.clone(), now_inst);
+                                                // Anti-ping-pong protection: shield the switched-out
+                                                // old node from immediate re-selection inside cooldown_sec.
+                                                recently_switched_out_until.insert(
+                                                    (gid.clone(), active_node.id.clone()),
+                                                    now_inst + cooldown,
+                                                );
                                                 last_checked_node
                                                     .insert(gid.clone(), next_id.clone());
                                                 effective_active_id = next_id.clone();
                                                 should_emit_runtime = true;
+
                                                 let health_tag = if is_full_healthy {
                                                     "双源全绿"
                                                 } else {
@@ -1750,13 +2166,77 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                                         "原节点连续 {degraded_rounds} 轮对 {failed_source} 单源超时（部分丢包），已平滑切换至{health_tag}节点（{verified_delay_ms} ms，不断开存量连接）"
                                                     ),
                                                 };
+
+                                                let updated_pool = st.snapshot_node_health_pool();
+                                                let candidate_traces = build_watchdog_candidate_traces(
+                                                    &latest_group,
+                                                    &latest_nodes,
+                                                    &latest_snaps,
+                                                    &updated_pool,
+                                                    now_inst,
+                                                    &active_node.id,
+                                                    &switch_out_cooldowns,
+                                                    &probed_results,
+                                                    Some(&next_id),
+                                                );
+                                                let next_recheck_at = (now_utc
+                                                    + chrono::Duration::seconds(
+                                                        cooldown.as_secs().min(i64::MAX as u64)
+                                                            as i64,
+                                                    ))
+                                                .to_rfc3339();
+                                                let decision_event = WatchdogDecisionEvent {
+                                                    timestamp: now_utc.to_rfc3339(),
+                                                    group_id: gid.clone(),
+                                                    group_name: gname.clone(),
+                                                    trigger_reason: trigger_reason_text.clone(),
+                                                    action: "switch_node".to_string(),
+                                                    from_node_id: Some(active_node.id.clone()),
+                                                    from_node_name: Some(active_node.name.clone()),
+                                                    to_node_id: Some(next_id.clone()),
+                                                    to_node_name: Some(next_name.clone()),
+                                                    current_probe_summary: current_probe_summary
+                                                        .clone(),
+                                                    candidates: candidate_traces,
+                                                    next_recheck_at: Some(next_recheck_at),
+                                                    keep_existing_connections,
+                                                };
+                                                let structured_log =
+                                                    format_watchdog_decision_log_line(
+                                                        &decision_event,
+                                                    );
                                                 st.log_app_event(
                                                     "warning",
                                                     "自动切优",
-                                                    &format!(
-                                                        "分组「{gname}」后台健康守护自动切换：{} -> {}（{reason}）",
-                                                        active_node.name, next_name
-                                                    ),
+                                                    &structured_log,
+                                                );
+                                                let snap_mut = watchdog_snapshot.get_or_insert_with(
+                                                    || {
+                                                        read_watchdog_state_snapshot(
+                                                            &st.paths.root_data_dir,
+                                                        )
+                                                        .unwrap_or_default()
+                                                    },
+                                                );
+                                                let active_backoffs = build_watchdog_backoff_entries(
+                                                    &failed_group_backoff_until,
+                                                    &groups,
+                                                    &consecutive_fail_counts,
+                                                    now_inst,
+                                                    now_utc,
+                                                );
+                                                let cooldown_entries =
+                                                    build_watchdog_cooldown_entries(
+                                                        &updated_pool,
+                                                        &latest_nodes,
+                                                        now_inst,
+                                                    );
+                                                let _ = record_watchdog_decision_event_and_persist(
+                                                    &st.paths.root_data_dir,
+                                                    snap_mut,
+                                                    decision_event,
+                                                    active_backoffs,
+                                                    cooldown_entries,
                                                 );
                                                 let _ = app_h.emit(
                                                     commands::EVENT_STRATEGY_SWITCH,
@@ -1785,26 +2265,74 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                 consecutive_fail_counts.remove(&gid);
                                 consecutive_degraded_counts.remove(&gid);
                                 let now = Instant::now();
+                                let now_utc = chrono::Utc::now();
                                 let backoff_until = now + ALL_CANDIDATES_FAILED_BACKOFF;
                                 last_auto_switch_at.insert(gid.clone(), now);
                                 failed_group_backoff_until.insert(gid.clone(), backoff_until);
                                 st.set_group_backoff_until(&gid, Some(backoff_until));
                                 should_emit_runtime = true;
                                 commands::refresh_tray(&app_h, &st);
-                                let log_msg = match trigger {
-                                    WatchdogFailoverTrigger::TotalOutage { fail_count } => format!(
-                                        "分组「{gname}」原节点「{}」连续 {fail_count} 次双源探活失败，但顺位前 {probed_total} 个备用候选均未通过实测，已记入退避冷却并进入 180 秒退避，放弃盲切",
-                                        active_node.name
+
+                                let updated_pool = st.snapshot_node_health_pool();
+                                let candidate_traces = build_watchdog_candidate_traces(
+                                    &latest_group,
+                                    &latest_nodes,
+                                    &latest_snaps,
+                                    &updated_pool,
+                                    now,
+                                    &active_node.id,
+                                    &switch_out_cooldowns,
+                                    &probed_results,
+                                    None,
+                                );
+                                let next_recheck_at = (now_utc
+                                    + chrono::Duration::seconds(
+                                        ALL_CANDIDATES_FAILED_BACKOFF.as_secs() as i64,
+                                    ))
+                                .to_rfc3339();
+                                let decision_event = WatchdogDecisionEvent {
+                                    timestamp: now_utc.to_rfc3339(),
+                                    group_id: gid.clone(),
+                                    group_name: gname.clone(),
+                                    trigger_reason: format!(
+                                        "{trigger_reason_text}（顺位前 {probed_total} 个备选均未通过实测，进入 180 秒退避）"
                                     ),
-                                    WatchdogFailoverTrigger::SustainedDegraded {
-                                        degraded_rounds,
-                                        failed_source,
-                                    } => format!(
-                                        "分组「{gname}」原节点「{}」连续 {degraded_rounds} 轮对 {failed_source} 单源超时（半残），但顺位前 {probed_total} 个备用候选无双源全绿节点，保持当前节点避免无效互切并进入 180 秒退避",
-                                        active_node.name
-                                    ),
+                                    action: "backoff_all_candidates_failed".to_string(),
+                                    from_node_id: Some(active_node.id.clone()),
+                                    from_node_name: Some(active_node.name.clone()),
+                                    to_node_id: None,
+                                    to_node_name: None,
+                                    current_probe_summary,
+                                    candidates: candidate_traces,
+                                    next_recheck_at: Some(next_recheck_at),
+                                    keep_existing_connections: true,
                                 };
-                                st.log_app_event("warning", "自动切优", &log_msg);
+                                let structured_log =
+                                    format_watchdog_decision_log_line(&decision_event);
+                                st.log_app_event("warning", "自动切优", &structured_log);
+                                let snap_mut = watchdog_snapshot.get_or_insert_with(|| {
+                                    read_watchdog_state_snapshot(&st.paths.root_data_dir)
+                                        .unwrap_or_default()
+                                });
+                                let active_backoffs = build_watchdog_backoff_entries(
+                                    &failed_group_backoff_until,
+                                    &groups,
+                                    &consecutive_fail_counts,
+                                    now,
+                                    now_utc,
+                                );
+                                let cooldown_entries = build_watchdog_cooldown_entries(
+                                    &updated_pool,
+                                    &latest_nodes,
+                                    now,
+                                );
+                                let _ = record_watchdog_decision_event_and_persist(
+                                    &st.paths.root_data_dir,
+                                    snap_mut,
+                                    decision_event,
+                                    active_backoffs,
+                                    cooldown_entries,
+                                );
                             }
                         }
                     }
@@ -2165,7 +2693,8 @@ fn spawn_telemetry_forwarders(app: &tauri::AppHandle, state: &AppState) {
                             }
                         }
                         if lifecycle::is_main_window_visible(&app_h) {
-                            let _ = app_h.emit(commands::EVENT_CORE_LOG, line);
+                            let sanitized_line = commands::sanitize_core_log_line(line);
+                            let _ = app_h.emit(commands::EVENT_CORE_LOG, sanitized_line);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2433,5 +2962,350 @@ mod tests {
             collect_enabled_group_member_ids(&dynamic_pool, &nodes),
             vec!["a".to_string(), "c".to_string()]
         );
+    }
+
+    #[test]
+    fn watchdog_does_not_flap_when_business_healthy_or_single_transient_jitter() {
+        let mut fails = 0u32;
+        let mut degraded = 0u32;
+        let required_failures = 2u32;
+
+        // 1. Healthy dual-origin probe -> stays sticky, zero switch.
+        assert_eq!(
+            evaluate_watchdog_active_health_tick(
+                DualProbeHealth::FullHealthy(62),
+                &mut fails,
+                &mut degraded,
+                required_failures,
+                true,
+            ),
+            WatchdogTickDecision::HoldHealthy
+        );
+        assert_eq!(fails, 0);
+        assert_eq!(degraded, 0);
+
+        // 2. Single transient total failure (1 < 2) followed by recovery -> holds and resets, never flaps.
+        assert_eq!(
+            evaluate_watchdog_active_health_tick(
+                DualProbeHealth::TotalFailure,
+                &mut fails,
+                &mut degraded,
+                required_failures,
+                true,
+            ),
+            WatchdogTickDecision::HoldTransient {
+                count: 1,
+                threshold: 2,
+            }
+        );
+        assert_eq!(
+            evaluate_watchdog_active_health_tick(
+                DualProbeHealth::FullHealthy(68),
+                &mut fails,
+                &mut degraded,
+                required_failures,
+                true,
+            ),
+            WatchdogTickDecision::HoldHealthy
+        );
+        assert_eq!(fails, 0);
+
+        // 3. Partial single-origin timeouts (business still reachable on the other origin) for 1..3 rounds
+        //    followed by recovery -> holds and resets without spurious switching.
+        for round in 1..WATCHDOG_DEGRADED_THRESHOLD_ROUNDS {
+            assert_eq!(
+                evaluate_watchdog_active_health_tick(
+                    DualProbeHealth::Degraded {
+                        passed_delay_ms: 74,
+                        failed_source: "Cloudflare",
+                    },
+                    &mut fails,
+                    &mut degraded,
+                    required_failures,
+                    true,
+                ),
+                WatchdogTickDecision::HoldTransient {
+                    count: round,
+                    threshold: WATCHDOG_DEGRADED_THRESHOLD_ROUNDS,
+                }
+            );
+        }
+        assert_eq!(
+            evaluate_watchdog_active_health_tick(
+                DualProbeHealth::FullHealthy(70),
+                &mut fails,
+                &mut degraded,
+                required_failures,
+                true,
+            ),
+            WatchdogTickDecision::HoldHealthy
+        );
+        assert_eq!(degraded, 0);
+
+        // 4. Inside cooldown window, even consecutive total failures hold to prevent ping-pong.
+        let _ = evaluate_watchdog_active_health_tick(
+            DualProbeHealth::TotalFailure,
+            &mut fails,
+            &mut degraded,
+            required_failures,
+            false,
+        );
+        assert_eq!(
+            evaluate_watchdog_active_health_tick(
+                DualProbeHealth::TotalFailure,
+                &mut fails,
+                &mut degraded,
+                required_failures,
+                false,
+            ),
+            WatchdogTickDecision::HoldCooldown
+        );
+    }
+
+    #[test]
+    fn watchdog_switches_to_verified_backup_and_persists_structured_event_on_sustained_outage() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_watchdog_event_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp dir");
+
+        let make_node = |id: &str, name: &str| ProxyNode {
+            id: id.to_string(),
+            name: name.to_string(),
+            region_code: "TW".to_string(),
+            protocol: "vless".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            multiplier: 1.0,
+            enabled: true,
+            ..Default::default()
+        };
+        let nodes = vec![
+            make_node("n-active", "TW-Primary"),
+            make_node("n-old-cool", "JP-RecentlySwitchedOut"),
+            make_node("n-bad-bak", "SG-Backup-Down"),
+            make_node("n-good-bak", "HK-Backup-Healthy"),
+        ];
+        let group = MultiGroup {
+            id: "grp-ai".to_string(),
+            name: "AI主力组".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec![
+                "n-active".into(),
+                "n-old-cool".into(),
+                "n-bad-bak".into(),
+                "n-good-bak".into(),
+            ],
+            active_node_id: Some("n-active".to_string()),
+            switch_mode: SwitchMode::GracefulNewOnly,
+            cooldown_sec: 60,
+            ..Default::default()
+        };
+        let mut snaps = HashMap::new();
+        for (nid, up, lat) in [
+            ("n-active", 12.0, 50.0),
+            ("n-old-cool", 18.0, 45.0),
+            ("n-bad-bak", 15.0, 55.0),
+            ("n-good-bak", 14.0, 60.0),
+        ] {
+            snaps.insert(
+                nid.to_string(),
+                ProbeSnapshot {
+                    node_id: nid.to_string(),
+                    ok: true,
+                    up_mbps: Some(up),
+                    down_mbps: Some(120.0),
+                    latency_ms: Some(lat),
+                    google_clean: Some(true),
+                    keepalive_60s_ok: Some(true),
+                    ..Default::default()
+                },
+            );
+        }
+
+        // 1. Sustained dual-origin outage hits threshold (2/2) with cooldown elapsed -> triggers failover.
+        let mut fails = 0u32;
+        let mut degraded = 0u32;
+        assert_eq!(
+            evaluate_watchdog_active_health_tick(
+                DualProbeHealth::TotalFailure,
+                &mut fails,
+                &mut degraded,
+                2,
+                true,
+            ),
+            WatchdogTickDecision::HoldTransient {
+                count: 1,
+                threshold: 2,
+            }
+        );
+        let trigger = match evaluate_watchdog_active_health_tick(
+            DualProbeHealth::TotalFailure,
+            &mut fails,
+            &mut degraded,
+            2,
+            true,
+        ) {
+            WatchdogTickDecision::Trigger(t) => t,
+            other => panic!("expected Trigger on 2nd failure, got {other:?}"),
+        };
+        assert_eq!(trigger, WatchdogFailoverTrigger::TotalOutage { fail_count: 2 });
+
+        // 2. Recently switched-out old node is shielded from ping-pong candidate ranking.
+        let now = Instant::now();
+        let mut pool = NodeHealthPool::new();
+        pool.record_probe_result("n-active", RuntimeDualHealth::Failed, None, now);
+        let switch_out_cooldowns: HashSet<String> =
+            ["n-old-cool".to_string()].into_iter().collect();
+        let ranked = commands::pick_group_candidates_with_cooldown_and_runtime(
+            &group,
+            &nodes,
+            &snaps,
+            Some("n-active"),
+            &switch_out_cooldowns,
+            Some(&pool),
+            now,
+            4,
+        );
+        assert!(
+            !ranked.contains(&"n-old-cool".to_string()),
+            "recently switched-out node must be excluded during cooldown window: {ranked:?}"
+        );
+        assert_eq!(ranked, vec!["n-bad-bak".to_string(), "n-good-bak".to_string()]);
+
+        // 3. Live probing: n-bad-bak fails, n-good-bak passes 2/2 -> decisively selects n-good-bak.
+        pool.record_probe_result("n-bad-bak", RuntimeDualHealth::Failed, None, now);
+        pool.record_probe_result("n-good-bak", RuntimeDualHealth::FullHealthy, Some(58.0), now);
+        let probed_results = vec![
+            (
+                ("n-bad-bak".to_string(), "SG-Backup-Down".to_string()),
+                DualProbeHealth::TotalFailure,
+            ),
+            (
+                ("n-good-bak".to_string(), "HK-Backup-Healthy".to_string()),
+                DualProbeHealth::FullHealthy(58),
+            ),
+        ];
+        let ((chosen_id, chosen_name), delay_ms, full_healthy) =
+            choose_verified_candidate_from_probes(trigger, &probed_results)
+                .expect("verified backup must be selected");
+        assert_eq!(chosen_id, "n-good-bak");
+        assert_eq!(chosen_name, "HK-Backup-Healthy");
+        assert_eq!(delay_ms, 58);
+        assert!(full_healthy);
+
+        // 4. Construct structured decision event and atomically persist `watchdog-state.json`.
+        let traces = build_watchdog_candidate_traces(
+            &group,
+            &nodes,
+            &snaps,
+            &pool,
+            now,
+            "n-active",
+            &switch_out_cooldowns,
+            &probed_results,
+            Some(&chosen_id),
+        );
+        assert_eq!(traces.len(), 4);
+        assert_eq!(
+            traces
+                .iter()
+                .find(|t| t.node_id == "n-old-cool")
+                .map(|t| t.status.as_str()),
+            Some("skipped_recently_switched_out")
+        );
+        assert_eq!(
+            traces
+                .iter()
+                .find(|t| t.node_id == "n-bad-bak")
+                .map(|t| t.status.as_str()),
+            Some("probed_failed")
+        );
+        assert_eq!(
+            traces
+                .iter()
+                .find(|t| t.node_id == "n-good-bak")
+                .map(|t| t.status.as_str()),
+            Some("selected")
+        );
+
+        let event = WatchdogDecisionEvent {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            group_id: group.id.clone(),
+            group_name: group.name.clone(),
+            trigger_reason: format_trigger_reason(trigger),
+            action: "switch_node".to_string(),
+            from_node_id: Some("n-active".to_string()),
+            from_node_name: Some("TW-Primary".to_string()),
+            to_node_id: Some(chosen_id.clone()),
+            to_node_name: Some(chosen_name.clone()),
+            current_probe_summary: format_dual_probe_summary(DualProbeHealth::TotalFailure),
+            candidates: traces,
+            next_recheck_at: Some((chrono::Utc::now() + chrono::Duration::seconds(60)).to_rfc3339()),
+            keep_existing_connections: true,
+        };
+        let log_line = format_watchdog_decision_log_line(&event);
+        assert!(log_line.contains("AI主力组"));
+        assert!(log_line.contains("TW-Primary -> HK-Backup-Healthy"));
+        assert!(log_line.contains("skipped_recently_switched_out"));
+
+        let mut snapshot = WatchdogStateSnapshot::default();
+        let cooldown_entries = build_watchdog_cooldown_entries(&pool, &nodes, now);
+        assert!(cooldown_entries.iter().any(|c| c.node_id == "n-active"));
+        assert!(cooldown_entries.iter().any(|c| c.node_id == "n-bad-bak"));
+
+        // Persist 22 events to verify atomic disk persistence + 20-event ring cap.
+        for _ in 0..22 {
+            record_watchdog_decision_event_and_persist(
+                &tmp,
+                &mut snapshot,
+                event.clone(),
+                Vec::new(),
+                cooldown_entries.clone(),
+            )
+            .expect("persist watchdog-state.json");
+        }
+        let reloaded =
+            read_watchdog_state_snapshot(&tmp).expect("read persisted watchdog-state.json");
+        assert_eq!(reloaded.recent_events.len(), 20);
+        let last = reloaded.recent_events.last().unwrap();
+        assert_eq!(last.action, "switch_node");
+        assert_eq!(last.from_node_id.as_deref(), Some("n-active"));
+        assert_eq!(last.to_node_id.as_deref(), Some("n-good-bak"));
+        assert!(last.keep_existing_connections);
+        assert!(last.next_recheck_at.is_some());
+        assert_eq!(last.candidates.len(), 4);
+        assert!(!reloaded.cooldown_nodes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn event_core_log_sanitizer_masks_fictional_ips_and_secrets() {
+        let raw = catcloud_core::core_adapter::CoreLogLine {
+            level: "warning".to_string(),
+            payload: "[TCP] 192.168.10.22:54321 --> 203.0.113.88:443 via 198.18.0.9 dns 223.5.5.5 token=super_secret_xyz".to_string(),
+            timestamp: "2026-11-26T04:00:00Z".to_string(),
+        };
+        let sanitized = commands::sanitize_core_log_line(raw);
+        for leaked in [
+            "192.168.10.22",
+            "203.0.113.88",
+            "198.18.0.9",
+            "223.5.5.5",
+            "super_secret_xyz",
+        ] {
+            assert!(
+                !sanitized.payload.contains(leaked),
+                "EVENT_CORE_LOG sanitizer leaked `{leaked}`: {}",
+                sanitized.payload
+            );
+        }
+        assert!(sanitized.payload.contains("192.168.10.*"));
+        assert!(sanitized.payload.contains("203.0.113.*"));
+        assert!(sanitized.payload.contains("198.18.0.*"));
+        assert!(sanitized.payload.contains("223.5.5.*"));
+        assert!(sanitized.payload.contains("token=<REDACTED>"));
     }
 }

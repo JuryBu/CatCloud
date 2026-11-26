@@ -1,5 +1,6 @@
 import { Cpu, Pause } from "lucide-react";
 import { type MouseEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { normalizeUiLanguage, type UiLanguage } from "../i18n";
 import {
   TrafficRingBuffer,
   appStore,
@@ -8,6 +9,36 @@ import {
   useTrafficVersion,
 } from "../store/appStore";
 import { oneOfPref, usePersistedState } from "../utils/uiPrefs";
+
+const MINI_TRAFFIC_LABELS: Record<
+  UiLanguage,
+  { liveTraffic: string; paused: string; conns: (n: number) => string; coreMemory: string }
+> = {
+  "zh-CN": {
+    liveTraffic: "实时流量",
+    paused: "已暂停",
+    conns: (n) => `${n} 个连接`,
+    coreMemory: "内核内存",
+  },
+  en: {
+    liveTraffic: "Live Traffic",
+    paused: "Paused",
+    conns: (n) => `${n} conns`,
+    coreMemory: "Core Mem",
+  },
+  ja: {
+    liveTraffic: "通信速度",
+    paused: "一時停止",
+    conns: (n) => `${n} 接続`,
+    coreMemory: "コアメモリ",
+  },
+  ru: {
+    liveTraffic: "Трафик",
+    paused: "Пауза",
+    conns: (n) => `${n} соед.`,
+    coreMemory: "Память ядра",
+  },
+};
 
 export { TrafficRingBuffer };
 
@@ -306,6 +337,10 @@ export function TrafficSparkline({
   const [isVisible, setIsVisible] = useState<boolean>(() =>
     typeof document === "undefined" ? true : document.visibilityState === "visible"
   );
+  const uiLang = normalizeUiLanguage(
+    useAppSelector((s) => s.config.personalization.ui_language)
+  );
+  const miniLabels = MINI_TRAFFIC_LABELS[uiLang];
   const [windowSec, setWindowSec] = usePersistedState<TimeWindowSec>(
     "home.sparkline.windowSec",
     600,
@@ -543,18 +578,18 @@ export function TrafficSparkline({
         }
       >
         <div className="mb-1.5 flex items-center justify-between text-[11px] text-[var(--muted)]">
-          <span className="font-medium">实时流量</span>
+          <span className="font-medium">{miniLabels.liveTraffic}</span>
           {!sparklineEnabled ? (
             <span className="inline-flex items-center gap-1 text-[10px] text-[var(--amber)]">
               <Pause className="h-2.5 w-2.5" />
-              已暂停
+              {miniLabels.paused}
             </span>
           ) : (
             <span
               className="cc-tabular text-[10px] text-[var(--muted)]"
               title={connSummaryTooltip}
             >
-              {latest.connections} 个连接
+              {miniLabels.conns(latest.connections)}
             </span>
           )}
         </div>
@@ -632,7 +667,7 @@ export function TrafficSparkline({
         <div className="mt-1.5 flex items-center justify-between border-t border-[var(--line)] pt-1.5 text-[11px]">
           <span className="inline-flex items-center gap-1 text-[var(--muted)]">
             <Cpu className="h-3 w-3 text-[var(--green)]" />
-            内核内存
+            {miniLabels.coreMemory}
           </span>
           <span className="cc-mono font-medium text-[var(--green)]">
             {latest.memory_mb.toFixed(1)} MB

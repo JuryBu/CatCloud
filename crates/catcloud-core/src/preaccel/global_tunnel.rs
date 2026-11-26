@@ -116,6 +116,135 @@ pub const STANDALONE_TUNNEL_GOMEMLIMIT: &str = "24MiB";
 /// Dedicated GC target for the lightweight standalone 443 tunnel subprocess.
 pub const STANDALONE_TUNNEL_GOGC: &str = "25";
 
+/// Filename of the persisted standalone global `:443` pre-acceleration runtime metadata snapshot
+/// under `<data_dir>/run/`.
+pub const GLOBAL_PREACCEL_RUNTIME_META_FILENAME: &str = "global-preaccel-runtime.json";
+
+/// Persisted runtime metadata snapshot for the standalone global domestic `:443`
+/// pre-acceleration engine, atomically written to `<data_dir>/run/global-preaccel-runtime.json`
+/// (with Unix `0o600` permissions) for CLI and diagnostic self-recognition.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GlobalPreAccelRuntimeMeta {
+    pub pid: Option<u32>,
+    pub process_start_time_unix: Option<u64>,
+    pub binary_path: Option<String>,
+    pub running: bool,
+    /// Active or suspended mode: `"off" | "windivert" | "local_socks5" | "suspended_for_tun"`.
+    pub mode: String,
+    /// Unified carrier label: `"standalone_windivert" | "standalone_socks5" | "main_core_tun_suspended_standalone" | "main_core_proxy_only" | "off"`.
+    pub effective_carrier: String,
+    pub socks_port: Option<u16>,
+    pub active_relays: Vec<String>,
+    pub updated_at: String,
+}
+
+impl Default for GlobalPreAccelRuntimeMeta {
+    fn default() -> Self {
+        Self {
+            pid: None,
+            process_start_time_unix: None,
+            binary_path: None,
+            running: false,
+            mode: "off".to_string(),
+            effective_carrier: "off".to_string(),
+            socks_port: None,
+            active_relays: Vec::new(),
+            updated_at: String::new(),
+        }
+    }
+}
+
+/// Resolve the canonical runtime metadata file path `<data_dir>/run/global-preaccel-runtime.json`.
+pub fn global_preaccel_runtime_meta_path(data_dir: &Path) -> PathBuf {
+    data_dir
+        .join("run")
+        .join(GLOBAL_PREACCEL_RUNTIME_META_FILENAME)
+}
+
+fn write_restricted_runtime_meta_file(target: &Path, bytes: &[u8]) -> CatResult<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = target
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(GLOBAL_PREACCEL_RUNTIME_META_FILENAME);
+        let tmp = parent.join(format!(
+            ".{file_name}.tmp.{}.{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        if let Err(err) = f.write_all(bytes).and_then(|()| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CatError::Io(err));
+        }
+        drop(f);
+        if let Err(err) = std::fs::rename(&tmp, target) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(CatError::Io(err));
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        AppPaths::atomic_write(target, bytes)
+    }
+}
+
+/// Atomically persist `GlobalPreAccelRuntimeMeta` to `<data_dir>/run/global-preaccel-runtime.json`
+/// (creating with mode `0o600` on Unix).
+pub fn write_global_preaccel_runtime_meta(
+    data_dir: &Path,
+    meta: &GlobalPreAccelRuntimeMeta,
+) -> CatResult<()> {
+    let target = global_preaccel_runtime_meta_path(data_dir);
+    let bytes = serde_json::to_vec_pretty(meta)?;
+    write_restricted_runtime_meta_file(&target, &bytes)
+}
+
+/// Read `<data_dir>/run/global-preaccel-runtime.json` if present and valid JSON.
+/// Also falls back to `<data_dir>/global-preaccel-runtime.json` when the caller passes `run/` directly.
+pub fn read_global_preaccel_runtime_meta(data_dir: &Path) -> Option<GlobalPreAccelRuntimeMeta> {
+    let primary = global_preaccel_runtime_meta_path(data_dir);
+    let candidate = if primary.is_file() {
+        primary
+    } else if data_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("run"))
+    {
+        let direct = data_dir.join(GLOBAL_PREACCEL_RUNTIME_META_FILENAME);
+        if direct.is_file() {
+            direct
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let raw = std::fs::read_to_string(candidate).ok()?;
+    serde_json::from_str::<GlobalPreAccelRuntimeMeta>(&raw).ok()
+}
+
+/// Remove `<data_dir>/run/global-preaccel-runtime.json` cleanly when the tunnel stops or exits.
+pub fn remove_global_preaccel_runtime_meta(data_dir: &Path) {
+    let target = global_preaccel_runtime_meta_path(data_dir);
+    let _ = std::fs::remove_file(target);
+}
+
 /// Well-known non-proxy communication, browser, IDE, office, media, and cloud-drive
 /// executable stems excluded from automatic local proxy listener heuristics.
 ///
@@ -585,6 +714,8 @@ pub fn compile_standalone_preaccel_yaml_with_interface(
 pub struct StandalonePreAccelTunnel {
     child: Option<Child>,
     pid: Option<u32>,
+    process_start_time_unix: Option<u64>,
+    binary_path: PathBuf,
     socks_port: u16,
     work_dir: PathBuf,
     config_path: PathBuf,
@@ -737,6 +868,14 @@ impl StandalonePreAccelTunnel {
         }
 
         let pid = child.id();
+        let process_start_time_unix = pid
+            .and_then(crate::platform::get_process_start_time_unix)
+            .or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs())
+            });
         let deadline = Instant::now() + STANDALONE_TUNNEL_READY_TIMEOUT;
         let target_addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, socks_port);
 
@@ -764,6 +903,8 @@ impl StandalonePreAccelTunnel {
                 return Ok(Self {
                     child: Some(child),
                     pid,
+                    process_start_time_unix,
+                    binary_path: norm_bin,
                     socks_port,
                     work_dir,
                     config_path,
@@ -793,6 +934,14 @@ impl StandalonePreAccelTunnel {
 
     pub fn pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    pub fn process_start_time_unix(&self) -> Option<u64> {
+        self.process_start_time_unix
+    }
+
+    pub fn binary_path(&self) -> &Path {
+        &self.binary_path
     }
 
     pub fn socks_port(&self) -> u16 {
@@ -3371,8 +3520,9 @@ fn normalize_verify_state(raw: &str) -> &'static str {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GlobalPreAccelStatus {
     pub running: bool,
-    /// Active engine mode: `"off"`, `"windivert"` (Windows transparent kernel NAT), or
-    /// `"local_socks5"` (cross-platform standalone 127.0.0.1 :443 dual-active SOCKS5 entry).
+    /// Active engine mode: `"off"`, `"windivert"` (Windows transparent kernel NAT),
+    /// `"local_socks5"` (cross-platform standalone 127.0.0.1 :443 dual-active SOCKS5 entry),
+    /// or `"suspended_for_tun"` (standalone tunnel paused while main-core TUN carries preaccel).
     pub mode: String,
     /// Strictly `true` only when `running && mode == "windivert"`.
     #[serde(default)]
@@ -3512,6 +3662,7 @@ pub struct GlobalPreAccelManager {
     detected_security_products: Mutex<Vec<String>>,
     custom_windivert_dir: Mutex<Option<String>>,
     synced_main_core_pid: Mutex<Option<u32>>,
+    suspended_for_tun_relays: Mutex<Option<Vec<String>>>,
 }
 
 impl GlobalPreAccelManager {
@@ -3528,6 +3679,58 @@ impl GlobalPreAccelManager {
             detected_security_products: Mutex::new(Vec::new()),
             custom_windivert_dir: Mutex::new(None),
             synced_main_core_pid: Mutex::new(None),
+            suspended_for_tun_relays: Mutex::new(None),
+        }
+    }
+
+    fn persist_current_runtime_meta(&self) {
+        let running_meta = {
+            let guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|rt| {
+                let effective_carrier = if rt.mode == "windivert" {
+                    "standalone_windivert"
+                } else {
+                    "standalone_socks5"
+                };
+                GlobalPreAccelRuntimeMeta {
+                    pid: rt.tunnel.pid(),
+                    process_start_time_unix: rt.tunnel.process_start_time_unix(),
+                    binary_path: Some(rt.tunnel.binary_path().to_string_lossy().to_string()),
+                    running: true,
+                    mode: rt.mode.clone(),
+                    effective_carrier: effective_carrier.to_string(),
+                    socks_port: Some(rt.socks_port),
+                    active_relays: rt.active_relays.clone(),
+                    updated_at: chrono::Utc::now().to_rfc3339(),
+                }
+            })
+        };
+
+        if let Some(meta) = running_meta {
+            let _ = write_global_preaccel_runtime_meta(&self.paths.root_data_dir, &meta);
+            return;
+        }
+
+        let suspended_relays = self
+            .suspended_for_tun_relays
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(active_relays) = suspended_relays {
+            let meta = GlobalPreAccelRuntimeMeta {
+                pid: None,
+                process_start_time_unix: None,
+                binary_path: None,
+                running: false,
+                mode: "suspended_for_tun".to_string(),
+                effective_carrier: "main_core_tun_suspended_standalone".to_string(),
+                socks_port: None,
+                active_relays,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let _ = write_global_preaccel_runtime_meta(&self.paths.root_data_dir, &meta);
+        } else {
+            remove_global_preaccel_runtime_meta(&self.paths.root_data_dir);
         }
     }
 
@@ -3630,6 +3833,15 @@ impl GlobalPreAccelManager {
             *dir_guard = cfg.preaccel.windivert_dir.clone();
         }
 
+        // Clear any prior TUN-suspension state before starting a live standalone tunnel.
+        {
+            let mut susp_guard = self
+                .suspended_for_tun_relays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *susp_guard = None;
+        }
+
         // Cleanly stop any previous runtime before starting a fresh instance (hot rebuild:
         // keep the WinDivert kernel service loaded to avoid Win32 error 1072 races).
         let previous = {
@@ -3639,6 +3851,7 @@ impl GlobalPreAccelManager {
         if let Some(prev) = previous {
             prev.stop(false).await;
         }
+        remove_global_preaccel_runtime_meta(&self.paths.root_data_dir);
         self.metrics.reset();
         self.set_last_error(None);
         self.reset_verify_snapshot();
@@ -3854,6 +4067,7 @@ impl GlobalPreAccelManager {
             });
         }
 
+        self.persist_current_runtime_meta();
         Ok(self.status())
     }
 
@@ -4031,6 +4245,7 @@ impl GlobalPreAccelManager {
                                     checked_at_ms: Some(now_epoch_ms()),
                                     security_guidance: None,
                                 });
+                                self.persist_current_runtime_meta();
                             } else {
                                 let wd_ready = locate_windivert_files(
                                     &self.paths,
@@ -4194,6 +4409,7 @@ impl GlobalPreAccelManager {
                                 checked_at_ms: Some(now_epoch_ms()),
                                 security_guidance: None,
                             });
+                            self.persist_current_runtime_meta();
                             return Ok(self.status());
                         }
                         other => {
@@ -4208,6 +4424,7 @@ impl GlobalPreAccelManager {
                                     rt.mode = "local_socks5".to_string();
                                 }
                             }
+                            self.persist_current_runtime_meta();
                             let (msg, guidance) = classify_self_test_failure(
                                 &other,
                                 &detected_products,
@@ -4273,6 +4490,7 @@ impl GlobalPreAccelManager {
                 })
                 .await;
                 self.metrics.clear_active_connections();
+                self.persist_current_runtime_meta();
             }
         }
         Ok(self.status())
@@ -4381,9 +4599,14 @@ impl GlobalPreAccelManager {
         Ok(self.status())
     }
 
-    /// Deterministically stop transparent interception (including stopping the WinDivert kernel
-    /// service cleanly) and terminate the standalone :443 tunnel, clearing stale process cards.
-    pub async fn stop(&self) -> CatResult<GlobalPreAccelStatus> {
+    /// Suspend the standalone `:443` tunnel cleanly while the primary Mihomo core's TUN virtual NIC
+    /// carries domestic pre-acceleration, recording `mode = "suspended_for_tun"` and
+    /// `effective_carrier = "main_core_tun_suspended_standalone"` both in memory and on disk
+    /// (`run/global-preaccel-runtime.json`) instead of conflating with `"off"`.
+    pub async fn suspend_for_tun(
+        &self,
+        active_relays: Vec<String>,
+    ) -> CatResult<GlobalPreAccelStatus> {
         let _op = self.op_lock.lock().await;
         let current = {
             let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
@@ -4395,6 +4618,40 @@ impl GlobalPreAccelManager {
         self.metrics.reset();
         self.reset_verify_snapshot();
         self.set_last_error(None);
+        {
+            let mut susp_guard = self
+                .suspended_for_tun_relays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *susp_guard = Some(active_relays);
+        }
+        self.persist_current_runtime_meta();
+        Ok(self.status())
+    }
+
+    /// Deterministically stop transparent interception (including stopping the WinDivert kernel
+    /// service cleanly) and terminate the standalone :443 tunnel, clearing stale process cards
+    /// and removing `run/global-preaccel-runtime.json`.
+    pub async fn stop(&self) -> CatResult<GlobalPreAccelStatus> {
+        let _op = self.op_lock.lock().await;
+        {
+            let mut susp_guard = self
+                .suspended_for_tun_relays
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *susp_guard = None;
+        }
+        let current = {
+            let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            rt_guard.take()
+        };
+        if let Some(rt) = current {
+            rt.stop(true).await;
+        }
+        self.metrics.reset();
+        self.reset_verify_snapshot();
+        self.set_last_error(None);
+        remove_global_preaccel_runtime_meta(&self.paths.root_data_dir);
         Ok(self.status())
     }
 
@@ -4425,7 +4682,18 @@ impl GlobalPreAccelManager {
                     rt.active_relays.clone(),
                     rt.bound_physical_interface.clone(),
                 ),
-                None => (false, "off".to_string(), None, Vec::new(), None),
+                None => {
+                    let susp = self
+                        .suspended_for_tun_relays
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    if let Some(relays) = susp {
+                        (false, "suspended_for_tun".to_string(), None, relays, None)
+                    } else {
+                        (false, "off".to_string(), None, Vec::new(), None)
+                    }
+                }
             }
         };
 
@@ -4589,6 +4857,7 @@ impl Drop for GlobalPreAccelManager {
                 drop(rt);
             }
         }
+        remove_global_preaccel_runtime_meta(&self.paths.root_data_dir);
     }
 }
 
@@ -4622,6 +4891,7 @@ mod tests {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: false,
         }
     }
 
@@ -4644,6 +4914,7 @@ mod tests {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: false,
         }
     }
 
@@ -4774,7 +5045,8 @@ mod tests {
         assert_eq!(vless["servername"].as_str(), Some(""));
         assert_eq!(vless["skip-cert-verify"].as_bool(), Some(true));
 
-        // Verify fallback group uses domestic 204 probe and lazy: false.
+        // Verify two-layer nested LB + outer fallback group with domestic 204 probe, lazy: false,
+        // DIRECT strictly in outer fallback and NEVER in inner load-balance.
         let groups = doc["proxy-groups"].as_sequence().unwrap();
         let fallback = groups
             .iter()
@@ -4782,6 +5054,32 @@ mod tests {
             .expect("fallback group");
         assert_eq!(fallback["lazy"].as_bool(), Some(false));
         assert!(fallback["url"].as_str().unwrap().contains("hicloud.com"));
+        let fb_proxies: Vec<&str> = fallback["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            fb_proxies,
+            vec![crate::preaccel::schema::PREACCEL_LB_GROUP_NAME, "DIRECT"]
+        );
+
+        let lb = groups
+            .iter()
+            .find(|g| g["name"].as_str() == Some(crate::preaccel::schema::PREACCEL_LB_GROUP_NAME))
+            .expect("inner multi-cloud load-balance group");
+        assert_eq!(lb["type"].as_str(), Some("load-balance"));
+        assert_eq!(lb["strategy"].as_str(), Some("round-robin"));
+        assert_eq!(lb["lazy"].as_bool(), Some(false));
+        let lb_proxies: Vec<&str> = lb["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(lb_proxies, vec!["Relay-TX-443", "Relay-ALI-443"]);
+        assert!(!lb_proxies.contains(&"DIRECT"));
 
         // Verify top-level relay DIRECT anti-loop rules precede MATCH while probe_url / domestic
         // 204 domains are excluded from standalone rules so self-test probes always traverse :443.
@@ -6737,5 +7035,85 @@ mod tests {
         ));
         assert!(!table.may_contain_port(45003));
         assert!(table.is_empty());
+    }
+
+    #[tokio::test]
+    async fn global_preaccel_runtime_meta_suspend_for_tun_stop_and_drop_lifecycle() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-global-meta-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.join("data"), true).unwrap();
+        let data_dir = paths.root_data_dir.clone();
+
+        // 1. Direct write/read/remove roundtrip.
+        let sample_meta = GlobalPreAccelRuntimeMeta {
+            pid: Some(42424),
+            process_start_time_unix: Some(1_764_200_000),
+            binary_path: Some("/opt/catcloud/bin/mihomo".to_string()),
+            running: true,
+            mode: "windivert".to_string(),
+            effective_carrier: "standalone_windivert".to_string(),
+            socks_port: Some(17908),
+            active_relays: vec!["Relay-TX-443".to_string(), "Relay-ALI-443".to_string()],
+            updated_at: "2026-11-27T00:00:00Z".to_string(),
+        };
+        write_global_preaccel_runtime_meta(&data_dir, &sample_meta).expect("write runtime meta");
+        assert_eq!(
+            read_global_preaccel_runtime_meta(&data_dir).as_ref(),
+            Some(&sample_meta)
+        );
+        // Also readable when passing `run/` directory directly.
+        assert_eq!(
+            read_global_preaccel_runtime_meta(&paths.runtime_dir).as_ref(),
+            Some(&sample_meta)
+        );
+        remove_global_preaccel_runtime_meta(&data_dir);
+        assert!(read_global_preaccel_runtime_meta(&data_dir).is_none());
+
+        // 2. Manager `suspend_for_tun` -> persists suspended_for_tun & carrier, updates live status;
+        //    `stop` -> clears suspended state and removes runtime meta file cleanly.
+        {
+            let job_guard = Arc::new(JobGuard::new().unwrap());
+            let manager = GlobalPreAccelManager::new(paths.clone(), job_guard);
+
+            let suspended = manager
+                .suspend_for_tun(vec!["Relay-TX-443".to_string()])
+                .await
+                .expect("suspend_for_tun");
+            assert!(!suspended.running);
+            assert_eq!(suspended.mode, "suspended_for_tun");
+            assert_eq!(suspended.active_relays, vec!["Relay-TX-443".to_string()]);
+
+            let persisted = read_global_preaccel_runtime_meta(&data_dir)
+                .expect("suspended_for_tun meta must be written on disk");
+            assert!(!persisted.running);
+            assert_eq!(persisted.pid, None);
+            assert_eq!(persisted.mode, "suspended_for_tun");
+            assert_eq!(
+                persisted.effective_carrier,
+                "main_core_tun_suspended_standalone"
+            );
+            assert_eq!(persisted.active_relays, vec!["Relay-TX-443".to_string()]);
+
+            let stopped = manager.stop().await.expect("stop clears suspended state");
+            assert!(!stopped.running);
+            assert_eq!(stopped.mode, "off");
+            assert!(stopped.active_relays.is_empty());
+            assert!(read_global_preaccel_runtime_meta(&data_dir).is_none());
+
+            // 3. Re-suspend and drop manager -> Drop must clean up the runtime meta file.
+            let _ = manager
+                .suspend_for_tun(vec!["Relay-ALI-443".to_string()])
+                .await
+                .unwrap();
+            assert!(read_global_preaccel_runtime_meta(&data_dir).is_some());
+        }
+        assert!(
+            read_global_preaccel_runtime_meta(&data_dir).is_none(),
+            "Drop must remove global-preaccel-runtime.json"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

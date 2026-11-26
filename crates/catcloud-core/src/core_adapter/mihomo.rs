@@ -34,37 +34,66 @@ const MAX_STARTUP_STDERR_TAIL_BYTES: usize = 4 * 1024;
 /// Filename under `working_dir` capturing Mihomo stderr without blocking pipes.
 const MIHOMO_STDERR_LOG_FILENAME: &str = "mihomo-stderr.log";
 
-/// Ephemeral runtime controller metadata written under `data/run/` while the managed core
-/// is active so sibling local CLI commands (`catcloud net doctor`, `net connections`,
-/// `config reload`) can authenticate against the running core without persisting ephemeral
-/// secrets into user `config.json`.
+/// Ephemeral runtime controller metadata written under `data/run/runtime-controller.json`
+/// while the managed core is active so sibling local CLI commands (`catcloud net doctor`,
+/// `net connections`, `config reload`) can authenticate against the running core without
+/// persisting ephemeral secrets into user `config.json`, while guarding against OS PID reuse.
 pub const RUNTIME_CONTROLLER_META_FILENAME: &str = "runtime-controller.json";
 
+/// Maximum clock skew (seconds) tolerated when matching a live process's OS creation time
+/// against `RuntimeControllerMeta::process_start_time_unix` to guard against PID reuse.
+const PID_START_TIME_TOLERANCE_SECS: u64 = 2;
+
+/// Canonical pre-acceleration load-balance pool group name (aligned with `config_compiler`).
+const PREACCEL_LB_POOL_GROUP_NAME: &str = "⚖️ 预加速多云均衡";
+
+/// Ephemeral runtime metadata written to `data/run/runtime-controller.json`.
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RuntimeControllerMetadata {
-    host: String,
-    port: u16,
-    secret: String,
-    pid: Option<u32>,
+pub struct RuntimeControllerMeta {
+    pub host: String,
+    pub port: u16,
+    pub secret: String,
+    pub pid: Option<u32>,
     #[serde(default)]
-    mixed_port: Option<u16>,
+    pub mixed_port: Option<u16>,
     #[serde(default)]
-    dns_port: Option<u16>,
-    updated_at: String,
+    pub dns_port: Option<u16>,
+    #[serde(default)]
+    pub process_start_time_unix: Option<u64>,
+    #[serde(default)]
+    pub binary_path: Option<String>,
+    pub updated_at: String,
 }
 
-impl std::fmt::Debug for RuntimeControllerMetadata {
+impl std::fmt::Debug for RuntimeControllerMeta {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeControllerMetadata")
+        f.debug_struct("RuntimeControllerMeta")
             .field("host", &self.host)
             .field("port", &self.port)
             .field("secret", &"<REDACTED>")
             .field("pid", &self.pid)
             .field("mixed_port", &self.mixed_port)
             .field("dns_port", &self.dns_port)
+            .field("process_start_time_unix", &self.process_start_time_unix)
+            .field("binary_path", &self.binary_path)
             .field("updated_at", &self.updated_at)
             .finish()
     }
+}
+
+/// Origin of a [`ResolvedControllerEndpoint`], used to decide whether its secret is trusted
+/// for authenticating privileged live-core state such as `GET /configs` (`tun.enable`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControllerEndpointSource {
+    /// Verified live `data/run/runtime-controller.json` matching an alive core process.
+    LiveRuntimeMeta,
+    /// Explicit non-empty `controller_secret` configured in `config.json`.
+    ExplicitConfigSecret,
+    /// Legacy fallback read from `data/run/runtime.yaml` without live PID verification.
+    RuntimeYamlFallback,
+    /// Default configured host/port with no controller secret.
+    DefaultConfigUnauthenticated,
 }
 
 /// Resolved local controller endpoint and optional active shifted ports discovered from
@@ -76,6 +105,27 @@ pub struct ResolvedControllerEndpoint {
     pub secret: String,
     pub mixed_port: Option<u16>,
     pub dns_port: Option<u16>,
+    pub pid: Option<u32>,
+    pub process_start_time_unix: Option<u64>,
+    pub binary_path: Option<String>,
+    pub source: ControllerEndpointSource,
+}
+
+impl ResolvedControllerEndpoint {
+    /// Returns `true` strictly when this endpoint points to a loopback host with a non-zero port
+    /// and a non-empty secret derived from either a verified live-core `runtime-controller.json`
+    /// (with live PID) or an explicit `cfg.controller_secret`.
+    pub fn is_trusted_loopback_secret_endpoint(&self) -> bool {
+        normalize_loopback_controller_host(&self.host).is_some()
+            && self.port > 0
+            && sanitize_runtime_secret(&self.secret).is_some()
+            && match self.source {
+                ControllerEndpointSource::LiveRuntimeMeta => self.pid.is_some(),
+                ControllerEndpointSource::ExplicitConfigSecret => true,
+                ControllerEndpointSource::RuntimeYamlFallback
+                | ControllerEndpointSource::DefaultConfigUnauthenticated => false,
+            }
+    }
 }
 
 impl std::fmt::Debug for ResolvedControllerEndpoint {
@@ -86,8 +136,79 @@ impl std::fmt::Debug for ResolvedControllerEndpoint {
             .field("secret", &"<REDACTED>")
             .field("mixed_port", &self.mixed_port)
             .field("dns_port", &self.dns_port)
+            .field("pid", &self.pid)
+            .field("process_start_time_unix", &self.process_start_time_unix)
+            .field("binary_path", &self.binary_path)
+            .field("source", &self.source)
             .finish()
     }
+}
+
+/// Free-function helper delegating to [`ResolvedControllerEndpoint::is_trusted_loopback_secret_endpoint`].
+pub fn is_trusted_loopback_secret_endpoint(endpoint: &ResolvedControllerEndpoint) -> bool {
+    endpoint.is_trusted_loopback_secret_endpoint()
+}
+
+/// Live runtime configuration snapshot queried from Mihomo's `GET /configs` REST endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct LiveCoreConfigSnapshot {
+    pub tun_enable: bool,
+    pub mixed_port: u16,
+    pub port: u16,
+    pub socks_port: u16,
+    pub bind_address: String,
+    pub allow_lan: bool,
+    pub mode: String,
+}
+
+/// Shared connection classifier used by both Desktop UI and CLI `net connections` to separate
+/// kernel-internal or domestic pre-acceleration tunnel connections from user application traffic.
+///
+/// Aligns with Mihomo `Inner` connections and CatCloud's pre-acceleration groups:
+/// - `⚡ 国内预加速入口` (`PREACCEL_SELECT_GROUP_NAME`)
+/// - `🔄 预加速自动双活` (`PREACCEL_FALLBACK_GROUP_NAME`)
+/// - `⚖️ 预加速多云均衡` (`PREACCEL_LB_POOL_GROUP_NAME`)
+pub fn is_internal_or_preaccel_connection(
+    conn_type: &str,
+    chains: &[String],
+    host: &str,
+    rule: &str,
+) -> bool {
+    let type_trimmed = conn_type.trim();
+    if type_trimmed.eq_ignore_ascii_case("inner") {
+        return true;
+    }
+
+    let rule_trimmed = rule.trim();
+    if rule_trimmed == "国内提速拨号" || rule_trimmed == "内核内部连接" {
+        return true;
+    }
+
+    let has_preaccel_group = chains.iter().any(|c| {
+        let trimmed = c.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        trimmed == crate::core_adapter::PREACCEL_SELECT_GROUP_NAME
+            || trimmed == crate::core_adapter::PREACCEL_FALLBACK_GROUP_NAME
+            || trimmed == PREACCEL_LB_POOL_GROUP_NAME
+            || trimmed == "catcloud-probe-relay-pool"
+            || trimmed == "catcloud-probe-relay-lb"
+            || trimmed.contains("国内预加速入口")
+            || trimmed.contains("预加速自动双活")
+            || trimmed.contains("预加速多云均衡")
+    });
+    if has_preaccel_group {
+        return true;
+    }
+
+    // Bare kernel-internal sockets without host or routing rule.
+    if host.trim().is_empty() && rule_trimmed.is_empty() {
+        return true;
+    }
+
+    false
 }
 
 fn normalize_loopback_controller_host(host: &str) -> Option<&'static str> {
@@ -124,10 +245,47 @@ fn sanitize_runtime_secret(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn is_runtime_controller_pid_alive(pid: u32) -> bool {
-    if pid == 0 {
+fn verify_runtime_controller_pid_identity(
+    pid: u32,
+    current_pid: u32,
+    expected_start_time_unix: Option<u64>,
+    actual_start_time_unix: Option<u64>,
+    process_identity: Option<(&str, Option<&Path>, &[String])>,
+) -> bool {
+    if pid == 0 || pid == current_pid {
         return false;
     }
+    if let Some(expected_ts) = expected_start_time_unix {
+        let Some(actual_ts) = actual_start_time_unix else {
+            return false;
+        };
+        if actual_ts.abs_diff(expected_ts) > PID_START_TIME_TOLERANCE_SECS {
+            return false;
+        }
+    }
+    let Some((name, exe, cmdline)) = process_identity else {
+        return false;
+    };
+    if name.trim().is_empty() && exe.is_none() && cmdline.is_empty() {
+        return false;
+    }
+    crate::process_guard::is_managed_stale_process(name, exe, cmdline)
+}
+
+fn is_runtime_controller_meta_pid_live(pid: u32, expected_start_time_unix: Option<u64>) -> bool {
+    let current_pid = std::process::id();
+    if pid == 0 || pid == current_pid {
+        return false;
+    }
+    let actual_start_time_unix = if expected_start_time_unix.is_some() {
+        let actual_ts = crate::platform::get_process_start_time_unix(pid);
+        if actual_ts.is_none() {
+            return false;
+        }
+        actual_ts
+    } else {
+        None
+    };
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
     let target = Pid::from_u32(pid);
     let mut system = System::new_with_specifics(RefreshKind::nothing());
@@ -147,15 +305,13 @@ fn is_runtime_controller_pid_alive(pid: u32) -> bool {
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    if name.trim().is_empty() && proc_info.exe().is_none() && cmdline.is_empty() {
-        // Process exists (e.g. elevated Windows process queried from standard integrity)
-        // even if full metadata is restricted.
-        return true;
-    }
-    if pid == std::process::id() {
-        return true;
-    }
-    crate::process_guard::is_managed_stale_process(&name, proc_info.exe(), &cmdline)
+    verify_runtime_controller_pid_identity(
+        pid,
+        current_pid,
+        expected_start_time_unix,
+        actual_start_time_unix,
+        Some((&name, proc_info.exe(), &cmdline)),
+    )
 }
 
 fn write_restricted_atomic_file(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -207,6 +363,7 @@ fn write_runtime_controller_meta(
     pid: Option<u32>,
     mixed_port: Option<u16>,
     dns_port: Option<u16>,
+    binary_path: Option<&Path>,
 ) {
     let Some(norm_host) = normalize_loopback_controller_host(host) else {
         return;
@@ -217,13 +374,19 @@ fn write_runtime_controller_meta(
     if port == 0 {
         return;
     }
-    let meta = RuntimeControllerMetadata {
+    let process_start_time_unix = pid.and_then(crate::platform::get_process_start_time_unix);
+    let binary_path_str = binary_path
+        .map(|p| p.to_string_lossy().trim().to_string())
+        .filter(|s| !s.is_empty());
+    let meta = RuntimeControllerMeta {
         host: norm_host.to_string(),
         port,
         secret: clean_secret,
         pid,
         mixed_port: mixed_port.filter(|&p| p > 0),
         dns_port: dns_port.filter(|&p| p > 0),
+        process_start_time_unix,
+        binary_path: binary_path_str,
         updated_at: Utc::now().to_rfc3339(),
     };
     let Ok(bytes) = serde_json::to_vec(&meta) else {
@@ -233,10 +396,48 @@ fn write_runtime_controller_meta(
     let _ = write_restricted_atomic_file(&target, &bytes);
 }
 
+/// Read and verify live `data/run/runtime-controller.json`, ensuring loopback host, valid secret,
+/// live managed PID, and matching OS process start time (<= 2s tolerance against PID reuse).
+pub fn read_live_runtime_controller_meta(paths: &AppPaths) -> Option<RuntimeControllerMeta> {
+    let meta_path = paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME);
+    let raw = std::fs::read_to_string(&meta_path).ok()?;
+    let mut meta = serde_json::from_str::<RuntimeControllerMeta>(&raw).ok()?;
+    let norm_host = normalize_loopback_controller_host(&meta.host)?;
+    if meta.port == 0 {
+        return None;
+    }
+    let clean_secret = sanitize_runtime_secret(&meta.secret)?;
+    let pid = meta.pid?;
+    if !is_runtime_controller_meta_pid_live(pid, meta.process_start_time_unix) {
+        return None;
+    }
+    meta.host = norm_host.to_string();
+    meta.secret = clean_secret;
+    meta.mixed_port = meta.mixed_port.filter(|&p| p > 0);
+    meta.dns_port = meta.dns_port.filter(|&p| p > 0);
+    Some(meta)
+}
+
 /// Remove ephemeral `data/run/runtime-controller.json` when the core stops or exits.
 pub fn remove_runtime_controller_meta(working_dir: &Path) {
     let target = working_dir.join(RUNTIME_CONTROLLER_META_FILENAME);
     let _ = std::fs::remove_file(target);
+}
+
+fn remove_runtime_controller_meta_if_pid_matches(working_dir: &Path, expected_pid: u32) {
+    if expected_pid == 0 {
+        return;
+    }
+    let target = working_dir.join(RUNTIME_CONTROLLER_META_FILENAME);
+    let Ok(raw) = std::fs::read_to_string(&target) else {
+        return;
+    };
+    let Ok(meta) = serde_json::from_str::<RuntimeControllerMeta>(&raw) else {
+        return;
+    };
+    if meta.pid == Some(expected_pid) {
+        let _ = std::fs::remove_file(&target);
+    }
 }
 
 fn parse_yaml_scalar_string(raw: &str) -> Option<String> {
@@ -331,6 +532,10 @@ fn read_controller_endpoint_from_runtime_yaml(
         secret,
         mixed_port,
         dns_port: None,
+        pid: None,
+        process_start_time_unix: None,
+        binary_path: None,
+        source: ControllerEndpointSource::RuntimeYamlFallback,
     })
 }
 
@@ -339,9 +544,8 @@ fn read_controller_endpoint_from_runtime_yaml(
 ///
 /// Priority:
 /// 1. Live ephemeral `data/run/runtime-controller.json` written by the active managed core
-///    (verified loopback host, control-char-free secret, and PID alive when recorded; also
-///    tracks auto-shifted controller/mixed/DNS ports and live secret even if `config.json`
-///    was just edited prior to `catcloud config reload`).
+///    (verified loopback host, control-char-free secret, live PID, and OS process start time
+///    tolerance <= 2s against PID reuse; also tracks auto-shifted controller/mixed/DNS ports).
 /// 2. Explicit non-empty `cfg.controller_secret` from `config.json` (preserving loopback
 ///    host/port if static or external).
 /// 3. Fallback to top-level `external-controller` / `secret` in `data/run/runtime.yaml`
@@ -355,20 +559,17 @@ pub fn resolve_effective_controller_endpoint_info(
     paths: &AppPaths,
     cfg: &AppConfig,
 ) -> ResolvedControllerEndpoint {
-    let meta_path = paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME);
-    if let Ok(raw) = std::fs::read_to_string(&meta_path)
-        && let Ok(meta) = serde_json::from_str::<RuntimeControllerMetadata>(&raw)
-        && let Some(norm_host) = normalize_loopback_controller_host(&meta.host)
-        && meta.port > 0
-        && let Some(clean_secret) = sanitize_runtime_secret(&meta.secret)
-        && meta.pid.is_none_or(is_runtime_controller_pid_alive)
-    {
+    if let Some(meta) = read_live_runtime_controller_meta(paths) {
         return ResolvedControllerEndpoint {
-            host: norm_host.to_string(),
+            host: meta.host,
             port: meta.port,
-            secret: clean_secret,
-            mixed_port: meta.mixed_port.filter(|&p| p > 0),
-            dns_port: meta.dns_port.filter(|&p| p > 0),
+            secret: meta.secret,
+            mixed_port: meta.mixed_port,
+            dns_port: meta.dns_port,
+            pid: meta.pid,
+            process_start_time_unix: meta.process_start_time_unix,
+            binary_path: meta.binary_path,
+            source: ControllerEndpointSource::LiveRuntimeMeta,
         };
     }
 
@@ -383,6 +584,10 @@ pub fn resolve_effective_controller_endpoint_info(
             secret: explicit,
             mixed_port: None,
             dns_port: None,
+            pid: None,
+            process_start_time_unix: None,
+            binary_path: None,
+            source: ControllerEndpointSource::ExplicitConfigSecret,
         };
     }
 
@@ -397,6 +602,10 @@ pub fn resolve_effective_controller_endpoint_info(
         secret: String::new(),
         mixed_port: None,
         dns_port: None,
+        pid: None,
+        process_start_time_unix: None,
+        binary_path: None,
+        source: ControllerEndpointSource::DefaultConfigUnauthenticated,
     }
 }
 
@@ -473,6 +682,15 @@ impl Default for MihomoRuntimeState {
     }
 }
 
+impl Drop for MihomoRuntimeState {
+    fn drop(&mut self) {
+        let (Some(owned_pid), Some(working_dir)) = (self.pid, self.working_dir.as_deref()) else {
+            return;
+        };
+        remove_runtime_controller_meta_if_pid_matches(working_dir, owned_pid);
+    }
+}
+
 /// Production Mihomo core adapter managing subprocess lifecycle via `JobGuard`
 /// and authenticated `.no_proxy()` REST controller communication.
 #[derive(Debug, Clone)]
@@ -504,13 +722,11 @@ impl MihomoAdapter {
         secret: impl Into<String>,
     ) -> CatResult<Self> {
         let http = build_controller_http_client()?;
-        let state = MihomoRuntimeState {
-            controller_host: host.into(),
-            controller_port: port,
-            controller_secret: secret.into(),
-            external_endpoint_configured: true,
-            ..Default::default()
-        };
+        let mut state = MihomoRuntimeState::default();
+        state.controller_host = host.into();
+        state.controller_port = port;
+        state.controller_secret = secret.into();
+        state.external_endpoint_configured = true;
         Ok(Self {
             job_guard,
             http,
@@ -756,6 +972,7 @@ impl MihomoAdapter {
             pid,
             Some(req.allocated_ports.mixed_port),
             Some(req.allocated_ports.dns_port),
+            Some(&req.binary_path),
         );
 
         // Replay persisted `select` group selections immediately after startup.
@@ -928,13 +1145,14 @@ impl MihomoAdapter {
                             guard.pid,
                             guard.mixed_port,
                             guard.dns_listen_port,
+                            guard.binary_path.clone(),
                         )
                     })
                 } else {
                     None
                 }
             };
-            if let Some((dir, host, port, pid, mixed_port, dns_port)) = meta_refresh {
+            if let Some((dir, host, port, pid, mixed_port, dns_port, bin_path)) = meta_refresh {
                 write_runtime_controller_meta(
                     &dir,
                     &host,
@@ -943,6 +1161,7 @@ impl MihomoAdapter {
                     pid,
                     Some(mixed_port),
                     Some(dns_port),
+                    bin_path.as_deref(),
                 );
             }
         }
@@ -1221,6 +1440,42 @@ impl MihomoAdapter {
 
         let payload: VersionResponse = resp.json().await?;
         Ok(payload.version)
+    }
+
+    /// Query the running core live runtime configuration via `GET /configs` (including live
+    /// `tun.enable`, listening ports, `bind-address`, `allow-lan`, and `mode`).
+    pub async fn fetch_configs(&self) -> CatResult<LiveCoreConfigSnapshot> {
+        let (base_url, secret) = self.controller_endpoint().await;
+        let url = format!("{base_url}/configs");
+        let resp = self.http.get(&url).bearer_auth(&secret).send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            if matches!(status.as_u16(), 401 | 403) {
+                return Err(CatError::Core(format!(
+                    "GET /configs failed with HTTP {}: Unauthorized",
+                    status.as_u16()
+                )));
+            }
+            let body = resp.text().await.unwrap_or_default();
+            let capped: String = body.trim().chars().take(512).collect();
+            return Err(CatError::Core(format!(
+                "GET /configs failed with HTTP {}: {}",
+                status.as_u16(),
+                capped
+            )));
+        }
+
+        let raw: RawConfigsResponse = resp.json().await?;
+        Ok(LiveCoreConfigSnapshot {
+            tun_enable: raw.tun.map(|t| t.enable).unwrap_or(false),
+            mixed_port: raw.mixed_port,
+            port: raw.port,
+            socks_port: raw.socks_port,
+            bind_address: raw.bind_address,
+            allow_lan: raw.allow_lan,
+            mode: raw.mode,
+        })
     }
 
     async fn controller_endpoint(&self) -> (String, String) {
@@ -1571,6 +1826,28 @@ struct VersionResponse {
     version: String,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawTunConfig {
+    enable: bool,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawConfigsResponse {
+    #[serde(rename = "mixed-port")]
+    mixed_port: u16,
+    port: u16,
+    #[serde(rename = "socks-port")]
+    socks_port: u16,
+    #[serde(rename = "bind-address")]
+    bind_address: String,
+    #[serde(rename = "allow-lan")]
+    allow_lan: bool,
+    mode: String,
+    tun: Option<RawTunConfig>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1913,6 +2190,36 @@ mod tests {
     }
 
     #[test]
+    fn catcloud_mihomo_sleep_helper() {
+        if std::env::var_os("CATCLOUD_TEST_SLEEP_HELPER").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    struct KillChildOnDrop(std::process::Child);
+
+    impl Drop for KillChildOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn spawn_managed_test_helper_child() -> KillChildOnDrop {
+        let exe = std::env::current_exe().expect("resolve test executable");
+        let child = std::process::Command::new(exe)
+            .env("CATCLOUD_TEST_SLEEP_HELPER", "1")
+            .arg("catcloud_mihomo_sleep_helper")
+            .arg("--test-threads=1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn managed test helper process");
+        KillChildOnDrop(child)
+    }
+
+    #[test]
     fn resolve_effective_controller_endpoint_prefers_live_meta_then_explicit_then_runtime_yaml() {
         let root = std::env::temp_dir().join(format!(
             "catcloud-ctrl-meta-test-{}",
@@ -1946,16 +2253,21 @@ mod tests {
             ("127.0.0.1".to_string(), 29090, "explicit_secret_789".to_string())
         );
 
-        // 4. Live runtime-controller.json (current alive PID) takes highest priority,
-        //    preserving shifted ports and live secret even when config.json was just edited.
+        // 4. Live runtime-controller.json (external alive managed PID) takes highest priority,
+        //    preserving shifted ports, binary_path, process_start_time_unix, and live secret
+        //    even when config.json was just edited.
+        let helper = spawn_managed_test_helper_child();
+        let helper_pid = helper.0.id();
+        let fake_bin = root.join("mihomo.exe");
         write_runtime_controller_meta(
             &paths.runtime_dir,
             "127.0.0.1",
             29092,
             "meta_secret_456",
-            Some(std::process::id()),
+            Some(helper_pid),
             Some(27892),
             Some(21054),
+            Some(&fake_bin),
         );
         let live = resolve_effective_controller_endpoint_info(&paths, &cfg);
         assert_eq!(live.host, "127.0.0.1");
@@ -1963,8 +2275,44 @@ mod tests {
         assert_eq!(live.secret, "meta_secret_456");
         assert_eq!(live.mixed_port, Some(27892));
         assert_eq!(live.dns_port, Some(21054));
+        assert_eq!(live.pid, Some(helper_pid));
+        assert_eq!(live.source, ControllerEndpointSource::LiveRuntimeMeta);
+        assert!(live.is_trusted_loopback_secret_endpoint());
+        assert!(is_trusted_loopback_secret_endpoint(&live));
+        assert_eq!(
+            live.binary_path.as_deref(),
+            Some(fake_bin.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            live.process_start_time_unix,
+            crate::platform::get_process_start_time_unix(helper_pid)
+        );
         // Redacted Debug output must never leak plaintext secret.
         assert!(!format!("{live:?}").contains("meta_secret_456"));
+
+        // 4b. Mismatched process_start_time_unix (PID reuse) must be rejected as stale.
+        let reused_meta = RuntimeControllerMeta {
+            host: "127.0.0.1".to_string(),
+            port: 29098,
+            secret: "reused_pid_secret".to_string(),
+            pid: Some(helper_pid),
+            mixed_port: Some(27898),
+            dns_port: None,
+            process_start_time_unix: Some(1_000_000_000),
+            binary_path: Some(fake_bin.to_string_lossy().into_owned()),
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        std::fs::write(
+            paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME),
+            serde_json::to_vec(&reused_meta).unwrap(),
+        )
+        .unwrap();
+        let after_reuse = resolve_effective_controller_endpoint_info(&paths, &cfg);
+        assert_eq!(after_reuse.source, ControllerEndpointSource::ExplicitConfigSecret);
+        assert_eq!(after_reuse.secret, "explicit_secret_789");
+        assert!(after_reuse.is_trusted_loopback_secret_endpoint());
+
+        drop(helper);
 
         // 5. Dead/non-existent PID in runtime-controller.json is ignored as stale.
         write_runtime_controller_meta(
@@ -1975,6 +2323,7 @@ mod tests {
             Some(u32::MAX - 3),
             Some(27899),
             None,
+            None,
         );
         assert_eq!(
             resolve_effective_controller_endpoint(&paths, &cfg),
@@ -1982,15 +2331,176 @@ mod tests {
         );
 
         // 6. Removing runtime-controller.json falls back cleanly to runtime.yaml when explicit is None.
+        //    RuntimeYamlFallback endpoints are NOT considered trusted live-PID endpoints.
         cfg.controller_secret = None;
         remove_runtime_controller_meta(&paths.runtime_dir);
         assert!(!paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME).exists());
-        assert_eq!(
-            resolve_effective_controller_endpoint(&paths, &cfg),
-            ("::1".to_string(), 29091, "yaml_sec\"ret_123".to_string())
-        );
+        let yaml_ep = resolve_effective_controller_endpoint_info(&paths, &cfg);
+        assert_eq!(yaml_ep.host, "::1");
+        assert_eq!(yaml_ep.port, 29091);
+        assert_eq!(yaml_ep.secret, "yaml_sec\"ret_123");
+        assert_eq!(yaml_ep.source, ControllerEndpointSource::RuntimeYamlFallback);
+        assert!(!yaml_ep.is_trusted_loopback_secret_endpoint());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn runtime_controller_meta_pid_verification_is_strictly_fail_closed() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-ctrl-failclosed-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let paths = AppPaths::from_data_dir(root.clone(), true).unwrap();
+
+        // 1. `meta.pid == None` must be rejected (never trusted as LiveRuntimeMeta).
+        write_runtime_controller_meta(
+            &paths.runtime_dir,
+            "127.0.0.1",
+            29100,
+            "no_pid_secret",
+            None,
+            Some(27900),
+            None,
+            None,
+        );
+        assert!(read_live_runtime_controller_meta(&paths).is_none());
+
+        // 2. Current process PID must never be mistaken for the managed Mihomo core.
+        write_runtime_controller_meta(
+            &paths.runtime_dir,
+            "127.0.0.1",
+            29101,
+            "self_pid_secret",
+            Some(std::process::id()),
+            Some(27901),
+            None,
+            None,
+        );
+        assert!(!is_runtime_controller_meta_pid_live(std::process::id(), None));
+        assert!(read_live_runtime_controller_meta(&paths).is_none());
+
+        // 3. Pure identity helper fail-closed boundaries:
+        let mihomo_cmd = vec!["mihomo".to_string(), "-f".to_string(), "runtime.yaml".to_string()];
+        // 3a. expected_start_time_unix = Some(_), actual_start_time_unix = None -> false.
+        assert!(!verify_runtime_controller_pid_identity(
+            4242,
+            1000,
+            Some(1_764_200_000),
+            None,
+            Some(("mihomo.exe", None, &mihomo_cmd)),
+        ));
+        // 3b. Missing sysinfo process record -> false.
+        assert!(!verify_runtime_controller_pid_identity(
+            4242,
+            1000,
+            Some(1_764_200_000),
+            Some(1_764_200_000),
+            None,
+        ));
+        // 3c. Restricted/empty process metadata (name="", exe=None, cmdline=[]) -> false.
+        assert!(!verify_runtime_controller_pid_identity(
+            4242,
+            1000,
+            Some(1_764_200_000),
+            Some(1_764_200_000),
+            Some(("", None, &[])),
+        ));
+        // 3d. Self PID or PID 0 -> false.
+        assert!(!verify_runtime_controller_pid_identity(
+            1000,
+            1000,
+            Some(1_764_200_000),
+            Some(1_764_200_000),
+            Some(("mihomo.exe", None, &mihomo_cmd)),
+        ));
+        assert!(!verify_runtime_controller_pid_identity(
+            0,
+            1000,
+            None,
+            None,
+            Some(("mihomo.exe", None, &mihomo_cmd)),
+        ));
+        // 3e. Matching external managed process with within-tolerance start time -> true.
+        assert!(verify_runtime_controller_pid_identity(
+            4242,
+            1000,
+            Some(1_764_200_000),
+            Some(1_764_200_002),
+            Some(("mihomo.exe", None, &mihomo_cmd)),
+        ));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mihomo_runtime_state_drop_cleans_only_matching_pid_meta_without_panic() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-mihomo-drop-meta-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta_path = dir.join(RUNTIME_CONTROLLER_META_FILENAME);
+
+        // 1. Matching PID is removed on Drop.
+        write_runtime_controller_meta(
+            &dir,
+            "127.0.0.1",
+            29110,
+            "drop_secret_1",
+            Some(54321),
+            None,
+            None,
+            None,
+        );
+        assert!(meta_path.is_file());
+        {
+            let mut state = MihomoRuntimeState::default();
+            state.pid = Some(54321);
+            state.working_dir = Some(dir.clone());
+            drop(state);
+        }
+        assert!(!meta_path.exists());
+
+        // 2. Non-matching PID belongs to another process and must NOT be deleted on Drop.
+        write_runtime_controller_meta(
+            &dir,
+            "127.0.0.1",
+            29111,
+            "drop_secret_2",
+            Some(65432),
+            None,
+            None,
+            None,
+        );
+        assert!(meta_path.is_file());
+        {
+            let mut state = MihomoRuntimeState::default();
+            state.pid = Some(54321);
+            state.working_dir = Some(dir.clone());
+            drop(state);
+        }
+        assert!(meta_path.is_file());
+
+        // 3. Cleared PID (e.g. after normal `stop()`) must NOT touch the file on Drop.
+        {
+            let mut state = MihomoRuntimeState::default();
+            state.pid = None;
+            state.working_dir = Some(dir.clone());
+            drop(state);
+        }
+        assert!(meta_path.is_file());
+
+        // 4. Missing file on Drop must not panic.
+        let _ = std::fs::remove_file(&meta_path);
+        {
+            let mut state = MihomoRuntimeState::default();
+            state.pid = Some(54321);
+            state.working_dir = Some(dir.clone());
+            drop(state);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2014,6 +2524,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(!paths.runtime_dir.join(RUNTIME_CONTROLLER_META_FILENAME).exists());
         std::fs::write(
@@ -2026,11 +2537,118 @@ mod tests {
             "external-controller: 0.0.0.0:29090\nsecret: evil_yaml\n",
         )
         .unwrap();
+        let fallback_ep = resolve_effective_controller_endpoint_info(&paths, &cfg);
         assert_eq!(
-            resolve_effective_controller_endpoint(&paths, &cfg),
+            (fallback_ep.host.clone(), fallback_ep.port, fallback_ep.secret.clone()),
             ("127.0.0.1".to_string(), 29090, String::new())
         );
+        assert!(!fallback_ep.is_trusted_loopback_secret_endpoint());
+
+        // Non-loopback explicit secret must never be considered a trusted loopback endpoint.
+        cfg.controller_host = "0.0.0.0".to_string();
+        cfg.controller_secret = Some("explicit_non_loopback".to_string());
+        let non_loopback_ep = resolve_effective_controller_endpoint_info(&paths, &cfg);
+        assert!(!non_loopback_ep.is_trusted_loopback_secret_endpoint());
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn fetch_configs_parses_live_tun_and_ports_with_bearer_auth() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let secret = generate_controller_secret();
+        let expected_auth = format!("Bearer {secret}");
+
+        let server = tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut raw_bytes = Vec::with_capacity(1024);
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                raw_bytes.extend_from_slice(&chunk[..n]);
+                if raw_bytes.windows(4).any(|w| w == b"\r\n\r\n") || raw_bytes.len() >= 8192 {
+                    break;
+                }
+            }
+            let raw = String::from_utf8_lossy(&raw_bytes).to_string();
+            let first_line = raw.lines().next().unwrap_or_default();
+            let (status_line, body) = if !raw.contains(&expected_auth) {
+                ("HTTP/1.1 401 Unauthorized", "")
+            } else if first_line.starts_with("GET /configs ") {
+                (
+                    "HTTP/1.1 200 OK",
+                    r#"{"port":7892,"socks-port":7891,"mixed-port":7890,"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","tun":{"enable":true,"stack":"mixed"}}"#,
+                )
+            } else {
+                ("HTTP/1.1 404 Not Found", "")
+            };
+            let response = format!(
+                "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter =
+            MihomoAdapter::with_controller_endpoint(guard, "127.0.0.1", port, secret).unwrap();
+        let snapshot = adapter
+            .fetch_configs()
+            .await
+            .expect("GET /configs must succeed");
+        assert!(snapshot.tun_enable);
+        assert_eq!(snapshot.mixed_port, 7890);
+        assert_eq!(snapshot.port, 7892);
+        assert_eq!(snapshot.socks_port, 7891);
+        assert_eq!(snapshot.bind_address, "127.0.0.1");
+        assert!(!snapshot.allow_lan);
+        assert_eq!(snapshot.mode, "rule");
+
+        server.abort();
+    }
+
+    #[test]
+    fn is_internal_or_preaccel_connection_matches_inner_and_preaccel_groups_only() {
+        assert!(is_internal_or_preaccel_connection(
+            "Inner",
+            &["DIRECT".to_string()],
+            "223.5.5.5",
+            ""
+        ));
+        assert!(is_internal_or_preaccel_connection(
+            "inner",
+            &["CN-Relay".to_string(), "⚡ 国内预加速入口".to_string()],
+            "203.0.113.10",
+            ""
+        ));
+        assert!(is_internal_or_preaccel_connection(
+            "TCP",
+            &[
+                "CN-Relay-A".to_string(),
+                "⚖️ 预加速多云均衡".to_string(),
+                "🔄 预加速自动双活".to_string(),
+                "⚡ 国内预加速入口".to_string(),
+            ],
+            "203.0.113.10",
+            ""
+        ));
+        assert!(!is_internal_or_preaccel_connection(
+            "HTTP",
+            &["JP-01".to_string(), "AI-Group".to_string()],
+            "api.openai.com",
+            "DOMAIN-SUFFIX"
+        ));
+        assert!(!is_internal_or_preaccel_connection(
+            "TUN",
+            &["DIRECT".to_string()],
+            "github.com",
+            "MATCH"
+        ));
     }
 }

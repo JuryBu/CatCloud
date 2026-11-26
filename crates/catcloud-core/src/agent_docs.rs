@@ -115,7 +115,7 @@ fn lang_lock_line(lang: &str) -> &'static str {
         "en" => "> [LANGUAGE LOCK] Reply strictly in English throughout this conversation and use CatCloud's exact UI page/button names.",
         "ja" => "> 【言語固定】以降の回答はすべて自然な日本語で行い、CatCloud の日本語 UI 名称を正確に使ってください。",
         "ru" => "> [ЯЗЫК ОТВЕТА] Отвечайте строго на русском языке и используйте точные названия разделов интерфейса CatCloud.",
-        _ => "> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。",
+        _ => "> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。",
     }
 }
 
@@ -123,11 +123,15 @@ fn lang_lock_line(lang: &str) -> &'static str {
 // Authoritative zh-CN Manuals (8 Chapters)
 // ============================================================================
 
-const ZH_DOC_00_TROUBLESHOOTING: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_00_TROUBLESHOOTING: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 00 · 通用网络疑难杂症 6 层排障总纲（含 GitHub Issue 反馈模板）
 
 > 还没翻墙也能求助：把脱敏诊断直接贴给 **DeepSeek（deepseek.com）、豆包（doubao.com）、通义千问（tongyi.aliyun.com）、Kimi（kimi.moonshot.cn）** 等国内直连网页 AI，或交给本机 AI 助手排查。
+
+> **定位本机 `catcloud.exe`（安装版默认不在 PATH）**：
+> - PowerShell：`$CATCLOUD = @("$env:LOCALAPPDATA\CatCloud\resources\cli\catcloud.exe", ".\cli\catcloud.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1`
+> - Bash：`CATCLOUD=$(command -v catcloud || ([ -x "./cli/catcloud.exe" ] && echo "./cli/catcloud.exe") || echo "$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe")`
 
 ## 一、6 层自底向上排障法（按顺序定位，不瞎猜）
 
@@ -170,14 +174,16 @@ catcloud net doctor --json
 catcloud net connections --json
 catcloud net match api.openai.com --json
 catcloud logs tail --lines 80 --level warning --json
+catcloud logs tail --since 30m --level warning --json
+catcloud logs tail --since "2026-11-26 03:40" --until "2026-11-26 03:50" --json
 catcloud config diag --json
 ```
 
-> 默认只读命令会自动掩码密码、Token、UUID、个人目录与公私网 IP 末段；切勿把明文密码或订阅原链接发到公开讨论区。
+> 默认只读命令会自动掩码密码、Token、UUID、个人目录与公私网 IP 末段；`net doctor` 与 `config diag` 同时内置加密 DNS 证书校验诊断（绝不放宽 TLS 校验）；切勿把明文密码或订阅原链接发到公开讨论区。
 
 ## 三、排查仍未解决？向 GitHub 仓库 `JuryBu/CatCloud` 一键反馈 Issue
 
-1. **软件内一键反馈**：点击「AI 助手」、「运行日志」顶部工具条或「设置 → 关于与更新」中的**「反馈问题到 GitHub」**按钮，软件会自动把脱敏后的环境与关键异常摘要复制到剪贴板，并打开 `https://github.com/JuryBu/CatCloud/issues/new`。
+1. **软件内一键反馈**：点击「AI 全权代管」、「运行日志」顶部工具条或「设置 → 关于与更新」中的**「反馈问题到 GitHub」**按钮，软件会自动把脱敏后的环境与关键异常摘要复制到剪贴板，并打开 `https://github.com/JuryBu/CatCloud/issues/new`。
 2. **手动提交脱敏 Issue 模板**（粘贴剪贴板摘要即可，严禁附带任何密码、订阅链接或真实中转 IP）：
 
 ```markdown
@@ -197,7 +203,7 @@ catcloud config diag --json
 ```
 "###;
 
-const ZH_DOC_01_ONBOARDING: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_01_ONBOARDING: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 01 · 猫猫云梯（CatCloud）新手上手总纲（给 AI 导师）
 
@@ -213,7 +219,7 @@ const ZH_DOC_01_ONBOARDING: &str = r###"> 【语言锁定】请全程使用简�
 
 1. **猫猫云梯本身不内置、不售卖节点**：软件负责把你的多条线路管得更快更稳，你需要先准备至少一份「油」（服务商提供的订阅链接、朋友给的 `.zip` 分享包 / 节点文本，或电脑里已有代理软件的节点）。
 2. **去哪加油**：点击左侧「节点与测速 → 订阅与导入」，任选「粘贴订阅链接」「导入分享包 / 粘贴配置 / 一键搬家已有软件」或「`1→2→3` 实时捕捉运行中的软件」。
-3. **卡住随时求助**：点击左侧「AI 助手」一键复制当前进度发给 DeepSeek / 豆包等国内直连 AI，或直接让本机 AI 助手代办。
+3. **卡住随时求助**：点击左侧「AI 全权代管」一键复制当前进度发给 DeepSeek / 豆包等国内直连 AI，或直接让本机 AI 助手代办。
 
 ---
 
@@ -241,7 +247,7 @@ const ZH_DOC_01_ONBOARDING: &str = r###"> 【语言锁定】请全程使用简�
 ### 5. 国内提速（页面：`国内提速`）
 - 校园网或宽带遇到「下载很快、上传被限到 2～4 Mbps、给 AI 传图极慢」时开启，通过纯 IP 443 加密中转突破限速，原生 443 节点自动跳过不绕路；还支持关闭主代理时开启**全局提速**给其他代理软件提速。日常上传本来就快则保持关闭即可。
 
-### 6. 日常开关、朋友间 `.zip` 分享包与省内存（页面：`总览`、`运行日志`、`AI 助手`、`设置`）
+### 6. 日常开关、朋友间 `.zip` 分享包与省内存（页面：`总览`、`运行日志`、`AI 全权代管`、`设置`）
 - **系统代理 vs 虚拟网卡（TUN 模式）**：日常浏览器开「系统代理」免管理员权限最省心；终端、开发工具或游戏不通时再在「总览」开启「虚拟网卡（TUN 模式）」。
 - **朋友间 `.zip` 分享包**：在「节点与测速」或「国内提速」可勾选想分享的节点或中转一键打包 `.zip`，发给朋友直接一键导入（自动剥离原订阅链接与本机隐私）。
 - **悬浮小窗与关窗省内存**：在「总览」可开悬浮小窗盯网速；平时直接点右上角关窗，软件会缩进系统托盘释放界面内存（后台常驻约 70 MB 内），代理照常稳定运行。
@@ -257,7 +263,7 @@ const ZH_DOC_01_ONBOARDING: &str = r###"> 【语言锁定】请全程使用简�
 5. **状态 5：基础已全通（进阶按需）** → 先恭喜用户基础已全通！随后按兴趣轻推 1 项进阶玩法：自定义智能多选组公式、在「分流与连接」微调规则、打包 `.zip` 分享给朋友，或直接关窗进托盘省内存。
 "###;
 
-const ZH_DOC_02_PREACCEL: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_02_PREACCEL: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 02 · 国内提速从 0 到 1 实战手册（省事路线 + 自建一键脚本 + 全局提速）
 
@@ -461,12 +467,17 @@ echo "${MMRELAY_URI}"
      catcloud preaccel test --speed --json
      catcloud preaccel test --speed --node-id <id> --json
      catcloud preaccel global-status --json
+     catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json
      catcloud config reload --json
      ```
-2. **全局提速（独立加速其他代理软件或终端工具）**：
+2. **多云物理机调度与密钥轮换回收**：
+   - 接入 2 台及以上不同物理云时，默认 `--dispatch-strategy auto`（或 `load_balance`）自动按物理机去重做两层嵌套负载均衡（外层 `fallback` 兜底），同机多协议互不抢网卡；也可用 `--dispatch-strategy fallback` 切回纯单线主备，或 `--lb-strategy consistent_hashing`。
+   - 内测/朋友分享后需收回访问权时，使用仓库内置脱敏脚本一键安全轮换远端密钥（默认 SSH stdin 传密、自动生成回滚脚本并输出新 `mmrelay://v1/...`，先加 `--dry-run` 离线验证）：
+     `node scripts/relay/rotate_relay_secrets.mjs --host <IP> --user root --key <KEY_PATH> --config /etc/catcloud-relay/config.json --service catcloud-relay --dry-run`
+3. **全局提速（独立加速其他代理软件或终端工具）**：
    - 即使关闭猫猫云梯主代理，只要开启「国内提速」总开关，Windows 下可按需经签名 WinDivert 驱动透明加速其他代理核心或 `ssh`/`scp`（自动跳过纯国内 80 端口与普通通讯软件，避免误拦截）；若被安全软件拦截会自动优雅降级为本地 `SOCKS5` 入口防断网。
    - 在 macOS / Linux 或非管理员权限下，自动提供独立本地 `SOCKS5` 入口供其他工具填写前置代理。
-3. **一键安全回退**：
+4. **一键安全回退**：
    - 在「国内提速」关闭总开关，或执行：
      `catcloud preaccel bind --enabled false --json && catcloud config reload --json`
 
@@ -482,11 +493,11 @@ echo "${MMRELAY_URI}"
    - 若用户宽带不屏蔽国内 UDP 443，可在同一台云服务器的 `UDP 443` 并行部署 `Hysteria2`（与 TCP 443 互不冲突），彻底消除 TCP-over-TCP 队头阻塞。
 3. **搭配轻加密非 443 海外节点，避开双层 TLS**：
    - 外层国内 443 已提供完整 TLS 加密，内层优先搭配 `Shadowsocks` 等轻加密节点（单层 TLS 吞吐显著高于双层 TLS 嵌套且不易触发分片卡死）；原生 443 高速节点保持「自动跳过原生 443」直连。
-4. **双云中转坚持「主备秒切（`fallback`）」，勿盲目开启双云轮询**：
-   - 将实测上下行高、丢包低的中转排在首位作主力，另一台仅作故障秒切备援，避免丢包偏高的备机拖垮整体并发体验。
+4. **按云机数量选调度模式**：
+   - 2 台及以上独立健康物理云用默认 `auto`/`load_balance` 聚合带宽（同机多协议自动去重，外层 `fallback` 保兜底）；若备机质量显著弱于主机，切 `--dispatch-strategy fallback` 保持主备秒切。
 "###;
 
-const ZH_DOC_03_MULTIGROUP: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_03_MULTIGROUP: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 03 · 智能多选组与安全评分公式手册
 
@@ -517,18 +528,25 @@ const ZH_DOC_03_MULTIGROUP: &str = r###"> 【语言锁定】请全程使用简�
 # 查看全部多选组与当前选中节点
 catcloud group list --json
 
-# 创建或更新智能多选组
+# 创建或局部更新智能多选组（已有组未传字段全部安全保留）
 catcloud group create --id grp-ai --name "AI 稳定组" --mode sticky_best --fallback cross_pool_escalate --switch-mode force_close_old --json
 
-# 试算候选得分排行与仲裁决策（只读不改现役配置）
+# 专用成员维护（安全增删/替换成员，零触碰策略与分流规则）
+catcloud group members --id grp-ai add --nodes node_1,node_2 --json
+catcloud group members --id grp-ai remove --nodes node_2 --json
+catcloud group members --id grp-ai set --nodes node_1,node_3 --json
+
+# 试算候选得分排行与仲裁决策（离线只读试算 + 附带守护快照）
 catcloud group eval grp-ai --json
 
 # 切换到指定节点或自动轮换下一最佳候选
 catcloud group switch grp-ai --json
 catcloud group switch grp-ai --node <node_id> --json
 
-# 更新评分公式、兜底与硬门禁
-catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)" --fallback degrade_best_warn --hard-gate "google_clean == 1" --json
+# 更新评分公式、兜底、硬门禁与分流规则
+catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)" --fallback degrade_best_warn --hard-gate "google_clean == 1" --add-match-rule "DOMAIN-SUFFIX,openai.com" --json
+catcloud group policy grp-ai --match-rules "DOMAIN-SUFFIX,openai.com;DOMAIN-SUFFIX,claude.ai" --json
+catcloud group policy grp-ai --clear-match-rules --json
 ```
 
 ## 四、排障与回退
@@ -536,7 +554,7 @@ catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.
 - 若切点后旧对话仍卡死：将该组切换策略设为 `force_close_old` 以主动踢断旧 HTTP/2 长连接。
 "###;
 
-const ZH_DOC_04_NODES_PROBES: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_04_NODES_PROBES: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 04 · 节点管理、订阅导入、实时捕捉与三档零干扰测速手册
 
@@ -592,7 +610,7 @@ catcloud probe remove --id custom_api --json
 4. **遇到双层加密闭源客户端时的兜底路径**：若原客户端全程内存/本地双层加密且未暴露明文配置或标准控制口，可先借原软件保持联网，直接打开对应服务商官网用户中心复制通用订阅链接，再粘贴到猫猫云梯「节点与测速 → 订阅与导入」导入。
 "###;
 
-const ZH_DOC_05_ROUTING_CONNS: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_05_ROUTING_CONNS: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 05 · 分流规则、QUIC 策略与实时连接排障手册
 
@@ -624,7 +642,7 @@ catcloud net match qq.com --json
 ```
 "###;
 
-const ZH_DOC_06_NETWORK_LIFECYCLE: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_06_NETWORK_LIFECYCLE: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 06 · 网络设置、热加载、无窗省内存与安全更新手册
 
@@ -666,7 +684,7 @@ catcloud docs export --lang zh-CN --sync-dir <dir> --json
 ```
 "###;
 
-const ZH_DOC_07_SHARE_BUNDLE: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 助手 / 设置）。
+const ZH_DOC_07_SHARE_BUNDLE: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
 
 # 07 · 朋友间可勾选 `.zip` 分享包使用与安全红线手册
 
@@ -712,6 +730,10 @@ const EN_DOC_00_TROUBLESHOOTING: &str = r###"> [LANGUAGE LOCK] Reply strictly in
 
 > Need AI help before proxy access works? Paste your sanitized diagnostic summary into directly reachable Web AIs first (**DeepSeek, Doubao, Qwen, Kimi**), or use ChatGPT / Claude / Gemini once online, or ask a local CLI Agent.
 
+> **Locate local `catcloud.exe` (installed builds are not on `PATH` by default)**:
+> - PowerShell: `$CATCLOUD = @("$env:LOCALAPPDATA\CatCloud\resources\cli\catcloud.exe", ".\cli\catcloud.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1`
+> - Bash: `CATCLOUD=$(command -v catcloud || ([ -x "./cli/catcloud.exe" ] && echo "./cli/catcloud.exe") || echo "$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe")`
+
 ## 1. 6-Layer Bottom-Up Diagnostic Order
 1. **Layer 1 — Physical Network & Captive Portal**: Confirm direct domestic sites load with proxy off. On campus/hotel Wi-Fi returning HTTP 302 login portals, authenticate first (`catcloud preaccel test --campus --json`).
 2. **Layer 2 — Conflicting Proxy Apps & Residual Services**: Check for other running proxy clients, leftover system proxy entries, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env vars, or security software blocking core/driver binaries (`catcloud net doctor --json`).
@@ -727,11 +749,13 @@ catcloud net doctor --json
 catcloud net connections --json
 catcloud net match api.openai.com --json
 catcloud logs tail --lines 80 --level warning --json
+catcloud logs tail --since 30m --level warning --json
+catcloud logs tail --since "2026-11-26 03:40" --until "2026-11-26 03:50" --json
 catcloud config diag --json
 ```
 
 ## 3. Still Stuck? Report an Issue to `JuryBu/CatCloud`
-- Click **Report Issue on GitHub** in **AI Assistant**, **Logs**, or **Settings → About & Updates** to copy a sanitized diagnostic summary and open `https://github.com/JuryBu/CatCloud/issues/new`.
+- Click **Report Issue on GitHub** in **AI Autopilot**, **Logs**, or **Settings → About & Updates** to copy a sanitized diagnostic summary and open `https://github.com/JuryBu/CatCloud/issues/new`.
 - Never paste plaintext passwords, UUIDs, tokens, subscription URLs, or unmasked relay IPs.
 
 ```markdown
@@ -757,13 +781,13 @@ const EN_DOC_01_ONBOARDING: &str = r###"> [LANGUAGE LOCK] Reply strictly in Engl
 > **Mentor Rules:**
 > 1. Inspect the user's sanitized status snapshot first and summarize their exact step in 1-2 plain sentences; resolve errors/blocks first.
 > 2. Teach **only ONE small actionable step at a time** — never dump long manuals at once.
-> 3. Use exact CatCloud UI page names (**Overview / Smart Groups / Nodes & Speed / Rules & Conns / Domestic Boost / Logs / AI Assistant / Settings**); avoid internal jargon or CLI commands unless asked.
+> 3. Use exact CatCloud UI page names (**Overview / Smart Groups / Nodes & Speed / Rules & Conns / Domestic Boost / Logs / AI Autopilot / Settings**); avoid internal jargon or CLI commands unless asked.
 > 4. If offline, remind the user they can paste prompts into directly accessible Web AIs (**DeepSeek, Doubao, Qwen, Kimi**) first.
 
 ## 1. Zero-Node Cold Start: "CatCloud Is the Car, Subscriptions/Nodes Are the Fuel"
 1. CatCloud does not bundle or sell proxy nodes; bring your own subscription URL, a friend's `.zip` Share Pack / node text, or migrate from an existing proxy app.
 2. Go to **Nodes & Speed → Subs & Import** to add nodes.
-3. Anytime you feel stuck, open **AI Assistant** to copy a sanitized status prompt for Web AI or a local Agent.
+3. Anytime you feel stuck, open **AI Autopilot** to copy a sanitized status prompt for Web AI or a local Agent.
 
 ## 2. Six Core Workflows
 1. **Import, Migrate & `1→2→3` Live Capture (`Nodes & Speed → Subs & Import`)**: Paste subscription URLs (auto proxy-fallback on direct failure), paste configs/scan existing open-source clients read-only, or run the `1→2→3` live capture wizard (supports updating existing groups).
@@ -771,7 +795,7 @@ const EN_DOC_01_ONBOARDING: &str = r###"> [LANGUAGE LOCK] Reply strictly in Engl
 3. **Zero-Interference Speed Testing (`Nodes & Speed`)**: Isolated ephemeral sandbox core — Lite Test (latency, Google cleanliness, AI unlocks), Full Test (upload/download throughput), and 60s Keep-Alive without interrupting active sessions.
 4. **Routing & Live Connections (`Rules & Conns`)**: Domestic direct routing, built-in AI domain split routing, domestic QUIC allow + overseas QUIC block, and live connection/rule inspection.
 5. **Domestic Boost (`Domestic Boost`)**: Pure-IP TCP `:443` relay chain for upload-throttled campus/broadband networks (auto-skips native 443 nodes, supports single/all relay real upload/download speed testing, optional standalone global boost). Leave off if upload is already fast.
-6. **Daily Controls, `.zip` Share Packs & Tray Memory Saver (`Overview`, `Logs`, `AI Assistant`, `Settings`)**: System Proxy for browsers (no admin needed), **TUN Mode** for terminals/games, selective `.zip` Share Packs for friends, **Mini Capsule**, and closing the main window to destroy WebView2 (`<= 70 MB` background tray footprint).
+6. **Daily Controls, `.zip` Share Packs & Tray Memory Saver (`Overview`, `Logs`, `AI Autopilot`, `Settings`)**: System Proxy for browsers (no admin needed), **TUN Mode** for terminals/games, selective `.zip` Share Packs for friends, **Mini Capsule**, and closing the main window to destroy WebView2 (`<= 70 MB` background tray footprint).
 
 ## 3. Five-Step Mentor Progression
 1. **State 1 (0 nodes)** → Explain car-vs-fuel; ask which source they have and guide only that 1 import path.
@@ -866,14 +890,17 @@ echo "mmrelay://v1/$(printf '%s' "${MMJSON}" | python3 -c 'import base64,sys; pr
 - **Performance Tuning Checklist (for Agents)**:
   - Always check `tc qdisc show dev <iface>` on Linux relays: `sysctl` `default_qdisc=fq` does NOT retroactively replace `pfifo_fast` on an already-booted NIC. Run `tc qdisc replace dev <iface> root fq` (zero-downtime) and persist it via systemd so BBR pacing actually engages.
   - Prefer `anytls` (session pooling; CatCloud auto-enables `tfo: true` and `min-idle-session: 2`) over legacy per-connection `trojan`; if domestic UDP 443 is open, co-hosting `hysteria2` on UDP 443 eliminates TCP-over-TCP congestion without conflicting with TCP 443.
-  - Pair domestic `:443` relays with lightweight non-443 overseas nodes (e.g. `ss`) to avoid TLS-in-TLS overhead, and keep dual relays in active-standby `fallback` rather than round-robin load-balancing.
-- CLI verification & rollback:
+  - Pair domestic `:443` relays with lightweight non-443 overseas nodes (e.g. `ss`) to avoid TLS-in-TLS overhead. With 2+ distinct physical cloud relays, `auto` / `load_balance` aggregates bandwidth via nested `load-balance` inside outer `fallback` (deduplicating same-host protocols); switch to `--dispatch-strategy fallback` if a backup VPS has weaker quality.
+- **Secret Rotation & Revocation**: After private testing or sharing, rotate relay credentials cleanly via SSH stdin (auto backup + rollback script + fresh `mmrelay://v1/...`, preview with `--dry-run`):
+  `node scripts/relay/rotate_relay_secrets.mjs --host <IP> --user root --key <KEY_PATH> --config /etc/catcloud-relay/config.json --service catcloud-relay --dry-run`
+- CLI verification, strategy & rollback:
 ```bash
 catcloud preaccel pool --json
 catcloud preaccel test --json
 catcloud preaccel test --speed --json
 catcloud preaccel test --speed --node-id <id> --json
 catcloud preaccel global-status --json
+catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json
 catcloud preaccel bind --enabled false --json && catcloud config reload --json
 ```
 "###;
@@ -902,10 +929,13 @@ const EN_DOC_03_MULTIGROUP: &str = r###"> [LANGUAGE LOCK] Reply strictly in Engl
 ```bash
 catcloud group list --json
 catcloud group create --id grp-ai --name "AI Sticky" --mode sticky_best --fallback cross_pool_escalate --switch-mode force_close_old --json
+catcloud group members --id grp-ai add --nodes node_1,node_2 --json
+catcloud group members --id grp-ai remove --nodes node_2 --json
+catcloud group members --id grp-ai set --nodes node_1,node_3 --json
 catcloud group eval grp-ai --json
 catcloud group switch grp-ai --json
 catcloud group switch grp-ai --node <node_id> --json
-catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)" --fallback degrade_best_warn --json
+catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)" --fallback degrade_best_warn --add-match-rule "DOMAIN-SUFFIX,openai.com" --json
 ```
 
 ## 4. Rollback & Troubleshooting
@@ -1053,7 +1083,7 @@ const JA_UI_GLOSSARY: &str = r###"> 【言語固定】以降の回答はすべ�
 | `routing` | ルールと接続 | 国内直接・AI ドメイン分流・QUIC 制御・リアルタイム接続確認 |
 | `preaccel` | 国内高速化 | 純 IP TCP 443 中継・単体/全中継の実上下り速度テスト・グローバル高速化 |
 | `logs` | 実行ログ | 脱敏済みログ閲覧・`GitHub で不具合報告` |
-| `ai` | AI アシスタント | Web AI 向けガイドコピー・ローカル Agent 起動プロンプト・`GitHub で Issue 作成` |
+| `ai` | AI 自動設定 | Web AI 向けガイドコピー・ローカル Agent 起動プロンプト・`GitHub で Issue 作成` |
 | `settings` | 設定 | `一般・プロキシ` / `外観と言語` / `ネットワーク・DNS` / `コアと保守` / `情報と更新` |
 "###;
 
@@ -1069,7 +1099,7 @@ const RU_UI_GLOSSARY: &str = r###"> [ЯЗЫК ОТВЕТА] Отвечайте �
 | `routing` | Правила и сети | Прямой трафик CN, правила AI-доменов, QUIC, активные соединения |
 | `preaccel` | Ускорение 443 | Чистый IP TCP 443, тест реальной скорости одного/всех релеев, глобальное ускорение |
 | `logs` | Журнал | Очищенные логи, кнопка «Сообщить на GitHub» |
-| `ai` | ИИ-помощник | Промпты для веб-ИИ и локальных CLI-агентов, кнопка «Создать Issue на GitHub» |
+| `ai` | ИИ-автопилот | Промпты для веб-ИИ и локальных CLI-агентов, кнопка «Создать Issue на GitHub» |
 | `settings` | Настройки | «Общие и прокси» / «Внешний вид и язык» / «Сеть и DNS» / «Ядро и утилиты» / «О программе» |
 "###;
 
@@ -1077,7 +1107,8 @@ fn ja_chapter_intro(canonical_id: &str) -> &'static str {
     match canonical_id {
         TROUBLESHOOTING_DOC_ID => {
             "# 00 · ネットワーク総合トラブルシューティング（6 層診断 & GitHub Issue）\n\n\
-             物理回線・キャンパス認証 → 競合プロキシ/残留環境変数 → コア/仮想 NIC (TUN)（「設定 → ネットワーク・DNS」）→ ルールと接続/DNS/QUIC → 国内高速化 → 海外ノード/AI 解除の 6 層で順に切り分けます。解決しない場合は「AI アシスタント」（「GitHub で Issue 作成」）、「実行ログ」または「設定 → 情報と更新」（「GitHub で不具合報告」）から `JuryBu/CatCloud` へ脱敏済み Issue を送信してください（秘密情報・生 IP は絶対に含めないこと）。"
+             > ローカル `catcloud.exe` 探索（インストール版は PATH 未登録）：PowerShell `$CATCLOUD = @(\"$env:LOCALAPPDATA\\CatCloud\\resources\\cli\\catcloud.exe\", \".\\cli\\catcloud.exe\") | Where-Object { Test-Path $_ } | Select-Object -First 1` ／ Bash `CATCLOUD=$(command -v catcloud || ([ -x \"./cli/catcloud.exe\" ] && echo \"./cli/catcloud.exe\") || echo \"$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe\")`\n\n\
+             物理回線・キャンパス認証 → 競合プロキシ/残留環境変数 → コア/仮想 NIC (TUN)（「設定 → ネットワーク・DNS」）→ ルールと接続/DNS/QUIC（`logs tail --since/--until`、DNS 証明書診断対応）→ 国内高速化 → 海外ノード/AI 解除の 6 層で順に切り分けます。解決しない場合は「AI 自動設定」（「GitHub で Issue 作成」）、「実行ログ」または「設定 → 情報と更新」（「GitHub で不具合報告」）から `JuryBu/CatCloud` へ脱敏済み Issue を送信してください（秘密情報・生 IP は絶対に含めないこと）。"
         }
         ONBOARDING_DOC_ID => {
             "# 01 · 初心者向けオンボーディング総綱（AI メンター用）\n\n\
@@ -1085,11 +1116,11 @@ fn ja_chapter_intro(canonical_id: &str) -> &'static str {
         }
         PREACCEL_DOC_ID => {
             "# 02 · 国内高速化（TCP 443 純 IP 中継）実践マニュアル\n\n\
-             非 443 ポートの上り制限を突破するため、① 友人共有（`mmrelay://v1/...` / `.zip` 共有パック / 手動入力）と ② 自前構築（国内軽量 VPS・ファイアウォール TCP 443 開放・SNI 厳格空欄・AnyTLS/Trojan ワンショット導入スクリプト）、単体/全中継の実上下り速度テスト（`catcloud preaccel test --speed [--node-id <id>]`）、およびグローバル高速化・`catcloud preaccel global-status --json` 検証手順を提供します。ローカル Agent はユーザー同意後に全工程を代行してください。"
+             非 443 ポートの上り制限を突破するため、① 友人共有（`mmrelay://v1/...` / `.zip` 共有パック / 手動入力）と ② 自前構築（国内軽量 VPS・ファイアウォール TCP 443 開放・SNI 厳格空欄・AnyTLS/Trojan ワンショット導入スクリプト）、複数物理クラウド自動均衡（`preaccel bind --dispatch-strategy auto|load_balance|fallback --lb-strategy round_robin|consistent_hashing`）、鍵ローテーション（`scripts/relay/rotate_relay_secrets.mjs`）、単体/全中継の実上下り速度テスト（`catcloud preaccel test --speed [--node-id <id>]`）、およびグローバル高速化・`catcloud preaccel global-status --json` 検証手順を提供します。ローカル Agent はユーザー同意後に全工程を代行してください。"
         }
         MULTIGROUP_DOC_ID => {
             "# 03 · スマートグループ & 安全スコア式ガイド\n\n\
-             AI コーディング向け粘着ロック（IP 変動防止）、低倍率優先＋高倍率フェイルオーバー、動画向けプリセット式と、`catcloud group create / eval / switch <group_id> / policy` の正確なコマンド契約を定義します。"
+             AI コーディング向け粘着ロック（IP 変動防止）、低倍率優先＋高倍率フェイルオーバー、動画向けプリセット式と、`catcloud group create / members --id <id> <add|remove|set> --nodes <csv> / eval / switch <group_id> / policy` の正確なコマンド契約を定義します。"
         }
         NODES_PROBES_DOC_ID => {
             "# 04 · ノードと速度・購読・1→2→3 捕捉 & 3 段階速度テスト\n\n\
@@ -1119,7 +1150,8 @@ fn ru_chapter_intro(canonical_id: &str) -> &'static str {
     match canonical_id {
         TROUBLESHOOTING_DOC_ID => {
             "# 00 · Универсальная 6-уровневая диагностика сети и GitHub Issue\n\n\
-             Последовательно проверьте 6 слоёв: физическая сеть/портал → конфликтующие прокси/переменные → ядро/TUN-адаптер («Настройки → Сеть и DNS») → Правила и сети/DNS/QUIC → Ускорение 443 → зарубежные узлы/AI. Если проблема осталась, откройте форму Issue в `JuryBu/CatCloud` через «ИИ-помощник» («Создать Issue на GitHub»), «Журнал» или «Настройки → О программе» («Сообщить на GitHub») — только очищенные данные без секретов."
+             > Поиск локального `catcloud.exe` (установленная сборка не в PATH): PowerShell `$CATCLOUD = @(\"$env:LOCALAPPDATA\\CatCloud\\resources\\cli\\catcloud.exe\", \".\\cli\\catcloud.exe\") | Where-Object { Test-Path $_ } | Select-Object -First 1` | Bash `CATCLOUD=$(command -v catcloud || ([ -x \"./cli/catcloud.exe\" ] && echo \"./cli/catcloud.exe\") || echo \"$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe\")`\n\n\
+             Последовательно проверьте 6 слоёв: физическая сеть/портал → конфликтующие прокси/переменные → ядро/TUN-адаптер («Настройки → Сеть и DNS») → Правила и сети/DNS/QUIC (`logs tail --since/--until`, диагностика TLS DNS) → Ускорение 443 → зарубежные узлы/AI. Если проблема осталась, откройте форму Issue в `JuryBu/CatCloud` через «ИИ-автопилот» («Создать Issue на GitHub»), «Журнал» или «Настройки → О программе» («Сообщить на GitHub») — только очищенные данные без секретов."
         }
         ONBOARDING_DOC_ID => {
             "# 01 · Руководство для новичков (для AI-наставника)\n\n\
@@ -1127,11 +1159,11 @@ fn ru_chapter_intro(canonical_id: &str) -> &'static str {
         }
         PREACCEL_DOC_ID => {
             "# 02 · Практическое руководство по «Ускорение 443» (TCP :443 без SNI)\n\n\
-             Включает простой путь (`mmrelay://v1/...`, «Пакет обмена» `.zip`, ручной ввод), самостоятельное развёртывание на сервере (открытие TCP 443 в фаерволе, строго пустой SNI, готовый bash-скрипт AnyTLS/Trojan с выводом `mmrelay://v1/...`), тест реальной скорости аплоада/даунлоада одного или всех релеев (`catcloud preaccel test --speed [--node-id <id>]`), глобальное ускорение и проверку `catcloud preaccel global-status --json`. Локальный агент должен выполнять шаги целиком после согласия пользователя."
+             Включает простой путь (`mmrelay://v1/...`, «Пакет обмена» `.zip`, ручной ввод), самостоятельное развёртывание на сервере (открытие TCP 443 в фаерволе, строго пустой SNI, готовый bash-скрипт AnyTLS/Trojan с выводом `mmrelay://v1/...`), мульти-облачную балансировку (`preaccel bind --dispatch-strategy auto|load_balance|fallback --lb-strategy round_robin|consistent_hashing`), ротацию секретов (`scripts/relay/rotate_relay_secrets.mjs`), тест реальной скорости аплоада/даунлоада одного или всех релеев (`catcloud preaccel test --speed [--node-id <id>]`), глобальное ускорение и проверку `catcloud preaccel global-status --json`. Локальный агент должен выполнять шаги целиком после согласия пользователя."
         }
         MULTIGROUP_DOC_ID => {
             "# 03 · «Умные группы» и безопасные формулы оценки\n\n\
-             Готовые формулы для AI-кодинга (липкий выбор без скачков IP), экономии трафика с резервным пулом и стриминга, а также точные команды `catcloud group create / eval / switch <group_id> / policy`."
+             Готовые формулы для AI-кодинга (липкий выбор без скачков IP), экономии трафика с резервным пулом и стриминга, а также точные команды `catcloud group create / members --id <id> <add|remove|set> --nodes <csv> / eval / switch <group_id> / policy`."
         }
         NODES_PROBES_DOC_ID => {
             "# 04 · «Узлы и тест», подписки, захват 1→2→3 и 3-уровневый тест скорости\n\n\
@@ -1292,8 +1324,8 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
                 "所有只读听诊 CLI 默认自动掩码密码、UUID、Token、本机路径与公私网 IP 末段。",
             ]),
             gui_and_cli_verification: svec(&[
-                "GUI：打开「AI 助手」「运行日志」或「设置 → 关于与更新」，点击「反馈问题到 GitHub」或复制脱敏摘要。",
-                "CLI：`catcloud net doctor --json`、`catcloud net connections --json`、`catcloud net match <domain> --json`、`catcloud logs tail --lines 80 --json`。",
+                "GUI：打开「AI 全权代管」「运行日志」或「设置 → 关于与更新」，点击「反馈问题到 GitHub」或复制脱敏摘要。",
+                "CLI：`catcloud net doctor --json`、`catcloud net connections --json`、`catcloud net match <domain> --json`、`catcloud logs tail --lines 80 --since 30m --json`。",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "优先按 1→6 层定位：先查物理网/校园网认证与冲突代理软件，再查核心/TUN（「设置 → 网络与 DNS」）、分流、国内提速与海外节点。",
@@ -1307,7 +1339,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
             summary: "覆盖 0 节点「猫云是车、订阅是油」三要素、6 大核心玩法与 5 步渐进引导节奏（含基础已全通进阶引导），确保 AI 每次只教下一小步。".into(),
             when_to_use_and_signals: svec(&[
                 "首次安装或 0 节点冷启动，不知道如何导入节点、测速、建智能多选组或开关代理时。",
-                "准备在「AI 助手」页复制状态发给 DeepSeek / 豆包等网页 AI 手把手带路时。",
+                "准备在「AI 全权代管」页复制状态发给 DeepSeek / 豆包等网页 AI 手把手带路时。",
             ]),
             external_prereqs_and_schema: svec(&[
                 "只需准备至少一份订阅链接、朋友的 .zip 分享包 / 配置文本，或电脑上已有代理软件即可开始。",
@@ -1319,7 +1351,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
             ]),
             rollback_and_troubleshooting: svec(&[
                 "浏览器正常但终端/游戏不通：在「总览」开启「虚拟网卡（TUN 模式）」，随时可一键关闭。",
-                "点击「AI 助手」即可一键复制脱敏诊断或点击「反馈问题到 GitHub」。",
+                "点击「AI 全权代管」即可一键复制脱敏诊断或点击「反馈问题到 GitHub」。",
             ]),
             contract_example: String::new(),
         },
@@ -1337,7 +1369,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
             ]),
             gui_and_cli_verification: svec(&[
                 "GUI：「国内提速 → + 添加中转」导入 mmrelay://v1 或 JSON，确认开启「自动跳过原生 443 节点」，并可一键执行单条/全部中转真实上下行测速。",
-                "CLI：`catcloud preaccel add --uri ... --json`、`catcloud preaccel pool --json`、`catcloud preaccel test --json`、`catcloud preaccel test --speed [--node-id <id>] --json`、`catcloud preaccel global-status --json`。",
+                "CLI：`catcloud preaccel add --uri ... --json`、`catcloud preaccel pool --json`、`catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json`、`catcloud preaccel test --speed [--node-id <id>] --json`、`catcloud preaccel global-status --json`；轮换回收密钥用 `scripts/relay/rotate_relay_secrets.mjs`。",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "一键关闭：「国内提速」关总开关或执行 `catcloud preaccel bind --enabled false --json && catcloud config reload --json`。",
@@ -1359,7 +1391,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
             ]),
             gui_and_cli_verification: svec(&[
                 "GUI：「智能多选组」配置成员、硬门禁（如 google_clean == 1）、安全评分公式与切换模式。",
-                "CLI：`catcloud group list --json`、`catcloud group create --id grp-ai --name AI --mode sticky_best --json`、`catcloud group eval <group_id> --json`、`catcloud group switch <group_id> --json`、`catcloud group policy <group_id> --formula \"...\" --json`。",
+                "CLI：`catcloud group list --json`、`catcloud group create --id grp-ai --name AI --mode sticky_best --json`、`catcloud group members --id grp-ai add|remove|set --nodes <csv> --json`、`catcloud group eval <group_id> --json`、`catcloud group switch <group_id> --json`、`catcloud group policy <group_id> --formula \"...\" --match-rules \"...\" --json`。",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "组触发熔断（REJECT）时，用 `catcloud group eval <group_id> --json` 排查硬门禁或将兜底改回 degrade_best_warn。",
@@ -1474,8 +1506,8 @@ fn build_en_docs() -> Vec<AgentModuleDoc> {
                 "All read-only stethoscope commands sanitize secrets, paths, and non-allowlist IPs by default.",
             ]),
             gui_and_cli_verification: svec(&[
-                "GUI: Open 'AI Assistant', 'Logs', or 'Settings -> About & Updates' and click 'Report Issue on GitHub' or copy sanitized diagnostics.",
-                "CLI: `catcloud net doctor --json`, `catcloud net connections --json`, `catcloud net match <domain> --json`, `catcloud logs tail --lines 80 --json`.",
+                "GUI: Open 'AI Autopilot', 'Logs', or 'Settings -> About & Updates' and click 'Report Issue on GitHub' or copy sanitized diagnostics.",
+                "CLI: `catcloud net doctor --json`, `catcloud net connections --json`, `catcloud net match <domain> --json`, `catcloud logs tail --lines 80 --since 30m --json`.",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "Check bottom-up: Layer 1 physical/portal -> Layer 2 conflicting proxies -> Layer 3 core/TUN ('Settings -> Network & DNS') -> Layer 4 routing/DNS/QUIC -> Layer 5 Domestic Boost -> Layer 6 nodes/AI unlock.",
@@ -1515,7 +1547,7 @@ fn build_en_docs() -> Vec<AgentModuleDoc> {
             ]),
             gui_and_cli_verification: svec(&[
                 "GUI: Open 'Domestic Boost' -> '+ Add Relay' -> verify 'Auto-skip native 443 nodes', and run single/all relay real upload/download speed tests.",
-                "CLI: `catcloud preaccel add --uri ... --json`, `catcloud preaccel pool --json`, `catcloud preaccel test --json`, `catcloud preaccel test --speed [--node-id <id>] --json`, `catcloud preaccel global-status --json`.",
+                "CLI: `catcloud preaccel add --uri ... --json`, `catcloud preaccel pool --json`, `catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json`, `catcloud preaccel test --speed [--node-id <id>] --json`, `catcloud preaccel global-status --json`; rotate secrets via `scripts/relay/rotate_relay_secrets.mjs`.",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "Disable via GUI switch or `catcloud preaccel bind --enabled false --json && catcloud config reload --json`.",
@@ -1534,7 +1566,7 @@ fn build_en_docs() -> Vec<AgentModuleDoc> {
             ]),
             gui_and_cli_verification: svec(&[
                 "GUI: 'Smart Groups' -> mode, hard gates, formula, fallback, switch mode.",
-                "CLI: `catcloud group list --json`, `catcloud group create --id grp-ai --name AI --mode sticky_best --json`, `catcloud group eval <group_id> --json`, `catcloud group switch <group_id> --json`, `catcloud group policy <group_id> --formula \"...\" --json`.",
+                "CLI: `catcloud group list --json`, `catcloud group create --id grp-ai --name AI --mode sticky_best --json`, `catcloud group members --id grp-ai add|remove|set --nodes <csv> --json`, `catcloud group eval <group_id> --json`, `catcloud group switch <group_id> --json`, `catcloud group policy <group_id> --formula \"...\" --match-rules \"...\" --json`.",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "Inspect `circuit_open` via `catcloud group eval <group_id> --json` or set fallback to `degrade_best_warn`.",
@@ -1875,11 +1907,11 @@ fn describe_current_page(current_page: &str, lang: &str) -> (String, &'static st
             "Пакет обмена",
             "07-share-bundle.md",
         ),
-        "ai" | "assistant" | "ai_assistant" | "ai 助手" => (
-            "AI 助手",
-            "AI Assistant",
-            "AI アシスタント",
-            "ИИ-помощник",
+        "ai" | "assistant" | "ai_assistant" | "autopilot" | "ai_autopilot" | "ai 助手" | "ai 全权代管" => (
+            "AI 全权代管",
+            "AI Autopilot",
+            "AI 自動設定",
+            "ИИ-автопилот",
             "00-general-troubleshooting.md",
         ),
         _ => return (raw.to_string(), "00-general-troubleshooting.md"),
@@ -1894,14 +1926,35 @@ fn describe_current_page(current_page: &str, lang: &str) -> (String, &'static st
     (label.to_string(), doc_file)
 }
 
-/// Render a clean, lightweight (~15-line) Bootstrap Prompt for local CLI/coding AI Agents.
-/// Locks the AI output language on line 1 and binds exact local CLI, `--data-dir`, and `INDEX.md` paths.
-pub fn render_agent_bootstrap_prompt(
+/// Authorization mode for the local AI Agent bootstrap prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentPromptMode {
+    Autopilot,
+    Readonly,
+}
+
+impl AgentPromptMode {
+    pub fn from_opt_str(raw: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("readonly" | "read_only" | "inspect" | "check") => Self::Readonly,
+            _ => Self::Autopilot,
+        }
+    }
+}
+
+/// Render a clean, lightweight Bootstrap Prompt for local CLI/coding AI Agents
+/// (e.g. Codex, Claude Code, Antigravity) with explicit authorization mode:
+/// - `AgentPromptMode::Autopilot`: directly authorizes end-to-end setup, speed testing,
+///   smart group creation, domestic boost configuration, and hot-reload verification
+///   (confirming only before destructive deletions or remote SSH deployments).
+/// - `AgentPromptMode::Readonly`: read-only inspection first; ask confirmation before any write.
+pub fn render_agent_bootstrap_prompt_with_mode(
     cli_path: &str,
     data_dir: &str,
     docs_index_path: &str,
     current_page: &str,
     lang: &str,
+    mode: AgentPromptMode,
 ) -> String {
     let norm = normalize_doc_lang(Some(lang));
     let cli = if cli_path.trim().is_empty() {
@@ -1913,8 +1966,22 @@ pub fn render_agent_bootstrap_prompt(
     let index = docs_index_path.trim();
     let (page_label, suggested_doc) = describe_current_page(current_page, norm);
 
-    match norm {
-        "en" => format!(
+    match (norm, mode) {
+        ("en", AgentPromptMode::Autopilot) => format!(
+            "{}\n\n\
+             You are my local CatCloud AI Agent (Codex / Claude Code / Antigravity). I authorize you to configure and optimize this exact running instance end-to-end:\n\
+             - CLI executable: `{cli}`\n\
+             - Data directory flag: `--data-dir \"{data}\"` (always pass `--json`)\n\
+             - Authoritative local docs index: `{index}` (start with `{suggested_doc}` for current page: **{page_label}**)\n\n\
+             Autopilot Authorization:\n\
+             1. **Inspect automatically first**: Read `{index}` (and `{suggested_doc}`) as needed, then run read-only diagnostics (`status --json`, `net doctor --json`, `logs tail --lines 50 --json`) using the exact CLI path above.\n\
+             2. **Execute end-to-end directly**: You are pre-authorized to import subscriptions/nodes I provide (or migrate existing local clients), run zero-interference speed tests to pick the fastest golden nodes, build/tune Smart Groups, configure Domestic Boost (multi-cloud balancing or fallback), and run `config reload --json` to make changes live without pausing on routine steps.\n\
+             3. **Confirm only high-risk actions**: Ask me before destructive deletions (removing subscriptions/resetting config) or remote SSH server deployment / secret rotation.\n\
+             4. **Strict secret redline**: Keep default sanitized output; NEVER echo, print, or leak plaintext passwords, UUIDs, tokens, private keys, subscription URLs, or unmasked relay IPs.\n\n\
+             Start immediately by checking my current state, carry out the needed setup, and report a concise plain-language verification summary.",
+            lang_lock_line(norm)
+        ),
+        ("en", AgentPromptMode::Readonly) => format!(
             "{}\n\n\
              You are my local CatCloud AI Agent assistant. Work against this exact running instance:\n\
              - CLI executable: `{cli}`\n\
@@ -1928,7 +1995,21 @@ pub fn render_agent_bootstrap_prompt(
              Start by inspecting my current status read-only and tell me what you see and how you can help.",
             lang_lock_line(norm)
         ),
-        "ja" => format!(
+        ("ja", AgentPromptMode::Autopilot) => format!(
+            "{}\n\n\
+             あなたは私のローカル CatCloud AI エージェント（Codex / Claude Code / Antigravity）です。以下の実インスタンスの設定・最適化を一貫代行することを承認します：\n\
+             - CLI 実行ファイル：`{cli}`\n\
+             - データディレクトリ引数：`--data-dir \"{data}\"`（常に `--json` を付与）\n\
+             - ローカル権威マニュアル目次：`{index}`（現在画面「**{page_label}**」向け推奨章：`{suggested_doc}`）\n\n\
+             全自動代行ルール：\n\
+             1. **まず自動で現状診断**：`{index}` と `{suggested_doc}` を必要時に読み、上記 CLI で `status --json` / `net doctor --json` / `logs tail --lines 50 --json` を実行して現状を把握すること。\n\
+             2. **そのまま一気通貫で設定・反映**：購読/ノード取り込み、無干渉速度テストでの最速ゴールデンノード選定、スマートグループ構築、国内高速化設定、および `config reload --json` によるホットリロード検証まで都度確認せず自律完了してよい。\n\
+             3. **高リスク操作のみ事前確認**：購読・設定の破壊的削除やリモート SSH サーバー構築/鍵ローテーションの前だけ必ず確認を取ること。\n\
+             4. **秘密保護レッドライン**：平文パスワード・UUID・トークン・秘密鍵・購読 URL・未マスク中継 IP を絶対に出力・復唱しないこと。\n\n\
+             すぐ現状診断から始め、必要な設定と反映を完了したうえで分かりやすい日本語で検証結果を報告してください。",
+            lang_lock_line(norm)
+        ),
+        ("ja", AgentPromptMode::Readonly) => format!(
             "{}\n\n\
              あなたは私のローカル CatCloud AI エージェントです。以下の実インスタンス環境を操作対象にしてください：\n\
              - CLI 実行ファイル：`{cli}`\n\
@@ -1942,7 +2023,21 @@ pub fn render_agent_bootstrap_prompt(
              まず読み取り専用で現在状態を確認し、状況と手伝える内容を簡潔に教えてください。",
             lang_lock_line(norm)
         ),
-        "ru" => format!(
+        ("ru", AgentPromptMode::Autopilot) => format!(
+            "{}\n\n\
+             Ты мой локальный AI-агент CatCloud (Codex / Claude Code / Antigravity). Я заранее разрешаю тебе настроить и оптимизировать этот экземпляр под ключ:\n\
+             - Исполняемый CLI: `{cli}`\n\
+             - Флаг каталога данных: `--data-dir \"{data}\"` (всегда добавляй `--json`)\n\
+             - Индекс локальной документации: `{index}` (текущий экран: **{page_label}**, рекомендуемая глава: `{suggested_doc}`)\n\n\
+             Полномочия автонастройки:\n\
+             1. **Автодиагностика**: прочитай `{index}` и `{suggested_doc}`, затем проверь состояние через `status --json`, `net doctor --json`, `logs tail --lines 50 --json`.\n\
+             2. **Выполнение под ключ**: тебе разрешено самостоятельно импортировать подписки/узлы, запустить тесты скорости и отобрать лучшие золотые узлы, создать и настроить «Умные группы», подключить «Ускорение 443» и применить изменения через `config reload --json` без лишних остановок.\n\
+             3. **Подтверждение только для рисков**: спрашивай согласие только перед необратимым удалением подписок/данных или удалённым SSH-развёртыванием/ротацией ключей.\n\
+             4. **Запрет утечки секретов**: никогда не выводи и не повторяй открытые пароли, UUID, токены, приватные ключи, ссылки подписок и немаскированные IP.\n\n\
+             Сразу начни с диагностики, выполни настройку и дай краткий понятный отчёт о проверке.",
+            lang_lock_line(norm)
+        ),
+        ("ru", AgentPromptMode::Readonly) => format!(
             "{}\n\n\
              Ты мой локальный AI-агент для CatCloud. Работай строго с этим экземпляром:\n\
              - Исполняемый CLI: `{cli}`\n\
@@ -1956,7 +2051,21 @@ pub fn render_agent_bootstrap_prompt(
              Начни с диагностики только для чтения и коротко расскажи о текущем состоянии.",
             lang_lock_line(norm)
         ),
-        _ => format!(
+        (_, AgentPromptMode::Autopilot) => format!(
+            "{}\n\n\
+             请你作为我的本机猫猫云梯（CatCloud）全权代管 AI 助手（Codex / Claude Code / Antigravity），我正式授权你直接端到端替我配好这个真实实例：\n\
+             - CLI 绝对路径：`{cli}`\n\
+             - 实例数据目录参数：`--data-dir \"{data}\"`（所有命令统一加 `--json`）\n\
+             - 随装权威手册总目录：`{index}`（当前所在页面：**{page_label}**，推荐优先读 `{suggested_doc}`）\n\n\
+             全权代办授权：\n\
+             1. **自动先体检现状**：按需读取 `{index}` 与 `{suggested_doc}`，立即使用上面的精确 CLI 路径和 `--data-dir` 跑 `status --json`、`net doctor --json`、`logs tail --lines 50 --json` 摸清现状。\n\
+             2. **直接端到端帮我配好并热载生效**：无需每一步都反复打断问我——可直接帮我导入提供的订阅/节点（或只读迁移本机已有软件）、跑零干扰测速挑出最快黄金节点、建好并调优「智能多选组」防断流、按需配置「国内提速」，并执行 `config reload --json` 热载验收。\n\
+             3. **仅高风险操作前再确认**：只有涉及不可逆删除（删订阅/清配置）或远程 SSH 服务器部署/轮换密钥前，才先向我确认。\n\
+             4. **严守脱敏红线**：保持默认脱敏输出；严禁在对话、摘要或 Issue 中打印、复述任何明文密码、UUID、Token、私钥、订阅原链接或未脱敏中转 IP。\n\n\
+             请直接开始体检现状并替我推进配置，完成后用简洁大白话告诉我验收结果和还缺什么资料。",
+            lang_lock_line(norm)
+        ),
+        (_, AgentPromptMode::Readonly) => format!(
             "{}\n\n\
              请作为我的本机猫猫云梯（CatCloud）AI 助手，围绕下面这个真实实例协作：\n\
              - CLI 绝对路径：`{cli}`\n\
@@ -1973,11 +2082,34 @@ pub fn render_agent_bootstrap_prompt(
     }
 }
 
+/// Render a clean, lightweight (~15-line) Bootstrap Prompt for local CLI/coding AI Agents.
+/// Preserved for 100% backward compatibility (delegates to [`AgentPromptMode::Readonly`]).
+pub fn render_agent_bootstrap_prompt(
+    cli_path: &str,
+    data_dir: &str,
+    docs_index_path: &str,
+    current_page: &str,
+    lang: &str,
+) -> String {
+    render_agent_bootstrap_prompt_with_mode(
+        cli_path,
+        data_dir,
+        docs_index_path,
+        current_page,
+        lang,
+        AgentPromptMode::Readonly,
+    )
+}
+
 fn render_root_index_markdown() -> String {
     r###"# CatCloud Local Authoritative Agent Docs (`agent_docs/`)
 
 This directory is automatically synchronized by CatCloud on startup.
 Select the subdirectory matching the user's preferred language, then read only the needed chapter(s):
+
+- Locate local `catcloud.exe` (installed builds are not on `PATH` by default):
+  - PowerShell: `$CATCLOUD = @("$env:LOCALAPPDATA\CatCloud\resources\cli\catcloud.exe", ".\cli\catcloud.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1`
+  - Bash: `CATCLOUD=$(command -v catcloud || ([ -x "./cli/catcloud.exe" ] && echo "./cli/catcloud.exe") || echo "$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe")`
 
 - Simplified Chinese (Primary Authoritative Source): `zh-CN/INDEX.md`
 - English (Complete Baseline): `en/INDEX.md`
@@ -1990,7 +2122,7 @@ Select the subdirectory matching the user's preferred language, then read only t
 | `00-general-troubleshooting.md` | `troubleshooting` | 6-layer network diagnosis, stethoscope CLI & `JuryBu/CatCloud` Issue template |
 | `01-onboarding.md` | `onboarding` | Beginner mentor guide, 6 workflows, 5-step pacing & car-vs-fuel cold start |
 | `02-domestic-preaccel.md` | `preaccel` | Domestic TCP :443 boost: friend import, self-host bash script (`mmrelay://v1`), global boost |
-| `03-multigroup.md` | `multigroup` | Smart Multi-Groups, beginner formula presets & `group create/eval/switch/policy` |
+| `03-multigroup.md` | `multigroup` | Smart Multi-Groups, beginner formula presets & `group create/members/eval/switch/policy` |
 | `04-nodes-and-probes.md` | `nodes_probes` | 3-tier speed tests, subscriptions, `1->2->3` capture, group rename/merge (`sub`/`probe` CLI) |
 | `05-routing-and-connections.md` | `routing_conns` | Routing modes, domestic direct, AI split, domestic QUIC allow & `net connections/match` |
 | `06-network-and-lifecycle.md` | `network_lifecycle` | System proxy, TUN, DNS, 3-level hot reload, tray memory saver, `config backup/restore`, `update stage` |
@@ -2003,10 +2135,10 @@ fn render_lang_index_markdown(lang: &str) -> String {
     let norm = normalize_doc_lang(Some(lang));
     let docs = list_agent_docs_for_lang(norm);
     let heading = match norm {
-        "en" => "# CatCloud Authoritative Agent Manuals (`en`)\n\nRead only the chapter relevant to the user's current task:\n",
-        "ja" => "# CatCloud 公式エージェントマニュアル一覧 (`ja`)\n\n現在のタスクに該当する章だけを選んで参照してください：\n",
-        "ru" => "# Справочник локальной документации CatCloud (`ru`)\n\nОткрывайте только главы, нужные для текущей задачи пользователя:\n",
-        _ => "# 猫猫云梯（CatCloud）随装权威手册总目录（`zh-CN`）\n\n按需只读与当前任务相关的章节即可，严禁凭空猜测界面名称或命令参数：\n",
+        "en" => "# CatCloud Authoritative Agent Manuals (`en`)\n\n> Locate `catcloud.exe` (installed builds are not on `PATH`): PowerShell `$CATCLOUD = @(\"$env:LOCALAPPDATA\\CatCloud\\resources\\cli\\catcloud.exe\", \".\\cli\\catcloud.exe\") | Where-Object { Test-Path $_ } | Select-Object -First 1` | Bash `CATCLOUD=$(command -v catcloud || ([ -x \"./cli/catcloud.exe\" ] && echo \"./cli/catcloud.exe\") || echo \"$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe\")`\n\nRead only the chapter relevant to the user's current task:\n",
+        "ja" => "# CatCloud 公式エージェントマニュアル一覧 (`ja`)\n\n> `catcloud.exe` 探索（インストール版は PATH 未登録）：PowerShell `$CATCLOUD = @(\"$env:LOCALAPPDATA\\CatCloud\\resources\\cli\\catcloud.exe\", \".\\cli\\catcloud.exe\") | Where-Object { Test-Path $_ } | Select-Object -First 1` ／ Bash `CATCLOUD=$(command -v catcloud || ([ -x \"./cli/catcloud.exe\" ] && echo \"./cli/catcloud.exe\") || echo \"$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe\")`\n\n現在のタスクに該当する章だけを選んで参照してください：\n",
+        "ru" => "# Справочник локальной документации CatCloud (`ru`)\n\n> Поиск `catcloud.exe` (установленная сборка не в PATH): PowerShell `$CATCLOUD = @(\"$env:LOCALAPPDATA\\CatCloud\\resources\\cli\\catcloud.exe\", \".\\cli\\catcloud.exe\") | Where-Object { Test-Path $_ } | Select-Object -First 1` | Bash `CATCLOUD=$(command -v catcloud || ([ -x \"./cli/catcloud.exe\" ] && echo \"./cli/catcloud.exe\") || echo \"$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe\")`\n\nОткрывайте только главы, нужные для текущей задачи пользователя:\n",
+        _ => "# 猫猫云梯（CatCloud）随装权威手册总目录（`zh-CN`）\n\n> 定位本机 `catcloud.exe`（安装版不在 PATH）：PowerShell `$CATCLOUD = @(\"$env:LOCALAPPDATA\\CatCloud\\resources\\cli\\catcloud.exe\", \".\\cli\\catcloud.exe\") | Where-Object { Test-Path $_ } | Select-Object -First 1` ｜ Bash `CATCLOUD=$(command -v catcloud || ([ -x \"./cli/catcloud.exe\" ] && echo \"./cli/catcloud.exe\") || echo \"$LOCALAPPDATA/CatCloud/resources/cli/catcloud.exe\")`\n\n按需只读与当前任务相关的章节即可，严禁凭空猜测界面名称或命令参数：\n",
     };
 
     let mut out = String::new();
@@ -2229,6 +2361,7 @@ mod tests {
         assert!(share_md.contains("catcloud share inspect friend-pack.zip --json"));
 
         // Verify EN / JA / RU UI labels align verbatim with ui/src/i18n/locales/*.ts.
+        assert!(trouble_md.contains("AI 全权代管"));
         let en_trouble = export_agent_docs_with_lang(TROUBLESHOOTING_DOC_ID, false, "en").unwrap();
         assert!(en_trouble.contains("Settings → Network & DNS"));
         assert!(en_trouble.contains("Settings → About & Updates"));
@@ -2236,11 +2369,13 @@ mod tests {
         assert!(en_trouble.contains("Nodes & Speed"));
         assert!(en_trouble.contains("Smart Groups"));
         assert!(en_trouble.contains("Rules & Conns"));
+        assert!(en_trouble.contains("AI Autopilot"));
 
         let ja_trouble = export_agent_docs_with_lang(TROUBLESHOOTING_DOC_ID, false, "ja").unwrap();
         assert!(ja_trouble.contains("スマートグループ"));
         assert!(ja_trouble.contains("ノードと速度"));
         assert!(ja_trouble.contains("ルールと接続"));
+        assert!(ja_trouble.contains("AI 自動設定"));
         assert!(ja_trouble.contains("GitHub で不具合報告"));
         assert!(ja_trouble.contains("GitHub で Issue 作成"));
         assert!(ja_trouble.contains("ネットワーク・DNS"));
@@ -2251,11 +2386,16 @@ mod tests {
         assert!(ru_trouble.contains("Узлы и тест"));
         assert!(ru_trouble.contains("Правила и сети"));
         assert!(ru_trouble.contains("Ускорение 443"));
-        assert!(ru_trouble.contains("ИИ-помощник"));
+        assert!(ru_trouble.contains("ИИ-автопилот"));
         assert!(ru_trouble.contains("Сообщить на GitHub"));
         assert!(ru_trouble.contains("Создать Issue на GitHub"));
         assert!(ru_trouble.contains("Сеть и DNS"));
         assert!(ru_trouble.contains("О программе"));
+
+        assert_eq!(describe_current_page("ai", "zh-CN").0, "AI 全权代管");
+        assert_eq!(describe_current_page("ai", "en").0, "AI Autopilot");
+        assert_eq!(describe_current_page("ai", "ja").0, "AI 自動設定");
+        assert_eq!(describe_current_page("ai", "ru").0, "ИИ-автопилот");
     }
 
     #[test]
@@ -2283,6 +2423,74 @@ mod tests {
         assert!(prompt_en.contains(r"C:\CatCloud\data"));
         assert!(prompt_en.contains("02-domestic-preaccel.md"));
         assert!(prompt_en.contains("Domestic Boost"));
+
+        // Verify AgentPromptMode::from_opt_str parsing and Autopilot vs Readonly across all 4 langs.
+        assert_eq!(AgentPromptMode::from_opt_str(None), AgentPromptMode::Autopilot);
+        assert_eq!(
+            AgentPromptMode::from_opt_str(Some("autopilot")),
+            AgentPromptMode::Autopilot
+        );
+        assert_eq!(
+            AgentPromptMode::from_opt_str(Some("readonly")),
+            AgentPromptMode::Readonly
+        );
+        assert_eq!(
+            AgentPromptMode::from_opt_str(Some("read_only")),
+            AgentPromptMode::Readonly
+        );
+        assert_eq!(
+            AgentPromptMode::from_opt_str(Some("inspect")),
+            AgentPromptMode::Readonly
+        );
+        assert_eq!(
+            AgentPromptMode::from_opt_str(Some("check")),
+            AgentPromptMode::Readonly
+        );
+
+        for &lang in SUPPORTED_DOC_LANGS {
+            let ro_compat = render_agent_bootstrap_prompt(
+                r"C:\CatCloud\cli\catcloud.exe",
+                r"C:\CatCloud\data",
+                r"C:\CatCloud\data\agent_docs\INDEX.md",
+                "home",
+                lang,
+            );
+            let ro_explicit = render_agent_bootstrap_prompt_with_mode(
+                r"C:\CatCloud\cli\catcloud.exe",
+                r"C:\CatCloud\data",
+                r"C:\CatCloud\data\agent_docs\INDEX.md",
+                "home",
+                lang,
+                AgentPromptMode::Readonly,
+            );
+            assert_eq!(ro_compat, ro_explicit);
+
+            let auto_prompt = render_agent_bootstrap_prompt_with_mode(
+                r"C:\CatCloud\cli\catcloud.exe",
+                r"C:\CatCloud\data",
+                r"C:\CatCloud\data\agent_docs\INDEX.md",
+                "home",
+                lang,
+                AgentPromptMode::Autopilot,
+            );
+            assert!(auto_prompt.starts_with(lang_lock_line(lang)));
+            assert!(auto_prompt.contains("Codex / Claude Code / Antigravity"));
+            assert!(auto_prompt.contains("config reload --json"));
+            assert_ne!(auto_prompt, ro_explicit);
+
+            // Both INDEX.md and 00-general-troubleshooting.md must include the local CLI locator snippet.
+            let idx_md = render_lang_index_markdown(lang);
+            assert!(idx_md.contains(r"CatCloud\resources\cli\catcloud.exe"));
+            assert!(idx_md.contains(r".\cli\catcloud.exe"));
+            let trouble_md = export_agent_docs_with_lang(TROUBLESHOOTING_DOC_ID, false, lang).unwrap();
+            assert!(trouble_md.contains(r"CatCloud\resources\cli\catcloud.exe"));
+            assert!(trouble_md.contains("logs tail --since"));
+            let preaccel_md = export_agent_docs_with_lang(PREACCEL_DOC_ID, false, lang).unwrap();
+            assert!(preaccel_md.contains("rotate_relay_secrets.mjs"));
+            assert!(preaccel_md.contains("--dispatch-strategy"));
+            let mg_md = export_agent_docs_with_lang(MULTIGROUP_DOC_ID, false, lang).unwrap();
+            assert!(mg_md.contains("group members --id"));
+        }
     }
 
     #[test]

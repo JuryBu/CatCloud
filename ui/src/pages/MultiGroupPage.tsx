@@ -95,8 +95,8 @@ interface CreateTemplateMeta {
 const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
   {
     id: "manual",
-    title: "通用手动组",
-    desc: "零门槛，挑喜欢的节点随时用",
+    title: "日常通用",
+    desc: "智能默认，稳选低延迟常用节点",
     mode: "sticky_best",
     switchMode: "graceful_new_only",
     formula: FORMULA_COST_EFFECTIVE,
@@ -104,8 +104,8 @@ const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
   },
   {
     id: "ai",
-    title: "AI 专线组",
-    desc: "稳选最好防跳 IP，切线断旧连接",
+    title: "AI 专线防跳 IP",
+    desc: "稳选最优防频繁换地区，切线断旧连接",
     mode: "sticky_best",
     switchMode: "force_close_old",
     formula: FORMULA_COST_EFFECTIVE,
@@ -120,8 +120,8 @@ const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
   },
   {
     id: "download",
-    title: "均衡下载组",
-    desc: "多条线路轮流分摊，下载更稳",
+    title: "均衡高速",
+    desc: "多条线路并发轮询分摊，下载传文件更快",
     mode: "load_balance_round_robin",
     switchMode: "graceful_new_only",
     formula: FORMULA_MAX_PERF,
@@ -2324,6 +2324,40 @@ export function MultiGroupPage() {
             {showCreateForm ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
             <span>{showCreateForm ? "取消新建" : "新建多选组"}</span>
           </button>
+
+          {/* 3 One-Click Scenario Presets directly visible without expanding the form */}
+          {!showCreateForm && (
+            <div className="mt-2 space-y-1">
+              <div className="px-0.5 text-[10px] font-medium text-[var(--muted)]">
+                一键场景预设（点选即填好默认）
+              </div>
+              <div className="grid grid-cols-3 gap-1">
+                {CREATE_TEMPLATES.map((tpl) => {
+                  const shortLabel =
+                    tpl.id === "manual"
+                      ? "日常通用"
+                      : tpl.id === "ai"
+                        ? "AI 防跳"
+                        : "均衡高速";
+                  return (
+                    <button
+                      key={tpl.id}
+                      type="button"
+                      title={`${tpl.title}：${tpl.desc}`}
+                      onClick={() => {
+                        setNewGroupTemplate(tpl.id);
+                        setNewGroupName(tpl.title);
+                        setShowCreateForm(true);
+                      }}
+                      className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1 text-center text-[10.5px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/50 hover:text-[var(--accent)]"
+                    >
+                      {shortLabel}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           {/* Ultra-simple inline create form */}
           {showCreateForm && (

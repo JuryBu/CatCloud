@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 /// Source type of a subscription or node feed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -149,6 +150,278 @@ impl ProxyNode {
         }
         true
     }
+}
+
+/// Return `true` when `node` appears to be a subscription metadata/informational banner row
+/// (e.g. remaining traffic, expiry notice, official website, maintenance alert) rather than a
+/// usable proxy endpoint.
+pub fn is_info_proxy_node(node: &ProxyNode) -> bool {
+    let trimmed = node.name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    const ZH_INFO_KEYWORDS: &[&str] = &[
+        "剩余流量",
+        "到期",
+        "官网",
+        "公告",
+        "维护",
+        "重置",
+        "教程",
+        "过期",
+        "套餐",
+        "客服",
+        "通知",
+        "交流群",
+        "电报群",
+        "通知群",
+        "售后群",
+        "用户群",
+        "群组",
+        "tg群",
+        "qq群",
+        "官方群",
+    ];
+    let lower = trimmed.to_ascii_lowercase();
+    if ZH_INFO_KEYWORDS.iter().any(|kw| lower.contains(kw)) {
+        return true;
+    }
+    if lower.contains("群") && !lower.contains("集群") {
+        return true;
+    }
+
+    // ASCII word-boundary matching prevents false positives on unrelated substrings.
+    let tokens: Vec<&str> = lower
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|tok| !tok.is_empty())
+        .collect();
+    for tok in tokens {
+        if matches!(
+            tok,
+            "info" | "notice" | "website" | "official" | "maintenance" | "reset" | "renew"
+        ) || tok.starts_with("expire")
+            || tok.starts_with("traffic")
+            || tok.starts_with("remaining")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Pick a sensible default proxy node ID for fresh/fallback selections (avoiding disabled rows,
+/// informational traffic/expiry banners, and obscure high-multiplier regions such as `AD 3x`).
+///
+/// Ranking precedence:
+/// 1. Healthy / untested nodes ahead of confirmed failed (`ok == false`) snapshots;
+/// 2. Preferred mainstream regions (`TW`/`HK`/`SG`/`JP`/`US`/`KR`) > other mainstream regions >
+///    obscure/unknown regions;
+/// 3. Low billing multiplier (`<= 1.5x` > `< 3.0x` > `>= 3.0x`);
+/// 4. Confirmed healthy probe snapshot ahead of untested;
+/// 5. Preferred region order (`TW` -> `HK` -> `SG` -> `JP` -> `US` -> `KR`), lower latency,
+///    lower exact multiplier, then deterministic name/ID order.
+pub fn pick_smart_default_node_id(
+    nodes: &[ProxyNode],
+    snapshots: Option<&HashMap<String, ProbeSnapshot>>,
+) -> Option<String> {
+    fn preferred_region_rank(code: &str) -> Option<u8> {
+        match code {
+            "TW" => Some(0),
+            "HK" => Some(1),
+            "SG" => Some(2),
+            "JP" => Some(3),
+            "US" => Some(4),
+            "KR" => Some(5),
+            _ => None,
+        }
+    }
+
+    fn region_tier(code: &str) -> u8 {
+        if preferred_region_rank(code).is_some() {
+            0
+        } else if matches!(
+            code,
+            "GB" | "UK"
+                | "DE"
+                | "FR"
+                | "NL"
+                | "CA"
+                | "AU"
+                | "MY"
+                | "TH"
+                | "VN"
+                | "PH"
+                | "ID"
+                | "IN"
+                | "CH"
+                | "SE"
+                | "NO"
+                | "FI"
+                | "IT"
+                | "ES"
+        ) {
+            1
+        } else {
+            2
+        }
+    }
+
+    fn multiplier_tier(mult: f64) -> u8 {
+        if !mult.is_finite() || mult < 0.0 {
+            2
+        } else if mult <= 1.5 + 1e-9 {
+            0
+        } else if mult < 3.0 - 1e-9 {
+            1
+        } else {
+            2
+        }
+    }
+
+    let mut best: Option<((u8, u8, u8, u8, u8, u32, u64, String, String), &str)> = None;
+
+    for node in nodes {
+        if !node.enabled || node.id.trim().is_empty() || is_info_proxy_node(node) {
+            continue;
+        }
+
+        let code = node.region_code.trim().to_ascii_uppercase();
+        let r_tier = region_tier(&code);
+        let r_sub = preferred_region_rank(&code).unwrap_or(u8::MAX);
+        let m_tier = multiplier_tier(node.multiplier);
+        let mult_milli = if node.multiplier.is_finite() && node.multiplier >= 0.0 {
+            (node.multiplier * 1000.0).round() as u64
+        } else {
+            u64::MAX
+        };
+
+        let snap = snapshots.and_then(|map| map.get(&node.id));
+        let (dead_rank, probe_rank, latency_rank) = match snap {
+            Some(s) if s.ok => {
+                let lat = s
+                    .latency_ms
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .map(|v| v.round() as u32)
+                    .unwrap_or(u32::MAX / 2);
+                (0u8, 0u8, lat)
+            }
+            Some(_) => (1u8, 2u8, u32::MAX),
+            None => (0u8, 1u8, u32::MAX),
+        };
+
+        let key = (
+            dead_rank,
+            r_tier,
+            m_tier,
+            probe_rank,
+            r_sub,
+            latency_rank,
+            mult_milli,
+            node.name.trim().to_ascii_lowercase(),
+            node.id.clone(),
+        );
+
+        let replace = match &best {
+            None => true,
+            Some((cur_key, _)) => key < *cur_key,
+        };
+        if replace {
+            best = Some((key, node.id.as_str()));
+        }
+    }
+
+    best.map(|(_, id)| id.to_string())
+}
+
+/// Conservatively classify whether `node` is an IPv6-only business proxy that would fail when
+/// chained through an IPv4-only domestic relay (strictly avoiding false positives on dual-stack
+/// nodes such as `"HK-01-IPv6"`):
+///
+/// 1. `node.server` (or fallback `raw_config["server"]`) parses as `IpAddr::V6`;
+/// 2. `raw_config["ip-version"]` explicitly specifies `"ipv6"` (or `"ipv6-only"`);
+/// 3. `server` hostname carries a dedicated IPv6 label (`ipv6.` / `v6.` / `-ipv6.` / `-v6.` /
+///    `.ipv6.` / `.v6.`) and does NOT contain `"dual"` or `"v4"`;
+/// 4. `node.name` contains an exclusive IPv6-only marker (`ipv6-only` / `ipv6 only` / `v6-only` /
+///    `纯ipv6` / `仅ipv6`, etc.).
+pub fn is_ipv6_only_node(node: &ProxyNode) -> bool {
+    let raw_server = {
+        let s = node.server.trim();
+        if !s.is_empty() {
+            s
+        } else {
+            node.raw_config
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or("")
+        }
+    };
+    let clean_server = raw_server
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+
+    // 1. Literal IPv6 server address.
+    if let Ok(IpAddr::V6(_)) = clean_server.parse::<IpAddr>() {
+        return true;
+    }
+
+    // 2. Explicit Mihomo `ip-version: ipv6` directive in raw_config.
+    if let Some(ip_ver) = node
+        .raw_config
+        .get("ip-version")
+        .and_then(serde_json::Value::as_str)
+    {
+        let normalized_ver = ip_ver.trim().to_ascii_lowercase();
+        if matches!(normalized_ver.as_str(), "ipv6" | "ipv6-only") {
+            return true;
+        }
+    }
+
+    // 3. Dedicated IPv6-only DNS label in server hostname (excluding dual-stack / v4 markers).
+    let server_lower = clean_server.to_ascii_lowercase();
+    if !server_lower.is_empty()
+        && !server_lower.contains("dual")
+        && !server_lower.contains("v4")
+        && (server_lower.starts_with("ipv6.")
+            || server_lower.starts_with("v6.")
+            || server_lower.contains(".ipv6.")
+            || server_lower.contains(".v6.")
+            || server_lower.contains("-ipv6.")
+            || server_lower.contains("-v6."))
+    {
+        return true;
+    }
+
+    // 4. Exclusive IPv6-only terms in display name (never matching generic `HK-01-IPv6`).
+    let name_lower = node.name.trim().to_ascii_lowercase();
+    const EXCLUSIVE_V6_NAME_MARKERS: &[&str] = &[
+        "ipv6-only",
+        "ipv6 only",
+        "ipv6_only",
+        "ipv6only",
+        "v6-only",
+        "v6 only",
+        "v6_only",
+        "v6only",
+        "纯ipv6",
+        "纯 ipv6",
+        "纯v6",
+        "纯 v6",
+        "仅ipv6",
+        "仅 ipv6",
+        "仅v6",
+        "仅 v6",
+        "only-ipv6",
+        "only ipv6",
+        "only-v6",
+        "only v6",
+    ];
+    EXCLUSIVE_V6_NAME_MARKERS
+        .iter()
+        .any(|marker| name_lower.contains(marker))
 }
 
 /// Supported built-in and extensible probe kinds.
@@ -667,5 +940,197 @@ mod tests {
         assert_eq!(gemini.kind, ProbeKind::UnlockRegex);
         assert_eq!(gemini.method, "GET");
         assert_eq!(gemini.expected_status, None);
+    }
+
+    fn demo_node(id: &str, name: &str, region: &str, mult: f64, server: &str) -> ProxyNode {
+        ProxyNode {
+            id: id.to_string(),
+            sub_id: "sub-1".to_string(),
+            name: name.to_string(),
+            protocol: "trojan".to_string(),
+            server: server.to_string(),
+            port: 8443,
+            region_code: region.to_string(),
+            multiplier: mult,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn pick_smart_default_node_skips_info_and_andorra_3x_prefers_mainstream_low_mult_and_healthy() {
+        let mut disabled_tw = demo_node("n-tw-off", "TW 台湾 00", "TW", 1.0, "tw0.example.test");
+        disabled_tw.enabled = false;
+
+        let nodes = vec![
+            demo_node("n-info-1", "剩余流量：180 GB", "UNK", 1.0, "info.example.test"),
+            demo_node("n-info-2", "Expire: 2027-01-01", "TW", 1.0, "info2.example.test"),
+            demo_node("n-info-3", "Official Website Info", "HK", 1.0, "info3.example.test"),
+            demo_node("n-ad-3x", "AD 安道尔 | 3x AD", "AD", 3.0, "ad.example.test"),
+            demo_node("n-tw-3x", "TW 台湾专线 3x", "TW", 3.0, "tw3x.example.test"),
+            demo_node("n-de-1x", "DE 德国 01", "DE", 1.0, "de.example.test"),
+            demo_node("n-hk-1x", "HK 香港 02", "HK", 1.0, "hk2.example.test"),
+            demo_node("n-jp-1x", "JP 日本 01", "JP", 1.0, "jp1.example.test"),
+            disabled_tw,
+        ];
+
+        // 1. Without probe snapshots: skips disabled, info rows, AD 3x, and TW 3x -> picks HK 1x (HK before JP).
+        assert_eq!(
+            pick_smart_default_node_id(&nodes, None).as_deref(),
+            Some("n-hk-1x")
+        );
+
+        // 2. With probe snapshots: healthy JP 1x beats untested HK 1x!
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "n-jp-1x".to_string(),
+            ProbeSnapshot {
+                node_id: "n-jp-1x".to_string(),
+                ok: true,
+                latency_ms: Some(42.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            pick_smart_default_node_id(&nodes, Some(&snaps)).as_deref(),
+            Some("n-jp-1x")
+        );
+
+        // 3. When JP 1x failed (`ok == false`) and HK 1x is untested, never pick failed JP 1x.
+        snaps.insert(
+            "n-jp-1x".to_string(),
+            ProbeSnapshot {
+                node_id: "n-jp-1x".to_string(),
+                ok: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            pick_smart_default_node_id(&nodes, Some(&snaps)).as_deref(),
+            Some("n-hk-1x")
+        );
+
+        // 4. Only info / disabled nodes -> returns None safely.
+        let only_info = vec![
+            demo_node("i1", "官网公告维护通知", "UNK", 1.0, "x.test"),
+            demo_node("i2", "Traffic Reset 1st", "TW", 1.0, "y.test"),
+        ];
+        assert_eq!(pick_smart_default_node_id(&only_info, None), None);
+    }
+
+    #[test]
+    fn is_ipv6_only_node_classifies_strictly_without_false_positive_on_dual_stack() {
+        // 1. Literal IPv6 address (with or without brackets) -> true
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-lit",
+            "JP-01",
+            "JP",
+            1.0,
+            "2001:db8::42"
+        )));
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-bracket",
+            "JP-02",
+            "JP",
+            1.0,
+            "[2001:db8::43]"
+        )));
+
+        // 2. raw_config["ip-version"] == "ipv6" -> true; "dual" / "ipv4-prefer" -> false
+        let mut raw_v6 = demo_node("v6-cfg", "SG-01", "SG", 1.0, "sg01.example.test");
+        raw_v6.raw_config = serde_json::json!({"ip-version": "ipv6"});
+        assert!(is_ipv6_only_node(&raw_v6));
+
+        let mut raw_dual = demo_node("v6-dual-cfg", "HK-01-IPv6", "HK", 1.0, "hk01.example.test");
+        raw_dual.raw_config = serde_json::json!({"ip-version": "dual"});
+        assert!(!is_ipv6_only_node(&raw_dual));
+
+        // 3. Dedicated v6 hostname labels -> true; dual/v4 labels -> false
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-host-1",
+            "JP-01",
+            "JP",
+            1.0,
+            "ipv6.jp.example.test"
+        )));
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-host-2",
+            "JP-02",
+            "JP",
+            1.0,
+            "v6.jp.example.test"
+        )));
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-host-3",
+            "JP-03",
+            "JP",
+            1.0,
+            "tokyo-ipv6.example.test"
+        )));
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-host-4",
+            "JP-04",
+            "JP",
+            1.0,
+            "tokyo-v6.example.test"
+        )));
+        assert!(!is_ipv6_only_node(&demo_node(
+            "dual-host-1",
+            "HK-01-IPv6",
+            "HK",
+            1.0,
+            "dual-ipv6.example.test"
+        )));
+        assert!(!is_ipv6_only_node(&demo_node(
+            "dual-host-2",
+            "HK-02-IPv6",
+            "HK",
+            1.0,
+            "v4-v6.example.test"
+        )));
+
+        // 4. Exclusive name markers -> true; dual-stack label like `HK-01-IPv6` -> false!
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-name-1",
+            "JP-01 IPv6-Only",
+            "JP",
+            1.0,
+            "jp01.example.test"
+        )));
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-name-2",
+            "香港 纯IPv6 01",
+            "HK",
+            1.0,
+            "hk01.example.test"
+        )));
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-name-3",
+            "台湾 仅IPv6 节点",
+            "TW",
+            1.0,
+            "tw01.example.test"
+        )));
+        assert!(is_ipv6_only_node(&demo_node(
+            "v6-name-4",
+            "US v6-only 01",
+            "US",
+            1.0,
+            "us01.example.test"
+        )));
+        assert!(!is_ipv6_only_node(&demo_node(
+            "dual-name-1",
+            "HK-01-IPv6",
+            "HK",
+            1.0,
+            "hk01.example.test"
+        )));
+        assert!(!is_ipv6_only_node(&demo_node(
+            "dual-name-2",
+            "日本 IPv6 双栈 01",
+            "JP",
+            1.0,
+            "jp01.example.test"
+        )));
     }
 }

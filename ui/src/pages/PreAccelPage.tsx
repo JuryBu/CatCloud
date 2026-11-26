@@ -3,6 +3,7 @@ import {
   ArrowDown,
   ArrowLeftRight,
   ArrowUp,
+  Bot,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -15,6 +16,7 @@ import {
   FileText,
   Gauge,
   Globe,
+  Layers,
   Loader2,
   Package,
   Plus,
@@ -24,6 +26,7 @@ import {
   ShieldAlert,
   ShieldCheck,
   SlidersHorizontal,
+  Sparkles,
   Star,
   Terminal,
   Trash2,
@@ -38,6 +41,8 @@ import {
   type AcceleratedProcessStat,
   type AppConfig,
   type GlobalPreAccelScope,
+  type PreAccelDispatchStrategy,
+  type PreAccelLbStrategy,
   type PreAccelRelay,
   catcloudApi,
   formatErrorMessage,
@@ -59,6 +64,7 @@ import {
   resolvePlatformOs,
 } from "../utils/platform";
 import { resolvePreAccelSummary } from "../utils/preaccelStatus";
+import { resolveNodeRegionCode } from "../utils/regions";
 
 const DETECTED_BY_LABELS: Record<string, string> = {
   system_proxy_host: "系统代理",
@@ -459,6 +465,7 @@ export function PreAccelPage() {
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const storeRelays = useAppSelector((s) => s.preAccelRelays);
+  const relayChainLatencies = useAppSelector((s) => s.relayChainLatencies);
   const groups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const initialized = useAppSelector((s) => s.initialized);
@@ -472,6 +479,10 @@ export function PreAccelPage() {
   const platformOs = resolvePlatformOs(runtime.os_label);
 
   const enabled = config.preaccel.enabled;
+  const dispatchStrategy: PreAccelDispatchStrategy = config.preaccel.dispatch_strategy ?? "auto";
+  const activeRelayId: string | null = config?.preaccel.active_relay_id ?? null;
+  const lbStrategy: PreAccelLbStrategy = config.preaccel.lb_strategy ?? "round_robin";
+  const [savingDispatch, setSavingDispatch] = useState(false);
   const [togglingEnabled, setTogglingEnabled] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [savingGlobalScope, setSavingGlobalScope] = useState(false);
@@ -744,6 +755,29 @@ export function PreAccelPage() {
     [relays]
   );
 
+  const physicalHostSummary = useMemo(() => {
+    const enabledList = sortedRelays.filter((r) => r.enabled);
+    const hostMap = new Map<string, number>();
+    for (const r of enabledList) {
+      const hostKey = r.server.trim().toLowerCase();
+      if (!hostKey) continue;
+      hostMap.set(hostKey, (hostMap.get(hostKey) ?? 0) + 1);
+    }
+    const distinctHosts = hostMap.size;
+    const duplicateProtocolCount = Math.max(0, enabledList.length - distinctHosts);
+    return {
+      enabledCount: enabledList.length,
+      distinctHosts,
+      duplicateProtocolCount,
+    };
+  }, [sortedRelays]);
+
+  const isMultiCloudLbStrategy =
+    dispatchStrategy === "load_balance" || (dispatchStrategy === "auto" && !activeRelayId);
+
+  const isMultiCloudLbActive =
+    physicalHostSummary.distinctHosts >= 2 && isMultiCloudLbStrategy;
+
   const enabledRankMap = useMemo(() => {
     const map = new Map<string, number>();
     let rank = 0;
@@ -808,6 +842,7 @@ export function PreAccelPage() {
     : false;
 
   const benchmarkableNodes = useMemo(() => {
+    const preferredRegions = new Set(["TW", "HK", "SG", "JP", "US", "KR"]);
     const isInfoPlaceholder = (name: string) =>
       /剩余流量|过期时间|到期时间|重置|套餐|官网|发布页|续费地址|使用前|更新订阅/i.test(name);
     const enabledList = nodes.filter(
@@ -818,6 +853,15 @@ export function PreAccelPage() {
         ? enabledList
         : nodes.filter((n) => !isUdpOnlyProto(n.protocol) && !isInfoPlaceholder(n.name));
     return [...base].sort((a, b) => {
+      const aHighMult = a.multiplier >= 3 ? 1 : 0;
+      const bHighMult = b.multiplier >= 3 ? 1 : 0;
+      if (aHighMult !== bHighMult) return aHighMult - bHighMult;
+      const aPreferredReg = preferredRegions.has(resolveNodeRegionCode(a)) ? 1 : 0;
+      const bPreferredReg = preferredRegions.has(resolveNodeRegionCode(b)) ? 1 : 0;
+      if (aPreferredReg !== bPreferredReg) return bPreferredReg - aPreferredReg;
+      const aLowMult = a.multiplier <= 1.5 ? 1 : 0;
+      const bLowMult = b.multiplier <= 1.5 ? 1 : 0;
+      if (aLowMult !== bLowMult) return bLowMult - aLowMult;
       const aNon443 = a.is_443_native ? 0 : 1;
       const bNon443 = b.is_443_native ? 0 : 1;
       if (aNon443 !== bNon443) return bNon443 - aNon443;
@@ -1319,11 +1363,18 @@ export function PreAccelPage() {
         await catcloudApi.upsertPreAccelRelay(item);
       }
       appActions.syncPreAccelRelays(normalized);
-      if ((idx === 0 || swapIdx === 0) && normalized[0]?.enabled) {
+      const isMultiCloudLbMode =
+        isMultiCloudLbActive ||
+        dispatchStrategy === "load_balance" ||
+        (dispatchStrategy === "auto" && !activeRelayId);
+      if (!isMultiCloudLbMode && (idx === 0 || swapIdx === 0) && normalized[0]?.enabled) {
         await catcloudApi.selectPreAccelRelay(normalized[0].id);
-        const rt = await catcloudApi.getRuntimeInfo();
-        appActions.syncRuntime(rt);
+        const freshCfg = await catcloudApi.getConfig();
+        appActions.syncConfig(freshCfg);
       }
+      const rt = await catcloudApi.getRuntimeInfo();
+      appActions.syncRuntime(rt);
+      await appActions.refreshGlobalPreAccelStatus();
     } catch (err) {
       setRelays(prevRelays);
       appActions.showToast(`调整线路顺序失败：${formatErrorMessage(err)}`, "warn");
@@ -1346,11 +1397,53 @@ export function PreAccelPage() {
     }
   };
 
+  const handleUpdateDispatchConfig = async (
+    nextStrategy: PreAccelDispatchStrategy,
+    nextLbStrategy: PreAccelLbStrategy = lbStrategy,
+    customNotice?: string
+  ): Promise<boolean> => {
+    if (savingDispatch) return false;
+    setSavingDispatch(true);
+    try {
+      const latestConfig = appStore.getState().config;
+      const nextPreAccel: AppConfig["preaccel"] = {
+        ...latestConfig.preaccel,
+        dispatch_strategy: nextStrategy,
+        lb_strategy: nextLbStrategy,
+        ...(nextStrategy !== "fallback" ? { active_relay_id: null } : {}),
+      };
+      const nextConfig: AppConfig = {
+        ...latestConfig,
+        preaccel: nextPreAccel,
+      };
+      const saved = await catcloudApi.saveConfig(nextConfig);
+      appActions.syncConfig(saved);
+      const rt = await catcloudApi.getRuntimeInfo();
+      appActions.syncRuntime(rt);
+      await appActions.refreshGlobalPreAccelStatus();
+      const notice =
+        customNotice ??
+        (nextStrategy === "fallback"
+          ? "已切换为「单线主备」模式（优先主力线，故障自动切备用）"
+          : `已切换为「多云均衡聚合」模式（${
+              nextLbStrategy === "consistent_hashing" ? "同站一致哈希" : "轮询并发叠加"
+            }）`);
+      appActions.showToast(notice, "ok");
+      return true;
+    } catch (err) {
+      appActions.showToast(`切换中转调度方式失败：${formatErrorMessage(err)}`, "warn");
+      return false;
+    } finally {
+      setSavingDispatch(false);
+    }
+  };
+
   const handleSelectRelay = async (relay: PreAccelRelay) => {
     if (!relay.enabled) {
       appActions.showToast("请先开启该线路，再设为主力", "warn");
       return;
     }
+    const switchingFromMultiCloudLb = isMultiCloudLbActive;
     const prevRelays = relays;
     const reordered = [
       relay,
@@ -1362,6 +1455,17 @@ export function PreAccelPage() {
     });
 
     try {
+      if (switchingFromMultiCloudLb) {
+        const latestConfig = appStore.getState().config;
+        const saved = await catcloudApi.saveConfig({
+          ...latestConfig,
+          preaccel: {
+            ...latestConfig.preaccel,
+            dispatch_strategy: "fallback",
+          },
+        });
+        appActions.syncConfig(saved);
+      }
       await catcloudApi.selectPreAccelRelay(relay.id);
       try {
         for (const item of changed) {
@@ -1372,9 +1476,19 @@ export function PreAccelPage() {
       } catch {
         setRelays(prevRelays);
       }
-      const rt = await catcloudApi.getRuntimeInfo();
+      const [freshCfg, rt] = await Promise.all([
+        catcloudApi.getConfig(),
+        catcloudApi.getRuntimeInfo(),
+      ]);
+      appActions.syncConfig(freshCfg);
       appActions.syncRuntime(rt);
-      appActions.showToast(`已将「${relay.name}」设为主力线路`, "ok");
+      appActions.showToast(
+        switchingFromMultiCloudLb
+          ? `已切换为单线主备并优先使用「${relay.name}」（保留其余线路自动兜底），可随时在上方切回多云自动均衡`
+          : `已将「${relay.name}」设为主力线路（其余线路继续自动故障兜底）`,
+        "ok",
+        5200
+      );
     } catch (err) {
       setRelays(prevRelays);
       appActions.showToast(`设置主力线路失败：${formatErrorMessage(err)}`, "warn");
@@ -1386,7 +1500,11 @@ export function PreAccelPage() {
     setFailoverBusy(true);
     try {
       const nextId = await catcloudApi.failoverPreAccel();
-      const rt = await catcloudApi.getRuntimeInfo();
+      const [freshCfg, rt] = await Promise.all([
+        catcloudApi.getConfig(),
+        catcloudApi.getRuntimeInfo(),
+      ]);
+      appActions.syncConfig(freshCfg);
       appActions.syncRuntime(rt);
       if (nextId) {
         const matched = relays.find((r) => r.id === nextId);
@@ -1982,9 +2100,16 @@ export function PreAccelPage() {
               <span className="rounded-full bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--muted)]">
                 {sortedRelays.length} 条
               </span>
+              {physicalHostSummary.distinctHosts >= 2 && (
+                <span className="rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--green)]">
+                  {physicalHostSummary.distinctHosts} 台物理云
+                </span>
+              )}
             </div>
             <p className="mt-0.5 text-[11px] text-[var(--muted)]">
-              排在首位的是主力线路，遇到波动时自动按顺序切换到备用线路
+              {isMultiCloudLbActive
+                ? "多云均衡模式：自动按不同物理主机聚合并发带宽，同机多协议自动去重并保留故障兜底"
+                : "单线主备模式：排在首位的是主力线路，遇到波动时自动按顺序切换到备用线路"}
             </p>
           </div>
 
@@ -2047,6 +2172,110 @@ export function PreAccelPage() {
           </div>
         </div>
 
+        {/* 多云均衡聚合 / 单线主备 调度方式控制条 */}
+        {sortedRelays.length > 0 && (
+          <div className="mb-4 space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2.5 text-xs">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="inline-flex items-center gap-1.5 font-medium text-[var(--text-secondary)]">
+                  <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
+                  <span>{dict.preaccel.dispatchLabel}</span>
+                </span>
+                <div
+                  className="inline-flex rounded-xl border border-[var(--line)] bg-[var(--card)] p-0.5 text-[11px]"
+                  role="group"
+                  aria-label={dict.preaccel.dispatchLabel}
+                >
+                  <button
+                    type="button"
+                    disabled={savingDispatch}
+                    onClick={() => void handleUpdateDispatchConfig("auto", lbStrategy)}
+                    className={`rounded-lg px-2.5 py-1 font-medium transition-colors disabled:opacity-60 ${
+                      isMultiCloudLbStrategy
+                        ? "bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
+                        : "text-[var(--muted)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    {dict.preaccel.dispatchAutoLb}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={savingDispatch}
+                    onClick={() => void handleUpdateDispatchConfig("fallback", lbStrategy)}
+                    className={`rounded-lg px-2.5 py-1 font-medium transition-colors disabled:opacity-60 ${
+                      !isMultiCloudLbStrategy
+                        ? "bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
+                        : "text-[var(--muted)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    {dict.preaccel.dispatchFallback}
+                  </button>
+                </div>
+              </div>
+
+              {isMultiCloudLbActive && (
+                <div className="flex items-center gap-1.5 text-[11px]">
+                  <span className="text-[var(--muted)]">均衡算法</span>
+                  <button
+                    type="button"
+                    disabled={savingDispatch}
+                    onClick={() =>
+                      void handleUpdateDispatchConfig(
+                        dispatchStrategy,
+                        lbStrategy === "round_robin" ? "consistent_hashing" : "round_robin"
+                      )
+                    }
+                    className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
+                    title="轮询可最大化多云并发叠加带宽；一致哈希可让同一目标站固定走同一台云"
+                  >
+                    {lbStrategy === "consistent_hashing" ? "同站一致哈希" : "轮询并发叠加"}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {physicalHostSummary.distinctHosts >= 2 && isMultiCloudLbActive && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--green)]/40 bg-[var(--green-soft)]/45 px-3.5 py-2 text-[11.5px] text-[var(--text)]">
+                <div className="flex min-w-0 items-center gap-2">
+                  <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
+                  <span>
+                    已自动聚合{" "}
+                    <strong className="cc-mono text-[var(--green)]">
+                      {physicalHostSummary.distinctHosts}
+                    </strong>{" "}
+                    台物理云并发带宽
+                    {physicalHostSummary.duplicateProtocolCount > 0
+                      ? `（同机多余 ${physicalHostSummary.duplicateProtocolCount} 条协议已自动去重防抢占网卡）`
+                      : "（同机多协议自动去重）"}
+                    ，单台故障自动切换备用与直连兜底。
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {physicalHostSummary.distinctHosts >= 2 && !isMultiCloudLbActive && (
+              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)]/45 px-3.5 py-2 text-[11.5px] text-[var(--text)]">
+                <span className="text-[var(--text-secondary)]">
+                  当前已手动固定为单线主备模式（优先使用首位主力线，其余线路作故障兜底）。检测到{" "}
+                  <strong className="cc-mono text-[var(--text)]">
+                    {physicalHostSummary.distinctHosts}
+                  </strong>{" "}
+                  台不同物理云，可随时切回并发聚合。
+                </span>
+                <button
+                  type="button"
+                  disabled={savingDispatch}
+                  onClick={() => void handleUpdateDispatchConfig("auto", lbStrategy)}
+                  className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[var(--accent)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+                >
+                  <Layers className="h-3 w-3" />
+                  <span>{dict.preaccel.switchBackLbBtn}</span>
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
         {importWarnings.length > 0 && (
           <div className="mb-4 flex items-start justify-between gap-3 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2.5 text-xs text-[var(--amber)]">
             <div>
@@ -2088,7 +2317,13 @@ export function PreAccelPage() {
             const hasUrgentExpiry = expiry.tone === "warn" || expiry.tone === "expired";
             const safeSni = (relay.sni ?? "").trim();
             const hasConfigTip = relay.port !== 443 || safeSni !== "";
-            const canSetPrimary = relay.enabled && (!isTopEnabled || !isActivePrimary);
+            const canSetPrimary =
+              relay.enabled && (isMultiCloudLbActive || !isTopEnabled || !isActivePrimary);
+            const rawChainMs = relayChainLatencies[relay.id];
+            const validChainMs =
+              typeof rawChainMs === "number" && Number.isFinite(rawChainMs) && rawChainMs > 0
+                ? Math.round(rawChainMs)
+                : null;
 
             return (
               <div
@@ -2190,11 +2425,12 @@ export function PreAccelPage() {
                     </div>
                   </div>
 
-                  {/* 实时延迟 + 真实上下行 */}
+                  {/* 实时直连延迟 + 真实上下行 + 经海外对比延迟（严格区分绝不混淆） */}
                   <div className="shrink-0 text-right">
                     <div
                       className="cc-mono cc-tabular text-base font-bold leading-tight"
                       style={{ color: getRelayLatencyColor(relay.last_probe_ms) }}
+                      title="本机直连国内中转的真实延迟（绝不被经海外节点的两跳测速延迟污染）"
                     >
                       {relay.last_probe_ms !== null
                         ? formatLatencyDisplay(relay.last_probe_ms, "--")
@@ -2225,7 +2461,15 @@ export function PreAccelPage() {
                       </div>
                     ) : (
                       <div className="mt-0.5 text-[10px] text-[var(--muted)]">
-                        {relay.last_probe_ms !== null ? "未测上下行" : "实时延迟"}
+                        {relay.last_probe_ms !== null ? "直连延迟 · 未测上下行" : "直连实时延迟"}
+                      </div>
+                    )}
+                    {validChainMs !== null && (
+                      <div
+                        className="mt-0.5 whitespace-nowrap cc-mono text-[10px] text-[var(--muted)]"
+                        title="经国内中转 + 海外参考节点的两跳对比延迟，仅作上下行测试参考，不影响上方直连延迟"
+                      >
+                        {dict.preaccel.chainLatencyLabel} {validChainMs} ms
                       </div>
                     )}
                   </div>
@@ -2261,10 +2505,17 @@ export function PreAccelPage() {
                       <button
                         type="button"
                         onClick={() => void handleSelectRelay(relay)}
+                        title={
+                          isMultiCloudLbActive
+                            ? "切换为单线主备模式并固定优先使用此线（随时可切回多云自动均衡）"
+                            : "设为首选主力线路（其余启用线路继续自动故障兜底）"
+                        }
                         className="inline-flex items-center gap-1 whitespace-nowrap font-medium text-[var(--accent)] transition-opacity hover:opacity-80"
                       >
                         <Star className="h-3.5 w-3.5" />
-                        <span>设为主力</span>
+                        <span>
+                          {isMultiCloudLbActive ? dict.preaccel.pinPrimaryBtn : "设为主力"}
+                        </span>
                       </button>
                     )}
 
@@ -2309,22 +2560,57 @@ export function PreAccelPage() {
           })}
 
           {sortedRelays.length === 0 && (
-            <div className="col-span-full flex flex-col items-center justify-center rounded-2xl border border-dashed border-[var(--line)] py-10 text-center">
-              <Server className="h-7 w-7 text-[var(--muted)]/70" />
-              <p className="mt-2.5 text-xs font-medium text-[var(--text-secondary)]">
-                还没有添加中转线路
-              </p>
-              <p className="mt-1 text-[11px] text-[var(--muted)]">
-                添加一台国内轻量云服务器即可显著提升上传速度
-              </p>
-              <button
-                type="button"
-                onClick={() => openAddModal("manual")}
-                className="mt-3.5 inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                <span>添加中转</span>
-              </button>
+            <div className="col-span-full rounded-2xl border border-[var(--accent)]/40 bg-[var(--accent-soft)]/35 p-5">
+              <div className="flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
+                <div className="flex min-w-0 items-start gap-3">
+                  <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                    <Sparkles className="h-5 w-5" />
+                  </span>
+                  <div className="min-w-0">
+                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                      {dict.preaccel.emptyFriendlyTitle}
+                    </h3>
+                    <p className="mt-1 max-w-2xl text-xs leading-relaxed text-[var(--text-secondary)]">
+                      {dict.preaccel.emptyFriendlyDesc}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => appActions.openAiAssistant("preaccel", "agent")}
+                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90"
+                >
+                  <Bot className="h-3.5 w-3.5" />
+                  <span>{dict.preaccel.emptyAskAiDeploy}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openAddModal("manual")}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  <span>添加中转</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => openAddModal("import")}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+                >
+                  <Upload className="h-3.5 w-3.5" />
+                  <span>粘贴导入码</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShareModalOpen(true)}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+                >
+                  <Package className="h-3.5 w-3.5 text-[var(--accent)]" />
+                  <span>{dict.common.importShareBundle}</span>
+                </button>
+              </div>
             </div>
           )}
         </div>

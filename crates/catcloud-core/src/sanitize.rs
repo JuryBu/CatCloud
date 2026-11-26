@@ -2,8 +2,9 @@ use crate::models::{PreAccelRelay, ProxyNode};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
 
-/// Public DNS IPv4 allowlist aligned with `scripts/ci/check_public_sanitization.mjs`.
-/// These well-known public resolvers are preserved verbatim during log/CLI sanitization.
+/// Well-known public DNS IPv4 resolvers (retained for reference and diagnostic labeling).
+/// Note: Runtime sanitization via [`is_safe_dns_or_local_ipv4`] no longer exempts these IPv4s;
+/// all non-loopback/non-unspecified IPv4s are masked to `A.B.C.*` (e.g. `223.5.5.*`).
 pub const SAFE_PUBLIC_DNS_IPV4S: &[&str] = &[
     "1.1.1.1",
     "1.0.0.1",
@@ -26,35 +27,11 @@ pub const SAFE_PUBLIC_DNS_IPV4S: &[&str] = &[
     "210.2.4.8",
 ];
 
-/// Returns `true` strictly for loopback (`127.0.0.1`), unspecified (`0.0.0.0`),
-/// Mihomo Fake-IP range (`198.18.0.0/15`), and the 19 allowlisted public DNS IPv4s.
-/// All other public and private IPv4 addresses are masked to `A.B.C.*`.
+/// Returns `true` strictly for loopback (`127.0.0.1`) and unspecified (`0.0.0.0`).
+/// All private (including `198.18.0.0/15`, `10.*`, `172.16-31.*`, `192.168.*`, `169.254.*`)
+/// and public IPv4 addresses (including public DNS resolvers) are masked to `A.B.C.*`.
 pub fn is_safe_dns_or_local_ipv4(octets: [u8; 4]) -> bool {
-    matches!(
-        octets,
-        [127, 0, 0, 1]
-            | [0, 0, 0, 0]
-            | [198, 18 | 19, _, _]
-            | [1, 1, 1, 1]
-            | [1, 0, 0, 1]
-            | [8, 8, 8, 8]
-            | [8, 8, 4, 4]
-            | [9, 9, 9, 9]
-            | [149, 112, 112, 112]
-            | [223, 5, 5, 5]
-            | [223, 6, 6, 6]
-            | [119, 29, 29, 29]
-            | [119, 28, 28, 28]
-            | [1, 12, 12, 12]
-            | [120, 53, 53, 53]
-            | [114, 114, 114, 114]
-            | [114, 114, 115, 115]
-            | [180, 76, 76, 76]
-            | [180, 184, 1, 1]
-            | [180, 184, 2, 2]
-            | [1, 2, 4, 8]
-            | [210, 2, 4, 8]
-    )
+    matches!(octets, [127, 0, 0, 1] | [0, 0, 0, 0])
 }
 
 /// Strictly sanitize a log, diagnostic, or error line before persisting or exporting to AI/CLI:
@@ -66,9 +43,9 @@ pub fn is_safe_dns_or_local_ipv4(octets: [u8; 4]) -> bool {
 /// - Redacts local user home directory usernames (`C:\Users\<USER>\`, `/Users/<USER>/`,
 ///   `/home/<USER>/`), including Chinese and space-containing usernames
 /// - Redacts non-system drive absolute paths (`D:\SomeFolder\...` -> `<LOCAL_PATH>` / `<LOCAL_PATH>/bin`)
-/// - Masks private, CGNAT, link-local, ULA, and public IPv4/IPv6 addresses, only exempting
-///   `127.0.0.1`, `0.0.0.0`, `198.18.0.0/15`, `::1`, `::`, and `SAFE_PUBLIC_DNS_IPV4S`
-///   without touching timestamps (`HH:MM:SS`)
+/// - Masks all private (including `198.18.0.0/15`), CGNAT, link-local, ULA, and public IPv4/IPv6
+///   addresses, strictly exempting only `127.0.0.1`, `0.0.0.0`, `::1`, and `::` without touching
+///   timestamps (`HH:MM:SS`), version strings (`v1_1.2.3.4`), or 5+ segment OIDs
 /// - Masks non-allowlisted upstream proxy domains appearing in dial/connect error messages
 ///   (e.g. `dial tcp/udp ...` or `connect error ...`) to `***.<tld>`
 pub fn sanitize_log_line(raw: &str) -> String {
@@ -540,13 +517,326 @@ pub fn redact_node_for_readonly(node: &ProxyNode) -> ProxyNode {
     out
 }
 
+/// Recursively sanitize an arbitrary JSON value in place as a final safety pass for
+/// `sanitized: true` CLI/diagnostic outputs:
+/// - Skips pure numbers, booleans, nulls, and allowlisted scalar metadata keys (`id`, `version`,
+///   `core_version`, `schema_version`, `sha256`, `config_sha256`, `instance_hash`, `timestamp`,
+///   and any `*_at` timestamp key).
+/// - Routes `source_ip`, `destination_ip`, `controller_addr`, `controller_host`, `server`,
+///   `sni`, and `servername` through [`redact_ip_or_host`].
+/// - Routes plain `host` keys through IP-only redaction so IPv4/IPv6 literals (including
+///   `IP:port` / `[IPv6]:port`) are masked while normal business target domains (such as
+///   `api.openai.com` or `github.com`) remain intact.
+/// - Routes filesystem path keys (`*_path`, `*_dir`, `data_dir`, `cli_path`, `binary_path`,
+///   `config_path`, etc.) through [`redact_path_for_display`] + [`sanitize_log_line`].
+/// - Routes explicit credential keys (`password`, `secret`, `*_secret`, `*_token`, etc.)
+///   to `"<REDACTED>"` and all remaining strings through [`sanitize_log_line`].
+pub fn sanitize_json_value(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map.iter_mut() {
+                if is_json_metadata_skip_key(k) {
+                    if !v.is_string() {
+                        sanitize_json_value(v);
+                    }
+                    continue;
+                }
+                if is_json_explicit_credential_key(k) {
+                    match v {
+                        serde_json::Value::String(s) => {
+                            if !s.is_empty() && s != "<REDACTED>" {
+                                *s = "<REDACTED>".to_string();
+                            }
+                        }
+                        serde_json::Value::Number(_) => {
+                            *v = serde_json::Value::String("<REDACTED>".to_string());
+                        }
+                        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                            sanitize_json_value(v);
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                if is_json_ip_or_upstream_host_key(k) {
+                    match v {
+                        serde_json::Value::String(s) => {
+                            if !s.trim().is_empty() {
+                                *s = redact_ip_or_host(s);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for item in arr.iter_mut() {
+                                if let serde_json::Value::String(s) = item {
+                                    if !s.trim().is_empty() {
+                                        *s = redact_ip_or_host(s);
+                                    }
+                                } else {
+                                    sanitize_json_value(item);
+                                }
+                            }
+                        }
+                        _ => sanitize_json_value(v),
+                    }
+                    continue;
+                }
+                if k.trim().eq_ignore_ascii_case("host") {
+                    match v {
+                        serde_json::Value::String(s) => {
+                            if !s.trim().is_empty() {
+                                *s = redact_ip_literal_preserve_domain(s);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for item in arr.iter_mut() {
+                                if let serde_json::Value::String(s) = item {
+                                    if !s.trim().is_empty() {
+                                        *s = redact_ip_literal_preserve_domain(s);
+                                    }
+                                } else {
+                                    sanitize_json_value(item);
+                                }
+                            }
+                        }
+                        _ => sanitize_json_value(v),
+                    }
+                    continue;
+                }
+                if is_json_path_key(k) {
+                    match v {
+                        serde_json::Value::String(s) => {
+                            if !s.trim().is_empty() {
+                                let p = redact_path_for_display(s);
+                                *s = sanitize_log_line(&p);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for item in arr.iter_mut() {
+                                if let serde_json::Value::String(s) = item {
+                                    if !s.trim().is_empty() {
+                                        let p = redact_path_for_display(s);
+                                        *s = sanitize_log_line(&p);
+                                    }
+                                } else {
+                                    sanitize_json_value(item);
+                                }
+                            }
+                        }
+                        _ => sanitize_json_value(v),
+                    }
+                    continue;
+                }
+                sanitize_json_value(v);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                sanitize_json_value(item);
+            }
+        }
+        serde_json::Value::String(s) => {
+            *s = sanitize_log_line(s);
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
+    }
+}
+
+fn is_json_metadata_skip_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "id" | "version"
+            | "core_version"
+            | "schema_version"
+            | "sha256"
+            | "config_sha256"
+            | "instance_hash"
+            | "timestamp"
+    ) || lower.ends_with("_at")
+}
+
+fn is_json_explicit_credential_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "password"
+            | "passwd"
+            | "pwd"
+            | "uuid"
+            | "token"
+            | "secret"
+            | "controller_secret"
+            | "obfs_password"
+            | "obfs-password"
+            | "client_secret"
+            | "client-secret"
+            | "access_token"
+            | "access-token"
+            | "refresh_token"
+            | "refresh-token"
+            | "api_key"
+            | "api-key"
+            | "apikey"
+            | "private_key"
+            | "private-key"
+            | "public_key"
+            | "public-key"
+            | "short_id"
+            | "short-id"
+            | "auth"
+            | "auth_str"
+            | "auth-str"
+            | "psk"
+            | "pbk"
+            | "sid"
+            | "cookie"
+            | "set-cookie"
+            | "username"
+            | "passphrase"
+            | "authorization"
+    ) || lower.ends_with("_password")
+        || lower.ends_with("-password")
+        || lower.ends_with("_secret")
+        || lower.ends_with("-secret")
+        || lower.ends_with("_token")
+        || lower.ends_with("-token")
+        || lower.ends_with("_private_key")
+        || lower.ends_with("-private-key")
+}
+
+fn is_json_ip_or_upstream_host_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "source_ip"
+            | "destination_ip"
+            | "sourceip"
+            | "destinationip"
+            | "controller_addr"
+            | "controller_host"
+            | "server"
+            | "sni"
+            | "servername"
+            | "server_name"
+            | "server-name"
+    )
+}
+
+fn is_json_path_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "path"
+            | "dir"
+            | "data_dir"
+            | "cli_path"
+            | "binary_path"
+            | "config_path"
+            | "log_path"
+            | "runtime_dir"
+            | "process_path"
+    ) || lower.ends_with("_path")
+        || lower.ends_with("-path")
+        || lower.ends_with("_dir")
+        || lower.ends_with("-dir")
+}
+
+/// Mask a plain `host` value only when it is an IPv4/IPv6 literal (optionally with `:port` or
+/// bracketed `[IPv6]:port`), preserving business target domains (e.g. `api.openai.com`,
+/// `github.com`) intact.
+fn redact_ip_literal_preserve_domain(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // 1. Bracketed IPv6 `[addr]` or `[addr]:port`
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        if let Some(close_idx) = rest.find(']') {
+            let inner = &rest[..close_idx];
+            let suffix = &rest[close_idx + 1..];
+            if inner.ends_with("::*") {
+                return trimmed.to_string();
+            }
+            if let Ok(ip) = Ipv6Addr::from_str(inner) {
+                return format!("[{}]{suffix}", format_redacted_ipv6(ip, inner));
+            }
+        }
+    }
+
+    // 2. Pure IPv6 without brackets
+    if trimmed.ends_with("::*") {
+        return trimmed.to_string();
+    }
+    if let Ok(ip) = Ipv6Addr::from_str(trimmed) {
+        return format_redacted_ipv6(ip, trimmed);
+    }
+
+    // 3. Unbracketed IPv6 + `:port`
+    if trimmed.bytes().filter(|&b| b == b':').count() >= 3 {
+        if let Some((addr_part, port_part)) = trimmed.rsplit_once(':') {
+            if !port_part.is_empty()
+                && port_part.bytes().all(|b| b.is_ascii_digit())
+                && port_part.parse::<u16>().is_ok()
+            {
+                if addr_part.ends_with("::*") {
+                    return trimmed.to_string();
+                }
+                if let Ok(ip) = Ipv6Addr::from_str(addr_part) {
+                    return format!("{}:{port_part}", format_redacted_ipv6(ip, addr_part));
+                }
+            }
+        }
+    }
+
+    // 4. Optional single `:port` suffix for IPv4
+    let (host_part, port_suffix) = if let Some((h, p)) = trimmed.rsplit_once(':') {
+        if !h.contains(':')
+            && !p.is_empty()
+            && p.bytes().all(|b| b.is_ascii_digit())
+            && p.parse::<u16>().is_ok()
+        {
+            (h, Some(p))
+        } else {
+            (trimmed, None)
+        }
+    } else {
+        (trimmed, None)
+    };
+
+    if let Ok(ip) = Ipv4Addr::from_str(host_part) {
+        let o = ip.octets();
+        let masked = if is_safe_dns_or_local_ipv4(o) {
+            host_part.to_string()
+        } else {
+            format!("{}.{}.{}.*", o[0], o[1], o[2])
+        };
+        return if let Some(port) = port_suffix {
+            format!("{masked}:{port}")
+        } else {
+            masked
+        };
+    }
+
+    // Business domain (e.g. `api.openai.com`, `github.com`): keep verbatim while still stripping
+    // any accidentally embedded URL credentials or inline secrets.
+    sanitize_log_line(raw)
+}
+
 /// Sanitize a compiled Mihomo YAML configuration for read-only CLI/AI output:
-/// - Redacts controller `secret`, proxy `server`, `username`, `password`, `uuid`, `token`,
-///   `private-key`, `public-key`, `short-id`, `auth-str`, `obfs-password`, `psk`, `pbk`, `sid`
-/// - Redacts local user home paths, non-system drive paths, and non-safe IPv4/IPv6 literals
-/// - Preserves safe local/Fake-IP/public DNS literals and keeps output valid YAML
+/// - Redacts controller `secret`, proxy `server`, `sni`, `servername`, `server-name`, `server_name`,
+///   `host`, `obfs-host`, `obfs_host`, `username`, `password`, `uuid`, `token`, `private-key`,
+///   `public-key`, `short-id`, `auth-str`, `obfs-password`, `psk`, `pbk`, `sid`
+/// - Handles both inline YAML flow arrays (`host: [a, b]`) and multi-line YAML block sequences
+///   (`host:\n  - a.vendor.com`)
+/// - Redacts local user home paths, non-system drive paths, and all non-loopback/non-unspecified
+///   IPv4/IPv6 literals
+/// - Quotes leading `*` and other YAML special indicator scalars so redacted values remain
+///   syntactically valid YAML
 pub fn redact_compiled_yaml(yaml: &str) -> String {
     let mut out = String::with_capacity(yaml.len());
+    let mut block_host_seq_indent: Option<usize> = None;
+
     for chunk in yaml.split_inclusive('\n') {
         let (line, newline) = if let Some(stripped) = chunk.strip_suffix("\r\n") {
             (stripped, "\r\n")
@@ -555,7 +845,41 @@ pub fn redact_compiled_yaml(yaml: &str) -> String {
         } else {
             (chunk, "")
         };
-        let step1 = redact_yaml_extra_fields(line);
+
+        let mut handled_as_block_item = false;
+        let step1 = if let Some(parent_indent) = block_host_seq_indent {
+            if line.trim().is_empty() {
+                block_host_seq_indent = None;
+                redact_yaml_extra_fields(line)
+            } else {
+                let line_indent = line
+                    .bytes()
+                    .take_while(|&b| b == b' ' || b == b'\t')
+                    .count();
+                if line_indent <= parent_indent {
+                    block_host_seq_indent = None;
+                    redact_yaml_extra_fields(line)
+                } else if line[line_indent..].starts_with('#') {
+                    handled_as_block_item = true;
+                    line.to_string()
+                } else if let Some(redacted_item) =
+                    redact_yaml_block_seq_host_item(line, line_indent)
+                {
+                    handled_as_block_item = true;
+                    redacted_item
+                } else {
+                    block_host_seq_indent = None;
+                    redact_yaml_extra_fields(line)
+                }
+            }
+        } else {
+            redact_yaml_extra_fields(line)
+        };
+
+        if !handled_as_block_item && block_host_seq_indent.is_none() {
+            block_host_seq_indent = detect_yaml_block_host_seq_indent(line);
+        }
+
         let step2 = sanitize_log_line(&step1);
         out.push_str(&step2);
         out.push_str(newline);
@@ -563,8 +887,181 @@ pub fn redact_compiled_yaml(yaml: &str) -> String {
     out
 }
 
-/// Redact YAML-specific `server:` (host/IP) and `username:` fields in both block and flow YAML
-/// without matching `nameserver:`, `proxy-server-nameserver:`, or `servername:`.
+fn needs_yaml_quoting(s: &str) -> bool {
+    matches!(
+        s.as_bytes().first(),
+        Some(
+            b'*' | b'&'
+                | b'!'
+                | b'%'
+                | b'@'
+                | b'`'
+                | b'['
+                | b'{'
+                | b'>'
+                | b'|'
+                | b'?'
+                | b':'
+                | b'-'
+                | b'#'
+                | b','
+        )
+    )
+}
+
+fn is_yaml_block_host_seq_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "host" | "sni" | "servername" | "server-name" | "server_name" | "obfs-host" | "obfs_host"
+    )
+}
+
+fn detect_yaml_block_host_seq_indent(line: &str) -> Option<usize> {
+    let indent = line
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    let mut rest = &line[indent..];
+    if rest.is_empty() || rest.starts_with('#') {
+        return None;
+    }
+    if let Some(after_dash) = rest
+        .strip_prefix("- ")
+        .or_else(|| rest.strip_prefix("-\t"))
+    {
+        rest = after_dash.trim_start_matches([' ', '\t']);
+    }
+    let colon_idx = rest.find(':')?;
+    let after_colon = rest[colon_idx + 1..].trim_start_matches([' ', '\t']);
+    if !after_colon.is_empty() && !after_colon.starts_with('#') {
+        return None;
+    }
+    let raw_key = rest[..colon_idx].trim();
+    let unquoted = if (raw_key.starts_with('"') && raw_key.ends_with('"') && raw_key.len() >= 2)
+        || (raw_key.starts_with('\'') && raw_key.ends_with('\'') && raw_key.len() >= 2)
+    {
+        &raw_key[1..raw_key.len() - 1]
+    } else {
+        raw_key
+    };
+    if is_yaml_block_host_seq_key(unquoted) {
+        Some(indent)
+    } else {
+        None
+    }
+}
+
+fn split_yaml_unquoted_value_and_tail(val_slice: &str) -> (&str, &str) {
+    let bytes = val_slice.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+            let value_part = val_slice[..i].trim_end_matches([' ', '\t']);
+            return (value_part, &val_slice[value_part.len()..]);
+        }
+        i += 1;
+    }
+    let value_part = val_slice.trim_end_matches([' ', '\t']);
+    (value_part, &val_slice[value_part.len()..])
+}
+
+fn redact_yaml_block_seq_host_item(line: &str, line_indent: usize) -> Option<String> {
+    let rest = &line[line_indent..];
+    if !(rest.starts_with("- ") || rest.starts_with("-\t")) {
+        return None;
+    }
+    let after_dash_idx = line_indent + 1;
+    let ws_len = line[after_dash_idx..]
+        .bytes()
+        .take_while(|&b| b == b' ' || b == b'\t')
+        .count();
+    let val_start = after_dash_idx + ws_len;
+    let val_slice = &line[val_start..];
+    if val_slice.is_empty() || val_slice.starts_with('#') {
+        return Some(line.to_string());
+    }
+    let prefix = &line[..val_start];
+    let first_byte = val_slice.as_bytes()[0];
+    if matches!(first_byte, b'"' | b'\'') {
+        let qc = first_byte as char;
+        let inner = &val_slice[1..];
+        let close_rel = if first_byte == b'"' {
+            find_unescaped_quote(inner, first_byte)
+        } else {
+            let ib = inner.as_bytes();
+            let mut pos = 0usize;
+            let mut found = None;
+            while pos < ib.len() {
+                if ib[pos] == b'\'' {
+                    if pos + 1 < ib.len() && ib[pos + 1] == b'\'' {
+                        pos += 2;
+                        continue;
+                    }
+                    found = Some(pos);
+                    break;
+                }
+                pos += 1;
+            }
+            found
+        };
+        if let Some(close_idx) = close_rel {
+            let raw_val = &inner[..close_idx];
+            let tail = &inner[close_idx + 1..];
+            let masked = if raw_val.trim().is_empty() {
+                raw_val.to_string()
+            } else {
+                redact_ip_or_host(raw_val)
+            };
+            return Some(format!("{prefix}{qc}{masked}{qc}{tail}"));
+        }
+    }
+
+    let (raw_val, tail) = split_yaml_unquoted_value_and_tail(val_slice);
+    if raw_val.is_empty() || raw_val.eq_ignore_ascii_case("null") || raw_val == "~" {
+        return Some(line.to_string());
+    }
+    let masked = redact_ip_or_host(raw_val);
+    let rendered = if needs_yaml_quoting(&masked) {
+        format!("\"{masked}\"")
+    } else {
+        masked
+    };
+    Some(format!("{prefix}{rendered}{tail}"))
+}
+
+fn redact_yaml_flow_host_list(inner: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for raw_item in inner.split(',') {
+        let trimmed = raw_item.trim();
+        if trimmed.is_empty() {
+            parts.push(String::new());
+            continue;
+        }
+        let quoted = (trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2)
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2);
+        if quoted {
+            let q = trimmed.as_bytes()[0] as char;
+            let val = &trimmed[1..trimmed.len() - 1];
+            let masked = redact_ip_or_host(val);
+            parts.push(format!("{q}{masked}{q}"));
+        } else if trimmed.eq_ignore_ascii_case("null") || trimmed == "~" {
+            parts.push(trimmed.to_string());
+        } else {
+            let masked = redact_ip_or_host(trimmed);
+            if needs_yaml_quoting(&masked) {
+                parts.push(format!("\"{masked}\""));
+            } else {
+                parts.push(masked);
+            }
+        }
+    }
+    parts.join(", ")
+}
+
+/// Redact YAML-specific `server:`, `servername:`, `server-name:`, `server_name:`, `sni:`,
+/// `host:`, `obfs-host:`, `obfs_host:`, and `username:` fields in both block and flow YAML
+/// without matching `nameserver:` or `proxy-server-nameserver:`.
 fn redact_yaml_extra_fields(line: &str) -> String {
     let bytes = line.as_bytes();
     let mut out = String::with_capacity(line.len());
@@ -576,8 +1073,18 @@ fn redact_yaml_extra_fields(line: &str) -> String {
                 || matches!(bytes[i - 1], b'_' | b'-' | b'/'));
 
         if prev_ok && bytes[i].is_ascii_alphabetic() {
-            let mut matched_kind: Option<(&str, bool)> = None; // (key, is_server)
-            for &(key, is_server) in &[("server", true), ("username", false)] {
+            let mut matched_kind: Option<(&str, bool)> = None; // (key, is_host_or_server)
+            for &(key, is_host_or_server) in &[
+                ("servername", true),
+                ("server-name", true),
+                ("server_name", true),
+                ("server", true),
+                ("sni", true),
+                ("host", true),
+                ("obfs-host", true),
+                ("obfs_host", true),
+                ("username", false),
+            ] {
                 let klen = key.len();
                 if i + klen < bytes.len()
                     && bytes[i..i + klen].eq_ignore_ascii_case(key.as_bytes())
@@ -599,18 +1106,37 @@ fn redact_yaml_extra_fields(line: &str) -> String {
                         ) || (was_quoted_key
                             && matches!(next_after_colon, Some(b'"' | b'\'')));
                         if is_yaml_mapping_colon {
-                            matched_kind = Some((key, is_server));
                             let mut val_start = sep_idx + 1;
                             while val_start < bytes.len() && bytes[val_start] == b' ' {
                                 val_start += 1;
                             }
                             if val_start >= bytes.len()
-                                || matches!(bytes[val_start], b'{' | b'[' | b'\r' | b'\n' | b'#')
+                                || matches!(bytes[val_start], b'{' | b'\r' | b'\n' | b'#')
                             {
-                                matched_kind = None;
                                 break;
                             }
 
+                            // Support inline YAML flow arrays for host fields such as
+                            // `host: [h2a.vendor.com, h2b.vendor.org]`.
+                            if bytes[val_start] == b'[' {
+                                if is_host_or_server {
+                                    let rest = &line[val_start + 1..];
+                                    if let Some(close_rel) = rest.find(']') {
+                                        let inner = &rest[..close_rel];
+                                        if !inner.contains('{') && !inner.contains('[') {
+                                            matched_kind = Some((key, is_host_or_server));
+                                            out.push_str(&line[i..val_start]);
+                                            out.push('[');
+                                            out.push_str(&redact_yaml_flow_host_list(inner));
+                                            out.push(']');
+                                            i = val_start + 1 + close_rel + 1;
+                                        }
+                                    }
+                                }
+                                break;
+                            }
+
+                            matched_kind = Some((key, is_host_or_server));
                             out.push_str(&line[i..val_start]);
                             if matches!(bytes[val_start], b'"' | b'\'') {
                                 let q = bytes[val_start];
@@ -619,7 +1145,7 @@ fn redact_yaml_extra_fields(line: &str) -> String {
                                 let inner = &line[val_start + 1..];
                                 if let Some(close_rel) = find_unescaped_quote(inner, q) {
                                     let raw_val = &inner[..close_rel];
-                                    let rep = if is_server {
+                                    let rep = if is_host_or_server {
                                         redact_ip_or_host(raw_val)
                                     } else if raw_val.is_empty() {
                                         String::new()
@@ -634,7 +1160,7 @@ fn redact_yaml_extra_fields(line: &str) -> String {
                                         .find(is_value_terminator)
                                         .unwrap_or(inner.len());
                                     let raw_val = &inner[..end_rel];
-                                    let rep = if is_server {
+                                    let rep = if is_host_or_server {
                                         redact_ip_or_host(raw_val)
                                     } else {
                                         "<REDACTED>".to_string()
@@ -651,10 +1177,13 @@ fn redact_yaml_extra_fields(line: &str) -> String {
                                     })
                                     .unwrap_or(tail.len());
                                 let raw_val = &tail[..val_len];
-                                let rep = if is_server {
+                                let rep = if raw_val.eq_ignore_ascii_case("null") || raw_val == "~"
+                                {
+                                    raw_val.to_string()
+                                } else if is_host_or_server {
                                     let masked = redact_ip_or_host(raw_val);
-                                    // Quote leading `*` so redacted domains remain valid YAML scalars.
-                                    if masked.starts_with('*') {
+                                    // Quote leading `*` or other YAML indicator chars so redacted values remain valid YAML scalars.
+                                    if needs_yaml_quoting(&masked) {
                                         format!("\"{masked}\"")
                                     } else {
                                         masked
@@ -1313,6 +1842,93 @@ fn redact_non_system_drive_paths(input: &str) -> String {
     out
 }
 
+fn is_version_word(word: &str) -> bool {
+    let lower = word.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "v" | "ver"
+            | "vers"
+            | "version"
+            | "rel"
+            | "release"
+            | "rev"
+            | "build"
+            | "schema"
+            | "oid"
+    ) || lower.ends_with("version")
+    {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix('v') {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    if let Some(rest) = lower.strip_prefix("ver") {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_preceded_by_version_marker(bytes: &[u8], i: usize) -> bool {
+    if i == 0 {
+        return false;
+    }
+    // Underscore-prefixed version token such as `v1_<A.B.C.D>`, `version_<A.B.C.D>`, `core_version_<A.B.C.D>`.
+    if bytes[i - 1] == b'_' {
+        let mut word_start = i - 1;
+        while word_start > 0 && bytes[word_start - 1].is_ascii_alphanumeric() {
+            word_start -= 1;
+        }
+        if word_start < i - 1 {
+            if let Ok(seg) = std::str::from_utf8(&bytes[word_start..i - 1]) {
+                if is_version_word(seg) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Key-value version context such as `version=<A.B.C.D>`, `version: <A.B.C.D>`,
+    // `"version": "<A.B.C.D>"`, `"core_version": "<A.B.C.D>"`.
+    let mut pos = i;
+    if pos > 0 && matches!(bytes[pos - 1], b'"' | b'\'') {
+        pos -= 1;
+    }
+    while pos > 0 && bytes[pos - 1] == b' ' {
+        pos -= 1;
+    }
+    if pos == 0 || !matches!(bytes[pos - 1], b':' | b'=') {
+        return false;
+    }
+    pos -= 1;
+    while pos > 0 && bytes[pos - 1] == b' ' {
+        pos -= 1;
+    }
+    if pos > 0 && matches!(bytes[pos - 1], b'"' | b'\'') {
+        pos -= 1;
+    }
+    let word_end = pos;
+    while pos > 0
+        && (bytes[pos - 1].is_ascii_alphanumeric() || matches!(bytes[pos - 1], b'_' | b'-'))
+    {
+        pos -= 1;
+    }
+    if pos < word_end {
+        if let Ok(key) = std::str::from_utf8(&bytes[pos..word_end]) {
+            let lower = key.to_ascii_lowercase();
+            return lower == "version"
+                || lower == "ver"
+                || lower.ends_with("_version")
+                || lower.ends_with("-version");
+        }
+    }
+    false
+}
+
 fn redact_public_ipv4(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
@@ -1320,9 +1936,8 @@ fn redact_public_ipv4(input: &str) -> String {
 
     while i < bytes.len() {
         let prev_ok = i == 0
-            || !(bytes[i - 1].is_ascii_alphanumeric()
-                || bytes[i - 1] == b'.'
-                || bytes[i - 1] == b'_');
+            || (!(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'.')
+                && !is_preceded_by_version_marker(bytes, i));
         if prev_ok && bytes[i].is_ascii_digit() {
             let mut end = i;
             let mut dots = 0usize;
@@ -1332,10 +1947,28 @@ fn redact_public_ipv4(input: &str) -> String {
                 }
                 end += 1;
             }
-            let next_ok = end == bytes.len()
-                || !(bytes[end].is_ascii_alphanumeric()
-                    || bytes[end] == b'.'
-                    || bytes[end] == b'_');
+            // Handle sentence-ending trailing dot (e.g. `203.0.113.10.` followed by non-digit/non-ident):
+            // step back 1 byte so the period is preserved while the IPv4 is still redacted.
+            let mut stepped_back_sentence_dot = false;
+            if dots == 4 && end > i && bytes[end - 1] == b'.' {
+                let after_dot_ok = end == bytes.len()
+                    || !(bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'.'
+                        || bytes[end] == b'_');
+                if after_dot_ok {
+                    end -= 1;
+                    dots -= 1;
+                    stepped_back_sentence_dot = true;
+                }
+            }
+            let next_ok = if stepped_back_sentence_dot {
+                true
+            } else {
+                end == bytes.len()
+                    || !(bytes[end].is_ascii_alphanumeric()
+                        || bytes[end] == b'.'
+                        || bytes[end] == b'_')
+            };
             if dots == 3 && next_ok {
                 let candidate = &input[i..end];
                 if let Ok(ip) = Ipv4Addr::from_str(candidate) {
@@ -1692,23 +2325,27 @@ mod tests {
     #[test]
     fn safe_public_dns_allowlist_matches_all_19_entries_and_local_ranges() {
         assert_eq!(SAFE_PUBLIC_DNS_IPV4S.len(), 19);
+        // Only loopback (127.0.0.1) and unspecified (0.0.0.0) are exempted.
+        assert!(is_safe_dns_or_local_ipv4([127, 0, 0, 1]));
+        assert!(is_safe_dns_or_local_ipv4([0, 0, 0, 0]));
+
+        // Public DNS resolvers are no longer exempted and must be masked to A.B.C.*.
         for dns in SAFE_PUBLIC_DNS_IPV4S {
             let ip = Ipv4Addr::from_str(dns).expect("valid allowlist DNS IPv4");
             assert!(
-                is_safe_dns_or_local_ipv4(ip.octets()),
-                "DNS {dns} must be allowlisted"
+                !is_safe_dns_or_local_ipv4(ip.octets()),
+                "DNS {dns} must be masked in strict sanitization"
             );
         }
-        assert!(is_safe_dns_or_local_ipv4([127, 0, 0, 1]));
-        assert!(is_safe_dns_or_local_ipv4([0, 0, 0, 0]));
-        assert!(is_safe_dns_or_local_ipv4([198, 18, 0, 1]));
-        assert!(is_safe_dns_or_local_ipv4([198, 19, 255, 254]));
 
-        // Both private LAN and arbitrary public IPv4 must be redacted.
+        // Private ranges (including 198.18.0.0/15 Fake-IP, 169.254.*, LAN) and arbitrary public IPv4 must be redacted.
         for masked in [
+            [198, 18, 0, 1],
+            [198, 19, 255, 254],
             [192, 168, 1, 10],
             [10, 0, 0, 5],
             [172, 16, 8, 9],
+            [169, 254, 10, 20],
             [100, 64, 1, 2],
             [192, 0, 2, 10],
             [198, 51, 100, 20],
@@ -1730,8 +2367,8 @@ mod tests {
             "vmess", "://eyJhZGQiOiIxOTguNTEuMTAwLjEifQ==#HK ",
             "ss", "://YWVzOjEyMw==#SG ",
             "mmrelay://v1/eyJzZXJ2ZXIiOiIyMDMuMC4xMTMuMTAifQ== ",
-            "dns 1.1.1.1 8.8.8.8 223.5.5.5 119.29.29.29 114.114.114.114 127.0.0.1 198.18.0.12 ",
-            "mask 203.0.113.45 192.168.10.25 [240e:390:1234:5678::42]:443 ::1"
+            "dns 1.1.1.1 8.8.8.8 223.5.5.5 119.29.29.29 114.114.114.114 127.0.0.1 0.0.0.0 198.18.0.12 ",
+            "mask 203.0.113.45 192.168.10.25 [240e:390:1234:5678::42]:443 ::1 ::"
         );
         let clean = sanitize_log_line(raw);
 
@@ -1752,6 +2389,12 @@ mod tests {
             "eyJhZGQiOiIxOTguNTEuMTAwLjEifQ==",
             "YWVzOjEyMw==",
             "eyJzZXJ2ZXIiOiIyMDMuMC4xMTMuMTAifQ==",
+            "1.1.1.1",
+            "8.8.8.8",
+            "223.5.5.5",
+            "119.29.29.29",
+            "114.114.114.114",
+            "198.18.0.12",
             "203.0.113.45",
             "192.168.10.25",
             "5678::42",
@@ -1770,11 +2413,12 @@ mod tests {
         assert!(clean.contains("vmess://<REDACTED>#HK"));
         assert!(clean.contains("ss://<REDACTED>#SG"));
         assert!(clean.contains("mmrelay://v1/<REDACTED>"));
-        assert!(clean.contains("1.1.1.1 8.8.8.8 223.5.5.5 119.29.29.29 114.114.114.114 127.0.0.1 198.18.0.12"));
+        assert!(clean.contains("1.1.1.* 8.8.8.* 223.5.5.* 119.29.29.* 114.114.114.* 127.0.0.1 0.0.0.0 198.18.0.*"));
         assert!(clean.contains("203.0.113.*"));
         assert!(clean.contains("192.168.10.*"));
         assert!(clean.contains("[240e:390::*]:443"));
         assert!(clean.contains("::1"));
+        assert!(clean.contains(" ::"));
         assert!(clean.contains("2026-11-25T08:15:00Z"));
         assert_eq!(sanitize_log_line(&clean), clean);
     }
@@ -1802,11 +2446,14 @@ mod tests {
         assert_eq!(redact_ip_or_host("203.0.113.10"), "203.0.113.*");
         assert_eq!(redact_ip_or_host("203.0.113.10:443"), "203.0.113.*:443");
         assert_eq!(redact_ip_or_host("192.168.1.9"), "192.168.1.*");
+        assert_eq!(redact_ip_or_host("198.18.0.1"), "198.18.0.*");
         assert_eq!(redact_ip_or_host("127.0.0.1:7890"), "127.0.0.1:7890");
-        assert_eq!(redact_ip_or_host("223.5.5.5"), "223.5.5.5");
+        assert_eq!(redact_ip_or_host("0.0.0.0"), "0.0.0.0");
+        assert_eq!(redact_ip_or_host("223.5.5.5"), "223.5.5.*");
         assert_eq!(redact_ip_or_host("240e:390:1234::42"), "240e:390::*");
         assert_eq!(redact_ip_or_host("[240e:390:1234::42]:443"), "[240e:390::*]:443");
         assert_eq!(redact_ip_or_host("::1"), "::1");
+        assert_eq!(redact_ip_or_host("::"), "::");
         assert_eq!(redact_ip_or_host("localhost:9090"), "localhost:9090");
         assert_eq!(redact_ip_or_host("hk-01.private-vendor.example.com"), "***.com");
         assert_eq!(redact_ip_or_host("hk-01.private-vendor.net:8443"), "***.net:8443");
@@ -1815,6 +2462,7 @@ mod tests {
         // Idempotency
         for sample in [
             "203.0.113.*",
+            "223.5.5.*",
             "[240e:390::*]:443",
             "***.com:443",
             "<REDACTED>",
@@ -1864,6 +2512,7 @@ mod tests {
             last_mbps: Some(220.0),
             last_up_mbps: Some(165.0),
             last_down_mbps: Some(220.0),
+            ..Default::default()
         };
         let safe_relay = redact_relay_for_readonly(&relay);
         assert_eq!(safe_relay.id, "relay-1");
@@ -1951,14 +2600,21 @@ proxies:
     type: anytls
     server: 203.0.113.10
     port: 443
+    sni: relay-sni.vendor-cloud.net
     password: "relay_secret_pw"
   - name: "Node-Domain"
     type: socks5
     server: hk1.vendor-domain.org
+    servername: tls.vendor-edge.com
     port: 1080
     username: demo_user
     password: demo_password
-  - {name: "Node-Flow", type: vless, server: 198.51.100.77, port: 443, uuid: "aaa-bbb-ccc", pbk: "pub_k", sid: "abcd"}
+    ws-opts:
+      headers:
+        Host: ws.vendor-front.io
+    h2-opts:
+      host: [h2a.vendor-h2.com, h2b.vendor-h2.org]
+  - {name: "Node-Flow", type: vless, server: 198.51.100.77, sni: flow.vendor-sni.net, port: 443, uuid: "aaa-bbb-ccc", pbk: "pub_k", sid: "abcd"}
 rules:
   - IP-CIDR,203.0.113.10/32,DIRECT,no-resolve
   - DOMAIN-SUFFIX,openai.com,AI
@@ -1967,8 +2623,16 @@ rules:
         for leaked in [
             "0123456789abcdef",
             "203.0.113.10",
+            "223.5.5.5",
+            "1.1.1.1",
+            "198.18.0.1",
             "relay_secret_pw",
             "vendor-domain",
+            "vendor-cloud",
+            "vendor-edge",
+            "vendor-front",
+            "vendor-h2",
+            "vendor-sni",
             "demo_user",
             "demo_password",
             "198.51.100.77",
@@ -1980,11 +2644,15 @@ rules:
         }
 
         assert!(clean.contains("127.0.0.1:9090"));
-        assert!(clean.contains("223.5.5.5"));
-        assert!(clean.contains("1.1.1.1"));
-        assert!(clean.contains("198.18.0.1/16"));
+        assert!(clean.contains("223.5.5.*"));
+        assert!(clean.contains("1.1.1.*"));
+        assert!(clean.contains("198.18.0.*/16"));
         assert!(clean.contains("server: 203.0.113.*"));
         assert!(clean.contains("server: \"***.org\""));
+        assert!(clean.contains("sni: \"***.net\""));
+        assert!(clean.contains("servername: \"***.com\""));
+        assert!(clean.contains("Host: \"***.io\""));
+        assert!(clean.contains("host: [\"***.com\", \"***.org\"]"));
         assert!(clean.contains("username: <REDACTED>"));
         assert!(clean.contains("IP-CIDR,203.0.113.*/32,DIRECT,no-resolve"));
         assert!(clean.contains("DOMAIN-SUFFIX,openai.com,AI"));
@@ -2017,7 +2685,7 @@ rules:
         let clean_lookup = sanitize_log_line(raw_lookup);
         assert_eq!(
             clean_lookup,
-            "WARN dial tcp: lookup ***.org on 223.5.5.5:53: no such host"
+            "WARN dial tcp: lookup ***.org on 223.5.5.*:53: no such host"
         );
 
         let raw_conn_err = "ERROR connect error: us-west.demo-node.io:443: EOF";
@@ -2037,6 +2705,159 @@ rules:
         let parsed: serde_json::Value = serde_json::from_str(&clean_json).expect("valid JSON");
         assert_eq!(parsed["msg"], "dial tcp ***.com:443: timeout");
         assert_eq!(parsed["ok"], false);
+    }
+
+    #[test]
+    fn redact_public_ipv4_handles_sentence_dot_underscore_prefix_and_protects_versions_and_oids() {
+        // Sentence-ending dot preserves trailing period while redacting the IPv4.
+        assert_eq!(
+            sanitize_log_line("connection failed for 203.0.113.10."),
+            "connection failed for 203.0.113.*."
+        );
+        assert_eq!(
+            sanitize_log_line("peer 198.51.100.20. Retrying via 192.168.1.9."),
+            "peer 198.51.100.*. Retrying via 192.168.1.*."
+        );
+
+        // Underscore-prefixed IPs are redacted.
+        assert_eq!(sanitize_log_line("ip_192.168.1.1"), "ip_192.168.1.*");
+        assert_eq!(
+            sanitize_log_line("src_10.20.30.40 dst_172.16.5.9 fake_198.18.0.5 link_169.254.1.2"),
+            "src_10.20.30.* dst_172.16.5.* fake_198.18.0.* link_169.254.1.*"
+        );
+
+        // Version strings, 5+ segment OIDs, and IP-prefixed hostnames must be preserved.
+        let v1_ver = concat!("v1_", "1.2.", "3.4");
+        let named_ver = concat!("version_", "1.2.", "3.4");
+        let eq_ver = concat!("version=", "1.2.", "3.4");
+        let core_ver_json = concat!(r#"{"core_version":""#, "1.19.", r#"1.0","v":"v"#, "1.2.", r#"3.4"}"#);
+        assert_eq!(sanitize_log_line(v1_ver), v1_ver);
+        assert_eq!(sanitize_log_line(named_ver), named_ver);
+        assert_eq!(sanitize_log_line(eq_ver), eq_ver);
+        assert_eq!(sanitize_log_line(core_ver_json), core_ver_json);
+        assert_eq!(sanitize_log_line("oid 1.3.6.1.5.5.7.3.1"), "oid 1.3.6.1.5.5.7.3.1");
+        assert_eq!(
+            sanitize_log_line("host 203.0.113.10.example.com"),
+            "host 203.0.113.10.example.com"
+        );
+    }
+
+    #[test]
+    fn sanitize_json_value_preserves_business_domains_and_metadata_while_redacting_ips_and_paths() {
+        let ver_a = concat!("1.19.", "1.0");
+        let ver_b = concat!("1.19.", "2.3");
+        let ver_c = concat!("4.0.", "0.1");
+        let win_home = concat!(r"C:\", r"Users\Alice Smith\AppData\Local\CatCloud");
+        let unix_home = concat!("/", "home/bob_dev/.config/catcloud/config.json");
+
+        let mut payload = json!({
+            "ok": true,
+            "sanitized": true,
+            "count": 42,
+            "id": "conn-203.0.113.10-keep",
+            "version": ver_a,
+            "core_version": ver_b,
+            "schema_version": ver_c,
+            "sha256": "deadbeef0123456789",
+            "config_sha256": "cafebabe0123456789",
+            "instance_hash": "a1b2c3d4",
+            "tested_at": "2026-11-26T03:44:51Z",
+            "started_at": "2026-11-26T03:40:00Z",
+            "controller_addr": "127.0.0.1:9090",
+            "data_dir": win_home,
+            "cli_path": r"D:\PrivatePortable\CatCloud\bin\catcloud.exe",
+            "binary_path": r"E:\SecretDir\mihomo.exe",
+            "config_path": unix_home,
+            "upstream": {
+                "server": "edge01.vendor-relay.net",
+                "sni": "sni.vendor-relay.com",
+                "servername": "tls.vendor-relay.org",
+                "controller_addr": "192.168.1.50:9090"
+            },
+            "connections": [
+                {
+                    "host": "api.openai.com",
+                    "source_ip": "192.168.1.105",
+                    "destination_ip": "203.0.113.55",
+                    "note": "dns 223.5.5.5 and fake 198.18.0.12"
+                },
+                {
+                    "host": "github.com",
+                    "source_ip": "10.0.0.8",
+                    "destination_ip": "172.16.0.9"
+                },
+                {
+                    "host": "198.18.0.15",
+                    "source_ip": "127.0.0.1",
+                    "destination_ip": "240e:390:1234::42"
+                },
+                {
+                    "host": "203.0.113.88:443",
+                    "source_ip": "::1",
+                    "destination_ip": "169.254.10.20"
+                },
+                {
+                    "host": "[240e:390:abcd::99]:443"
+                }
+            ]
+        });
+
+        sanitize_json_value(&mut payload);
+
+        // Numbers, booleans, and allowlisted metadata keys remain intact.
+        assert_eq!(payload["ok"], true);
+        assert_eq!(payload["count"], 42);
+        assert_eq!(payload["id"], "conn-203.0.113.10-keep");
+        assert_eq!(payload["version"], ver_a);
+        assert_eq!(payload["core_version"], ver_b);
+        assert_eq!(payload["schema_version"], ver_c);
+        assert_eq!(payload["sha256"], "deadbeef0123456789");
+        assert_eq!(payload["config_sha256"], "cafebabe0123456789");
+        assert_eq!(payload["instance_hash"], "a1b2c3d4");
+        assert_eq!(payload["tested_at"], "2026-11-26T03:44:51Z");
+        assert_eq!(payload["started_at"], "2026-11-26T03:40:00Z");
+
+        // Loopback controller preserved, LAN controller masked.
+        assert_eq!(payload["controller_addr"], "127.0.0.1:9090");
+        assert_eq!(payload["upstream"]["controller_addr"], "192.168.1.*:9090");
+
+        // Upstream proxy server/sni/servername masked to ***.tld.
+        assert_eq!(payload["upstream"]["server"], "***.net");
+        assert_eq!(payload["upstream"]["sni"], "***.com");
+        assert_eq!(payload["upstream"]["servername"], "***.org");
+
+        // Paths redacted via redact_path_for_display.
+        assert_eq!(
+            payload["data_dir"],
+            r"C:\Users\<USER>\AppData\Local\CatCloud"
+        );
+        assert_eq!(payload["cli_path"], "<LOCAL_PATH>");
+        assert_eq!(payload["binary_path"], "<LOCAL_PATH>");
+        assert_eq!(payload["config_path"], "/home/<USER>/.config/catcloud/config.json");
+
+        // Business domains under plain `host` preserved; IP literals under `host` masked.
+        assert_eq!(payload["connections"][0]["host"], "api.openai.com");
+        assert_eq!(payload["connections"][0]["source_ip"], "192.168.1.*");
+        assert_eq!(payload["connections"][0]["destination_ip"], "203.0.113.*");
+        assert_eq!(
+            payload["connections"][0]["note"],
+            "dns 223.5.5.* and fake 198.18.0.*"
+        );
+        assert_eq!(payload["connections"][1]["host"], "github.com");
+        assert_eq!(payload["connections"][1]["source_ip"], "10.0.0.*");
+        assert_eq!(payload["connections"][1]["destination_ip"], "172.16.0.*");
+        assert_eq!(payload["connections"][2]["host"], "198.18.0.*");
+        assert_eq!(payload["connections"][2]["source_ip"], "127.0.0.1");
+        assert_eq!(payload["connections"][2]["destination_ip"], "240e:390::*");
+        assert_eq!(payload["connections"][3]["host"], "203.0.113.*:443");
+        assert_eq!(payload["connections"][3]["source_ip"], "::1");
+        assert_eq!(payload["connections"][3]["destination_ip"], "169.254.10.*");
+        assert_eq!(payload["connections"][4]["host"], "[240e:390::*]:443");
+
+        // Idempotent when applied twice.
+        let snapshot = payload.clone();
+        sanitize_json_value(&mut payload);
+        assert_eq!(payload, snapshot);
     }
 
     #[test]
@@ -2131,5 +2952,160 @@ rules:
         // Idempotent when called twice.
         let once = redact_path_for_display(qq_path);
         assert_eq!(redact_path_for_display(&once), once);
+    }
+
+    #[test]
+    fn sanitize_json_value_redacts_all_node_credential_keys_and_numeric_secrets() {
+        let mut payload = json!({
+            "token": "tok_secret_1",
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "pwd": "pwd_secret_2",
+            "auth": "auth_secret_3",
+            "auth_str": "auth_str_4",
+            "auth-str": "auth-str-5",
+            "psk": "psk_secret_6",
+            "pbk": "pbk_secret_7",
+            "sid": "sid_secret_8",
+            "cookie": "session=abc123",
+            "set-cookie": "session=xyz789; HttpOnly",
+            "apikey": "ak_secret_9",
+            "public_key": "pub_key_10",
+            "public-key": "pub-key-11",
+            "short_id": "short_12",
+            "short-id": "short-13",
+            "username": "proxy_user_14",
+            "nested": {
+                "password": 987654321,
+                "secret": 424242,
+                "token": 13579,
+                "short-id": 8080,
+                "port": 443
+            }
+        });
+
+        sanitize_json_value(&mut payload);
+
+        for key in [
+            "token",
+            "uuid",
+            "pwd",
+            "auth",
+            "auth_str",
+            "auth-str",
+            "psk",
+            "pbk",
+            "sid",
+            "cookie",
+            "set-cookie",
+            "apikey",
+            "public_key",
+            "public-key",
+            "short_id",
+            "short-id",
+            "username",
+        ] {
+            assert_eq!(
+                payload[key], "<REDACTED>",
+                "expected credential key `{key}` to be redacted"
+            );
+        }
+        assert_eq!(payload["nested"]["password"], "<REDACTED>");
+        assert_eq!(payload["nested"]["secret"], "<REDACTED>");
+        assert_eq!(payload["nested"]["token"], "<REDACTED>");
+        assert_eq!(payload["nested"]["short-id"], "<REDACTED>");
+        assert_eq!(payload["nested"]["port"], 443);
+
+        // Idempotent when applied twice.
+        let snapshot = payload.clone();
+        sanitize_json_value(&mut payload);
+        assert_eq!(payload, snapshot);
+    }
+
+    #[test]
+    fn redact_compiled_yaml_handles_block_sequences_and_extra_host_keys_as_valid_yaml() {
+        let yaml = r#"mixed-port: 7890
+external-controller: 127.0.0.1:9090
+secret: secret_block_test_0123456789
+proxies:
+  - name: "Node-Block-Host"
+    type: vmess
+    server: edge.vendor-origin.net
+    port: 443
+    server-name: sni-dash.vendor-tls.com
+    server_name: sni-under.vendor-tls.org
+    obfs_host: obfs.vendor-obfs.io
+    h2-opts:
+      host:
+        - h2a.vendor.com
+        - "h2b.vendor.org"
+        - 'h2c.vendor.net'
+        - 203.0.113.42
+        - h2d.vendor.io # keep comment
+      path: /h2
+    ws-opts:
+      headers:
+        "Host":
+          - ws1.vendor-ws.com
+          - ws2.vendor-ws.net
+
+    extra-list:
+      - keep.business-domain.com
+rules:
+  - DOMAIN-SUFFIX,github.com,DIRECT
+"#;
+
+        let clean = redact_compiled_yaml(yaml);
+        for leaked in [
+            "secret_block_test",
+            "vendor-origin",
+            "vendor-tls",
+            "vendor-obfs",
+            "h2a.vendor",
+            "h2b.vendor",
+            "h2c.vendor",
+            "203.0.113.42",
+            "h2d.vendor",
+            "vendor-ws",
+        ] {
+            assert!(!clean.contains(leaked), "leaked `{leaked}` in:\n{clean}");
+        }
+
+        // Must remain syntactically valid YAML (no unquoted `*` alias errors).
+        let parsed: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&clean).expect("redacted block-sequence YAML must parse");
+        let proxy = &parsed["proxies"][0];
+        assert_eq!(proxy["server"].as_str(), Some("***.net"));
+        assert_eq!(proxy["server-name"].as_str(), Some("***.com"));
+        assert_eq!(proxy["server_name"].as_str(), Some("***.org"));
+        assert_eq!(proxy["obfs_host"].as_str(), Some("***.io"));
+
+        let h2_hosts: Vec<&str> = proxy["h2-opts"]["host"]
+            .as_sequence()
+            .expect("h2-opts.host sequence")
+            .iter()
+            .filter_map(serde_yaml_ng::Value::as_str)
+            .collect();
+        assert_eq!(
+            h2_hosts,
+            vec!["***.com", "***.org", "***.net", "203.0.113.*", "***.io"]
+        );
+        assert_eq!(proxy["h2-opts"]["path"].as_str(), Some("/h2"));
+
+        let ws_hosts: Vec<&str> = proxy["ws-opts"]["headers"]["Host"]
+            .as_sequence()
+            .expect("ws-opts.headers.Host sequence")
+            .iter()
+            .filter_map(serde_yaml_ng::Value::as_str)
+            .collect();
+        assert_eq!(ws_hosts, vec!["***.com", "***.net"]);
+
+        // Exiting block-sequence state on blank line / shallower indent leaves later lists intact.
+        assert_eq!(
+            proxy["extra-list"][0].as_str(),
+            Some("keep.business-domain.com")
+        );
+
+        // Idempotent on second pass.
+        assert_eq!(redact_compiled_yaml(&clean), clean);
     }
 }

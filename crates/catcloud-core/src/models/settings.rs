@@ -3,7 +3,23 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Current configuration schema version.
-pub const CONFIG_SCHEMA_VERSION: u32 = 3;
+pub const CONFIG_SCHEMA_VERSION: u32 = 4;
+
+/// Legacy v3 pure-IP DoH (TCP 443) domestic resolver defaults, kept for backward compatibility
+/// and idempotent v3 -> v4 schema migration detection.
+pub const DEFAULT_PURE_IP_DOH_NAMESERVERS: &[&str] = &[
+    "https://223.5.5.5/dns-query",
+    "https://1.12.12.12/dns-query",
+];
+
+/// Default 4-endpoint heterogeneous pure-IP encrypted domestic DNS pool
+/// (2x TCP/443 DoH + 2x TCP/853 DoT, all strictly TLS-verified with IP SANs; never `skip-cert-verify`).
+pub const DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS: &[&str] = &[
+    "https://223.5.5.5/dns-query",
+    "https://1.12.12.12/dns-query",
+    "tls://223.6.6.6:853",
+    "tls://120.53.53.53:853",
+];
 
 /// Supported UI localization codes (Simplified Chinese authoritative default).
 pub const SUPPORTED_UI_LANGUAGES: &[&str] = &["zh-CN", "en", "ja", "ru"];
@@ -329,10 +345,10 @@ impl Default for TunConfig {
 }
 
 fn default_direct_nameserver() -> Vec<String> {
-    vec![
-        "https://223.5.5.5/dns-query".to_string(),
-        "https://1.12.12.12/dns-query".to_string(),
-    ]
+    DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 fn default_true_bool() -> bool {
@@ -455,24 +471,15 @@ impl Default for DnsConfig {
                 "connectivitycheck.platform.hicloud.com".to_string(),
                 "connect.rom.miui.com".to_string(),
             ],
-            default_nameserver: vec![
-                "https://223.5.5.5/dns-query".to_string(),
-                "https://1.12.12.12/dns-query".to_string(),
-            ],
+            default_nameserver: default_direct_nameserver(),
             direct_nameserver: default_direct_nameserver(),
             nameserver_policy: BTreeMap::new(),
-            nameserver: vec![
-                "https://223.5.5.5/dns-query".to_string(),
-                "https://1.12.12.12/dns-query".to_string(),
-            ],
+            nameserver: default_direct_nameserver(),
             fallback: vec![
                 "https://1.1.1.1/dns-query".to_string(),
                 "https://8.8.8.8/dns-query".to_string(),
             ],
-            proxy_server_nameserver: vec![
-                "https://223.5.5.5/dns-query".to_string(),
-                "https://1.12.12.12/dns-query".to_string(),
-            ],
+            proxy_server_nameserver: default_direct_nameserver(),
             fallback_filter: DnsFallbackFilter::default(),
         }
     }
@@ -719,6 +726,59 @@ fn default_global_target_processes() -> Vec<String> {
         .collect()
 }
 
+/// Multi-cloud dispatch strategy for domestic `:443` pre-acceleration relays.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PreAccelDispatchStrategy {
+    /// Automatically aggregate 2+ distinct physical cloud hosts with nested `load-balance`
+    /// inside outer `fallback`, or use single-layer `fallback` for 1 physical host.
+    #[default]
+    Auto,
+    /// Explicitly prefer multi-cloud nested `load-balance` when 2+ distinct physical hosts exist.
+    LoadBalance,
+    /// Always use single-layer active-standby `fallback` ordering.
+    Fallback,
+}
+
+impl PreAccelDispatchStrategy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::LoadBalance => "load_balance",
+            Self::Fallback => "fallback",
+        }
+    }
+}
+
+/// Load-balancing algorithm used by the inner multi-cloud domestic pre-acceleration pool.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PreAccelLbStrategy {
+    #[default]
+    #[serde(alias = "round-robin")]
+    RoundRobin,
+    #[serde(alias = "consistent-hashing")]
+    ConsistentHashing,
+}
+
+impl PreAccelLbStrategy {
+    /// Canonical Mihomo YAML `load-balance.strategy` string (`"round-robin"` | `"consistent-hashing"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round-robin",
+            Self::ConsistentHashing => "consistent-hashing",
+        }
+    }
+
+    /// Canonical snake_case config/CLI string (`"round_robin"` | `"consistent_hashing"`).
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::RoundRobin => "round_robin",
+            Self::ConsistentHashing => "consistent_hashing",
+        }
+    }
+}
+
 /// Domestic pre-acceleration configuration.
 /// Probe URLs must point to domestic endpoints (`hicloud` / `miui`), never overseas `gstatic`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -731,6 +791,12 @@ pub struct PreAccelConfig {
     pub probe_interval_sec: u64,
     pub active_relay_id: Option<String>,
     pub auto_failover: bool,
+    /// Dispatch mode across multiple distinct physical domestic cloud hosts.
+    #[serde(default)]
+    pub dispatch_strategy: PreAccelDispatchStrategy,
+    /// Load-balancing algorithm for the inner multi-cloud `load-balance` pool.
+    #[serde(default)]
+    pub lb_strategy: PreAccelLbStrategy,
     pub campus_portal_guard: bool,
     pub campus_direct_domains: Vec<String>,
     /// Allow standalone lowest-level domestic :443 pre-acceleration even when CatCloud's own
@@ -755,9 +821,11 @@ impl Default for PreAccelConfig {
             skip_443_native: true,
             probe_url: DEFAULT_PREACCEL_PROBE_URL.to_string(),
             fallback_probe_url: DEFAULT_PREACCEL_FALLBACK_PROBE_URL.to_string(),
-            probe_interval_sec: 30,
+            probe_interval_sec: 15,
             active_relay_id: None,
             auto_failover: true,
+            dispatch_strategy: PreAccelDispatchStrategy::Auto,
+            lb_strategy: PreAccelLbStrategy::RoundRobin,
             campus_portal_guard: true,
             campus_direct_domains: Vec::new(),
             global_bypass_enabled: false,
@@ -926,6 +994,9 @@ pub struct PersonalizationConfig {
     #[serde(alias = "ui_language")]
     pub language: String,
     pub capsule_enabled: bool,
+    /// Whether the user has completed (or dismissed) the first-launch welcome & AI autopilot modal.
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 impl PersonalizationConfig {
@@ -950,6 +1021,7 @@ impl Default for PersonalizationConfig {
             tray_icon_mode: TrayIconMode::AutoAc,
             language: "zh-CN".to_string(),
             capsule_enabled: false,
+            onboarding_completed: false,
         }
     }
 }
@@ -1125,14 +1197,16 @@ mod tests {
         assert!(cfg.tun.auto_detect_interface);
 
         assert!(cfg.dns.respect_rules);
-        let expected_doh = vec![
+        let expected_encrypted = vec![
             "https://223.5.5.5/dns-query",
             "https://1.12.12.12/dns-query",
+            "tls://223.6.6.6:853",
+            "tls://120.53.53.53:853",
         ];
-        assert_eq!(cfg.dns.default_nameserver, expected_doh);
-        assert_eq!(cfg.dns.direct_nameserver, expected_doh);
-        assert_eq!(cfg.dns.proxy_server_nameserver, expected_doh);
-        assert_eq!(cfg.dns.nameserver, expected_doh);
+        assert_eq!(cfg.dns.default_nameserver, expected_encrypted);
+        assert_eq!(cfg.dns.direct_nameserver, expected_encrypted);
+        assert_eq!(cfg.dns.proxy_server_nameserver, expected_encrypted);
+        assert_eq!(cfg.dns.nameserver, expected_encrypted);
         assert_eq!(
             cfg.dns.fallback,
             vec!["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"]
@@ -1164,22 +1238,37 @@ mod tests {
         // Legacy JSON missing newly added fields must populate defaults via serde attributes.
         let legacy: AppConfig =
             serde_json::from_str(r#"{"dns":{},"rules_override":{},"core_runtime":{},"preaccel":{},"behavior":{"hotkeys":{}}}"#).unwrap();
-        assert_eq!(
-            legacy.dns.direct_nameserver,
-            vec![
-                "https://223.5.5.5/dns-query",
-                "https://1.12.12.12/dns-query",
-            ]
-        );
+        assert_eq!(legacy.dns.direct_nameserver, expected_encrypted);
         assert!(legacy.rules_override.block_quic_udp_443);
         assert!(legacy.rules_override.domestic_direct_enabled);
         assert_eq!(legacy.core_runtime.gogc, 25);
         assert!(!legacy.core_runtime.compile_all_nodes);
+        assert!(!cfg.personalization.onboarding_completed);
+        assert!(!legacy.personalization.onboarding_completed);
 
-        // Stage 10/12 global pre-acceleration defaults & backward-compatible deserialization.
+        // Stage 10/12/19 global pre-acceleration defaults & backward-compatible deserialization.
         assert!(!cfg.preaccel.enabled);
         assert!(!cfg.preaccel.global_bypass_enabled);
         assert!(!cfg.preaccel.is_unified_enabled());
+        assert_eq!(cfg.preaccel.probe_interval_sec, 15);
+        assert_eq!(cfg.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Auto);
+        assert_eq!(cfg.preaccel.lb_strategy, PreAccelLbStrategy::RoundRobin);
+        assert_eq!(legacy.preaccel.probe_interval_sec, 15);
+        assert_eq!(legacy.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Auto);
+        assert_eq!(legacy.preaccel.lb_strategy, PreAccelLbStrategy::RoundRobin);
+        assert_eq!(
+            serde_json::to_string(&PreAccelDispatchStrategy::LoadBalance).unwrap(),
+            "\"load_balance\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PreAccelLbStrategy::ConsistentHashing).unwrap(),
+            "\"consistent_hashing\""
+        );
+        assert_eq!(PreAccelLbStrategy::RoundRobin.as_str(), "round-robin");
+        assert_eq!(
+            PreAccelLbStrategy::ConsistentHashing.as_str(),
+            "consistent-hashing"
+        );
         assert_eq!(cfg.preaccel.global_scope, GlobalPreAccelScope::ProxyAppsOnly);
         assert!(cfg.preaccel.windivert_dir.is_none());
         assert_eq!(
@@ -1270,9 +1359,9 @@ mod tests {
             Some("Alt+Shift+C")
         );
 
-        // Schema v3 default vs legacy missing schema_version field deserializing as v1.
-        assert_eq!(CONFIG_SCHEMA_VERSION, 3);
-        assert_eq!(cfg.schema_version, 3);
+        // Schema v4 default vs legacy missing schema_version field deserializing as v1.
+        assert_eq!(CONFIG_SCHEMA_VERSION, 4);
+        assert_eq!(cfg.schema_version, 4);
         assert_eq!(legacy.schema_version, 1);
     }
 

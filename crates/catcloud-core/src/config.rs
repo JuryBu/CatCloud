@@ -93,12 +93,14 @@ impl ConfigManager {
     }
 }
 
-/// Default pure-IP DoH (TCP 443) domestic resolvers safe on campus/enterprise networks
-/// that block outbound plaintext UDP 53.
-pub(crate) const DEFAULT_PURE_IP_DOH_NAMESERVERS: &[&str] = &[
-    "https://223.5.5.5/dns-query",
-    "https://1.12.12.12/dns-query",
-];
+/// Legacy v3 pure-IP DoH (TCP 443) domestic resolvers preserved for compatibility and
+/// v3 -> v4 idempotent migration matching.
+pub(crate) const DEFAULT_PURE_IP_DOH_NAMESERVERS: &[&str] =
+    crate::models::DEFAULT_PURE_IP_DOH_NAMESERVERS;
+
+/// Default v4 4-endpoint heterogeneous pure-IP encrypted domestic resolvers (DoH 443 + DoT 853).
+pub(crate) const DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS: &[&str] =
+    crate::models::DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS;
 
 const LEGACY_PLAINTEXT_DOMESTIC_DNS: &[&str] = &[
     "223.5.5.5",
@@ -118,12 +120,26 @@ pub(crate) fn is_legacy_plaintext_domestic_dns_list(list: &[String]) -> bool {
         })
 }
 
+/// Return `true` only when `list` strictly equals the legacy v3 dual-DoH default pair
+/// `["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"]`.
+pub(crate) fn is_legacy_v3_doh_default_dns_list(list: &[String]) -> bool {
+    list.len() == DEFAULT_PURE_IP_DOH_NAMESERVERS.len()
+        && list
+            .iter()
+            .zip(DEFAULT_PURE_IP_DOH_NAMESERVERS.iter())
+            .all(|(actual, expected)| actual.trim().eq_ignore_ascii_case(expected))
+}
+
 /// Apply idempotent in-memory schema migrations on a loaded configuration.
 ///
 /// - `schema_version < 2`: upgrades legacy `core_runtime.gogc == 35` to `25` without touching
 ///   v2+ configs where the user manually chose `35`.
 /// - `schema_version < 3`: gently upgrades legacy plaintext domestic UDP 53 DNS lists in
-///   `default_nameserver`, `direct_nameserver`, and `proxy_server_nameserver` to pure-IP DoH 443
+///   `default_nameserver`, `direct_nameserver`, `nameserver`, and `proxy_server_nameserver`
+///   to v3 DoH defaults without overwriting user-customized DNS entries.
+/// - `schema_version < 4`: gently upgrades exact v3 dual-DoH default lists in
+///   `default_nameserver`, `direct_nameserver`, `nameserver`, and `proxy_server_nameserver`
+///   to the 4-endpoint heterogeneous pure-IP encrypted pool (DoH 443 + DoT 853, TLS verified)
 ///   without ever overwriting user-customized DNS entries.
 /// - Returns `true` if `schema_version` or any field was migrated.
 fn migrate_config_in_memory(cfg: &mut AppConfig) -> bool {
@@ -134,20 +150,43 @@ fn migrate_config_in_memory(cfg: &mut AppConfig) -> bool {
         }
     }
     if cfg.schema_version < 3 {
-        let upgraded = || {
+        let v3_doh = || {
             DEFAULT_PURE_IP_DOH_NAMESERVERS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect::<Vec<String>>()
         };
         if is_legacy_plaintext_domestic_dns_list(&cfg.dns.default_nameserver) {
-            cfg.dns.default_nameserver = upgraded();
+            cfg.dns.default_nameserver = v3_doh();
         }
         if is_legacy_plaintext_domestic_dns_list(&cfg.dns.direct_nameserver) {
-            cfg.dns.direct_nameserver = upgraded();
+            cfg.dns.direct_nameserver = v3_doh();
+        }
+        if is_legacy_plaintext_domestic_dns_list(&cfg.dns.nameserver) {
+            cfg.dns.nameserver = v3_doh();
         }
         if is_legacy_plaintext_domestic_dns_list(&cfg.dns.proxy_server_nameserver) {
-            cfg.dns.proxy_server_nameserver = upgraded();
+            cfg.dns.proxy_server_nameserver = v3_doh();
+        }
+    }
+    if cfg.schema_version < 4 {
+        let v4_encrypted = || {
+            DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<String>>()
+        };
+        if is_legacy_v3_doh_default_dns_list(&cfg.dns.default_nameserver) {
+            cfg.dns.default_nameserver = v4_encrypted();
+        }
+        if is_legacy_v3_doh_default_dns_list(&cfg.dns.direct_nameserver) {
+            cfg.dns.direct_nameserver = v4_encrypted();
+        }
+        if is_legacy_v3_doh_default_dns_list(&cfg.dns.nameserver) {
+            cfg.dns.nameserver = v4_encrypted();
+        }
+        if is_legacy_v3_doh_default_dns_list(&cfg.dns.proxy_server_nameserver) {
+            cfg.dns.proxy_server_nameserver = v4_encrypted();
         }
     }
     if cfg.schema_version < CONFIG_SCHEMA_VERSION {
@@ -1110,13 +1149,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_v2_to_v3_migrates_legacy_plaintext_dns_while_preserving_custom_gogc_and_dns() {
-        let paths = temp_paths("v2-to-v3-dns-migration");
+    fn schema_v2_and_v3_to_v4_migrates_default_dns_while_preserving_custom_gogc_and_dns() {
+        let paths = temp_paths("v2-v3-to-v4-dns-migration");
         let mgr = ConfigManager::new(paths.clone());
-        let expected_doh = vec![
-            "https://223.5.5.5/dns-query".to_string(),
-            "https://1.12.12.12/dns-query".to_string(),
-        ];
+        let expected_v4: Vec<String> = DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
 
         assert!(is_legacy_plaintext_domestic_dns_list(&[
             "223.5.5.5".to_string(),
@@ -1132,41 +1171,71 @@ mod tests {
             "https://223.5.5.5/dns-query".to_string(),
         ]));
 
+        assert!(is_legacy_v3_doh_default_dns_list(&[
+            "https://223.5.5.5/dns-query".to_string(),
+            "https://1.12.12.12/dns-query".to_string(),
+        ]));
+        assert!(!is_legacy_v3_doh_default_dns_list(&[
+            "https://223.5.5.5/dns-query".to_string(),
+        ]));
+
         // 1. v2 config with manual gogc=35 + legacy plaintext domestic UDP 53 defaults:
-        //    DNS upgrades cleanly to pure-IP DoH 443 while manual gogc=35 is strictly preserved.
+        //    DNS upgrades cleanly all the way to v4 4-endpoint encrypted pool while gogc=35 stays.
         let v2_legacy_dns_raw = r#"{
             "schema_version": 2,
             "core_runtime": { "gogc": 35 },
             "dns": {
                 "default_nameserver": ["223.5.5.5", "119.29.29.29"],
                 "direct_nameserver": ["223.5.5.5:53", "223.6.6.6"],
+                "nameserver": ["223.5.5.5", "119.29.29.29"],
                 "proxy_server_nameserver": ["119.29.29.29:53"]
             }
         }"#;
         std::fs::write(&paths.config_path, v2_legacy_dns_raw).unwrap();
 
-        let migrated = mgr.load_or_init().expect("migrate v2 legacy dns to v3");
-        assert_eq!(migrated.schema_version, 3);
+        let migrated = mgr.load_or_init().expect("migrate v2 legacy dns to v4");
+        assert_eq!(migrated.schema_version, 4);
         assert_eq!(migrated.core_runtime.gogc, 35);
-        assert_eq!(migrated.dns.default_nameserver, expected_doh);
-        assert_eq!(migrated.dns.direct_nameserver, expected_doh);
-        assert_eq!(migrated.dns.proxy_server_nameserver, expected_doh);
+        assert_eq!(migrated.dns.default_nameserver, expected_v4);
+        assert_eq!(migrated.dns.direct_nameserver, expected_v4);
+        assert_eq!(migrated.dns.nameserver, expected_v4);
+        assert_eq!(migrated.dns.proxy_server_nameserver, expected_v4);
 
-        // 2. v2 config with user-customized DNS entries (custom IP, mixed list, custom DoH) must
-        //    NEVER be overwritten during v2 -> v3 migration.
+        // 2. v3 config carrying the exact v3 dual-DoH default upgrades all 4 DNS lists to v4 4-endpoint pool.
+        let v3_default_doh_raw = r#"{
+            "schema_version": 3,
+            "dns": {
+                "default_nameserver": ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"],
+                "direct_nameserver": ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"],
+                "nameserver": ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"],
+                "proxy_server_nameserver": ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"]
+            }
+        }"#;
+        std::fs::write(&paths.config_path, v3_default_doh_raw).unwrap();
+
+        let migrated_v3 = mgr.load_or_init().expect("migrate v3 default doh to v4");
+        assert_eq!(migrated_v3.schema_version, 4);
+        assert_eq!(migrated_v3.dns.default_nameserver, expected_v4);
+        assert_eq!(migrated_v3.dns.direct_nameserver, expected_v4);
+        assert_eq!(migrated_v3.dns.nameserver, expected_v4);
+        assert_eq!(migrated_v3.dns.proxy_server_nameserver, expected_v4);
+
+        // 3. v2/v3 config with user-customized DNS entries (custom IP, mixed list, custom DoH) must
+        //    NEVER be overwritten during migration.
         let v2_custom_dns_raw = r#"{
             "schema_version": 2,
             "core_runtime": { "gogc": 35 },
             "dns": {
                 "default_nameserver": ["223.5.5.5", "10.0.0.53"],
                 "direct_nameserver": ["114.114.114.114"],
+                "nameserver": ["https://1.12.12.12/dns-query"],
                 "proxy_server_nameserver": ["https://dns.alidns.com/dns-query"]
             }
         }"#;
         std::fs::write(&paths.config_path, v2_custom_dns_raw).unwrap();
 
-        let preserved = mgr.load_or_init().expect("preserve custom dns on v2->v3");
-        assert_eq!(preserved.schema_version, 3);
+        let preserved = mgr.load_or_init().expect("preserve custom dns on v2->v4");
+        assert_eq!(preserved.schema_version, 4);
         assert_eq!(preserved.core_runtime.gogc, 35);
         assert_eq!(
             preserved.dns.default_nameserver,
@@ -1177,11 +1246,15 @@ mod tests {
             vec!["114.114.114.114".to_string()]
         );
         assert_eq!(
+            preserved.dns.nameserver,
+            vec!["https://1.12.12.12/dns-query".to_string()]
+        );
+        assert_eq!(
             preserved.dns.proxy_server_nameserver,
             vec!["https://dns.alidns.com/dns-query".to_string()]
         );
 
-        // 3. Explicit v3 config intentionally configured with plaintext 223.5.5.5 is not re-migrated.
+        // 4. Explicit v3 config intentionally configured with plaintext 223.5.5.5 is NOT overwritten.
         let v3_manual_raw = r#"{
             "schema_version": 3,
             "dns": {
@@ -1190,8 +1263,26 @@ mod tests {
         }"#;
         std::fs::write(&paths.config_path, v3_manual_raw).unwrap();
         let v3_loaded = mgr.load_or_default().expect("load explicit v3");
-        assert_eq!(v3_loaded.schema_version, 3);
+        assert_eq!(v3_loaded.schema_version, 4);
         assert_eq!(v3_loaded.dns.direct_nameserver, vec!["223.5.5.5".to_string()]);
+
+        // 5. Explicit v4 config manually choosing 2-endpoint DoH is NOT re-migrated.
+        let v4_manual_raw = r#"{
+            "schema_version": 4,
+            "dns": {
+                "nameserver": ["https://223.5.5.5/dns-query", "https://1.12.12.12/dns-query"]
+            }
+        }"#;
+        std::fs::write(&paths.config_path, v4_manual_raw).unwrap();
+        let v4_loaded = mgr.load_or_default().expect("load explicit v4");
+        assert_eq!(v4_loaded.schema_version, 4);
+        assert_eq!(
+            v4_loaded.dns.nameserver,
+            vec![
+                "https://223.5.5.5/dns-query".to_string(),
+                "https://1.12.12.12/dns-query".to_string(),
+            ]
+        );
 
         cleanup_dir(&paths);
     }

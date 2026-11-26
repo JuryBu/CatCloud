@@ -11,19 +11,21 @@
 - 非 `443` 端口（尤其是高位随机 TCP/UDP 端口）的单流上行带宽容易遭遇限速或高重传（例如上行被压制在 `2 ~ 4 Mbps` 甚至静默卡顿），在进行大体积图片/视频上传、AI 多模态交互或代码仓库推送时极易超时断流；
 - 与此同时，国内主流云机房的 TCP `:443` 标准 TLS 链路通常具备高带宽余量与稳定 RTT（可达 `50 ~ 250+ Mbps`）。
 
-CatCloud 的 **国内提速（Domestic Pre-Acceleration）** 在客户端侧自动编排一条低延迟、可双活切换的前端国内 `:443` 中继链，将受限的非 443 跨境业务节点通过 Mihomo 原生 `dialer-proxy` 封装送出：
+CatCloud 的 **国内提速（Domestic Pre-Acceleration）** 在客户端侧自动编排一条低延迟、支持多云负载均衡聚合与主备秒切的前端国内 `:443` 中继链，将受限的非 443 跨境业务节点通过 Mihomo 原生 `dialer-proxy` 封装送出：
 
 ```text
-+------------+      +------------------------+      +----------------------------+      +--------------+
-| 本机应用    | ---> | 业务节点 (非 443 端口)   | ---> | ⚡ 国内提速入口 (select)     | ---> | 目标海外节点  |
-|            |      | dialer-proxy 自动挂载   |      |  └─ 🔄 提速自动双活          |      |              |
-+------------+      +------------------------+      |     (fallback, lazy:false) |      +--------------+
-                                                    |     ├─ 主机: 203.0.113.10  |
-                                                    |     └─ 备机: 198.51.100.12 |
-                                                    +----------------------------+
-                                                                 ^
-                                                                 | 仅允许国内 204 探针监测
-                                                    hicloud.com / miui.com generate_204
++------------+      +------------------------+      +------------------------------------------+      +--------------+
+| 本机应用    | ---> | 业务节点 (非 443 端口)   | ---> | ⚡ 国内预加速入口 (select)                | ---> | 目标海外节点  |
+|            |      | dialer-proxy 自动挂载   |      |  └─ 🔄 预加速自动双活 (fallback)         |      |              |
++------------+      +------------------------+      |     ├─ ⚖️ 预加速多云均衡 (load-balance)  |      +--------------+
+                                                    |     │  ├─ 物理云 A 代表: 203.0.113.10    |
+                                                    |     │  └─ 物理云 B 代表: 198.51.100.12   |
+                                                    |     ├─ 同机其余协议备选 (如 Hysteria2)    |
+                                                    |     └─ DIRECT (最终兜底)                 |
+                                                    +------------------------------------------+
+                                                                         ^
+                                                                         | 仅允许国内 204 探针监测 (lazy: false)
+                                                            hicloud.com / miui.com generate_204
 ```
 
 ### 443 vs 非 443 量化体检
@@ -120,11 +122,22 @@ mmrelay://v1/<URL_SAFE_BASE64_NO_PAD(JSON)>
 
 ---
 
-## 4. 双活主动秒切、原生 443 智能跳过与国内 204 探针
+## 4. 多云负载均衡聚合、双活兜底、智能跳过与国内 204 探针
 
-### 双活链路与 `lazy: false`
+### 两层嵌套多云负载均衡聚合与 `lazy: false`
 
-编译器将启用中的跳板按 `priority` 升序编排为两级结构（主选入口 `type: select` + 自动双活池 `type: fallback` 且强制写入 `lazy: false`），由核心持续保活探测，避免懒惰模式在首次故障时经历漫长超时。主跳板失活时主动刷新测活或直切备机并精准断开旧连接，实现亚秒级故障转移。
+为兼顾多台国内云的并发带宽叠加与单台故障时的亚秒级容灾，CatCloud 对主内核、底层独立 443 隧道以及批量隔离测速统一采用**按物理云主机 IP 去重的两层嵌套编排**（调度策略由 `dispatch_strategy` 控制，支持 `auto` 默认 / `load_balance` / `fallback`；负载均衡算法由 `lb_strategy` 控制，支持 `round_robin` 默认 / `consistent_hashing`）：
+
+1. **按物理云主机 IP 去重选代表**：以规范化后的中继 `server` 地址作为物理主机键；同一台物理机若同时部署了多种协议（例如 TCP 443 `AnyTLS` + UDP 443 `Hysteria2`），每台物理机仅推选 1 条最高优先级流式传输代表（`anytls` / `trojan` / `vless` 等 TCP 协议优先于同机 `hysteria2` UDP）进入负载均衡池，避免同一台云服务器的 TCP 与 UDP 入口重复参与轮询、互相抢占同一张物理网卡。
+2. **内层多云负载均衡池（`⚖️ 预加速多云均衡`）**：当去重后的健康物理云主机数 `>= 2` 且 `dispatch_strategy` 为 `auto` 或 `load_balance` 时，编译器生成内层 `type: load-balance` 组（默认 `strategy: round-robin`，强制 `lazy: false` 与国内 204 探针，`interval: 15`，隔离测速 `10`），**仅纳入多台物理云代表，严禁将 `DIRECT` 放进 `load-balance`**（防止正常流量被随机轮询分流至直连）。Mihomo 会按国内 204 探活结果自动踢除失活物理机，在其余健康物理云之间继续聚合。
+3. **外层自动双活与最终兜底（`🔄 预加速自动双活`）**：外层 `type: fallback`（同样强制 `lazy: false`）按顺序编排为 `[⚖️ 预加速多云均衡, 同机其余协议备选..., DIRECT]`。当所有物理云主代表同时不可达时，先依次尝试同机备用协议，极端全挂场景下仍保留 `DIRECT` 兜底不断网。主选入口 `⚡ 国内预加速入口`（`type: select`）默认指向该自动组，同时在下方列出单条中转以便按需临时固定单线。当仅有 1 台物理云主机，或用户显式选择 `fallback` 调度模式时，自动退化为单层 `fallback([relays..., DIRECT])`。
+4. **批量隔离测速同步受惠**：数百节点的批量隔离测速同样使用两层嵌套池（`catcloud-probe-relay-lb` → `catcloud-probe-relay-pool` 含 `DIRECT` 兜底），将并发测速流量均摊到多台物理云，避免单机打满导致大面积误判超时。
+
+#### 带宽聚合的真实能力边界与退回单线主备
+
+- **可叠加的场景**：多流并发下载/上传、数百节点批量测速、多人共享同一套多云中转时，不同连接会被分摊至不同物理云主机，总并发吞吐可叠加为多台物理机带宽之和；
+- **单连接上限不变**：**单条 TCP 长连接仍受单台物理云带宽上限与本机宽带/校园网单流上限约束**，多云负载均衡不会将单条 TCP 流拆分到两台物理机上；
+- **丢包备机一键退回**：若其中某台备机链路质量不佳、丢包严重，混入轮询容易拖慢部分连接（木桶效应），此时可随时在 GUI「国内提速」顶部或通过 CLI（`catcloud preaccel bind --dispatch-strategy fallback --json && catcloud config reload --json`）一键切回单线主备（`fallback`）模式。
 
 ### 严禁使用海外探针测试国内跳板
 
@@ -135,9 +148,10 @@ CatCloud 在配置保存与 YAML 编译两个阶段均实施硬性校验：
 - **默认备选探针**：`http://connect.rom.miui.com/generate_204`
 - **硬性拒绝列表**：检测到 `gstatic.com`、`google.com`、`cloudflare.com` 等海外域名填入国内跳板探针时立即拒绝保存与编译。
 
-### 原生 443 节点智能跳过
+### 原生 443 节点与纯 IPv6 业务节点智能跳过
 
-对于订阅中本身已经监听在 `:443` 且未受限速的节点（解析时自动标记 `is_443_native = true`），CatCloud 在 `skip_443_native: true`（默认开启）时**自动跳过挂载 `dialer-proxy`**，避免无意义绕行并节省国内中继流量；用户仍可对任意单个节点配置 `preaccel_override`（强制开启或强制关闭）。
+- **原生 443 节点自动跳过**：对于订阅中本身已经监听在 `:443` 且未受限速的节点（解析时自动标记 `is_443_native = true`），CatCloud 在 `skip_443_native: true`（默认开启）时**自动跳过挂载 `dialer-proxy`**，避免无意义绕行并节省国内中继流量；用户仍可对任意单个节点配置 `preaccel_override`（强制开启或强制关闭）。
+- **纯 IPv6 业务节点自动跳过纯 IPv4 中转**：大多数国内轻量应用服务器默认仅提供公网 IPv4 出口（中继配置默认 `supports_ipv6: false`）。当业务节点被识别为纯 IPv6 入口（例如 `server` 为 IPv6 字面量、`ip-version: ipv6`、域名带有纯 IPv6 专用标签或节点名显式标明 `ipv6-only` / `v6-only` / `纯ipv6` / `仅ipv6`，不误伤常见双栈节点），且当前启用的国内中转池均不支持 IPv6 出口时，编译器与隔离测速会自动跳过为其挂载 `dialer-proxy`（除非用户对该单节点显式设置了强制开启 `preaccel_override: true`），彻底避免把纯 IPv6 节点送入纯 IPv4 中转引发大量 `network unreachable` 报错。
 
 ---
 
@@ -209,4 +223,43 @@ catcloud config reload --json
 
 1. **必须在线实刷主网卡 `fq` 队列调度**：仅在 `/etc/sysctl.d/` 写入 `net.core.default_qdisc = fq` 不会对开机前已初始化的 `eth0` 生效；若 `tc qdisc show dev eth0` 仍为 `pfifo_fast`，BBR 将失去 pacing 整形并显著放大并发丢包。在服务端执行 `tc qdisc replace dev <iface> root fq`（在线零断流）并注册开机 `systemd` 服务持久化，同时配合 `tcp_fastopen = 3`、`tcp_notsent_lowat = 16384` 与 `16 MiB` TCP 缓冲区。
 2. **客户端 `tfo: true` 与 `AnyTLS` 连接池**：CatCloud 编译国内 443 中转时已自动启用 `tfo: true`，并为 `AnyTLS` 自动注入空闲连接池参数（`min-idle-session: 2`），显著降低短并发握手超时；宽带放行国内 UDP 443 时可在同机房 `UDP 443` 并行部署 `Hysteria2` 彻底消除 TCP-over-TCP 拥塞。
-3. **单层 TLS 优先与主备优于轮询**：外层 443 中转已有完整 TLS 加密，内层优先搭配 `Shadowsocks` 等轻量非 443 海外节点避免双重 TLS 分片损耗；双云中转优先使用主备秒切（`fallback`），避免将丢包较高的备机混入轮询造成木桶效应。
+3. **单层 TLS 优先与多云聚合边界把控**：外层 443 中转已有完整 TLS 加密，内层优先搭配 `Shadowsocks` 等轻量非 443 海外节点避免双重 TLS 分片损耗；拥有 2 台及以上健康物理云主机时，默认两层嵌套调度（内层 `load-balance` 按物理机 IP 去重聚合 + 外层 `fallback` 保留同机协议备选与 `DIRECT` 兜底）可将多流并发、批量测速与多人共享总吞吐叠加为多台物理机带宽之和，但**单条 TCP 长连接仍受单台物理机与本地宽带上限约束**；若其中某台备机出现持续丢包或高抖动，可随时一键切回单线主备（`fallback`）防止木桶效应。
+
+---
+
+## 10. 中转密钥一键轮换与收回
+
+当内测结束、朋友临时试用期满或怀疑中转密钥外泄时，可使用仓库自带的零依赖跨平台脚本 `scripts/relay/rotate_relay_secrets.mjs` 一键轮换国内云 `sing-box` 中转服务器的全部密码/UUID，并生成全新的 `mmrelay/v1` 清单收回自用。
+
+### 常用命令（示例均使用 RFC 5737 示例 IP 与占位符）
+
+```bash
+# 1. 纯本地离线演练（绝不发起 SSH；验证 AnyTLS + Hysteria2 + VLESS 轮换、断言与回退脚本生成）
+node scripts/relay/rotate_relay_secrets.mjs --dry-run
+
+# 2. 一键轮换单台国内云中转并将新清单安全导出为 .mmrelay.json（0600 权限，终端默认脱敏）
+node scripts/relay/rotate_relay_secrets.mjs \
+  --host 203.0.113.10 --user root --key <YOUR_SSH_KEY> \
+  --provider cloud-a --region CN-East --name-prefix "CN-East-443" \
+  --expires 2027-08-12 --out-file ./cn-east.mmrelay.json
+
+# 3. 多配置 / 多服务 / 非 root 提权场景，并显式在终端输出完整 mmrelay://v1/... 导入码
+node scripts/relay/rotate_relay_secrets.mjs \
+  --host 198.51.100.12 --user ubuntu --key <YOUR_SSH_KEY> --use-sudo \
+  --config /etc/catcloud-relay/config.json --config /etc/catcloud-relay/vless.json \
+  --service catcloud-relay --service catcloud-vless \
+  --sing-box-bin /opt/sing-box/sing-box \
+  --name-prefix "CN-South-443" --print-uri
+```
+
+### 安全机制与自动/手动回退
+
+1. **零命令行泄露与强随机轮换**：所有新密码（`24` 字节 `base64url`）与新 `VLESS` / `TUIC` UUID（UUID v4）均在本地由 CSPRNG 生成，并通过 SSH `stdin` 管道传入远端执行器，绝不出现在 SSH 命令行参数中（防止 `ps aux` 泄露）。脚本会遍历每份配置的所有受支持 `inbounds[]`（`anytls` / `hysteria2` / `trojan` / `vless` / `tuic`）并强断言总替换凭据数 `>= 1`。
+2. **远端原子替换与重启失败自动回滚**：远端执行器先将原配置完整备份至 `/etc/catcloud-relay/backups/rotate-<timestamp>/`（同时写入 SHA-256 清单与独立可执行 `rollback.sh`），随后写入同目录临时文件、精确保留原文件的 `chmod` 权限与 `chown` 属主，并执行 `sing-box check -c <tmp>` 校验；全部通过后才原子 `os.replace` 替换配置并执行 `systemctl restart` 与 `systemctl is-active` 验活。一旦重启或验活失败，立即自动执行刚生成的 `rollback.sh` 恢复旧配置并重启原服务，同时返回非零退出码。
+3. **防凭据误提交公开仓**：使用 `--out-file` 导出新清单时，文件权限自动收紧为 `0o600`；若目标路径位于任意 Git 仓库内且文件名不以 `.mmrelay.json` 结尾（已被 `.gitignore` 忽略），脚本会直接强拦截报错退出。终端默认仅打印脱敏摘要，仅显式传入 `--print-uri` 时才输出完整 `mmrelay://v1/...` 导入码。
+4. **事后手动回退**：若轮换后需要主动恢复轮换前的旧密钥，只需在目标服务器上执行脚本输出的对应备份目录回退脚本：
+
+```bash
+# 示例时间戳请替换为轮换输出中的真实目录名
+sudo bash /etc/catcloud-relay/backups/rotate-<YYYYMMDDTHHMMSSZ>/rollback.sh
+```

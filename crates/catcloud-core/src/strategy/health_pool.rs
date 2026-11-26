@@ -5,8 +5,11 @@
 //! round-robin sweep cursors, and two-consecutive-full-healthy recovery with a half-penalty
 //! probation stage to prevent flapping.
 
+use crate::error::CatResult;
+use crate::paths::AppPaths;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// EWMA smoothing factor (`alpha = 0.35`): responsive to real shifts while damping spikes.
@@ -58,6 +61,13 @@ pub struct NodeHealthHintDto {
     /// One of `"healthy"`, `"degraded"`, `"cooldown"`, or `"probation"`.
     pub status: String,
     pub cooldown_remaining_sec: u64,
+    /// Human-readable Chinese reason explaining current runtime health / penalty status.
+    #[serde(default)]
+    pub reason: String,
+    /// Structured lifecycle stage (`"healthy"`, `"degraded"`, `"cooldown_s1"`, `"cooldown_s2"`,
+    /// `"cooldown_s3"`, `"recovery_pending"`, or `"probation"`).
+    #[serde(default)]
+    pub stage: String,
 }
 
 /// Per-node runtime health metrics, penalty, cooldown, and recovery state.
@@ -124,6 +134,54 @@ impl RuntimeNodeHealth {
             "degraded"
         } else {
             "healthy"
+        }
+    }
+
+    /// Return a structured stage identifier for observability & diagnostics.
+    pub fn stage_label(&self, now: Instant) -> String {
+        if self.is_in_cooldown(now) {
+            format!("cooldown_s{}", self.backoff_stage.max(1))
+        } else if self.probation_remaining > 0 {
+            "probation".to_string()
+        } else if self.backoff_stage > 0 || self.cooldown_until.is_some() {
+            "recovery_pending".to_string()
+        } else if self.penalty_score > 1e-6
+            || matches!(
+                self.last_health,
+                Some(RuntimeDualHealth::Degraded | RuntimeDualHealth::Failed)
+            )
+        {
+            "degraded".to_string()
+        } else {
+            "healthy".to_string()
+        }
+    }
+
+    /// Return a concise, user-facing Chinese explanation of the current health state.
+    pub fn reason_zh(&self, now: Instant) -> String {
+        if self.is_in_cooldown(now) {
+            let rem = self.cooldown_remaining_sec(now);
+            let stage = self.backoff_stage.max(1);
+            format!("连续探测超时，冷却退避中（第 {stage} 阶，剩余 {rem}s）")
+        } else if self.probation_remaining > 0 {
+            "恢复观察中（半罚分保护，避免抖动回切）".to_string()
+        } else if self.backoff_stage > 0 || self.cooldown_until.is_some() {
+            if self.recovery_streak > 0 {
+                format!(
+                    "恢复观察中（已连续通过 {}/{} 次双源检测）",
+                    self.recovery_streak, RECOVERY_STREAK_REQUIRED
+                )
+            } else {
+                "连续探测超时，冷却到期等待恢复复测".to_string()
+            }
+        } else if matches!(self.last_health, Some(RuntimeDualHealth::Degraded))
+            || self.penalty_score > 1e-6
+        {
+            "双源半残降权（仅单侧探测通过）".to_string()
+        } else if matches!(self.last_health, Some(RuntimeDualHealth::Failed)) {
+            "连续探测超时，降权待恢复".to_string()
+        } else {
+            "双源探测正常".to_string()
         }
     }
 }
@@ -382,6 +440,8 @@ impl NodeHealthPool {
                     latency_ms,
                     status: status.to_string(),
                     cooldown_remaining_sec: entry.cooldown_remaining_sec(now),
+                    reason: entry.reason_zh(now),
+                    stage: entry.stage_label(now),
                 },
             );
         }
@@ -430,6 +490,158 @@ impl NodeHealthPool {
     pub fn reset_node(&mut self, node_id: &str) {
         self.nodes.remove(node_id);
     }
+}
+
+/// Maximum number of recent watchdog decision events retained in [`WatchdogStateSnapshot`].
+pub const MAX_WATCHDOG_RECENT_EVENTS: usize = 20;
+
+/// Relative filename under `<data_dir>/run/` for persisted watchdog observability snapshots.
+pub const WATCHDOG_STATE_FILENAME: &str = "watchdog-state.json";
+
+/// Per-candidate evaluation trace captured inside a [`WatchdogDecisionEvent`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WatchdogCandidateTrace {
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub node_name: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub score: Option<f64>,
+    #[serde(default)]
+    pub latency_ms: Option<f64>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Structured record of a single watchdog evaluation or automatic switch decision.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WatchdogDecisionEvent {
+    #[serde(default)]
+    pub timestamp: String,
+    #[serde(default)]
+    pub group_id: String,
+    #[serde(default)]
+    pub group_name: String,
+    #[serde(default)]
+    pub trigger_reason: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub from_node_id: Option<String>,
+    #[serde(default)]
+    pub from_node_name: Option<String>,
+    #[serde(default)]
+    pub to_node_id: Option<String>,
+    #[serde(default)]
+    pub to_node_name: Option<String>,
+    #[serde(default)]
+    pub current_probe_summary: String,
+    #[serde(default)]
+    pub candidates: Vec<WatchdogCandidateTrace>,
+    #[serde(default)]
+    pub next_recheck_at: Option<String>,
+    #[serde(default)]
+    pub keep_existing_connections: bool,
+}
+
+/// Active group-level backoff summary exposed inside [`WatchdogStateSnapshot`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchdogGroupBackoffEntry {
+    #[serde(default)]
+    pub group_id: String,
+    #[serde(default)]
+    pub group_name: String,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub backoff_until: Option<String>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Active node cooldown/probation summary exposed inside [`WatchdogStateSnapshot`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WatchdogCooldownNodeEntry {
+    #[serde(default)]
+    pub node_id: String,
+    #[serde(default)]
+    pub node_name: String,
+    #[serde(default)]
+    pub stage: String,
+    #[serde(default)]
+    pub cooldown_remaining_sec: u64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Persisted observability snapshot of background watchdog state and recent decisions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct WatchdogStateSnapshot {
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub active_backoffs: Vec<WatchdogGroupBackoffEntry>,
+    #[serde(default)]
+    pub cooldown_nodes: Vec<WatchdogCooldownNodeEntry>,
+    /// Most recent watchdog decision events, capped at [`MAX_WATCHDOG_RECENT_EVENTS`] (20).
+    #[serde(default)]
+    pub recent_events: Vec<WatchdogDecisionEvent>,
+}
+
+impl WatchdogStateSnapshot {
+    /// Append a watchdog decision event while keeping at most [`MAX_WATCHDOG_RECENT_EVENTS`] items.
+    pub fn push_event(&mut self, event: WatchdogDecisionEvent) {
+        self.recent_events.push(event);
+        self.trim_recent_events();
+    }
+
+    /// Retain only the newest [`MAX_WATCHDOG_RECENT_EVENTS`] decision events.
+    pub fn trim_recent_events(&mut self) {
+        if self.recent_events.len() > MAX_WATCHDOG_RECENT_EVENTS {
+            let drain_count = self.recent_events.len() - MAX_WATCHDOG_RECENT_EVENTS;
+            self.recent_events.drain(0..drain_count);
+        }
+    }
+}
+
+/// Canonical path to the persisted watchdog state snapshot (`<data_dir>/run/watchdog-state.json`).
+pub fn watchdog_state_snapshot_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("run").join(WATCHDOG_STATE_FILENAME)
+}
+
+/// Atomically persist [`WatchdogStateSnapshot`] to `<data_dir>/run/watchdog-state.json`,
+/// enforcing the 20-event cap and `0o600` permissions on Unix.
+pub fn write_watchdog_state_snapshot(
+    data_dir: &Path,
+    snapshot: &WatchdogStateSnapshot,
+) -> CatResult<()> {
+    let path = watchdog_state_snapshot_path(data_dir);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut normalized = snapshot.clone();
+    normalized.trim_recent_events();
+    let payload = serde_json::to_vec_pretty(&normalized)?;
+    AppPaths::atomic_write(&path, &payload)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// Read the latest persisted [`WatchdogStateSnapshot`] from `<data_dir>/run/watchdog-state.json`.
+pub fn read_watchdog_state_snapshot(data_dir: &Path) -> Option<WatchdogStateSnapshot> {
+    let primary = watchdog_state_snapshot_path(data_dir);
+    let bytes = std::fs::read(&primary)
+        .or_else(|_| std::fs::read(data_dir.join(WATCHDOG_STATE_FILENAME)))
+        .ok()?;
+    let mut snapshot: WatchdogStateSnapshot = serde_json::from_slice(&bytes).ok()?;
+    snapshot.trim_recent_events();
+    Some(snapshot)
 }
 
 #[cfg(test)]
@@ -693,5 +905,108 @@ mod tests {
             pool.select_background_sweep_ids("g3", &members, None, 1, t0),
             vec!["n1"]
         );
+    }
+
+    #[test]
+    fn hints_snapshot_populates_chinese_reason_and_stage_across_states() {
+        let mut pool = NodeHealthPool::new();
+        let t0 = Instant::now();
+
+        pool.record_probe_result("n-ok", RuntimeDualHealth::FullHealthy, Some(65.0), t0);
+        pool.record_probe_result("n-deg", RuntimeDualHealth::Degraded, Some(120.0), t0);
+        pool.record_probe_result("n-cool", RuntimeDualHealth::Failed, None, t0);
+
+        let snap1 = pool.build_hints_snapshot(t0 + Duration::from_secs(5));
+        assert_eq!(snap1["n-ok"].stage, "healthy");
+        assert!(snap1["n-ok"].reason.contains("正常"));
+
+        assert_eq!(snap1["n-deg"].stage, "degraded");
+        assert!(snap1["n-deg"].reason.contains("双源半残降权"));
+
+        assert_eq!(snap1["n-cool"].stage, "cooldown_s1");
+        assert!(snap1["n-cool"].reason.contains("连续探测超时"));
+        assert!(snap1["n-cool"].cooldown_remaining_sec > 0);
+
+        // After cooldown expires and two consecutive full-healthy probes, enters probation.
+        let t1 = t0 + Duration::from_secs(65);
+        pool.record_probe_result("n-cool", RuntimeDualHealth::FullHealthy, Some(70.0), t1);
+        let snap_recovering = pool.build_hints_snapshot(t1);
+        assert_eq!(snap_recovering["n-cool"].stage, "recovery_pending");
+        assert!(snap_recovering["n-cool"].reason.contains("恢复观察中"));
+
+        let t2 = t1 + Duration::from_secs(65);
+        pool.record_probe_result("n-cool", RuntimeDualHealth::FullHealthy, Some(68.0), t2);
+        let snap_probation = pool.build_hints_snapshot(t2);
+        assert_eq!(snap_probation["n-cool"].stage, "probation");
+        assert!(snap_probation["n-cool"].reason.contains("恢复观察中"));
+    }
+
+    #[test]
+    fn watchdog_state_snapshot_roundtrip_and_caps_recent_events_to_twenty() {
+        let dir = std::env::temp_dir().join(format!(
+            "catcloud-watchdog-snap-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut snapshot = WatchdogStateSnapshot {
+            updated_at: "2026-11-27T01:30:00Z".to_string(),
+            active_backoffs: vec![WatchdogGroupBackoffEntry {
+                group_id: "g-ai".to_string(),
+                group_name: "AI-主力".to_string(),
+                consecutive_failures: 2,
+                backoff_until: Some("2026-11-27T01:35:00Z".to_string()),
+                reason: "连续探测超时".to_string(),
+            }],
+            cooldown_nodes: vec![WatchdogCooldownNodeEntry {
+                node_id: "n-bad".to_string(),
+                node_name: "JP-01".to_string(),
+                stage: "cooldown_s1".to_string(),
+                cooldown_remaining_sec: 55,
+                reason: "连续探测超时，冷却退避中（第 1 阶，剩余 55s）".to_string(),
+            }],
+            recent_events: Vec::new(),
+        };
+
+        for idx in 0..25 {
+            snapshot.recent_events.push(WatchdogDecisionEvent {
+                timestamp: format!("2026-11-27T01:{idx:02}:00Z"),
+                group_id: "g-ai".to_string(),
+                group_name: "AI-主力".to_string(),
+                trigger_reason: format!("event-{idx}"),
+                action: "switch".to_string(),
+                from_node_id: Some("n-old".to_string()),
+                from_node_name: Some("JP-Old".to_string()),
+                to_node_id: Some("n-new".to_string()),
+                to_node_name: Some("TW-New".to_string()),
+                current_probe_summary: "0/2 timeout".to_string(),
+                candidates: vec![WatchdogCandidateTrace {
+                    node_id: "n-new".to_string(),
+                    node_name: "TW-New".to_string(),
+                    status: "healthy".to_string(),
+                    score: Some(88.5),
+                    latency_ms: Some(42.0),
+                    reason: "双源探测正常".to_string(),
+                }],
+                next_recheck_at: Some("2026-11-27T01:31:00Z".to_string()),
+                keep_existing_connections: true,
+            });
+        }
+
+        write_watchdog_state_snapshot(&dir, &snapshot).expect("write watchdog snapshot");
+        assert!(watchdog_state_snapshot_path(&dir).is_file());
+
+        let loaded = read_watchdog_state_snapshot(&dir).expect("read watchdog snapshot");
+        assert_eq!(loaded.recent_events.len(), MAX_WATCHDOG_RECENT_EVENTS);
+        assert_eq!(loaded.recent_events[0].trigger_reason, "event-5");
+        assert_eq!(
+            loaded.recent_events.last().unwrap().trigger_reason,
+            "event-24"
+        );
+        assert!(loaded.recent_events[0].keep_existing_connections);
+        assert_eq!(loaded.active_backoffs.len(), 1);
+        assert_eq!(loaded.cooldown_nodes.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

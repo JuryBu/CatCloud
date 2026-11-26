@@ -16,34 +16,39 @@ pub use campus::{
     probe_campus_portal, probe_campus_portal_with_fallback,
 };
 pub use generator::{
-    DEFAULT_DOMESTIC_204_FALLBACK, DEFAULT_DOMESTIC_204_PRIMARY, PREACCEL_FALLBACK_GROUP,
-    PREACCEL_SELECT_GROUP, PreAccelCompilePlan, build_preaccel_compile_plan,
-    compile_relay_to_mihomo_yaml, host_to_direct_rule, host_to_fake_ip_filter,
-    is_disallowed_domestic_probe_host, validate_domestic_probe_url,
+    BuiltPreAccelGroups, DEFAULT_DOMESTIC_204_FALLBACK, DEFAULT_DOMESTIC_204_PRIMARY,
+    PREACCEL_FALLBACK_GROUP, PREACCEL_LB_GROUP, PREACCEL_SELECT_GROUP, PreAccelCompilePlan,
+    build_preaccel_compile_plan, build_preaccel_proxy_groups, compile_relay_to_mihomo_yaml,
+    host_to_direct_rule, host_to_fake_ip_filter, is_disallowed_domestic_probe_host,
+    validate_domestic_probe_url,
 };
 pub use global_tunnel::{
-    GlobalPreAccelManager, GlobalPreAccelMetrics, GlobalPreAccelStatus, Ipv4TcpMeta,
-    MAX_NAT_ENTRIES, NAT_CLOSING_GRACE, NAT_IDLE_TIMEOUT, NatEntry, NatKey, NatTable,
-    SELF_TEST_DETECTED_BY, STANDALONE_TUNNEL_GOGC, STANDALONE_TUNNEL_GOMEMLIMIT,
-    StandalonePreAccelTunnel, WINDIVERT_DOWNLOAD_URL, WINDIVERT_ZIP_SHA256, WinDivertAddress,
-    WinDivertPaths, build_security_guidance, build_self_test_probe_urls, build_windivert_filter,
-    clamp_tcp_syn_mss, classify_security_products_from_process_names,
-    collect_enabled_relay_ipv4s, compile_standalone_preaccel_yaml,
-    compile_standalone_preaccel_yaml_with_interface, detect_host_security_products,
-    download_and_install_windivert, is_physical_nic_descriptor, locate_windivert_files,
+    GLOBAL_PREACCEL_RUNTIME_META_FILENAME, GlobalPreAccelManager, GlobalPreAccelMetrics,
+    GlobalPreAccelRuntimeMeta, GlobalPreAccelStatus, Ipv4TcpMeta, MAX_NAT_ENTRIES,
+    NAT_CLOSING_GRACE, NAT_IDLE_TIMEOUT, NatEntry, NatKey, NatTable, SELF_TEST_DETECTED_BY,
+    STANDALONE_TUNNEL_GOGC, STANDALONE_TUNNEL_GOMEMLIMIT, StandalonePreAccelTunnel,
+    WINDIVERT_DOWNLOAD_URL, WINDIVERT_ZIP_SHA256, WinDivertAddress, WinDivertPaths,
+    build_security_guidance, build_self_test_probe_urls, build_windivert_filter, clamp_tcp_syn_mss,
+    classify_security_products_from_process_names, collect_enabled_relay_ipv4s,
+    compile_standalone_preaccel_yaml, compile_standalone_preaccel_yaml_with_interface,
+    detect_host_security_products, download_and_install_windivert,
+    global_preaccel_runtime_meta_path, is_physical_nic_descriptor, locate_windivert_files,
     locate_windivert_files_with_exe_dir, locate_windivert_paths, normalize_process_basename,
-    parse_ipv4_tcp_packet, rewrite_ipv4_tcp_dst, rewrite_ipv4_tcp_from_loopback,
-    rewrite_ipv4_tcp_src, rewrite_ipv4_tcp_to_loopback, should_intercept_process,
-    socks5_noauth_connect_ipv4, verify_and_extract_windivert_zip,
+    parse_ipv4_tcp_packet, read_global_preaccel_runtime_meta, remove_global_preaccel_runtime_meta,
+    rewrite_ipv4_tcp_dst, rewrite_ipv4_tcp_from_loopback, rewrite_ipv4_tcp_src,
+    rewrite_ipv4_tcp_to_loopback, should_intercept_process, socks5_noauth_connect_ipv4,
+    verify_and_extract_windivert_zip, write_global_preaccel_runtime_meta,
 };
 pub use schema::{
-    EXPIRY_SOON_THRESHOLD_DAYS, MMRELAY_URI_PREFIX, RelayExpiryStatus, RelayProtocol,
-    RelayValidationCode, RelayValidationIssue, RelayValidationSeverity, bundle_from_relays,
-    days_until_expiry, decode_mmrelay_uri, encode_mmrelay_uri, evaluate_expiry,
-    import_relays_dedup_into_storage, is_pure_ip_server, parse_expiry_timestamp,
-    parse_mmrelay_clipboard, parse_mmrelay_json, parse_server_ip, sanitize_relay_for_domestic_443,
-    serialize_mmrelay_json, serialize_mmrelay_json_compact, validate_bundle_envelope,
-    validate_relay, validate_relay_at, validate_relay_strict, validate_relay_strict_at,
+    EXPIRY_SOON_THRESHOLD_DAYS, MMRELAY_URI_PREFIX, PREACCEL_LB_GROUP_NAME, PhysicalRelaySelection,
+    RelayExpiryStatus, RelayProtocol, RelayValidationCode, RelayValidationIssue,
+    RelayValidationSeverity, bundle_from_relays, days_until_expiry, decode_mmrelay_uri,
+    encode_mmrelay_uri, evaluate_expiry, import_relays_dedup_into_storage, is_pure_ip_server,
+    normalize_relay_host_key, parse_expiry_timestamp, parse_mmrelay_clipboard, parse_mmrelay_json,
+    parse_server_ip, relays_support_ipv6, sanitize_relay_for_domestic_443,
+    select_physical_host_relays, serialize_mmrelay_json, serialize_mmrelay_json_compact,
+    validate_bundle_envelope, validate_relay, validate_relay_at, validate_relay_strict,
+    validate_relay_strict_at,
 };
 
 #[cfg(test)]
@@ -53,7 +58,9 @@ mod tests {
         MMRELAY_ROLE_DOMESTIC_PRE_ACCEL, MMRELAY_SCHEMA_V1, MmRelayBundleV1, PreAccelRelay,
     };
     use crate::models::node::ProxyNode;
-    use crate::models::settings::PreAccelConfig;
+    use crate::models::settings::{
+        PreAccelConfig, PreAccelDispatchStrategy, PreAccelLbStrategy,
+    };
     use chrono::{DateTime, Utc};
     use serde_yaml_ng::Value;
     use std::sync::Arc;
@@ -83,6 +90,7 @@ mod tests {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: false,
         }
     }
 
@@ -105,6 +113,7 @@ mod tests {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: false,
         }
     }
 
@@ -426,7 +435,7 @@ mod tests {
         assert_eq!(vless_yaml.get("tfo").and_then(Value::as_bool), Some(true));
         assert_eq!(vless_yaml.get("skip-cert-verify").and_then(Value::as_bool), Some(true));
 
-        // Check `select` group puts `PREACCEL_FALLBACK_GROUP` first by default.
+        // Check `select` group puts `PREACCEL_FALLBACK_GROUP` first by default and ends with DIRECT.
         let select_group = &plan.proxy_groups[0];
         assert_eq!(
             select_group.get("name").and_then(Value::as_str),
@@ -441,10 +450,21 @@ mod tests {
             .collect();
         assert_eq!(
             select_proxies,
-            vec![PREACCEL_FALLBACK_GROUP, "Tencent-GZ-443", "Aliyun-SH-443"]
+            vec![
+                PREACCEL_FALLBACK_GROUP,
+                "Tencent-GZ-443",
+                "Aliyun-SH-443",
+                "DIRECT",
+            ]
         );
 
-        // Check `fallback` group has explicit `lazy: false`, domestic 204 URL, clamped interval.
+        // Two distinct physical hosts under Auto strategy emit two-layer nested LB + outer fallback.
+        assert_eq!(plan.distinct_host_count, 2);
+        assert_eq!(plan.lb_group_name.as_deref(), Some(PREACCEL_LB_GROUP_NAME));
+        assert_eq!(plan.proxy_groups.len(), 3);
+
+        // Outer `fallback` group has explicit `lazy: false`, domestic 204 URL, clamped interval,
+        // and wraps inner `PREACCEL_LB_GROUP_NAME` + `DIRECT` safety net.
         let fallback_group = &plan.proxy_groups[1];
         assert_eq!(
             fallback_group.get("name").and_then(Value::as_str),
@@ -460,6 +480,39 @@ mod tests {
             Some(DEFAULT_DOMESTIC_204_PRIMARY)
         );
         assert_eq!(fallback_group.get("interval").and_then(Value::as_u64), Some(10));
+        let fb_proxies: Vec<&str> = fallback_group
+            .get("proxies")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(fb_proxies, vec![PREACCEL_LB_GROUP_NAME, "DIRECT"]);
+
+        // Inner `load-balance` group contains deduplicated physical hosts and NEVER `DIRECT`.
+        let lb_group = &plan.proxy_groups[2];
+        assert_eq!(
+            lb_group.get("name").and_then(Value::as_str),
+            Some(PREACCEL_LB_GROUP_NAME)
+        );
+        assert_eq!(
+            lb_group.get("type").and_then(Value::as_str),
+            Some("load-balance")
+        );
+        assert_eq!(
+            lb_group.get("strategy").and_then(Value::as_str),
+            Some("round-robin")
+        );
+        assert_eq!(lb_group.get("lazy").and_then(Value::as_bool), Some(false));
+        let lb_proxies: Vec<&str> = lb_group
+            .get("proxies")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(lb_proxies, vec!["Tencent-GZ-443", "Aliyun-SH-443"]);
+        assert!(!lb_proxies.contains(&"DIRECT"));
 
         // Check anti-loop rules and fake-ip-filter contents.
         assert!(plan
@@ -500,7 +553,9 @@ mod tests {
         assert!(plan.fake_ip_filter.contains(&"+.miui.com".to_string()));
         assert!(!plan.fake_ip_filter.contains(&"203.0.113.10".to_string()));
 
-        // Selecting an explicit `active_relay_id` places it at position 0 of the `select` group.
+        // Selecting an explicit `active_relay_id` with `auto_failover == true` preserves
+        // `PREACCEL_FALLBACK_GROUP` at position 0 of `select` and promotes `Aliyun-SH-443` to
+        // position 0 of `fallback` (with `DIRECT` safety net) so failover is never bypassed.
         cfg.active_relay_id = Some("relay-ali-sh".to_string());
         cfg.probe_interval_sec = 999; // should clamp to 300
         let pinned_plan =
@@ -515,7 +570,44 @@ mod tests {
             .collect();
         assert_eq!(
             pinned_select,
-            vec!["Aliyun-SH-443", PREACCEL_FALLBACK_GROUP, "Tencent-GZ-443"]
+            vec![
+                PREACCEL_FALLBACK_GROUP,
+                "Aliyun-SH-443",
+                "Tencent-GZ-443",
+                "DIRECT",
+            ]
+        );
+        let pinned_fb: Vec<&str> = pinned_plan.proxy_groups[1]
+            .get("proxies")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            pinned_fb,
+            vec!["Aliyun-SH-443", "Tencent-GZ-443", "DIRECT"]
+        );
+
+        // When `auto_failover == false`, explicit `active_relay_id` moves to position 0 of `select`.
+        cfg.auto_failover = false;
+        let pinned_direct_plan =
+            build_preaccel_compile_plan(&cfg, &relays, &nodes).expect("manual pin compile plan");
+        let pinned_direct_select: Vec<&str> = pinned_direct_plan.proxy_groups[0]
+            .get("proxies")
+            .and_then(Value::as_sequence)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            pinned_direct_select,
+            vec![
+                "Aliyun-SH-443",
+                PREACCEL_FALLBACK_GROUP,
+                "Tencent-GZ-443",
+                "DIRECT",
+            ]
         );
 
         // Disabled config or zero enabled relays must safely bypass without dangling dialer-proxy.
@@ -791,6 +883,7 @@ mod tests {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: false,
         };
         let hy2_alias = PreAccelRelay {
             id: "relay-hy2-2".to_string(),
@@ -810,6 +903,7 @@ mod tests {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: false,
         };
 
         assert!(validate_relay_strict_at(&hy2_canonical, now).is_ok());
@@ -867,5 +961,129 @@ mod tests {
         assert!(plan
             .anti_loop_rules
             .contains(&"IP-CIDR,198.51.100.44/32,DIRECT,no-resolve".to_string()));
+    }
+
+    #[test]
+    fn select_physical_host_relays_dedups_same_host_prefers_tcp_and_builds_nested_lb_without_direct()
+    {
+        // Host A (203.0.113.10): UDP HY2 has lower numeric priority (5) than TCP AnyTLS (10),
+        // yet TCP AnyTLS must be picked as primary host representative for LB pool, putting HY2
+        // into `secondary_protocol_relays`.
+        let mut tx_hy2 = sample_tencent_relay();
+        tx_hy2.id = "relay-tx-hy2".to_string();
+        tx_hy2.name = "Tencent-GZ-HY2".to_string();
+        tx_hy2.protocol = "hysteria2".to_string();
+        tx_hy2.priority = 5;
+
+        let tx_anytls = sample_tencent_relay(); // 203.0.113.10, anytls, priority 10
+
+        // Host B (198.51.100.20): VLESS (priority 20) + same-host HY2 (priority 25)
+        let ali_vless = sample_aliyun_vless_relay();
+        let mut ali_hy2 = sample_aliyun_vless_relay();
+        ali_hy2.id = "relay-ali-hy2".to_string();
+        ali_hy2.name = "Aliyun-SH-HY2".to_string();
+        ali_hy2.protocol = "hy2".to_string();
+        ali_hy2.password = "demo-hy2-pass".to_string();
+        ali_hy2.priority = 25;
+
+        let all_relays = vec![
+            tx_hy2.clone(),
+            tx_anytls.clone(),
+            ali_vless.clone(),
+            ali_hy2.clone(),
+        ];
+
+        let sel = select_physical_host_relays(&all_relays);
+        assert_eq!(sel.distinct_host_count, 2);
+        let primary_ids: Vec<&str> = sel.primary_host_relays.iter().map(|r| r.id.as_str()).collect();
+        let secondary_ids: Vec<&str> = sel
+            .secondary_protocol_relays
+            .iter()
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(primary_ids, vec!["relay-tx-gz", "relay-ali-sh"]);
+        assert_eq!(secondary_ids, vec!["relay-tx-hy2", "relay-ali-hy2"]);
+
+        // Two-layer compilation with ConsistentHashing puts only TCP host reps in inner LB (NO DIRECT!),
+        // and places [PREACCEL_LB_GROUP_NAME, same-host UDP backups..., DIRECT] in outer fallback.
+        let mut cfg = PreAccelConfig::default();
+        cfg.enabled = true;
+        cfg.dispatch_strategy = PreAccelDispatchStrategy::Auto;
+        cfg.lb_strategy = PreAccelLbStrategy::ConsistentHashing;
+
+        let mut ipv6_only = sample_node("n-v6", "2001:db8::99", 8443, false, None);
+        ipv6_only.name = "JP-IPv6-Only".to_string();
+        let mut dual_stack = sample_node("n-dual", "hk01.example.test", 8443, false, None);
+        dual_stack.name = "HK-01-IPv6".to_string();
+        let mut ipv6_forced = sample_node("n-v6-force", "2001:db8::100", 8443, false, Some(true));
+        ipv6_forced.name = "TW-Pure-V6-Forced".to_string();
+
+        let plan = build_preaccel_compile_plan(
+            &cfg,
+            &all_relays,
+            &[ipv6_only, dual_stack, ipv6_forced],
+        )
+        .expect("compile multi-cloud plan");
+
+        assert!(plan.active);
+        assert_eq!(plan.lb_group_name.as_deref(), Some(PREACCEL_LB_GROUP_NAME));
+        assert_eq!(plan.distinct_host_count, 2);
+        assert_eq!(plan.dialer_for_node("n-v6"), None);
+        assert_eq!(plan.skipped_ipv6_node_ids, vec!["n-v6"]);
+        assert_eq!(plan.dialer_for_node("n-dual"), Some(PREACCEL_SELECT_GROUP));
+        assert_eq!(
+            plan.dialer_for_node("n-v6-force"),
+            Some(PREACCEL_SELECT_GROUP)
+        );
+
+        let fb = &plan.proxy_groups[1];
+        let fb_proxies: Vec<&str> = fb["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            fb_proxies,
+            vec![
+                PREACCEL_LB_GROUP_NAME,
+                "Tencent-GZ-HY2",
+                "Aliyun-SH-HY2",
+                "DIRECT",
+            ]
+        );
+
+        let lb = &plan.proxy_groups[2];
+        assert_eq!(lb["type"].as_str(), Some("load-balance"));
+        assert_eq!(lb["strategy"].as_str(), Some("consistent-hashing"));
+        let lb_proxies: Vec<&str> = lb["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(lb_proxies, vec!["Tencent-GZ-443", "Aliyun-SH-443"]);
+        assert!(!lb_proxies.contains(&"DIRECT"));
+
+        // Single physical host with 2 protocols (AnyTLS + HY2 on same IP) must stay single-layer fallback.
+        let single_host_plan =
+            build_preaccel_compile_plan(&cfg, &[tx_anytls, tx_hy2], &[]).expect("single host plan");
+        assert_eq!(single_host_plan.distinct_host_count, 1);
+        assert_eq!(single_host_plan.lb_group_name, None);
+        assert_eq!(single_host_plan.proxy_groups.len(), 2);
+        let sh_fb: Vec<&str> = single_host_plan.proxy_groups[1]["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(sh_fb, vec!["Tencent-GZ-HY2", "Tencent-GZ-443", "DIRECT"]);
+
+        // Explicit Fallback strategy with 2 physical hosts also stays single-layer fallback.
+        cfg.dispatch_strategy = PreAccelDispatchStrategy::Fallback;
+        let explicit_fb_plan =
+            build_preaccel_compile_plan(&cfg, &all_relays, &[]).expect("explicit fallback plan");
+        assert_eq!(explicit_fb_plan.lb_group_name, None);
+        assert_eq!(explicit_fb_plan.proxy_groups.len(), 2);
     }
 }

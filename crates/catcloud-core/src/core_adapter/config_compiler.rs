@@ -5,7 +5,9 @@ use crate::error::{CatError, CatResult};
 use crate::models::{
     AppConfig, DEFAULT_AI_ROUTING_DOMAINS, FallbackPolicy, MultiGroup, MultiGroupMode,
     MultiGroupState, OverrideMode, PreAccelRelay, ProxyMode, ProxyNode, RouteTargetMode,
+    is_ipv6_only_node, pick_smart_default_node_id,
 };
+use crate::preaccel::generator::build_preaccel_proxy_groups;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Number, Value};
 use sha2::{Digest, Sha256};
@@ -19,6 +21,9 @@ pub const PREACCEL_SELECT_GROUP_NAME: &str = "⚡ 国内预加速入口";
 
 /// Canonical Mihomo fallback group name for active-standby domestic pre-acceleration relays.
 pub const PREACCEL_FALLBACK_GROUP_NAME: &str = "🔄 预加速自动双活";
+
+/// Canonical Mihomo inner load-balance group name for multi-cloud physical host aggregation.
+pub use crate::preaccel::schema::PREACCEL_LB_GROUP_NAME;
 
 /// Default top-level proxy selector group generated when no custom multi-groups exist.
 pub const DEFAULT_FALLBACK_GROUP_NAME: &str = "🐱 猫猫云梯";
@@ -66,6 +71,8 @@ pub struct CompileStats {
     pub relay_proxies: usize,
     pub dialer_wrapped_proxies: usize,
     pub skipped_443_native_proxies: usize,
+    #[serde(default)]
+    pub skipped_ipv6_proxies: usize,
     pub proxy_groups: usize,
     pub total_rules: usize,
     pub preaccel_active: bool,
@@ -699,7 +706,20 @@ pub fn compile_mihomo_config_with_runtime_dir(
     root.insert(str_val("tun"), Value::Mapping(tun_map));
 
     // 6. Compile proxies (domestic relays + business nodes with optional dialer-proxy).
-    let mut used_proxy_names: HashSet<String> = HashSet::new();
+    // Pre-seed Mihomo built-in target names and pre-acceleration group names so user-provided
+    // relay/node names (e.g. a relay literally named `DIRECT`) never collide with reserved names
+    // or get filtered out of load-balance groups.
+    let mut used_proxy_names: HashSet<String> = [
+        "DIRECT",
+        "REJECT",
+        "PASS",
+        PREACCEL_SELECT_GROUP_NAME,
+        PREACCEL_FALLBACK_GROUP_NAME,
+        PREACCEL_LB_GROUP_NAME,
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect();
     let mut compiled_proxies: Vec<Value> = Vec::new();
     let mut relay_id_to_name: HashMap<String, String> = HashMap::new();
     let mut relay_names_ordered: Vec<String> = Vec::new();
@@ -723,6 +743,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
     let mut all_enabled_node_names: Vec<String> = Vec::new();
     let mut dialer_wrapped_proxies = 0usize;
     let mut skipped_443_native_proxies = 0usize;
+    let mut skipped_ipv6_proxies = 0usize;
+    let relays_support_ipv6 =
+        !enabled_relays.is_empty() && enabled_relays.iter().all(|r| r.supports_ipv6);
 
     for &node in &compiled_nodes {
         let base_name = if node.name.trim().is_empty() {
@@ -734,7 +757,12 @@ pub fn compile_mihomo_config_with_runtime_dir(
         let mut proxy_map = build_node_proxy_mapping(node, &unique_name)?;
 
         if preaccel_active {
-            if node.should_apply_preaccel(cfg.preaccel.skip_443_native) {
+            let wants_preaccel = node.should_apply_preaccel(cfg.preaccel.skip_443_native);
+            let skip_for_ipv6 = wants_preaccel
+                && !relays_support_ipv6
+                && is_ipv6_only_node(node)
+                && node.preaccel_override != Some(true);
+            if wants_preaccel && !skip_for_ipv6 {
                 insert_str(&mut proxy_map, "dialer-proxy", PREACCEL_SELECT_GROUP_NAME);
                 dialer_wrapped_proxies += 1;
             } else {
@@ -743,7 +771,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
                 {
                     proxy_map.shift_remove("dialer-proxy");
                 }
-                if cfg.preaccel.skip_443_native
+                if skip_for_ipv6 {
+                    skipped_ipv6_proxies += 1;
+                } else if cfg.preaccel.skip_443_native
                     && node.is_443_native
                     && node.preaccel_override.is_none()
                 {
@@ -767,76 +797,21 @@ pub fn compile_mihomo_config_with_runtime_dir(
     let mut active_selections: BTreeMap<String, String> = BTreeMap::new();
 
     if preaccel_active {
-        let active_relay_name = cfg
-            .preaccel
-            .active_relay_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .and_then(|id| relay_id_to_name.get(id))
-            .cloned();
-
-        // Always promote the user-selected relay to index 0 of `relay_names_ordered` so it becomes
-        // the true primary relay even when `auto_failover == true`.
-        if let Some(ref chosen) = active_relay_name {
-            if let Some(pos) = relay_names_ordered.iter().position(|n| n == chosen) {
-                let item = relay_names_ordered.remove(pos);
-                relay_names_ordered.insert(0, item);
-            }
-        }
-
-        // Fallback group: active-standby domestic 204 health check with lazy: false.
-        // Append `DIRECT` at the end so all dialer-wrapped nodes fail open to direct dialing
-        // instead of blackholing if every domestic relay fails simultaneously.
-        let mut fallback_members = relay_names_ordered.clone();
-        push_unique(&mut fallback_members, "DIRECT".to_string());
-
-        let mut fallback_group = Mapping::new();
-        insert_str(&mut fallback_group, "name", PREACCEL_FALLBACK_GROUP_NAME);
-        insert_str(&mut fallback_group, "type", "fallback");
-        fallback_group.insert(
-            str_val("proxies"),
-            string_seq(fallback_members.iter().map(String::as_str)),
+        let enabled_owned: Vec<PreAccelRelay> =
+            enabled_relays.iter().map(|r| (*r).clone()).collect();
+        let built = build_preaccel_proxy_groups(
+            &cfg.preaccel,
+            &enabled_owned,
+            &relay_id_to_name,
+            &relay_names_ordered,
+            cfg.preaccel.probe_url.trim(),
+            cfg.preaccel.probe_interval_sec,
         );
-        insert_str(&mut fallback_group, "url", cfg.preaccel.probe_url.trim());
-        insert_u64(&mut fallback_group, "interval", cfg.preaccel.probe_interval_sec);
-        insert_bool(&mut fallback_group, "lazy", false);
-
-        // Select group: entry point referenced by dialer-proxy.
-        let mut select_members: Vec<String> = Vec::new();
-        if let Some(ref chosen) = active_relay_name {
-            if !cfg.preaccel.auto_failover {
-                push_unique(&mut select_members, chosen.clone());
-            }
-        }
-        push_unique(
-            &mut select_members,
-            PREACCEL_FALLBACK_GROUP_NAME.to_string(),
+        active_selections.insert(
+            PREACCEL_SELECT_GROUP_NAME.to_string(),
+            built.default_select_target,
         );
-        if let Some(ref chosen) = active_relay_name {
-            push_unique(&mut select_members, chosen.clone());
-        }
-        for name in &relay_names_ordered {
-            push_unique(&mut select_members, name.clone());
-        }
-        push_unique(&mut select_members, "DIRECT".to_string());
-
-        let selected_first = select_members
-            .first()
-            .cloned()
-            .unwrap_or_else(|| PREACCEL_FALLBACK_GROUP_NAME.to_string());
-        active_selections.insert(PREACCEL_SELECT_GROUP_NAME.to_string(), selected_first);
-
-        let mut select_group = Mapping::new();
-        insert_str(&mut select_group, "name", PREACCEL_SELECT_GROUP_NAME);
-        insert_str(&mut select_group, "type", "select");
-        select_group.insert(
-            str_val("proxies"),
-            string_seq(select_members.iter().map(String::as_str)),
-        );
-
-        proxy_groups.push(Value::Mapping(select_group));
-        proxy_groups.push(Value::Mapping(fallback_group));
+        proxy_groups.extend(built.proxy_groups);
     }
 
     let mut default_match_target: Option<String> = None;
@@ -1048,6 +1023,14 @@ pub fn compile_mihomo_config_with_runtime_dir(
             Some(target) => target,
             None => {
                 let mut default_members = all_enabled_node_names.clone();
+                if let Some(smart_id) = pick_smart_default_node_id(input.nodes, None) {
+                    if let Some(smart_name) = node_id_to_name.get(&smart_id) {
+                        if let Some(pos) = default_members.iter().position(|n| n == smart_name) {
+                            let chosen = default_members.remove(pos);
+                            default_members.insert(0, chosen);
+                        }
+                    }
+                }
                 if default_members.is_empty() {
                     default_members.push("DIRECT".to_string());
                 }
@@ -1069,7 +1052,20 @@ pub fn compile_mihomo_config_with_runtime_dir(
 
     // Strip dangling/invalid/self-referencing `dialer-proxy` entries inherited from raw
     // subscriptions unless their target exists in the compiled proxies or proxy-groups.
-    let mut valid_dialer_targets: HashSet<String> = used_proxy_names.clone();
+    let mut valid_dialer_targets: HashSet<String> =
+        HashSet::with_capacity(compiled_proxies.len() + proxy_groups.len());
+    for proxy_val in &compiled_proxies {
+        if let Some(name) = proxy_val
+            .as_mapping()
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+        {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                valid_dialer_targets.insert(trimmed.to_string());
+            }
+        }
+    }
     for group_val in &proxy_groups {
         if let Some(name) = group_val
             .as_mapping()
@@ -1488,6 +1484,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         relay_proxies: relay_names_ordered.len(),
         dialer_wrapped_proxies,
         skipped_443_native_proxies,
+        skipped_ipv6_proxies,
         proxy_groups: total_groups,
         total_rules,
         preaccel_active,
@@ -1507,60 +1504,19 @@ pub fn compile_mihomo_config_with_runtime_dir(
     })
 }
 
-/// Redact sensitive credential fields (`password`, `uuid`, `token`, `private-key`, `auth-str`)
-/// across all compiled `proxies` entries and mask domestic pre-acceleration relay `server`
-/// addresses with `<REDACTED>` for safe UI/diagnostics preview.
+/// Redact sensitive credential fields, controller secrets, and upstream/relay IP or domain
+/// endpoints from compiled Mihomo YAML for safe UI/diagnostics preview by delegating to the
+/// unified [`crate::sanitize::redact_compiled_yaml`] pipeline.
 pub fn redact_compiled_yaml_for_preview(
     compiled: &CompiledCoreConfig,
-    relays: &[PreAccelRelay],
+    _relays: &[PreAccelRelay],
 ) -> CatResult<String> {
-    const SENSITIVE_KEYS: &[&str] = &[
-        "password",
-        "uuid",
-        "token",
-        "private-key",
-        "auth-str",
-        "obfs-password",
-    ];
-    let relay_servers: HashSet<String> = relays
-        .iter()
-        .map(|r| r.server.trim().to_ascii_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let mut doc = compiled.value.clone();
-    if let Some(root) = doc.as_mapping_mut() {
-        let proxies_key = str_val("proxies");
-        if let Some(proxies) = root.get_mut(&proxies_key).and_then(Value::as_sequence_mut) {
-            let server_key = str_val("server");
-            for (idx, item) in proxies.iter_mut().enumerate() {
-                let Some(map) = item.as_mapping_mut() else {
-                    continue;
-                };
-                for &key in SENSITIVE_KEYS {
-                    let yaml_key = str_val(key);
-                    if let Some(val) = map.get_mut(&yaml_key) {
-                        if !val.is_null() {
-                            *val = Value::String("<REDACTED>".to_string());
-                        }
-                    }
-                }
-                let is_relay = idx < compiled.stats.relay_proxies
-                    || map
-                        .get(&server_key)
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| relay_servers.contains(&s.trim().to_ascii_lowercase()));
-                if is_relay {
-                    if let Some(server_val) = map.get_mut(&server_key) {
-                        if !server_val.is_null() {
-                            *server_val = Value::String("<REDACTED>".to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    Ok(serde_yaml_ng::to_string(&doc)?)
+    let source_yaml = if compiled.yaml.trim().is_empty() {
+        serde_yaml_ng::to_string(&compiled.value)?
+    } else {
+        compiled.yaml.clone()
+    };
+    Ok(crate::sanitize::redact_compiled_yaml(&source_yaml))
 }
 
 /// Apply a declarative RFC 7396 style YAML Merge Patch onto a cloned copy of `base`.
@@ -1714,7 +1670,8 @@ pub fn validate_compiled_yaml(
                 });
             }
 
-            // Detect forbidden overseas probe URLs on domestic pre-acceleration groups.
+            // Detect forbidden overseas probe URLs on domestic pre-acceleration groups and ensure
+            // inner `load-balance` pre-acceleration groups never contain `DIRECT`.
             if is_preaccel_group_name(&group_name, &dialer_targets) {
                 if let Some(probe_url) = map.get("url").and_then(Value::as_str) {
                     if let Some(host) = extract_url_host(probe_url) {
@@ -1728,6 +1685,20 @@ pub fn validate_compiled_yaml(
                             });
                         }
                     }
+                }
+                if map
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.eq_ignore_ascii_case("load-balance"))
+                    && members.iter().any(|m| m.eq_ignore_ascii_case("DIRECT"))
+                {
+                    issues.push(StaticCheckIssue {
+                        code: "preaccel_lb_contains_direct".to_string(),
+                        severity: StaticCheckSeverity::Error,
+                        message: format!(
+                            "pre-acceleration load-balance group `{group_name}` must never contain `DIRECT`"
+                        ),
+                    });
                 }
             }
 
@@ -2184,7 +2155,7 @@ fn build_dns_section(
         .map(ToString::to_string)
         .collect();
     if effective_default_ns.is_empty() {
-        effective_default_ns = crate::config::DEFAULT_PURE_IP_DOH_NAMESERVERS
+        effective_default_ns = crate::config::DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS
             .iter()
             .map(|s| (*s).to_string())
             .collect();
@@ -2198,7 +2169,7 @@ fn build_dns_section(
         .map(ToString::to_string)
         .collect();
     if effective_direct_ns.is_empty() {
-        effective_direct_ns = crate::config::DEFAULT_PURE_IP_DOH_NAMESERVERS
+        effective_direct_ns = crate::config::DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS
             .iter()
             .map(|s| (*s).to_string())
             .collect();
@@ -2224,7 +2195,7 @@ fn build_dns_section(
         {
             effective_proxy_server_ns = cleaned_default_ns;
         } else {
-            effective_proxy_server_ns = crate::config::DEFAULT_PURE_IP_DOH_NAMESERVERS
+            effective_proxy_server_ns = crate::config::DEFAULT_PURE_IP_ENCRYPTED_NAMESERVERS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect();
@@ -2400,10 +2371,20 @@ fn build_dns_section(
         }
     }
 
-    let campus_policy_servers: [&str; 2] = if dns.respect_rules {
-        ["system", "https://223.5.5.5/dns-query#DIRECT"]
+    // Intentionally omit port-853 DoT here so campus firewalls dropping TCP 853 never stall
+    // intranet DNS resolution; keep `system` first followed by dual pure-IP 443 DoH fallbacks.
+    let campus_policy_servers: [&str; 3] = if dns.respect_rules {
+        [
+            "system",
+            "https://223.5.5.5/dns-query#DIRECT",
+            "https://1.12.12.12/dns-query#DIRECT",
+        ]
     } else {
-        ["system", "https://223.5.5.5/dns-query"]
+        [
+            "system",
+            "https://223.5.5.5/dns-query",
+            "https://1.12.12.12/dns-query",
+        ]
     };
     const CAMPUS_INTRANET_DNS_POLICY_DOMAINS: &[&str] = &[
         "+.edu.cn",
@@ -2668,6 +2649,7 @@ fn extract_url_host(raw_url: &str) -> Option<String> {
 fn is_preaccel_group_name(name: &str, dialer_targets: &HashSet<String>) -> bool {
     if name == PREACCEL_FALLBACK_GROUP_NAME
         || name == PREACCEL_SELECT_GROUP_NAME
+        || name == PREACCEL_LB_GROUP_NAME
         || dialer_targets.contains(name)
     {
         return true;
@@ -2954,6 +2936,7 @@ mod tests {
             priority,
             expires_at: None,
             enabled: true,
+            supports_ipv6: false,
             last_probe_ms: None,
             last_mbps: None,
             last_up_mbps: None,
@@ -5667,27 +5650,42 @@ rules:
                 .collect()
         };
 
-        let expected_doh = vec![
+        let expected_encrypted = vec![
             "https://223.5.5.5/dns-query".to_string(),
             "https://1.12.12.12/dns-query".to_string(),
+            "tls://223.6.6.6:853".to_string(),
+            "tls://120.53.53.53:853".to_string(),
         ];
-        let expected_doh_direct = vec![
+        let expected_encrypted_direct = vec![
             "https://223.5.5.5/dns-query#DIRECT".to_string(),
             "https://1.12.12.12/dns-query#DIRECT".to_string(),
+            "tls://223.6.6.6:853#DIRECT".to_string(),
+            "tls://120.53.53.53:853#DIRECT".to_string(),
         ];
 
-        assert_eq!(seq_to_vec(&compiled.value["dns"]["default-nameserver"]), expected_doh);
-        assert_eq!(seq_to_vec(&compiled.value["dns"]["direct-nameserver"]), expected_doh_direct);
+        assert_eq!(
+            seq_to_vec(&compiled.value["dns"]["default-nameserver"]),
+            expected_encrypted
+        );
+        assert_eq!(
+            seq_to_vec(&compiled.value["dns"]["direct-nameserver"]),
+            expected_encrypted_direct
+        );
         assert_eq!(
             seq_to_vec(&compiled.value["dns"]["proxy-server-nameserver"]),
-            expected_doh
+            expected_encrypted
         );
 
         let policy = &compiled.value["dns"]["nameserver-policy"];
         let expected_campus_policy = vec![
             "system".to_string(),
             "https://223.5.5.5/dns-query#DIRECT".to_string(),
+            "https://1.12.12.12/dns-query#DIRECT".to_string(),
         ];
+        assert!(
+            expected_campus_policy.iter().all(|s| !s.contains(":853")),
+            "campus policy must never include port 853 DoT"
+        );
         for key in [
             "+.edu.cn",
             "+.local",
@@ -5711,7 +5709,7 @@ rules:
         assert!(policy.get("ip-cidr,10.0.0.0/8,direct,no-resolve").is_none());
         assert!(policy.get("domain-suffix,rule-campus.example.org,direct").is_none());
 
-        // 2. Empty arrays & legacy plaintext default_nameserver fall back to pure-IP DoH 443.
+        // 2. Empty arrays & legacy plaintext default_nameserver fall back to 4-endpoint encrypted pool.
         let mut cfg_empty = AppConfig::default();
         cfg_empty.dns.respect_rules = true;
         cfg_empty.dns.default_nameserver = vec!["223.5.5.5".to_string(), "119.29.29.29".to_string()];
@@ -5731,14 +5729,14 @@ rules:
         .expect("compile legacy fallback");
         assert_eq!(
             seq_to_vec(&compiled_legacy_fallback.value["dns"]["direct-nameserver"]),
-            expected_doh_direct
+            expected_encrypted_direct
         );
         assert_eq!(
             seq_to_vec(&compiled_legacy_fallback.value["dns"]["proxy-server-nameserver"]),
-            expected_doh
+            expected_encrypted
         );
 
-        // 3. Empty default_nameserver gets DoH 443 fallback; custom non-legacy default_nameserver
+        // 3. Empty default_nameserver gets 4-endpoint encrypted fallback; custom non-legacy default_nameserver
         //    is reused by empty proxy-server-nameserver without appending `#DIRECT`.
         let mut cfg_custom_default = AppConfig::default();
         cfg_custom_default.dns.respect_rules = true;
@@ -5778,14 +5776,343 @@ rules:
         .expect("compile blank default with respect_rules=false");
         assert_eq!(
             seq_to_vec(&compiled_blank_default.value["dns"]["default-nameserver"]),
-            expected_doh
+            expected_encrypted
         );
         assert_eq!(
             seq_to_vec(&compiled_blank_default.value["dns"]["nameserver-policy"]["+.edu.cn"]),
             vec![
                 "system".to_string(),
                 "https://223.5.5.5/dns-query".to_string(),
+                "https://1.12.12.12/dns-query".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn multi_cloud_preaccel_compiles_two_layer_nested_lb_and_rejects_direct_in_lb() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.auto_failover = true;
+        cfg.preaccel.active_relay_id = None;
+        cfg.preaccel.dispatch_strategy = crate::models::PreAccelDispatchStrategy::Auto;
+        cfg.preaccel.lb_strategy = crate::models::PreAccelLbStrategy::RoundRobin;
+
+        let relay_a_tcp = sample_relay("r-a-tcp", "CloudA-AnyTLS", "203.0.113.10", 10);
+        let mut relay_a_udp = sample_relay("r-a-udp", "CloudA-HY2", "203.0.113.10", 20);
+        relay_a_udp.protocol = "hysteria2".to_string();
+        let mut relay_b_tcp = sample_relay("r-b-tcp", "CloudB-VLESS", "198.51.100.20", 30);
+        relay_b_tcp.protocol = "vless".to_string();
+        relay_b_tcp.password = "11111111-2222-4333-8444-555555555555".to_string();
+
+        let relays = vec![relay_a_tcp, relay_a_udp, relay_b_tcp];
+        let nodes = vec![sample_node("n1", "JP-8443", 8443, false)];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &relays,
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile multi-cloud nested lb");
+        assert!(compiled.validation.ok, "issues: {:?}", compiled.validation.issues);
+
+        let groups = compiled.value["proxy-groups"].as_sequence().unwrap();
+        let lb_group = groups
+            .iter()
+            .find(|g| g["name"] == PREACCEL_LB_GROUP_NAME)
+            .expect("inner preaccel lb group");
+        assert_eq!(lb_group["type"], "load-balance");
+        assert_eq!(lb_group["strategy"], "round-robin");
+        assert_eq!(lb_group["lazy"], Value::Bool(false));
+        let lb_members: Vec<&str> = lb_group["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(lb_members, vec!["CloudA-AnyTLS", "CloudB-VLESS"]);
+        assert!(!lb_members.contains(&"DIRECT"));
+
+        let fb_group = groups
+            .iter()
+            .find(|g| g["name"] == PREACCEL_FALLBACK_GROUP_NAME)
+            .expect("outer preaccel fallback group");
+        assert_eq!(fb_group["type"], "fallback");
+        let fb_members: Vec<&str> = fb_group["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(
+            fb_members,
+            vec![PREACCEL_LB_GROUP_NAME, "CloudA-HY2", "DIRECT"]
+        );
+
+        // Static validator must reject any preaccel load-balance group containing DIRECT.
+        let bad_yaml = format!(
+            r#"
+proxies:
+  - name: Relay-A
+    type: anytls
+    server: 203.0.113.10
+    port: 443
+    password: secret
+proxy-groups:
+  - name: "{PREACCEL_LB_GROUP_NAME}"
+    type: load-balance
+    strategy: round-robin
+    url: http://connectivitycheck.platform.hicloud.com/generate_204
+    interval: 15
+    lazy: false
+    proxies:
+      - Relay-A
+      - DIRECT
+rules:
+  - IP-CIDR,203.0.113.10/32,DIRECT,no-resolve
+  - MATCH,DIRECT
+"#
+        );
+        let report = validate_compiled_yaml(&bad_yaml, &["203.0.113.10".to_string()]).unwrap();
+        assert!(!report.ok);
+        assert!(report
+            .issues
+            .iter()
+            .any(|i| i.code == "preaccel_lb_contains_direct"));
+    }
+
+    #[test]
+    fn preaccel_skips_ipv6_only_nodes_preserves_dual_stack_and_honors_override_and_relay_ipv6() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.skip_443_native = true;
+
+        let mut ipv6_only = sample_node("n-v6-only", "HK-IPv6-Only", 8443, false);
+        ipv6_only.server = "2001:db8::10".to_string();
+        ipv6_only.raw_config["server"] = serde_json::json!("2001:db8::10");
+
+        let mut dual_stack = sample_node("n-dual", "HK-01-IPv6", 8443, false);
+        dual_stack.server = "hk01.example.invalid".to_string();
+
+        let mut ipv6_forced = sample_node("n-v6-force", "US-纯IPv6-Forced", 8443, false);
+        ipv6_forced.server = "2001:db8::20".to_string();
+        ipv6_forced.raw_config["server"] = serde_json::json!("2001:db8::20");
+        ipv6_forced.preaccel_override = Some(true);
+
+        let relay_v4 = sample_relay("r-v4", "Relay-V4", "203.0.113.10", 10);
+        let nodes = vec![ipv6_only.clone(), dual_stack.clone(), ipv6_forced.clone()];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled_v4 = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[relay_v4.clone()],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with ipv4 relay");
+        assert_eq!(compiled_v4.stats.skipped_ipv6_proxies, 1);
+        assert_eq!(compiled_v4.stats.dialer_wrapped_proxies, 2);
+
+        let proxies = compiled_v4.value["proxies"].as_sequence().unwrap();
+        let p_v6 = proxies.iter().find(|p| p["name"] == "HK-IPv6-Only").unwrap();
+        assert!(p_v6.get("dialer-proxy").is_none());
+        let p_dual = proxies.iter().find(|p| p["name"] == "HK-01-IPv6").unwrap();
+        assert_eq!(p_dual["dialer-proxy"], PREACCEL_SELECT_GROUP_NAME);
+        let p_forced = proxies.iter().find(|p| p["name"] == "US-纯IPv6-Forced").unwrap();
+        assert_eq!(p_forced["dialer-proxy"], PREACCEL_SELECT_GROUP_NAME);
+
+        // Mixed multi-cloud pool (1 IPv4-only + 1 dual-stack) must still skip IPv6-only nodes
+        // to avoid 50% blackhole routing through the IPv4-only relay.
+        let mut relay_v6 = relay_v4.clone();
+        relay_v6.id = "r-v6".to_string();
+        relay_v6.name = "Relay-V6".to_string();
+        relay_v6.server = "198.51.100.20".to_string();
+        relay_v6.priority = 20;
+        relay_v6.supports_ipv6 = true;
+        let compiled_mixed = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[relay_v4.clone(), relay_v6.clone()],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with mixed ipv4+ipv6 relay pool");
+        assert_eq!(compiled_mixed.stats.skipped_ipv6_proxies, 1);
+        assert_eq!(compiled_mixed.stats.dialer_wrapped_proxies, 2);
+        let mixed_proxies = compiled_mixed.value["proxies"].as_sequence().unwrap();
+        let mixed_v6 = mixed_proxies
+            .iter()
+            .find(|p| p["name"] == "HK-IPv6-Only")
+            .unwrap();
+        assert!(mixed_v6.get("dialer-proxy").is_none());
+
+        // Only when every enabled relay declares supports_ipv6=true are IPv6-only nodes wrapped.
+        let mut relay_v4_upgraded = relay_v4;
+        relay_v4_upgraded.supports_ipv6 = true;
+        let compiled_v6 = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[relay_v4_upgraded, relay_v6],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with all-ipv6 relay pool");
+        assert_eq!(compiled_v6.stats.skipped_ipv6_proxies, 0);
+        assert_eq!(compiled_v6.stats.dialer_wrapped_proxies, 3);
+    }
+
+    #[test]
+    fn reserved_builtin_and_preaccel_group_names_prevent_relay_name_collisions() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.auto_failover = true;
+        cfg.preaccel.active_relay_id = None;
+        cfg.preaccel.dispatch_strategy = crate::models::PreAccelDispatchStrategy::Auto;
+
+        let relay_direct = sample_relay("r-direct", "DIRECT", "203.0.113.10", 10);
+        let relay_lb = sample_relay("r-lb", PREACCEL_LB_GROUP_NAME, "198.51.100.20", 20);
+        let node_reject = sample_node("n-rej", "REJECT", 8443, false);
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &[node_reject],
+            groups: &[],
+            relays: &[relay_direct, relay_lb],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with reserved-name relays and nodes");
+        assert!(compiled.validation.ok, "issues: {:?}", compiled.validation.issues);
+
+        let proxies = compiled.value["proxies"].as_sequence().unwrap();
+        let proxy_names: Vec<&str> = proxies
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(!proxy_names.contains(&"DIRECT"));
+        assert!(!proxy_names.contains(&"REJECT"));
+        assert!(!proxy_names.contains(&PREACCEL_LB_GROUP_NAME));
+        assert!(proxy_names.contains(&"DIRECT (2)"));
+        assert!(proxy_names.contains(&"REJECT (2)"));
+
+        let groups = compiled.value["proxy-groups"].as_sequence().unwrap();
+        let lb_group = groups
+            .iter()
+            .find(|g| g["name"] == PREACCEL_LB_GROUP_NAME)
+            .expect("preaccel lb group");
+        let lb_members: Vec<&str> = lb_group["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(lb_members.len(), 2);
+        assert!(lb_members.contains(&"DIRECT (2)"));
+        assert!(!lb_members.contains(&"DIRECT"));
+    }
+
+    #[test]
+    fn no_group_fallback_prefers_smart_default_node_over_andorra_and_info_banners() {
+        let cfg = AppConfig::default();
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let mut info_node = sample_node("n-info", "剩余流量：120GB", 443, true);
+        info_node.region_code = "HK".to_string();
+
+        let mut andorra = sample_node("n-ad", "AD 安道尔 01 3x", 443, true);
+        andorra.region_code = "AD".to_string();
+        andorra.multiplier = 3.0;
+
+        let mut tw_node = sample_node("n-tw", "TW 台湾 01 1x", 443, true);
+        tw_node.region_code = "TW".to_string();
+        tw_node.multiplier = 1.0;
+
+        let nodes = vec![info_node, andorra, tw_node];
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile no-group smart fallback");
+
+        assert_eq!(
+            compiled
+                .active_selections
+                .get(DEFAULT_FALLBACK_GROUP_NAME)
+                .map(String::as_str),
+            Some("TW 台湾 01 1x")
+        );
+        let default_group = compiled.value["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == DEFAULT_FALLBACK_GROUP_NAME)
+            .expect("default fallback group");
+        assert_eq!(
+            default_group["proxies"][0].as_str(),
+            Some("TW 台湾 01 1x")
+        );
+    }
+
+    #[test]
+    fn redact_compiled_yaml_for_preview_delegates_to_unified_sanitizer() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        let relay = sample_relay("r-sec", "Relay-Secret", "203.0.113.55", 10);
+        let node = sample_node("n-sec", "JP-Secret", 8443, false);
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &[node],
+            groups: &[],
+            relays: &[relay.clone()],
+            controller_secret: "super-secret-controller-token-9999",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile secret yaml");
+
+        let redacted = redact_compiled_yaml_for_preview(&compiled, &[relay]).expect("redact yaml");
+        assert!(!redacted.contains("relay-password"));
+        assert!(!redacted.contains("super-secret-controller-token-9999"));
+        assert!(!redacted.contains("203.0.113.55"));
+        assert_eq!(redacted, crate::sanitize::redact_compiled_yaml(&compiled.yaml));
     }
 }

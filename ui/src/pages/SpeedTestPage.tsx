@@ -518,6 +518,20 @@ function hasMeasuredSpeed(snap: ProbeSnapshot | undefined): boolean {
   return snap.up_mbps !== null || snap.down_mbps !== null;
 }
 
+function formatRelativeProbeTime(iso?: string | null): { short: string; full: string } | null {
+  if (!iso) return null;
+  const ts = Date.parse(iso);
+  if (!Number.isFinite(ts)) return null;
+  const date = new Date(ts);
+  const full = date.toLocaleString();
+  const diffSec = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (diffSec < 45) return { short: "刚刚测过", full };
+  if (diffSec < 3600) return { short: `${Math.floor(diffSec / 60)}分钟前`, full };
+  if (diffSec < 86400) return { short: `${Math.floor(diffSec / 3600)}小时前`, full };
+  const days = Math.floor(diffSec / 86400);
+  return { short: `${days}天前`, full };
+}
+
 interface CtrlDragState {
   dragging: boolean;
   action: "add" | "remove";
@@ -1823,10 +1837,49 @@ export function SpeedTestPage({
         ? `当前筛选 ${totalFiltered} 个`
         : "暂无节点";
 
-  const testedCountInFiltered = useMemo(
-    () => filteredRows.filter((r) => Boolean(r.snap)).length,
-    [filteredRows]
-  );
+  const probeBreakdown = useMemo(() => {
+    let latencyOk = 0;
+    let bandwidthOk = 0;
+    let keepaliveOk = 0;
+    let failed = 0;
+    let untested = 0;
+    for (const row of filteredRows) {
+      const snap = row.snap;
+      if (!snap && !row.hasFreshHealthLatency && !row.isCooldown) {
+        untested += 1;
+        continue;
+      }
+      const isLatOk =
+        row.hasFreshHealthLatency ||
+        (Boolean(snap?.ok) &&
+          typeof snap?.latency_ms === "number" &&
+          Number.isFinite(snap.latency_ms) &&
+          snap.latency_ms > 0);
+      if (isLatOk && !row.isCooldown) {
+        latencyOk += 1;
+      } else if (row.isCooldown || snap?.ok === false) {
+        failed += 1;
+      } else {
+        untested += 1;
+      }
+      if (
+        snap &&
+        snap.ok !== false &&
+        snap.up_mbps !== null &&
+        snap.up_mbps > 0 &&
+        snap.down_mbps !== null &&
+        snap.down_mbps > 0
+      ) {
+        bandwidthOk += 1;
+      }
+      if (snap?.keepalive_60s_ok === true) {
+        keepaliveOk += 1;
+      }
+    }
+    return { latencyOk, bandwidthOk, keepaliveOk, failed, untested };
+  }, [filteredRows]);
+
+  const lastProbeSummary = useAppSelector((s) => s.lastProbeSummary);
 
   return (
     <div className="space-y-3">
@@ -1895,7 +1948,7 @@ export function SpeedTestPage({
             className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-            <span>测延迟 + 送中/AI（省流）</span>
+            <span>{dict.nodes.recommendedProbeBtn}</span>
             {!embedded && (
               <span className="rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium">
                 约 0.2 MB/节点
@@ -2636,9 +2689,53 @@ export function SpeedTestPage({
                   （含当前筛选外 {selectedOutsideFiltered} 个）
                 </span>
               )}
-              <span className="text-[11px] text-[var(--muted)] cc-tabular">
-                当前列表 {totalFiltered} 个 · 已测 {testedCountInFiltered} 个
-              </span>
+              <div className="flex flex-wrap items-center gap-1.5 text-[11px] cc-tabular">
+                <span className="rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[var(--text-secondary)]">
+                  共 {totalFiltered}
+                </span>
+                <span
+                  className="rounded-md bg-[var(--green-soft)] px-1.5 py-0.5 font-medium text-[var(--green)]"
+                  title="基础连通与延迟探测通过的节点数"
+                >
+                  {dict.nodes.summaryLatencyOk} {probeBreakdown.latencyOk}
+                </span>
+                <span
+                  className="rounded-md bg-[var(--sky-soft)] px-1.5 py-0.5 font-medium text-[var(--sky)]"
+                  title="已实测并同时测出有效上传与下载速度的节点数"
+                >
+                  {dict.nodes.summaryBandwidthOk} {probeBreakdown.bandwidthOk}
+                </span>
+                {probeBreakdown.keepaliveOk > 0 && (
+                  <span
+                    className="rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 font-medium text-[var(--accent)]"
+                    title="通过 60 秒长连接保活检测的节点数"
+                  >
+                    {dict.nodes.summaryKeepaliveOk} {probeBreakdown.keepaliveOk}
+                  </span>
+                )}
+                {probeBreakdown.failed > 0 && (
+                  <span
+                    className="rounded-md bg-[var(--red-soft)] px-1.5 py-0.5 font-medium text-[var(--red)]"
+                    title="测速超时、不可达或冷却中的节点数"
+                  >
+                    {dict.nodes.summaryFailed} {probeBreakdown.failed}
+                  </span>
+                )}
+                {lastProbeSummary && lastProbeSummary.exec_error_count > 0 && (
+                  <span
+                    className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 font-medium text-[var(--amber)]"
+                    title="最近一次测速中出现执行异常的次数"
+                  >
+                    执行异常 {lastProbeSummary.exec_error_count}
+                  </span>
+                )}
+                <span
+                  className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[var(--muted)]"
+                  title="尚未执行过探测的节点数"
+                >
+                  {dict.nodes.summaryUntested} {probeBreakdown.untested}
+                </span>
+              </div>
               {isRunning && (
                 <span className="inline-flex items-center gap-1 rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--accent)]">
                   测速中已锁定行顺序，结束后自动按结果排序
@@ -2727,12 +2824,12 @@ export function SpeedTestPage({
                 {(
                   [
                     { key: "name", label: "节点名称", cls: "px-2" },
-                    { key: "source", label: "来源", cls: "w-[78px] px-1.5" },
-                    { key: "latency", label: "延迟", cls: "w-[68px] px-1.5" },
+                    { key: "source", label: "来源", cls: "w-[96px] px-1.5" },
+                    { key: "latency", label: "延迟", cls: "w-[88px] px-1.5" },
                     { key: "up", label: "上传 (Mbps)", cls: "w-[82px] px-1.5", title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）" },
                     { key: "down", label: "下载 (Mbps)", cls: "w-[86px] px-1.5", title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）" },
                     { key: "google", label: "谷歌地区", cls: "w-[80px] px-1.5" },
-                    { key: "unlocks", label: "AI 解锁", cls: "w-[134px] px-1.5" },
+                    { key: "unlocks", label: "AI 解锁", cls: "w-[130px] px-1.5" },
                   ] as ReadonlyArray<{ key: SortKey; label: string; cls: string; title?: string }>
                 ).map((col) => (
                   <th key={col.key} className={`whitespace-nowrap py-2.5 font-medium ${col.cls}`} title={col.title}>
@@ -2858,35 +2955,68 @@ export function SpeedTestPage({
                               ? `${node.multiplier}x`
                               : `${node.multiplier.toFixed(1)}x`}
                           </span>
+                          {(() => {
+                            const rel = formatRelativeProbeTime(snap?.tested_at);
+                            if (!rel) return null;
+                            return (
+                              <>
+                                <span>·</span>
+                                <span
+                                  className="shrink-0 text-[10px] text-[var(--muted)]/90"
+                                  title={`上次测速时间：${rel.full}`}
+                                >
+                                  {rel.short}
+                                </span>
+                              </>
+                            );
+                          })()}
                         </div>
                       </td>
 
                       {/* Source */}
-                      <td className="w-[78px] px-1.5 py-2">
+                      <td className="w-[96px] px-1.5 py-2">
                         <span
-                          className="block truncate text-[11px] text-[var(--text-secondary)]"
-                          title={sourceName}
+                          className="block truncate text-[11px] font-medium text-[var(--text-secondary)]"
+                          title={`来源分组：${sourceName}（协议：${node.protocol.toUpperCase()}）`}
                         >
                           {sourceName}
                         </span>
                       </td>
 
                       {/* Latency */}
-                      <td className="w-[68px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
+                      <td className="w-[88px] px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
                         {isCooldown ? (
                           <div>
                             <span
-                              className="font-semibold text-[var(--amber)]"
+                              className="whitespace-nowrap font-semibold text-[var(--amber)]"
                               title={
-                                cooldownRemainingSec > 0
-                                  ? `节点暂时冷却中，约 ${cooldownRemainingSec} 秒后重试`
-                                  : "节点暂时冷却中"
+                                [
+                                  cooldownRemainingSec > 0
+                                    ? `节点暂时冷却中，约 ${cooldownRemainingSec} 秒后重试`
+                                    : "节点暂时冷却中",
+                                  healthHint?.reason?.trim()
+                                    ? `原因：${healthHint.reason.trim()}`
+                                    : "",
+                                  healthHint?.stage?.trim()
+                                    ? `阶段：${healthHint.stage.trim()}`
+                                    : "",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")
                               }
                             >
                               {cooldownRemainingSec > 0
                                 ? `冷却 ${cooldownRemainingSec}s`
                                 : "冷却中"}
                             </span>
+                            {healthHint?.reason?.trim() && (
+                              <div
+                                className="mt-0.5 max-w-[82px] truncate font-sans text-[9.5px] text-[var(--amber)]/90"
+                                title={healthHint.reason.trim()}
+                              >
+                                {healthHint.reason.trim()}
+                              </div>
+                            )}
                             {snap?.keepalive_60s_ok !== null &&
                               snap?.keepalive_60s_ok !== undefined && (
                                 <div
@@ -2903,16 +3033,23 @@ export function SpeedTestPage({
                         ) : hasFreshHealthLatency || snap ? (
                           <div>
                             <span
-                              className="font-semibold"
+                              className="whitespace-nowrap font-semibold"
                               style={{
                                 color: getLatencyColor(effectiveLatencyMs, effectiveLatencyOk),
                               }}
                               title={
-                                hasFreshHealthLatency
-                                  ? healthHint?.status === "probation"
-                                    ? "实时探测恢复中延迟"
-                                    : "实时健康池最新延迟"
-                                  : undefined
+                                [
+                                  hasFreshHealthLatency
+                                    ? healthHint?.status === "probation"
+                                      ? "实时探测恢复中延迟"
+                                      : "实时健康池最新延迟"
+                                    : "",
+                                  healthHint?.reason?.trim()
+                                    ? `状态说明：${healthHint.reason.trim()}`
+                                    : "",
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ") || undefined
                               }
                             >
                               {hasFreshHealthLatency && effectiveLatencyMs !== null

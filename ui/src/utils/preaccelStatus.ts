@@ -21,6 +21,8 @@ export interface PreAccelSummary {
   proxyActive: boolean;
   realWinDivertActive: boolean;
   localSocksActive: boolean;
+  suspendedForTun: boolean;
+  effectiveCarrier: string;
   installState: PreAccelInstallState;
   verifyState: PreAccelVerifyState;
   verifyLatencyMs: number | null;
@@ -42,6 +44,8 @@ type RuntimePreAccelFields = Pick<
   | "global_preaccel_mode"
   | "global_preaccel_socks_port"
 > & {
+  preaccel_effective_carrier?: string;
+  standalone_tunnel_suspended_for_tun?: boolean;
   global_windivert_active?: boolean;
   preaccel_install_state?: string;
   global_preaccel_verify_state?: PreAccelVerifyState | string;
@@ -113,13 +117,38 @@ export function resolvePreAccelSummary(
   const proxyActive = Boolean(
     runtime?.running && (runtime.system_proxy_enabled || runtime.tun_enabled)
   );
-  const realWinDivertActive = isRealWinDivertActive(runtime, globalPreAccel);
+  const rawCarrier = (runtime?.preaccel_effective_carrier ?? "").trim().toLowerCase();
+  const suspendedForTun = Boolean(
+    runtime?.standalone_tunnel_suspended_for_tun ||
+      globalPreAccel?.mode === "suspended_for_tun" ||
+      runtime?.global_preaccel_mode === "suspended_for_tun" ||
+      rawCarrier === "main_core_tun_suspended_standalone" ||
+      (runtime?.running && runtime.tun_enabled && (runtime.preaccel_enabled ?? configPreAccelEnabled ?? false))
+  );
+  const realWinDivertActive = suspendedForTun
+    ? false
+    : isRealWinDivertActive(runtime, globalPreAccel);
   const localSocksActive = Boolean(
-    globalPreAccel?.running && globalPreAccel.mode === "local_socks5"
+    !suspendedForTun && globalPreAccel?.running && globalPreAccel.mode === "local_socks5"
   );
   const enabled = Boolean(
-    (runtime?.preaccel_enabled ?? configPreAccelEnabled ?? false) || realWinDivertActive
+    (runtime?.preaccel_enabled ?? configPreAccelEnabled ?? false) ||
+      realWinDivertActive ||
+      suspendedForTun
   );
+  const effectiveCarrier = !enabled
+    ? "off"
+    : rawCarrier && rawCarrier !== "off"
+      ? rawCarrier
+      : suspendedForTun
+        ? "main_core_tun_suspended_standalone"
+        : proxyActive
+          ? "main_core_proxy_only"
+          : realWinDivertActive
+            ? "standalone_windivert"
+            : localSocksActive
+              ? "standalone_socks5"
+              : "off";
 
   const globalState = normalizePreAccelInstallState(globalPreAccel?.install_state);
   const runtimeState = normalizePreAccelInstallState(runtime?.preaccel_install_state);
@@ -130,6 +159,7 @@ export function resolvePreAccelSummary(
     installState === "idle" &&
     enabled &&
     !realWinDivertActive &&
+    !suspendedForTun &&
     globalPreAccel?.windivert_available &&
     globalPreAccel.is_elevated === false
   ) {
@@ -161,6 +191,8 @@ export function resolvePreAccelSummary(
       proxyActive,
       realWinDivertActive: false,
       localSocksActive: false,
+      suspendedForTun: false,
+      effectiveCarrier: "off",
       installState: "idle",
       verifyState: "idle",
       verifyLatencyMs: null,
@@ -171,6 +203,26 @@ export function resolvePreAccelSummary(
     };
   }
 
+  if (suspendedForTun && (runtime?.preaccel_active || relayName || proxyActive)) {
+    return {
+      enabled: true,
+      proxyActive: true,
+      realWinDivertActive: false,
+      localSocksActive: false,
+      suspendedForTun: true,
+      effectiveCarrier: "main_core_tun_suspended_standalone",
+      installState,
+      verifyState,
+      verifyLatencyMs,
+      badgeText: "主内核虚拟网卡提速中",
+      subBadgeText: "独立 443 通道已自动暂停",
+      detailText: relayName
+        ? `主内核虚拟网卡正通过「${relayName}」提速中（独立 443 通道已自动暂停避免冲突）`
+        : "主内核虚拟网卡提速中（独立 443 通道已自动暂停避免冲突）",
+      tone: "green",
+    };
+  }
+
   if (proxyActive) {
     if (!runtime?.preaccel_active && !realWinDivertActive && !relayName) {
       return {
@@ -178,6 +230,8 @@ export function resolvePreAccelSummary(
         proxyActive: true,
         realWinDivertActive: false,
         localSocksActive,
+        suspendedForTun: false,
+        effectiveCarrier,
         installState,
         verifyState,
         verifyLatencyMs,
@@ -195,45 +249,45 @@ export function resolvePreAccelSummary(
       if (verifyState === "probing") {
         subBadgeText = "探测其它软件链路…";
         detailText = relayName
-          ? `猫云代理已通过「${relayName}」提速 · 正在探测其它软件拦截链路…`
-          : "猫云代理已走国内 443 提速 · 正在探测其它软件拦截链路…";
+          ? `主内核代理已通过「${relayName}」提速 · 正在探测其它软件拦截链路…`
+          : "主内核代理已走国内 443 提速 · 正在探测其它软件拦截链路…";
       } else if (verifyState === "verified") {
         subBadgeText = verifyLatencyMs
-          ? `猫云 + 其它软件 · ${verifyLatencyMs} ms`
-          : "猫云 + 其它软件";
+          ? `主内核 + 独立底层 · ${verifyLatencyMs} ms`
+          : "主内核 + 独立底层";
         detailText = verifyLatencyMs
           ? relayName
-            ? `猫云 + 其它软件均已通过「${relayName}」实测畅通（${verifyLatencyMs} ms）`
-            : `猫云 + 其它软件均已走国内 443 提速，实测畅通（${verifyLatencyMs} ms）`
+            ? `主内核代理 + 独立底层均已通过「${relayName}」实测畅通（${verifyLatencyMs} ms）`
+            : `主内核代理 + 独立底层均已走国内 443 提速，实测畅通（${verifyLatencyMs} ms）`
           : verifyMessage ||
             (relayName
-              ? `猫云 + 其它软件均已通过「${relayName}」实测畅通`
-              : "猫云 + 其它软件均已走国内 443 提速并实测畅通");
+              ? `主内核代理 + 独立底层均已通过「${relayName}」实测畅通`
+              : "主内核代理 + 独立底层均已走国内 443 提速并实测畅通");
       } else {
-        subBadgeText = "猫云 + 其它软件";
+        subBadgeText = "主内核 + 独立底层";
         detailText = relayName
-          ? `猫云 + 其它软件均已通过「${relayName}」走国内 443 提速`
-          : "猫云 + 其它软件均已走国内 443 提速";
+          ? `主内核代理 + 独立底层均已通过「${relayName}」走国内 443 提速`
+          : "主内核代理 + 独立底层均已走国内 443 提速";
       }
     } else if (verifyState === "probing") {
       subBadgeText = "探测其它软件链路…";
       detailText = relayName
-        ? `猫云代理已通过「${relayName}」提速 · 正在探测其它软件拦截链路…`
-        : "猫云代理已走国内 443 提速 · 正在探测其它软件拦截链路…";
+        ? `主内核代理已通过「${relayName}」提速 · 正在探测其它软件拦截链路…`
+        : "主内核代理已走国内 443 提速 · 正在探测其它软件拦截链路…";
     } else if (verifyState === "degraded") {
       subBadgeText = "其它软件已保护回退";
       detailText =
         verifyMessage ||
         lastError ||
-        "自动探测发现底层拦截未畅通，已自动停止拦截防止断网，本地 443 通道仍待命";
+        "自动探测发现底层拦截未畅通，已自动停止拦截防止断网，主内核代理仍正常提速";
     } else if (installState === "downloading" || installState === "verifying") {
-      detailText = "猫猫代理已走国内 443 提速 · 正在后台准备其它软件提速组件…";
+      detailText = "主内核代理已走国内 443 提速 · 正在后台准备其它软件提速组件…";
     } else if (installState === "need_elevation") {
-      detailText = "猫猫代理已走国内 443 提速 · 其它软件自动加速需管理员权限";
+      detailText = "主内核代理已走国内 443 提速 · 其它软件自动加速需管理员权限";
     } else {
       detailText = relayName
-        ? `正通过「${relayName}」加速猫猫代理上传`
-        : "正在通过国内 443 中转加速猫猫代理上传";
+        ? `主内核代理正通过「${relayName}」提速上传与连通`
+        : "主内核代理正在通过国内 443 中转提速";
     }
 
     return {
@@ -241,31 +295,35 @@ export function resolvePreAccelSummary(
       proxyActive: true,
       realWinDivertActive,
       localSocksActive,
+      suspendedForTun: false,
+      effectiveCarrier,
       installState,
       verifyState,
       verifyLatencyMs,
-      badgeText: "国内提速中",
+      badgeText: realWinDivertActive ? "主内核 + 独立底层提速中" : "主内核代理提速中",
       subBadgeText,
       detailText,
       tone: "green",
     };
   }
 
-  if (realWinDivertActive) {
+  if (realWinDivertActive || effectiveCarrier === "standalone_windivert") {
     if (verifyState === "probing") {
       return {
         enabled: true,
         proxyActive: false,
         realWinDivertActive: true,
         localSocksActive: false,
+        suspendedForTun: false,
+        effectiveCarrier: "standalone_windivert",
         installState: "ready",
         verifyState,
         verifyLatencyMs,
-        badgeText: "正在探测链路…",
+        badgeText: "独立底层探测中…",
         subBadgeText: "自动加速其它软件",
         detailText: relayName
-          ? `已通过「${relayName}」启用其它软件提速，正在自动探测链路连通性…`
-          : "已启用其它软件提速，正在自动探测链路连通性…",
+          ? `已通过「${relayName}」启用独立底层提速，正在自动探测链路连通性…`
+          : "已启用独立底层提速，正在自动探测链路连通性…",
         tone: "amber",
       };
     }
@@ -276,19 +334,21 @@ export function resolvePreAccelSummary(
         proxyActive: false,
         realWinDivertActive: true,
         localSocksActive: false,
+        suspendedForTun: false,
+        effectiveCarrier: "standalone_windivert",
         installState: "ready",
         verifyState,
         verifyLatencyMs,
-        badgeText: "已探测畅通",
-        subBadgeText: verifyLatencyMs ? `实测 ${verifyLatencyMs} ms` : "自动加速其它软件",
+        badgeText: "独立底层提速中",
+        subBadgeText: verifyLatencyMs ? `已畅通 · ${verifyLatencyMs} ms` : "自动加速其它软件",
         detailText: verifyLatencyMs
           ? relayName
-            ? `已通过「${relayName}」实测畅通（${verifyLatencyMs} ms），正自动加速电脑上其它代理软件`
-            : `实测链路畅通（${verifyLatencyMs} ms），正自动加速电脑上其它代理软件`
+            ? `独立底层已通过「${relayName}」实测畅通（${verifyLatencyMs} ms），正自动加速电脑上其它代理软件`
+            : `独立底层实测链路畅通（${verifyLatencyMs} ms），正自动加速电脑上其它代理软件`
           : verifyMessage ||
             (relayName
-              ? `已通过「${relayName}」实测畅通，正自动加速电脑上其它代理软件`
-              : "实测链路畅通，正自动加速电脑上其它代理软件"),
+              ? `独立底层已通过「${relayName}」实测畅通，正自动加速电脑上其它代理软件`
+              : "独立底层实测链路畅通，正自动加速电脑上其它代理软件"),
         tone: "green",
       };
     }
@@ -298,14 +358,16 @@ export function resolvePreAccelSummary(
       proxyActive: false,
       realWinDivertActive: true,
       localSocksActive: false,
+      suspendedForTun: false,
+      effectiveCarrier: "standalone_windivert",
       installState: "ready",
       verifyState,
       verifyLatencyMs,
-      badgeText: "全局提速中",
+      badgeText: "独立底层提速中",
       subBadgeText: "自动加速其它软件",
       detailText: relayName
-        ? `正通过「${relayName}」自动加速电脑上其它代理软件`
-        : "正在自动加速电脑上其它代理软件",
+        ? `独立底层正通过「${relayName}」自动加速电脑上其它代理软件`
+        : "独立底层正在自动加速电脑上其它代理软件",
       tone: "accent",
     };
   }
@@ -316,6 +378,8 @@ export function resolvePreAccelSummary(
       proxyActive: false,
       realWinDivertActive: false,
       localSocksActive,
+      suspendedForTun: false,
+      effectiveCarrier,
       installState,
       verifyState,
       verifyLatencyMs,
@@ -335,6 +399,8 @@ export function resolvePreAccelSummary(
       proxyActive: false,
       realWinDivertActive: false,
       localSocksActive,
+      suspendedForTun: false,
+      effectiveCarrier,
       installState,
       verifyState,
       verifyLatencyMs,
@@ -351,6 +417,8 @@ export function resolvePreAccelSummary(
       proxyActive: false,
       realWinDivertActive: false,
       localSocksActive,
+      suspendedForTun: false,
+      effectiveCarrier,
       installState,
       verifyState,
       verifyLatencyMs,
@@ -371,6 +439,8 @@ export function resolvePreAccelSummary(
       proxyActive: false,
       realWinDivertActive: false,
       localSocksActive,
+      suspendedForTun: false,
+      effectiveCarrier,
       installState,
       verifyState,
       verifyLatencyMs,
@@ -398,10 +468,12 @@ export function resolvePreAccelSummary(
     proxyActive: false,
     realWinDivertActive: false,
     localSocksActive,
+    suspendedForTun: false,
+    effectiveCarrier,
     installState,
     verifyState,
     verifyLatencyMs,
-    badgeText: "本地通道待命",
+    badgeText: localSocksActive ? "独立 SOCKS5 提速待命" : "本地通道待命",
     subBadgeText: null,
     detailText,
     tone: "amber",

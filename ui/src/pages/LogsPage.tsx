@@ -338,46 +338,30 @@ function formatLogTimestamp(ts?: string): string {
   return ts.slice(0, 12);
 }
 
+const SENSITIVE_LOG_KEY_ALT =
+  "(?:controller_secret|obfs[-_]?password|authorization|refresh[-_]?token|client[-_]?secret|access[-_]?token|private[-_]?key|public[-_]?key|passphrase|set[-_]?cookie|auth[-_]?token|sub[-_]?token|user[-_]?uuid|short[-_]?id|password|auth[-_]?str|api[-_]?key|apikey|passwd|secret|cookie|token|auth|uuid|pwd|key|psk|pbk|sid|username)";
+
+const SENSITIVE_QUERY_PARAM_RE = new RegExp(
+  `([?&](?:[A-Za-z0-9_-]*[-_])?${SENSITIVE_LOG_KEY_ALT}=)([^&#\\s"'<>]+)`,
+  "gi"
+);
+
+const SENSITIVE_KV_RE = new RegExp(
+  `((?<![A-Za-z0-9])${SENSITIVE_LOG_KEY_ALT}["']?[ \\t]*(?:=|:(?!//))[ \\t]*)(Bearer[ \\t]+)?(?:<REDACTED>|"(?:[^"\\\\]|\\\\.)*"|'(?:[^'\\\\]|\\\\.)*'|(?![{\\[\\r\\n])[^\\s&#"'\\x60,;\\)\\]\\}<>]+)`,
+  "gi"
+);
+
 /**
- * Sanitize exported or copied logs so credentials, URL query tokens, bearer secrets,
- * user paths, and unexpected non-documentation public IPv4/IPv6 addresses are never leaked.
+ * Strict frontend log sanitizer aligned 1:1 with `crates/catcloud-core/src/sanitize.rs`:
+ * - Only loopback/unspecified (`127.0.0.1`, `0.0.0.0`, `::1`, `::`) are preserved verbatim.
+ * - Redacts sensitive query params & key-value pairs (`token`, `uuid`, `pwd`, `auth`, `auth_str`,
+ *   `auth-str`, `psk`, `pbk`, `sid`, `cookie`, `set-cookie`, `apikey`, `public_key`, `public-key`,
+ *   `short_id`, `short-id`, `username`, and `_`/`-` prefixed compound keys) while preserving JSON quotes.
+ * - ALL other IPv4 addresses (including private RFC1918, TUN `198.18.*`, link-local, and public DNS)
+ *   are masked as `A.B.C.*` while protecting version strings (`v1.2.3.4`) and 5-part OIDs.
+ * - ALL other IPv6 literals (including `fe80:`, `fc/fd`, `ff`, `2001:db8:`, `::ffff:`) are masked as `a:b::*`.
  */
 function sanitizeLogLine(raw: string): string {
-  const safeDnsIps = new Set([
-    "1.1.1.1",
-    "1.0.0.1",
-    "8.8.8.8",
-    "8.8.4.4",
-    "9.9.9.9",
-    "223.5.5.5",
-    "223.6.6.6",
-    "119.29.29.29",
-    "114.114.114.114",
-  ]);
-  const safePrefixes = [
-    "0.",
-    "10.",
-    "127.",
-    "169.254.",
-    "192.168.",
-    "198.18.",
-    "198.19.",
-    "192.0.2.",
-    "198.51.100.",
-    "203.0.113.",
-    "224.",
-    "255.",
-  ];
-  const safeDnsIpv6s = new Set([
-    "2606:4700:4700::1111",
-    "2606:4700:4700::1001",
-    "2001:4860:4860::8888",
-    "2001:4860:4860::8844",
-    "2400:3200::1",
-    "2400:3200:baba::1",
-    "2402:4e00::",
-  ]);
-
   let out = raw
     // Redact custom CatCloud relay import tokens (`mmrelay://v1/...`) and opaque `vmess://` base64 payloads
     .replace(/(mmrelay:\/\/(?:v\d+\/)?)[^\s"'<>]+/gi, "$1<REDACTED>")
@@ -389,59 +373,63 @@ function sanitizeLogLine(raw: string): string {
     )
     // Redact opaque base64-only Shadowsocks/SSR payloads (`ss://<base64>#tag`)
     .replace(/(ssr?:\/\/)(?!<REDACTED>@)[^\s"'<>#]+/gi, "$1<REDACTED>")
-    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1<REDACTED>")
-    .replace(
-      /([?&](?:token|access_token|refresh_token|key|api_?key|secret|controller_secret|password|obfs[-_]?password|passwd|pwd|auth|auth_token|authorization|uuid)=)([^&#\s"'<>]+)/gi,
-      "$1<REDACTED>"
-    )
-    .replace(
-      /((?:password|obfs[-_]?password|passwd|secret|controller_secret|token|access_token|refresh_token|api_?key|key|auth|auth_token|authorization|uuid)\s*[=:]\s*)([^\s,&"'<>#]+)/gi,
-      "$1<REDACTED>"
-    )
+    .replace(/(?<![A-Za-z0-9])(Bearer[ \t]+)(?:<REDACTED>|[^\s&#"'`,;)\]}<>]+)/gi, "$1<REDACTED>")
+    .replace(SENSITIVE_QUERY_PARAM_RE, "$1<REDACTED>")
+    .replace(SENSITIVE_KV_RE, (full, prefix: string, bearer: string | undefined) => {
+      const valStart = prefix.length + (bearer?.length ?? 0);
+      const val = full.slice(valStart);
+      if (!val || val === "<REDACTED>" || val === '"<REDACTED>"' || val === "'<REDACTED>'") {
+        return full;
+      }
+      if (val.startsWith('"') && val.endsWith('"') && val.length >= 2) {
+        return `${prefix}${bearer ?? ""}"<REDACTED>"`;
+      }
+      if (val.startsWith("'") && val.endsWith("'") && val.length >= 2) {
+        return `${prefix}${bearer ?? ""}'<REDACTED>'`;
+      }
+      return `${prefix}${bearer ?? ""}<REDACTED>`;
+    })
     // Redact Windows & Unix user directories (supporting CJK and other non-ASCII usernames)
     .replace(/[A-Za-z]:([\\/])Users([\\/])[^\\/\s"'<>|:*?\r\n]+/gi, "C:$1Users$2<USER>")
     .replace(/\/(Users|home)\/[^\\/\s"'<>|:*?\r\n]+/g, "/$1/<USER>");
 
-  out = out.replace(/\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g, (full, a, b, c, d) => {
-    const nums = [Number(a), Number(b), Number(c), Number(d)];
-    if (nums.some((n) => n > 255)) return full;
-    if (safeDnsIps.has(full)) return full;
-    if (safePrefixes.some((p) => full.startsWith(p))) return full;
-    if (nums[0] === 172 && nums[1] >= 16 && nums[1] <= 31) return full;
-    return `${a}.${b}.***.***`;
-  });
-
-  // Mask public IPv6 literals (both full 8-hextet and compressed `::` forms) without touching HH:MM:SS timestamps or 6-byte MACs
+  // Strictly mask all non-loopback/non-unspecified IPv4 addresses to `A.B.C.*`
+  // Protects version strings (`v1.2.3.4`, `version=1.2.3.4`) and multi-segment OIDs (`1.3.6.1.5`).
   out = out.replace(
-    /(?<![0-9a-fA-F:])(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4})(?![0-9a-fA-F:])/g,
+    /(?<![A-Za-z0-9.])(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})(?!\.\d)(?![0-9A-Za-z])/g,
+    (full, a, b, c, d, offset: number, source: string) => {
+      const nums = [Number(a), Number(b), Number(c), Number(d)];
+      if (nums.some((n) => n > 255)) return full;
+      // Preserve explicit loopback and unspecified addresses only
+      if (full === "127.0.0.1" || full === "0.0.0.0") return full;
+      // Guard version prefixes immediately preceding the match (e.g. `v1_1.2.3.4`, `version: 1.2.3.4`)
+      const before = source.slice(Math.max(0, offset - 12), offset);
+      if (/(?:^|[^a-zA-Z])(?:v\d+_|version[\s:=_-]*)$/i.test(before)) {
+        return full;
+      }
+      return `${a}.${b}.${c}.*`;
+    }
+  );
+
+  // Strictly mask all non-loopback/non-unspecified IPv6 literals to `a:b::*` (without touching HH:MM:SS or MACs)
+  out = out.replace(
+    /(?<![0-9a-fA-F:])(?:(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|(?:[0-9a-fA-F]{1,4}:){1,6}:(?:[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4})*)?|::(?:[0-9a-fA-F]{1,4}:){0,5}[0-9a-fA-F]{1,4}|::)(?![0-9a-fA-F:])/g,
     (full) => {
       const lower = full.toLowerCase();
       if (lower === "::" || lower === "::1") return full;
-      if (safeDnsIpv6s.has(lower)) return full;
-      if (
-        lower.startsWith("fe80:") ||
-        lower.startsWith("fc") ||
-        lower.startsWith("fd") ||
-        lower.startsWith("ff") ||
-        lower.startsWith("2001:db8:") ||
-        lower.startsWith("2001:0db8:") ||
-        lower.startsWith("::ffff:")
-      ) {
-        return full;
-      }
       if (lower.includes("::")) {
         const parts = lower.split("::");
         if (parts.length > 2) return full;
         const left = parts[0] ? parts[0].split(":") : [];
         const right = parts[1] ? parts[1].split(":") : [];
         if (left.length + right.length > 7) return full;
-        if (left.length >= 2) return `${left[0]}:${left[1]}::***`;
-        if (left.length === 1) return `${left[0]}::***`;
+        if (left.length >= 2) return `${left[0]}:${left[1]}::*`;
+        if (left.length === 1) return `${left[0]}::*`;
         return "<REDACTED_IPV6>";
       }
       const segments = lower.split(":");
       if (segments.length !== 8) return full;
-      return `${segments[0]}:${segments[1]}:***:***`;
+      return `${segments[0]}:${segments[1]}::*`;
     }
   );
 

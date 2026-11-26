@@ -2,28 +2,37 @@ use anyhow::{Context, Result};
 use catcloud_core::agent_docs;
 use catcloud_core::config::{self, ConfigValidationIssue, ValidationSeverity};
 use catcloud_core::core_adapter::config_compiler::{
-    CompileInput, StaticCheckIssue, StaticValidationReport, compile_mihomo_config,
+    CompileInput, StaticCheckIssue, StaticValidationReport,
     compile_mihomo_config_with_runtime_dir, validate_compiled_yaml,
 };
+use catcloud_core::core_adapter::dns_diag::{
+    DNS_TLS_STATUS_CERT_FAILED, DNS_TLS_STATUS_DEGRADED_RECOVERED, DnsTlsDiagnostics,
+    analyze_dns_tls_diagnostics, analyze_dns_tls_diagnostics_from_log_file,
+};
 use catcloud_core::core_adapter::port_guard::{
-    AllocatedPorts, allocate_safe_ports, is_port_available_tcp_udp,
+    AllocatedPorts, PortShiftNotice, allocate_safe_ports_for_hosts, is_port_available_tcp_udp,
 };
 use catcloud_core::core_adapter::{
     ActiveConnection, BinaryResolution, DiskReloadOptions, DownloadGuidance, HotReloadCoordinator,
-    MihomoAdapter, ReloadOutcome, ResolvedControllerEndpoint, compute_file_sha256,
-    format_host_port, generate_controller_secret, resolve_effective_controller_endpoint_info,
-    resolve_mihomo_binary, verify_config_with_binary,
+    LiveCoreConfigSnapshot, MihomoAdapter, ReloadLevel, ReloadOutcome, ResolvedControllerEndpoint,
+    classify_config_diff, compute_file_sha256, format_host_port, generate_controller_secret,
+    is_internal_or_preaccel_connection, read_live_runtime_controller_meta,
+    resolve_effective_controller_endpoint_info, resolve_mihomo_binary, verify_config_with_binary,
 };
 use catcloud_core::models::{
-    AppConfig, DEFAULT_COST_EFFECTIVE_FORMULA, FallbackPolicy, MultiGroup, MultiGroupMode,
-    NodeFilter, PreAccelConfig, PreAccelRelay, ProbeDefinition, ProbeKind, ProxyMode, ProxyNode,
-    RouteTargetMode, SubscriptionKind, SubscriptionRecord, SwitchMode,
+    AppConfig, CoreLogLevel, DEFAULT_COST_EFFECTIVE_FORMULA, FallbackPolicy, MultiGroup,
+    MultiGroupMode, NodeFilter, PreAccelConfig, PreAccelDispatchStrategy, PreAccelLbStrategy,
+    PreAccelRelay, ProbeDefinition, ProbeKind, ProxyMode, ProxyNode, RouteTargetMode,
+    SubscriptionKind, SubscriptionRecord, SwitchMode, TunStackMode, is_ipv6_only_node,
 };
-use catcloud_core::platform::default_platform;
+use catcloud_core::platform::{
+    PortListenerOwner, default_platform, get_process_start_time_unix, list_listening_port_owners,
+};
 use catcloud_core::preaccel::campus::{CampusBypassTracker, probe_campus_portal};
 use catcloud_core::preaccel::generator::{build_preaccel_compile_plan, validate_domestic_probe_url};
 use catcloud_core::preaccel::global_tunnel::{
-    detect_host_security_products, locate_windivert_files,
+    GlobalPreAccelRuntimeMeta, detect_host_security_products, locate_windivert_files,
+    read_global_preaccel_runtime_meta,
 };
 use catcloud_core::preaccel::schema::{
     evaluate_expiry, parse_mmrelay_clipboard, validate_relay_strict,
@@ -37,7 +46,7 @@ use catcloud_core::probe::{
 use catcloud_core::process_guard::JobGuard;
 use catcloud_core::sanitize::{
     redact_compiled_yaml, redact_ip_or_host, redact_node_for_readonly, redact_path_for_display,
-    redact_relay_for_readonly, sanitize_log_line,
+    redact_relay_for_readonly, sanitize_json_value, sanitize_log_line,
 };
 use catcloud_core::share_bundle::{
     ShareBundleExportRequest, ShareBundlePreview, ShareGroupsBundle, build_share_groups_bundle,
@@ -57,6 +66,7 @@ use catcloud_core::storage::{Storage, SubscriptionUpdateMode};
 use catcloud_core::strategy::arbiter::{ArbiterGroupMemory, decide_group_action};
 use catcloud_core::strategy::evaluator::evaluate_group_candidates;
 use catcloud_core::strategy::formula::validate_formula;
+use catcloud_core::strategy::health_pool::read_watchdog_state_snapshot;
 use catcloud_core::subscription::migrator::{
     MigrationImportOptions, MigrationPreview, generate_migration_subscription_id,
     import_migration_preview, scan_custom_path_readonly, scan_local_clients,
@@ -75,7 +85,7 @@ use catcloud_core::updater::{
     parse_sha256sums, read_pending_staged_update, resolve_asset_sha256, stage_verified_archive,
 };
 use catcloud_core::{AppPaths, CatError, CatResult};
-use chrono::Utc;
+use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -205,12 +215,15 @@ pub enum SubCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum NetCommand {
-    /// Run pure read-only layered diagnostics across paths, config, core, ports, proxy/TUN, preaccel, conflicts, and GeoData
+    /// Run pure read-only layered diagnostics across paths, config, core, ports, proxy/TUN, preaccel, conflicts, GeoData, and DNS TLS health
     Doctor,
     /// Query active connections from the running Mihomo controller (redacted by default)
     Connections {
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Reveal unredacted IPs and process paths (default: redacted)
+        #[arg(long)]
+        reveal_secrets: bool,
     },
     /// Simulate or query which routing rule and outbound policy a domain or IP matches
     Match {
@@ -226,12 +239,21 @@ pub enum NetCommand {
 
 #[derive(Subcommand, Debug)]
 pub enum LogsCommand {
-    /// Read sanitized tail lines from catcloud.log (and .1 archive)
+    /// Read sanitized tail lines from catcloud.log (and .2 / .1 archives)
     Tail {
         #[arg(long, default_value_t = 80)]
         lines: usize,
         #[arg(long, default_value = "all")]
         level: String,
+        /// Filter entries at or after this time (RFC3339, YYYY-MM-DD HH:MM[:SS], HH:MM, or relative like 30m / 2h)
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter entries at or before this time (RFC3339, YYYY-MM-DD HH:MM[:SS], HH:MM, or relative like 5m / 1h)
+        #[arg(long)]
+        until: Option<String>,
+        /// Reveal unredacted log lines (default: redacted)
+        #[arg(long)]
+        reveal_secrets: bool,
     },
 }
 
@@ -540,15 +562,17 @@ pub struct ProbeRunArgs {
 pub enum GroupCommand {
     /// List all configured multi-groups
     List,
-    /// Create or update a smart multi-group
+    /// Create or partially update a smart multi-group (preserves unspecified fields on existing groups)
     Create(GroupCreateArgs),
+    /// Safely add, remove, or replace member nodes without touching group policies or routing rules
+    Members(GroupMembersArgs),
     /// Switch active node in a multi-group (explicit or next best)
     Switch {
         group_id: String,
         #[arg(long)]
         node: Option<String>,
     },
-    /// Update formula, fallback policy, switch mode, or hard gates for a group
+    /// Update formula, fallback policy, switch mode, hard gates, or routing match rules for a group
     Policy(GroupPolicyArgs),
     /// Evaluate candidate scores and arbiter decision for a group
     Eval { group_id: String },
@@ -559,17 +583,30 @@ pub struct GroupCreateArgs {
     #[arg(long)]
     pub id: String,
     #[arg(long)]
-    pub name: String,
-    #[arg(long, default_value = "sticky_best")]
-    pub mode: String,
+    pub name: Option<String>,
+    #[arg(long)]
+    pub mode: Option<String>,
     #[arg(long)]
     pub formula: Option<String>,
-    #[arg(long, default_value = "degrade_best_warn")]
-    pub fallback: String,
-    #[arg(long, default_value = "force_close_old")]
-    pub switch_mode: String,
+    #[arg(long)]
+    pub fallback: Option<String>,
+    #[arg(long)]
+    pub switch_mode: Option<String>,
     #[arg(long)]
     pub nodes: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct GroupMembersArgs {
+    /// Target multi-group ID
+    #[arg(long = "id", alias = "group-id")]
+    pub id: String,
+    /// Member mutation operation: add | remove | set
+    #[arg(value_parser = ["add", "remove", "set"])]
+    pub action: String,
+    /// Comma-separated node IDs
+    #[arg(long)]
+    pub nodes: String,
 }
 
 #[derive(Args, Debug)]
@@ -583,6 +620,15 @@ pub struct GroupPolicyArgs {
     pub switch_mode: Option<String>,
     #[arg(long)]
     pub hard_gate: Vec<String>,
+    /// Replace group match rules (semicolon-separated full rules or comma-separated domains)
+    #[arg(long = "match-rules")]
+    pub match_rules: Option<String>,
+    /// Append one or more match rules (repeatable)
+    #[arg(long = "add-match-rule")]
+    pub add_match_rule: Vec<String>,
+    /// Clear all match rules on this group
+    #[arg(long = "clear-match-rules")]
+    pub clear_match_rules: bool,
 }
 
 /// Platform-appropriate default shell for `config export-env`.
@@ -607,7 +653,7 @@ pub enum PreaccelCommand {
         #[arg(long)]
         reveal_secrets: bool,
     },
-    /// Update domestic pre-acceleration enablement, native-443 skip, and domestic 204 probe URL
+    /// Update domestic pre-acceleration enablement, native-443 skip, dispatch strategy, and domestic 204 probe URL
     Bind {
         #[arg(long)]
         enabled: Option<bool>,
@@ -615,6 +661,12 @@ pub enum PreaccelCommand {
         skip_443_native: Option<bool>,
         #[arg(long)]
         probe_url: Option<String>,
+        /// Multi-cloud dispatch strategy: auto | load_balance | fallback
+        #[arg(long)]
+        dispatch_strategy: Option<String>,
+        /// Inner load-balance strategy: round_robin | consistent_hashing
+        #[arg(long)]
+        lb_strategy: Option<String>,
     },
     /// Validate pre-acceleration compile plan, anti-loop rules, optional campus portal check,
     /// and optional real relay speed test
@@ -714,9 +766,21 @@ pub enum UpdateCommand {
     },
 }
 
+fn finalize_output_value(value: &Value) -> Value {
+    let mut out = value.clone();
+    if out.get("sanitized").and_then(Value::as_bool) == Some(true) {
+        sanitize_json_value(&mut out);
+    }
+    out
+}
+
 fn emit_output(as_json: bool, value: &Value, human: &str) -> Result<()> {
+    let should_sanitize = value.get("sanitized").and_then(Value::as_bool) == Some(true);
     if as_json {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        let final_value = finalize_output_value(value);
+        println!("{}", serde_json::to_string_pretty(&final_value)?);
+    } else if should_sanitize {
+        println!("{}", sanitize_multiline_text(human));
     } else {
         println!("{human}");
     }
@@ -756,6 +820,83 @@ fn parse_switch_mode(raw: &str) -> Result<SwitchMode> {
     }
 }
 
+fn parse_preaccel_dispatch_strategy(raw: &str) -> Result<PreAccelDispatchStrategy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(PreAccelDispatchStrategy::Auto),
+        "load_balance" | "load-balance" | "lb" => Ok(PreAccelDispatchStrategy::LoadBalance),
+        "fallback" | "failover" => Ok(PreAccelDispatchStrategy::Fallback),
+        other => anyhow::bail!(
+            "unsupported dispatch strategy `{other}` (use auto|load_balance|fallback)"
+        ),
+    }
+}
+
+fn parse_preaccel_lb_strategy(raw: &str) -> Result<PreAccelLbStrategy> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "round_robin" | "round-robin" | "rr" => Ok(PreAccelLbStrategy::RoundRobin),
+        "consistent_hashing" | "consistent-hashing" | "ch" => {
+            Ok(PreAccelLbStrategy::ConsistentHashing)
+        }
+        other => anyhow::bail!(
+            "unsupported lb strategy `{other}` (use round_robin|consistent_hashing)"
+        ),
+    }
+}
+
+fn looks_like_clash_rule_prefix(token: &str) -> bool {
+    matches!(
+        token.trim().to_ascii_uppercase().as_str(),
+        "DOMAIN"
+            | "DOMAIN-SUFFIX"
+            | "DOMAIN-KEYWORD"
+            | "DOMAIN-WILDCARD"
+            | "DOMAIN-REGEX"
+            | "GEOSITE"
+            | "GEOIP"
+            | "IP-CIDR"
+            | "IP-CIDR6"
+            | "SRC-IP-CIDR"
+            | "SRC-PORT"
+            | "DST-PORT"
+            | "PROCESS-NAME"
+            | "PROCESS-PATH"
+            | "NETWORK"
+            | "RULE-SET"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "SUB-RULE"
+            | "MATCH"
+    )
+}
+
+fn parse_group_match_rules_arg(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let items: Vec<&str> = if trimmed.contains(';') {
+        trimmed.split(';').collect()
+    } else if let Some((first, _)) = trimmed.split_once(',') {
+        if looks_like_clash_rule_prefix(first) {
+            vec![trimmed]
+        } else {
+            trimmed.split(',').collect()
+        }
+    } else {
+        vec![trimmed]
+    };
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for part in items {
+        let cleaned = part.trim();
+        if !cleaned.is_empty() && seen.insert(cleaned.to_string()) {
+            out.push(cleaned.to_string());
+        }
+    }
+    out
+}
+
 pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Status => {
@@ -767,14 +908,24 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 .ok()
                 .and_then(|r| r.path);
             let tun_configured = cfg.tun.enabled;
+            let active_ports = inspect_active_core_ports(paths, &cfg).await;
             let (tun_enabled, tun_needs_elevation, tun_runtime_source) =
-                resolve_cli_effective_tun_state(paths, &cfg, &caps, mihomo_bin.as_deref()).await;
+                resolve_cli_effective_tun_state_with_probe(
+                    &cfg,
+                    &caps,
+                    mihomo_bin.as_deref(),
+                    &active_ports,
+                )
+                .await;
             let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
             let sub_count = db.list_subscriptions()?.len();
             let node_count = db.list_nodes()?.len();
             let group_count = db.list_multi_groups()?.len();
             let relay_count = db.list_preaccel_relays(false)?.len();
             let probe_count = db.list_probe_definitions()?.len();
+            let eff_mixed = active_ports.effective_mixed_port;
+            let eff_ctrl = active_ports.effective_controller_port;
+            let eff_dns = active_ports.effective_dns_port;
             let out = json!({
                 "ok": true,
                 "sanitized": true,
@@ -783,15 +934,18 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 "is_portable": paths.is_portable,
                 "instance_hash": paths.instance_hash,
                 "platform": caps,
+                "core_running": active_ports.core_running,
+                "core_version": &active_ports.core_version,
                 "proxy_mode": cfg.proxy_mode,
                 "system_proxy_enabled": cfg.system_proxy.enabled,
                 "tun_enabled": tun_enabled,
                 "tun_configured": tun_configured,
                 "tun_needs_elevation": tun_needs_elevation,
                 "tun_source": tun_runtime_source,
-                "mixed_port": cfg.mixed_port,
-                "controller_addr": cfg.controller_addr(),
-                "dns_listen_addr": cfg.dns_listen_addr(),
+                "mixed_port": eff_mixed,
+                "controller_addr": format_host_port(&active_ports.endpoint.host, eff_ctrl),
+                "dns_listen_addr": format_host_port(&cfg.dns_listen_host, eff_dns),
+                "ports": active_ports.to_status_json(),
                 "preaccel_enabled": cfg.preaccel.enabled,
                 "global_preaccel": {
                     "enabled": cfg.preaccel.global_bypass_enabled,
@@ -816,11 +970,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 "false"
             };
             let human = format!(
-                "CatCloud CLI v{} | portable={} | mode={} | port={} | tun={} | nodes={} | groups={} | global_preaccel={} (windivert={})",
+                "CatCloud CLI v{} | core_running={} | portable={} | mode={} | port={} | tun={} | nodes={} | groups={} | global_preaccel={} (windivert={})",
                 env!("CARGO_PKG_VERSION"),
+                active_ports.core_running,
                 paths.is_portable,
                 cfg.proxy_mode.as_str(),
-                cfg.mixed_port,
+                eff_mixed,
                 tun_summary,
                 node_count,
                 group_count,
@@ -1547,33 +1702,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             }
 
             GroupCommand::Create(args) => {
-                let db = open_storage(paths)?;
-                let formula = args
-                    .formula
-                    .unwrap_or_else(|| DEFAULT_COST_EFFECTIVE_FORMULA.to_string());
-                validate_formula(&formula)?;
-                let member_node_ids = args
-                    .nodes
-                    .map(|s| {
-                        s.split(',')
-                            .map(|v| v.trim().to_string())
-                            .filter(|v| !v.is_empty())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let group = MultiGroup {
-                    id: args.id.clone(),
-                    name: args.name,
-                    mode: parse_group_mode(&args.mode)?,
-                    member_node_ids,
-                    formula_expr: formula,
-                    fallback_policy: parse_fallback_policy(&args.fallback)?,
-                    switch_mode: parse_switch_mode(&args.switch_mode)?,
-                    ..MultiGroup::default()
-                };
-                db.upsert_multi_group(&group)?;
-                let out = json!({ "ok": true, "group": group });
-                emit_output(as_json, &out, &format!("Saved multi-group `{}`.", args.id))
+                let (out, human) = execute_group_create(paths, args)?;
+                emit_output(as_json, &out, &human)
+            }
+
+            GroupCommand::Members(args) => {
+                let (out, human) = execute_group_members(paths, args)?;
+                emit_output(as_json, &out, &human)
             }
 
             GroupCommand::Switch { group_id, node } => {
@@ -1620,60 +1755,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             }
 
             GroupCommand::Policy(args) => {
-                let db = open_storage(paths)?;
-                let mut group = db
-                    .get_multi_group(&args.group_id)?
-                    .with_context(|| format!("multi-group `{}` not found", args.group_id))?;
-                if let Some(expr) = args.formula {
-                    validate_formula(&expr)?;
-                    group.formula_expr = expr;
-                }
-                if let Some(fb) = args.fallback {
-                    group.fallback_policy = parse_fallback_policy(&fb)?;
-                }
-                if let Some(sw) = args.switch_mode {
-                    group.switch_mode = parse_switch_mode(&sw)?;
-                }
-                if !args.hard_gate.is_empty() {
-                    for g in &args.hard_gate {
-                        validate_formula(g)?;
-                    }
-                    group.hard_gates = args.hard_gate;
-                }
-                db.upsert_multi_group(&group)?;
-                let out = json!({ "ok": true, "group": group });
-                emit_output(
-                    as_json,
-                    &out,
-                    &format!("Updated policy for multi-group `{}`.", args.group_id),
-                )
+                let (out, human) = execute_group_policy(paths, args)?;
+                emit_output(as_json, &out, &human)
             }
 
             GroupCommand::Eval { group_id } => {
-                let db = open_storage(paths)?;
-                let group = db
-                    .get_multi_group(&group_id)?
-                    .with_context(|| format!("multi-group `{group_id}` not found"))?;
-                let nodes = db.list_nodes()?;
-                let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
-                let snaps = db.get_probe_snapshots_batch(&ids, group.primary_probe_id.as_deref())?;
-                let eval_report = evaluate_group_candidates(&group, &nodes, &snaps)?;
-                let mut mem = ArbiterGroupMemory::default();
-                let decision =
-                    decide_group_action(&group, &nodes, &snaps, None, &mut mem, Utc::now().timestamp())?;
-                let out = json!({
-                    "ok": true,
-                    "evaluation": eval_report,
-                    "decision": decision,
-                });
-                emit_output(
-                    as_json,
-                    &out,
-                    &format!(
-                        "Evaluated group `{group_id}`: {} gate-passed candidate(s) ranked.",
-                        eval_report.gate_passed.len()
-                    ),
-                )
+                let (out, human) = build_group_eval_payload(paths, &group_id)?;
+                emit_output(as_json, &out, &human)
             }
         },
 
@@ -1769,6 +1857,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 enabled,
                 skip_443_native,
                 probe_url,
+                dispatch_strategy,
+                lb_strategy,
             } => {
                 let mut cfg = config::load_or_init(paths)?;
                 if let Some(en) = enabled {
@@ -1782,6 +1872,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     validate_domestic_probe_url(&url)?;
                     cfg.preaccel.probe_url = url;
                 }
+                if let Some(ds) = dispatch_strategy {
+                    cfg.preaccel.dispatch_strategy = parse_preaccel_dispatch_strategy(&ds)?;
+                }
+                if let Some(lb) = lb_strategy {
+                    cfg.preaccel.lb_strategy = parse_preaccel_lb_strategy(&lb)?;
+                }
                 config::save(paths, &cfg)?;
                 let sanitized_preaccel = redact_preaccel_config_for_output(&cfg.preaccel);
                 let out = json!({
@@ -1793,8 +1889,11 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     as_json,
                     &out,
                     &format!(
-                        "Updated preaccel binding: enabled={}, skip_443_native={}.",
-                        cfg.preaccel.enabled, cfg.preaccel.skip_443_native
+                        "Updated preaccel binding: enabled={}, skip_443_native={}, dispatch_strategy={}, lb_strategy={}.",
+                        cfg.preaccel.enabled,
+                        cfg.preaccel.skip_443_native,
+                        cfg.preaccel.dispatch_strategy.as_str(),
+                        cfg.preaccel.lb_strategy.as_config_str()
                     ),
                 )
             }
@@ -1853,17 +1952,20 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 }
 
                 let groups = db.list_multi_groups()?;
-                let (reference_node, ref_note) = select_preaccel_speed_reference_node(
-                    &cfg,
-                    &groups,
-                    &nodes,
-                    node_id.as_deref(),
-                )?;
                 let target_relays: Vec<PreAccelRelay> = relays
                     .iter()
                     .filter(|r| r.enabled && !r.server.trim().is_empty() && r.port > 0)
                     .cloned()
                     .collect();
+                let relays_support_ipv6 =
+                    !target_relays.is_empty() && target_relays.iter().all(|r| r.supports_ipv6);
+                let (reference_node, ref_note) = select_preaccel_speed_reference_node(
+                    &cfg,
+                    &groups,
+                    &nodes,
+                    node_id.as_deref(),
+                    relays_support_ipv6,
+                )?;
 
                 if target_relays.is_empty() {
                     let speed_test = json!({
@@ -1962,8 +2064,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 // Measure relays strictly one-by-one to prevent bandwidth contention.
                 for (relay_id, proxy_port) in relay_ports {
                     let sample = measure_single_preaccel_relay_speed(proxy_port, &relay_id).await;
-                    let rounded_lat = sample
-                        .latency_ms
+                    let rounded_chain_lat = sample
+                        .chain_latency_ms
                         .filter(|v| v.is_finite() && *v > 0.0)
                         .map(|ms| ((ms * 10.0).round() / 10.0).max(0.1));
                     let rounded_up = sample
@@ -1974,10 +2076,11 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         .down_mbps
                         .filter(|v| v.is_finite() && *v > 0.0)
                         .map(|v| (v * 100.0).round() / 100.0);
-                    if rounded_lat.is_some() || rounded_up.is_some() || rounded_down.is_some() {
+                    // Never overwrite domestic direct `last_probe_ms` with dual-hop overseas `cp.cloudflare.com` latency.
+                    if rounded_up.is_some() || rounded_down.is_some() {
                         if let Err(err) = db.update_preaccel_speed_metrics(
                             &relay_id,
-                            rounded_lat,
+                            None,
                             rounded_up,
                             rounded_down,
                         ) {
@@ -2005,13 +2108,14 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         "server": relay_opt.map(|r| redact_ip_or_host(&r.server)).unwrap_or_default(),
                         "port": relay_opt.map(|r| r.port).unwrap_or(0),
                         "ok": sample.ok,
-                        "latency_ms": rounded_lat,
+                        "last_probe_ms": relay_opt.and_then(|r| r.last_probe_ms),
+                        "chain_latency_ms": rounded_chain_lat,
                         "up_mbps": rounded_up,
                         "down_mbps": rounded_down,
                         "error": &clean_err,
                     }));
 
-                    let lat_str = rounded_lat
+                    let lat_str = rounded_chain_lat
                         .map(|v| format!("{v:.1}ms"))
                         .unwrap_or_else(|| "--".to_string());
                     let up_str = rounded_up
@@ -2022,12 +2126,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         .unwrap_or_else(|| "--".to_string());
                     if let Some(err_text) = clean_err {
                         human_lines.push(format!(
-                            "- {relay_name} ({relay_id}): ok={} | latency={lat_str} | up={up_str} | down={down_str} | note={err_text}",
+                            "- {relay_name} ({relay_id}): ok={} | chain_latency={lat_str} | up={up_str} | down={down_str} | note={err_text}",
                             sample.ok
                         ));
                     } else {
                         human_lines.push(format!(
-                            "- {relay_name} ({relay_id}): ok={} | latency={lat_str} | up={up_str} | down={down_str}",
+                            "- {relay_name} ({relay_id}): ok={} | chain_latency={lat_str} | up={up_str} | down={down_str}",
                             sample.ok
                         ));
                     }
@@ -2094,7 +2198,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             }
 
             PreaccelCommand::GlobalStatus => {
-                let (out, human) = build_global_preaccel_status_payload(paths)?;
+                let (out, human) = build_global_preaccel_status_payload(paths).await?;
                 emit_output(as_json, &out, &human)
             }
         },
@@ -2105,8 +2209,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 emit_output(as_json, &out, &human)
             }
 
-            NetCommand::Connections { limit } => {
-                let (out, human) = build_net_connections_payload(paths, limit).await?;
+            NetCommand::Connections {
+                limit,
+                reveal_secrets,
+            } => {
+                let (out, human) =
+                    build_net_connections_payload(paths, limit, reveal_secrets).await?;
                 emit_output(as_json, &out, &human)
             }
 
@@ -2121,64 +2229,30 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
         },
 
         Commands::Logs { action } => match action {
-            LogsCommand::Tail { lines, level } => {
-                let (out, human) = build_logs_tail_payload(paths, lines, &level)?;
+            LogsCommand::Tail {
+                lines,
+                level,
+                since,
+                until,
+                reveal_secrets,
+            } => {
+                let (out, human) = build_logs_tail_payload_with_options(
+                    paths,
+                    lines,
+                    &level,
+                    since.as_deref(),
+                    until.as_deref(),
+                    reveal_secrets,
+                    Local::now(),
+                )?;
                 emit_output(as_json, &out, &human)
             }
         },
 
         Commands::Config { action } => match action {
             ConfigCommand::Validate => {
-                let cfg = config::load_or_init(paths)?;
-                let cfg_issues = config::validate_config_detailed(&cfg);
-                let db = open_storage(paths)?;
-                let nodes = db.list_nodes()?;
-                let groups = db.list_multi_groups()?;
-                let relays = db.list_preaccel_relays(false)?;
-                let ports = allocate_safe_ports(
-                    &cfg.bind_address,
-                    cfg.mixed_port,
-                    cfg.controller_port,
-                    cfg.dns_listen_port,
-                    cfg.port_guard_auto_shift,
-                )?;
-                let empty_filter = HashMap::new();
-                let compiled = compile_mihomo_config(&CompileInput {
-                    config: &cfg,
-                    nodes: &nodes,
-                    groups: &groups,
-                    relays: &relays,
-                    controller_secret: "validation-placeholder-secret",
-                    allocated_ports: &ports,
-                    extra_prepend_rules: &[],
-                    extra_fake_ip_filters: &[],
-                    group_filtered_members: &empty_filter,
-                })?;
-                let relay_servers: Vec<String> = relays
-                    .iter()
-                    .filter(|r| r.enabled)
-                    .map(|r| r.server.clone())
-                    .collect();
-                let static_report = validate_compiled_yaml(&compiled.yaml, &relay_servers)?;
-                let ok = cfg_issues.is_empty() && static_report.ok;
-                let sanitized_cfg_issues = redact_config_issues(&cfg_issues);
-                let sanitized_static = redact_static_validation(&static_report);
-                let out = json!({
-                    "ok": ok,
-                    "sanitized": true,
-                    "config_issues": sanitized_cfg_issues,
-                    "static_validation": sanitized_static,
-                    "stats": compiled.stats,
-                    "ports": ports,
-                });
-                emit_output(
-                    as_json,
-                    &out,
-                    &format!(
-                        "Config validation ok={ok} (rules={}, proxies={}).",
-                        compiled.stats.total_rules, compiled.stats.total_proxies
-                    ),
-                )?;
+                let (ok, out, human) = build_config_validate_payload(paths).await?;
+                emit_output(as_json, &out, &human)?;
                 if !ok {
                     if as_json {
                         return Err(AlreadyEmittedJsonError(
@@ -2192,389 +2266,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             }
 
             ConfigCommand::Reload { dry_run } => {
-                let cfg = config::load_or_init(paths)?;
-                let _ = open_storage(paths)?;
-                let bin_res = resolve_mihomo_binary(&cfg, paths, &[], false)?;
-                let job_guard = Arc::new(JobGuard::new()?);
-
-                let ep = resolve_effective_controller_endpoint_info(paths, &cfg);
-                let ctrl_addr = format_host_port(&ep.host, ep.port);
-                let configured_secret =
-                    (!ep.secret.trim().is_empty()).then_some(ep.secret.clone());
-
-                let probe_adapter = MihomoAdapter::with_controller_endpoint(
-                    Arc::clone(&job_guard),
-                    &ep.host,
-                    ep.port,
-                    ep.secret.clone(),
-                )?;
-
-                let mut live_controller_version: Option<String> = None;
-                let mut controller_auth_error: Option<String> = None;
-                match tokio::time::timeout(Duration::from_secs(2), probe_adapter.fetch_version())
-                    .await
-                {
-                    Ok(Ok(ver)) => {
-                        live_controller_version = Some(ver);
-                    }
-                    Ok(Err(CatError::Core(msg)))
-                        if msg.contains("HTTP 401") || msg.contains("HTTP 403") =>
-                    {
-                        controller_auth_error = Some(msg);
-                    }
-                    _ => {}
-                }
-
-                let redacted_bin_path = bin_res
-                    .path
-                    .as_ref()
-                    .map(|p| redact_path_for_display(&p.to_string_lossy()));
-                let caps = default_platform().capabilities();
-                let allow_tun = is_cli_tun_privilege_ready(&caps, bin_res.path.as_deref());
-                let tun_masked_no_elevation = cfg.tun.enabled && !allow_tun;
-
-                if dry_run {
-                    let db = open_storage(paths)?;
-                    let nodes = db.list_nodes()?;
-                    let groups = db.list_multi_groups()?;
-                    let relays = db.list_preaccel_relays(false)?;
-                    let mut effective_cfg = cfg.clone();
-                    if !allow_tun && effective_cfg.tun.enabled {
-                        effective_cfg.tun.enabled = false;
-                    }
-                    let bind_host = if effective_cfg.allow_lan {
-                        effective_cfg.bind_address.clone()
-                    } else {
-                        "127.0.0.1".to_string()
-                    };
-                    let ports = AllocatedPorts {
-                        bind_host,
-                        mixed_port: ep.mixed_port.unwrap_or(effective_cfg.mixed_port),
-                        controller_port: ep.port,
-                        dns_port: ep.dns_port.unwrap_or(effective_cfg.dns_listen_port),
-                        shifted: Vec::new(),
-                    };
-                    let secret = configured_secret
-                        .clone()
-                        .unwrap_or_else(generate_controller_secret);
-                    let empty_filter = HashMap::new();
-                    let compiled = compile_mihomo_config(&CompileInput {
-                        config: &effective_cfg,
-                        nodes: &nodes,
-                        groups: &groups,
-                        relays: &relays,
-                        controller_secret: &secret,
-                        allocated_ports: &ports,
-                        extra_prepend_rules: &[],
-                        extra_fake_ip_filters: &[],
-                        group_filtered_members: &empty_filter,
-                    })?;
-                    if !compiled.validation.ok {
-                        let summary = sanitize_log_line(
-                            &compiled
-                                .validation
-                                .errors()
-                                .iter()
-                                .map(|i| format!("[{}] {}", i.code, i.message))
-                                .collect::<Vec<_>>()
-                                .join("; "),
-                        );
-                        let msg =
-                            format!("compiled YAML failed static anti-loop preflight: {summary}");
-                        let sanitized_validation = redact_static_validation(&compiled.validation);
-                        let out = json!({
-                            "ok": false,
-                            "sanitized": true,
-                            "dry_run": true,
-                            "validated_and_written": false,
-                            "error": &msg,
-                            "static_validation": &sanitized_validation,
-                        });
-                        if as_json {
-                            emit_output(true, &out, "")?;
-                            return Err(AlreadyEmittedJsonError(msg).into());
-                        }
-                        anyhow::bail!("refused reload dry-run: {summary}");
-                    }
-
-                    let mut binary_verified = false;
-                    if let Some(ref bin_path) = bin_res.path {
-                        let candidate_path = paths
-                            .runtime_dir
-                            .join(format!("runtime-dryrun-{}.yaml", std::process::id()));
-                        AppPaths::atomic_write(&candidate_path, compiled.yaml.as_bytes())?;
-                        let verify_res = verify_config_with_binary(
-                            bin_path,
-                            &paths.runtime_dir,
-                            &candidate_path,
-                            Duration::from_secs(8),
-                        )
-                        .await;
-                        let _ = std::fs::remove_file(&candidate_path);
-                        if let Err(err) = verify_res {
-                            let msg = sanitize_log_line(&err.to_string());
-                            let out = json!({
-                                "ok": false,
-                                "dry_run": true,
-                                "validated_and_written": false,
-                                "binary_verified": false,
-                                "binary_path": &redacted_bin_path,
-                                "error": &msg,
-                            });
-                            if as_json {
-                                emit_output(true, &out, "")?;
-                                return Err(AlreadyEmittedJsonError(msg).into());
-                            }
-                            anyhow::bail!("refused reload dry-run: {msg}");
-                        }
-                        binary_verified = true;
-                    }
-
-                    let offline_coord = HotReloadCoordinator::new(
-                        paths.clone(),
-                        Arc::new(MihomoAdapter::new(Arc::clone(&job_guard))?),
-                    );
-                    let runtime_yaml_path = offline_coord.runtime_yaml_path();
-                    let warnings: Vec<String> = compiled
-                        .validation
-                        .warnings()
-                        .iter()
-                        .map(|w| sanitize_log_line(&format!("[{}] {}", w.code, w.message)))
-                        .collect();
-                    let out = json!({
-                        "ok": true,
-                        "sanitized": true,
-                        "dry_run": true,
-                        "runtime_yaml_path": redact_path_for_display(&runtime_yaml_path.to_string_lossy()),
-                        "core_not_running": live_controller_version.is_none() && controller_auth_error.is_none(),
-                        "core_version": &live_controller_version,
-                        "hot_reloaded": false,
-                        "validated_and_written": false,
-                        "allow_tun": allow_tun,
-                        "tun_masked_no_elevation": tun_masked_no_elevation,
-                        "binary_verified": binary_verified,
-                        "binary_path": &redacted_bin_path,
-                        "sha256": &compiled.sha256,
-                        "stats": &compiled.stats,
-                        "warnings": &warnings,
-                    });
-                    return emit_output(
-                        as_json,
-                        &out,
-                        &format!(
-                            "Validated candidate runtime.yaml (dry_run=true, binary_verified={}, sha256={}).",
-                            binary_verified,
-                            &compiled.sha256[..12]
-                        ),
-                    );
-                }
-
-                if let Some(auth_err) = controller_auth_error {
-                    let msg = sanitize_log_line(&format!(
-                        "running Mihomo controller at {} rejected authentication ({auth_err}); ensure config.json controller_secret matches the active core or restart core",
-                        ctrl_addr
-                    ));
-                    let out = json!({
-                        "ok": false,
-                        "dry_run": false,
-                        "core_not_running": false,
-                        "hot_reloaded": false,
-                        "validated_and_written": false,
-                        "error": &msg,
-                    });
-                    if as_json {
-                        emit_output(true, &out, "")?;
-                        return Err(AlreadyEmittedJsonError(msg).into());
-                    }
-                    anyhow::bail!("{msg}");
-                }
-
-                let core_running = live_controller_version.is_some();
-                let adapter = if core_running {
-                    Arc::new(probe_adapter)
-                } else {
-                    Arc::new(MihomoAdapter::new(Arc::clone(&job_guard))?)
-                };
-                let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
-                if core_running {
-                    let mut seeded_cfg = cfg.clone();
-                    if !allow_tun && seeded_cfg.tun.enabled {
-                        seeded_cfg.tun.enabled = false;
-                    }
-                    let seeded_ports = AllocatedPorts {
-                        bind_host: if seeded_cfg.allow_lan {
-                            seeded_cfg.bind_address.clone()
-                        } else {
-                            "127.0.0.1".to_string()
-                        },
-                        mixed_port: ep.mixed_port.unwrap_or(seeded_cfg.mixed_port),
-                        controller_port: ep.port,
-                        dns_port: ep.dns_port.unwrap_or(seeded_cfg.dns_listen_port),
-                        shifted: Vec::new(),
-                    };
-                    coordinator
-                        .seed_active_state(
-                            seeded_cfg,
-                            String::new(),
-                            seeded_ports,
-                            ep.secret.clone(),
-                        )
-                        .await;
-                }
-                let runtime_yaml_path = coordinator.runtime_yaml_path();
-                let redacted_runtime_yaml =
-                    redact_path_for_display(&runtime_yaml_path.to_string_lossy());
-                let outcome = coordinator
-                    .apply_disk_reload(DiskReloadOptions {
-                        force: true,
-                        verify_with_binary: true,
-                        allow_l3_restart: false,
-                        allow_tun,
-                        ..DiskReloadOptions::default()
-                    })
-                    .await;
-                let sanitized_outcome = redact_reload_outcome(&outcome);
-
-                if sanitized_outcome.rejected || !sanitized_outcome.applied {
-                    let err_msg = sanitized_outcome
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "hot reload rejected".to_string());
-                    let out = json!({
-                        "ok": false,
-                        "sanitized": true,
-                        "dry_run": false,
-                        "runtime_yaml_path": &redacted_runtime_yaml,
-                        "core_not_running": !core_running,
-                        "core_version": &live_controller_version,
-                        "hot_reloaded": false,
-                        "validated_and_written": false,
-                        "binary_verified": bin_res.found,
-                        "binary_path": &redacted_bin_path,
-                        "error": &err_msg,
-                        "outcome": &sanitized_outcome,
-                    });
-                    if as_json {
-                        emit_output(true, &out, "")?;
-                        return Err(AlreadyEmittedJsonError(err_msg).into());
-                    }
-                    anyhow::bail!("config reload failed: {err_msg}");
-                }
-
-                let sha_preview = sanitized_outcome
-                    .config_hash
-                    .as_deref()
-                    .map(|h| &h[..h.len().min(12)])
-                    .unwrap_or("unknown");
-                let out = json!({
-                    "ok": true,
-                    "sanitized": true,
-                    "dry_run": false,
-                    "runtime_yaml_path": &redacted_runtime_yaml,
-                    "core_not_running": !core_running,
-                    "core_version": &live_controller_version,
-                    "hot_reloaded": core_running,
-                    "validated_and_written": true,
-                    "allow_tun": allow_tun,
-                    "tun_masked_no_elevation": tun_masked_no_elevation,
-                    "binary_verified": bin_res.found,
-                    "binary_path": &redacted_bin_path,
-                    "replayed_groups": sanitized_outcome.replayed_groups,
-                    "level": sanitized_outcome.level,
-                    "sha256": &sanitized_outcome.config_hash,
-                    "warnings": &sanitized_outcome.warnings,
-                    "applied_at": &sanitized_outcome.applied_at,
-                    "outcome": &sanitized_outcome,
-                });
-                let human = if core_running {
-                    format!(
-                        "Hot-reloaded runtime.yaml via controller ({}) and replayed {} group(s) (sha256={sha_preview}).",
-                        ctrl_addr,
-                        outcome.replayed_groups
-                    )
-                } else {
-                    format!(
-                        "Core not running; validated and wrote {} (binary_verified={}, sha256={sha_preview}).",
-                        redacted_runtime_yaml, bin_res.found
-                    )
-                };
-                emit_output(as_json, &out, &human)
+                execute_config_reload(paths, as_json, dry_run).await
             }
 
             ConfigCommand::Compile {
                 output,
                 reveal_secrets,
-            } => {
-                let cfg = config::load_or_init(paths)?;
-                let db = open_storage(paths)?;
-                let nodes = db.list_nodes()?;
-                let groups = db.list_multi_groups()?;
-                let relays = db.list_preaccel_relays(false)?;
-                let ports = allocate_safe_ports(
-                    &cfg.bind_address,
-                    cfg.mixed_port,
-                    cfg.controller_port,
-                    cfg.dns_listen_port,
-                    cfg.port_guard_auto_shift,
-                )?;
-                let empty_filter = HashMap::new();
-                let compiled = compile_mihomo_config_with_runtime_dir(
-                    &CompileInput {
-                        config: &cfg,
-                        nodes: &nodes,
-                        groups: &groups,
-                        relays: &relays,
-                        controller_secret: cfg
-                            .controller_secret
-                            .as_deref()
-                            .filter(|s| !s.trim().is_empty())
-                            .unwrap_or("compile-placeholder-secret"),
-                        allocated_ports: &ports,
-                        extra_prepend_rules: &[],
-                        extra_fake_ip_filters: &[],
-                        group_filtered_members: &empty_filter,
-                    },
-                    Some(&paths.runtime_dir),
-                )?;
-                let rendered_yaml = if reveal_secrets {
-                    compiled.yaml.clone()
-                } else {
-                    redact_compiled_yaml(&compiled.yaml)
-                };
-                if let Some(path) = output {
-                    AppPaths::atomic_write(&path, rendered_yaml.as_bytes())?;
-                    let file_sha256 = compute_file_sha256(&path)?;
-                    let display_path = redact_path_for_display(&path.to_string_lossy());
-                    let out = json!({
-                        "ok": true,
-                        "sanitized": !reveal_secrets,
-                        "output": &display_path,
-                        "sha256": file_sha256,
-                    });
-                    emit_output(
-                        as_json,
-                        &out,
-                        &format!(
-                            "Wrote compiled YAML (sanitized={}) to {}.",
-                            !reveal_secrets, display_path
-                        ),
-                    )
-                } else if as_json {
-                    emit_output(
-                        true,
-                        &json!({
-                            "ok": true,
-                            "sanitized": !reveal_secrets,
-                            "yaml": rendered_yaml,
-                            "sha256": compiled.sha256,
-                        }),
-                        "",
-                    )
-                } else {
-                    println!("{rendered_yaml}");
-                    Ok(())
-                }
-            }
+            } => execute_config_compile(paths, as_json, output, reveal_secrets).await,
 
             ConfigCommand::ExportEnv { shell } => {
                 let cfg = config::load_or_init(paths)?;
@@ -3263,6 +2961,34 @@ fn redact_process_inspection(inspection: &ProcessInspectionResult) -> ProcessIns
     }
 }
 
+fn redact_connection_host_for_readonly(host: &str) -> String {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    // Preserve normal business target domains (e.g. `api.openai.com`, `github.com`),
+    // while masking IPv4/IPv6 literals (with or without `:port` / `[IPv6]:port`).
+    if trimmed.starts_with('[') && trimmed.contains(']') {
+        return redact_ip_or_host(trimmed);
+    }
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return redact_ip_or_host(trimmed);
+    }
+    if trimmed.bytes().filter(|&b| b == b':').count() >= 3 {
+        if let Some((addr, port)) = trimmed.rsplit_once(':') {
+            if port.parse::<u16>().is_ok() && addr.parse::<IpAddr>().is_ok() {
+                return redact_ip_or_host(trimmed);
+            }
+        }
+    }
+    if let Some((addr, port)) = trimmed.rsplit_once(':') {
+        if !addr.contains(':') && port.parse::<u16>().is_ok() && addr.parse::<IpAddr>().is_ok() {
+            return redact_ip_or_host(trimmed);
+        }
+    }
+    sanitize_log_line(trimmed)
+}
+
 fn redact_connection_for_readonly(conn: &ActiveConnection) -> ActiveConnection {
     ActiveConnection {
         id: conn.id.clone(),
@@ -3278,7 +3004,7 @@ fn redact_connection_for_readonly(conn: &ActiveConnection) -> ActiveConnection {
         source_port: conn.source_port.clone(),
         destination_ip: redact_ip_or_host(&conn.destination_ip),
         destination_port: conn.destination_port.clone(),
-        host: redact_ip_or_host(&conn.host),
+        host: redact_connection_host_for_readonly(&conn.host),
         process: conn.process.clone(),
         process_path: redact_path_for_display(&conn.process_path),
     }
@@ -4733,6 +4459,7 @@ fn select_preaccel_speed_reference_node(
     groups: &[MultiGroup],
     nodes: &[ProxyNode],
     requested_node_id: Option<&str>,
+    relay_supports_ipv6: bool,
 ) -> Result<(Option<ProxyNode>, Option<String>)> {
     if let Some(nid) = requested_node_id.map(str::trim).filter(|s| !s.is_empty()) {
         let node = nodes
@@ -4748,6 +4475,10 @@ fn select_preaccel_speed_reference_node(
         }
         return Ok((Some(node), None));
     }
+
+    let is_ipv6_incompatible = |n: &ProxyNode| -> bool {
+        !relay_supports_ipv6 && is_ipv6_only_node(n) && n.preaccel_override != Some(true)
+    };
 
     let primary_group = cfg
         .active_group_id
@@ -4772,7 +4503,7 @@ fn select_preaccel_speed_reference_node(
     };
 
     if let Some(home) = homepage_node {
-        if home.enabled && !home.is_udp_only_transport() {
+        if home.enabled && !home.is_udp_only_transport() && !is_ipv6_incompatible(home) {
             return Ok((Some(home.clone()), None));
         }
     }
@@ -4807,7 +4538,7 @@ fn select_preaccel_speed_reference_node(
 
     let tcp_enabled: Vec<&ProxyNode> = ordered
         .into_iter()
-        .filter(|n| n.enabled && !n.is_udp_only_transport())
+        .filter(|n| n.enabled && !n.is_udp_only_transport() && !is_ipv6_incompatible(n))
         .collect();
 
     let picked = tcp_enabled
@@ -4826,6 +4557,10 @@ fn select_preaccel_speed_reference_node(
                     "homepage node `{}` uses UDP-only transport; auto-selected `{}` as reference node",
                     home.name, node.name
                 )),
+                Some(home) if is_ipv6_incompatible(home) => Some(format!(
+                    "homepage node `{}` is IPv6-only while domestic relay does not support IPv6; auto-selected `{}` as reference node",
+                    home.name, node.name
+                )),
                 Some(home) if !home.enabled => Some(format!(
                     "homepage node `{}` is disabled; auto-selected `{}` as reference node",
                     home.name, node.name
@@ -4836,17 +4571,26 @@ fn select_preaccel_speed_reference_node(
         }
         None => Ok((
             None,
-            Some(
+            Some(if !relay_supports_ipv6
+                && nodes
+                    .iter()
+                    .any(|n| n.enabled && !n.is_udp_only_transport() && is_ipv6_incompatible(n))
+            {
+                "no enabled non-UDP IPv4/dual-stack overseas node available for IPv4-only relay; running single-hop direct relay speed test"
+                    .to_string()
+            } else {
                 "no enabled non-UDP overseas node available; running single-hop direct relay speed test"
-                    .to_string(),
-            ),
+                    .to_string()
+            }),
         )),
     }
 }
 
 struct PreAccelRelaySpeedOutcome {
     ok: bool,
-    latency_ms: Option<f64>,
+    /// Overseas two-hop chain latency measured via `cp.cloudflare.com/generate_204`.
+    /// Must NEVER overwrite domestic direct `last_probe_ms`.
+    chain_latency_ms: Option<f64>,
     up_mbps: Option<f64>,
     down_mbps: Option<f64>,
     error: Option<String>,
@@ -4877,11 +4621,11 @@ async fn measure_single_preaccel_relay_speed(
     proxy_port: u16,
     relay_id: &str,
 ) -> PreAccelRelaySpeedOutcome {
-    let measured_latency: Arc<std::sync::Mutex<Option<f64>>> =
+    let measured_chain_latency: Arc<std::sync::Mutex<Option<f64>>> =
         Arc::new(std::sync::Mutex::new(None));
     let measured_up: Arc<std::sync::Mutex<Option<f64>>> = Arc::new(std::sync::Mutex::new(None));
     let measured_down: Arc<std::sync::Mutex<Option<f64>>> = Arc::new(std::sync::Mutex::new(None));
-    let lat_ref = Arc::clone(&measured_latency);
+    let lat_ref = Arc::clone(&measured_chain_latency);
     let up_ref = Arc::clone(&measured_up);
     let down_ref = Arc::clone(&measured_down);
     let relay_id_owned = relay_id.to_string();
@@ -4892,7 +4636,7 @@ async fn measure_single_preaccel_relay_speed(
             Err(err) => {
                 return PreAccelRelaySpeedOutcome {
                     ok: false,
-                    latency_ms: None,
+                    chain_latency_ms: None,
                     up_mbps: None,
                     down_mbps: None,
                     error: Some(sanitize_multiline_text(&format!(
@@ -4904,7 +4648,7 @@ async fn measure_single_preaccel_relay_speed(
 
         let latency_def = ProbeDefinition {
             id: "preaccel_relay_speed_latency".to_string(),
-            name: "PreAccel Relay Latency".to_string(),
+            name: "PreAccel Relay Chain Latency".to_string(),
             kind: ProbeKind::Latency,
             target_url: "https://cp.cloudflare.com/generate_204".to_string(),
             method: "GET".to_string(),
@@ -4924,10 +4668,10 @@ async fn measure_single_preaccel_relay_speed(
             Err(_) => {
                 return PreAccelRelaySpeedOutcome {
                     ok: false,
-                    latency_ms: None,
+                    chain_latency_ms: None,
                     up_mbps: None,
                     down_mbps: None,
-                    error: Some("latency probe timed out (6s)".to_string()),
+                    error: Some("chain connectivity probe timed out (6s)".to_string()),
                 };
             }
         };
@@ -4946,7 +4690,7 @@ async fn measure_single_preaccel_relay_speed(
                 .unwrap_or_else(|| "connectivity probe failed".to_string());
             return PreAccelRelaySpeedOutcome {
                 ok: false,
-                latency_ms: lat_rec.latency_ms,
+                chain_latency_ms: lat_rec.latency_ms,
                 up_mbps: None,
                 down_mbps: None,
                 error: Some(reason),
@@ -5066,7 +4810,7 @@ async fn measure_single_preaccel_relay_speed(
 
         PreAccelRelaySpeedOutcome {
             ok,
-            latency_ms: lat_rec.latency_ms,
+            chain_latency_ms: lat_rec.latency_ms,
             up_mbps,
             down_mbps,
             error,
@@ -5076,12 +4820,12 @@ async fn measure_single_preaccel_relay_speed(
     match tokio::time::timeout(Duration::from_secs(45), speed_fut).await {
         Ok(outcome) => outcome,
         Err(_) => {
-            let preserved_lat = measured_latency.lock().ok().and_then(|g| *g);
+            let preserved_lat = measured_chain_latency.lock().ok().and_then(|g| *g);
             let preserved_up = measured_up.lock().ok().and_then(|g| *g);
             let preserved_down = measured_down.lock().ok().and_then(|g| *g);
             PreAccelRelaySpeedOutcome {
                 ok: preserved_up.is_some() || preserved_down.is_some(),
-                latency_ms: preserved_lat,
+                chain_latency_ms: preserved_lat,
                 up_mbps: preserved_up,
                 down_mbps: preserved_down,
                 error: Some("relay speed test exceeded 45s budget and aborted".to_string()),
@@ -5212,20 +4956,215 @@ fn read_bounded_file_lines(path: &Path, max_bytes: u64) -> Vec<String> {
         .collect()
 }
 
+fn parse_log_time_bound(raw: &str, now_local: DateTime<Local>) -> Result<DateTime<Utc>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("time filter cannot be empty");
+    }
+
+    // 1. RFC3339 (e.g. `2026-11-26T03:44:51+08:00` or `2026-11-26T03:44:51Z`)
+    if let Ok(dt) = DateTime::parse_from_rfc3339(trimmed) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // 2. Relative window (e.g. `30m`, `2h`, `45s`, `1d`, optionally prefixed with `-`)
+    let rel = trimmed.strip_prefix('-').unwrap_or(trimmed).trim();
+    let digit_end = rel
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rel.len());
+    if digit_end > 0 && digit_end < rel.len() {
+        if let Ok(amount) = rel[..digit_end].parse::<i64>() {
+            let unit = rel[digit_end..].trim().to_ascii_lowercase();
+            let secs = match unit.as_str() {
+                "s" | "sec" | "secs" => Some(amount),
+                "m" | "min" | "mins" => amount.checked_mul(60),
+                "h" | "hr" | "hrs" => amount.checked_mul(3600),
+                "d" | "day" | "days" => amount.checked_mul(86400),
+                _ => None,
+            };
+            if let Some(delta_secs) = secs {
+                return Ok(now_local.with_timezone(&Utc) - chrono::Duration::seconds(delta_secs));
+            }
+        }
+    }
+
+    // 3. Local datetime `YYYY-MM-DD HH:MM(:SS)` or `YYYY-MM-DDTHH:MM(:SS)`
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+            if let Some(local_dt) = Local.from_local_datetime(&naive).earliest() {
+                return Ok(local_dt.with_timezone(&Utc));
+            }
+            return Ok(Utc.from_utc_datetime(&naive));
+        }
+    }
+
+    // 4. Local today `HH:MM(:SS)`
+    for fmt in ["%H:%M:%S", "%H:%M"] {
+        if let Ok(naive_time) = NaiveTime::parse_from_str(trimmed, fmt) {
+            let naive = now_local.date_naive().and_time(naive_time);
+            if let Some(local_dt) = Local.from_local_datetime(&naive).earliest() {
+                return Ok(local_dt.with_timezone(&Utc));
+            }
+            return Ok(Utc.from_utc_datetime(&naive));
+        }
+    }
+
+    anyhow::bail!(
+        "unsupported time format `{trimmed}` (use RFC3339, YYYY-MM-DD HH:MM[:SS], HH:MM, or relative like 30m / 2h)"
+    )
+}
+
+fn is_iso_datetime_prefix(slice: &[u8]) -> bool {
+    slice.len() == 19
+        && slice[0].is_ascii_digit()
+        && slice[1].is_ascii_digit()
+        && slice[2].is_ascii_digit()
+        && slice[3].is_ascii_digit()
+        && slice[4] == b'-'
+        && slice[5].is_ascii_digit()
+        && slice[6].is_ascii_digit()
+        && slice[7] == b'-'
+        && slice[8].is_ascii_digit()
+        && slice[9].is_ascii_digit()
+        && matches!(slice[10], b'T' | b't' | b' ')
+        && slice[11].is_ascii_digit()
+        && slice[12].is_ascii_digit()
+        && slice[13] == b':'
+        && slice[14].is_ascii_digit()
+        && slice[15].is_ascii_digit()
+        && slice[16] == b':'
+        && slice[17].is_ascii_digit()
+        && slice[18].is_ascii_digit()
+}
+
+fn extract_log_line_timestamp_utc(line: &str) -> Option<DateTime<Utc>> {
+    // 1. Mihomo logfmt `time="..."`
+    if let Some(pos) = line.find("time=\"") {
+        let rest = &line[pos + 6..];
+        if let Some(end) = rest.find('"') {
+            let cand = rest[..end].trim();
+            if let Ok(dt) = DateTime::parse_from_rfc3339(cand) {
+                return Some(dt.with_timezone(&Utc));
+            }
+            if let Ok(naive) = NaiveDateTime::parse_from_str(cand, "%Y-%m-%d %H:%M:%S") {
+                return Local
+                    .from_local_datetime(&naive)
+                    .earliest()
+                    .map(|d| d.with_timezone(&Utc))
+                    .or_else(|| Some(Utc.from_utc_datetime(&naive)));
+            }
+        }
+    }
+
+    // 2. Embedded or leading ISO/RFC3339 or `YYYY-MM-DD HH:MM:SS`
+    let bytes = line.as_bytes();
+    if bytes.len() >= 19 {
+        let scan_limit = (bytes.len() - 19).min(64);
+        for i in 0..=scan_limit {
+            if is_iso_datetime_prefix(&bytes[i..i + 19]) {
+                let mut end = i + 19;
+                if end < bytes.len() && bytes[end] == b'.' {
+                    end += 1;
+                    while end < bytes.len() && bytes[end].is_ascii_digit() {
+                        end += 1;
+                    }
+                }
+                let mut has_tz = false;
+                if end < bytes.len() && matches!(bytes[end], b'Z' | b'z') {
+                    end += 1;
+                    has_tz = true;
+                } else if end + 6 <= bytes.len()
+                    && matches!(bytes[end], b'+' | b'-')
+                    && bytes[end + 1].is_ascii_digit()
+                    && bytes[end + 2].is_ascii_digit()
+                    && bytes[end + 3] == b':'
+                    && bytes[end + 4].is_ascii_digit()
+                    && bytes[end + 5].is_ascii_digit()
+                {
+                    end += 6;
+                    has_tz = true;
+                }
+                let token = &line[i..end];
+                if has_tz {
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(token) {
+                        return Some(dt.with_timezone(&Utc));
+                    }
+                    let normalized = token.replacen(' ', "T", 1);
+                    if let Ok(dt) = DateTime::parse_from_rfc3339(&normalized) {
+                        return Some(dt.with_timezone(&Utc));
+                    }
+                }
+                let base_19 = &line[i..i + 19];
+                for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
+                    if let Ok(naive) = NaiveDateTime::parse_from_str(base_19, fmt) {
+                        return Local
+                            .from_local_datetime(&naive)
+                            .earliest()
+                            .map(|d| d.with_timezone(&Utc))
+                            .or_else(|| Some(Utc.from_utc_datetime(&naive)));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
 fn build_logs_tail_payload(
     paths: &AppPaths,
     requested_lines: usize,
     level_raw: &str,
 ) -> Result<(Value, String)> {
+    build_logs_tail_payload_with_options(
+        paths,
+        requested_lines,
+        level_raw,
+        None,
+        None,
+        false,
+        Local::now(),
+    )
+}
+
+fn build_logs_tail_payload_with_options(
+    paths: &AppPaths,
+    requested_lines: usize,
+    level_raw: &str,
+    since_raw: Option<&str>,
+    until_raw: Option<&str>,
+    reveal_secrets: bool,
+    now_local: DateTime<Local>,
+) -> Result<(Value, String)> {
     let filter = parse_log_level_filter(level_raw)?;
+    let since_utc = since_raw
+        .map(|s| parse_log_time_bound(s, now_local))
+        .transpose()?;
+    let until_utc = until_raw
+        .map(|s| parse_log_time_bound(s, now_local))
+        .transpose()?;
+    if let (Some(s), Some(u)) = (since_utc, until_utc) {
+        if s > u {
+            anyhow::bail!("--since time cannot be later than --until time");
+        }
+    }
+    let has_time_filter = since_utc.is_some() || until_utc.is_some();
+
     let capped = requested_lines.min(MAX_LOG_TAIL_LINES_CAP);
-    let archive_path = paths.logs_dir.join("catcloud.log.1");
+    let archive2_path = paths.logs_dir.join("catcloud.log.2");
+    let archive1_path = paths.logs_dir.join("catcloud.log.1");
     let primary_path = paths.logs_dir.join("catcloud.log");
 
     let mut sources: Vec<String> = Vec::new();
     let mut combined: Vec<String> = Vec::new();
     for (label, candidate) in [
-        ("catcloud.log.1", &archive_path),
+        ("catcloud.log.2", &archive2_path),
+        ("catcloud.log.1", &archive1_path),
         ("catcloud.log", &primary_path),
     ] {
         if candidate.is_file() {
@@ -5237,33 +5176,62 @@ fn build_logs_tail_payload(
         }
     }
 
-    let mut matched: Vec<String> = combined
-        .into_iter()
-        .filter(|line| line_matches_log_level(line, filter))
-        .collect();
+    let mut matched: Vec<String> = Vec::new();
+    let mut last_ts_matched = false;
+    for line in combined {
+        if has_time_filter {
+            let in_window = match extract_log_line_timestamp_utc(&line) {
+                Some(ts) => {
+                    let ok = since_utc.map_or(true, |s| ts >= s)
+                        && until_utc.map_or(true, |u| ts <= u);
+                    last_ts_matched = ok;
+                    ok
+                }
+                None => last_ts_matched,
+            };
+            if !in_window {
+                continue;
+            }
+        }
+        if line_matches_log_level(&line, filter) {
+            matched.push(line);
+        }
+    }
+
     if matched.len() > capped {
         let drop_count = matched.len() - capped;
         matched.drain(0..drop_count);
     }
-    let sanitized_lines: Vec<String> = matched.iter().map(|l| sanitize_log_line(l)).collect();
+    let final_lines: Vec<String> = if reveal_secrets {
+        matched
+    } else {
+        matched.iter().map(|l| sanitize_log_line(l)).collect()
+    };
 
-    let out = json!({
+    let mut out = json!({
         "ok": true,
-        "sanitized": true,
+        "sanitized": !reveal_secrets,
         "level": filter.as_str(),
+        "since": since_raw,
+        "until": until_raw,
+        "since_utc": since_utc.map(|d| d.to_rfc3339()),
+        "until_utc": until_utc.map(|d| d.to_rfc3339()),
         "requested_lines": capped,
-        "count": sanitized_lines.len(),
+        "count": final_lines.len(),
         "sources": sources,
-        "lines": &sanitized_lines,
+        "lines": &final_lines,
     });
-    let human = if sanitized_lines.is_empty() {
+    if !reveal_secrets {
+        sanitize_json_value(&mut out);
+    }
+    let human = if final_lines.is_empty() {
         format!(
             "No matching log lines (level={}, sources={:?}).",
             filter.as_str(),
             out["sources"]
         )
     } else {
-        sanitized_lines.join("\n")
+        final_lines.join("\n")
     };
     Ok((out, human))
 }
@@ -5293,7 +5261,54 @@ async fn probe_live_controller(
     }
 }
 
-async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result<(Value, String)> {
+fn classify_and_format_connections(
+    conns: &[ActiveConnection],
+    limit: usize,
+    reveal_secrets: bool,
+) -> (
+    Vec<ActiveConnection>,
+    Vec<ActiveConnection>,
+    Vec<ActiveConnection>,
+    usize,
+    usize,
+) {
+    let mut app_all: Vec<ActiveConnection> = Vec::new();
+    let mut internal_all: Vec<ActiveConnection> = Vec::new();
+    let mut all_formatted: Vec<ActiveConnection> = Vec::with_capacity(conns.len().min(limit));
+
+    for conn in conns {
+        let formatted = if reveal_secrets {
+            conn.clone()
+        } else {
+            redact_connection_for_readonly(conn)
+        };
+        if all_formatted.len() < limit {
+            all_formatted.push(formatted.clone());
+        }
+        if is_internal_or_preaccel_connection(
+            &conn.conn_type,
+            &conn.chains,
+            &conn.host,
+            &conn.rule,
+        ) {
+            internal_all.push(formatted);
+        } else {
+            app_all.push(formatted);
+        }
+    }
+
+    let app_count = app_all.len();
+    let internal_count = internal_all.len();
+    app_all.truncate(limit);
+    internal_all.truncate(limit);
+    (all_formatted, app_all, internal_all, app_count, internal_count)
+}
+
+async fn build_net_connections_payload(
+    paths: &AppPaths,
+    limit: usize,
+    reveal_secrets: bool,
+) -> Result<(Value, String)> {
     let cfg = config::load_or_init(paths)?;
     let job_guard = Arc::new(JobGuard::new()?);
     let ep = resolve_effective_controller_endpoint_info(paths, &cfg);
@@ -5308,15 +5323,11 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
     match tokio::time::timeout(Duration::from_secs(2), adapter.list_connections()).await {
         Ok(Ok(snapshot)) => {
             let total = snapshot.connections.len();
-            let redacted: Vec<ActiveConnection> = snapshot
-                .connections
-                .iter()
-                .take(limit)
-                .map(redact_connection_for_readonly)
-                .collect();
-            let out = json!({
+            let (connections, app_connections, internal_connections, app_count, internal_count) =
+                classify_and_format_connections(&snapshot.connections, limit, reveal_secrets);
+            let mut out = json!({
                 "ok": true,
-                "sanitized": true,
+                "sanitized": !reveal_secrets,
                 "core_running": true,
                 "auth_error": false,
                 "controller_addr": controller_addr,
@@ -5324,20 +5335,30 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
                 "upload_total": snapshot.upload_total,
                 "memory": snapshot.memory,
                 "total_connections": total,
-                "returned_connections": redacted.len(),
-                "connections": redacted,
+                "returned_connections": connections.len(),
+                "app_count": app_count,
+                "internal_count": internal_count,
+                "app_connections": app_connections,
+                "internal_connections": internal_connections,
+                "connections": connections,
             });
+            if !reveal_secrets {
+                sanitize_json_value(&mut out);
+            }
             let human = format!(
-                "Active connections: showing {}/{total} (sanitized, core_running=true).",
-                out["returned_connections"]
+                "Active connections: showing {}/{total} (app={}, internal={}, sanitized={}, core_running=true).",
+                out["returned_connections"],
+                app_count,
+                internal_count,
+                !reveal_secrets
             );
             Ok((out, human))
         }
         Ok(Err(CatError::Core(msg))) if msg.contains("HTTP 401") || msg.contains("HTTP 403") => {
             let clean = sanitize_log_line(&msg);
-            let out = json!({
+            let mut out = json!({
                 "ok": true,
-                "sanitized": true,
+                "sanitized": !reveal_secrets,
                 "core_running": true,
                 "auth_error": true,
                 "controller_addr": controller_addr,
@@ -5346,9 +5367,16 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
                 "memory": 0u64,
                 "total_connections": 0usize,
                 "returned_connections": 0usize,
+                "app_count": 0usize,
+                "internal_count": 0usize,
+                "app_connections": [],
+                "internal_connections": [],
                 "connections": [],
                 "note": format!("Controller reachable but authentication failed ({clean})."),
             });
+            if !reveal_secrets {
+                sanitize_json_value(&mut out);
+            }
             Ok((
                 out,
                 "Core controller reachable, but authentication failed; returning 0 connections."
@@ -5356,9 +5384,9 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
             ))
         }
         _ => {
-            let out = json!({
+            let mut out = json!({
                 "ok": true,
-                "sanitized": true,
+                "sanitized": !reveal_secrets,
                 "core_running": false,
                 "auth_error": false,
                 "controller_addr": controller_addr,
@@ -5367,9 +5395,16 @@ async fn build_net_connections_payload(paths: &AppPaths, limit: usize) -> Result
                 "memory": 0u64,
                 "total_connections": 0usize,
                 "returned_connections": 0usize,
+                "app_count": 0usize,
+                "internal_count": 0usize,
+                "app_connections": [],
+                "internal_connections": [],
                 "connections": [],
                 "note": "Mihomo core controller is not currently running or reachable.",
             });
+            if !reveal_secrets {
+                sanitize_json_value(&mut out);
+            }
             Ok((
                 out,
                 "Mihomo core is not running (core_running=false); 0 active connections."
@@ -5394,20 +5429,36 @@ fn is_path_writable_probe(dir: &Path) -> bool {
     }
 }
 
-/// Evaluate effective TUN status for `net doctor`.
+/// Evaluate effective TUN status for `net doctor` / `status` / `config diag`.
 ///
-/// When a managed core is already running (e.g. launched elevated by CatCloud Desktop while
-/// `catcloud net doctor` runs in a standard-privilege shell), live `Tun` inbound connections
-/// or a running controller with `tun.enabled == true` must not be misreported as
-/// `tun_needs_elevation = true / tun_enabled = false`.
+/// Precedence:
+/// 1. Live `Tun` inbound connections prove TUN is actively handling traffic.
+/// 2. Authoritative `GET /configs` (`live_tun_enable == Some(true | false)`) overrides optimistic
+///    inference so an unprivileged running core with `tun.enable == false` NEVER misreports
+///    `tun_enabled = true` via `live_core_with_tun_config`.
+/// 3. Only when `live_tun_enable` is unavailable (`None`) do we fall back to inferring from
+///    `core_running` / process privileges.
 fn evaluate_doctor_tun_state(
     tun_configured: bool,
     tun_privilege_ready: bool,
     core_running: bool,
     has_live_tun_connections: bool,
+    live_tun_enable: Option<bool>,
 ) -> (bool, bool, &'static str) {
     if has_live_tun_connections {
         return (true, false, "live_tun_connections");
+    }
+    if core_running && live_tun_enable == Some(true) {
+        return (true, false, "live_core_configs");
+    }
+    if core_running && live_tun_enable == Some(false) {
+        if !tun_configured {
+            return (false, false, "disabled");
+        }
+        if !tun_privilege_ready {
+            return (false, true, "live_core_tun_disabled_needs_elevation");
+        }
+        return (false, false, "live_core_tun_disabled");
     }
     if !tun_configured {
         return (false, false, "disabled");
@@ -5442,22 +5493,1785 @@ async fn probe_live_tun_connections(ep: &ResolvedControllerEndpoint) -> bool {
     }
 }
 
-fn read_runtime_controller_pid(paths: &AppPaths) -> Option<u32> {
-    let meta_path = paths.runtime_dir.join("runtime-controller.json");
-    let raw = std::fs::read_to_string(&meta_path).ok()?;
-    let val: Value = serde_json::from_str(&raw).ok()?;
-    val.get("pid")
-        .and_then(Value::as_u64)
-        .and_then(|p| u32::try_from(p).ok())
-        .filter(|&p| p > 0)
+const MANAGED_PID_START_TIME_TOLERANCE_SECS: u64 = 2;
+
+fn execute_group_create(paths: &AppPaths, args: GroupCreateArgs) -> Result<(Value, String)> {
+    let db = open_storage(paths)?;
+    let existing = db.get_multi_group(&args.id)?;
+    let created = existing.is_none();
+
+    let group = if let Some(mut existing_group) = existing {
+        if let Some(name) = args.name {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                existing_group.name = trimmed.to_string();
+            }
+        }
+        if let Some(mode_raw) = args.mode {
+            existing_group.mode = parse_group_mode(&mode_raw)?;
+        }
+        if let Some(formula) = args.formula {
+            validate_formula(&formula)?;
+            existing_group.formula_expr = formula;
+        }
+        if let Some(fb_raw) = args.fallback {
+            existing_group.fallback_policy = parse_fallback_policy(&fb_raw)?;
+        }
+        if let Some(sw_raw) = args.switch_mode {
+            existing_group.switch_mode = parse_switch_mode(&sw_raw)?;
+        }
+        if let Some(nodes_csv) = args.nodes {
+            existing_group.member_node_ids = parse_csv_ids(Some(&nodes_csv));
+            if let Some(ref active) = existing_group.active_node_id {
+                if !existing_group.member_node_ids.iter().any(|id| id == active) {
+                    existing_group.active_node_id = None;
+                }
+            }
+        }
+        existing_group
+    } else {
+        let name = args
+            .name
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| args.id.clone());
+        let mode = match args.mode {
+            Some(ref m) => parse_group_mode(m)?,
+            None => MultiGroupMode::StickyBest,
+        };
+        let formula = args
+            .formula
+            .unwrap_or_else(|| DEFAULT_COST_EFFECTIVE_FORMULA.to_string());
+        validate_formula(&formula)?;
+        let fallback_policy = match args.fallback {
+            Some(ref fb) => parse_fallback_policy(fb)?,
+            None => FallbackPolicy::DegradeBestWarn,
+        };
+        let switch_mode = match args.switch_mode {
+            Some(ref sw) => parse_switch_mode(sw)?,
+            None => SwitchMode::ForceCloseOld,
+        };
+        let member_node_ids = parse_csv_ids(args.nodes.as_deref());
+        MultiGroup {
+            id: args.id.clone(),
+            name,
+            mode,
+            member_node_ids,
+            formula_expr: formula,
+            fallback_policy,
+            switch_mode,
+            ..MultiGroup::default()
+        }
+    };
+
+    db.upsert_multi_group(&group)?;
+    let out = json!({
+        "ok": true,
+        "created": created,
+        "updated": !created,
+        "group": group,
+    });
+    let verb = if created { "Created" } else { "Updated" };
+    Ok((out, format!("{verb} multi-group `{}`.", args.id)))
+}
+
+fn execute_group_members(paths: &AppPaths, args: GroupMembersArgs) -> Result<(Value, String)> {
+    let db = open_storage(paths)?;
+    let mut group = db
+        .get_multi_group(&args.id)?
+        .with_context(|| format!("multi-group `{}` not found", args.id))?;
+    let action_norm = args.action.trim().to_ascii_lowercase();
+    let target_ids = parse_csv_ids(Some(&args.nodes));
+
+    let mut added: Vec<String> = Vec::new();
+    let mut removed: Vec<String> = Vec::new();
+
+    match action_norm.as_str() {
+        "add" => {
+            if target_ids.is_empty() {
+                anyhow::bail!("--nodes must specify at least one node ID for `add`");
+            }
+            let mut existing_set: HashSet<String> =
+                group.member_node_ids.iter().cloned().collect();
+            for nid in target_ids {
+                if existing_set.insert(nid.clone()) {
+                    group.member_node_ids.push(nid.clone());
+                    added.push(nid);
+                }
+            }
+        }
+        "remove" => {
+            if target_ids.is_empty() {
+                anyhow::bail!("--nodes must specify at least one node ID for `remove`");
+            }
+            let remove_set: HashSet<String> = target_ids.into_iter().collect();
+            let mut kept = Vec::with_capacity(group.member_node_ids.len());
+            for nid in group.member_node_ids.drain(..) {
+                if remove_set.contains(&nid) {
+                    removed.push(nid);
+                } else {
+                    kept.push(nid);
+                }
+            }
+            group.member_node_ids = kept;
+        }
+        "set" => {
+            let old_set: HashSet<String> = group.member_node_ids.iter().cloned().collect();
+            let new_set: HashSet<String> = target_ids.iter().cloned().collect();
+            for nid in &target_ids {
+                if !old_set.contains(nid) {
+                    added.push(nid.clone());
+                }
+            }
+            for nid in &group.member_node_ids {
+                if !new_set.contains(nid) {
+                    removed.push(nid.clone());
+                }
+            }
+            group.member_node_ids = target_ids;
+        }
+        other => anyhow::bail!("unsupported members action `{other}` (use add|remove|set)"),
+    }
+
+    if let Some(ref active) = group.active_node_id {
+        if !group.member_node_ids.iter().any(|id| id == active) {
+            group.active_node_id = None;
+        }
+    }
+
+    db.upsert_multi_group(&group)?;
+    let out = json!({
+        "ok": true,
+        "group_id": &group.id,
+        "action": action_norm,
+        "added": added,
+        "removed": removed,
+        "member_count": group.member_node_ids.len(),
+        "active_node_id": &group.active_node_id,
+        "member_node_ids": &group.member_node_ids,
+    });
+    let human = format!(
+        "Updated members of group `{}` (action={}, added={}, removed={}, member_count={}).",
+        group.id,
+        action_norm,
+        out["added"].as_array().map(|a| a.len()).unwrap_or(0),
+        out["removed"].as_array().map(|a| a.len()).unwrap_or(0),
+        group.member_node_ids.len()
+    );
+    Ok((out, human))
+}
+
+fn execute_group_policy(paths: &AppPaths, args: GroupPolicyArgs) -> Result<(Value, String)> {
+    let db = open_storage(paths)?;
+    let mut group = db
+        .get_multi_group(&args.group_id)?
+        .with_context(|| format!("multi-group `{}` not found", args.group_id))?;
+    if let Some(expr) = args.formula {
+        validate_formula(&expr)?;
+        group.formula_expr = expr;
+    }
+    if let Some(fb) = args.fallback {
+        group.fallback_policy = parse_fallback_policy(&fb)?;
+    }
+    if let Some(sw) = args.switch_mode {
+        group.switch_mode = parse_switch_mode(&sw)?;
+    }
+    if !args.hard_gate.is_empty() {
+        for g in &args.hard_gate {
+            validate_formula(g)?;
+        }
+        group.hard_gates = args.hard_gate;
+    }
+    if args.clear_match_rules {
+        group.match_rules.clear();
+    }
+    if let Some(raw_rules) = args.match_rules {
+        group.match_rules = parse_group_match_rules_arg(&raw_rules);
+    }
+    if !args.add_match_rule.is_empty() {
+        let mut seen: HashSet<String> = group.match_rules.iter().cloned().collect();
+        for raw in args.add_match_rule {
+            for rule in parse_group_match_rules_arg(&raw) {
+                if seen.insert(rule.clone()) {
+                    group.match_rules.push(rule);
+                }
+            }
+        }
+    }
+    db.upsert_multi_group(&group)?;
+    let out = json!({ "ok": true, "group": group });
+    Ok((
+        out,
+        format!("Updated policy for multi-group `{}`.", args.group_id),
+    ))
+}
+
+fn build_group_eval_payload(paths: &AppPaths, group_id: &str) -> Result<(Value, String)> {
+    let db = open_storage(paths)?;
+    let group = db
+        .get_multi_group(group_id)?
+        .with_context(|| format!("multi-group `{group_id}` not found"))?;
+    let nodes = db.list_nodes()?;
+    let ids: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
+    let snaps = db.get_probe_snapshots_batch(&ids, group.primary_probe_id.as_deref())?;
+    let eval_report = evaluate_group_candidates(&group, &nodes, &snaps)?;
+    let mut mem = ArbiterGroupMemory::default();
+    let decision =
+        decide_group_action(&group, &nodes, &snaps, None, &mut mem, Utc::now().timestamp())?;
+    let watchdog_snapshot = read_watchdog_state_snapshot(&paths.root_data_dir);
+    let mut out = json!({
+        "ok": true,
+        "sanitized": true,
+        "evaluation_mode": "offline_dry_run",
+        "evaluation": eval_report,
+        "decision": decision,
+        "watchdog_snapshot": watchdog_snapshot,
+    });
+    sanitize_json_value(&mut out);
+    let human = format!(
+        "Evaluated group `{group_id}` (offline_dry_run): {} gate-passed candidate(s) ranked.",
+        out["evaluation"]["gate_passed"]
+            .as_array()
+            .map(|a| a.len())
+            .unwrap_or(0)
+    );
+    Ok((out, human))
+}
+
+fn analyze_dns_tls_across_logs(logs_dir: &Path, max_tail_bytes: usize) -> DnsTlsDiagnostics {
+    let primary = logs_dir.join("catcloud.log");
+    let archive1 = logs_dir.join("catcloud.log.1");
+    let primary_len = std::fs::metadata(&primary).map(|m| m.len()).unwrap_or(0);
+
+    if !archive1.is_file() || primary_len >= max_tail_bytes as u64 {
+        return analyze_dns_tls_diagnostics_from_log_file(&primary, max_tail_bytes);
+    }
+
+    // Combine tail of `.1` and all of `catcloud.log` strictly within the `max_tail_bytes` budget.
+    let remaining_budget = (max_tail_bytes as u64).saturating_sub(primary_len);
+    let mut lines: Vec<String> = Vec::new();
+    let mut sources: Vec<&str> = Vec::new();
+    if remaining_budget > 0 {
+        let prev_lines = read_bounded_file_lines(&archive1, remaining_budget);
+        if !prev_lines.is_empty() {
+            sources.push("catcloud.log.1");
+            lines.extend(prev_lines);
+        }
+    }
+    if primary.is_file() {
+        let cur_lines = read_bounded_file_lines(&primary, max_tail_bytes as u64);
+        if !cur_lines.is_empty() {
+            sources.push("catcloud.log");
+            lines.extend(cur_lines);
+        }
+    }
+    if lines.is_empty() {
+        return analyze_dns_tls_diagnostics_from_log_file(&primary, max_tail_bytes);
+    }
+    let kib = max_tail_bytes.div_ceil(1024).max(1);
+    let window_desc = format!(
+        "tail <= {kib} KiB across {} ({} lines)",
+        sources.join(" + "),
+        lines.len()
+    );
+    analyze_dns_tls_diagnostics(&lines, &window_desc)
+}
+
+#[derive(Debug, Clone)]
+struct ThirdPartyPortConflict {
+    role: String,
+    host: String,
+    port: u16,
+    owner_pids: Vec<u32>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveCorePortState {
+    core_running: bool,
+    core_version: Option<String>,
+    controller_auth_error: Option<String>,
+    endpoint: ResolvedControllerEndpoint,
+    live_config: Option<LiveCoreConfigSnapshot>,
+    effective_mixed_port: u16,
+    effective_controller_port: u16,
+    effective_dns_port: u16,
+    mixed_free: bool,
+    controller_free: bool,
+    dns_free: bool,
+    mixed_owned_by_active_core: bool,
+    controller_owned_by_active_core: bool,
+    dns_owned_by_active_core: bool,
+    owners: Vec<PortListenerOwner>,
+}
+
+impl ActiveCorePortState {
+    fn all_active_ports_owned_by_core(&self) -> bool {
+        self.core_running
+            && self.controller_owned_by_active_core
+            && (self.mixed_free || self.mixed_owned_by_active_core)
+            && (self.dns_free || self.dns_owned_by_active_core)
+    }
+
+    fn third_party_conflicts_for_effective_ports(&self, cfg: &AppConfig) -> Vec<Value> {
+        let mut out = Vec::new();
+        let bind_host = if cfg.allow_lan {
+            cfg.bind_address.as_str()
+        } else {
+            "127.0.0.1"
+        };
+        let dns_host = if cfg.allow_lan {
+            cfg.dns_listen_host.as_str()
+        } else {
+            "127.0.0.1"
+        };
+        for (role, host, port, free, owned) in [
+            (
+                "mixed",
+                bind_host,
+                self.effective_mixed_port,
+                self.mixed_free,
+                self.mixed_owned_by_active_core,
+            ),
+            (
+                "controller",
+                self.endpoint.host.as_str(),
+                self.effective_controller_port,
+                self.controller_free,
+                self.controller_owned_by_active_core,
+            ),
+            (
+                "dns",
+                dns_host,
+                self.effective_dns_port,
+                self.dns_free,
+                self.dns_owned_by_active_core,
+            ),
+        ] {
+            if !free && !owned {
+                let mut pids: Vec<u32> = self
+                    .owners
+                    .iter()
+                    .filter(|o| o.port == port)
+                    .map(|o| o.pid)
+                    .collect();
+                pids.sort_unstable();
+                pids.dedup();
+                out.push(json!({
+                    "role": role,
+                    "host": host,
+                    "port": port,
+                    "owner_pids": pids,
+                }));
+            }
+        }
+        out
+    }
+
+    fn to_status_json(&self) -> Value {
+        json!({
+            "owned_by_active_core": self.all_active_ports_owned_by_core(),
+            "mixed_port": self.effective_mixed_port,
+            "mixed_available": self.mixed_free || self.mixed_owned_by_active_core,
+            "mixed_free_for_new_instance": self.mixed_free,
+            "mixed_owned_by_active_core": self.mixed_owned_by_active_core,
+            "mixed_third_party_conflict": !self.mixed_free && !self.mixed_owned_by_active_core,
+            "controller_port": self.effective_controller_port,
+            "controller_available": self.controller_free || self.controller_owned_by_active_core,
+            "controller_free_for_new_instance": self.controller_free,
+            "controller_owned_by_active_core": self.controller_owned_by_active_core,
+            "controller_third_party_conflict": !self.controller_free && !self.controller_owned_by_active_core,
+            "dns_listen_port": self.effective_dns_port,
+            "dns_available": self.dns_free || self.dns_owned_by_active_core,
+            "dns_free_for_new_instance": self.dns_free,
+            "dns_owned_by_active_core": self.dns_owned_by_active_core,
+            "dns_third_party_conflict": !self.dns_free && !self.dns_owned_by_active_core,
+        })
+    }
+
+    fn to_active_core_ports_json(&self) -> Value {
+        if !self.core_running {
+            return Value::Null;
+        }
+        json!({
+            "owned_by_active_core": self.all_active_ports_owned_by_core(),
+            "pid": self.endpoint.pid,
+            "mixed_port": self.effective_mixed_port,
+            "controller_port": self.effective_controller_port,
+            "dns_listen_port": self.effective_dns_port,
+            "mixed_owned_by_active_core": self.mixed_owned_by_active_core,
+            "controller_owned_by_active_core": self.controller_owned_by_active_core,
+            "dns_owned_by_active_core": self.dns_owned_by_active_core,
+        })
+    }
+}
+
+fn is_valid_managed_pid(pid: u32) -> bool {
+    pid > 0 && pid != std::process::id()
+}
+
+fn pid_start_time_matches_fail_closed(
+    expected_start_time: Option<u64>,
+    actual_start_time: Option<u64>,
+) -> bool {
+    match (expected_start_time, actual_start_time) {
+        (Some(exp), Some(actual)) => {
+            actual.abs_diff(exp) <= MANAGED_PID_START_TIME_TOLERANCE_SECS
+        }
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+fn is_port_owned_by_active_core(
+    port: u16,
+    core_running: bool,
+    core_pid: Option<u32>,
+    core_start_ts: Option<u64>,
+    owners: &[PortListenerOwner],
+    is_free: bool,
+) -> bool {
+    if !core_running || is_free || port == 0 {
+        return false;
+    }
+    let matching_owners: Vec<&PortListenerOwner> =
+        owners.iter().filter(|o| o.port == port).collect();
+    if !matching_owners.is_empty() {
+        if let Some(expected_pid) = core_pid.filter(|&p| p > 0) {
+            if !is_valid_managed_pid(expected_pid) {
+                return false;
+            }
+            return matching_owners.iter().any(|o| {
+                o.pid == expected_pid
+                    && is_valid_managed_pid(o.pid)
+                    && pid_start_time_matches_fail_closed(core_start_ts, o.process_start_time_unix)
+            });
+        }
+        // Live external controller with no recorded PID: treat active core's own ports as owned.
+        return true;
+    }
+    // Cross-platform fallback when OS listener table is unavailable (e.g. non-Windows).
+    true
+}
+
+async fn probe_trusted_live_core_configs(
+    ep: &ResolvedControllerEndpoint,
+) -> Option<LiveCoreConfigSnapshot> {
+    if !ep.is_trusted_loopback_secret_endpoint() {
+        return None;
+    }
+    let job_guard = JobGuard::new().ok()?;
+    let adapter = MihomoAdapter::with_controller_endpoint(
+        Arc::new(job_guard),
+        &ep.host,
+        ep.port,
+        ep.secret.clone(),
+    )
+    .ok()?;
+    tokio::time::timeout(Duration::from_secs(2), adapter.fetch_configs())
+        .await
+        .ok()
+        .and_then(|res| res.ok())
+}
+
+async fn inspect_active_core_ports(paths: &AppPaths, cfg: &AppConfig) -> ActiveCorePortState {
+    let (live_version, controller_auth_err, ctrl_ep) = probe_live_controller(paths, cfg).await;
+    let core_running = live_version.is_some();
+    let live_config = if core_running {
+        probe_trusted_live_core_configs(&ctrl_ep).await
+    } else {
+        None
+    };
+
+    let effective_mixed_port = if core_running {
+        ctrl_ep
+            .mixed_port
+            .or_else(|| live_config.as_ref().map(|lc| lc.mixed_port).filter(|&p| p > 0))
+            .unwrap_or(cfg.mixed_port)
+    } else {
+        cfg.mixed_port
+    };
+    let effective_controller_port = if core_running || controller_auth_err.is_some() {
+        ctrl_ep.port
+    } else {
+        cfg.controller_port
+    };
+    let effective_dns_port = if core_running {
+        ctrl_ep.dns_port.unwrap_or(cfg.dns_listen_port)
+    } else {
+        cfg.dns_listen_port
+    };
+
+    let bind_host = if cfg.allow_lan {
+        cfg.bind_address.as_str()
+    } else {
+        "127.0.0.1"
+    };
+    let dns_host = if cfg.allow_lan {
+        cfg.dns_listen_host.as_str()
+    } else {
+        "127.0.0.1"
+    };
+
+    let mixed_free = is_port_available_tcp_udp(bind_host, effective_mixed_port);
+    let controller_free = is_port_available_tcp_udp(&ctrl_ep.host, effective_controller_port);
+    let dns_free = is_port_available_tcp_udp(dns_host, effective_dns_port);
+
+    let mut watched_ports = vec![
+        effective_mixed_port,
+        effective_controller_port,
+        effective_dns_port,
+        cfg.mixed_port,
+        cfg.controller_port,
+        cfg.dns_listen_port,
+    ];
+    watched_ports.sort_unstable();
+    watched_ports.dedup();
+    let owners = list_listening_port_owners(&watched_ports);
+
+    let mixed_owned_by_active_core = is_port_owned_by_active_core(
+        effective_mixed_port,
+        core_running,
+        ctrl_ep.pid,
+        ctrl_ep.process_start_time_unix,
+        &owners,
+        mixed_free,
+    );
+    let controller_owned_by_active_core = is_port_owned_by_active_core(
+        effective_controller_port,
+        core_running,
+        ctrl_ep.pid,
+        ctrl_ep.process_start_time_unix,
+        &owners,
+        controller_free,
+    );
+    let dns_owned_by_active_core = is_port_owned_by_active_core(
+        effective_dns_port,
+        core_running,
+        ctrl_ep.pid,
+        ctrl_ep.process_start_time_unix,
+        &owners,
+        dns_free,
+    );
+
+    ActiveCorePortState {
+        core_running,
+        core_version: live_version,
+        controller_auth_error: controller_auth_err,
+        endpoint: ctrl_ep,
+        live_config,
+        effective_mixed_port,
+        effective_controller_port,
+        effective_dns_port,
+        mixed_free,
+        controller_free,
+        dns_free,
+        mixed_owned_by_active_core,
+        controller_owned_by_active_core,
+        dns_owned_by_active_core,
+        owners,
+    }
+}
+
+fn find_next_free_port(host: &str, start_after: u16, reserved: &HashSet<u16>) -> Option<u16> {
+    let mut cand = if start_after == u16::MAX {
+        10240
+    } else {
+        start_after + 1
+    };
+    for _ in 0..512 {
+        if !reserved.contains(&cand) && is_port_available_tcp_udp(host, cand) {
+            return Some(cand);
+        }
+        cand = if cand == u16::MAX { 10240 } else { cand + 1 };
+    }
+    None
+}
+
+/// Separate compilation ports (retaining active CatCloud core's own listening ports without false
+/// conflict shifts) from `new_instance_preview_ports` (if launching a fresh second instance) while
+/// still detecting genuine third-party port conflicts.
+fn resolve_compile_and_preview_ports(
+    cfg: &AppConfig,
+    active: &ActiveCorePortState,
+) -> Result<(AllocatedPorts, Option<AllocatedPorts>, Vec<ThirdPartyPortConflict>)> {
+    let bind_host = if cfg.allow_lan {
+        cfg.bind_address.clone()
+    } else {
+        "127.0.0.1".to_string()
+    };
+    let ctrl_host = if cfg.allow_lan {
+        cfg.controller_host.clone()
+    } else {
+        "127.0.0.1".to_string()
+    };
+    let dns_host = if cfg.allow_lan {
+        cfg.dns_listen_host.clone()
+    } else {
+        "127.0.0.1".to_string()
+    };
+
+    let mut reserved = HashSet::with_capacity(3);
+    let mut shifted: Vec<PortShiftNotice> = Vec::new();
+    let mut conflicts: Vec<ThirdPartyPortConflict> = Vec::new();
+
+    let mut resolve_role = |role: &str,
+                            host: &str,
+                            desired: u16,
+                            active_port: u16,
+                            active_owned: bool|
+     -> Result<u16> {
+        let owned_same = active.core_running && desired == active_port && active_owned;
+        let is_free = is_port_available_tcp_udp(host, desired);
+        let owned_by_core = owned_same
+            || is_port_owned_by_active_core(
+                desired,
+                active.core_running,
+                active.endpoint.pid,
+                active.endpoint.process_start_time_unix,
+                &active.owners,
+                is_free,
+            ) && (desired == active.effective_mixed_port
+                || desired == active.effective_controller_port
+                || desired == active.effective_dns_port);
+
+        if !reserved.contains(&desired) && (owned_by_core || is_free) {
+            reserved.insert(desired);
+            return Ok(desired);
+        }
+
+        if !is_free && !owned_by_core {
+            let mut pids: Vec<u32> = active
+                .owners
+                .iter()
+                .filter(|o| o.port == desired)
+                .map(|o| o.pid)
+                .collect();
+            pids.sort_unstable();
+            pids.dedup();
+            conflicts.push(ThirdPartyPortConflict {
+                role: role.to_string(),
+                host: host.to_string(),
+                port: desired,
+                owner_pids: pids,
+            });
+        }
+
+        if cfg.port_guard_auto_shift {
+            if let Some(next_port) = find_next_free_port(host, desired, &reserved) {
+                reserved.insert(next_port);
+                shifted.push(PortShiftNotice {
+                    role: role.to_string(),
+                    desired_port: desired,
+                    actual_port: next_port,
+                    reason: format!(
+                        "port {desired} on `{host}` is occupied by another process or collides with another role"
+                    ),
+                });
+                return Ok(next_port);
+            }
+        }
+        reserved.insert(desired);
+        Ok(desired)
+    };
+
+    let mixed_port = resolve_role(
+        "mixed",
+        &bind_host,
+        cfg.mixed_port,
+        active.effective_mixed_port,
+        active.mixed_owned_by_active_core,
+    )?;
+    let controller_port = resolve_role(
+        "controller",
+        &ctrl_host,
+        cfg.controller_port,
+        active.effective_controller_port,
+        active.controller_owned_by_active_core,
+    )?;
+    let dns_port = resolve_role(
+        "dns",
+        &dns_host,
+        cfg.dns_listen_port,
+        active.effective_dns_port,
+        active.dns_owned_by_active_core,
+    )?;
+
+    let compile_ports = AllocatedPorts {
+        bind_host: bind_host.clone(),
+        mixed_port,
+        controller_port,
+        dns_port,
+        shifted,
+    };
+
+    let new_instance_preview = allocate_safe_ports_for_hosts(
+        &bind_host,
+        &ctrl_host,
+        &dns_host,
+        cfg.mixed_port,
+        cfg.controller_port,
+        cfg.dns_listen_port,
+        true,
+    )
+    .ok();
+
+    Ok((compile_ports, new_instance_preview, conflicts))
+}
+
+fn parse_yaml_bool_scalar(raw: &str) -> Option<bool> {
+    match unquote_yaml_scalar(raw).trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" => Some(true),
+        "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_yaml_u16_scalar(raw: &str) -> Option<u16> {
+    unquote_yaml_scalar(raw).trim().parse::<u16>().ok()
+}
+
+fn parse_host_and_port_pair(raw: &str) -> Option<(String, u16)> {
+    let clean = unquote_yaml_scalar(raw);
+    let trimmed = clean.trim();
+    if let Some(rest) = trimmed.strip_prefix('[') {
+        let (host, tail) = rest.split_once("]:")?;
+        let port = tail.trim().parse::<u16>().ok()?;
+        return Some((host.trim().to_string(), port));
+    }
+    let (host, port_str) = trimmed.rsplit_once(':')?;
+    let port = port_str.trim().parse::<u16>().ok()?;
+    Some((host.trim().to_string(), port))
+}
+
+/// Reconstruct the live running baseline [`AppConfig`] from on-disk `run/runtime.yaml` plus
+/// authenticated `GET /configs` runtime values so `classify_config_diff` compares the *actual*
+/// running core state against the new `config.json` instead of comparing `cfg` against itself.
+fn build_live_baseline_config_from_runtime(
+    cfg: &AppConfig,
+    runtime_yaml_path: &Path,
+    live_cfg: Option<&LiveCoreConfigSnapshot>,
+    ep: &ResolvedControllerEndpoint,
+) -> AppConfig {
+    let mut baseline = cfg.clone();
+    let mut yaml_allow_lan: Option<bool> = None;
+    let mut yaml_bind_addr: Option<String> = None;
+    let mut yaml_ctrl_host: Option<String> = None;
+    let mut yaml_dns_host: Option<String> = None;
+
+    const MAX_RUNTIME_YAML_HEADER_LINES: usize = 65_536;
+    if let Ok(raw_yaml) = std::fs::read_to_string(runtime_yaml_path) {
+        let text = raw_yaml.strip_prefix('\u{feff}').unwrap_or(&raw_yaml);
+        let mut section: Option<&str> = None;
+        for raw_line in text.lines().take(MAX_RUNTIME_YAML_HEADER_LINES) {
+            let trimmed = raw_line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
+            if indent == 0 {
+                if trimmed.starts_with("proxies:")
+                    || trimmed.starts_with("proxy-groups:")
+                    || trimmed.starts_with("rules:")
+                {
+                    break;
+                }
+                section = None;
+                if trimmed == "tun:" {
+                    section = Some("tun");
+                    continue;
+                }
+                if trimmed == "dns:" {
+                    section = Some("dns");
+                    continue;
+                }
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    let key = k.trim().trim_matches(['"', '\'']);
+                    let val = v.trim();
+                    match key {
+                        "mixed-port" => {
+                            if let Some(p) = parse_yaml_u16_scalar(val).filter(|&p| p > 0) {
+                                baseline.mixed_port = p;
+                            }
+                        }
+                        "socks-port" => {
+                            baseline.socks_port = parse_yaml_u16_scalar(val).filter(|&p| p > 0);
+                        }
+                        "port" => {
+                            baseline.http_port = parse_yaml_u16_scalar(val).filter(|&p| p > 0);
+                        }
+                        "redir-port" => {
+                            baseline.redir_port = parse_yaml_u16_scalar(val).filter(|&p| p > 0);
+                        }
+                        "tproxy-port" => {
+                            baseline.tproxy_port = parse_yaml_u16_scalar(val).filter(|&p| p > 0);
+                        }
+                        "allow-lan" => {
+                            if let Some(b) = parse_yaml_bool_scalar(val) {
+                                yaml_allow_lan = Some(b);
+                                baseline.allow_lan = b;
+                            }
+                        }
+                        "bind-address" => {
+                            let s = unquote_yaml_scalar(val);
+                            if !s.trim().is_empty() {
+                                yaml_bind_addr = Some(s.trim().to_string());
+                            }
+                        }
+                        "external-controller" => {
+                            if let Some((h, p)) = parse_host_and_port_pair(val) {
+                                if p > 0 {
+                                    baseline.controller_port = p;
+                                }
+                                if !h.is_empty() {
+                                    yaml_ctrl_host = Some(h);
+                                }
+                            }
+                        }
+                        "mode" => {
+                            match unquote_yaml_scalar(val).trim().to_ascii_lowercase().as_str() {
+                                "rule" => baseline.proxy_mode = ProxyMode::Rule,
+                                "global" => baseline.proxy_mode = ProxyMode::Global,
+                                "direct" => baseline.proxy_mode = ProxyMode::Direct,
+                                _ => {}
+                            }
+                        }
+                        "log-level" => {
+                            match unquote_yaml_scalar(val).trim().to_ascii_lowercase().as_str() {
+                                "silent" => baseline.log_level = CoreLogLevel::Silent,
+                                "error" => baseline.log_level = CoreLogLevel::Error,
+                                "warning" | "warn" => baseline.log_level = CoreLogLevel::Warning,
+                                "info" => baseline.log_level = CoreLogLevel::Info,
+                                "debug" => baseline.log_level = CoreLogLevel::Debug,
+                                _ => {}
+                            }
+                        }
+                        "ipv6" => {
+                            if let Some(b) = parse_yaml_bool_scalar(val) {
+                                baseline.core_ipv6 = b;
+                            }
+                        }
+                        "unified-delay" => {
+                            if let Some(b) = parse_yaml_bool_scalar(val) {
+                                baseline.unified_delay = b;
+                            }
+                        }
+                        "tcp-concurrent" => {
+                            if let Some(b) = parse_yaml_bool_scalar(val) {
+                                baseline.tcp_concurrent = b;
+                            }
+                        }
+                        "find-process-mode" => {
+                            match unquote_yaml_scalar(val).trim().to_ascii_lowercase().as_str() {
+                                "strict" => {
+                                    baseline.find_process_mode =
+                                        catcloud_core::models::FindProcessMode::Strict;
+                                }
+                                "always" => {
+                                    baseline.find_process_mode =
+                                        catcloud_core::models::FindProcessMode::Always;
+                                }
+                                "off" => {
+                                    baseline.find_process_mode =
+                                        catcloud_core::models::FindProcessMode::Off;
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            } else if indent == 2 && !trimmed.starts_with('-') {
+                if let Some((k, v)) = trimmed.split_once(':') {
+                    let key = k.trim().trim_matches(['"', '\'']);
+                    let val = v.trim();
+                    match section {
+                        Some("tun") => match key {
+                            "enable" => {
+                                if let Some(b) = parse_yaml_bool_scalar(val) {
+                                    baseline.tun.enabled = b;
+                                }
+                            }
+                            "stack" => {
+                                match unquote_yaml_scalar(val).trim().to_ascii_lowercase().as_str()
+                                {
+                                    "mixed" => baseline.tun.stack_mode = TunStackMode::Mixed,
+                                    "system" => baseline.tun.stack_mode = TunStackMode::System,
+                                    "gvisor" => baseline.tun.stack_mode = TunStackMode::Gvisor,
+                                    _ => {}
+                                }
+                            }
+                            "device" => {
+                                let d = unquote_yaml_scalar(val);
+                                if !d.trim().is_empty() {
+                                    baseline.tun.device_name = d.trim().to_string();
+                                }
+                            }
+                            "mtu" => {
+                                if let Some(m) = parse_yaml_u16_scalar(val).filter(|&m| m > 0) {
+                                    baseline.tun.mtu = m;
+                                }
+                            }
+                            "auto-route" => {
+                                if let Some(b) = parse_yaml_bool_scalar(val) {
+                                    baseline.tun.auto_route = b;
+                                }
+                            }
+                            "auto-detect-interface" => {
+                                if let Some(b) = parse_yaml_bool_scalar(val) {
+                                    baseline.tun.auto_detect_interface = b;
+                                }
+                            }
+                            "strict-route" => {
+                                if let Some(b) = parse_yaml_bool_scalar(val) {
+                                    baseline.tun.strict_route = b;
+                                }
+                            }
+                            _ => {}
+                        },
+                        Some("dns") => match key {
+                            "listen" => {
+                                if let Some((h, p)) = parse_host_and_port_pair(val) {
+                                    if p > 0 {
+                                        baseline.dns_listen_port = p;
+                                    }
+                                    if !h.is_empty() {
+                                        yaml_dns_host = Some(h);
+                                    }
+                                }
+                            }
+                            "enable" => {
+                                if let Some(b) = parse_yaml_bool_scalar(val) {
+                                    baseline.dns.enable = b;
+                                }
+                            }
+                            "ipv6" => {
+                                if let Some(b) = parse_yaml_bool_scalar(val) {
+                                    baseline.dns.ipv6 = b;
+                                }
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Apply live controller metadata ports when present.
+    if let Some(p) = ep.mixed_port.filter(|&p| p > 0) {
+        baseline.mixed_port = p;
+    }
+    if ep.port > 0
+        && ep.source == catcloud_core::core_adapter::ControllerEndpointSource::LiveRuntimeMeta
+    {
+        baseline.controller_port = ep.port;
+    }
+    if let Some(p) = ep.dns_port.filter(|&p| p > 0) {
+        baseline.dns_listen_port = p;
+    }
+
+    // Overlay live `GET /configs` values (highest authority for active running core).
+    let mut live_bind_addr: Option<String> = None;
+    if let Some(lc) = live_cfg {
+        baseline.tun.enabled = lc.tun_enable;
+        if lc.mixed_port > 0 {
+            baseline.mixed_port = lc.mixed_port;
+        }
+        if lc.port > 0 {
+            baseline.http_port = Some(lc.port);
+        }
+        if lc.socks_port > 0 {
+            baseline.socks_port = Some(lc.socks_port);
+        }
+        baseline.allow_lan = lc.allow_lan;
+        if !lc.bind_address.trim().is_empty() {
+            live_bind_addr = Some(lc.bind_address.trim().to_string());
+        }
+        match lc.mode.trim().to_ascii_lowercase().as_str() {
+            "rule" => baseline.proxy_mode = ProxyMode::Rule,
+            "global" => baseline.proxy_mode = ProxyMode::Global,
+            "direct" => baseline.proxy_mode = ProxyMode::Direct,
+            _ => {}
+        }
+    }
+
+    // Reconcile compiled bind/controller/DNS hosts with `allow_lan` semantics from
+    // `config_compiler.rs` so non-LAN `127.0.0.1` bindings do not cause spurious L3 diffs.
+    let effective_bind_candidate = live_bind_addr.or(yaml_bind_addr);
+    if let Some(obs_bind) = effective_bind_candidate {
+        let cfg_compiled_bind = if cfg.allow_lan {
+            let c = cfg.bind_address.trim();
+            if c.is_empty() || c == "127.0.0.1" {
+                "*"
+            } else {
+                c
+            }
+        } else {
+            "127.0.0.1"
+        };
+        if baseline.allow_lan == cfg.allow_lan && obs_bind == cfg_compiled_bind {
+            baseline.bind_address = cfg.bind_address.clone();
+        } else {
+            baseline.bind_address = obs_bind;
+        }
+    }
+    if let Some(obs_ctrl_host) = yaml_ctrl_host {
+        let cfg_compiled_ctrl = if cfg.allow_lan {
+            cfg.controller_host.trim()
+        } else {
+            "127.0.0.1"
+        };
+        if baseline.allow_lan == cfg.allow_lan && obs_ctrl_host == cfg_compiled_ctrl {
+            baseline.controller_host = cfg.controller_host.clone();
+        } else {
+            baseline.controller_host = obs_ctrl_host;
+        }
+    }
+    if let Some(obs_dns_host) = yaml_dns_host {
+        let cfg_compiled_dns = if cfg.allow_lan {
+            cfg.dns_listen_host.trim()
+        } else {
+            "127.0.0.1"
+        };
+        if baseline.allow_lan == cfg.allow_lan && obs_dns_host == cfg_compiled_dns {
+            baseline.dns_listen_host = cfg.dns_listen_host.clone();
+        } else {
+            baseline.dns_listen_host = obs_dns_host;
+        }
+    }
+    let _ = yaml_allow_lan;
+    baseline
+}
+
+fn summarize_l3_diff_reasons(old: &AppConfig, new: &AppConfig) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if old.mixed_port != new.mixed_port {
+        reasons.push(format!("mixed_port: {} -> {}", old.mixed_port, new.mixed_port));
+    }
+    if old.socks_port != new.socks_port {
+        reasons.push(format!("socks_port: {:?} -> {:?}", old.socks_port, new.socks_port));
+    }
+    if old.http_port != new.http_port {
+        reasons.push(format!("http_port: {:?} -> {:?}", old.http_port, new.http_port));
+    }
+    if old.redir_port != new.redir_port {
+        reasons.push(format!("redir_port: {:?} -> {:?}", old.redir_port, new.redir_port));
+    }
+    if old.tproxy_port != new.tproxy_port {
+        reasons.push(format!("tproxy_port: {:?} -> {:?}", old.tproxy_port, new.tproxy_port));
+    }
+    if old.allow_lan != new.allow_lan {
+        reasons.push(format!("allow_lan: {} -> {}", old.allow_lan, new.allow_lan));
+    }
+    if old.bind_address != new.bind_address {
+        reasons.push(format!("bind_address: {} -> {}", old.bind_address, new.bind_address));
+    }
+    if old.controller_host != new.controller_host || old.controller_port != new.controller_port {
+        reasons.push(format!(
+            "controller: {}:{} -> {}:{}",
+            old.controller_host, old.controller_port, new.controller_host, new.controller_port
+        ));
+    }
+    if old.dns_listen_host != new.dns_listen_host || old.dns_listen_port != new.dns_listen_port {
+        reasons.push(format!(
+            "dns_listen: {}:{} -> {}:{}",
+            old.dns_listen_host, old.dns_listen_port, new.dns_listen_host, new.dns_listen_port
+        ));
+    }
+    if old.tun.enabled != new.tun.enabled {
+        reasons.push(format!("tun.enabled: {} -> {}", old.tun.enabled, new.tun.enabled));
+    } else if new.tun.enabled && old.tun != new.tun {
+        reasons.push("tun settings changed (stack/mtu/route/device)".to_string());
+    }
+    if old.core_runtime.kernel_kind != new.core_runtime.kernel_kind
+        || old.core_runtime.custom_binary_path != new.core_runtime.custom_binary_path
+        || old.core_runtime.memory_tier != new.core_runtime.memory_tier
+        || old.core_runtime.gogc != new.core_runtime.gogc
+    {
+        reasons.push("core_runtime binary or memory/GC settings changed".to_string());
+    }
+    reasons
+}
+
+async fn build_config_validate_payload(paths: &AppPaths) -> Result<(bool, Value, String)> {
+    let cfg = config::load_or_init(paths)?;
+    let cfg_issues = config::validate_config_detailed(&cfg);
+    let db = open_storage(paths)?;
+    let nodes = db.list_nodes()?;
+    let groups = db.list_multi_groups()?;
+    let relays = db.list_preaccel_relays(false)?;
+    let active_ports = inspect_active_core_ports(paths, &cfg).await;
+    let (ports, new_instance_preview_ports, third_party_conflicts) =
+        resolve_compile_and_preview_ports(&cfg, &active_ports)?;
+
+    let empty_filter = HashMap::new();
+    let compiled = compile_mihomo_config_with_runtime_dir(
+        &CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &relays,
+            controller_secret: "validation-placeholder-secret",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty_filter,
+        },
+        Some(&paths.runtime_dir),
+    )?;
+    let relay_servers: Vec<String> = relays
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.server.clone())
+        .collect();
+    let static_report = validate_compiled_yaml(&compiled.yaml, &relay_servers)?;
+    let conflict_blocks_start = !third_party_conflicts.is_empty() && !cfg.port_guard_auto_shift;
+    let ok = cfg_issues.is_empty() && static_report.ok && !conflict_blocks_start;
+    let sanitized_cfg_issues = redact_config_issues(&cfg_issues);
+    let sanitized_static = redact_static_validation(&static_report);
+    let conflicts_json: Vec<Value> = third_party_conflicts
+        .iter()
+        .map(|c| {
+            json!({
+                "role": &c.role,
+                "host": &c.host,
+                "port": c.port,
+                "owner_pids": &c.owner_pids,
+            })
+        })
+        .collect();
+
+    let mut out = json!({
+        "ok": ok,
+        "sanitized": true,
+        "config_issues": sanitized_cfg_issues,
+        "static_validation": sanitized_static,
+        "stats": compiled.stats,
+        "ports": ports,
+        "active_core_ports": active_ports.to_active_core_ports_json(),
+        "new_instance_preview_ports": new_instance_preview_ports,
+        "third_party_port_conflicts": conflicts_json,
+    });
+    sanitize_json_value(&mut out);
+    let human = format!(
+        "Config validation ok={ok} (rules={}, proxies={}, core_running={}, third_party_conflicts={}).",
+        compiled.stats.total_rules,
+        compiled.stats.total_proxies,
+        active_ports.core_running,
+        third_party_conflicts.len()
+    );
+    Ok((ok, out, human))
+}
+
+async fn build_config_compile_result(
+    paths: &AppPaths,
+    reveal_secrets: bool,
+) -> Result<(String, Value)> {
+    let cfg = config::load_or_init(paths)?;
+    let db = open_storage(paths)?;
+    let nodes = db.list_nodes()?;
+    let groups = db.list_multi_groups()?;
+    let relays = db.list_preaccel_relays(false)?;
+    let active_ports = inspect_active_core_ports(paths, &cfg).await;
+    let (ports, new_instance_preview_ports, third_party_conflicts) =
+        resolve_compile_and_preview_ports(&cfg, &active_ports)?;
+
+    let empty_filter = HashMap::new();
+    let compiled = compile_mihomo_config_with_runtime_dir(
+        &CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &relays,
+            controller_secret: cfg
+                .controller_secret
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("compile-placeholder-secret"),
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty_filter,
+        },
+        Some(&paths.runtime_dir),
+    )?;
+    let rendered_yaml = if reveal_secrets {
+        compiled.yaml.clone()
+    } else {
+        redact_compiled_yaml(&compiled.yaml)
+    };
+    let conflicts_json: Vec<Value> = third_party_conflicts
+        .iter()
+        .map(|c| {
+            json!({
+                "role": &c.role,
+                "host": &c.host,
+                "port": c.port,
+                "owner_pids": &c.owner_pids,
+            })
+        })
+        .collect();
+    let meta = json!({
+        "sha256": compiled.sha256,
+        "ports": ports,
+        "active_core_ports": active_ports.to_active_core_ports_json(),
+        "new_instance_preview_ports": new_instance_preview_ports,
+        "third_party_port_conflicts": conflicts_json,
+    });
+    Ok((rendered_yaml, meta))
+}
+
+async fn execute_config_compile(
+    paths: &AppPaths,
+    as_json: bool,
+    output: Option<PathBuf>,
+    reveal_secrets: bool,
+) -> Result<()> {
+    let (rendered_yaml, meta) = build_config_compile_result(paths, reveal_secrets).await?;
+    if let Some(path) = output {
+        AppPaths::atomic_write(&path, rendered_yaml.as_bytes())?;
+        let file_sha256 = compute_file_sha256(&path)?;
+        let display_path = redact_path_for_display(&path.to_string_lossy());
+        let out = json!({
+            "ok": true,
+            "sanitized": !reveal_secrets,
+            "output": &display_path,
+            "sha256": file_sha256,
+            "ports": &meta["ports"],
+            "active_core_ports": &meta["active_core_ports"],
+            "new_instance_preview_ports": &meta["new_instance_preview_ports"],
+            "third_party_port_conflicts": &meta["third_party_port_conflicts"],
+        });
+        emit_output(
+            as_json,
+            &out,
+            &format!(
+                "Wrote compiled YAML (sanitized={}) to {}.",
+                !reveal_secrets, display_path
+            ),
+        )
+    } else if as_json {
+        emit_output(
+            true,
+            &json!({
+                "ok": true,
+                "sanitized": !reveal_secrets,
+                "yaml": rendered_yaml,
+                "sha256": &meta["sha256"],
+                "ports": &meta["ports"],
+                "active_core_ports": &meta["active_core_ports"],
+                "new_instance_preview_ports": &meta["new_instance_preview_ports"],
+                "third_party_port_conflicts": &meta["third_party_port_conflicts"],
+            }),
+            "",
+        )
+    } else {
+        println!("{rendered_yaml}");
+        Ok(())
+    }
+}
+
+async fn run_config_reload_inner(
+    paths: &AppPaths,
+    dry_run: bool,
+    caps_override: Option<catcloud_core::platform::PlatformCapabilities>,
+    verify_with_binary: bool,
+) -> Result<(bool, Value, String)> {
+    let cfg = config::load_or_init(paths)?;
+    let _ = open_storage(paths)?;
+    let bin_res = resolve_mihomo_binary(&cfg, paths, &[], false)?;
+    let job_guard = Arc::new(JobGuard::new()?);
+
+    let ep = resolve_effective_controller_endpoint_info(paths, &cfg);
+    let ctrl_addr = format_host_port(&ep.host, ep.port);
+    let configured_secret = (!ep.secret.trim().is_empty()).then_some(ep.secret.clone());
+
+    let probe_adapter = MihomoAdapter::with_controller_endpoint(
+        Arc::clone(&job_guard),
+        &ep.host,
+        ep.port,
+        ep.secret.clone(),
+    )?;
+
+    let mut live_controller_version: Option<String> = None;
+    let mut controller_auth_error: Option<String> = None;
+    match tokio::time::timeout(Duration::from_secs(2), probe_adapter.fetch_version()).await {
+        Ok(Ok(ver)) => {
+            live_controller_version = Some(ver);
+        }
+        Ok(Err(CatError::Core(msg)))
+            if msg.contains("HTTP 401") || msg.contains("HTTP 403") =>
+        {
+            controller_auth_error = Some(msg);
+        }
+        _ => {}
+    }
+
+    let core_running = live_controller_version.is_some();
+    // Strictly query `GET /configs` ONLY on trusted loopback secret endpoints.
+    let trusted_endpoint = ep.is_trusted_loopback_secret_endpoint();
+    let live_cfg: Option<LiveCoreConfigSnapshot> = if core_running && trusted_endpoint {
+        tokio::time::timeout(Duration::from_secs(2), probe_adapter.fetch_configs())
+            .await
+            .ok()
+            .and_then(|res| res.ok())
+    } else {
+        None
+    };
+
+    let redacted_bin_path = bin_res
+        .path
+        .as_ref()
+        .map(|p| redact_path_for_display(&p.to_string_lossy()));
+    let caps = caps_override.unwrap_or_else(|| default_platform().capabilities());
+    let cli_tun_privilege_ready = is_cli_tun_privilege_ready(&caps, bin_res.path.as_deref());
+    let live_tun_enabled = live_cfg.as_ref().is_some_and(|lc| lc.tun_enable);
+    // Issue #2 root fix: when an elevated desktop core is already running with TUN enabled and
+    // `cfg.tun.enabled == true`, preserve `allow_tun = true` during L2 hot reload instead of
+    // silently disabling TUN due to the CLI process running unprivileged.
+    let tun_preserved_via_live_core =
+        !cli_tun_privilege_ready && core_running && live_tun_enabled && cfg.tun.enabled;
+    let allow_tun = cli_tun_privilege_ready || tun_preserved_via_live_core;
+    let tun_masked_no_elevation = cfg.tun.enabled && !allow_tun;
+
+    let runtime_yaml_path = paths.runtime_dir.join("runtime.yaml");
+    let redacted_runtime_yaml = redact_path_for_display(&runtime_yaml_path.to_string_lossy());
+    let mut effective_cfg = cfg.clone();
+    if !allow_tun && effective_cfg.tun.enabled {
+        effective_cfg.tun.enabled = false;
+    }
+
+    let live_baseline_cfg = if core_running {
+        Some(build_live_baseline_config_from_runtime(
+            &cfg,
+            &runtime_yaml_path,
+            live_cfg.as_ref(),
+            &ep,
+        ))
+    } else {
+        None
+    };
+    let classified_level = match &live_baseline_cfg {
+        Some(old) => classify_config_diff(old, &effective_cfg),
+        None => ReloadLevel::L2HotReload,
+    };
+    let diff_reasons = match &live_baseline_cfg {
+        Some(old) => summarize_l3_diff_reasons(old, &effective_cfg),
+        None => Vec::new(),
+    };
+    let requires_l3_restart = classified_level == ReloadLevel::L3CoreRestart;
+
+    if dry_run {
+        let db = open_storage(paths)?;
+        let nodes = db.list_nodes()?;
+        let groups = db.list_multi_groups()?;
+        let relays = db.list_preaccel_relays(false)?;
+        let bind_host = if effective_cfg.allow_lan {
+            effective_cfg.bind_address.clone()
+        } else {
+            "127.0.0.1".to_string()
+        };
+        let ports = AllocatedPorts {
+            bind_host,
+            mixed_port: ep
+                .mixed_port
+                .or_else(|| live_cfg.as_ref().map(|lc| lc.mixed_port).filter(|&p| p > 0))
+                .unwrap_or(effective_cfg.mixed_port),
+            controller_port: ep.port,
+            dns_port: ep.dns_port.unwrap_or(effective_cfg.dns_listen_port),
+            shifted: Vec::new(),
+        };
+        let secret = configured_secret
+            .clone()
+            .unwrap_or_else(generate_controller_secret);
+        let empty_filter = HashMap::new();
+        let compiled = compile_mihomo_config_with_runtime_dir(
+            &CompileInput {
+                config: &effective_cfg,
+                nodes: &nodes,
+                groups: &groups,
+                relays: &relays,
+                controller_secret: &secret,
+                allocated_ports: &ports,
+                extra_prepend_rules: &[],
+                extra_fake_ip_filters: &[],
+                group_filtered_members: &empty_filter,
+            },
+            Some(&paths.runtime_dir),
+        )?;
+        if !compiled.validation.ok {
+            let summary = sanitize_log_line(
+                &compiled
+                    .validation
+                    .errors()
+                    .iter()
+                    .map(|i| format!("[{}] {}", i.code, i.message))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            );
+            let msg = format!("compiled YAML failed static anti-loop preflight: {summary}");
+            let sanitized_validation = redact_static_validation(&compiled.validation);
+            let mut out = json!({
+                "ok": false,
+                "sanitized": true,
+                "dry_run": true,
+                "validated_and_written": false,
+                "level": classified_level,
+                "allow_tun": allow_tun,
+                "live_tun_enabled": live_tun_enabled,
+                "requires_l3_restart": requires_l3_restart,
+                "diff_reasons": &diff_reasons,
+                "error": &msg,
+                "static_validation": &sanitized_validation,
+            });
+            sanitize_json_value(&mut out);
+            return Ok((false, out, format!("refused reload dry-run: {summary}")));
+        }
+
+        let mut binary_verified = false;
+        if verify_with_binary {
+            if let Some(ref bin_path) = bin_res.path {
+                let candidate_path = paths
+                    .runtime_dir
+                    .join(format!("runtime-dryrun-{}.yaml", std::process::id()));
+                AppPaths::atomic_write(&candidate_path, compiled.yaml.as_bytes())?;
+                let verify_res = verify_config_with_binary(
+                    bin_path,
+                    &paths.runtime_dir,
+                    &candidate_path,
+                    Duration::from_secs(8),
+                )
+                .await;
+                let _ = std::fs::remove_file(&candidate_path);
+                if let Err(err) = verify_res {
+                    let msg = sanitize_log_line(&err.to_string());
+                    let mut out = json!({
+                        "ok": false,
+                        "sanitized": true,
+                        "dry_run": true,
+                        "validated_and_written": false,
+                        "binary_verified": false,
+                        "binary_path": &redacted_bin_path,
+                        "level": classified_level,
+                        "allow_tun": allow_tun,
+                        "error": &msg,
+                    });
+                    sanitize_json_value(&mut out);
+                    return Ok((false, out, format!("refused reload dry-run: {msg}")));
+                }
+                binary_verified = true;
+            }
+        }
+
+        let warnings: Vec<String> = compiled
+            .validation
+            .warnings()
+            .iter()
+            .map(|w| sanitize_log_line(&format!("[{}] {}", w.code, w.message)))
+            .collect();
+        let l3_restart_hint = if requires_l3_restart {
+            Some("本次变更需要 L3 重启内核（端口、TUN 开关/栈或核心底层参数变更）；CLI 在非提权/非重启模式下会拒绝直接重启，请通过已提权的 CatCloud 桌面端重启核心生效。")
+        } else {
+            None
+        };
+        let mut out = json!({
+            "ok": true,
+            "sanitized": true,
+            "dry_run": true,
+            "runtime_yaml_path": &redacted_runtime_yaml,
+            "core_not_running": live_controller_version.is_none() && controller_auth_error.is_none(),
+            "core_version": &live_controller_version,
+            "trusted_controller_endpoint": trusted_endpoint,
+            "hot_reloaded": false,
+            "validated_and_written": false,
+            "level": classified_level,
+            "requires_l3_restart": requires_l3_restart,
+            "allow_l3_restart": false,
+            "diff_reasons": &diff_reasons,
+            "l3_restart_hint": l3_restart_hint,
+            "allow_tun": allow_tun,
+            "live_tun_enabled": live_tun_enabled,
+            "tun_preserved_via_live_core": tun_preserved_via_live_core,
+            "tun_masked_no_elevation": tun_masked_no_elevation,
+            "binary_verified": binary_verified,
+            "binary_path": &redacted_bin_path,
+            "sha256": &compiled.sha256,
+            "stats": &compiled.stats,
+            "warnings": &warnings,
+        });
+        sanitize_json_value(&mut out);
+        let human = format!(
+            "Validated candidate runtime.yaml (dry_run=true, level={}, allow_tun={}, requires_l3_restart={}, binary_verified={}, sha256={}).",
+            classified_level,
+            allow_tun,
+            requires_l3_restart,
+            binary_verified,
+            &compiled.sha256[..12]
+        );
+        return Ok((true, out, human));
+    }
+
+    if let Some(auth_err) = controller_auth_error {
+        let msg = sanitize_log_line(&format!(
+            "running Mihomo controller at {} rejected authentication ({auth_err}); ensure config.json controller_secret matches the active core or restart core",
+            ctrl_addr
+        ));
+        let mut out = json!({
+            "ok": false,
+            "sanitized": true,
+            "dry_run": false,
+            "core_not_running": false,
+            "hot_reloaded": false,
+            "validated_and_written": false,
+            "error": &msg,
+        });
+        sanitize_json_value(&mut out);
+        return Ok((false, out, msg));
+    }
+
+    let adapter = if core_running {
+        Arc::new(probe_adapter)
+    } else {
+        Arc::new(MihomoAdapter::new(Arc::clone(&job_guard))?)
+    };
+    let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+    if let Some(baseline_cfg) = live_baseline_cfg {
+        let seeded_ports = AllocatedPorts {
+            bind_host: if baseline_cfg.allow_lan {
+                baseline_cfg.bind_address.clone()
+            } else {
+                "127.0.0.1".to_string()
+            },
+            mixed_port: ep
+                .mixed_port
+                .or_else(|| live_cfg.as_ref().map(|lc| lc.mixed_port).filter(|&p| p > 0))
+                .unwrap_or(baseline_cfg.mixed_port),
+            controller_port: ep.port,
+            dns_port: ep.dns_port.unwrap_or(baseline_cfg.dns_listen_port),
+            shifted: Vec::new(),
+        };
+        coordinator
+            .seed_active_state(baseline_cfg, String::new(), seeded_ports, ep.secret.clone())
+            .await;
+    }
+
+    let outcome = coordinator
+        .apply_disk_reload(DiskReloadOptions {
+            force: true,
+            verify_with_binary,
+            allow_l3_restart: false,
+            allow_tun,
+            ..DiskReloadOptions::default()
+        })
+        .await;
+    let sanitized_outcome = redact_reload_outcome(&outcome);
+
+    if sanitized_outcome.rejected || !sanitized_outcome.applied {
+        let base_err = sanitized_outcome
+            .error
+            .clone()
+            .unwrap_or_else(|| "hot reload rejected".to_string());
+        let err_msg = if sanitized_outcome.level == ReloadLevel::L3CoreRestart {
+            format!(
+                "{base_err}；本次变更涉及监听端口、TUN 或底层内核参数（{}），请通过已提权的 CatCloud 桌面端执行内核重启生效。",
+                if diff_reasons.is_empty() {
+                    "L3 restart required".to_string()
+                } else {
+                    diff_reasons.join(", ")
+                }
+            )
+        } else {
+            base_err
+        };
+        let mut out = json!({
+            "ok": false,
+            "sanitized": true,
+            "dry_run": false,
+            "runtime_yaml_path": &redacted_runtime_yaml,
+            "core_not_running": !core_running,
+            "core_version": &live_controller_version,
+            "trusted_controller_endpoint": trusted_endpoint,
+            "hot_reloaded": false,
+            "validated_and_written": false,
+            "level": sanitized_outcome.level,
+            "requires_l3_restart": sanitized_outcome.level == ReloadLevel::L3CoreRestart,
+            "allow_l3_restart": false,
+            "diff_reasons": &diff_reasons,
+            "allow_tun": allow_tun,
+            "live_tun_enabled": live_tun_enabled,
+            "tun_preserved_via_live_core": tun_preserved_via_live_core,
+            "tun_masked_no_elevation": tun_masked_no_elevation,
+            "binary_verified": bin_res.found,
+            "binary_path": &redacted_bin_path,
+            "error": &err_msg,
+            "outcome": &sanitized_outcome,
+        });
+        sanitize_json_value(&mut out);
+        return Ok((false, out, format!("config reload failed: {err_msg}")));
+    }
+
+    let sha_preview = sanitized_outcome
+        .config_hash
+        .as_deref()
+        .map(|h| &h[..h.len().min(12)])
+        .unwrap_or("unknown");
+    let mut out = json!({
+        "ok": true,
+        "sanitized": true,
+        "dry_run": false,
+        "runtime_yaml_path": &redacted_runtime_yaml,
+        "core_not_running": !core_running,
+        "core_version": &live_controller_version,
+        "trusted_controller_endpoint": trusted_endpoint,
+        "hot_reloaded": core_running,
+        "validated_and_written": true,
+        "allow_tun": allow_tun,
+        "live_tun_enabled": live_tun_enabled,
+        "tun_preserved_via_live_core": tun_preserved_via_live_core,
+        "tun_masked_no_elevation": tun_masked_no_elevation,
+        "binary_verified": bin_res.found,
+        "binary_path": &redacted_bin_path,
+        "replayed_groups": sanitized_outcome.replayed_groups,
+        "level": sanitized_outcome.level,
+        "sha256": &sanitized_outcome.config_hash,
+        "warnings": &sanitized_outcome.warnings,
+        "applied_at": &sanitized_outcome.applied_at,
+        "outcome": &sanitized_outcome,
+    });
+    sanitize_json_value(&mut out);
+    let human = if core_running {
+        format!(
+            "Hot-reloaded runtime.yaml via controller ({}) and replayed {} group(s) (allow_tun={}, sha256={sha_preview}).",
+            ctrl_addr, outcome.replayed_groups, allow_tun
+        )
+    } else {
+        format!(
+            "Core not running; validated and wrote {} (allow_tun={}, binary_verified={}, sha256={sha_preview}).",
+            redacted_runtime_yaml, allow_tun, bin_res.found
+        )
+    };
+    Ok((true, out, human))
+}
+
+async fn execute_config_reload(paths: &AppPaths, as_json: bool, dry_run: bool) -> Result<()> {
+    let (ok, out, human) = run_config_reload_inner(paths, dry_run, None, true).await?;
+    if !ok {
+        if as_json {
+            emit_output(true, &out, "")?;
+            return Err(AlreadyEmittedJsonError(human).into());
+        }
+        anyhow::bail!("{human}");
+    }
+    emit_output(as_json, &out, &human)
 }
 
 #[derive(Debug, Default)]
 struct CatCloudManagedProcessFilter {
     managed_pid: Option<u32>,
+    managed_start_time_unix: Option<u64>,
+    standalone_tunnel_pid: Option<u32>,
+    standalone_tunnel_start_time_unix: Option<u64>,
+    standalone_tunnel_binary_path: Option<PathBuf>,
+    standalone_tunnel_socks_port: Option<u16>,
     mihomo_binary_path: Option<PathBuf>,
     owned_dirs: Vec<PathBuf>,
     live_controller_port: Option<u16>,
+    verified_listener_pids: HashSet<u32>,
+}
+
+fn verify_managed_pid_with_start_time(
+    candidate_pid: u32,
+    candidate_name: &str,
+    expected_pid: Option<u32>,
+    expected_start_time: Option<u64>,
+    actual_start_time: Option<u64>,
+) -> bool {
+    let Some(exp_pid) = expected_pid.filter(|&p| is_valid_managed_pid(p)) else {
+        return false;
+    };
+    if candidate_pid != exp_pid || !is_valid_managed_pid(candidate_pid) {
+        return false;
+    }
+    if !is_mihomo_like_process_name(candidate_name) {
+        return false;
+    }
+    pid_start_time_matches_fail_closed(expected_start_time, actual_start_time)
+}
+
+fn is_mihomo_global_preaccel_process_name(name: Option<&str>) -> bool {
+    name.is_some_and(|raw| raw.trim().to_ascii_lowercase().contains("mihomo"))
+}
+
+fn evaluate_live_global_preaccel_pid(
+    meta: &GlobalPreAccelRuntimeMeta,
+    actual_start_time: Option<u64>,
+    non_windows_process_name: Option<Option<&str>>,
+    listening_owners: Option<&[PortListenerOwner]>,
+) -> bool {
+    if !meta.running {
+        return false;
+    }
+    let Some(pid) = meta.pid.filter(|&p| is_valid_managed_pid(p)) else {
+        return false;
+    };
+    let Some(actual_ts) = actual_start_time else {
+        return false;
+    };
+    if !pid_start_time_matches_fail_closed(meta.process_start_time_unix, Some(actual_ts)) {
+        return false;
+    }
+    if let Some(proc_name) = non_windows_process_name {
+        if !is_mihomo_global_preaccel_process_name(proc_name) {
+            return false;
+        }
+    }
+    if let Some(owners) = listening_owners {
+        if !owners.is_empty()
+            && !owners.iter().any(|o| {
+                o.pid == pid
+                    && is_valid_managed_pid(o.pid)
+                    && pid_start_time_matches_fail_closed(
+                        meta.process_start_time_unix,
+                        o.process_start_time_unix,
+                    )
+            })
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_live_global_preaccel_pid(meta: &GlobalPreAccelRuntimeMeta) -> bool {
+    if !meta.running {
+        return false;
+    }
+    let Some(pid) = meta.pid.filter(|&p| is_valid_managed_pid(p)) else {
+        return false;
+    };
+    let actual_ts = get_process_start_time_unix(pid);
+    #[cfg(not(target_os = "windows"))]
+    let non_windows_proc_name_owned: Option<String> = list_process_candidates(false)
+        .into_iter()
+        .find(|c| c.pid == pid)
+        .map(|c| c.name);
+    #[cfg(not(target_os = "windows"))]
+    let non_windows_proc_name = Some(non_windows_proc_name_owned.as_deref());
+    #[cfg(target_os = "windows")]
+    let non_windows_proc_name: Option<Option<&str>> = None;
+
+    let owners = meta
+        .socks_port
+        .filter(|&p| p > 0)
+        .map(|socks_port| list_listening_port_owners(&[socks_port]));
+
+    evaluate_live_global_preaccel_pid(
+        meta,
+        actual_ts,
+        non_windows_proc_name,
+        owners.as_deref(),
+    )
 }
 
 fn normalize_path_for_compare(path: &Path) -> String {
@@ -5497,16 +7311,29 @@ fn is_mihomo_like_process_name(name: &str) -> bool {
         || stem == "catcloud"
 }
 
-fn is_catcloud_managed_proxy_process(
+fn is_catcloud_managed_proxy_process_with_start_time(
     candidate: &ProcessCandidate,
     filter: &CatCloudManagedProcessFilter,
+    candidate_start_time_unix: Option<u64>,
 ) -> bool {
-    // 1. Exact runtime PID recorded in `data/run/runtime-controller.json` (works even when an
-    //    elevated Windows `mihomo.exe` hides its exe_path/cmdline from a standard CLI).
-    if filter
-        .managed_pid
-        .is_some_and(|mpid| mpid > 0 && candidate.pid == mpid)
-    {
+    // 1. Exact runtime PID recorded in `runtime-controller.json` or `global-preaccel-runtime.json`,
+    //    strictly guarded by process name + OS creation time tolerance (<= 2s) against Windows PID reuse.
+    if verify_managed_pid_with_start_time(
+        candidate.pid,
+        &candidate.name,
+        filter.managed_pid,
+        filter.managed_start_time_unix,
+        candidate_start_time_unix,
+    ) {
+        return true;
+    }
+    if verify_managed_pid_with_start_time(
+        candidate.pid,
+        &candidate.name,
+        filter.standalone_tunnel_pid,
+        filter.standalone_tunnel_start_time_unix,
+        candidate_start_time_unix,
+    ) {
         return true;
     }
 
@@ -5514,11 +7341,21 @@ fn is_catcloud_managed_proxy_process(
         return false;
     }
 
-    // 2. Executable path matches resolved CatCloud mihomo binary or resides inside CatCloud's
-    //    bin/data/install directories.
+    if filter.verified_listener_pids.contains(&candidate.pid) {
+        return true;
+    }
+
+    // 2. Executable path matches resolved CatCloud mihomo binary (or standalone tunnel binary)
+    //    or resides inside CatCloud's bin/data/install directories.
     if let Some(ref exe) = candidate.exe_path {
+        let norm_exe = normalize_path_for_compare(exe);
         if let Some(ref resolved_bin) = filter.mihomo_binary_path {
-            if normalize_path_for_compare(exe) == normalize_path_for_compare(resolved_bin) {
+            if norm_exe == normalize_path_for_compare(resolved_bin) {
+                return true;
+            }
+        }
+        if let Some(ref tunnel_bin) = filter.standalone_tunnel_binary_path {
+            if norm_exe == normalize_path_for_compare(tunnel_bin) {
                 return true;
             }
         }
@@ -5586,6 +7423,50 @@ fn is_catcloud_managed_proxy_process(
     false
 }
 
+fn is_catcloud_managed_proxy_process(
+    candidate: &ProcessCandidate,
+    filter: &CatCloudManagedProcessFilter,
+) -> bool {
+    let start_ts = get_process_start_time_unix(candidate.pid);
+    is_catcloud_managed_proxy_process_with_start_time(candidate, filter, start_ts)
+}
+
+fn collect_verified_listener_pids(
+    owners: &[PortListenerOwner],
+    managed_pid: Option<u32>,
+    managed_start_time_unix: Option<u64>,
+    standalone_tunnel_pid: Option<u32>,
+    standalone_tunnel_start_time_unix: Option<u64>,
+) -> HashSet<u32> {
+    let mut verified_listener_pids = HashSet::new();
+    for owner in owners {
+        if !is_valid_managed_pid(owner.pid) {
+            continue;
+        }
+        if let Some(mpid) = managed_pid.filter(|&p| is_valid_managed_pid(p)) {
+            if owner.pid == mpid
+                && pid_start_time_matches_fail_closed(
+                    managed_start_time_unix,
+                    owner.process_start_time_unix,
+                )
+            {
+                verified_listener_pids.insert(owner.pid);
+            }
+        }
+        if let Some(spid) = standalone_tunnel_pid.filter(|&p| is_valid_managed_pid(p)) {
+            if owner.pid == spid
+                && pid_start_time_matches_fail_closed(
+                    standalone_tunnel_start_time_unix,
+                    owner.process_start_time_unix,
+                )
+            {
+                verified_listener_pids.insert(owner.pid);
+            }
+        }
+    }
+    verified_listener_pids
+}
+
 fn build_catcloud_managed_process_filter(
     paths: &AppPaths,
     mihomo_binary: Option<&Path>,
@@ -5612,8 +7493,69 @@ fn build_catcloud_managed_process_filter(
             }
         }
     }
+
+    let live_core_meta = read_live_runtime_controller_meta(paths);
+    let managed_pid = live_core_meta
+        .as_ref()
+        .and_then(|m| m.pid)
+        .filter(|&p| is_valid_managed_pid(p));
+    let managed_start_time_unix = live_core_meta
+        .as_ref()
+        .and_then(|m| m.process_start_time_unix);
+
+    let global_meta = read_global_preaccel_runtime_meta(&paths.root_data_dir)
+        .filter(is_live_global_preaccel_pid);
+    let standalone_tunnel_pid = global_meta
+        .as_ref()
+        .and_then(|m| m.pid)
+        .filter(|&p| is_valid_managed_pid(p));
+    let standalone_tunnel_start_time_unix = global_meta
+        .as_ref()
+        .and_then(|m| m.process_start_time_unix);
+    let standalone_tunnel_binary_path = global_meta
+        .as_ref()
+        .and_then(|m| m.binary_path.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let standalone_tunnel_socks_port = global_meta.as_ref().and_then(|m| m.socks_port);
+
+    // Cross-check OS listening port ownership table for CatCloud's verified live controller
+    // and standalone 443 tunnel ports, enforcing fail-closed start-time tolerance against PID reuse.
+    let mut watched_ports = Vec::new();
+    if core_running && effective_ctrl_port > 0 {
+        watched_ports.push(effective_ctrl_port);
+    }
+    if let Some(m) = &live_core_meta {
+        if let Some(mp) = m.mixed_port {
+            watched_ports.push(mp);
+        }
+        if let Some(dp) = m.dns_port {
+            watched_ports.push(dp);
+        }
+    }
+    if let Some(sp) = standalone_tunnel_socks_port {
+        watched_ports.push(sp);
+    }
+    watched_ports.sort_unstable();
+    watched_ports.dedup();
+
+    let owners = list_listening_port_owners(&watched_ports);
+    let verified_listener_pids = collect_verified_listener_pids(
+        &owners,
+        managed_pid,
+        managed_start_time_unix,
+        standalone_tunnel_pid,
+        standalone_tunnel_start_time_unix,
+    );
+
     CatCloudManagedProcessFilter {
-        managed_pid: read_runtime_controller_pid(paths),
+        managed_pid,
+        managed_start_time_unix,
+        standalone_tunnel_pid,
+        standalone_tunnel_start_time_unix,
+        standalone_tunnel_binary_path,
+        standalone_tunnel_socks_port,
         mihomo_binary_path: mihomo_binary.map(Path::to_path_buf),
         owned_dirs,
         live_controller_port: if core_running {
@@ -5621,6 +7563,7 @@ fn build_catcloud_managed_process_filter(
         } else {
             None
         },
+        verified_listener_pids,
     }
 }
 
@@ -5635,7 +7578,7 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     let groups = db.list_multi_groups()?;
     let relays = db.list_preaccel_relays(false)?;
 
-    let mut checks: Vec<Value> = Vec::with_capacity(7);
+    let mut checks: Vec<Value> = Vec::with_capacity(8);
     let mut recommendations: Vec<String> = Vec::new();
 
     // Check 1: Portable / standard paths & storage counts
@@ -5764,26 +7707,16 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
 
     // Check 3: Core binary, live controller & configured/active ports
     let bin_res = resolve_mihomo_binary(&cfg, paths, &[], false)?;
-    let (live_version, controller_auth_err, ctrl_ep) = probe_live_controller(paths, &cfg).await;
-    let core_running = live_version.is_some();
-    let effective_mixed_port = if core_running {
-        ctrl_ep.mixed_port.unwrap_or(cfg.mixed_port)
-    } else {
-        cfg.mixed_port
-    };
-    let effective_ctrl_port = if core_running || controller_auth_err.is_some() {
-        ctrl_ep.port
-    } else {
-        cfg.controller_port
-    };
-    let effective_dns_port = if core_running {
-        ctrl_ep.dns_port.unwrap_or(cfg.dns_listen_port)
-    } else {
-        cfg.dns_listen_port
-    };
-    let mixed_free = is_port_available_tcp_udp(&cfg.bind_address, effective_mixed_port);
-    let ctrl_free = is_port_available_tcp_udp(&ctrl_ep.host, effective_ctrl_port);
-    let dns_free = is_port_available_tcp_udp(&cfg.dns_listen_host, effective_dns_port);
+    let active_ports = inspect_active_core_ports(paths, &cfg).await;
+    let live_version = active_ports.core_version.clone();
+    let controller_auth_err = active_ports.controller_auth_error.clone();
+    let ctrl_ep = active_ports.endpoint.clone();
+    let core_running = active_ports.core_running;
+    let effective_mixed_port = active_ports.effective_mixed_port;
+    let effective_ctrl_port = active_ports.effective_controller_port;
+    let effective_dns_port = active_ports.effective_dns_port;
+    let third_party_port_conflicts = active_ports.third_party_conflicts_for_effective_ports(&cfg);
+    let owned_by_active_core = active_ports.all_active_ports_owned_by_core();
 
     let core_status = if !bin_res.found {
         recommendations.push(
@@ -5797,9 +7730,9 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
                 .to_string(),
         );
         "warn"
-    } else if !core_running && (!mixed_free || !ctrl_free || !dns_free) {
+    } else if !third_party_port_conflicts.is_empty() {
         recommendations.push(
-            "One or more configured CatCloud ports are occupied while CatCloud core is not running; enable port_guard_auto_shift or free conflicting ports."
+            "One or more configured CatCloud ports are occupied by a non-CatCloud process; enable port_guard_auto_shift or free conflicting ports."
                 .to_string(),
         );
         if cfg.port_guard_auto_shift {
@@ -5810,21 +7743,28 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     } else {
         "pass"
     };
+    let port_label = |port: u16, free: bool, owned: bool| -> String {
+        if owned {
+            format!("{port}:owned_by_active_core")
+        } else if free {
+            format!("{port}:free")
+        } else {
+            format!("{port}:occupied_conflict")
+        }
+    };
     checks.push(json!({
         "id": "core_and_ports",
         "layer": 3,
         "name": "Core Binary & Listening Ports",
         "status": core_status,
         "detail": format!(
-            "binary_found={}, core_running={}, ports(mixed={}:free={}, ctrl={}:free={}, dns={}:free={})",
+            "binary_found={}, core_running={}, owned_by_active_core={}, ports(mixed={}, ctrl={}, dns={})",
             bin_res.found,
             core_running,
-            effective_mixed_port,
-            mixed_free,
-            effective_ctrl_port,
-            ctrl_free,
-            effective_dns_port,
-            dns_free
+            owned_by_active_core,
+            port_label(effective_mixed_port, active_ports.mixed_free, active_ports.mixed_owned_by_active_core),
+            port_label(effective_ctrl_port, active_ports.controller_free, active_ports.controller_owned_by_active_core),
+            port_label(effective_dns_port, active_ports.dns_free, active_ports.dns_owned_by_active_core)
         ),
         "data": {
             "binary_found": bin_res.found,
@@ -5833,15 +7773,10 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             "core_running": core_running,
             "core_version": live_version,
             "controller_auth_error": controller_auth_err,
+            "owned_by_active_core": owned_by_active_core,
             "port_guard_auto_shift": cfg.port_guard_auto_shift,
-            "ports": {
-                "mixed_port": effective_mixed_port,
-                "mixed_available": mixed_free,
-                "controller_port": effective_ctrl_port,
-                "controller_available": ctrl_free,
-                "dns_listen_port": effective_dns_port,
-                "dns_available": dns_free,
-            }
+            "third_party_port_conflicts": third_party_port_conflicts,
+            "ports": active_ports.to_status_json(),
         }
     }));
 
@@ -5880,11 +7815,13 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     } else {
         false
     };
+    let live_tun_enable = active_ports.live_config.as_ref().map(|lc| lc.tun_enable);
     let (tun_effective_enabled, tun_needs_admin, tun_runtime_source) = evaluate_doctor_tun_state(
         tun_configured,
         tun_privilege_ready,
         core_running,
         has_live_tun_connections,
+        live_tun_enable,
     );
     let proxy_tun_status = if os_proxy_dangling || os_proxy_mismatch || tun_needs_admin {
         if os_proxy_dangling {
@@ -6062,6 +7999,9 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         {
             continue;
         }
+        if managed_proc_filter.standalone_tunnel_socks_port == Some(p) {
+            continue;
+        }
         if !is_port_available_tcp_udp("127.0.0.1", p) {
             occupied_other_ports.push(p);
         }
@@ -6104,12 +8044,37 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     }));
 
     // Check 7: GeoData readiness (aligned strictly with Country.mmdb / country.mmdb)
-    let geodata = collect_geodata_status(&paths.runtime_dir);
+    let mut geodata = collect_geodata_status(&paths.runtime_dir);
     let has_country_mmdb = geodata["country_mmdb"]["exists"].as_bool().unwrap_or(false);
     let has_geosite = geodata["geosite_dat"]["exists"].as_bool().unwrap_or(false);
+    let mut missing_geodata_files: Vec<&str> = Vec::new();
+    if !has_country_mmdb {
+        missing_geodata_files.push("Country.mmdb");
+    }
+    if !has_geosite {
+        missing_geodata_files.push("geosite.dat");
+    }
+    let geodata_impact_scope = if missing_geodata_files.is_empty() {
+        json!({
+            "missing_files": [],
+            "explicit_domain_rules_unaffected": true,
+            "affected_traffic_zh": "GeoData 完整，依赖 GeoIP/GeoSite 的国内直连与显式域名规则均正常工作。",
+            "affected_traffic": "GeoData databases are complete; both GeoIP/GeoSite domestic direct rules and explicit domain rules are active.",
+        })
+    } else {
+        json!({
+            "missing_files": &missing_geodata_files,
+            "explicit_domain_rules_unaffected": true,
+            "affected_traffic_zh": "缺失 GeoData 仅影响依赖 GeoIP/GeoSite 的未显式列出国内域名与国内 IP 自动直连判定（可能误走代理）；已写明的 DOMAIN/DOMAIN-SUFFIX/IP-CIDR 规则（如内置 AI 域名、QQ/微信与自定义规则）不受影响。",
+            "affected_traffic": "Missing GeoData only affects unlisted domestic domains/IPs relying on GeoIP/GeoSite auto-direct rules; explicit DOMAIN/DOMAIN-SUFFIX/IP-CIDR rules (AI domains, domestic IM, custom rules) are unaffected.",
+        })
+    };
+    if let Some(obj) = geodata.as_object_mut() {
+        obj.insert("impact_scope".to_string(), geodata_impact_scope.clone());
+    }
     let geo_status = if cfg.rules_override.domestic_direct_enabled && !has_country_mmdb {
         recommendations.push(
-            "Country.mmdb is missing while domestic direct routing is enabled; refresh GeoData in Settings."
+            "Country.mmdb is missing while domestic direct routing is enabled (only affects unlisted domestic domains/IPs relying on GeoIP/GeoSite; explicit domain rules remain unaffected); refresh GeoData in Settings."
                 .to_string(),
         );
         "warn"
@@ -6121,8 +8086,54 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         "layer": 4,
         "name": "GeoData Databases",
         "status": geo_status,
-        "detail": format!("country_mmdb={has_country_mmdb}, geosite_dat={has_geosite}"),
+        "detail": format!(
+            "country_mmdb={has_country_mmdb}, geosite_dat={has_geosite} ({})",
+            if missing_geodata_files.is_empty() {
+                "complete"
+            } else {
+                "missing files only affect GeoIP/GeoSite rules; explicit domain rules unaffected"
+            }
+        ),
         "data": geodata,
+    }));
+
+    // Check 8: Encrypted DNS TLS certificate verification health (256 KiB window across catcloud.log & .1)
+    let dns_tls_diag = analyze_dns_tls_across_logs(&paths.logs_dir, 256 * 1024);
+    let dns_tls_status = match dns_tls_diag.status.as_str() {
+        DNS_TLS_STATUS_CERT_FAILED => {
+            recommendations.push(format!(
+                "{}: {} (upstreams={:?}; TLS verification preserved)",
+                dns_tls_diag.category,
+                dns_tls_diag.next_retry_hint,
+                dns_tls_diag.affected_upstreams
+            ));
+            "fail"
+        }
+        DNS_TLS_STATUS_DEGRADED_RECOVERED => {
+            recommendations.push(format!(
+                "{}: {} (upstreams={:?})",
+                dns_tls_diag.category,
+                dns_tls_diag.next_retry_hint,
+                dns_tls_diag.affected_upstreams
+            ));
+            "warn"
+        }
+        _ => "pass",
+    };
+    checks.push(json!({
+        "id": "dns_tls_health",
+        "layer": 4,
+        "name": "Encrypted DNS TLS Certificate Health",
+        "status": dns_tls_status,
+        "detail": format!(
+            "status={}, failures={}, recovered={}, dot_853_timeouts={}, tls_verified={}",
+            dns_tls_diag.status,
+            dns_tls_diag.failure_count,
+            dns_tls_diag.recovered,
+            dns_tls_diag.network_timeout_only_count,
+            dns_tls_diag.tls_verification_preserved
+        ),
+        "data": dns_tls_diag,
     }));
 
     let pass_count = checks.iter().filter(|c| c["status"] == "pass").count();
@@ -6130,7 +8141,7 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     let fail_count = checks.iter().filter(|c| c["status"] == "fail").count();
     let healthy = fail_count == 0;
 
-    let out = json!({
+    let mut out = json!({
         "ok": true,
         "sanitized": true,
         "healthy": healthy,
@@ -6146,6 +8157,7 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         "checks": &checks,
         "recommendations": &recommendations,
     });
+    sanitize_json_value(&mut out);
     let mut lines = vec![format!(
         "CatCloud Net Doctor: healthy={healthy} (pass={pass_count}, warn={warn_count}, fail={fail_count})"
     )];
@@ -6649,13 +8661,49 @@ async fn build_net_match_payload(
             })
         });
 
+    let geodata_status = collect_geodata_status(&paths.runtime_dir);
+    let has_country_mmdb = geodata_status["country_mmdb"]["exists"]
+        .as_bool()
+        .unwrap_or(false);
+    let has_geosite_dat = geodata_status["geosite_dat"]["exists"]
+        .as_bool()
+        .unwrap_or(false);
+    let mut missing_geodata_files: Vec<&str> = Vec::new();
+    if !has_country_mmdb {
+        missing_geodata_files.push("Country.mmdb");
+    }
+    if !has_geosite_dat {
+        missing_geodata_files.push("geosite.dat");
+    }
+    let geodata_impact_scope = if missing_geodata_files.is_empty() {
+        json!({
+            "missing_files": [],
+            "explicit_domain_rules_unaffected": true,
+            "affected_traffic_zh": "GeoData 完整，GeoIP/GeoSite 与显式域名规则均有效。",
+            "affected_traffic": "GeoData files are present; both GeoIP/GeoSite and explicit domain rules apply.",
+        })
+    } else {
+        json!({
+            "missing_files": &missing_geodata_files,
+            "explicit_domain_rules_unaffected": true,
+            "affected_traffic_zh": "缺失 GeoData 仅影响依赖 GeoIP/GeoSite 的未显式列出国内域名/IP；已写明的域名与 IP-CIDR 规则不受影响。",
+            "affected_traffic": "Missing GeoData only affects unlisted domestic domains/IPs relying on GeoIP/GeoSite; explicit domain/IP-CIDR rules are unaffected.",
+        })
+    };
+
     let geo_note = if !skipped_geo_rules.is_empty() {
-        Some("Offline rule simulation cannot inspect binary GeoSite/GeoIP databases; live Mihomo core may match an earlier GEOSITE/GEOIP rule before the fallback result shown here.")
+        if !missing_geodata_files.is_empty() {
+            Some("Offline rule simulation cannot inspect binary GeoSite/GeoIP databases, and GeoData files are currently missing on disk (缺失 GeoData 仅影响依赖 GeoIP/GeoSite 的未列国内域名/IP，已写明域名规则不受影响).")
+        } else {
+            Some("Offline rule simulation cannot inspect binary GeoSite/GeoIP databases; live Mihomo core may match an earlier GEOSITE/GEOIP rule before the fallback result shown here.")
+        }
+    } else if !missing_geodata_files.is_empty() {
+        Some("GeoData files are missing on disk (缺失 GeoData 仅影响依赖 GeoIP/GeoSite 的未列国内域名/IP，当前已写明域名规则不受影响).")
     } else {
         None
     };
 
-    let out = json!({
+    let mut out = json!({
         "ok": true,
         "sanitized": true,
         "query": {
@@ -6675,7 +8723,10 @@ async fn build_net_match_payload(
         "bypass_fake_ip": bypass_fake_ip,
         "skipped_geo_rules": skipped_geo_rules,
         "geo_note": geo_note,
+        "geodata_missing_files": missing_geodata_files,
+        "geodata_impact_scope": geodata_impact_scope,
     });
+    sanitize_json_value(&mut out);
     let human = format!(
         "Match {} ({}/{}) -> policy `{}` via rule `{}` (bypass_fake_ip={}).",
         out["query"]["host"].as_str().unwrap_or(""),
@@ -6796,7 +8847,47 @@ fn collect_geodata_status(runtime_dir: &std::path::Path) -> Value {
     })
 }
 
-fn build_global_preaccel_status_payload(paths: &AppPaths) -> Result<(Value, String)> {
+fn resolve_effective_preaccel_carrier(
+    cfg: &AppConfig,
+    has_enabled_relays: bool,
+    is_direct_mode: bool,
+    core_running: bool,
+    live_tun_enabled: bool,
+    runtime_meta: Option<&GlobalPreAccelRuntimeMeta>,
+    standalone_pid_alive: bool,
+) -> (&'static str, bool, bool, &'static str) {
+    // Returns (effective_carrier, standalone_tunnel_running, standalone_tunnel_suspended_for_tun, runtime_mode)
+    // Strictly aligned with Desktop `resolve_preaccel_effective_carrier` 5-state contract.
+    if standalone_pid_alive {
+        if let Some(meta) = runtime_meta {
+            if meta.mode == "windivert" {
+                return ("standalone_windivert", true, false, "windivert");
+            }
+            return ("standalone_socks5", true, false, "local_socks5");
+        }
+    }
+
+    if !cfg.preaccel.enabled || !has_enabled_relays || is_direct_mode {
+        return ("off", false, false, "off");
+    }
+
+    if core_running && live_tun_enabled {
+        return (
+            "main_core_tun_suspended_standalone",
+            false,
+            true,
+            "suspended_for_tun",
+        );
+    }
+
+    if core_running {
+        return ("main_core_proxy_only", false, false, "off");
+    }
+
+    ("off", false, false, "off")
+}
+
+async fn build_global_preaccel_status_payload(paths: &AppPaths) -> Result<(Value, String)> {
     let cfg = config::load_or_init(paths)?;
     let db = open_storage(paths)?;
     let plat = default_platform();
@@ -6822,14 +8913,66 @@ fn build_global_preaccel_status_payload(paths: &AppPaths) -> Result<(Value, Stri
         "local_socks5"
     };
 
-    let out = json!({
+    let active_ports = inspect_active_core_ports(paths, &cfg).await;
+    let core_running = active_ports.core_running;
+    let live_tun_enabled = if core_running {
+        active_ports
+            .live_config
+            .as_ref()
+            .map(|lc| lc.tun_enable)
+            .unwrap_or(false)
+            || probe_live_tun_connections(&active_ports.endpoint).await
+    } else {
+        false
+    };
+
+    let has_enabled_relays = !enabled_relays.is_empty();
+    let is_direct_mode = active_ports
+        .live_config
+        .as_ref()
+        .map(|lc| lc.mode.trim())
+        .filter(|m| !m.is_empty())
+        .map(|m| m.eq_ignore_ascii_case("direct"))
+        .unwrap_or(cfg.proxy_mode == ProxyMode::Direct);
+    let raw_meta = read_global_preaccel_runtime_meta(&paths.root_data_dir);
+    let standalone_pid_alive = raw_meta.as_ref().is_some_and(is_live_global_preaccel_pid);
+    let runtime_meta_stale = raw_meta.as_ref().is_some_and(|m| {
+        (m.running && !standalone_pid_alive)
+            || (m.mode == "suspended_for_tun"
+                && (!core_running || !live_tun_enabled || is_direct_mode || !has_enabled_relays))
+    });
+    let (
+        effective_carrier,
+        standalone_tunnel_running,
+        standalone_tunnel_suspended_for_tun,
+        runtime_mode,
+    ) = resolve_effective_preaccel_carrier(
+        &cfg,
+        has_enabled_relays,
+        is_direct_mode,
+        core_running,
+        live_tun_enabled,
+        raw_meta.as_ref(),
+        standalone_pid_alive,
+    );
+    let live_socks_port = if standalone_tunnel_running {
+        raw_meta.as_ref().and_then(|m| m.socks_port)
+    } else {
+        None
+    };
+
+    let mut out = json!({
         "ok": true,
         "sanitized": true,
         "os": caps.os,
         "arch": caps.arch,
         "is_elevated": caps.is_elevated,
+        "core_running": core_running,
+        "live_tun_enabled": live_tun_enabled,
         "global_bypass_enabled": cfg.preaccel.global_bypass_enabled,
         "global_scope": cfg.preaccel.global_scope,
+        "dispatch_strategy": cfg.preaccel.dispatch_strategy,
+        "lb_strategy": cfg.preaccel.lb_strategy,
         "global_target_processes": cfg.preaccel.global_target_processes,
         "windivert_dir": cfg.preaccel.windivert_dir.as_deref().map(redact_path_for_display),
         "windivert_available": windivert_available,
@@ -6839,12 +8982,23 @@ fn build_global_preaccel_status_payload(paths: &AppPaths) -> Result<(Value, Stri
         "enabled_relay_count": active_relay_names.len(),
         "active_relays": active_relay_names,
         "recommended_mode": recommended_mode,
+        "runtime_mode": runtime_mode,
+        "effective_carrier": effective_carrier,
+        "standalone_tunnel_running": standalone_tunnel_running,
+        "standalone_tunnel_suspended_for_tun": standalone_tunnel_suspended_for_tun,
+        "standalone_socks_port": live_socks_port,
+        "runtime_meta_stale": runtime_meta_stale,
     });
+    sanitize_json_value(&mut out);
 
     let human = format!(
-        "Global Pre-Accel: enabled={} | scope={} | relays={} | windivert_ready={} | elevated={} | recommended_mode={}",
+        "Global Pre-Accel: enabled={} | carrier={} | standalone_running={} | suspended_for_tun={} | scope={} | dispatch={} | relays={} | windivert_ready={} | elevated={} | recommended_mode={}",
         cfg.preaccel.global_bypass_enabled,
+        effective_carrier,
+        standalone_tunnel_running,
+        standalone_tunnel_suspended_for_tun,
         cfg.preaccel.global_scope.as_str(),
+        cfg.preaccel.dispatch_strategy.as_str(),
         enabled_relays.len(),
         windivert_available,
         caps.is_elevated,
@@ -6872,27 +9026,38 @@ fn is_cli_tun_privilege_ready(
     false
 }
 
+async fn resolve_cli_effective_tun_state_with_probe(
+    cfg: &AppConfig,
+    caps: &catcloud_core::platform::PlatformCapabilities,
+    mihomo_binary: Option<&Path>,
+    active_ports: &ActiveCorePortState,
+) -> (bool, bool, &'static str) {
+    let tun_privilege_ready = is_cli_tun_privilege_ready(caps, mihomo_binary);
+    let tun_configured = cfg.tun.enabled;
+    let core_running = active_ports.core_running;
+    let has_live_tun_connections = if core_running {
+        probe_live_tun_connections(&active_ports.endpoint).await
+    } else {
+        false
+    };
+    let live_tun_enable = active_ports.live_config.as_ref().map(|lc| lc.tun_enable);
+    evaluate_doctor_tun_state(
+        tun_configured,
+        tun_privilege_ready,
+        core_running,
+        has_live_tun_connections,
+        live_tun_enable,
+    )
+}
+
 async fn resolve_cli_effective_tun_state(
     paths: &AppPaths,
     cfg: &AppConfig,
     caps: &catcloud_core::platform::PlatformCapabilities,
     mihomo_binary: Option<&Path>,
 ) -> (bool, bool, &'static str) {
-    let tun_privilege_ready = is_cli_tun_privilege_ready(caps, mihomo_binary);
-    let tun_configured = cfg.tun.enabled;
-    let (live_version, _, ctrl_ep) = probe_live_controller(paths, cfg).await;
-    let core_running = live_version.is_some();
-    let has_live_tun_connections = if core_running {
-        probe_live_tun_connections(&ctrl_ep).await
-    } else {
-        false
-    };
-    evaluate_doctor_tun_state(
-        tun_configured,
-        tun_privilege_ready,
-        core_running,
-        has_live_tun_connections,
-    )
+    let active_ports = inspect_active_core_ports(paths, cfg).await;
+    resolve_cli_effective_tun_state_with_probe(cfg, caps, mihomo_binary, &active_ports).await
 }
 
 async fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Value> {
@@ -6913,6 +9078,41 @@ async fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Va
         MAX_DIAG_LOG_LINES,
         !reveal_secrets,
     );
+    let dns_diagnostics = analyze_dns_tls_across_logs(&paths.logs_dir, 256 * 1024);
+    let relays = db.list_preaccel_relays(false)?;
+    let enabled_relay_count = relays.iter().filter(|r| r.enabled).count();
+
+    let mut warnings: Vec<String> = Vec::new();
+    if dns_diagnostics.status == DNS_TLS_STATUS_CERT_FAILED {
+        warnings.push(format!(
+            "{}: {}",
+            dns_diagnostics.category, dns_diagnostics.next_retry_hint
+        ));
+    } else if dns_diagnostics.status == DNS_TLS_STATUS_DEGRADED_RECOVERED {
+        warnings.push(format!(
+            "{}（已自动恢复）: {}",
+            dns_diagnostics.category, dns_diagnostics.next_retry_hint
+        ));
+    }
+    if tun_needs_elevation {
+        warnings.push(
+            "TUN 模式已在配置中开启，但当前进程缺少管理员/TUN 权限，需要提权后生效。".to_string(),
+        );
+    }
+    if cfg.rules_override.domestic_direct_enabled
+        && !geodata_status["country_mmdb"]["exists"]
+            .as_bool()
+            .unwrap_or(false)
+    {
+        warnings.push(
+            "缺失 Country.mmdb（仅影响依赖 GeoIP/GeoSite 的未列国内域名/IP，已写明域名规则不受影响）。"
+                .to_string(),
+        );
+    }
+    if cfg.preaccel.enabled && enabled_relay_count == 0 {
+        warnings.push("国内提速已开启，但当前没有已启用的国内 443 中转节点。".to_string());
+    }
+
     let data_dir = if reveal_secrets {
         paths.root_data_dir.to_string_lossy().to_string()
     } else {
@@ -6952,18 +9152,22 @@ async fn build_diag_payload(paths: &AppPaths, reveal_secrets: bool) -> Result<Va
         "windivert_available": wd_files.is_some(),
         "compile_all_nodes": cfg.core_runtime.compile_all_nodes,
         "geodata_status": geodata_status,
+        "dns_diagnostics": dns_diagnostics,
+        "warnings": warnings,
         "recent_logs": recent_logs,
         "counts": {
             "subscriptions": db.list_subscriptions()?.len(),
             "nodes": db.list_nodes()?.len(),
             "multi_groups": db.list_multi_groups()?.len(),
-            "preaccel_relays": db.list_preaccel_relays(false)?.len(),
+            "preaccel_relays": relays.len(),
         }
     });
     if reveal_secrets {
         if let Some(obj) = payload.as_object_mut() {
             obj.insert("controller_secret".to_string(), json!(cfg.controller_secret));
         }
+    } else {
+        sanitize_json_value(&mut payload);
     }
     Ok(payload)
 }
@@ -7285,7 +9489,21 @@ mod tests {
         let (doctor, _) = build_net_doctor_payload(&paths).await.expect("net doctor");
         assert_eq!(doctor["ok"], json!(true));
         assert_eq!(doctor["sanitized"], json!(true));
-        assert_eq!(doctor["checks"].as_array().unwrap().len(), 7);
+        let checks = doctor["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 8);
+        assert!(checks.iter().any(|c| c["id"] == "dns_tls_health"));
+        let geo_check = checks
+            .iter()
+            .find(|c| c["id"] == "geodata_status")
+            .expect("geodata_status check");
+        assert_eq!(
+            geo_check["data"]["impact_scope"]["explicit_domain_rules_unaffected"],
+            json!(true)
+        );
+        assert_eq!(
+            match_direct["geodata_impact_scope"]["explicit_domain_rules_unaffected"],
+            json!(true)
+        );
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }
@@ -7411,8 +9629,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
-    #[test]
-    fn global_preaccel_status_payload_reports_config_and_windivert_readiness() {
+    #[tokio::test]
+    async fn global_preaccel_status_payload_reports_config_and_windivert_readiness() {
         let temp_root = std::env::temp_dir().join(format!(
             "catcloud-cli-global-preaccel-{}",
             std::process::id()
@@ -7424,19 +9642,27 @@ mod tests {
         cfg.preaccel.global_bypass_enabled = true;
         config::save(&paths, &cfg).expect("save config");
 
-        let (payload_before, human_before) =
-            build_global_preaccel_status_payload(&paths).expect("status before windivert");
+        let (payload_before, human_before) = build_global_preaccel_status_payload(&paths)
+            .await
+            .expect("status before windivert");
         assert_eq!(payload_before["ok"], json!(true));
         assert_eq!(payload_before["global_bypass_enabled"], json!(true));
         assert_eq!(payload_before["global_scope"], json!("proxy_apps_only"));
         assert_eq!(payload_before["windivert_available"], json!(false));
+        assert_eq!(payload_before["effective_carrier"], json!("off"));
+        assert_eq!(payload_before["standalone_tunnel_running"], json!(false));
+        assert_eq!(
+            payload_before["standalone_tunnel_suspended_for_tun"],
+            json!(false)
+        );
         assert!(human_before.contains("enabled=true"));
 
         std::fs::write(paths.bin_dir.join("WinDivert64.dll"), b"stub-dll").unwrap();
         std::fs::write(paths.bin_dir.join("WinDivert64.sys"), b"stub-sys").unwrap();
 
-        let (payload_after, _) =
-            build_global_preaccel_status_payload(&paths).expect("status after windivert");
+        let (payload_after, _) = build_global_preaccel_status_payload(&paths)
+            .await
+            .expect("status after windivert");
         if !cfg!(all(target_os = "windows", not(target_arch = "aarch64"))) {
             assert_eq!(payload_after["windivert_available"], json!(false));
             assert!(payload_after["windivert_dll"].is_null());
@@ -8018,6 +10244,7 @@ mod tests {
             &[],
             &[udp_node.clone(), tcp_node.clone()],
             None,
+            false,
         )
         .expect("auto-select tcp node");
         assert_eq!(picked.as_ref().map(|n| n.id.as_str()), Some("n-tcp"));
@@ -8025,13 +10252,19 @@ mod tests {
 
         // Explicit UDP node must fail with clear validation error.
         assert!(
-            select_preaccel_speed_reference_node(&cfg, &[], &[udp_node.clone(), tcp_node], Some("n-udp"))
-                .is_err()
+            select_preaccel_speed_reference_node(
+                &cfg,
+                &[],
+                &[udp_node.clone(), tcp_node],
+                Some("n-udp"),
+                false,
+            )
+            .is_err()
         );
 
         // When only UDP nodes exist, omit reference node for single-hop direct relay speed test.
         let (single_hop, single_note) =
-            select_preaccel_speed_reference_node(&cfg, &[], &[udp_node], None)
+            select_preaccel_speed_reference_node(&cfg, &[], &[udp_node], None, false)
                 .expect("fallback to single-hop");
         assert!(single_hop.is_none());
         assert!(single_note.unwrap().contains("single-hop"));
@@ -8155,31 +10388,45 @@ mod tests {
 
     #[test]
     fn net_doctor_tun_state_and_managed_mihomo_filter_prevent_false_positives() {
-        // 1. Live Tun inbound connections or running core with tun_configured=true must not
-        //    falsely claim tun_needs_elevation=true / tun_enabled=false on standard CLI.
+        // 1. Live Tun inbound connections or running core with tun_configured=true (when live
+        //    `GET /configs` is unavailable) must not falsely claim tun_needs_elevation=true /
+        //    tun_enabled=false on standard CLI; conversely, authoritative `Some(false)` MUST
+        //    report `tun_enabled = false`.
         assert_eq!(
-            evaluate_doctor_tun_state(true, false, true, true),
+            evaluate_doctor_tun_state(true, false, true, true, None),
             (true, false, "live_tun_connections")
         );
         assert_eq!(
-            evaluate_doctor_tun_state(true, false, true, false),
+            evaluate_doctor_tun_state(true, false, true, false, None),
             (true, false, "live_core_with_tun_config")
         );
         assert_eq!(
-            evaluate_doctor_tun_state(false, false, true, true),
+            evaluate_doctor_tun_state(false, false, true, true, None),
             (true, false, "live_tun_connections")
         );
         assert_eq!(
-            evaluate_doctor_tun_state(true, false, false, false),
+            evaluate_doctor_tun_state(true, false, false, false, None),
             (false, true, "privilege_required")
         );
         assert_eq!(
-            evaluate_doctor_tun_state(true, true, false, false),
+            evaluate_doctor_tun_state(true, true, false, false, None),
             (true, false, "process_privilege")
         );
         assert_eq!(
-            evaluate_doctor_tun_state(false, false, false, false),
+            evaluate_doctor_tun_state(false, false, false, false, None),
             (false, false, "disabled")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(true, false, true, false, Some(false)),
+            (false, true, "live_core_tun_disabled_needs_elevation")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(true, true, true, false, Some(false)),
+            (false, false, "live_core_tun_disabled")
+        );
+        assert_eq!(
+            evaluate_doctor_tun_state(true, false, true, false, Some(true)),
+            (true, false, "live_core_configs")
         );
 
         // 2. Managed CatCloud mihomo.exe must be excluded by PID, binary path, or data dir,
@@ -8189,12 +10436,16 @@ mod tests {
         let runtime_dir = data_dir.join("run");
         let filter = CatCloudManagedProcessFilter {
             managed_pid: Some(42420),
+            managed_start_time_unix: Some(1_700_000_000),
+            standalone_tunnel_pid: Some(42421),
+            standalone_tunnel_start_time_unix: Some(1_700_000_100),
             mihomo_binary_path: Some(bin_dir.join("mihomo.exe")),
             owned_dirs: vec![bin_dir.clone(), runtime_dir.clone(), data_dir.clone()],
             live_controller_port: Some(19090),
+            ..CatCloudManagedProcessFilter::default()
         };
 
-        // Case A: Elevated mihomo.exe with inaccessible exe_path/cmdline matched via runtime PID.
+        // Case A: Elevated mihomo.exe with inaccessible exe_path/cmdline matched via runtime PID + valid start time.
         let by_pid = ProcessCandidate {
             pid: 42420,
             name: "mihomo.exe".to_string(),
@@ -8205,7 +10456,33 @@ mod tests {
             detected_controller_addr: None,
             likely_proxy_client: true,
         };
-        assert!(is_catcloud_managed_proxy_process(&by_pid, &filter));
+        assert!(is_catcloud_managed_proxy_process_with_start_time(
+            &by_pid,
+            &filter,
+            Some(1_700_000_001)
+        ));
+        // PID reuse guard: if OS start time drifts > 2s, the recycled PID must NOT be exempted!
+        assert!(!is_catcloud_managed_proxy_process_with_start_time(
+            &by_pid,
+            &filter,
+            Some(1_700_000_050)
+        ));
+        // Standalone 443 tunnel PID with valid start time is exempted.
+        let standalone_tunnel = ProcessCandidate {
+            pid: 42421,
+            name: "mihomo.exe".to_string(),
+            exe_path: None,
+            cmdline: Vec::new(),
+            detected_config_dir: None,
+            detected_config_file: None,
+            detected_controller_addr: None,
+            likely_proxy_client: true,
+        };
+        assert!(is_catcloud_managed_proxy_process_with_start_time(
+            &standalone_tunnel,
+            &filter,
+            Some(1_700_000_100)
+        ));
 
         // Case B: Managed mihomo.exe matched via binary path in CatCloud bin dir.
         let by_exe = ProcessCandidate {
@@ -8502,5 +10779,1317 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&sender_root);
         let _ = std::fs::remove_dir_all(&receiver_root);
+    }
+
+    #[tokio::test]
+    async fn issue2_config_reload_preserves_live_tun_and_rejects_l3_restart_with_real_baseline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Reserve clean ports for mixed and dns so test never collides with host listeners.
+        let tmp_mixed = std::net::TcpListener::bind("127.0.0.1:0").expect("mixed port");
+        let mixed_port = tmp_mixed.local_addr().unwrap().port();
+        drop(tmp_mixed);
+        let tmp_dns = std::net::TcpListener::bind("127.0.0.1:0").expect("dns port");
+        let dns_port = tmp_dns.local_addr().unwrap().port();
+        drop(tmp_dns);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock controller");
+        let mock_port = listener.local_addr().unwrap().port();
+        let put_reload_count = Arc::new(AtomicUsize::new(0));
+        let put_counter_srv = Arc::clone(&put_reload_count);
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..32 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 4096];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let has_auth = req_str
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-issue2-secret");
+                let (status_line, body) = if !has_auth {
+                    ("HTTP/1.1 401 Unauthorized", r#"{"message":"Unauthorized"}"#.to_string())
+                } else if req_str.starts_with("GET /version ") {
+                    ("HTTP/1.1 200 OK", r#"{"version":"v1.19.1"}"#.to_string())
+                } else if req_str.starts_with("GET /configs ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        format!(
+                            r#"{{"tun":{{"enable":true}},"mixed-port":{},"port":0,"socks-port":0,"bind-address":"127.0.0.1","allow-lan":false,"mode":"rule"}}"#,
+                            mixed_port
+                        ),
+                    )
+                } else if req_str.starts_with("PUT /configs") {
+                    put_counter_srv.fetch_add(1, Ordering::SeqCst);
+                    ("HTTP/1.1 204 No Content", String::new())
+                } else if req_str.starts_with("PUT /proxies/") {
+                    ("HTTP/1.1 204 No Content", String::new())
+                } else {
+                    ("HTTP/1.1 200 OK", r#"{}"#.to_string())
+                };
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-issue2-reload-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        let mut cfg = config::load_or_init(&paths).expect("init config");
+        cfg.mixed_port = mixed_port;
+        cfg.controller_port = mock_port;
+        cfg.dns_listen_port = dns_port;
+        cfg.controller_secret = Some("test-issue2-secret".to_string());
+        cfg.tun.enabled = true;
+        cfg.allow_lan = false;
+        cfg.bind_address = "127.0.0.1".to_string();
+        config::save(&paths, &cfg).expect("save config");
+
+        let db = open_storage(&paths).expect("open db");
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-issue2".to_string(),
+            name: "Issue2 Sub".to_string(),
+            kind: SubscriptionKind::File,
+            url_or_cmd: "issue2.yaml".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_node(&ProxyNode {
+            id: "n-issue2-1".to_string(),
+            sub_id: "sub-issue2".to_string(),
+            name: "JP-Issue2".to_string(),
+            protocol: "trojan".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            enabled: true,
+            raw_config: json!({
+                "name": "JP-Issue2",
+                "type": "trojan",
+                "server": "203.0.113.10",
+                "port": 443,
+                "password": "demo-trojan-password"
+            }),
+            ..ProxyNode::default()
+        })
+        .unwrap();
+        drop(db);
+
+        // Seed realistic on-disk `run/runtime.yaml` reflecting the running elevated core.
+        let initial_yaml = format!(
+            "mixed-port: {mixed_port}\n\
+             allow-lan: false\n\
+             bind-address: 127.0.0.1\n\
+             mode: rule\n\
+             log-level: info\n\
+             external-controller: 127.0.0.1:{mock_port}\n\
+             secret: test-issue2-secret\n\
+             dns:\n\
+               enable: true\n\
+               listen: 127.0.0.1:{dns_port}\n\
+               ipv6: false\n\
+             tun:\n\
+               enable: true\n\
+               stack: mixed\n\
+               device: CatCloud\n\
+               mtu: 1500\n\
+               auto-route: true\n\
+               auto-detect-interface: true\n\
+               strict-route: true\n"
+        );
+        let runtime_yaml_path = paths.runtime_dir.join("runtime.yaml");
+        std::fs::write(&runtime_yaml_path, &initial_yaml).unwrap();
+
+        let mut unpriv_caps = default_platform().capabilities();
+        unpriv_caps.is_elevated = false;
+
+        // 1. Dry-run from unprivileged CLI must recognize live elevated TUN and keep allow_tun=true.
+        let (dry_ok, dry_out, _) =
+            run_config_reload_inner(&paths, true, Some(unpriv_caps.clone()), false)
+                .await
+                .expect("dry run");
+        assert!(dry_ok, "dry run failed: {dry_out}");
+        assert_eq!(dry_out["trusted_controller_endpoint"], json!(true));
+        assert_eq!(dry_out["live_tun_enabled"], json!(true));
+        assert_eq!(dry_out["allow_tun"], json!(true));
+        assert_eq!(dry_out["tun_preserved_via_live_core"], json!(true));
+        assert_eq!(dry_out["requires_l3_restart"], json!(false));
+
+        // 2. Real L2 hot reload from unprivileged CLI must preserve `tun.enable: true` in runtime.yaml!
+        let (reload_ok, reload_out, _) =
+            run_config_reload_inner(&paths, false, Some(unpriv_caps.clone()), false)
+                .await
+                .expect("l2 reload");
+        assert!(reload_ok, "l2 reload failed: {reload_out}");
+        assert_eq!(reload_out["allow_tun"], json!(true));
+        assert_eq!(reload_out["hot_reloaded"], json!(true));
+        assert_eq!(put_reload_count.load(Ordering::SeqCst), 1);
+        let updated_yaml = std::fs::read_to_string(&runtime_yaml_path).unwrap();
+        assert!(
+            updated_yaml.contains("tun:") && updated_yaml.contains("enable: true"),
+            "L2 hot reload from unprivileged CLI must never silently disable live TUN"
+        );
+
+        // 3. Mutate an L3 field (`mixed_port`): dry-run must report `l3_core_restart`, and
+        //    real reload must be hard-rejected without touching runtime.yaml or calling PUT /configs.
+        let mut next_mixed = if mixed_port < 65000 {
+            mixed_port + 1
+        } else {
+            mixed_port - 1
+        };
+        while next_mixed == mixed_port
+            || next_mixed == cfg.controller_port
+            || next_mixed == cfg.dns_listen_port
+        {
+            next_mixed = if next_mixed < 65000 {
+                next_mixed + 1
+            } else {
+                20000
+            };
+        }
+        cfg.mixed_port = next_mixed;
+        config::save(&paths, &cfg).expect("save l3 port change");
+
+        let (l3_dry_ok, l3_dry_out, _) =
+            run_config_reload_inner(&paths, true, Some(unpriv_caps.clone()), false)
+                .await
+                .expect("l3 dry run");
+        assert!(l3_dry_ok);
+        assert_eq!(l3_dry_out["level"], json!("l3_core_restart"));
+        assert_eq!(l3_dry_out["requires_l3_restart"], json!(true));
+        assert!(
+            l3_dry_out["diff_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap_or("").contains("mixed_port"))
+        );
+
+        let yaml_before_l3_reject = std::fs::read_to_string(&runtime_yaml_path).unwrap();
+        let (l3_ok, l3_out, _) =
+            run_config_reload_inner(&paths, false, Some(unpriv_caps), false)
+                .await
+                .expect("l3 reject outcome");
+        assert!(!l3_ok, "L3 change must be rejected when allow_l3_restart=false");
+        assert_eq!(l3_out["level"], json!("l3_core_restart"));
+        assert_eq!(l3_out["outcome"]["rejected"], json!(true));
+        assert!(
+            l3_out["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("桌面端")
+        );
+        assert_eq!(
+            put_reload_count.load(Ordering::SeqCst),
+            1,
+            "rejected L3 reload must never call PUT /configs?force=true"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&runtime_yaml_path).unwrap(),
+            yaml_before_l3_reject,
+            "rejected L3 reload must leave runtime.yaml untouched"
+        );
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn issue3_group_create_preserves_fields_and_group_members_and_policy_match_rules_work() {
+        use catcloud_core::models::{DynamicFilterSpec, TriggerRule};
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-issue3-group-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+        let db = open_storage(&paths).expect("open db");
+
+        let original = MultiGroup {
+            id: "grp-issue3".to_string(),
+            name: "AI Dedicated".to_string(),
+            mode: MultiGroupMode::ConditionalPool,
+            match_rules: vec!["DOMAIN-SUFFIX,openai.com".to_string()],
+            member_node_ids: vec!["n1".to_string(), "n2".to_string()],
+            dynamic_filter: Some(DynamicFilterSpec {
+                region_codes: vec!["JP".to_string(), "SG".to_string()],
+                max_multiplier: Some(1.0),
+                ..DynamicFilterSpec::default()
+            }),
+            primary_probe_id: Some("probe-ai".to_string()),
+            hard_gates: vec!["google_clean == 1".to_string(), "keepalive_ok == 1".to_string()],
+            trigger_rules: vec![TriggerRule {
+                expr: "ping_ms > 1500".to_string(),
+                consecutive_failures: 3,
+                bypass_cooldown_on_disconnect: true,
+            }],
+            formula_expr: "up_mbps * 40 - ping_ms * 0.1".to_string(),
+            fallback_policy: FallbackPolicy::CrossPoolEscalate,
+            fallback_pool_id: Some("grp-backup".to_string()),
+            escalated_since: None,
+            recover_probe_interval_sec: 90,
+            switch_mode: SwitchMode::GracefulNewOnly,
+            cooldown_sec: 120,
+            hysteresis_pct: 35.0,
+            active_node_id: Some("n1".to_string()),
+            state: catcloud_core::models::MultiGroupState::Healthy,
+            independent_routing: true,
+        };
+        db.upsert_multi_group(&original).unwrap();
+        drop(db);
+
+        // 1. Updating existing group via `group create` with only `--nodes` (omitting name/mode/fallback/switch_mode)
+        //    must preserve ALL existing fields including `switch_mode` and keep `active_node_id` while still in pool.
+        let (upd_out, _) = execute_group_create(
+            &paths,
+            GroupCreateArgs {
+                id: "grp-issue3".to_string(),
+                name: None,
+                mode: None,
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                nodes: Some("n1,n3".to_string()),
+            },
+        )
+        .expect("partial update existing group");
+        assert_eq!(upd_out["created"], json!(false));
+        assert_eq!(upd_out["updated"], json!(true));
+
+        let db = open_storage(&paths).expect("reopen db");
+        let after = db.get_multi_group("grp-issue3").unwrap().unwrap();
+        assert_eq!(after.name, "AI Dedicated");
+        assert_eq!(after.mode, MultiGroupMode::ConditionalPool);
+        assert_eq!(after.fallback_policy, FallbackPolicy::CrossPoolEscalate);
+        assert_eq!(after.switch_mode, SwitchMode::GracefulNewOnly);
+        assert_eq!(after.hard_gates, original.hard_gates);
+        assert_eq!(after.match_rules, original.match_rules);
+        assert_eq!(after.trigger_rules, original.trigger_rules);
+        assert_eq!(after.dynamic_filter, original.dynamic_filter);
+        assert_eq!(after.primary_probe_id, original.primary_probe_id);
+        assert_eq!(after.fallback_pool_id, original.fallback_pool_id);
+        assert_eq!(after.independent_routing, true);
+        assert_eq!(after.cooldown_sec, 120);
+        assert!((after.hysteresis_pct - 35.0).abs() < 1e-6);
+        assert_eq!(after.member_node_ids, vec!["n1", "n3"]);
+        assert_eq!(after.active_node_id.as_deref(), Some("n1"));
+        drop(db);
+
+        // 2. `group members add / remove / set` mutates members safely without touching policy/rules.
+        let (add_out, _) = execute_group_members(
+            &paths,
+            GroupMembersArgs {
+                id: "grp-issue3".to_string(),
+                action: "add".to_string(),
+                nodes: "n3,n4".to_string(),
+            },
+        )
+        .expect("members add");
+        assert_eq!(add_out["added"], json!(["n4"]));
+        assert_eq!(add_out["removed"], json!([]));
+        assert_eq!(add_out["member_count"], json!(3));
+        assert_eq!(add_out["active_node_id"], json!("n1"));
+
+        let (rem_out, _) = execute_group_members(
+            &paths,
+            GroupMembersArgs {
+                id: "grp-issue3".to_string(),
+                action: "remove".to_string(),
+                nodes: "n1".to_string(),
+            },
+        )
+        .expect("members remove active node");
+        assert_eq!(rem_out["removed"], json!(["n1"]));
+        assert_eq!(rem_out["member_count"], json!(2));
+        assert!(rem_out["active_node_id"].is_null());
+
+        let (set_out, _) = execute_group_members(
+            &paths,
+            GroupMembersArgs {
+                id: "grp-issue3".to_string(),
+                action: "set".to_string(),
+                nodes: "n4,n5".to_string(),
+            },
+        )
+        .expect("members set");
+        assert_eq!(set_out["added"], json!(["n5"]));
+        assert_eq!(set_out["removed"], json!(["n3"]));
+        assert_eq!(set_out["member_count"], json!(2));
+
+        // 3. `group policy` match-rules add / replace / clear.
+        let (pol_add, _) = execute_group_policy(
+            &paths,
+            GroupPolicyArgs {
+                group_id: "grp-issue3".to_string(),
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                hard_gate: Vec::new(),
+                match_rules: None,
+                add_match_rule: vec!["DOMAIN-SUFFIX,claude.ai".to_string()],
+                clear_match_rules: false,
+            },
+        )
+        .expect("policy add match rule");
+        assert_eq!(
+            pol_add["group"]["match_rules"],
+            json!(["DOMAIN-SUFFIX,openai.com", "DOMAIN-SUFFIX,claude.ai"])
+        );
+
+        let (pol_rep, _) = execute_group_policy(
+            &paths,
+            GroupPolicyArgs {
+                group_id: "grp-issue3".to_string(),
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                hard_gate: Vec::new(),
+                match_rules: Some("DOMAIN-SUFFIX,anthropic.com;DOMAIN,chatgpt.com".to_string()),
+                add_match_rule: Vec::new(),
+                clear_match_rules: false,
+            },
+        )
+        .expect("policy replace match rules");
+        assert_eq!(
+            pol_rep["group"]["match_rules"],
+            json!(["DOMAIN-SUFFIX,anthropic.com", "DOMAIN,chatgpt.com"])
+        );
+
+        let (pol_clr, _) = execute_group_policy(
+            &paths,
+            GroupPolicyArgs {
+                group_id: "grp-issue3".to_string(),
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                hard_gate: Vec::new(),
+                match_rules: None,
+                add_match_rule: Vec::new(),
+                clear_match_rules: true,
+            },
+        )
+        .expect("policy clear match rules");
+        assert_eq!(pol_clr["group"]["match_rules"], json!([]));
+
+        // Verify policy/switch_mode/hard_gates remained intact throughout all mutations.
+        let db = open_storage(&paths).expect("final check db");
+        let final_grp = db.get_multi_group("grp-issue3").unwrap().unwrap();
+        assert_eq!(final_grp.switch_mode, SwitchMode::GracefulNewOnly);
+        assert_eq!(final_grp.hard_gates, original.hard_gates);
+        assert_eq!(final_grp.fallback_policy, FallbackPolicy::CrossPoolEscalate);
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn emit_output_post_sanitization_masks_public_and_private_ips_while_preserving_api_openai_com() {
+        let raw_sanitized = json!({
+            "ok": true,
+            "sanitized": true,
+            "version": "0.1.0",
+            "source_ip": "198.18.0.5",
+            "destination_ip": "203.0.113.42",
+            "host": "api.openai.com",
+            "ip_host": { "host": "198.51.100.77:443" },
+            "dns_note": "direct 223.5.5.5 and lan 10.20.30.40 and loopback 127.0.0.1",
+            "nested": {
+                "host": "github.com",
+                "server": "192.168.1.99"
+            }
+        });
+        let cleaned = finalize_output_value(&raw_sanitized);
+        assert_eq!(cleaned["source_ip"], json!("198.18.0.*"));
+        assert_eq!(cleaned["destination_ip"], json!("203.0.113.*"));
+        assert_eq!(cleaned["host"], json!("api.openai.com"));
+        assert_eq!(cleaned["nested"]["host"], json!("github.com"));
+        assert_eq!(cleaned["ip_host"]["host"], json!("198.51.100.*:443"));
+        assert_eq!(cleaned["nested"]["server"], json!("192.168.1.*"));
+        let note = cleaned["dns_note"].as_str().unwrap();
+        assert!(!note.contains("223.5.5.5"));
+        assert!(!note.contains("10.20.30.40"));
+        assert!(note.contains("223.5.5.*"));
+        assert!(note.contains("10.20.30.*"));
+        assert!(note.contains("127.0.0.1"));
+
+        // When `sanitized` is false (`--reveal-secrets`), values must pass through untouched.
+        let raw_revealed = json!({
+            "ok": true,
+            "sanitized": false,
+            "source_ip": "198.18.0.5",
+            "destination_ip": "203.0.113.42"
+        });
+        let revealed = finalize_output_value(&raw_revealed);
+        assert_eq!(revealed["source_ip"], json!("198.18.0.5"));
+        assert_eq!(revealed["destination_ip"], json!("203.0.113.42"));
+    }
+
+    #[test]
+    fn logs_tail_supports_archive2_since_until_relative_and_reveal_secrets() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-logs-since-until-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        std::fs::write(
+            paths.logs_dir.join("catcloud.log.2"),
+            "2026-11-26T01:00:00Z WARN oldest-archive2 secret=pw_arch2\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.logs_dir.join("catcloud.log.1"),
+            "2026-11-26T02:30:00Z WARN mid-archive1 ip=203.0.113.88\n",
+        )
+        .unwrap();
+        std::fs::write(
+            paths.logs_dir.join("catcloud.log"),
+            "2026-11-26T03:45:00Z ERROR latest-main token=tok_live_99\n\
+             2026-11-26T04:10:00Z INFO after-window\n",
+        )
+        .unwrap();
+
+        let anchor_utc = DateTime::parse_from_rfc3339("2026-11-26T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Local);
+
+        // 1. Absolute RFC3339 window (`--since` + `--until`) reads `.2`/`.1`/primary in order and sanitizes by default.
+        let (window_out, _) = build_logs_tail_payload_with_options(
+            &paths,
+            50,
+            "all",
+            Some("2026-11-26T02:00:00Z"),
+            Some("2026-11-26T03:50:00Z"),
+            false,
+            anchor_utc,
+        )
+        .expect("since/until window");
+        assert_eq!(
+            window_out["sources"],
+            json!(["catcloud.log.2", "catcloud.log.1", "catcloud.log"])
+        );
+        assert_eq!(window_out["sanitized"], json!(true));
+        let lines = window_out["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].as_str().unwrap().contains("mid-archive1"));
+        assert!(lines[0].as_str().unwrap().contains("203.0.113.*"));
+        assert!(lines[1].as_str().unwrap().contains("latest-main"));
+        assert!(!lines[1].as_str().unwrap().contains("tok_live_99"));
+
+        // 2. Relative `--since 30m` from anchor `04:00Z` -> `03:30Z..`, plus `--reveal-secrets`.
+        let (rel_out, _) = build_logs_tail_payload_with_options(
+            &paths,
+            50,
+            "error",
+            Some("30m"),
+            None,
+            true,
+            anchor_utc,
+        )
+        .expect("relative since + reveal");
+        assert_eq!(rel_out["sanitized"], json!(false));
+        let rel_lines = rel_out["lines"].as_array().unwrap();
+        assert_eq!(rel_lines.len(), 1);
+        assert!(rel_lines[0].as_str().unwrap().contains("tok_live_99"));
+
+        // 3. Invalid inverted window (`since > until`) must error cleanly.
+        assert!(
+            build_logs_tail_payload_with_options(
+                &paths,
+                50,
+                "all",
+                Some("2026-11-26T05:00:00Z"),
+                Some("2026-11-26T03:00:00Z"),
+                false,
+                anchor_utc,
+            )
+            .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn config_validate_separates_active_core_ports_from_new_instance_preview_and_detects_third_party_conflict()
+    {
+        use catcloud_core::core_adapter::ControllerEndpointSource;
+
+        fn reserve_tcp_udp_port() -> (u16, std::net::TcpListener, std::net::UdpSocket) {
+            for _ in 0..64 {
+                let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind tcp");
+                let port = tcp.local_addr().unwrap().port();
+                if let Ok(udp) = std::net::UdpSocket::bind(format!("127.0.0.1:{port}")) {
+                    return (port, tcp, udp);
+                }
+            }
+            panic!("failed to reserve ephemeral tcp+udp port");
+        }
+
+        let (busy_mixed, _t1, _u1) = reserve_tcp_udp_port();
+        let (busy_ctrl, _t2, _u2) = reserve_tcp_udp_port();
+        let (busy_dns, _t3, _u3) = reserve_tcp_udp_port();
+
+        let mut cfg = AppConfig::default();
+        cfg.mixed_port = busy_mixed;
+        cfg.controller_port = busy_ctrl;
+        cfg.dns_listen_port = busy_dns;
+        cfg.port_guard_auto_shift = true;
+
+        // 1. When all three ports are owned by the active CatCloud core, compilation MUST reuse
+        //    the active ports without false shifting, while `new_instance_preview_ports` shifts cleanly.
+        let active_owned_state = ActiveCorePortState {
+            core_running: true,
+            core_version: Some("v1.19.1".to_string()),
+            controller_auth_error: None,
+            endpoint: ResolvedControllerEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: busy_ctrl,
+                secret: "demo-secret".to_string(),
+                mixed_port: Some(busy_mixed),
+                dns_port: Some(busy_dns),
+                pid: Some(std::process::id()),
+                process_start_time_unix: get_process_start_time_unix(std::process::id()),
+                binary_path: None,
+                source: ControllerEndpointSource::LiveRuntimeMeta,
+            },
+            live_config: None,
+            effective_mixed_port: busy_mixed,
+            effective_controller_port: busy_ctrl,
+            effective_dns_port: busy_dns,
+            mixed_free: false,
+            controller_free: false,
+            dns_free: false,
+            mixed_owned_by_active_core: true,
+            controller_owned_by_active_core: true,
+            dns_owned_by_active_core: true,
+            owners: Vec::new(),
+        };
+        let (compile_ports, preview_opt, conflicts) =
+            resolve_compile_and_preview_ports(&cfg, &active_owned_state)
+                .expect("resolve active core ports");
+        assert!(conflicts.is_empty());
+        assert!(compile_ports.shifted.is_empty());
+        assert_eq!(compile_ports.mixed_port, busy_mixed);
+        assert_eq!(compile_ports.controller_port, busy_ctrl);
+        assert_eq!(compile_ports.dns_port, busy_dns);
+
+        let preview = preview_opt.expect("new_instance_preview_ports");
+        assert_ne!(preview.mixed_port, busy_mixed);
+        assert_ne!(preview.controller_port, busy_ctrl);
+        assert_ne!(preview.dns_port, busy_dns);
+        assert_eq!(preview.shifted.len(), 3);
+
+        // 2. When no CatCloud core is running and a real third-party listener holds `busy_mixed`,
+        //    `config validate` must detect the genuine conflict!
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-validate-conflict-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        let mut cfg_conflict = config::load_or_init(&paths).expect("init config");
+        cfg_conflict.mixed_port = busy_mixed;
+        cfg_conflict.port_guard_auto_shift = false;
+        config::save(&paths, &cfg_conflict).expect("save conflict cfg");
+
+        let (ok_no_shift, out_no_shift, _) = build_config_validate_payload(&paths)
+            .await
+            .expect("validate conflict no shift");
+        assert!(!ok_no_shift, "third-party conflict with auto_shift=false must fail validation");
+        assert!(out_no_shift["active_core_ports"].is_null());
+        assert!(
+            out_no_shift["third_party_port_conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["port"] == json!(busy_mixed))
+        );
+
+        cfg_conflict.port_guard_auto_shift = true;
+        config::save(&paths, &cfg_conflict).expect("save auto_shift cfg");
+        let (ok_shift, out_shift, _) = build_config_validate_payload(&paths)
+            .await
+            .expect("validate conflict with shift");
+        assert!(ok_shift);
+        assert_ne!(out_shift["ports"]["mixed_port"], json!(busy_mixed));
+        assert!(
+            out_shift["third_party_port_conflicts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["port"] == json!(busy_mixed))
+        );
+        assert!(out_shift["new_instance_preview_ports"].is_object());
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn net_connections_separates_app_and_internal_connections_and_respects_reveal_secrets() {
+        let conns = vec![
+            ActiveConnection {
+                id: "app-1".to_string(),
+                conn_type: "Tun".to_string(),
+                host: "api.openai.com".to_string(),
+                source_ip: "198.18.0.1".to_string(),
+                destination_ip: "203.0.113.55".to_string(),
+                rule: "DomainSuffix".to_string(),
+                chains: vec!["JP-01".to_string(), "AI-Group".to_string()],
+                ..ActiveConnection::default()
+            },
+            ActiveConnection {
+                id: "inner-1".to_string(),
+                conn_type: "Inner".to_string(),
+                host: "223.5.5.5".to_string(),
+                source_ip: "127.0.0.1".to_string(),
+                destination_ip: "223.5.5.5".to_string(),
+                rule: "".to_string(),
+                chains: vec!["DIRECT".to_string()],
+                ..ActiveConnection::default()
+            },
+            ActiveConnection {
+                id: "preaccel-1".to_string(),
+                conn_type: "Socks5".to_string(),
+                host: "198.51.100.10".to_string(),
+                source_ip: "127.0.0.1".to_string(),
+                destination_ip: "198.51.100.10".to_string(),
+                rule: "MATCH".to_string(),
+                chains: vec!["Relay-CN".to_string(), "⚖️ 预加速多云均衡".to_string()],
+                ..ActiveConnection::default()
+            },
+        ];
+
+        let (all_redacted, app, internal, app_count, internal_count) =
+            classify_and_format_connections(&conns, 50, false);
+        assert_eq!(all_redacted.len(), 3);
+        assert_eq!(app_count, 1);
+        assert_eq!(internal_count, 2);
+        assert_eq!(app[0].id, "app-1");
+        assert_eq!(app[0].host, "api.openai.com");
+        assert_eq!(app[0].source_ip, "198.18.0.*");
+        assert_eq!(app[0].destination_ip, "203.0.113.*");
+        assert_eq!(internal[0].id, "inner-1");
+        assert_eq!(internal[0].destination_ip, "223.5.5.*");
+        assert_eq!(internal[1].id, "preaccel-1");
+        assert_eq!(internal[1].host, "198.51.100.*");
+
+        let (_, app_raw, _, _, _) = classify_and_format_connections(&conns, 50, true);
+        assert_eq!(app_raw[0].source_ip, "198.18.0.1");
+        assert_eq!(app_raw[0].destination_ip, "203.0.113.55");
+    }
+
+    #[tokio::test]
+    async fn group_eval_diag_and_global_preaccel_surface_observability_snapshots() {
+        use catcloud_core::models::ProbeResultRecord;
+        use catcloud_core::preaccel::global_tunnel::write_global_preaccel_runtime_meta;
+        use catcloud_core::strategy::health_pool::{
+            WatchdogDecisionEvent, WatchdogStateSnapshot, write_watchdog_state_snapshot,
+        };
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-stage19-obs-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        let db = open_storage(&paths).expect("open db");
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-obs".to_string(),
+            name: "Obs Sub".to_string(),
+            kind: SubscriptionKind::File,
+            url_or_cmd: "obs.yaml".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_node(&ProxyNode {
+            id: "n-obs-1".to_string(),
+            sub_id: "sub-obs".to_string(),
+            name: "JP-Obs-1".to_string(),
+            protocol: "trojan".to_string(),
+            server: "203.0.113.20".to_string(),
+            port: 443,
+            enabled: true,
+            ..ProxyNode::default()
+        })
+        .unwrap();
+        db.insert_probe_result(&ProbeResultRecord {
+            node_id: "n-obs-1".to_string(),
+            probe_id: "builtin_latency".to_string(),
+            tested_at: "2026-11-26T12:00:00Z".to_string(),
+            ok: true,
+            latency_ms: Some(45.0),
+            up_mbps: Some(25.0),
+            down_mbps: Some(120.0),
+            google_clean: Some(true),
+            keepalive_60s_ok: Some(true),
+            ..ProbeResultRecord::default()
+        })
+        .unwrap();
+        db.upsert_multi_group(&MultiGroup {
+            id: "grp-obs".to_string(),
+            name: "Obs Group".to_string(),
+            member_node_ids: vec!["n-obs-1".to_string()],
+            active_node_id: Some("n-obs-1".to_string()),
+            ..MultiGroup::default()
+        })
+        .unwrap();
+        drop(db);
+
+        let mut wd = WatchdogStateSnapshot {
+            updated_at: "2026-11-26T12:05:00Z".to_string(),
+            ..WatchdogStateSnapshot::default()
+        };
+        wd.push_event(WatchdogDecisionEvent {
+            timestamp: "2026-11-26T12:05:00Z".to_string(),
+            group_id: "grp-obs".to_string(),
+            group_name: "Obs Group".to_string(),
+            trigger_reason: "manual_check".to_string(),
+            action: "keep_active".to_string(),
+            ..WatchdogDecisionEvent::default()
+        });
+        write_watchdog_state_snapshot(&paths.root_data_dir, &wd).unwrap();
+
+        let (eval_out, _) = build_group_eval_payload(&paths, "grp-obs").expect("group eval");
+        assert_eq!(eval_out["evaluation_mode"], json!("offline_dry_run"));
+        assert_eq!(
+            eval_out["evaluation"]["gate_passed"][0]["tested_at"],
+            json!("2026-11-26T12:00:00Z")
+        );
+        assert_eq!(
+            eval_out["watchdog_snapshot"]["recent_events"][0]["group_id"],
+            json!("grp-obs")
+        );
+
+        // Verify `config diag` and `net doctor` detect DNS TLS cert verification errors across `.1` + main log.
+        std::fs::write(
+            paths.logs_dir.join("catcloud.log.1"),
+            "2026-11-26T03:44:51+08:00 WARN [DNS] direct-nameserver https://223.5.5.5/dns-query failed: x509: cannot validate certificate for 223.5.5.5 because it doesn't contain any IP SANs\n",
+        )
+        .unwrap();
+        std::fs::write(paths.logs_dir.join("catcloud.log"), "").unwrap();
+
+        let diag = build_diag_payload(&paths, false).await.expect("diag");
+        assert_eq!(
+            diag["dns_diagnostics"]["status"],
+            json!("cert_verification_failed")
+        );
+        assert_eq!(diag["dns_diagnostics"]["tls_verification_preserved"], json!(true));
+        assert!(!diag["warnings"].as_array().unwrap().is_empty());
+
+        let (doctor, _) = build_net_doctor_payload(&paths).await.expect("net doctor");
+        let dns_check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "dns_tls_health")
+            .expect("dns_tls_health check");
+        assert_eq!(dns_check["status"], json!("fail"));
+        assert_eq!(dns_check["data"]["failure_count"], json!(1));
+
+        // Verify stale `global-preaccel-runtime.json` with a bogus dead PID does not report running=true.
+        write_global_preaccel_runtime_meta(
+            &paths.root_data_dir,
+            &GlobalPreAccelRuntimeMeta {
+                pid: Some(u32::MAX - 7),
+                process_start_time_unix: Some(1_600_000_000),
+                running: true,
+                mode: "local_socks5".to_string(),
+                effective_carrier: "standalone_socks5".to_string(),
+                socks_port: Some(17999),
+                updated_at: "2026-11-26T00:00:00Z".to_string(),
+                ..GlobalPreAccelRuntimeMeta::default()
+            },
+        )
+        .unwrap();
+        let (gp_out, _) = build_global_preaccel_status_payload(&paths)
+            .await
+            .expect("global status");
+        assert_eq!(gp_out["standalone_tunnel_running"], json!(false));
+        assert_eq!(gp_out["runtime_meta_stale"], json!(true));
+        assert_eq!(gp_out["effective_carrier"], json!("off"));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn preaccel_global_status_carrier_aligns_with_desktop_for_zero_relays_direct_and_tun() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.global_bypass_enabled = false;
+
+        // 1. Zero enabled relays MUST return `off` in both proxy-only and TUN modes.
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, false, false, true, false, None, false),
+            ("off", false, false, "off")
+        );
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, false, false, true, true, None, false),
+            ("off", false, false, "off")
+        );
+
+        // 2. Direct proxy mode MUST return `off` in both proxy-only and TUN modes.
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, true, true, true, false, None, false),
+            ("off", false, false, "off")
+        );
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, true, true, true, true, None, false),
+            ("off", false, false, "off")
+        );
+
+        // 3. Enabled relays + non-direct + live TUN reports `main_core_tun_suspended_standalone`
+        //    even when `global_bypass_enabled == false` and `runtime_meta == None` (aligned with Desktop).
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, true, false, true, true, None, false),
+            (
+                "main_core_tun_suspended_standalone",
+                false,
+                true,
+                "suspended_for_tun"
+            )
+        );
+
+        // 4. Enabled relays + non-direct + running core without TUN reports `main_core_proxy_only`.
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, true, false, true, false, None, false),
+            ("main_core_proxy_only", false, false, "off")
+        );
+
+        // 5. Live standalone tunnel processes report `standalone_windivert` / `standalone_socks5`.
+        let wd_meta = GlobalPreAccelRuntimeMeta {
+            running: true,
+            mode: "windivert".to_string(),
+            ..GlobalPreAccelRuntimeMeta::default()
+        };
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, true, false, false, false, Some(&wd_meta), true),
+            ("standalone_windivert", true, false, "windivert")
+        );
+        let socks_meta = GlobalPreAccelRuntimeMeta {
+            running: true,
+            mode: "local_socks5".to_string(),
+            ..GlobalPreAccelRuntimeMeta::default()
+        };
+        assert_eq!(
+            resolve_effective_preaccel_carrier(&cfg, true, false, false, false, Some(&socks_meta), true),
+            ("standalone_socks5", true, false, "local_socks5")
+        );
+    }
+
+    #[test]
+    fn live_baseline_reads_tun_section_beyond_512_lines_of_fake_ip_filter() {
+        use catcloud_core::core_adapter::ControllerEndpointSource;
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-large-fake-ip-filter-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let runtime_yaml_path = temp_root.join("runtime.yaml");
+
+        let mut yaml = String::from(concat!(
+            "mixed-port: 17890\n",
+            "allow-lan: false\n",
+            "mode: rule\n",
+            "dns:\n",
+            "  enable: true\n",
+            "  listen: 127.0.0.1:21053\n",
+            "  ipv6: false\n",
+            "  fake-ip-filter:\n",
+        ));
+        for idx in 0..700usize {
+            yaml.push_str(&format!("    - 'node-{idx}.demo.example.invalid'\n"));
+        }
+        yaml.push_str(concat!(
+            "tun:\n",
+            "  enable: true\n",
+            "  stack: gvisor\n",
+            "  device: CatCloudBig\n",
+            "  mtu: 1480\n",
+            "  auto-route: true\n",
+            "  auto-detect-interface: true\n",
+            "  strict-route: false\n",
+            "proxies:\n",
+            "  - name: dummy\n",
+            "    type: trojan\n",
+            "    server: 203.0.113.10\n",
+            "    port: 443\n",
+        ));
+        std::fs::write(&runtime_yaml_path, &yaml).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = false;
+        cfg.tun.stack_mode = TunStackMode::Mixed;
+        cfg.tun.device_name = "CatCloud".to_string();
+        cfg.tun.mtu = 1500;
+        cfg.tun.strict_route = true;
+
+        let ep = ResolvedControllerEndpoint {
+            host: "127.0.0.1".to_string(),
+            port: 19090,
+            secret: "demo".to_string(),
+            mixed_port: None,
+            dns_port: None,
+            pid: None,
+            process_start_time_unix: None,
+            binary_path: None,
+            source: ControllerEndpointSource::ExplicitConfigSecret,
+        };
+
+        let baseline =
+            build_live_baseline_config_from_runtime(&cfg, &runtime_yaml_path, None, &ep);
+        assert_eq!(baseline.mixed_port, 17890);
+        assert_eq!(baseline.dns_listen_port, 21053);
+        assert!(baseline.tun.enabled, "tun.enable past >600 fake-ip-filter lines must be parsed");
+        assert_eq!(baseline.tun.stack_mode, TunStackMode::Gvisor);
+        assert_eq!(baseline.tun.device_name, "CatCloudBig");
+        assert_eq!(baseline.tun.mtu, 1480);
+        assert!(!baseline.tun.strict_route);
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn pid_reuse_guards_fail_closed_on_missing_start_time_self_pid_and_non_windows_process_name() {
+        let self_pid = std::process::id();
+        let other_pid = if self_pid == 42420 { 42421 } else { 42420 };
+
+        // 1. `is_port_owned_by_active_core`: missing actual start time fails closed, self PID rejected.
+        let owner_missing_ts = PortListenerOwner {
+            port: 7890,
+            protocol: "tcp".to_string(),
+            pid: other_pid,
+            process_start_time_unix: None,
+        };
+        assert!(!is_port_owned_by_active_core(
+            7890,
+            true,
+            Some(other_pid),
+            Some(1_700_000_000),
+            &[owner_missing_ts],
+            false,
+        ));
+        let owner_matching_ts = PortListenerOwner {
+            port: 7890,
+            protocol: "tcp".to_string(),
+            pid: other_pid,
+            process_start_time_unix: Some(1_700_000_001),
+        };
+        assert!(is_port_owned_by_active_core(
+            7890,
+            true,
+            Some(other_pid),
+            Some(1_700_000_000),
+            &[owner_matching_ts],
+            false,
+        ));
+        let owner_self = PortListenerOwner {
+            port: 7890,
+            protocol: "tcp".to_string(),
+            pid: self_pid,
+            process_start_time_unix: Some(1_700_000_000),
+        };
+        assert!(!is_port_owned_by_active_core(
+            7890,
+            true,
+            Some(self_pid),
+            Some(1_700_000_000),
+            &[owner_self.clone()],
+            false,
+        ));
+
+        // 2. `verify_managed_pid_with_start_time`: missing actual start time fails closed, self PID rejected.
+        assert!(!verify_managed_pid_with_start_time(
+            other_pid,
+            "mihomo.exe",
+            Some(other_pid),
+            Some(1_700_000_000),
+            None,
+        ));
+        assert!(!verify_managed_pid_with_start_time(
+            self_pid,
+            "mihomo.exe",
+            Some(self_pid),
+            Some(1_700_000_000),
+            Some(1_700_000_000),
+        ));
+        assert!(verify_managed_pid_with_start_time(
+            other_pid,
+            "mihomo.exe",
+            Some(other_pid),
+            Some(1_700_000_000),
+            Some(1_700_000_002),
+        ));
+
+        // 3. `collect_verified_listener_pids`: missing actual start time fails closed, self PID rejected.
+        let verified_missing = collect_verified_listener_pids(
+            &[PortListenerOwner {
+                port: 19090,
+                protocol: "tcp".to_string(),
+                pid: other_pid,
+                process_start_time_unix: None,
+            }],
+            Some(other_pid),
+            Some(1_700_000_000),
+            None,
+            None,
+        );
+        assert!(verified_missing.is_empty());
+        let verified_self = collect_verified_listener_pids(
+            &[owner_self],
+            Some(self_pid),
+            Some(1_700_000_000),
+            None,
+            None,
+        );
+        assert!(verified_self.is_empty());
+        let verified_ok = collect_verified_listener_pids(
+            &[PortListenerOwner {
+                port: 19090,
+                protocol: "tcp".to_string(),
+                pid: other_pid,
+                process_start_time_unix: Some(1_700_000_002),
+            }],
+            Some(other_pid),
+            Some(1_700_000_000),
+            None,
+            None,
+        );
+        assert!(verified_ok.contains(&other_pid));
+
+        // 4. `is_live_global_preaccel_pid` & `evaluate_live_global_preaccel_pid`:
+        //    reject self PID, fail closed on missing start time, and validate non-Windows process name.
+        let self_meta = GlobalPreAccelRuntimeMeta {
+            running: true,
+            pid: Some(self_pid),
+            process_start_time_unix: get_process_start_time_unix(self_pid),
+            mode: "local_socks5".to_string(),
+            ..GlobalPreAccelRuntimeMeta::default()
+        };
+        assert!(!is_live_global_preaccel_pid(&self_meta));
+
+        let other_meta = GlobalPreAccelRuntimeMeta {
+            running: true,
+            pid: Some(other_pid),
+            process_start_time_unix: Some(1_700_000_000),
+            mode: "local_socks5".to_string(),
+            ..GlobalPreAccelRuntimeMeta::default()
+        };
+        assert!(evaluate_live_global_preaccel_pid(
+            &other_meta,
+            Some(1_700_000_001),
+            Some(Some("mihomo-linux-amd64")),
+            None,
+        ));
+        assert!(!evaluate_live_global_preaccel_pid(
+            &other_meta,
+            Some(1_700_000_001),
+            Some(Some("python3")),
+            None,
+        ));
+        assert!(!evaluate_live_global_preaccel_pid(
+            &other_meta,
+            Some(1_700_000_001),
+            Some(None),
+            None,
+        ));
+        assert!(!evaluate_live_global_preaccel_pid(
+            &other_meta,
+            None,
+            Some(Some("mihomo")),
+            None,
+        ));
+    }
+
+    #[test]
+    fn preaccel_speed_reference_node_skips_ipv6_only_for_ipv4_relay_without_breaking_dual_stack() {
+        let ipv6_only = ProxyNode {
+            id: "n-v6-only".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "JP Pure IPv6".to_string(),
+            protocol: "vless".to_string(),
+            server: "2001:db8:cafe::1".to_string(),
+            port: 8443,
+            is_443_native: false,
+            enabled: true,
+            ..ProxyNode::default()
+        };
+        let dual_stack_named_ipv6 = ProxyNode {
+            id: "n-hk-dual".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "HK-01-IPv6".to_string(),
+            protocol: "trojan".to_string(),
+            server: "hk01.example.com".to_string(),
+            port: 8443,
+            is_443_native: false,
+            enabled: true,
+            ..ProxyNode::default()
+        };
+        let mut cfg = AppConfig::default();
+        cfg.route_mode = RouteTargetMode::Single;
+        cfg.active_single_node_id = Some("n-v6-only".to_string());
+
+        // 1. Homepage IPv6-only node gracefully falls back to dual-stack `HK-01-IPv6` when relay is IPv4-only.
+        let (picked, note) = select_preaccel_speed_reference_node(
+            &cfg,
+            &[],
+            &[ipv6_only.clone(), dual_stack_named_ipv6.clone()],
+            None,
+            false,
+        )
+        .expect("fallback from IPv6-only homepage node");
+        assert_eq!(picked.as_ref().map(|n| n.id.as_str()), Some("n-hk-dual"));
+        assert!(note.as_deref().is_some_and(|n| n.contains("IPv6-only")));
+
+        // 2. Dual-stack `HK-01-IPv6` is NOT skipped when selected on homepage.
+        cfg.active_single_node_id = Some("n-hk-dual".to_string());
+        let (picked_dual, note_dual) = select_preaccel_speed_reference_node(
+            &cfg,
+            &[],
+            &[ipv6_only.clone(), dual_stack_named_ipv6.clone()],
+            None,
+            false,
+        )
+        .expect("dual-stack node kept");
+        assert_eq!(picked_dual.as_ref().map(|n| n.id.as_str()), Some("n-hk-dual"));
+        assert!(note_dual.is_none());
+
+        // 3. When relay supports IPv6, IPv6-only homepage node is kept directly.
+        cfg.active_single_node_id = Some("n-v6-only".to_string());
+        let (picked_v6, note_v6) = select_preaccel_speed_reference_node(
+            &cfg,
+            &[],
+            &[ipv6_only.clone(), dual_stack_named_ipv6.clone()],
+            None,
+            true,
+        )
+        .expect("IPv6-capable relay keeps IPv6-only node");
+        assert_eq!(picked_v6.as_ref().map(|n| n.id.as_str()), Some("n-v6-only"));
+        assert!(note_v6.is_none());
+
+        // 4. Explicit requested_node_id honors user choice even for IPv6-only node.
+        let (picked_explicit, note_explicit) = select_preaccel_speed_reference_node(
+            &cfg,
+            &[],
+            &[ipv6_only.clone(), dual_stack_named_ipv6],
+            Some("n-v6-only"),
+            false,
+        )
+        .expect("explicit node honored");
+        assert_eq!(picked_explicit.as_ref().map(|n| n.id.as_str()), Some("n-v6-only"));
+        assert!(note_explicit.is_none());
+
+        // 5. Only IPv6-only node with IPv4-only relay gracefully falls back to single-hop speed test.
+        let (single_hop, single_note) =
+            select_preaccel_speed_reference_node(&cfg, &[], &[ipv6_only], None, false)
+                .expect("fallback to single-hop when only IPv6-only nodes exist");
+        assert!(single_hop.is_none());
+        assert!(single_note.as_deref().is_some_and(|n| n.contains("single-hop")));
+    }
+
+    #[tokio::test]
+    async fn cli_tun_state_does_not_misreport_enabled_when_live_core_reports_tun_disabled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock controller");
+        let mock_port = listener.local_addr().unwrap().port();
+        let secret = "test-bp15-secret";
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..16 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 2048];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let has_auth = req_str
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-bp15-secret");
+                let (status_line, body) = if !has_auth {
+                    ("HTTP/1.1 401 Unauthorized", r#"{"message":"Unauthorized"}"#)
+                } else if req_str.starts_with("GET /version ") {
+                    ("HTTP/1.1 200 OK", r#"{"version":"v1.19.1"}"#)
+                } else if req_str.starts_with("GET /configs ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"tun":{"enable":false},"mixed-port":17890,"port":0,"socks-port":0,"bind-address":"127.0.0.1","allow-lan":false,"mode":"rule"}"#,
+                    )
+                } else if req_str.starts_with("GET /connections ") {
+                    ("HTTP/1.1 200 OK", r#"{"downloadTotal":0,"uploadTotal":0,"connections":[]}"#)
+                } else {
+                    ("HTTP/1.1 200 OK", r#"{}"#)
+                };
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-live-tun-disabled-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+        let mut cfg = config::load_or_init(&paths).expect("init config");
+        cfg.controller_port = mock_port;
+        cfg.controller_secret = Some(secret.to_string());
+        cfg.tun.enabled = true;
+        config::save(&paths, &cfg).expect("save config");
+
+        let mut unpriv_caps = default_platform().capabilities();
+        unpriv_caps.is_elevated = false;
+
+        let active_ports = inspect_active_core_ports(&paths, &cfg).await;
+        assert!(active_ports.core_running);
+        assert_eq!(
+            active_ports.live_config.as_ref().map(|lc| lc.tun_enable),
+            Some(false)
+        );
+
+        let (tun_enabled, tun_needs_elevation, tun_source) =
+            resolve_cli_effective_tun_state_with_probe(&cfg, &unpriv_caps, None, &active_ports)
+                .await;
+        assert!(!tun_enabled, "must NOT misreport tun_enabled=true when live /configs says false");
+        assert!(tun_needs_elevation);
+        assert_eq!(tun_source, "live_core_tun_disabled_needs_elevation");
+
+        let (doctor, _) = build_net_doctor_payload(&paths).await.expect("net doctor");
+        let tun_check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "system_proxy_and_tun")
+            .expect("system_proxy_and_tun check");
+        assert_eq!(tun_check["data"]["tun_enabled"], json!(false));
+        assert_ne!(
+            tun_check["data"]["tun_runtime_source"],
+            json!("live_core_with_tun_config")
+        );
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

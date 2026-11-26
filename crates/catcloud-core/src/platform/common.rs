@@ -1,5 +1,64 @@
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+
+/// Listener socket ownership entry mapping a listening local port and protocol to its owning PID.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PortListenerOwner {
+    pub port: u16,
+    pub protocol: String,
+    pub pid: u32,
+    pub process_start_time_unix: Option<u64>,
+}
+
+/// Query local TCP and UDP listening socket owners matching `ports`.
+///
+/// - Windows: queries both `GetExtendedTcpTable` (`TCP_TABLE_OWNER_PID_LISTENER`) and
+///   `GetExtendedUdpTable` (`UDP_TABLE_OWNER_PID`) across IPv4 and IPv6.
+/// - Non-Windows: returns an empty vector as a safe cross-platform fallback.
+pub fn list_listening_port_owners(ports: &[u16]) -> Vec<PortListenerOwner> {
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        super::windows::list_listening_port_owners_windows(ports)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = ports;
+        Vec::new()
+    }
+}
+
+/// Return the process creation timestamp (Unix epoch seconds) for `pid`, or `None` if the process
+/// does not exist or cannot be queried.
+///
+/// - Windows: uses `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetProcessTimes`.
+/// - Non-Windows: lightweight `sysinfo` single-PID query fallback.
+pub fn get_process_start_time_unix(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        super::windows::get_process_start_time_unix_windows(pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+        let target = Pid::from_u32(pid);
+        let mut system = System::new_with_specifics(RefreshKind::nothing());
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[target]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        let proc_info = system.process(target)?;
+        let start = proc_info.start_time();
+        (start > 0).then_some(start)
+    }
+}
 
 pub const LAUNCH_AGENT_LABEL: &str = "io.catcloud.app";
 

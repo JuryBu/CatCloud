@@ -51,6 +51,9 @@ const SettingsPage = lazy(() =>
 const CapsuleWindow = lazy(() =>
   import("./pages/CapsuleWindow").then((m) => ({ default: m.CapsuleWindow }))
 );
+const OnboardingModal = lazy(() =>
+  import("./components/OnboardingModal").then((m) => ({ default: m.OnboardingModal }))
+);
 
 function PageLoadingFallback({ label }: { label: string }) {
   return (
@@ -84,6 +87,16 @@ function renderActivePage(route: NavRouteId) {
 
 export function App() {
   const windowMode = useAppSelector((s) => s.windowMode);
+  const initialized = useAppSelector((s) => s.initialized);
+  const onboardingCompleted = useAppSelector(
+    (s) => s.config.personalization.onboarding_completed === true
+  );
+  const onboardingModalOpen = useAppSelector((s) => s.onboardingModalOpen);
+  const onboardingAutoSkipped = useAppSelector((s) => s.onboardingAutoSkipped);
+  const showOnboardingModal =
+    windowMode === "main" &&
+    initialized &&
+    (onboardingModalOpen || (!onboardingCompleted && !onboardingAutoSkipped));
   const activeNav = useAppSelector((s) => s.activeNav);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const wallpaperPath = useAppSelector((s) => s.config.personalization.wallpaper_path);
@@ -333,6 +346,12 @@ export function App() {
           </div>
         </main>
       </div>
+
+      {showOnboardingModal && (
+        <Suspense fallback={null}>
+          <OnboardingModal />
+        </Suspense>
+      )}
 
       {visibleToast && (
         <div className="pointer-events-none fixed inset-x-4 top-12 z-50 flex justify-center">

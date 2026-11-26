@@ -1,18 +1,28 @@
+use super::common::PortListenerOwner;
 use super::{PlatformAdapter, PlatformCapabilities, SystemProxySpec};
 use crate::error::{CatError, CatResult};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, GetLastError, HANDLE,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS, FILETIME,
+    GetLastError, HANDLE, NO_ERROR,
+};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_PID, MIB_TCP6TABLE_OWNER_PID,
+    MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID, MIB_UDP6ROW_OWNER_PID, MIB_UDP6TABLE_OWNER_PID,
+    MIB_UDPROW_OWNER_PID, MIB_UDPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_LISTENER,
+    UDP_TABLE_OWNER_PID,
 };
 use windows_sys::Win32::Networking::WinInet::{
     INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED, InternetSetOptionW,
 };
+use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
@@ -22,7 +32,8 @@ use windows_sys::Win32::System::Registry::{
     RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 use windows_sys::Win32::System::Threading::{
-    CREATE_NO_WINDOW, GetCurrentProcess, OpenProcessToken,
+    CREATE_NO_WINDOW, GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+    PROCESS_QUERY_LIMITED_INFORMATION,
 };
 
 const INTERNET_SETTINGS_SUBKEY: &str =
@@ -909,9 +920,297 @@ impl Drop for RegKeyGuard {
     }
 }
 
+const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+
+/// Query the process creation timestamp (Unix epoch seconds) for `pid` on Windows via
+/// `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` + `GetProcessTimes`.
+pub(crate) fn get_process_start_time_unix_windows(pid: u32) -> Option<u64> {
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: Opening process with read-only limited query rights; handle is closed unconditionally.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let mut creation = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut exit = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut kernel = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let mut user = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    // SAFETY: `handle` is live and all four `FILETIME` out-pointers point to valid stack storage.
+    let ok = unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) };
+    // SAFETY: Always release the opened process handle.
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if ok == 0 {
+        return None;
+    }
+    let ticks_100ns =
+        ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
+    if ticks_100ns < WINDOWS_TO_UNIX_EPOCH_100NS {
+        return None;
+    }
+    Some((ticks_100ns - WINDOWS_TO_UNIX_EPOCH_100NS) / 10_000_000)
+}
+
+fn query_extended_tcp_listener_table(af: u32) -> Option<Vec<u32>> {
+    let mut size: u32 = 0;
+    // SAFETY: First probe with null buffer retrieves required byte size in `size`.
+    let rc0 = unsafe {
+        GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            af,
+            TCP_TABLE_OWNER_PID_LISTENER,
+            0,
+        )
+    };
+    if rc0 != ERROR_INSUFFICIENT_BUFFER && rc0 != NO_ERROR {
+        return None;
+    }
+    if size == 0 {
+        return None;
+    }
+    for _ in 0..3 {
+        let words = (size as usize).div_ceil(std::mem::size_of::<u32>());
+        let mut buf = vec![0u32; words];
+        let mut actual_size = (buf.len() * std::mem::size_of::<u32>()) as u32;
+        // SAFETY: `buf` is 4-byte aligned with capacity `actual_size` bytes.
+        let rc = unsafe {
+            GetExtendedTcpTable(
+                buf.as_mut_ptr().cast(),
+                &mut actual_size,
+                0,
+                af,
+                TCP_TABLE_OWNER_PID_LISTENER,
+                0,
+            )
+        };
+        if rc == NO_ERROR {
+            return Some(buf);
+        }
+        if rc == ERROR_INSUFFICIENT_BUFFER && actual_size > 0 {
+            size = actual_size;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+fn query_extended_udp_owner_table(af: u32) -> Option<Vec<u32>> {
+    let mut size: u32 = 0;
+    // SAFETY: First probe with null buffer retrieves required byte size in `size`.
+    let rc0 = unsafe {
+        GetExtendedUdpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            af,
+            UDP_TABLE_OWNER_PID,
+            0,
+        )
+    };
+    if rc0 != ERROR_INSUFFICIENT_BUFFER && rc0 != NO_ERROR {
+        return None;
+    }
+    if size == 0 {
+        return None;
+    }
+    for _ in 0..3 {
+        let words = (size as usize).div_ceil(std::mem::size_of::<u32>());
+        let mut buf = vec![0u32; words];
+        let mut actual_size = (buf.len() * std::mem::size_of::<u32>()) as u32;
+        // SAFETY: `buf` is 4-byte aligned with capacity `actual_size` bytes.
+        let rc = unsafe {
+            GetExtendedUdpTable(
+                buf.as_mut_ptr().cast(),
+                &mut actual_size,
+                0,
+                af,
+                UDP_TABLE_OWNER_PID,
+                0,
+            )
+        };
+        if rc == NO_ERROR {
+            return Some(buf);
+        }
+        if rc == ERROR_INSUFFICIENT_BUFFER && actual_size > 0 {
+            size = actual_size;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+fn decode_win_iphelper_port(dw_local_port: u32) -> u16 {
+    u16::from_be((dw_local_port & 0xffff) as u16)
+}
+
+fn collect_table_rows<Row: Copy, F>(
+    buf: &[u32],
+    table_offset: usize,
+    mut extract: F,
+    wanted: &HashSet<u16>,
+    protocol: &'static str,
+    seen: &mut HashSet<(u16, &'static str, u32)>,
+    start_cache: &mut HashMap<u32, Option<u64>>,
+    out: &mut Vec<PortListenerOwner>,
+) where
+    F: FnMut(&Row) -> (u16, u32),
+{
+    let total_bytes = buf.len() * std::mem::size_of::<u32>();
+    if total_bytes < std::mem::size_of::<u32>() {
+        return;
+    }
+    let base_ptr = buf.as_ptr().cast::<u8>();
+    // SAFETY: `buf` is 4-byte aligned and holds at least one `u32` (`dwNumEntries`).
+    let count = unsafe { *(base_ptr.cast::<u32>()) } as usize;
+    let row_size = std::mem::size_of::<Row>();
+    if row_size == 0 || total_bytes < table_offset {
+        return;
+    }
+    let max_rows = (total_bytes - table_offset) / row_size;
+    let safe_count = count.min(max_rows);
+    for idx in 0..safe_count {
+        let offset = table_offset + idx * row_size;
+        // SAFETY: `offset + row_size <= total_bytes` and pointer derives from `buf` allocation.
+        let row = unsafe { std::ptr::read_unaligned(base_ptr.add(offset).cast::<Row>()) };
+        let (port, pid) = extract(&row);
+        if pid == 0 || !wanted.contains(&port) {
+            continue;
+        }
+        if seen.insert((port, protocol, pid)) {
+            let start_ts = *start_cache
+                .entry(pid)
+                .or_insert_with(|| get_process_start_time_unix_windows(pid));
+            out.push(PortListenerOwner {
+                port,
+                protocol: protocol.to_string(),
+                pid,
+                process_start_time_unix: start_ts,
+            });
+        }
+    }
+}
+
+/// Query Windows TCP (IPv4 + IPv6 listeners) and UDP (IPv4 + IPv6 bound sockets) owners
+/// matching `ports` via `GetExtendedTcpTable` and `GetExtendedUdpTable`.
+pub(crate) fn list_listening_port_owners_windows(ports: &[u16]) -> Vec<PortListenerOwner> {
+    let wanted: HashSet<u16> = ports.iter().copied().filter(|&p| p > 0).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    let mut seen: HashSet<(u16, &'static str, u32)> = HashSet::new();
+    let mut start_cache: HashMap<u32, Option<u64>> = HashMap::new();
+    let mut out: Vec<PortListenerOwner> = Vec::new();
+
+    if let Some(buf) = query_extended_tcp_listener_table(u32::from(AF_INET)) {
+        collect_table_rows::<MIB_TCPROW_OWNER_PID, _>(
+            &buf,
+            std::mem::offset_of!(MIB_TCPTABLE_OWNER_PID, table),
+            |row| (decode_win_iphelper_port(row.dwLocalPort), row.dwOwningPid),
+            &wanted,
+            "tcp",
+            &mut seen,
+            &mut start_cache,
+            &mut out,
+        );
+    }
+    if let Some(buf) = query_extended_tcp_listener_table(u32::from(AF_INET6)) {
+        collect_table_rows::<MIB_TCP6ROW_OWNER_PID, _>(
+            &buf,
+            std::mem::offset_of!(MIB_TCP6TABLE_OWNER_PID, table),
+            |row| (decode_win_iphelper_port(row.dwLocalPort), row.dwOwningPid),
+            &wanted,
+            "tcp",
+            &mut seen,
+            &mut start_cache,
+            &mut out,
+        );
+    }
+    if let Some(buf) = query_extended_udp_owner_table(u32::from(AF_INET)) {
+        collect_table_rows::<MIB_UDPROW_OWNER_PID, _>(
+            &buf,
+            std::mem::offset_of!(MIB_UDPTABLE_OWNER_PID, table),
+            |row| (decode_win_iphelper_port(row.dwLocalPort), row.dwOwningPid),
+            &wanted,
+            "udp",
+            &mut seen,
+            &mut start_cache,
+            &mut out,
+        );
+    }
+    if let Some(buf) = query_extended_udp_owner_table(u32::from(AF_INET6)) {
+        collect_table_rows::<MIB_UDP6ROW_OWNER_PID, _>(
+            &buf,
+            std::mem::offset_of!(MIB_UDP6TABLE_OWNER_PID, table),
+            |row| (decode_win_iphelper_port(row.dwLocalPort), row.dwOwningPid),
+            &wanted,
+            "udp",
+            &mut seen,
+            &mut start_cache,
+            &mut out,
+        );
+    }
+
+    out.sort_by(|a, b| {
+        (a.port, a.protocol.as_str(), a.pid).cmp(&(b.port, b.protocol.as_str(), b.pid))
+    });
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_port_listener_owners_and_process_start_time_detect_current_process() {
+        use std::net::{TcpListener, UdpSocket};
+
+        let my_pid = std::process::id();
+        let my_start = super::super::common::get_process_start_time_unix(my_pid)
+            .expect("current process start time must be readable on Windows");
+        assert!(my_start > 1_700_000_000, "unexpected unix start time: {my_start}");
+        assert_eq!(super::super::common::get_process_start_time_unix(0), None);
+
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral tcp");
+        let tcp_port = tcp.local_addr().unwrap().port();
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral udp");
+        let udp_port = udp.local_addr().unwrap().port();
+
+        let owners = super::super::common::list_listening_port_owners(&[tcp_port, udp_port]);
+        let tcp_owner = owners
+            .iter()
+            .find(|o| o.port == tcp_port && o.protocol == "tcp" && o.pid == my_pid)
+            .expect("TCP listener must be attributed to current process");
+        assert_eq!(tcp_owner.process_start_time_unix, Some(my_start));
+
+        let udp_owner = owners
+            .iter()
+            .find(|o| o.port == udp_port && o.protocol == "udp" && o.pid == my_pid)
+            .expect("UDP socket must be attributed to current process");
+        assert_eq!(udp_owner.process_start_time_unix, Some(my_start));
+
+        drop(tcp);
+        drop(udp);
+    }
 
     #[test]
     fn parse_proxy_server_variants() {

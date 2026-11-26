@@ -1,6 +1,11 @@
 use crate::error::{CatError, CatResult};
-use crate::models::{PreAccelRelay, ProxyNode};
-use crate::preaccel::{compile_relay_to_mihomo_yaml, host_to_direct_rule};
+use crate::models::{
+    PreAccelDispatchStrategy, PreAccelLbStrategy, PreAccelRelay, ProxyNode, is_ipv6_only_node,
+};
+use crate::preaccel::{
+    DEFAULT_DOMESTIC_204_PRIMARY, compile_relay_to_mihomo_yaml, host_to_direct_rule,
+    relays_support_ipv6, select_physical_host_relays,
+};
 use crate::process_guard::JobGuard;
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Value as YamlValue};
@@ -24,19 +29,24 @@ pub const PROBE_CORE_PROCESS_NAME: &str = if cfg!(windows) {
     "catcloud-probe-core"
 };
 
-/// Pure-IP DoH (TCP 443) bootstrap resolvers for `dns.default-nameserver` inside isolated probe
-/// configs. Never include `"system"` here so an active primary-core TUN `dns-hijack: any:53`
-/// cannot loop or return Fake-IPs, while remaining immune to campus networks blocking UDP 53.
+/// Pure-IP heterogeneous encrypted (TCP 443 DoH + TCP 853 DoT) bootstrap resolvers for
+/// `dns.default-nameserver` inside isolated probe configs. Never include `"system"` here so an
+/// active primary-core TUN `dns-hijack: any:53` cannot loop or return Fake-IPs, while remaining
+/// resilient against campus networks blocking UDP 53 or throttling single DoH/DoT endpoints.
 pub const DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS: &[&str] = &[
     "https://223.5.5.5/dns-query",
     "https://1.12.12.12/dns-query",
+    "tls://223.6.6.6:853",
+    "tls://120.53.53.53:853",
 ];
 
-/// Default pure-IP DoH resolvers used for `proxy-server-nameserver` / `nameserver` so isolated
-/// probe DNS completely avoids primary-core TUN `dns-hijack: any:53` interception.
+/// Default pure-IP heterogeneous encrypted resolvers used for `proxy-server-nameserver` /
+/// `nameserver` so isolated probe DNS completely avoids primary-core TUN `dns-hijack: any:53`.
 pub const DEFAULT_PROBE_NAMESERVERS: &[&str] = &[
     "https://223.5.5.5/dns-query",
     "https://1.12.12.12/dns-query",
+    "tls://223.6.6.6:853",
+    "tls://120.53.53.53:853",
 ];
 
 /// Memory limit injected into temporary isolated Mihomo probe instances.
@@ -135,6 +145,12 @@ pub fn allocate_ephemeral_ports(count: usize) -> CatResult<Vec<u16>> {
 /// Canonical proxy name for the optional domestic pre-acceleration relay inside isolated probe cores.
 pub const PROBE_RELAY_PROXY_NAME: &str = "catcloud-probe-relay";
 
+/// Outer fallback group name used by multi-cloud pre-acceleration isolated probe pools.
+pub const PROBE_RELAY_POOL_GROUP_NAME: &str = "catcloud-probe-relay-pool";
+
+/// Inner load-balance group name used when 2+ distinct physical cloud relays are active in probe pools.
+pub const PROBE_RELAY_LB_GROUP_NAME: &str = "catcloud-probe-relay-lb";
+
 /// Resolve deterministic, collision-free proxy names for a slice of bound nodes.
 pub fn resolve_unique_proxy_names(bindings: &[(u16, &ProxyNode)]) -> Vec<String> {
     resolve_unique_proxy_names_with_reserved(bindings, None)
@@ -144,9 +160,20 @@ fn resolve_unique_proxy_names_with_reserved(
     bindings: &[(u16, &ProxyNode)],
     reserved_name: Option<&str>,
 ) -> Vec<String> {
-    let mut used: HashSet<String> = HashSet::with_capacity(bindings.len() + 1);
-    if let Some(reserved) = reserved_name {
-        used.insert(reserved.to_string());
+    let mut reserved: HashSet<String> = HashSet::new();
+    if let Some(name) = reserved_name {
+        reserved.insert(name.to_string());
+    }
+    resolve_unique_proxy_names_with_reserved_set(bindings, &reserved)
+}
+
+fn resolve_unique_proxy_names_with_reserved_set(
+    bindings: &[(u16, &ProxyNode)],
+    reserved_names: &HashSet<String>,
+) -> Vec<String> {
+    let mut used: HashSet<String> = HashSet::with_capacity(bindings.len() + reserved_names.len());
+    for reserved in reserved_names {
+        used.insert(reserved.clone());
     }
     let mut out = Vec::with_capacity(bindings.len());
 
@@ -445,7 +472,15 @@ pub fn build_isolated_probe_yaml_with_preaccel(
         // groups absent from the minimal ephemeral probe configuration.
         proxy_map.remove("dialer-proxy");
 
-        if preaccel_relay.is_some() && node.should_apply_preaccel(skip_443_native) {
+        let skip_for_ipv6 = preaccel_relay.is_some_and(|relay| {
+            !relay.supports_ipv6
+                && is_ipv6_only_node(node)
+                && node.preaccel_override != Some(true)
+        });
+        if preaccel_relay.is_some()
+            && node.should_apply_preaccel(skip_443_native)
+            && !skip_for_ipv6
+        {
             proxy_map.insert(
                 YamlValue::from("dialer-proxy"),
                 YamlValue::from(PROBE_RELAY_PROXY_NAME),
@@ -502,6 +537,326 @@ pub fn build_isolated_probe_yaml_with_preaccel(
     if let Some(relay) = preaccel_relay {
         if let Some(anti_loop) = host_to_direct_rule(&relay.server) {
             rules_seq.push(YamlValue::from(anti_loop));
+        }
+    }
+    rules_seq.push(YamlValue::from("MATCH,DIRECT"));
+    root.insert(YamlValue::from("rules"), YamlValue::Sequence(rules_seq));
+
+    let yaml = serde_yaml_ng::to_string(&YamlValue::Mapping(root))?;
+    Ok(yaml)
+}
+
+/// Generate a strictly isolated, zero-interference Mihomo probe configuration YAML backed by a
+/// multi-cloud domestic `:443` pre-acceleration relay pool.
+///
+/// Enforced invariants:
+/// - Enabled relays are sorted `(priority ASC, id ASC)` and deduplicated by physical cloud host
+///   via [`select_physical_host_relays`].
+/// - When `distinct_host_count >= 2` and `dispatch_strategy` is `Auto | LoadBalance`:
+///   - Inner [`PROBE_RELAY_LB_GROUP_NAME`] (`type: load-balance`, `strategy: lb_strategy.as_str()`,
+///     `proxies: [physical-host TCP reps]`, **NEVER contains `DIRECT`**);
+///   - Outer [`PROBE_RELAY_POOL_GROUP_NAME`] (`type: fallback`,
+///     `proxies: [PROBE_RELAY_LB_GROUP_NAME, same-host secondary protocols..., "DIRECT"]`).
+/// - When only 1 physical host is enabled (or `dispatch_strategy == Fallback`):
+///   - Single-layer [`PROBE_RELAY_POOL_GROUP_NAME`] (`type: fallback`,
+///     `proxies: [catcloud-probe-relay-0..., "DIRECT"]`).
+/// - Pure IPv6 business nodes automatically skip IPv4-only relays unless `preaccel_override == Some(true)`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_isolated_probe_yaml_with_preaccel_pool(
+    controller_port: u16,
+    secret: &str,
+    bindings: &[(u16, &ProxyNode)],
+    proxy_nameservers: &[String],
+    relays: &[PreAccelRelay],
+    dispatch_strategy: PreAccelDispatchStrategy,
+    lb_strategy: PreAccelLbStrategy,
+    skip_443_native: bool,
+) -> CatResult<String> {
+    let mut enabled_relays: Vec<PreAccelRelay> =
+        relays.iter().filter(|r| r.enabled).cloned().collect();
+    if enabled_relays.is_empty() {
+        return build_isolated_probe_yaml(controller_port, secret, bindings, proxy_nameservers);
+    }
+    enabled_relays.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+
+    if controller_port == 0 {
+        return Err(CatError::Validation(
+            "isolated probe controller_port must be non-zero".into(),
+        ));
+    }
+    if secret.trim().is_empty() {
+        return Err(CatError::Validation(
+            "isolated probe controller secret cannot be empty".into(),
+        ));
+    }
+    if bindings.is_empty() {
+        return Err(CatError::Validation(
+            "isolated probe configuration requires at least one node binding".into(),
+        ));
+    }
+    for relay in &enabled_relays {
+        if relay.server.trim().is_empty() || relay.port == 0 {
+            return Err(CatError::Validation(format!(
+                "domestic pre-acceleration relay `{}` must specify a valid server and port",
+                relay.id
+            )));
+        }
+    }
+
+    let mut used_ports: HashSet<u16> = HashSet::with_capacity(bindings.len() + 1);
+    used_ports.insert(controller_port);
+    for (port, node) in bindings {
+        if *port == 0 {
+            return Err(CatError::Validation(format!(
+                "listener port for node `{}` must be non-zero",
+                node.id
+            )));
+        }
+        if !used_ports.insert(*port) {
+            return Err(CatError::Validation(format!(
+                "duplicate port {port} in isolated probe configuration"
+            )));
+        }
+    }
+
+    let resolved_ns = sanitize_isolated_probe_nameservers(proxy_nameservers);
+    let ns_yaml: Vec<YamlValue> = resolved_ns.iter().cloned().map(YamlValue::from).collect();
+    let bootstrap_ns_yaml: Vec<YamlValue> = DEFAULT_PROBE_BOOTSTRAP_NAMESERVERS
+        .iter()
+        .map(|s| YamlValue::from(*s))
+        .collect();
+
+    let mut relay_id_to_proxy_name: HashMap<String, String> =
+        HashMap::with_capacity(enabled_relays.len());
+    let mut relay_proxy_names_ordered: Vec<String> = Vec::with_capacity(enabled_relays.len());
+    let mut reserved_names: HashSet<String> = HashSet::with_capacity(enabled_relays.len() + 2);
+    reserved_names.insert(PROBE_RELAY_POOL_GROUP_NAME.to_string());
+    reserved_names.insert(PROBE_RELAY_LB_GROUP_NAME.to_string());
+    for (idx, relay) in enabled_relays.iter().enumerate() {
+        let name = format!("catcloud-probe-relay-{idx}");
+        reserved_names.insert(name.clone());
+        relay_id_to_proxy_name.insert(relay.id.clone(), name.clone());
+        relay_proxy_names_ordered.push(name);
+    }
+
+    let proxy_names = resolve_unique_proxy_names_with_reserved_set(bindings, &reserved_names);
+    let all_relays_ipv6 = relays_support_ipv6(&enabled_relays);
+    let selection = select_physical_host_relays(&enabled_relays);
+    let use_two_layer_lb = selection.distinct_host_count >= 2
+        && matches!(
+            dispatch_strategy,
+            PreAccelDispatchStrategy::Auto | PreAccelDispatchStrategy::LoadBalance
+        );
+
+    let mut root = Mapping::new();
+    root.insert(YamlValue::from("mixed-port"), YamlValue::from(0u16));
+    root.insert(YamlValue::from("allow-lan"), YamlValue::from(false));
+    root.insert(
+        YamlValue::from("bind-address"),
+        YamlValue::from(ISOLATED_BIND_HOST),
+    );
+    root.insert(YamlValue::from("mode"), YamlValue::from("rule"));
+    root.insert(YamlValue::from("log-level"), YamlValue::from("warning"));
+    root.insert(YamlValue::from("ipv6"), YamlValue::from(false));
+    root.insert(YamlValue::from("geodata-mode"), YamlValue::from(false));
+    root.insert(
+        YamlValue::from("external-controller"),
+        YamlValue::from(format!("{ISOLATED_BIND_HOST}:{controller_port}")),
+    );
+    root.insert(YamlValue::from("secret"), YamlValue::from(secret));
+
+    let mut profile = Mapping::new();
+    profile.insert(YamlValue::from("store-selected"), YamlValue::from(false));
+    profile.insert(YamlValue::from("store-fake-ip"), YamlValue::from(false));
+    root.insert(YamlValue::from("profile"), YamlValue::Mapping(profile));
+
+    let mut tun = Mapping::new();
+    tun.insert(YamlValue::from("enable"), YamlValue::from(false));
+    root.insert(YamlValue::from("tun"), YamlValue::Mapping(tun));
+
+    let mut dns = Mapping::new();
+    dns.insert(YamlValue::from("enable"), YamlValue::from(true));
+    dns.insert(YamlValue::from("ipv6"), YamlValue::from(false));
+    dns.insert(
+        YamlValue::from("enhanced-mode"),
+        YamlValue::from("redir-host"),
+    );
+    dns.insert(
+        YamlValue::from("default-nameserver"),
+        YamlValue::Sequence(bootstrap_ns_yaml),
+    );
+    dns.insert(
+        YamlValue::from("proxy-server-nameserver"),
+        YamlValue::Sequence(ns_yaml.clone()),
+    );
+    dns.insert(
+        YamlValue::from("nameserver"),
+        YamlValue::Sequence(ns_yaml),
+    );
+    root.insert(YamlValue::from("dns"), YamlValue::Mapping(dns));
+
+    // Compile all enabled relays followed by business nodes.
+    let mut proxies_seq: Vec<YamlValue> =
+        Vec::with_capacity(enabled_relays.len() + bindings.len());
+    for (relay, proxy_name) in enabled_relays.iter().zip(relay_proxy_names_ordered.iter()) {
+        proxies_seq.push(compile_relay_to_mihomo_yaml(relay, proxy_name)?);
+    }
+
+    let mut listeners_seq: Vec<YamlValue> = Vec::with_capacity(bindings.len());
+    for (idx, ((listen_port, node), proxy_name)) in
+        bindings.iter().zip(proxy_names.iter()).enumerate()
+    {
+        let mut proxy_map = match serde_yaml_ng::to_value(&node.raw_config)? {
+            YamlValue::Mapping(map) => map,
+            _ => Mapping::new(),
+        };
+        proxy_map.remove("dialer-proxy");
+
+        let skip_for_ipv6 =
+            !all_relays_ipv6 && is_ipv6_only_node(node) && node.preaccel_override != Some(true);
+        if node.should_apply_preaccel(skip_443_native) && !skip_for_ipv6 {
+            proxy_map.insert(
+                YamlValue::from("dialer-proxy"),
+                YamlValue::from(PROBE_RELAY_POOL_GROUP_NAME),
+            );
+        }
+
+        proxy_map.insert(
+            YamlValue::from("name"),
+            YamlValue::from(proxy_name.as_str()),
+        );
+        if !proxy_map.contains_key("type") && !node.protocol.trim().is_empty() {
+            proxy_map.insert(
+                YamlValue::from("type"),
+                YamlValue::from(node.protocol.as_str()),
+            );
+        }
+        if !proxy_map.contains_key("server") && !node.server.trim().is_empty() {
+            proxy_map.insert(
+                YamlValue::from("server"),
+                YamlValue::from(node.server.as_str()),
+            );
+        }
+        if !proxy_map.contains_key("port") && node.port > 0 {
+            proxy_map.insert(YamlValue::from("port"), YamlValue::from(node.port));
+        }
+
+        proxies_seq.push(YamlValue::Mapping(proxy_map));
+
+        let mut listener = Mapping::new();
+        listener.insert(
+            YamlValue::from("name"),
+            YamlValue::from(format!("probe-listener-{idx}")),
+        );
+        listener.insert(YamlValue::from("type"), YamlValue::from("mixed"));
+        listener.insert(YamlValue::from("port"), YamlValue::from(*listen_port));
+        listener.insert(
+            YamlValue::from("listen"),
+            YamlValue::from(ISOLATED_BIND_HOST),
+        );
+        listener.insert(
+            YamlValue::from("proxy"),
+            YamlValue::from(proxy_name.as_str()),
+        );
+        listeners_seq.push(YamlValue::Mapping(listener));
+    }
+
+    // Build pre-acceleration pool proxy-groups (two-layer nested LB or single-layer fallback).
+    let mut proxy_groups: Vec<YamlValue> = Vec::with_capacity(if use_two_layer_lb { 2 } else { 1 });
+    if use_two_layer_lb {
+        let lb_members: Vec<YamlValue> = selection
+            .primary_host_relays
+            .iter()
+            .filter_map(|r| relay_id_to_proxy_name.get(&r.id))
+            .filter(|name| !name.eq_ignore_ascii_case("DIRECT"))
+            .map(|name| YamlValue::from(name.as_str()))
+            .collect();
+
+        let mut fb_members: Vec<YamlValue> = Vec::with_capacity(
+            selection.secondary_protocol_relays.len() + 2,
+        );
+        fb_members.push(YamlValue::from(PROBE_RELAY_LB_GROUP_NAME));
+        for relay in &selection.secondary_protocol_relays {
+            if let Some(name) = relay_id_to_proxy_name.get(&relay.id) {
+                fb_members.push(YamlValue::from(name.as_str()));
+            }
+        }
+        fb_members.push(YamlValue::from("DIRECT"));
+
+        let mut fb_group = Mapping::new();
+        fb_group.insert(
+            YamlValue::from("name"),
+            YamlValue::from(PROBE_RELAY_POOL_GROUP_NAME),
+        );
+        fb_group.insert(YamlValue::from("type"), YamlValue::from("fallback"));
+        fb_group.insert(YamlValue::from("proxies"), YamlValue::Sequence(fb_members));
+        fb_group.insert(
+            YamlValue::from("url"),
+            YamlValue::from(DEFAULT_DOMESTIC_204_PRIMARY),
+        );
+        fb_group.insert(YamlValue::from("interval"), YamlValue::from(10u64));
+        fb_group.insert(YamlValue::from("lazy"), YamlValue::from(false));
+
+        let mut lb_group = Mapping::new();
+        lb_group.insert(
+            YamlValue::from("name"),
+            YamlValue::from(PROBE_RELAY_LB_GROUP_NAME),
+        );
+        lb_group.insert(YamlValue::from("type"), YamlValue::from("load-balance"));
+        lb_group.insert(
+            YamlValue::from("strategy"),
+            YamlValue::from(lb_strategy.as_str()),
+        );
+        lb_group.insert(YamlValue::from("proxies"), YamlValue::Sequence(lb_members));
+        lb_group.insert(
+            YamlValue::from("url"),
+            YamlValue::from(DEFAULT_DOMESTIC_204_PRIMARY),
+        );
+        lb_group.insert(YamlValue::from("interval"), YamlValue::from(10u64));
+        lb_group.insert(YamlValue::from("lazy"), YamlValue::from(false));
+
+        proxy_groups.push(YamlValue::Mapping(fb_group));
+        proxy_groups.push(YamlValue::Mapping(lb_group));
+    } else {
+        let mut fb_members: Vec<YamlValue> = relay_proxy_names_ordered
+            .iter()
+            .map(|name| YamlValue::from(name.as_str()))
+            .collect();
+        fb_members.push(YamlValue::from("DIRECT"));
+
+        let mut fb_group = Mapping::new();
+        fb_group.insert(
+            YamlValue::from("name"),
+            YamlValue::from(PROBE_RELAY_POOL_GROUP_NAME),
+        );
+        fb_group.insert(YamlValue::from("type"), YamlValue::from("fallback"));
+        fb_group.insert(YamlValue::from("proxies"), YamlValue::Sequence(fb_members));
+        fb_group.insert(
+            YamlValue::from("url"),
+            YamlValue::from(DEFAULT_DOMESTIC_204_PRIMARY),
+        );
+        fb_group.insert(YamlValue::from("interval"), YamlValue::from(10u64));
+        fb_group.insert(YamlValue::from("lazy"), YamlValue::from(false));
+        proxy_groups.push(YamlValue::Mapping(fb_group));
+    }
+
+    root.insert(YamlValue::from("proxies"), YamlValue::Sequence(proxies_seq));
+    root.insert(
+        YamlValue::from("proxy-groups"),
+        YamlValue::Sequence(proxy_groups),
+    );
+    root.insert(
+        YamlValue::from("listeners"),
+        YamlValue::Sequence(listeners_seq),
+    );
+
+    let mut rules_seq: Vec<YamlValue> = Vec::new();
+    let mut seen_rules: HashSet<String> = HashSet::new();
+    for relay in &enabled_relays {
+        if let Some(anti_loop) = host_to_direct_rule(&relay.server) {
+            if seen_rules.insert(anti_loop.clone()) {
+                rules_seq.push(YamlValue::from(anti_loop));
+            }
         }
     }
     rules_seq.push(YamlValue::from("MATCH,DIRECT"));
@@ -718,10 +1073,11 @@ pub fn generate_preaccel_comparison_yaml(
 /// - `dns.enhanced-mode: redir-host` with pure-IP DoH to prevent active TUN Fake-IP pollution
 /// - Every relay is compiled via `compile_relay_to_mihomo_yaml` (enforcing empty SNI on domestic `:443`)
 ///   as `cc-rs-relay-{i}`
-/// - When `reference_node` is `Some(node)` and `!node.is_udp_only_transport()`, each relay gets a
-///   chained proxy `cc-rs-chain-{i}` (`dialer-proxy: cc-rs-relay-{i}`) bound to its dedicated
+/// - When `reference_node` is `Some(node)`, `!node.is_udp_only_transport()`, and the relay can
+///   reach the reference node (`relay.supports_ipv6 || !is_ipv6_only_node(node)`), that relay gets
+///   a chained proxy `cc-rs-chain-{i}` (`dialer-proxy: cc-rs-relay-{i}`) bound to its dedicated
 ///   loopback listener; otherwise the listener binds directly to `cc-rs-relay-{i}`
-/// - Prepends deduplicated anti-loop `DIRECT` rules for every relay server and `reference_node.server`
+/// - Prepends deduplicated anti-loop `DIRECT` rules for every relay server and chained `reference_node.server`
 pub fn generate_preaccel_relay_speed_yaml(
     relays: &[PreAccelRelay],
     reference_node: Option<&ProxyNode>,
@@ -882,25 +1238,31 @@ pub fn generate_preaccel_relay_speed_yaml(
         relays.len()
     });
     let mut listeners_seq: Vec<YamlValue> = Vec::with_capacity(relays.len());
+    let mut any_chained_ref = false;
 
     for (i, (relay, listen_port)) in relays.iter().zip(resolved_ports.into_iter()).enumerate() {
         let relay_name = format!("cc-rs-relay-{i}");
         let relay_yaml = compile_relay_to_mihomo_yaml(relay, &relay_name)?;
         proxies_seq.push(relay_yaml);
 
-        let listener_proxy = if let Some(ref base_map) = chain_ref_base {
-            let chain_name = format!("cc-rs-chain-{i}");
-            let mut chain_map = base_map.clone();
-            chain_map.insert(
-                YamlValue::from("name"),
-                YamlValue::from(chain_name.as_str()),
-            );
-            chain_map.insert(
-                YamlValue::from("dialer-proxy"),
-                YamlValue::from(relay_name.as_str()),
-            );
-            proxies_seq.push(YamlValue::Mapping(chain_map));
-            chain_name
+        let listener_proxy = if can_chain_relay_with_reference_node(relay, reference_node) {
+            if let Some(ref base_map) = chain_ref_base {
+                let chain_name = format!("cc-rs-chain-{i}");
+                let mut chain_map = base_map.clone();
+                chain_map.insert(
+                    YamlValue::from("name"),
+                    YamlValue::from(chain_name.as_str()),
+                );
+                chain_map.insert(
+                    YamlValue::from("dialer-proxy"),
+                    YamlValue::from(relay_name.as_str()),
+                );
+                proxies_seq.push(YamlValue::Mapping(chain_map));
+                any_chained_ref = true;
+                chain_name
+            } else {
+                relay_name
+            }
         } else {
             relay_name
         };
@@ -938,10 +1300,12 @@ pub fn generate_preaccel_relay_speed_yaml(
             }
         }
     }
-    if let Some(node) = reference_node {
-        if let Some(rule) = host_to_direct_rule(&node.server) {
-            if seen_rules.insert(rule.to_ascii_lowercase()) {
-                rules_seq.push(YamlValue::from(rule));
+    if any_chained_ref {
+        if let Some(node) = reference_node {
+            if let Some(rule) = host_to_direct_rule(&node.server) {
+                if seen_rules.insert(rule.to_ascii_lowercase()) {
+                    rules_seq.push(YamlValue::from(rule));
+                }
             }
         }
     }
@@ -950,6 +1314,15 @@ pub fn generate_preaccel_relay_speed_yaml(
 
     let yaml = serde_yaml_ng::to_string(&YamlValue::Mapping(root))?;
     Ok(yaml)
+}
+
+fn can_chain_relay_with_reference_node(
+    relay: &PreAccelRelay,
+    reference_node: Option<&ProxyNode>,
+) -> bool {
+    reference_node.is_some_and(|node| {
+        !node.is_udp_only_transport() && (relay.supports_ipv6 || !is_ipv6_only_node(node))
+    })
 }
 
 /// Build an isolated `reqwest::Client` that strips all system/environment proxies (`.no_proxy()`)
@@ -1191,6 +1564,190 @@ impl IsolatedProbeCore {
             &pair_refs,
             proxy_nameservers,
             preaccel_relay,
+            skip_443_native,
+        )?;
+
+        let work_dir = temp_dir.join(format!("catcloud-probe-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&work_dir)?;
+        let config_path = work_dir.join("isolated-probe.yaml");
+        let log_path = work_dir.join("probe-core.log");
+
+        let mut cleanup_guard = SpawnCleanupGuard {
+            config_path: config_path.clone(),
+            work_dir: work_dir.clone(),
+            child: None,
+            armed: true,
+        };
+
+        std::fs::write(&config_path, yaml.as_bytes())?;
+
+        let stderr_stdio = match std::fs::File::create(&log_path) {
+            Ok(file) => Stdio::from(file),
+            Err(_) => Stdio::null(),
+        };
+
+        let probe_bin = prepare_probe_core_binary(mihomo_bin, temp_dir)?;
+        let norm_bin = crate::paths::normalize_os_path(&probe_bin);
+        let norm_work = crate::paths::normalize_os_path(&work_dir);
+        let norm_cfg = crate::paths::normalize_os_path(&config_path);
+
+        let mut cmd = Command::new(&norm_bin);
+        cmd.arg("-d")
+            .arg(&norm_work)
+            .arg("-f")
+            .arg(&norm_cfg)
+            .env("GOMEMLIMIT", ISOLATED_CORE_GOMEMLIMIT)
+            .env("GOGC", ISOLATED_CORE_GOGC)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(stderr_stdio)
+            .kill_on_drop(true);
+        JobGuard::configure_tokio_command(&mut cmd);
+
+        let child = cmd.spawn().map_err(|err| {
+            CatError::Process(format!(
+                "failed to spawn isolated probe core `{}`: {err}",
+                probe_bin.display()
+            ))
+        })?;
+        cleanup_guard.child = Some(child);
+
+        if let Err(err) = job_guard.assign_tokio_child(
+            cleanup_guard
+                .child
+                .as_mut()
+                .expect("child assigned to spawn cleanup guard"),
+        ) {
+            if let Some(mut c) = cleanup_guard.child.take() {
+                let _ = c.kill().await;
+                let _ = c.wait().await;
+            }
+            remove_work_dir_async(&config_path, &work_dir).await;
+            cleanup_guard.armed = false;
+            return Err(err);
+        }
+
+        let child_pid = cleanup_guard.child.as_ref().and_then(Child::id);
+
+        if let Err(err) = wait_for_controller_ready(
+            controller_port,
+            &secret,
+            cleanup_guard
+                .child
+                .as_mut()
+                .expect("child held by spawn cleanup guard"),
+            &log_path,
+            ready_timeout,
+        )
+        .await
+        {
+            if let Some(mut c) = cleanup_guard.child.take() {
+                let _ = c.kill().await;
+                let _ = c.wait().await;
+            }
+            remove_work_dir_async(&config_path, &work_dir).await;
+            cleanup_guard.armed = false;
+            return Err(err);
+        }
+
+        let mut ordered_bindings = Vec::with_capacity(nodes.len());
+        let mut bindings_by_node = HashMap::with_capacity(nodes.len());
+        for ((port, node), proxy_name) in pair_refs.iter().zip(proxy_names.into_iter()) {
+            let binding = NodeProbeBinding {
+                node_id: node.id.clone(),
+                proxy_name,
+                listen_port: *port,
+            };
+            bindings_by_node.insert(node.id.clone(), binding.clone());
+            ordered_bindings.push(binding);
+        }
+
+        let child = cleanup_guard.child.take();
+        cleanup_guard.armed = false;
+
+        Ok(Self {
+            child,
+            child_pid,
+            controller_port,
+            secret,
+            config_path,
+            work_dir,
+            bindings_by_node,
+            ordered_bindings,
+            cleaned_up: false,
+        })
+    }
+
+    /// Spawn an isolated temporary Mihomo instance backed by a multi-cloud domestic `:443`
+    /// pre-acceleration relay pool (two-layer nested `load-balance` + outer `fallback` when 2+
+    /// physical hosts are enabled).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn spawn_with_options_and_preaccel_pool(
+        mihomo_bin: &Path,
+        temp_dir: &Path,
+        job_guard: &JobGuard,
+        nodes: &[ProxyNode],
+        proxy_nameservers: &[String],
+        ready_timeout: Duration,
+        relays: &[PreAccelRelay],
+        dispatch_strategy: PreAccelDispatchStrategy,
+        lb_strategy: PreAccelLbStrategy,
+        skip_443_native: bool,
+    ) -> CatResult<Self> {
+        let mut enabled_relays: Vec<PreAccelRelay> =
+            relays.iter().filter(|r| r.enabled).cloned().collect();
+        if enabled_relays.is_empty() {
+            return Self::spawn_with_options_and_preaccel(
+                mihomo_bin,
+                temp_dir,
+                job_guard,
+                nodes,
+                proxy_nameservers,
+                ready_timeout,
+                None,
+                skip_443_native,
+            )
+            .await;
+        }
+        enabled_relays.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+
+        if !mihomo_bin.is_file() {
+            return Err(CatError::NotFound(format!(
+                "isolated probe mihomo binary not found: {}",
+                mihomo_bin.display()
+            )));
+        }
+        if nodes.is_empty() {
+            return Err(CatError::Validation(
+                "cannot spawn IsolatedProbeCore with an empty node list".into(),
+            ));
+        }
+
+        let ports = allocate_ephemeral_ports(nodes.len() + 1)?;
+        let controller_port = ports[0];
+        let node_ports = &ports[1..];
+        let secret = generate_controller_secret();
+
+        let pair_refs: Vec<(u16, &ProxyNode)> = node_ports
+            .iter()
+            .copied()
+            .zip(nodes.iter())
+            .collect();
+        let mut reserved_names: HashSet<String> = HashSet::with_capacity(enabled_relays.len() + 2);
+        reserved_names.insert(PROBE_RELAY_POOL_GROUP_NAME.to_string());
+        reserved_names.insert(PROBE_RELAY_LB_GROUP_NAME.to_string());
+        for idx in 0..enabled_relays.len() {
+            reserved_names.insert(format!("catcloud-probe-relay-{idx}"));
+        }
+        let proxy_names = resolve_unique_proxy_names_with_reserved_set(&pair_refs, &reserved_names);
+        let yaml = build_isolated_probe_yaml_with_preaccel_pool(
+            controller_port,
+            &secret,
+            &pair_refs,
+            proxy_nameservers,
+            &enabled_relays,
+            dispatch_strategy,
+            lb_strategy,
             skip_443_native,
         )?;
 
@@ -1583,10 +2140,12 @@ impl IsolatedProbeCore {
             return Err(err);
         }
 
-        let use_chain = reference_node.is_some_and(|node| !node.is_udp_only_transport());
         let mut ordered_bindings = Vec::with_capacity(relay_ports.len());
         let mut bindings_by_node = HashMap::with_capacity(relay_ports.len());
-        for (i, (relay_id, listen_port)) in relay_ports.iter().enumerate() {
+        for (i, (relay, (relay_id, listen_port))) in
+            relays.iter().zip(relay_ports.iter()).enumerate()
+        {
+            let use_chain = can_chain_relay_with_reference_node(relay, reference_node);
             let proxy_name = if use_chain {
                 format!("cc-rs-chain-{i}")
             } else {
@@ -1967,6 +2526,7 @@ mod tests {
             priority: 10,
             expires_at: None,
             enabled: true,
+            supports_ipv6: false,
             last_probe_ms: None,
             last_mbps: None,
             last_up_mbps: None,
@@ -2062,6 +2622,7 @@ mod tests {
             priority: 10,
             expires_at: None,
             enabled: true,
+            supports_ipv6: false,
             last_probe_ms: None,
             last_mbps: None,
             last_up_mbps: None,
@@ -2271,6 +2832,7 @@ mod tests {
             priority: 10,
             expires_at: None,
             enabled: true,
+            supports_ipv6: false,
             last_probe_ms: None,
             last_mbps: None,
             last_up_mbps: None,
@@ -2290,6 +2852,7 @@ mod tests {
             priority: 20,
             expires_at: None,
             enabled: true,
+            supports_ipv6: false,
             last_probe_ms: None,
             last_mbps: None,
             last_up_mbps: None,
@@ -2423,6 +2986,7 @@ mod tests {
             priority: 10,
             expires_at: None,
             enabled: true,
+            supports_ipv6: false,
             last_probe_ms: None,
             last_mbps: None,
             last_up_mbps: None,
@@ -2499,5 +3063,348 @@ mod tests {
             speed_bootstrap[1].as_str(),
             Some("https://1.12.12.12/dns-query")
         );
+        assert_eq!(speed_bootstrap[2].as_str(), Some("tls://223.6.6.6:853"));
+        assert_eq!(speed_bootstrap[3].as_str(), Some("tls://120.53.53.53:853"));
+    }
+
+    #[test]
+    fn isolated_probe_yaml_with_preaccel_pool_builds_two_layer_lb_single_fallback_and_skips_ipv6_only()
+    {
+        let relay_a_tcp = PreAccelRelay {
+            id: "r-pool-a-tcp".to_string(),
+            name: "CloudA-AnyTLS".to_string(),
+            provider: "cloud-a".to_string(),
+            region: "CN-East".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "pass-a-tcp".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            supports_ipv6: false,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+        let mut relay_a_udp = relay_a_tcp.clone();
+        relay_a_udp.id = "r-pool-a-udp".to_string();
+        relay_a_udp.name = "CloudA-HY2".to_string();
+        relay_a_udp.protocol = "hysteria2".to_string();
+        relay_a_udp.priority = 20;
+
+        let mut relay_b_tcp = relay_a_tcp.clone();
+        relay_b_tcp.id = "r-pool-b-tcp".to_string();
+        relay_b_tcp.name = "CloudB-VLESS".to_string();
+        relay_b_tcp.server = "198.51.100.20".to_string();
+        relay_b_tcp.protocol = "vless".to_string();
+        relay_b_tcp.password = "11111111-2222-4333-8444-555555555555".to_string();
+        relay_b_tcp.priority = 30;
+
+        let mut node_tcp = sample_node("n-pool-tcp", "JP-8443");
+        node_tcp.port = 8443;
+        node_tcp.is_443_native = false;
+        node_tcp.preaccel_eligible = true;
+        node_tcp.raw_config["port"] = serde_json::json!(8443);
+
+        let mut node_v6 = sample_node("n-pool-v6", "HK-IPv6-Only");
+        node_v6.server = "2001:db8::99".to_string();
+        node_v6.port = 8443;
+        node_v6.is_443_native = false;
+        node_v6.preaccel_eligible = true;
+        node_v6.raw_config["server"] = serde_json::json!("2001:db8::99");
+        node_v6.raw_config["port"] = serde_json::json!(8443);
+
+        let mut node_dual = sample_node("n-pool-dual", "HK-01-IPv6");
+        node_dual.port = 8443;
+        node_dual.is_443_native = false;
+        node_dual.preaccel_eligible = true;
+        node_dual.raw_config["port"] = serde_json::json!(8443);
+
+        let ports = allocate_ephemeral_ports(4).unwrap();
+        let bindings = vec![
+            (ports[1], &node_tcp),
+            (ports[2], &node_v6),
+            (ports[3], &node_dual),
+        ];
+
+        // 1. Two distinct physical hosts -> two-layer nested LB + outer fallback with DIRECT.
+        let yaml_multi = build_isolated_probe_yaml_with_preaccel_pool(
+            ports[0],
+            "pool-secret-0123456789",
+            &bindings,
+            &[],
+            &[relay_a_tcp.clone(), relay_a_udp.clone(), relay_b_tcp.clone()],
+            PreAccelDispatchStrategy::Auto,
+            PreAccelLbStrategy::RoundRobin,
+            true,
+        )
+        .expect("build multi-cloud probe pool yaml");
+        let parsed: YamlValue = serde_yaml_ng::from_str(&yaml_multi).expect("valid multi yaml");
+
+        let dns_boot: Vec<&str> = parsed["dns"]["default-nameserver"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .collect();
+        assert_eq!(
+            dns_boot,
+            vec![
+                "https://223.5.5.5/dns-query",
+                "https://1.12.12.12/dns-query",
+                "tls://223.6.6.6:853",
+                "tls://120.53.53.53:853",
+            ]
+        );
+
+        let groups = parsed["proxy-groups"].as_sequence().expect("proxy-groups");
+        assert_eq!(groups.len(), 2);
+        let fb = groups
+            .iter()
+            .find(|g| g["name"].as_str() == Some(PROBE_RELAY_POOL_GROUP_NAME))
+            .expect("pool fallback group");
+        let lb = groups
+            .iter()
+            .find(|g| g["name"].as_str() == Some(PROBE_RELAY_LB_GROUP_NAME))
+            .expect("pool lb group");
+        assert_eq!(lb["type"].as_str(), Some("load-balance"));
+        assert_eq!(lb["strategy"].as_str(), Some("round-robin"));
+        let lb_members: Vec<&str> = lb["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .collect();
+        assert_eq!(
+            lb_members,
+            vec!["catcloud-probe-relay-0", "catcloud-probe-relay-2"]
+        );
+        assert!(!lb_members.contains(&"DIRECT"));
+
+        let fb_members: Vec<&str> = fb["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .collect();
+        assert_eq!(
+            fb_members,
+            vec![PROBE_RELAY_LB_GROUP_NAME, "catcloud-probe-relay-1", "DIRECT"]
+        );
+
+        // Node dialer-proxy: TCP & dual-stack wrapped; pure IPv6 skipped.
+        let proxies = parsed["proxies"].as_sequence().unwrap();
+        let p_tcp = proxies
+            .iter()
+            .find(|p| p["name"].as_str() == Some("JP-8443"))
+            .unwrap();
+        assert_eq!(
+            p_tcp["dialer-proxy"].as_str(),
+            Some(PROBE_RELAY_POOL_GROUP_NAME)
+        );
+        let p_v6 = proxies
+            .iter()
+            .find(|p| p["name"].as_str() == Some("HK-IPv6-Only"))
+            .unwrap();
+        assert!(p_v6.get("dialer-proxy").is_none());
+        let p_dual = proxies
+            .iter()
+            .find(|p| p["name"].as_str() == Some("HK-01-IPv6"))
+            .unwrap();
+        assert_eq!(
+            p_dual["dialer-proxy"].as_str(),
+            Some(PROBE_RELAY_POOL_GROUP_NAME)
+        );
+
+        // Rules deduplicate same-host IPs and include both physical hosts.
+        let rules: Vec<&str> = parsed["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .collect();
+        assert_eq!(
+            rules,
+            vec![
+                "IP-CIDR,203.0.113.10/32,DIRECT,no-resolve",
+                "IP-CIDR,198.51.100.20/32,DIRECT,no-resolve",
+                "MATCH,DIRECT",
+            ]
+        );
+
+        // 2. Single physical host -> single-layer fallback([catcloud-probe-relay-0, DIRECT]).
+        let yaml_single = build_isolated_probe_yaml_with_preaccel_pool(
+            ports[0],
+            "pool-secret-0123456789",
+            &bindings,
+            &[],
+            &[relay_a_tcp],
+            PreAccelDispatchStrategy::Auto,
+            PreAccelLbStrategy::RoundRobin,
+            true,
+        )
+        .expect("build single-host probe pool yaml");
+        let parsed_single: YamlValue =
+            serde_yaml_ng::from_str(&yaml_single).expect("valid single yaml");
+        let single_groups = parsed_single["proxy-groups"]
+            .as_sequence()
+            .expect("single proxy-groups");
+        assert_eq!(single_groups.len(), 1);
+        assert_eq!(
+            single_groups[0]["name"].as_str(),
+            Some(PROBE_RELAY_POOL_GROUP_NAME)
+        );
+        let single_members: Vec<&str> = single_groups[0]["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .collect();
+        assert_eq!(single_members, vec!["catcloud-probe-relay-0", "DIRECT"]);
+    }
+
+    #[test]
+    fn mixed_ipv4_ipv6_relay_pool_skips_ipv6_only_node_and_relay_speed_skips_ipv6_only_reference() {
+        let relay_v4 = PreAccelRelay {
+            id: "r-mix-v4".to_string(),
+            name: "CloudA-V4".to_string(),
+            provider: "cloud-a".to_string(),
+            region: "CN-East".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "pass-v4".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            supports_ipv6: false,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+        let mut relay_v6 = relay_v4.clone();
+        relay_v6.id = "r-mix-v6".to_string();
+        relay_v6.name = "CloudB-V6".to_string();
+        relay_v6.server = "198.51.100.20".to_string();
+        relay_v6.priority = 20;
+        relay_v6.supports_ipv6 = true;
+
+        let mut node_v6 = sample_node("n-v6-only-ref", "HK-IPv6-Only");
+        node_v6.server = "2001:db8::42".to_string();
+        node_v6.port = 8443;
+        node_v6.is_443_native = false;
+        node_v6.preaccel_eligible = true;
+        node_v6.raw_config["server"] = serde_json::json!("2001:db8::42");
+        node_v6.raw_config["port"] = serde_json::json!(8443);
+
+        // 1. Mixed relay pool (IPv4-only + dual-stack) must skip pure IPv6 node in probe pool YAML.
+        let pool_ports = allocate_ephemeral_ports(2).unwrap();
+        let bindings = vec![(pool_ports[1], &node_v6)];
+        let mixed_yaml = build_isolated_probe_yaml_with_preaccel_pool(
+            pool_ports[0],
+            "mixed-pool-secret-0123456789",
+            &bindings,
+            &[],
+            &[relay_v4.clone(), relay_v6.clone()],
+            PreAccelDispatchStrategy::Auto,
+            PreAccelLbStrategy::RoundRobin,
+            true,
+        )
+        .expect("build mixed pool probe yaml");
+        let parsed_mixed: YamlValue =
+            serde_yaml_ng::from_str(&mixed_yaml).expect("valid mixed pool yaml");
+        let p_v6_mixed = parsed_mixed["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("HK-IPv6-Only"))
+            .unwrap();
+        assert!(
+            p_v6_mixed.get("dialer-proxy").is_none(),
+            "mixed IPv4+IPv6 pool must not wrap pure IPv6 node"
+        );
+
+        // 2. All-IPv6 relay pool wraps the pure IPv6 node normally.
+        let mut relay_v4_upgraded = relay_v4.clone();
+        relay_v4_upgraded.supports_ipv6 = true;
+        let all_v6_yaml = build_isolated_probe_yaml_with_preaccel_pool(
+            pool_ports[0],
+            "all-v6-pool-secret-0123456789",
+            &bindings,
+            &[],
+            &[relay_v4_upgraded, relay_v6.clone()],
+            PreAccelDispatchStrategy::Auto,
+            PreAccelLbStrategy::RoundRobin,
+            true,
+        )
+        .expect("build all-v6 pool probe yaml");
+        let parsed_all_v6: YamlValue =
+            serde_yaml_ng::from_str(&all_v6_yaml).expect("valid all-v6 pool yaml");
+        let p_v6_wrapped = parsed_all_v6["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"].as_str() == Some("HK-IPv6-Only"))
+            .unwrap();
+        assert_eq!(
+            p_v6_wrapped["dialer-proxy"].as_str(),
+            Some(PROBE_RELAY_POOL_GROUP_NAME)
+        );
+
+        // 3. Relay speed test with a pure IPv6 reference node skips chaining for IPv4-only relay
+        //    (`cc-rs-relay-0`) while still chaining the dual-stack relay (`cc-rs-chain-1`).
+        let speed_ports = allocate_ephemeral_ports(3).unwrap();
+        let relay_ports = vec![
+            (relay_v4.id.clone(), speed_ports[1]),
+            (relay_v6.id.clone(), speed_ports[2]),
+        ];
+        let speed_yaml = generate_preaccel_relay_speed_yaml(
+            &[relay_v4.clone(), relay_v6],
+            Some(&node_v6),
+            &relay_ports,
+            speed_ports[0],
+            "relay-speed-v6-ref-0123456789",
+            &[],
+        )
+        .expect("generate relay speed yaml with ipv6-only reference node");
+        let parsed_speed: YamlValue =
+            serde_yaml_ng::from_str(&speed_yaml).expect("valid relay speed yaml");
+        let speed_proxies = parsed_speed["proxies"].as_sequence().unwrap();
+        let proxy_names: Vec<&str> = speed_proxies
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(proxy_names, vec!["cc-rs-relay-0", "cc-rs-relay-1", "cc-rs-chain-1"]);
+        let speed_listeners = parsed_speed["listeners"].as_sequence().unwrap();
+        assert_eq!(speed_listeners[0]["proxy"].as_str(), Some("cc-rs-relay-0"));
+        assert_eq!(speed_listeners[1]["proxy"].as_str(), Some("cc-rs-chain-1"));
+
+        // 4. Single IPv4-only relay with pure IPv6 reference node emits no chain proxy and no ref rule.
+        let single_ports = allocate_ephemeral_ports(2).unwrap();
+        let single_speed_yaml = generate_preaccel_relay_speed_yaml(
+            &[relay_v4.clone()],
+            Some(&node_v6),
+            &[(relay_v4.id, single_ports[1])],
+            single_ports[0],
+            "relay-speed-v4-only-0123456789",
+            &[],
+        )
+        .expect("generate v4-only relay speed yaml with ipv6-only ref");
+        let parsed_single: YamlValue =
+            serde_yaml_ng::from_str(&single_speed_yaml).expect("valid single speed yaml");
+        assert_eq!(parsed_single["proxies"].as_sequence().unwrap().len(), 1);
+        assert_eq!(
+            parsed_single["listeners"][0]["proxy"].as_str(),
+            Some("cc-rs-relay-0")
+        );
+        assert!(!single_speed_yaml.contains("cc-rs-chain-"));
+        assert!(!single_speed_yaml.contains("2001:db8::42"));
     }
 }

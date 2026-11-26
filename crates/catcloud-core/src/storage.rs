@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Current SQLite schema version tracked via `PRAGMA user_version`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
 
 /// Strategy used by `Storage::update_subscription_nodes_with_mode` when updating an existing
 /// subscription group with newly fetched, captured, or imported nodes.
@@ -184,6 +184,14 @@ impl Storage {
                 )?;
                 ensure_column_exists(tx, "preaccel_relays", "last_up_mbps", "REAL")?;
                 ensure_column_exists(tx, "preaccel_relays", "last_down_mbps", "REAL")?;
+            }
+            if current < 4 {
+                ensure_column_exists(
+                    tx,
+                    "preaccel_relays",
+                    "supports_ipv6",
+                    "INTEGER NOT NULL DEFAULT 0",
+                )?;
             }
             tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION as i64)?;
             Ok(())
@@ -1441,8 +1449,8 @@ impl Storage {
             INSERT INTO preaccel_relays (
                 id, name, provider, region, server, port, protocol,
                 password, sni, skip_cert_verify, priority, expires_at,
-                enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps, supports_ipv6
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 provider = excluded.provider,
@@ -1459,7 +1467,8 @@ impl Storage {
                 last_probe_ms = excluded.last_probe_ms,
                 last_mbps = excluded.last_mbps,
                 last_up_mbps = excluded.last_up_mbps,
-                last_down_mbps = excluded.last_down_mbps
+                last_down_mbps = excluded.last_down_mbps,
+                supports_ipv6 = excluded.supports_ipv6
             ",
             params![
                 relay.id,
@@ -1479,6 +1488,7 @@ impl Storage {
                 relay.last_mbps,
                 relay.last_up_mbps,
                 relay.last_down_mbps,
+                bool_to_int(relay.supports_ipv6),
             ],
         )?;
         Ok(())
@@ -1490,7 +1500,8 @@ impl Storage {
                 "
                 SELECT id, name, provider, region, server, port, protocol,
                        password, sni, skip_cert_verify, priority, expires_at,
-                       enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
+                       enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps,
+                       supports_ipv6
                 FROM preaccel_relays
                 WHERE id = ?1
                 ",
@@ -1506,7 +1517,8 @@ impl Storage {
             "
             SELECT id, name, provider, region, server, port, protocol,
                    password, sni, skip_cert_verify, priority, expires_at,
-                   enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
+                   enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps,
+                   supports_ipv6
             FROM preaccel_relays
             WHERE enabled = 1
             ORDER BY priority ASC, id ASC
@@ -1515,7 +1527,8 @@ impl Storage {
             "
             SELECT id, name, provider, region, server, port, protocol,
                    password, sni, skip_cert_verify, priority, expires_at,
-                   enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
+                   enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps,
+                   supports_ipv6
             FROM preaccel_relays
             ORDER BY priority ASC, id ASC
             "
@@ -1700,7 +1713,8 @@ CREATE TABLE IF NOT EXISTS preaccel_relays (
     last_probe_ms REAL,
     last_mbps REAL,
     last_up_mbps REAL,
-    last_down_mbps REAL
+    last_down_mbps REAL,
+    supports_ipv6 INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_preaccel_priority ON preaccel_relays(enabled, priority ASC);
 "#;
@@ -1970,6 +1984,7 @@ fn row_to_preaccel_relay(row: &Row<'_>) -> rusqlite::Result<PreAccelRelay> {
     let port_i64: i64 = row.get(5)?;
     let skip_cert: i64 = row.get(9)?;
     let enabled: i64 = row.get(12)?;
+    let supports_ipv6: i64 = row.get(17)?;
     Ok(PreAccelRelay {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -1988,6 +2003,7 @@ fn row_to_preaccel_relay(row: &Row<'_>) -> rusqlite::Result<PreAccelRelay> {
         last_mbps: row.get(14)?,
         last_up_mbps: row.get(15)?,
         last_down_mbps: row.get(16)?,
+        supports_ipv6: supports_ipv6 != 0,
     })
 }
 
@@ -2499,6 +2515,7 @@ mod tests {
             last_mbps: Some(92.0),
             last_up_mbps: Some(85.0),
             last_down_mbps: Some(180.0),
+            supports_ipv6: false,
         };
         let relay2 = PreAccelRelay {
             id: "relay-standby".to_string(),
@@ -2518,6 +2535,7 @@ mod tests {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: true,
         };
         storage.upsert_preaccel_relay(&relay2).unwrap();
         storage.upsert_preaccel_relay(&relay1).unwrap();
@@ -3591,6 +3609,85 @@ mod tests {
             assert_eq!(relays.len(), 1);
             assert_eq!(relays[0].last_up_mbps, Some(64.5));
             assert_eq!(relays[0].last_down_mbps, Some(210.0));
+            assert!(!relays[0].supports_ipv6);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrates_v3_preaccel_relays_to_v4_with_supports_ipv6_default_and_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("catcloud-db-mig-v4-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("legacy-v3.sqlite");
+
+        // Seed a legacy v3 database lacking `preaccel_relays.supports_ipv6`.
+        {
+            let conn = Connection::open(&db_path).expect("create legacy v3 sqlite");
+            conn.execute_batch(
+                "
+                CREATE TABLE preaccel_relays (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    provider TEXT NOT NULL DEFAULT '',
+                    region TEXT NOT NULL DEFAULT '',
+                    server TEXT NOT NULL,
+                    port INTEGER NOT NULL DEFAULT 443,
+                    protocol TEXT NOT NULL,
+                    password TEXT NOT NULL DEFAULT '',
+                    sni TEXT,
+                    skip_cert_verify INTEGER NOT NULL DEFAULT 1,
+                    priority INTEGER NOT NULL DEFAULT 100,
+                    expires_at TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_probe_ms REAL,
+                    last_mbps REAL,
+                    last_up_mbps REAL,
+                    last_down_mbps REAL
+                );
+                INSERT INTO preaccel_relays (
+                    id, name, provider, region, server, port, protocol,
+                    password, sni, skip_cert_verify, priority, enabled,
+                    last_probe_ms, last_mbps, last_up_mbps, last_down_mbps
+                ) VALUES (
+                    'relay-v3-legacy', 'Legacy V3 Relay', 'cloud-v3', 'CN-South',
+                    '198.51.100.33', 443, 'anytls', 'placeholder-pass', NULL, 1, 10, 1,
+                    19.5, 95.0, 95.0, 190.0
+                );
+                PRAGMA user_version = 3;
+                ",
+            )
+            .expect("seed legacy v3 schema");
+        }
+
+        // First open: migrates v3 -> v4 idempotently with supports_ipv6 defaulting to false.
+        {
+            let storage = Storage::open(&db_path).expect("open & migrate v3 db");
+            assert_eq!(storage.schema_version().unwrap(), 4);
+            let mut relay = storage
+                .get_preaccel_relay("relay-v3-legacy")
+                .unwrap()
+                .expect("legacy v3 relay preserved");
+            assert!(!relay.supports_ipv6);
+            assert_eq!(relay.last_up_mbps, Some(95.0));
+
+            // Flip supports_ipv6 = true and verify roundtrip via get & list.
+            relay.supports_ipv6 = true;
+            storage.upsert_preaccel_relay(&relay).unwrap();
+            let updated = storage
+                .get_preaccel_relay("relay-v3-legacy")
+                .unwrap()
+                .unwrap();
+            assert!(updated.supports_ipv6);
+        }
+
+        // Re-opening migrated v4 database is idempotent and preserves supports_ipv6 == true.
+        {
+            let storage = Storage::open(&db_path).expect("reopen migrated v4 db");
+            assert_eq!(storage.schema_version().unwrap(), 4);
+            let relays = storage.list_preaccel_relays(true).unwrap();
+            assert_eq!(relays.len(), 1);
+            assert!(relays[0].supports_ipv6);
         }
 
         let _ = std::fs::remove_dir_all(&dir);

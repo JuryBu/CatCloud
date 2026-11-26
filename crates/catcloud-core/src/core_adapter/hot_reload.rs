@@ -473,6 +473,16 @@ impl HotReloadCoordinator {
             level = ReloadLevel::L2HotReload;
         }
 
+        // Hard L3 gate: when a full core restart is required (e.g., listening ports, TUN toggle/stack,
+        // binary path, or memory tier) and `allow_l3_restart` is disabled, reject immediately before
+        // running port allocation, rewriting `runtime.yaml`, or falling through into L2 hot reload.
+        if level == ReloadLevel::L3CoreRestart && !options.allow_l3_restart {
+            return rejected_outcome(
+                ReloadLevel::L3CoreRestart,
+                "L3 core restart is required for these configuration changes (ports, TUN, binary, or memory tier), but allow_l3_restart is disabled; active core and runtime.yaml were left untouched".to_string(),
+            );
+        }
+
         // 4. Resolve controller secret and active ports for compilation.
         let secret = match effective_cfg
             .controller_secret
@@ -2128,6 +2138,89 @@ mod tests {
         assert_eq!(yaml4["tun"]["enable"].as_bool(), Some(false));
         assert!(load_or_default(&paths).unwrap().tun.enabled);
 
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[tokio::test]
+    async fn l3_hard_gate_rejects_without_port_shift_yaml_overwrite_or_l2_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = listener.local_addr().unwrap().port();
+        let secret = "l3_hard_gate_secret_0123456789abcdef".to_string();
+        let http_hits = Arc::new(AtomicUsize::new(0));
+        let hits_bg = Arc::clone(&http_hits);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                hits_bg.fetch_add(1, Ordering::SeqCst);
+                let resp =
+                    "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let paths = temp_paths("l3-hard-gate");
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter = Arc::new(
+            MihomoAdapter::with_controller_endpoint(guard, "127.0.0.1", ctrl_port, secret.clone())
+                .unwrap(),
+        );
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        let mut old_cfg = AppConfig::default();
+        old_cfg.controller_port = ctrl_port;
+        old_cfg.controller_secret = Some(secret.clone());
+        old_cfg.tun.enabled = false;
+        let ports = AllocatedPorts {
+            bind_host: "127.0.0.1".to_string(),
+            mixed_port: old_cfg.mixed_port,
+            controller_port: ctrl_port,
+            dns_port: old_cfg.dns_listen_port,
+            shifted: Vec::new(),
+        };
+        coordinator
+            .seed_active_state(old_cfg.clone(), "seed-hash".into(), ports, secret)
+            .await;
+
+        let sentinel_yaml = "# SENTINEL_ACTIVE_RUNTIME_YAML\nmixed-port: 7890\n";
+        std::fs::write(coordinator.runtime_yaml_path(), sentinel_yaml).unwrap();
+
+        // Persist an L3-requiring change (port + TUN toggle) on disk.
+        let mut next_cfg = old_cfg;
+        next_cfg.mixed_port = 27890;
+        next_cfg.tun.enabled = true;
+        save(&paths, &next_cfg).unwrap();
+
+        let outcome = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                allow_l3_restart: false,
+                verify_with_binary: false,
+                ..Default::default()
+            })
+            .await;
+
+        assert!(outcome.rejected, "L3 reload must be rejected when allow_l3_restart=false");
+        assert!(!outcome.applied, "L3 reload must never fall through into L2 apply");
+        assert_eq!(outcome.level, ReloadLevel::L3CoreRestart);
+        assert!(outcome.shifted_ports.is_empty());
+        assert!(outcome.error.as_deref().unwrap_or_default().contains("allow_l3_restart"));
+        assert_eq!(
+            std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap(),
+            sentinel_yaml,
+            "active runtime.yaml must remain completely untouched"
+        );
+        assert_eq!(
+            http_hits.load(Ordering::SeqCst),
+            0,
+            "must never send PUT /configs?force=true to the active core"
+        );
+
+        server.abort();
         let _ = std::fs::remove_dir_all(&paths.root_data_dir);
     }
 }

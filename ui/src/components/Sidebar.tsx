@@ -6,7 +6,6 @@ import {
   Image,
   Layers,
   LayoutDashboard,
-  Loader2,
   Moon,
   Network,
   PictureInPicture2,
@@ -16,13 +15,11 @@ import {
   Sparkles,
   Sun,
   Wifi,
-  X,
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { normalizeUiLanguage, useUiDict } from "../i18n";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
+import { normalizeUiLanguage, type UiLanguage, useUiDict } from "../i18n";
 import {
   BUILTIN_WALLPAPER_PRESETS,
   type MascotState,
@@ -39,9 +36,13 @@ import { TrafficSparkline } from "./TrafficSparkline";
 import { resolvePlatformOs } from "../utils/platform";
 import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
 
+const TunAdminPromptModal = lazy(() =>
+  import("./TunAdminPromptModal").then((m) => ({ default: m.TunAdminPromptModal }))
+);
+
 export interface NavItemSpec {
   id: NavRouteId;
-  section: "network" | "assist";
+  section: "network" | "ai" | "assist";
   label: string;
   shortDesc: string;
   icon: LucideIcon;
@@ -49,23 +50,44 @@ export interface NavItemSpec {
 
 export const NAV_ITEMS: readonly NavItemSpec[] = [
   { id: "overview", section: "network", label: "总览", shortDesc: "代理开关与实时状态", icon: LayoutDashboard },
-  { id: "groups", section: "network", label: "智能多选组", shortDesc: "路线分组与自动优选", icon: Layers },
   { id: "nodes", section: "network", label: "节点与测速", shortDesc: "节点管理、订阅导入与测速", icon: Globe },
+  { id: "groups", section: "network", label: "智能多选组", shortDesc: "路线分组与自动优选", icon: Layers },
   { id: "preaccel", section: "network", label: "国内提速", shortDesc: "国内中转与稳连加速", icon: Zap },
-  { id: "rules", section: "network", label: "分流与连接", shortDesc: "网站分流与当前连接", icon: Network },
-  { id: "logs", section: "network", label: "运行日志", shortDesc: "查看内核运行记录", icon: ScrollText },
-  { id: "ai", section: "assist", label: "AI 助手", shortDesc: "小白上手、排障与 Agent 代配", icon: Bot },
+  { id: "ai", section: "ai", label: "AI 全权代管", shortDesc: "全自动代配与一键排障", icon: Bot },
+  { id: "rules", section: "assist", label: "分流与连接", shortDesc: "网站分流与当前连接", icon: Network },
+  { id: "logs", section: "assist", label: "运行日志", shortDesc: "查看内核运行记录", icon: ScrollText },
   { id: "settings", section: "assist", label: "设置", shortDesc: "外观、启动与偏好", icon: SlidersHorizontal },
 ] as const;
 
 const NETWORK_NAV_ITEMS = NAV_ITEMS.filter((item) => item.section === "network");
+const AI_NAV_ITEM = NAV_ITEMS.find((item) => item.id === "ai")!;
 const ASSIST_NAV_ITEMS = NAV_ITEMS.filter((item) => item.section === "assist");
 
-const THEME_BUTTON_LABELS: Record<ThemeMode, string> = {
-  auto_time: "自动",
-  light: "暖纸",
-  warm_dark: "深苔",
-  midnight_blue: "星蓝",
+const THEME_BUTTON_LABELS_I18N: Record<UiLanguage, Record<ThemeMode, string>> = {
+  "zh-CN": {
+    auto_time: "自动",
+    light: "暖纸",
+    warm_dark: "深苔",
+    midnight_blue: "星蓝",
+  },
+  en: {
+    auto_time: "Auto",
+    light: "Light",
+    warm_dark: "Moss",
+    midnight_blue: "Night",
+  },
+  ja: {
+    auto_time: "自動",
+    light: "ライト",
+    warm_dark: "ダーク",
+    midnight_blue: "ミッド",
+  },
+  ru: {
+    auto_time: "Авто",
+    light: "Свет.",
+    warm_dark: "Тёмн.",
+    midnight_blue: "Ночь",
+  },
 };
 
 const RESOLVED_THEME_NAMES: Record<ResolvedTheme, string> = {
@@ -117,19 +139,22 @@ function resolveStatusLabel(status: string, preaccel: PreAccelSummary): string {
   if (status === "warn") return "路线存在波动";
   if (preaccel.proxyActive) {
     if (preaccel.enabled) {
+      if (preaccel.suspendedForTun) {
+        return "主内核虚拟网卡提速中（独立 443 通道已自动暂停）";
+      }
       if (preaccel.realWinDivertActive) {
         if (preaccel.verifyState === "probing") {
           return "国内提速中（探测其它软件链路…）";
         }
         if (preaccel.verifyState === "verified" && preaccel.verifyLatencyMs) {
-          return `国内提速中（猫云 + 其它软件 · ${preaccel.verifyLatencyMs} ms）`;
+          return `主内核 + 独立底层提速中（${preaccel.verifyLatencyMs} ms）`;
         }
-        return "国内提速中（猫云 + 其它软件）";
+        return "主内核 + 独立底层提速中";
       }
       if (preaccel.verifyState === "degraded") {
-        return "国内提速中（其它软件已保护回退）";
+        return "主内核代理提速中（其它软件已保护回退）";
       }
-      return "国内提速运行中";
+      return "主内核代理提速中";
     }
     return "代理运行中";
   }
@@ -185,12 +210,9 @@ export function Sidebar() {
   const multiGroupHasDirty = useAppSelector((s) => s.sessionDrafts.multiGroup.hasDirtyDrafts);
   const settingsHasDirty = useAppSelector((s) => s.sessionDrafts.settings.hasDirtyDrafts);
   const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
-  const tunAdminPromptBusy = useAppSelector((s) => s.tunAdminPromptBusy);
-  const tunAdminPromptReason = useAppSelector((s) => s.tunAdminPromptReason);
 
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const [localPetting, setLocalPetting] = useState(false);
-  const [disablingTunIntent, setDisablingTunIntent] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
   const petTimerRef = useRef<number | null>(null);
   const platformOs = resolvePlatformOs(runtime.os_label);
@@ -300,17 +322,6 @@ export function Sidebar() {
   })();
 
   useEffect(() => {
-    if (!tunAdminPromptOpen) return;
-    const handleKeyDown = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape" && !tunAdminPromptBusy) {
-        appActions.closeTunAdminPrompt();
-      }
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [tunAdminPromptOpen, tunAdminPromptBusy]);
-
-  useEffect(() => {
     if (!themeMenuOpen) return;
     const handlePointerDown = (ev: MouseEvent) => {
       if (themeMenuRef.current && !themeMenuRef.current.contains(ev.target as Node)) {
@@ -351,33 +362,12 @@ export function Sidebar() {
 
   const statusLabel = resolveStatusLabel(runtime.status, preaccelSummary);
 
-  const tunElevationCopy =
+  const tunButtonHint =
     platformOs === "linux"
-      ? {
-          ariaLabel: "为代理核心授予网络权限开启虚拟网卡",
-          title: "为代理核心授予网络权限并开启虚拟网卡",
-          desc: "虚拟网卡可接管终端、浏览器与桌面软件的全部流量。点击确认后，将通过系统授权仅给代理核心授予网络权限（cap_net_admin），界面继续以普通用户运行，不会污染个人配置目录。",
-          actionLabel: "一键授予核心网络权限",
-          busyLabel: "正在请求系统授权…",
-          buttonHint: "开启虚拟网卡需要给代理核心授予网络权限，点击可一键授权",
-        }
+      ? "开启虚拟网卡需要给代理核心授予网络权限，点击可一键授权"
       : platformOs === "macos"
-        ? {
-            ariaLabel: "安全授权开启虚拟网卡",
-            title: "安全授权开启虚拟网卡（macOS）",
-            desc: "虚拟网卡可接管终端与桌面软件的全部流量，在 macOS 下创建系统虚拟网卡（utun）需要管理员安全授权。确认后将弹出系统授权指引，完成验证后即可自动开启虚拟网卡。",
-            actionLabel: "前往系统授权并开启",
-            busyLabel: "正在请求系统授权…",
-            buttonHint: "开启虚拟网卡需要 macOS 系统安全授权，点击查看并一键授权",
-          }
-        : {
-            ariaLabel: "需要管理员权限开启虚拟网卡",
-            title: "以管理员身份重启并开启虚拟网卡",
-            desc: "虚拟网卡可接管终端、游戏与桌面软件的全部流量，需要 Windows 管理员权限。确认后将弹出系统授权框（UAC），自动以管理员身份重启猫猫云梯并开启虚拟网卡。",
-            actionLabel: "以管理员身份重启并开启",
-            busyLabel: "正在请求授权…",
-            buttonHint: "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启",
-          };
+        ? "开启虚拟网卡需要 macOS 系统安全授权，点击查看并一键授权"
+        : "开启虚拟网卡需要管理员权限，点击可一键以管理员身份重启并开启";
 
   const handleSelectTheme = (mode: ThemeMode) => {
     void appActions.setThemeMode(mode);
@@ -398,19 +388,6 @@ export function Sidebar() {
   const handleOpenAppearanceSettings = () => {
     setThemeMenuOpen(false);
     appActions.openSettingsTab("appearance");
-  };
-
-  const handleDisableTunIntent = async () => {
-    if (tunAdminPromptBusy || disablingTunIntent) return;
-    setDisablingTunIntent(true);
-    try {
-      const ok = await appActions.toggleTun(false);
-      if (ok) {
-        appActions.closeTunAdminPrompt();
-      }
-    } finally {
-      setDisablingTunIntent(false);
-    }
   };
 
   const resolveNavLabel = (id: NavRouteId): string => {
@@ -633,7 +610,7 @@ export function Sidebar() {
             ) : (
               <Moon className="h-3.5 w-3.5 text-[var(--accent)]" />
             )}
-            <span>{THEME_BUTTON_LABELS[themeMode]}</span>
+            <span>{THEME_BUTTON_LABELS_I18N[uiLang][themeMode]}</span>
             <ChevronDown
               className={`h-3 w-3 shrink-0 opacity-75 transition-transform ${
                 themeMenuOpen ? "rotate-180" : ""
@@ -753,7 +730,7 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Grouped 8-item primary navigation (6 Network + subtle divider + 2 Assist & Config) */}
+      {/* Grouped 8-item primary navigation: Network (4) + Mid-Focus AI Autopilot Card (1) + Advanced & Config (3) */}
       <nav className="flex-1 overflow-y-auto pr-0.5" aria-label={dict.nav.sectionNetwork}>
         <div className="mb-1 px-2.5 text-[10px] font-medium tracking-wide text-[var(--muted)]/85">
           {dict.nav.sectionNetwork}
@@ -762,7 +739,48 @@ export function Sidebar() {
           {NETWORK_NAV_ITEMS.map((item) => renderNavButton(item))}
         </div>
 
-        <div className="my-2 border-t border-[var(--line)]/65" role="separator" />
+        {/* Highlighted Mid-Level Warm-Gold AI Autopilot Card (instant 1-second visibility) */}
+        <div className="my-2.5">
+          <button
+            type="button"
+            onClick={() => appActions.setNav(AI_NAV_ITEM.id)}
+            aria-current={activeNav === "ai" ? "page" : undefined}
+            className={`group relative flex w-full items-center gap-2.5 rounded-2xl border px-2.5 py-2 text-left transition-all ${
+              activeNav === "ai"
+                ? "border-[var(--accent)] bg-[var(--accent-soft)] shadow-xs"
+                : "border-[var(--accent)]/45 hover:border-[var(--accent)]"
+            }`}
+            style={{
+              background:
+                activeNav === "ai"
+                  ? "linear-gradient(135deg, var(--accent-soft) 0%, color-mix(in srgb, var(--accent-soft) 55%, var(--card)) 100%)"
+                  : "linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 72%, var(--card)) 0%, var(--card) 100%)",
+            }}
+          >
+            {activeNav === "ai" && (
+              <span
+                className="absolute left-0 top-1/2 h-5 w-[3px] -translate-y-1/2 rounded-r-full bg-[var(--accent)]"
+                aria-hidden="true"
+              />
+            )}
+            <span className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] text-[var(--accent-ink)] shadow-xs">
+              <Bot className="h-4 w-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center justify-between gap-1.5">
+                <span className="truncate text-[13px] font-semibold text-[var(--text)]">
+                  {dict.nav.ai}
+                </span>
+                <span className="shrink-0 rounded-full border border-[var(--accent)]/45 bg-[var(--surface)]/90 px-1.5 py-0.5 text-[9.5px] font-semibold leading-none text-[var(--accent)]">
+                  {dict.nav.aiAutopilotBadge}
+                </span>
+              </div>
+              <div className="mt-0.5 truncate text-[10.5px] text-[var(--text-secondary)]">
+                {dict.nav.aiAutopilotSub}
+              </div>
+            </div>
+          </button>
+        </div>
 
         <div className="mb-1 px-2.5 text-[10px] font-medium tracking-wide text-[var(--muted)]/85">
           {dict.nav.sectionAssist}
@@ -806,16 +824,16 @@ export function Sidebar() {
             <button
               type="button"
               onClick={() => void appActions.toggleSystemProxy()}
-              className={`flex items-center justify-between rounded-xl border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+              className={`flex min-w-0 items-center justify-between gap-1 rounded-xl border px-2 py-1.5 text-[10.5px] font-medium transition-colors ${
                 runtime.system_proxy_enabled
                   ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
                   : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
               title={dict.home.systemProxy}
             >
-              <span className="inline-flex items-center gap-1 truncate">
+              <span className="inline-flex min-w-0 flex-1 items-center gap-1">
                 <Wifi className="h-3 w-3 shrink-0" />
-                {dict.home.systemProxy}
+                <span className="truncate">{dict.home.systemProxy}</span>
               </span>
               <span
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${
@@ -831,7 +849,7 @@ export function Sidebar() {
                   ? appActions.openTunAdminPrompt(null)
                   : void appActions.toggleTun()
               }
-              className={`flex items-center justify-between rounded-xl border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+              className={`flex min-w-0 items-center justify-between gap-1 rounded-xl border px-2 py-1.5 text-[10.5px] font-medium transition-colors ${
                 runtime.tun_enabled
                   ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
                   : runtime.tun_needs_elevation
@@ -843,10 +861,10 @@ export function Sidebar() {
                   ? "配置已开启虚拟网卡但当前权限不足，点击一键以管理员重启生效"
                   : runtime.tun_admin_ready
                     ? dict.home.tunMode
-                    : tunElevationCopy.buttonHint
+                    : tunButtonHint
               }
             >
-              <span className="inline-flex min-w-0 items-center gap-1 truncate">
+              <span className="inline-flex min-w-0 flex-1 items-center gap-1">
                 <ShieldCheck className="h-3 w-3 shrink-0" />
                 <span className="truncate">
                   {runtime.tun_needs_elevation ? dict.home.tunNeedsAdminShort : dict.home.tunMode}
@@ -904,100 +922,11 @@ export function Sidebar() {
         </div>
       )}
 
-      {tunAdminPromptOpen &&
-        typeof document !== "undefined" &&
-        createPortal(
-          <div
-            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 p-4 backdrop-blur-[2px]"
-            onClick={() => {
-              if (!tunAdminPromptBusy) appActions.closeTunAdminPrompt();
-            }}
-          >
-            <div
-              role="dialog"
-              aria-modal="true"
-              aria-label={tunElevationCopy.ariaLabel}
-              onClick={(e) => e.stopPropagation()}
-              className="cc-surface w-full max-w-[468px] rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-start gap-3">
-                  <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
-                    <ShieldCheck className="h-5 w-5" />
-                  </span>
-                  <div>
-                    <h3 className="text-sm font-semibold text-[var(--text)]">
-                      {tunElevationCopy.title}
-                    </h3>
-                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                      {tunElevationCopy.desc}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  disabled={tunAdminPromptBusy || disablingTunIntent}
-                  onClick={() => appActions.closeTunAdminPrompt()}
-                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
-                  aria-label="关闭弹窗"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
-
-              {tunAdminPromptReason && (
-                <div className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
-                  {tunAdminPromptReason}
-                </div>
-              )}
-
-              <div
-                className={`mt-5 flex flex-wrap items-center gap-2 ${
-                  runtime.tun_needs_elevation ? "justify-between" : "justify-end"
-                }`}
-              >
-                {runtime.tun_needs_elevation && (
-                  <button
-                    type="button"
-                    disabled={tunAdminPromptBusy || disablingTunIntent}
-                    onClick={() => void handleDisableTunIntent()}
-                    className="rounded-xl border border-[var(--line)] bg-transparent px-3 py-2 text-xs font-medium text-[var(--muted)] transition-colors hover:border-[var(--amber)]/55 hover:bg-[var(--amber-soft)]/45 hover:text-[var(--text)] disabled:opacity-50"
-                  >
-                    {disablingTunIntent ? "正在关闭…" : "暂不开网卡（关闭此项）"}
-                  </button>
-                )}
-                <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    disabled={tunAdminPromptBusy || disablingTunIntent}
-                    onClick={() => appActions.closeTunAdminPrompt()}
-                    className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)] disabled:opacity-50"
-                  >
-                    {runtime.tun_needs_elevation ? dict.common.cancel : "暂不开启"}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={tunAdminPromptBusy || disablingTunIntent}
-                    onClick={() => void appActions.relaunchAsAdminForTun()}
-                    className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
-                  >
-                    {tunAdminPromptBusy ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <ShieldCheck className="h-3.5 w-3.5" />
-                    )}
-                    <span>
-                      {tunAdminPromptBusy
-                        ? tunElevationCopy.busyLabel
-                        : tunElevationCopy.actionLabel}
-                    </span>
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>,
-          document.body
-        )}
+      {tunAdminPromptOpen && (
+        <Suspense fallback={null}>
+          <TunAdminPromptModal />
+        </Suspense>
+      )}
     </aside>
   );
 }

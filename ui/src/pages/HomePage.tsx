@@ -5,6 +5,7 @@ import {
   ArrowLeftRight,
   ArrowRight,
   ArrowUp,
+  Bot,
   CheckCircle2,
   ChevronDown,
   Clock,
@@ -48,7 +49,7 @@ import {
 import { type MascotState, MascotSprite } from "../components/MascotSprite";
 import { ShareBundleModal } from "../components/ShareBundleModal";
 import { TrafficSparkline, formatBytes, formatRate } from "../components/TrafficSparkline";
-import { normalizeUiLanguage, useUiDict } from "../i18n";
+import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import {
   appActions,
   selectHasBackgroundActivity,
@@ -1123,8 +1124,162 @@ export function HomePage() {
             state: "unknown" as const,
           };
 
+  const isZh = uiLang === "zh-CN";
+  const dnsTlsDiag = runtime.dns_tls_diagnostics;
+  const showDnsTlsBanner = Boolean(
+    dnsTlsDiag && dnsTlsDiag.status && dnsTlsDiag.status !== "healthy"
+  );
+  const dnsLabelSep = isZh || uiLang === "ja" ? "：" : ": ";
+  const dnsListSep = isZh ? "、" : uiLang === "ja" ? "・" : ", ";
+  const hasCjkText = (value: string) => /[\u3400-\u9fff]/.test(value);
+  const formatDnsPathLabel = (rawPath: string): string => {
+    switch (rawPath.trim().toLowerCase()) {
+      case "direct":
+        return dict.home.dnsDiagPathDirect;
+      case "proxy":
+        return dict.home.dnsDiagPathProxy;
+      case "proxy_server":
+        return dict.home.dnsDiagPathProxyServer;
+      case "default":
+        return dict.home.dnsDiagPathDefault;
+      default:
+        return rawPath;
+    }
+  };
+  const dnsDiagHeading = dnsTlsDiag
+    ? dnsTlsDiag.status === "degraded_recovered"
+      ? dict.home.dnsDiagRecoveredTitle
+      : isZh
+        ? dnsTlsDiag.category || dict.home.dnsDiagTitle
+        : dnsTlsDiag.category && !hasCjkText(dnsTlsDiag.category)
+          ? dnsTlsDiag.category
+          : dict.home.dnsDiagTitle
+    : "";
+  const dnsDiagNextHint = dnsTlsDiag
+    ? isZh
+      ? dnsTlsDiag.next_retry_hint ||
+        (dnsTlsDiag.status === "degraded_recovered" || dnsTlsDiag.recovered
+          ? dict.home.dnsDiagRecoveredHint
+          : dnsTlsDiag.next_retry_at
+            ? formatI18nTemplate(dict.home.dnsDiagRetryWithTimeHint, {
+                time: dnsTlsDiag.next_retry_at,
+              })
+            : dict.home.dnsDiagRetrySoonHint)
+      : dnsTlsDiag.status === "degraded_recovered" || dnsTlsDiag.recovered
+        ? dict.home.dnsDiagRecoveredHint
+        : dnsTlsDiag.next_retry_at
+          ? formatI18nTemplate(dict.home.dnsDiagRetryWithTimeHint, {
+              time: dnsTlsDiag.next_retry_at,
+            })
+          : dnsTlsDiag.next_retry_hint && !hasCjkText(dnsTlsDiag.next_retry_hint)
+            ? dnsTlsDiag.next_retry_hint
+            : dict.home.dnsDiagRetrySoonHint
+    : "";
+
   return (
     <div className="space-y-3 pb-3">
+      {/* DNS TLS Diagnostics Banner: zero vertical space when healthy; explicit warning/recovery banner otherwise */}
+      {showDnsTlsBanner && dnsTlsDiag && (
+        <section
+          className={`cc-card cc-glass rounded-2xl border px-4 py-3 text-xs ${
+            dnsTlsDiag.status === "degraded_recovered"
+              ? "border-[var(--amber)]/55 bg-[var(--amber-soft)]/50"
+              : "border-[var(--red)]/55 bg-[var(--red-soft)]/45"
+          }`}
+        >
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex min-w-0 flex-1 items-start gap-2.5">
+              <ShieldAlert
+                className={`mt-0.5 h-4 w-4 shrink-0 ${
+                  dnsTlsDiag.status === "degraded_recovered"
+                    ? "text-[var(--amber)]"
+                    : "text-[var(--red)]"
+                }`}
+              />
+              <div className="min-w-0 flex-1 space-y-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-semibold text-[var(--text)]">
+                    {dnsDiagHeading}
+                  </span>
+                  {dnsTlsDiag.tls_verification_preserved !== false && (
+                    <span className="inline-flex items-center gap-1 rounded-full border border-[var(--green)]/40 bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                      <ShieldCheck className="h-3 w-3" />
+                      <span>{dict.home.dnsDiagTlsPreserved}</span>
+                    </span>
+                  )}
+                  {dnsTlsDiag.failure_count > 0 && (
+                    <span className="cc-mono rounded-full bg-[var(--surface)]/85 px-2 py-0.5 text-[10px] text-[var(--text-secondary)]">
+                      {dnsTlsDiag.failure_count}x
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-[var(--text-secondary)]">
+                  {dnsTlsDiag.first_seen_at && (
+                    <span>
+                      {dict.home.dnsDiagStartedLabel}
+                      {dnsLabelSep}
+                      <span className="cc-mono text-[var(--text)]">{dnsTlsDiag.first_seen_at}</span>
+                    </span>
+                  )}
+                  {dnsTlsDiag.affected_paths.length > 0 && (
+                    <span>
+                      {dict.home.dnsDiagPathsLabel}
+                      {dnsLabelSep}
+                      <span className="cc-mono text-[var(--text)]">
+                        {dnsTlsDiag.affected_paths.map(formatDnsPathLabel).join(" / ")}
+                      </span>
+                    </span>
+                  )}
+                  {dnsTlsDiag.affected_upstreams.length > 0 && (
+                    <span>
+                      {dict.home.dnsDiagUpstreamsLabel}
+                      {dnsLabelSep}
+                      <span className="cc-mono text-[var(--text)]">
+                        {dnsTlsDiag.affected_upstreams.join(dnsListSep)}
+                      </span>
+                    </span>
+                  )}
+                </div>
+
+                {dnsDiagNextHint && (
+                  <div className="text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                    <span className="font-medium text-[var(--text)]">
+                      {dict.home.dnsDiagNextLabel}
+                      {dnsLabelSep}
+                    </span>
+                    <span>{dnsDiagNextHint}</span>
+                    {dnsTlsDiag.next_retry_at && !dnsDiagNextHint.includes(dnsTlsDiag.next_retry_at) && (
+                      <span className="ml-1.5 cc-mono text-[var(--muted)]">
+                        ({dnsTlsDiag.next_retry_at})
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => appActions.setNav("logs")}
+                className="rounded-lg border border-[var(--line)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              >
+                {dict.home.dnsDiagOpenLogs}
+              </button>
+              <button
+                type="button"
+                onClick={() => appActions.openAiAssistant("troubleshooting", "agent")}
+                className="inline-flex items-center gap-1 rounded-lg bg-[var(--accent)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+              >
+                <Bot className="h-3 w-3" />
+                <span>{dict.home.dnsDiagAskAi}</span>
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* 0-Node Onboarding Guide Card: car/fuel metaphor + 3 clear entry actions */}
       {initialized && nodes.length === 0 && (
         <section className="cc-card cc-glass rounded-2xl border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 p-4">
@@ -1828,12 +1983,12 @@ export function HomePage() {
                                 <div className="flex shrink-0 items-center gap-2 cc-mono text-[11px]">
                                   {up !== null && (
                                     <span className="text-[var(--coral)]">
-                                      ↑{up.toFixed(1)}M
+                                      ↑{up.toFixed(1)} Mbps
                                     </span>
                                   )}
                                   {down !== null && (
                                     <span className="text-[var(--sky)]">
-                                      ↓{down >= 100 ? Math.round(down) : down.toFixed(1)}M
+                                      ↓{down >= 100 ? Math.round(down) : down.toFixed(1)} Mbps
                                     </span>
                                   )}
                                   <span className="font-semibold" style={{ color: latColor }}>
@@ -1977,6 +2132,16 @@ export function HomePage() {
               >
                 <Minimize2 className="h-3.5 w-3.5 text-[var(--green)]" />
                 <span>{dict.home.traySaveMem}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => appActions.openAiAssistant(undefined, "agent")}
+                className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-[var(--accent)]/40 bg-[var(--accent-soft)]/55 px-3 py-1.5 text-[11.5px] font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                title="前往 AI 全权代管：复制本机 AI 全权托管指令或网页 AI 手把手引导"
+              >
+                <Bot className="h-3.5 w-3.5 shrink-0" />
+                <span>{dict.home.aiQuickBtn}</span>
               </button>
             </div>
           </div>

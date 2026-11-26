@@ -1132,6 +1132,7 @@ mod tests {
             last_mbps: Some(180.0),
             last_up_mbps: Some(125.0),
             last_down_mbps: Some(180.0),
+            supports_ipv6: false,
         }
     }
 

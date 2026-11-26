@@ -61,9 +61,14 @@ const READONLY_CLI_ITEMS: readonly ReadonlyCliItem[] = [
     descEn: "Test which routing rule and outbound a domain matches",
   },
   {
-    cmd: "catcloud logs tail --lines 80 --json",
-    descZh: "读取最近 80 条自动脱敏运行日志",
-    descEn: "Read the latest 80 automatically sanitized core log lines",
+    cmd: "catcloud logs tail --lines 80 --since 30m --json",
+    descZh: "读取近 30 分钟最近 80 条自动脱敏运行日志（支持时间窗过滤）",
+    descEn: "Read the latest 80 sanitized log lines within a time window",
+  },
+  {
+    cmd: "catcloud group members --id <id> add --nodes <node_id> --json",
+    descZh: "向已有智能多选组安全增删节点（不影响策略与分流规则）",
+    descEn: "Safely add/remove nodes in a smart group without resetting policies",
   },
   {
     cmd: "catcloud sub list --json",
@@ -340,7 +345,11 @@ export function AiAssistantPage() {
 
   const [bootstrapInfo, setBootstrapInfo] = useState<AgentBootstrapPromptDto | null>(null);
   const [highlightAgentCard, setHighlightAgentCard] = useState<boolean>(false);
+  const [showAgentPaths, setShowAgentPaths] = useState<boolean>(false);
 
+  const [manualsAccordionOpen, setManualsAccordionOpen] = useState<boolean>(() =>
+    Boolean(aiRouteHint?.moduleId)
+  );
   const [cliAccordionOpen, setCliAccordionOpen] = useState<boolean>(false);
   const [issueAccordionOpen, setIssueAccordionOpen] = useState<boolean>(false);
   const [issueSummary, setIssueSummary] = useState<string>("");
@@ -381,6 +390,7 @@ export function AiAssistantPage() {
     if (aiRouteHint.moduleId) {
       pendingHintModuleRef.current = aiRouteHint.moduleId;
       setSelectedDocId(aiRouteHint.moduleId);
+      setManualsAccordionOpen(true);
     }
     if (aiRouteHint.tab === "agent") {
       setHighlightAgentCard(true);
@@ -403,7 +413,7 @@ export function AiAssistantPage() {
 
     void Promise.allSettled([
       catcloudApi.listAgentDocs(docLang),
-      catcloudApi.buildAgentBootstrapPrompt(docLang, "ai"),
+      catcloudApi.buildAgentBootstrapPrompt(docLang, "ai", "autopilot"),
     ]).then(([docsRes, bootRes]) => {
       if (cancelled) return;
       if (docsRes.status === "fulfilled") {
@@ -526,12 +536,13 @@ export function AiAssistantPage() {
     }
   };
 
-  const handleCopyAgentBootstrap = async () => {
+  const handleCopyAgentBootstrap = async (mode: "autopilot" | "readonly" = "autopilot") => {
     if (busyAction) return;
-    setBusyAction("agent-bootstrap");
+    const actionKey = mode === "readonly" ? "agent-readonly" : "agent-autopilot";
+    setBusyAction(actionKey);
     try {
-      const ok = await appActions.copyAgentBootstrapPrompt(docLang);
-      if (ok) flashCopied("agent-bootstrap");
+      const ok = await appActions.copyAgentBootstrapPrompt(docLang, mode);
+      if (ok) flashCopied(actionKey);
     } finally {
       setBusyAction(null);
     }
@@ -656,6 +667,15 @@ export function AiAssistantPage() {
 
           <button
             type="button"
+            onClick={() => appActions.openOnboardingModal()}
+            className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[var(--accent)]/45 bg-[var(--accent-soft)]/70 px-3 text-xs font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+          >
+            <Sparkles className="h-3.5 w-3.5 shrink-0" />
+            <span>{dict.aiHub.reopenOnboardingBtn}</span>
+          </button>
+
+          <button
+            type="button"
             disabled={busyAction === "github-issue"}
             onClick={() => void handleOpenIssue()}
             className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
@@ -670,14 +690,153 @@ export function AiAssistantPage() {
         </div>
       </section>
 
-      {/* Dual Audience Equal-Height Cards */}
+      {/* Dual Audience Equal-Height Cards: Left Hero = Local AI Agent Autopilot | Right = Web AI Walkthrough */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-        {/* Left Card: Web AI (Beginners) */}
+        {/* Left Hero Card: Local AI Agent Full Autopilot */}
+        <section
+          className={`cc-card cc-glass flex flex-col justify-between gap-3.5 rounded-2xl border-[var(--accent)]/60 p-4 transition-colors ${
+            highlightAgentCard ? "border-[var(--accent)] ring-2 ring-[var(--accent)]/40" : ""
+          }`}
+          style={{
+            background:
+              "linear-gradient(135deg, color-mix(in srgb, var(--accent-soft) 55%, var(--card)) 0%, var(--card) 100%)",
+          }}
+        >
+          <div className="space-y-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2">
+                <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent)] text-[var(--accent-ink)]">
+                  <Cpu className="h-4 w-4" />
+                </span>
+                <h2 className="text-sm font-bold text-[var(--text)]">
+                  {dict.aiHub.agentTitle}
+                </h2>
+              </div>
+              <span className="rounded-full border border-[var(--accent)]/45 bg-[var(--surface)]/90 px-2.5 py-0.5 text-[10.5px] font-semibold text-[var(--accent)]">
+                {dict.aiHub.agentCardBadge}
+              </span>
+            </div>
+
+            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
+              {dict.aiHub.agentDesc}
+            </p>
+
+            {/* Collapsible single-line CLI & Manual Path Disclosure (no terminal wall on first glance) */}
+            <div className="rounded-xl border border-[var(--line)]/80 bg-[var(--bg-elevated)]/75">
+              <button
+                type="button"
+                onClick={() => setShowAgentPaths((v) => !v)}
+                aria-expanded={showAgentPaths}
+                className="flex w-full items-center justify-between gap-2 px-3 py-1.5 text-left text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text)]"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <Terminal className="h-3.5 w-3.5 text-[var(--accent)]" />
+                  <span>
+                    {showAgentPaths ? dict.aiHub.agentHidePaths : dict.aiHub.agentShowPaths}
+                  </span>
+                </span>
+                {showAgentPaths ? (
+                  <ChevronDown className="h-3.5 w-3.5 text-[var(--muted)]" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5 text-[var(--muted)]" />
+                )}
+              </button>
+              {showAgentPaths && (
+                <div className="space-y-1 border-t border-[var(--line)]/70 px-3 py-2 text-[11px]">
+                  <div className="flex items-center gap-2">
+                    <span className="w-12 shrink-0 font-medium text-[var(--muted)]">CLI</span>
+                    <code
+                      title={cliPathPreview}
+                      className="cc-mono cc-selectable min-w-0 flex-1 truncate text-[var(--text)]"
+                    >
+                      {cliPathPreview}
+                    </code>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-12 shrink-0 font-medium text-[var(--muted)]">
+                      {isZh ? "手册树" : "Manuals"}
+                    </span>
+                    <code
+                      title={docsIndexPreview}
+                      className="cc-mono cc-selectable min-w-0 flex-1 truncate text-[var(--text-secondary)]"
+                    >
+                      {docsIndexPreview}
+                    </code>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 pt-0.5">
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => void handleCopyAgentBootstrap("autopilot")}
+              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:opacity-60"
+            >
+              {copiedKey === "agent-autopilot" ? (
+                <Check className="h-3.5 w-3.5" />
+              ) : busyAction === "agent-autopilot" ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Terminal className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {copiedKey === "agent-autopilot"
+                  ? dict.common.copied
+                  : dict.aiHub.agentCopyBootstrap}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => void handleCopyAgentBootstrap("readonly")}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3 py-2 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
+            >
+              {copiedKey === "agent-readonly" ? (
+                <Check className="h-3.5 w-3.5 text-[var(--green)]" />
+              ) : busyAction === "agent-readonly" ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Stethoscope className="h-3.5 w-3.5 text-[var(--sky)]" />
+              )}
+              <span>
+                {copiedKey === "agent-readonly"
+                  ? dict.common.copied
+                  : dict.aiHub.agentCopyReadonly}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => void handleCopyDiag("agent-diag")}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
+            >
+              {copiedKey === "agent-diag" ? (
+                <Check className="h-3.5 w-3.5 text-[var(--green)]" />
+              ) : busyAction === "agent-diag" ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
+              )}
+              <span>
+                {copiedKey === "agent-diag"
+                  ? dict.common.copied
+                  : dict.aiHub.webAiCopyDiag}
+              </span>
+            </button>
+          </div>
+        </section>
+
+        {/* Right Card: Web AI Step-by-Step Guide */}
         <section className="cc-card cc-glass flex flex-col justify-between gap-4 rounded-2xl p-4">
           <div className="space-y-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <div className="flex items-center gap-2">
-                <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--sky-soft)] text-[var(--sky)]">
                   <Sparkles className="h-4 w-4" />
                 </span>
                 <h2 className="text-sm font-semibold text-[var(--text)]">
@@ -685,7 +844,7 @@ export function AiAssistantPage() {
                 </h2>
               </div>
               <span className="rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] font-medium text-[var(--muted)]">
-                DeepSeek · 豆包 · Kimi · ChatGPT
+                {dict.onboarding.aiSupportWebNames}
               </span>
             </div>
 
@@ -699,7 +858,7 @@ export function AiAssistantPage() {
               type="button"
               disabled={busyAction !== null}
               onClick={() => void handleCopyWebGuide()}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--accent)]/60 bg-[var(--accent-soft)] px-3.5 py-2 text-xs font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)] disabled:opacity-60"
             >
               {copiedKey === "web-guide" ? (
                 <Check className="h-3.5 w-3.5" />
@@ -746,123 +905,65 @@ export function AiAssistantPage() {
             </button>
           </div>
         </section>
-
-        {/* Right Card: Local AI Agent */}
-        <section
-          className={`cc-card cc-glass flex flex-col justify-between gap-3.5 rounded-2xl p-4 transition-colors ${
-            highlightAgentCard ? "border-[var(--accent)] ring-1 ring-[var(--accent)]/40" : ""
-          }`}
-        >
-          <div className="space-y-2">
-            <div className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-2">
-                <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--sky-soft)] text-[var(--sky)]">
-                  <Cpu className="h-4 w-4" />
-                </span>
-                <h2 className="text-sm font-semibold text-[var(--text)]">
-                  {dict.aiHub.agentTitle}
-                </h2>
-              </div>
-              <span className="rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] font-medium text-[var(--muted)]">
-                {isZh ? "只读自查 · 按需读手册" : "Read-Only Inspect · On-Demand"}
-              </span>
-            </div>
-
-            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-              {dict.aiHub.agentDesc}
-            </p>
-
-            {/* Concise read-only path hint strip */}
-            <div className="space-y-1 rounded-xl border border-[var(--line)]/80 bg-[var(--bg-elevated)]/80 px-3 py-2 text-[11px]">
-              <div className="flex items-center gap-2">
-                <span className="w-12 shrink-0 font-medium text-[var(--muted)]">CLI</span>
-                <code
-                  title={cliPathPreview}
-                  className="cc-mono cc-selectable min-w-0 flex-1 truncate text-[var(--text)]"
-                >
-                  {cliPathPreview}
-                </code>
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="w-12 shrink-0 font-medium text-[var(--muted)]">
-                  {isZh ? "手册树" : "Manuals"}
-                </span>
-                <code
-                  title={docsIndexPreview}
-                  className="cc-mono cc-selectable min-w-0 flex-1 truncate text-[var(--text-secondary)]"
-                >
-                  {docsIndexPreview}
-                </code>
-              </div>
-            </div>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 pt-0.5">
-            <button
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => void handleCopyAgentBootstrap()}
-              className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-            >
-              {copiedKey === "agent-bootstrap" ? (
-                <Check className="h-3.5 w-3.5" />
-              ) : busyAction === "agent-bootstrap" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Terminal className="h-3.5 w-3.5" />
-              )}
-              <span>
-                {copiedKey === "agent-bootstrap"
-                  ? dict.common.copied
-                  : dict.aiHub.agentCopyBootstrap}
-              </span>
-            </button>
-
-            <button
-              type="button"
-              disabled={busyAction !== null}
-              onClick={() => void handleCopyDiag("agent-diag")}
-              className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
-            >
-              {copiedKey === "agent-diag" ? (
-                <Check className="h-3.5 w-3.5 text-[var(--green)]" />
-              ) : busyAction === "agent-diag" ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
-              )}
-              <span>
-                {copiedKey === "agent-diag"
-                  ? dict.common.copied
-                  : isZh
-                    ? "复制完整排障包"
-                    : dict.aiHub.webAiCopyDiag}
-              </span>
-            </button>
-          </div>
-        </section>
       </div>
 
-      {/* Bundled Manuals (8 docs): Left Catalog + Right On-Demand Preview */}
-      <section className="cc-card cc-glass rounded-2xl p-4">
-        <div className="mb-3 flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] pb-2.5">
-          <div className="flex items-center gap-2">
-            <BookOpen className="h-4 w-4 text-[var(--accent)]" />
-            <h2 className="text-sm font-semibold text-[var(--text)]">
-              {dict.aiHub.tabManuals}
-            </h2>
-            <span className="cc-mono rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] text-[var(--muted)]">
-              {isZh ? `${docs.length || 8} 篇` : `${docs.length || 8} docs`}
-            </span>
+      {/* Collapsible Bundled Manuals (8 docs): Collapsed by Default with Chapter Preview Chips */}
+      <section className="cc-card cc-glass overflow-hidden rounded-2xl">
+        <button
+          type="button"
+          onClick={() => setManualsAccordionOpen((open) => !open)}
+          aria-expanded={manualsAccordionOpen}
+          className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left transition-colors hover:bg-[var(--surface)]/60"
+        >
+          <div className="flex min-w-0 items-center gap-2.5">
+            <BookOpen className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+            <div className="min-w-0">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="truncate text-xs font-semibold text-[var(--text)]">
+                  {dict.aiHub.tabManuals}
+                </span>
+                <span className="cc-mono rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] text-[var(--muted)]">
+                  {isZh ? `${docs.length || 8} 篇` : `${docs.length || 8} docs`}
+                </span>
+              </div>
+              <p className="mt-0.5 truncate text-[11px] text-[var(--muted)]">
+                {dict.aiHub.manualsExpandHint}
+              </p>
+            </div>
           </div>
-          <span className="text-[11px] text-[var(--muted)]">
-            {isZh
-              ? "点选左侧目录按需展开单篇，支持一键复制或导出 .md"
-              : "Select any chapter to load on demand, copy, or export as .md"}
+          <span className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
+            {manualsAccordionOpen ? dict.aiHub.manualsCollapseBtn : dict.aiHub.manualsExpandBtn}
+            {manualsAccordionOpen ? (
+              <ChevronDown className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronRight className="h-3.5 w-3.5" />
+            )}
           </span>
-        </div>
+        </button>
 
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+        {/* Compact module catalog overview chips when collapsed */}
+        {!manualsAccordionOpen && docs.length > 0 && (
+          <div className="flex flex-wrap gap-1.5 border-t border-[var(--line)]/65 bg-[var(--bg-elevated)]/40 px-4 py-2.5">
+            {docs.map((doc) => (
+              <button
+                key={doc.id}
+                type="button"
+                onClick={() => {
+                  setSelectedDocId(doc.id);
+                  setManualsAccordionOpen(true);
+                }}
+                title={doc.summary || doc.title}
+                className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+              >
+                {doc.title}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {manualsAccordionOpen && (
+          <div className="border-t border-[var(--line)] p-4">
+            <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
           {/* Left Column: Lightweight 8-doc Index */}
           <div className="space-y-1 lg:col-span-4">
             {docsLoading ? (
@@ -993,6 +1094,8 @@ export function AiAssistantPage() {
             </div>
           </div>
         </div>
+          </div>
+        )}
       </section>
 
       {/* Bottom Collapsed Accordion 1: Read-Only Diagnostic CLI Quick Reference */}
@@ -1061,8 +1164,8 @@ export function AiAssistantPage() {
                     key={item.cmd}
                     className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2"
                   >
-                    <div className="min-w-0">
-                      <div className="truncate cc-mono cc-selectable text-xs text-[var(--text)]">
+                    <div className="min-w-0 flex-1">
+                      <div className="break-all cc-mono cc-selectable text-[11px] leading-snug text-[var(--text)]">
                         {item.cmd}
                       </div>
                       <div className="mt-0.5 truncate text-[11px] text-[var(--muted)]">

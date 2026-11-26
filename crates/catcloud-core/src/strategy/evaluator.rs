@@ -204,6 +204,9 @@ pub struct EvaluatedCandidate {
     /// Indices into `group.trigger_rules` that evaluated to `true` for this node.
     pub triggered_rule_indices: Vec<usize>,
     pub score: f64,
+    /// RFC 3339 timestamp of the latest probe snapshot backing this candidate evaluation, if any.
+    #[serde(default)]
+    pub tested_at: Option<String>,
 }
 
 /// Evaluation record of a single [`TriggerRule`] against the currently active node.
@@ -410,6 +413,11 @@ pub fn evaluate_group_candidates_with_runtime(
 
         let meets_thresholds = passed_hard_gates && ctx.ok && triggered_indices.is_empty();
 
+        let tested_at = snap
+            .map(|s| s.tested_at.trim())
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string);
+
         let candidate = EvaluatedCandidate {
             node_id: node.id.clone(),
             node_name: node.name.clone(),
@@ -421,6 +429,7 @@ pub fn evaluate_group_candidates_with_runtime(
             meets_thresholds,
             triggered_rule_indices: triggered_indices,
             score,
+            tested_at,
         };
 
         if passed_hard_gates {
@@ -1190,5 +1199,50 @@ mod tests {
         assert_eq!(rep_all_down.gate_passed.len(), 3);
         assert_eq!(rep_all_down.gate_passed[0].node_id, "n-steady");
         assert_eq!(rep_all_down.gate_passed[2].node_id, "n-fast");
+    }
+
+    #[test]
+    fn evaluated_candidate_populates_tested_at_from_probe_snapshot() {
+        let nodes = vec![
+            test_node("n-probed", "JP Probed", "JP"),
+            test_node("n-unprobed", "TW Unprobed", "TW"),
+        ];
+        let mut snaps = HashMap::new();
+        let snap = ProbeSnapshot {
+            node_id: "n-probed".to_string(),
+            ok: true,
+            latency_ms: Some(55.0),
+            up_mbps: Some(20.0),
+            down_mbps: Some(100.0),
+            tested_at: "2026-11-27T01:40:00Z".to_string(),
+            ..Default::default()
+        };
+        snaps.insert("n-probed".to_string(), snap);
+
+        let group = MultiGroup {
+            id: "g-tested-at".to_string(),
+            name: "TestedAtGroup".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-probed".to_string(), "n-unprobed".to_string()],
+            hard_gates: Vec::new(),
+            formula_expr: "100".to_string(),
+            trigger_rules: Vec::new(),
+            ..Default::default()
+        };
+
+        let report = evaluate_group_candidates(&group, &nodes, &snaps).unwrap();
+        let probed = report
+            .gate_passed
+            .iter()
+            .find(|c| c.node_id == "n-probed")
+            .expect("probed candidate");
+        assert_eq!(probed.tested_at.as_deref(), Some("2026-11-27T01:40:00Z"));
+
+        let unprobed = report
+            .gate_passed
+            .iter()
+            .find(|c| c.node_id == "n-unprobed")
+            .expect("unprobed candidate");
+        assert_eq!(unprobed.tested_at, None);
     }
 }

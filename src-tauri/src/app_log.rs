@@ -470,7 +470,8 @@ mod tests {
         assert!(clean.contains("127.0.0.1:7890"));
         assert!(!clean.contains("192.168.1.10"));
         assert!(clean.contains("192.168.1.*"));
-        assert!(clean.contains("198.18.0.12"));
+        assert!(!clean.contains("198.18.0.12"));
+        assert!(clean.contains("198.18.0.*"));
         assert!(clean.contains("[240e:390::*]:443"));
         assert!(clean.contains("回环 ::1"));
         assert!(clean.contains("Bearer <REDACTED>"));
@@ -678,6 +679,9 @@ mod tests {
             "172.16.9.22",
             "192.168.50.88",
             "100.64.12.34",
+            "198.18.0.5",
+            "223.5.5.5",
+            "119.29.29.29",
             "789a::42",
             "abcd:1234",
             "John Doe",
@@ -696,14 +700,14 @@ mod tests {
         assert!(clean.contains("172.16.9.*"));
         assert!(clean.contains("192.168.50.*"));
         assert!(clean.contains("100.64.12.*"));
+        assert!(clean.contains("198.18.0.*"));
+        assert!(clean.contains("223.5.5.*"));
+        assert!(clean.contains("119.29.29.*"));
         assert!(clean.contains("fd12:3456::*"));
         assert!(clean.contains("fe80:0::*"));
 
         assert!(clean.contains("127.0.0.1"));
         assert!(clean.contains("0.0.0.0"));
-        assert!(clean.contains("198.18.0.5"));
-        assert!(clean.contains("223.5.5.5"));
-        assert!(clean.contains("119.29.29.29"));
         assert!(clean.contains("::1"));
         assert!(clean.contains(" :: "));
 
@@ -714,6 +718,59 @@ mod tests {
         assert!(clean.contains("`<LOCAL_PATH>/bin`（放行）"));
         assert!(clean.contains("安装至 <LOCAL_PATH>/bin 完成"));
         assert!(clean.contains("读取 <LOCAL_PATH> 失败"));
+        assert_eq!(sanitize_log_line(&clean), clean);
+    }
+
+    #[test]
+    fn sanitize_log_line_strictly_masks_fictional_public_private_tun_and_dns_ips() {
+        let raw = concat!(
+            "2026-11-26T03:44:51Z [warning] ",
+            "public 203.0.113.10. relay 198.51.100.77:443 ",
+            "private 10.99.88.77 corp 172.20.14.9 home ip_192.168.31.44 ",
+            "tun 198.18.0.21 linklocal 169.254.12.34 ",
+            "dns https://223.5.5.5/dns-query tls://1.12.12.12:853 fallback 8.8.8.8 ",
+            "v6 [2001:db8:abcd:ef01::99]:443 ",
+            "keep 127.0.0.1:7890 0.0.0.0 ::1 :: ver v1.2.3.4 oid 1.3.6.1.5.5"
+        );
+        let clean = sanitize_log_line(raw);
+
+        for leaked in [
+            "203.0.113.10",
+            "198.51.100.77",
+            "10.99.88.77",
+            "172.20.14.9",
+            "192.168.31.44",
+            "198.18.0.21",
+            "169.254.12.34",
+            "223.5.5.5",
+            "1.12.12.12",
+            "8.8.8.8",
+            "ef01::99",
+        ] {
+            assert!(
+                !clean.contains(leaked),
+                "strict app_log sanitizer leaked `{leaked}` in: {clean}"
+            );
+        }
+
+        assert!(clean.contains("203.0.113.*."));
+        assert!(clean.contains("198.51.100.*:443"));
+        assert!(clean.contains("10.99.88.*"));
+        assert!(clean.contains("172.20.14.*"));
+        assert!(clean.contains("ip_192.168.31.*"));
+        assert!(clean.contains("198.18.0.*"));
+        assert!(clean.contains("169.254.12.*"));
+        assert!(clean.contains("https://223.5.5.*/dns-query"));
+        assert!(clean.contains("tls://1.12.12.*:853"));
+        assert!(clean.contains("fallback 8.8.8.*"));
+        assert!(clean.contains("[2001:db8::*]:443"));
+        assert!(clean.contains("127.0.0.1:7890"));
+        assert!(clean.contains("0.0.0.0"));
+        assert!(clean.contains("::1"));
+        assert!(clean.contains(" :: "));
+        assert!(clean.contains("v1.2.3.4"));
+        assert!(clean.contains("1.3.6.1.5.5"));
+        assert!(clean.contains("2026-11-26T03:44:51Z"));
         assert_eq!(sanitize_log_line(&clean), clean);
     }
 }

@@ -31,6 +31,7 @@ import {
   Save,
   Shield,
   SlidersHorizontal,
+  Sparkles,
   Square,
   Terminal,
   Upload,
@@ -152,11 +153,15 @@ const DEFAULT_EXTENDED: ExtendedSettings = {
   enhancedMode: "fake-ip",
   fakeIpRange: "198.18.0.1/16",
   fakeIpFilter: "*.lan, *.local, time.*.com, ntp.*.com, +.msftconnecttest.com",
-  defaultNameserver: "https://223.5.5.5/dns-query, https://1.12.12.12/dns-query",
-  nameserverPolicy: "geosite:cn,private: https://223.5.5.5/dns-query",
-  nameserver: "https://223.5.5.5/dns-query, https://doh.pub/dns-query",
+  defaultNameserver:
+    "https://223.5.5.5/dns-query, https://1.12.12.12/dns-query, tls://223.6.6.6:853, tls://120.53.53.53:853",
+  nameserverPolicy:
+    "geosite:cn,private: https://223.5.5.5/dns-query, https://1.12.12.12/dns-query",
+  nameserver:
+    "https://223.5.5.5/dns-query, https://1.12.12.12/dns-query, tls://223.6.6.6:853, tls://120.53.53.53:853",
   fallback: "https://1.1.1.1/dns-query, https://dns.google/dns-query",
-  proxyServerNameserver: "https://223.5.5.5/dns-query",
+  proxyServerNameserver:
+    "https://223.5.5.5/dns-query, https://1.12.12.12/dns-query, tls://223.6.6.6:853, tls://120.53.53.53:853",
   fallbackFilterGeoip: true,
   fallbackFilterGeoipCode: "CN",
   fallbackFilterIpcidr: "240.0.0.0/4, 0.0.0.0/32, 198.51.100.0/24",
@@ -985,6 +990,7 @@ export function SettingsPage() {
   dirtyRef.current = dirty;
   const extDirtyRef = useRef(extDirty);
   extDirtyRef.current = extDirty;
+  const savedExtRef = useRef<ExtendedSettings | null>(null);
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -1062,8 +1068,10 @@ export function SettingsPage() {
     try {
       const full = await catcloudApi.getFullConfig();
       if (isActive && !isActive()) return;
+      const hydrated = hydrateExtendedFromFullConfig(full);
+      savedExtRef.current = structuredClone(hydrated);
       if (!extDirtyRef.current) {
-        setExt(hydrateExtendedFromFullConfig(full));
+        setExt(hydrated);
       }
       setExtLoaded(true);
       setExtLoadError(null);
@@ -1244,6 +1252,9 @@ export function SettingsPage() {
       clearSettingsDirtyDraftCache();
       setDraftDirty(false);
       setExtDirty(false);
+      if (extLoaded) {
+        savedExtRef.current = structuredClone(ext);
+      }
       appActions.patchSessionDraft("settings", { hasDirtyDrafts: false });
       appActions.syncConfig(syncedConfig);
       const rt = await catcloudApi.getRuntimeInfo();
@@ -1254,6 +1265,24 @@ export function SettingsPage() {
     } finally {
       setSaving(false);
     }
+  };
+
+  const handleDiscardUnsaved = () => {
+    if (saving) return;
+    const latestStoreConfig = appStore.getState().config;
+    dirtyRef.current = false;
+    extDirtyRef.current = false;
+    clearSettingsDirtyDraftCache();
+    setDraftDirty(false);
+    setExtDirty(false);
+    appActions.patchSessionDraft("settings", { hasDirtyDrafts: false });
+    setDraft(structuredClone(latestStoreConfig));
+    if (savedExtRef.current) {
+      setExt(structuredClone(savedExtRef.current));
+    } else {
+      void loadExtendedConfig(() => mountedRef.current);
+    }
+    appActions.showToast(dict.settings.discardUnsavedToast, "info");
   };
 
   const handlePickWallpaper = async () => {
@@ -1413,7 +1442,9 @@ export function SettingsPage() {
             await appActions.refreshAllData();
             const full = await catcloudApi.getFullConfig();
             if (mountedRef.current) {
-              setExt(hydrateExtendedFromFullConfig(full));
+              const hydrated = hydrateExtendedFromFullConfig(full);
+              savedExtRef.current = structuredClone(hydrated);
+              setExt(hydrated);
               setExtLoaded(true);
               setExtLoadError(null);
             }
@@ -1666,6 +1697,35 @@ export function SettingsPage() {
           </span>
         </button>
       </div>
+
+      {dirty && (
+        <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--accent)]/55 bg-[var(--accent-soft)]/55 px-3.5 py-2 text-xs text-[var(--text)]">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+            <span className="leading-relaxed">{dict.settings.unsavedBanner}</span>
+          </div>
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+            <button
+              type="button"
+              disabled={saving}
+              onClick={handleDiscardUnsaved}
+              className="inline-flex items-center gap-1 rounded-lg border border-[var(--line-strong)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
+            >
+              <RotateCcw className="h-3 w-3" />
+              <span>{dict.settings.discardUnsavedBtn}</span>
+            </button>
+            <button
+              type="button"
+              disabled={saving || (extDirty && !extLoaded)}
+              onClick={() => void handleSave()}
+              className="inline-flex items-center gap-1 rounded-lg bg-[var(--accent)] px-3 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+            >
+              <Save className="h-3 w-3" />
+              <span>{saving ? (isZh ? "保存中..." : dict.common.loading) : isZh ? "立即保存" : dict.common.save}</span>
+            </button>
+          </div>
+        </div>
+      )}
 
       {!extLoaded && extLoadError && (
         <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2 text-xs text-[var(--amber)]">
@@ -3319,6 +3379,15 @@ export function SettingsPage() {
             </div>
 
             <div className="flex shrink-0 flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => appActions.openOnboardingModal()}
+                className={BTN_CLS}
+              >
+                <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
+                <span>{dict.settings.reopenOnboardingBtn}</span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => appActions.openAiAssistant()}

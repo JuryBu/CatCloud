@@ -27,7 +27,27 @@ export type MemoryTier = "auto" | "mb48" | "mb64" | "mb96" | "48MiB" | "64MiB" |
 export type PreAccelOverrideMode = "inherit" | "force_on" | "force_off";
 export type RouteTargetMode = "single" | "group";
 export type GlobalPreAccelScope = "proxy_apps_only" | "all_non_443_tcp";
-export type GlobalPreAccelMode = "off" | "windivert" | "local_socks5";
+export type GlobalPreAccelMode = "off" | "windivert" | "local_socks5" | "suspended_for_tun";
+export type PreAccelDispatchStrategy = "auto" | "load_balance" | "fallback";
+export type PreAccelLbStrategy = "round_robin" | "consistent_hashing";
+export type AgentPromptMode = "autopilot" | "readonly";
+
+export interface DnsTlsDiagnostics {
+  status: "healthy" | "degraded_recovered" | "cert_verification_failed" | string;
+  category: string;
+  first_seen_at: string | null;
+  last_seen_at: string | null;
+  failure_count: number;
+  affected_paths: string[];
+  affected_upstreams: string[];
+  tls_verification_preserved: boolean;
+  recovered: boolean;
+  recovery_time: string | null;
+  next_retry_at: string | null;
+  next_retry_hint: string;
+  scanned_window_desc?: string;
+  network_timeout_only_count?: number;
+}
 
 export type MultiGroupMode =
   | "sticky_best"
@@ -68,6 +88,7 @@ export interface PersonalizationConfig {
   mascot_enabled: boolean;
   sparkline_enabled: boolean;
   tray_icon_mode: TrayIconMode;
+  onboarding_completed?: boolean;
 }
 
 export interface PreAccelConfig {
@@ -75,11 +96,14 @@ export interface PreAccelConfig {
   skip_443_native: boolean;
   probe_url: string;
   fallback_probe_url: string;
+  active_relay_id?: string | null;
   campus_portal_guard?: boolean;
   global_bypass_enabled?: boolean;
   global_scope?: GlobalPreAccelScope;
   global_target_processes?: string[];
   windivert_dir?: string | null;
+  dispatch_strategy?: PreAccelDispatchStrategy;
+  lb_strategy?: PreAccelLbStrategy;
 }
 
 export type PreAccelInstallState =
@@ -435,6 +459,7 @@ export interface PreAccelRelay {
   last_mbps: number | null;
   last_up_mbps?: number | null;
   last_down_mbps?: number | null;
+  supports_ipv6?: boolean;
 }
 
 export interface TrafficSample {
@@ -457,7 +482,11 @@ export interface NodeHealthHintDto {
   latency_ms: number | null;
   status: "healthy" | "degraded" | "cooldown" | "probation";
   cooldown_remaining_sec: number;
+  reason?: string;
+  stage?: string;
 }
+
+export type NodeHealthHint = NodeHealthHintDto;
 
 export interface CoreRuntimeInfo {
   running: boolean;
@@ -480,6 +509,8 @@ export interface CoreRuntimeInfo {
   preaccel_active: boolean;
   preaccel_enabled?: boolean;
   preaccel_relay_name: string | null;
+  preaccel_effective_carrier?: string;
+  standalone_tunnel_suspended_for_tun?: boolean;
   global_preaccel_active?: boolean;
   global_preaccel_mode?: GlobalPreAccelMode;
   global_preaccel_socks_port?: number | null;
@@ -488,6 +519,7 @@ export interface CoreRuntimeInfo {
   preaccel_install_state?: string;
   global_preaccel_verify_state?: PreAccelVerifyState;
   global_preaccel_verify_ms?: number | null;
+  dns_tls_diagnostics?: DnsTlsDiagnostics | null;
   node_health_hints?: Record<string, NodeHealthHintDto>;
   probing_active?: boolean;
   switching_active?: boolean;
@@ -557,6 +589,15 @@ export interface ReloadOutcome {
   applied_at: string;
 }
 
+export interface ProbeRunSummary {
+  latency_ok_count: number;
+  bandwidth_ok_count: number;
+  keepalive_ok_count: number;
+  failed_count: number;
+  exec_error_count: number;
+  untested_count: number;
+}
+
 export interface RunIsolatedProbesResult {
   probed_count: number;
   total_count?: number;
@@ -566,6 +607,12 @@ export interface RunIsolatedProbesResult {
   core_available: boolean;
   used_preaccel?: boolean;
   preaccel_relay_name?: string | null;
+  latency_ok_count?: number;
+  bandwidth_ok_count?: number;
+  keepalive_ok_count?: number;
+  failed_count?: number;
+  exec_error_count?: number;
+  untested_count?: number;
 }
 
 export interface ProbeProgressEvent {
@@ -577,6 +624,12 @@ export interface ProbeProgressEvent {
   done: boolean;
   snapshot: ProbeSnapshot | null;
   error: string | null;
+  latency_ok_count?: number;
+  bandwidth_ok_count?: number;
+  keepalive_ok_count?: number;
+  failed_count?: number;
+  exec_error_count?: number;
+  untested_count?: number;
 }
 
 export interface PickWallpaperResult {
@@ -610,12 +663,15 @@ export interface PreAccelSpeedTestResult {
   relay_name: string;
   ok: boolean;
   latency_ms: number | null;
+  chain_latency_ms?: number | null;
   up_mbps: number | null;
   down_mbps: number | null;
   mode: "via_node" | "relay_direct";
   reference_node_name: string | null;
   error: string | null;
 }
+
+export type PreAccelRelaySpeedResult = PreAccelSpeedTestResult;
 
 export interface PreAccelSideSpeed {
   ok: boolean;
@@ -1386,6 +1442,8 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     global_scope: "proxy_apps_only",
     global_target_processes: [...DEFAULT_GLOBAL_TARGET_PROCESSES],
     windivert_dir: null,
+    dispatch_strategy: "auto",
+    lb_strategy: "round_robin",
   },
   personalization: {
     ui_language: "zh-CN",
@@ -1402,6 +1460,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     mascot_enabled: true,
     sparkline_enabled: true,
     tray_icon_mode: "auto_ac",
+    onboarding_completed: false,
   },
   update: {
     repo: "JuryBu/CatCloud",
@@ -2104,6 +2163,8 @@ let mockRuntime: CoreRuntimeInfo = {
   preaccel_active: true,
   preaccel_enabled: mockConfig.preaccel.enabled,
   preaccel_relay_name: "CN-East-443 Primary",
+  preaccel_effective_carrier: mockConfig.preaccel.enabled ? "main_core_proxy_only" : "off",
+  standalone_tunnel_suspended_for_tun: false,
   global_preaccel_active: false,
   global_preaccel_mode: "off",
   global_preaccel_socks_port: null,
@@ -2117,10 +2178,11 @@ let mockRuntime: CoreRuntimeInfo = {
       : "idle",
   global_preaccel_verify_state: "idle",
   global_preaccel_verify_ms: null,
+  dns_tls_diagnostics: null,
   node_health_hints: {
-    "node-jp-01": { latency_ms: 68, status: "healthy", cooldown_remaining_sec: 0 },
-    "node-sg-02": { latency_ms: 82, status: "healthy", cooldown_remaining_sec: 0 },
-    "node-us-03": { latency_ms: 144, status: "healthy", cooldown_remaining_sec: 0 },
+    "node-jp-01": { latency_ms: 68, status: "healthy", cooldown_remaining_sec: 0, reason: "", stage: "healthy" },
+    "node-sg-02": { latency_ms: 82, status: "healthy", cooldown_remaining_sec: 0, reason: "", stage: "healthy" },
+    "node-us-03": { latency_ms: 144, status: "healthy", cooldown_remaining_sec: 0, reason: "", stage: "healthy" },
   },
   captive_portal_required: false,
   system_proxy_enabled: mockConfig.system_proxy_enabled,
@@ -2154,10 +2216,25 @@ function syncMockPreAccelRuntime(): void {
         : "idle";
 
   const activeRelays = mockRelays.filter((r) => r.enabled).map((r) => r.name);
+  const suspendedForTun = Boolean(
+    effectiveTunEnabled && mockRuntime.running && mockConfig.preaccel.enabled
+  );
+  const effectiveCarrier = !mockConfig.preaccel.enabled
+    ? "off"
+    : suspendedForTun
+      ? "main_core_tun_suspended_standalone"
+      : proxyActive && proxyPreAccelActive
+        ? "main_core_proxy_only"
+        : isWindivertActive
+          ? "standalone_windivert"
+          : globalActive && mockGlobalPreAccel.mode === "local_socks5"
+            ? "standalone_socks5"
+            : "off";
   mockGlobalPreAccel = {
     ...mockGlobalPreAccel,
+    mode: suspendedForTun ? "suspended_for_tun" : mockGlobalPreAccel.mode,
     active_relays: activeRelays,
-    is_windivert_active: isWindivertActive,
+    is_windivert_active: suspendedForTun ? false : isWindivertActive,
   };
   mockRuntime = {
     ...mockRuntime,
@@ -2167,11 +2244,13 @@ function syncMockPreAccelRuntime(): void {
     preaccel_enabled: mockConfig.preaccel.enabled,
     preaccel_active: preaccelActive,
     preaccel_relay_name: activeRelays[0] ?? null,
-    global_preaccel_active: globalActive,
+    preaccel_effective_carrier: effectiveCarrier,
+    standalone_tunnel_suspended_for_tun: suspendedForTun,
+    global_preaccel_active: suspendedForTun ? false : globalActive,
     global_preaccel_mode: mockGlobalPreAccel.mode,
     global_preaccel_socks_port: mockGlobalPreAccel.socks_port,
     global_preaccel_connections: mockGlobalPreAccel.active_connections,
-    global_windivert_active: isWindivertActive,
+    global_windivert_active: suspendedForTun ? false : isWindivertActive,
     preaccel_install_state: mockGlobalPreAccel.install_state ?? "idle",
     global_preaccel_verify_state: mockGlobalPreAccel.verify_state ?? "idle",
     global_preaccel_verify_ms: mockGlobalPreAccel.verify_latency_ms ?? null,
@@ -2962,6 +3041,13 @@ export const catcloudApi = {
       };
       mockProbes[id] = out[id];
     }
+    const latencyOkCount = Object.values(out).filter((s) => s.ok && s.latency_ms !== null).length;
+    const bandwidthOkCount = Object.values(out).filter(
+      (s) => s.ok && s.up_mbps !== null && s.down_mbps !== null
+    ).length;
+    const keepaliveOkCount = Object.values(out).filter((s) => s.keepalive_60s_ok === true).length;
+    const failedCount = Object.values(out).filter((s) => !s.ok).length;
+    const untestedCount = Math.max(0, mockNodes.length - Object.keys(mockProbes).length);
     return {
       probed_count: targetIds.length,
       total_count: targetIds.length,
@@ -2971,6 +3057,12 @@ export const catcloudApi = {
       core_available: true,
       used_preaccel: usedPreaccel,
       preaccel_relay_name: usedPreaccel ? activeRelay?.name ?? null : null,
+      latency_ok_count: latencyOkCount,
+      bandwidth_ok_count: bandwidthOkCount,
+      keepalive_ok_count: keepaliveOkCount,
+      failed_count: failedCount,
+      exec_error_count: 0,
+      untested_count: untestedCount,
     };
   },
 
@@ -3718,6 +3810,13 @@ export const catcloudApi = {
       .sort((a, b) => a.priority - b.priority);
     if (enabledRelays.length < 2) return enabledRelays[0]?.id ?? null;
     const next = enabledRelays[1];
+    mockConfig = {
+      ...mockConfig,
+      preaccel: {
+        ...mockConfig.preaccel,
+        active_relay_id: next.id,
+      },
+    };
     mockRuntime.preaccel_relay_name = next.name;
     return next.id;
   },
@@ -3727,6 +3826,13 @@ export const catcloudApi = {
       return tauriInvokeOrThrow<string>("select_preaccel_relay", { relayId });
     }
     const found = mockRelays.find((r) => r.id === relayId);
+    mockConfig = {
+      ...mockConfig,
+      preaccel: {
+        ...mockConfig.preaccel,
+        active_relay_id: relayId,
+      },
+    };
     if (found) mockRuntime.preaccel_relay_name = found.name;
     return relayId;
   },
@@ -3788,6 +3894,7 @@ export const catcloudApi = {
         relay_name: r.name,
         ok: true,
         latency_ms: latencyMs,
+        chain_latency_ms: chosenNode ? latencyMs + 138 : null,
         up_mbps: upMbps,
         down_mbps: downMbps,
         mode: chosenNode ? "via_node" : "relay_direct",
@@ -4048,31 +4155,57 @@ export const catcloudApi = {
 
   async buildAgentBootstrapPrompt(
     lang?: UiLanguage,
-    currentPage?: string
+    currentPage?: string,
+    mode: AgentPromptMode = "autopilot"
   ): Promise<AgentBootstrapPromptDto> {
     const normalizedLang = normalizeUiLanguage(lang ?? mockConfig.personalization.ui_language);
+    const resolvedMode: AgentPromptMode = mode === "readonly" ? "readonly" : "autopilot";
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<AgentBootstrapPromptDto>("build_agent_bootstrap_prompt", {
         lang: normalizedLang,
         currentPage: currentPage ?? null,
+        mode: resolvedMode,
       });
     }
     const cliPath = "C:\\Users\\<USER>\\Apps\\CatCloud\\cli\\catcloud.exe";
     const dataDir = "C:\\Users\\<USER>\\Apps\\CatCloud\\data";
     const docsIndex = `${dataDir}\\agent_docs\\${normalizedLang}\\INDEX.md`;
-    const prompt = [
-      `请全程使用「${normalizedLang === "en" ? "English" : normalizedLang === "ja" ? "日本語" : normalizedLang === "ru" ? "Русский" : "简体中文"}」向我解释，并主动帮我使用本机工具检查猫猫云梯（CatCloud）。`,
-      "",
-      `- 可执行 CLI：\`${cliPath}\``,
-      `- 数据目录：\`${dataDir}\``,
-      `- 随装手册索引：\`${docsIndex}\``,
-      `- 当前所在界面：${currentPage || "overview"}`,
-      "",
-      "## 协作约定",
-      "1. 先只读自查：优先阅读随装手册索引并运行 `catcloud status --json`、`catcloud net doctor --json` 摸清现状。",
-      "2. 改动前先确认：涉及修改配置、节点、分流或中转前，先用大白话告诉我方案并征得我同意，你可以直接帮我用 CLI 执行。",
-      "3. 隐私红线：严禁在回复中复述明文密码、UUID、订阅完整 URL 或真实公网中转 IP。",
-    ].join("\n");
+    const langDisplay =
+      normalizedLang === "en"
+        ? "English"
+        : normalizedLang === "ja"
+          ? "日本語"
+          : normalizedLang === "ru"
+            ? "Русский"
+            : "简体中文";
+    const prompt =
+      resolvedMode === "readonly"
+        ? [
+            `请全程使用「${langDisplay}」向我解释，仅执行只读体检与排查，不要擅自改动猫猫云梯（CatCloud）配置。`,
+            "",
+            `- 可执行 CLI：\`${cliPath}\``,
+            `- 数据目录：\`${dataDir}\``,
+            `- 随装手册索引：\`${docsIndex}\``,
+            `- 当前所在界面：${currentPage || "overview"}`,
+            "",
+            "## 只读体检约定",
+            "1. 先阅读随装手册索引并运行 `catcloud status --json`、`catcloud net doctor --json`、`catcloud config diag --json`。",
+            "2. 严禁修改配置、节点、分流或中转，给出清晰的人话诊断结论与可选下一步建议即可。",
+            "3. 隐私红线：严禁在回复中复述明文密码、UUID、订阅完整 URL 或真实公网中转 IP。",
+          ].join("\n")
+        : [
+            `请全程使用「${langDisplay}」与我沟通，我现在授权你作为本机 AI Agent（Codex / Claude Code / Antigravity）全权帮我配置与排查猫猫云梯（CatCloud）。`,
+            "",
+            `- 可执行 CLI：\`${cliPath}\``,
+            `- 数据目录：\`${dataDir}\``,
+            `- 随装手册索引：\`${docsIndex}\``,
+            `- 当前所在界面：${currentPage || "overview"}`,
+            "",
+            "## 全权托管约定",
+            "1. 先快速自查：读取随装手册索引并运行 `catcloud status --json` 与 `catcloud net doctor --json` 摸清现状。",
+            "2. 直接帮我办好：按我的需求直接调用 CLI 完成订阅导入/旧客户端无损搬家、节点测速优选、智能多选组建立、国内 443 提速部署与网络排障，并在完成后用 CLI 复核验证。",
+            "3. 涉及删除数据或外部账号凭据时先向我确认；隐私红线：严禁在回复中复述明文密码、UUID、订阅完整 URL 或真实公网中转 IP。",
+          ].join("\n");
     return {
       prompt,
       cli_path: cliPath,

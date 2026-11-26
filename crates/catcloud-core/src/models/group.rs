@@ -260,6 +260,9 @@ pub struct PreAccelRelay {
     pub last_mbps: Option<f64>,
     pub last_up_mbps: Option<f64>,
     pub last_down_mbps: Option<f64>,
+    /// Whether this domestic relay host has public IPv6 egress capable of chaining IPv6-only business nodes.
+    #[serde(default)]
+    pub supports_ipv6: bool,
 }
 
 impl Default for PreAccelRelay {
@@ -282,6 +285,7 @@ impl Default for PreAccelRelay {
             last_mbps: None,
             last_up_mbps: None,
             last_down_mbps: None,
+            supports_ipv6: false,
         }
     }
 }
@@ -333,5 +337,23 @@ mod tests {
         )
         .unwrap();
         assert!(enabled.independent_routing);
+    }
+
+    #[test]
+    fn preaccel_relay_supports_ipv6_defaults_false_and_deserializes_legacy_json() {
+        let def = PreAccelRelay::default();
+        assert!(!def.supports_ipv6);
+
+        let legacy: PreAccelRelay = serde_json::from_str(
+            r#"{"id":"relay-1","name":"CN-GZ","server":"203.0.113.10","port":443,"protocol":"anytls","password":"pw"}"#,
+        )
+        .unwrap();
+        assert!(!legacy.supports_ipv6);
+
+        let v6_enabled: PreAccelRelay = serde_json::from_str(
+            r#"{"id":"relay-v6","name":"CN-V6","server":"203.0.113.11","port":443,"protocol":"anytls","password":"pw","supports_ipv6":true}"#,
+        )
+        .unwrap();
+        assert!(v6_enabled.supports_ipv6);
     }
 }

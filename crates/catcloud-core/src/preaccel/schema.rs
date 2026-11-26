@@ -16,6 +16,9 @@ pub const MMRELAY_URI_PREFIX: &str = "mmrelay://v1/";
 /// Days-remaining threshold below which a relay triggers an `expiring_soon` reminder.
 pub const EXPIRY_SOON_THRESHOLD_DAYS: i64 = 3;
 
+/// Mihomo inner `load-balance` proxy group name aggregating distinct physical domestic cloud hosts.
+pub const PREACCEL_LB_GROUP_NAME: &str = "⚖️ 预加速多云均衡";
+
 /// Supported domestic pre-acceleration relay protocols.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -57,6 +60,109 @@ impl RelayProtocol {
             Self::Vless => "servername",
             Self::AnyTls | Self::Trojan | Self::Hysteria2 | Self::Tuic => "sni",
         }
+    }
+
+    /// Return `true` for TCP-stream domestic relay transports preferred as primary representatives
+    /// in multi-cloud `load-balance` pools carrying TCP business nodes.
+    pub fn is_tcp_stream(self) -> bool {
+        matches!(self, Self::AnyTls | Self::Trojan | Self::Vless)
+    }
+}
+
+/// Deduplicated physical-host partition of enabled domestic pre-acceleration relays.
+///
+/// Each distinct physical host (grouped by normalized `server`) contributes exactly one primary
+/// representative (preferring TCP-stream protocols `anytls`/`trojan`/`vless` over same-host UDP
+/// protocols `hysteria2`/`tuic`, tie-broken by `priority ASC, id ASC`) to `primary_host_relays`,
+/// while remaining same-host protocols are placed in `secondary_protocol_relays` as outer
+/// `fallback` backups.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PhysicalRelaySelection {
+    /// One primary representative relay per distinct physical host, ordered by `(priority ASC, id ASC)`.
+    pub primary_host_relays: Vec<PreAccelRelay>,
+    /// Remaining enabled relays sharing a physical host with a primary representative,
+    /// ordered by `(priority ASC, id ASC)`.
+    pub secondary_protocol_relays: Vec<PreAccelRelay>,
+    /// Number of distinct physical cloud hosts represented in `primary_host_relays`.
+    pub distinct_host_count: usize,
+}
+
+/// Normalize a domestic relay `server` address into a canonical physical-host deduplication key.
+pub fn normalize_relay_host_key(server: &str) -> String {
+    if let Some(ip) = parse_server_ip(server) {
+        ip.to_string().to_ascii_lowercase()
+    } else {
+        server
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    }
+}
+
+/// Return `true` only when at least one enabled domestic relay exists and **every** enabled
+/// relay declares public IPv6 egress support (preventing IPv6 blackholes in mixed IPv4-only
+/// + dual-stack multi-cloud relay pools).
+pub fn relays_support_ipv6(relays: &[PreAccelRelay]) -> bool {
+    let mut has_enabled = false;
+    for relay in relays.iter().filter(|r| r.enabled) {
+        has_enabled = true;
+        if !relay.supports_ipv6 {
+            return false;
+        }
+    }
+    has_enabled
+}
+
+/// Deduplicate enabled domestic relays by normalized physical host (`server`).
+///
+/// Per physical host, picks the highest-priority TCP-stream transport (`anytls`/`trojan`/`vless`)
+/// into `primary_host_relays` (falling back to the highest-priority UDP protocol only when that
+/// physical host has no TCP-stream relay), and places all remaining protocols on that same host
+/// into `secondary_protocol_relays` for outer `fallback` backup.
+pub fn select_physical_host_relays(relays: &[PreAccelRelay]) -> PhysicalRelaySelection {
+    let mut by_host: HashMap<String, Vec<PreAccelRelay>> = HashMap::new();
+
+    for relay in relays.iter().filter(|r| r.enabled) {
+        let raw_key = normalize_relay_host_key(&relay.server);
+        let host_key = if raw_key.is_empty() {
+            format!("__empty_host__:{}", relay.id)
+        } else {
+            raw_key
+        };
+        by_host.entry(host_key).or_default().push(relay.clone());
+    }
+
+    let mut primary_host_relays: Vec<PreAccelRelay> = Vec::with_capacity(by_host.len());
+    let mut secondary_protocol_relays: Vec<PreAccelRelay> = Vec::new();
+
+    for mut group in by_host.into_values() {
+        group.sort_by(|a, b| {
+            let a_non_tcp = !RelayProtocol::parse(&a.protocol).is_some_and(RelayProtocol::is_tcp_stream);
+            let b_non_tcp = !RelayProtocol::parse(&b.protocol).is_some_and(RelayProtocol::is_tcp_stream);
+            a_non_tcp
+                .cmp(&b_non_tcp)
+                .then_with(|| a.priority.cmp(&b.priority))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let mut iter = group.into_iter();
+        if let Some(primary) = iter.next() {
+            primary_host_relays.push(primary);
+            secondary_protocol_relays.extend(iter);
+        }
+    }
+
+    primary_host_relays.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+    secondary_protocol_relays
+        .sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)));
+    let distinct_host_count = primary_host_relays.len();
+
+    PhysicalRelaySelection {
+        primary_host_relays,
+        secondary_protocol_relays,
+        distinct_host_count,
     }
 }
 
@@ -621,5 +727,54 @@ fn provider_label(provider: &str) -> &'static str {
         "aliyun" | "alibaba" | "alicloud" => "Alibaba Cloud",
         "huawei" | "huaweicloud" => "Huawei Cloud",
         _ => "domestic cloud",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_relay(id: &str, enabled: bool, supports_ipv6: bool) -> PreAccelRelay {
+        PreAccelRelay {
+            id: id.to_string(),
+            name: id.to_string(),
+            provider: "cloud".to_string(),
+            region: "CN".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-password".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled,
+            supports_ipv6,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        }
+    }
+
+    #[test]
+    fn relays_support_ipv6_requires_every_enabled_relay_to_support_ipv6() {
+        assert!(!relays_support_ipv6(&[]));
+        assert!(!relays_support_ipv6(&[mk_relay("r-off", false, true)]));
+        assert!(!relays_support_ipv6(&[mk_relay("r-v4", true, false)]));
+        assert!(relays_support_ipv6(&[mk_relay("r-v6", true, true)]));
+
+        // Mixed IPv4-only + dual-stack pool must return false to avoid 50% IPv6 blackholes.
+        assert!(!relays_support_ipv6(&[
+            mk_relay("r-v4", true, false),
+            mk_relay("r-v6", true, true),
+        ]));
+
+        // Disabled IPv4-only relays must not block an all-IPv6 active pool.
+        assert!(relays_support_ipv6(&[
+            mk_relay("r-v6-a", true, true),
+            mk_relay("r-v6-b", true, true),
+            mk_relay("r-v4-disabled", false, false),
+        ]));
     }
 }
