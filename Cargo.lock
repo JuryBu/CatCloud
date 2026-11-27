@@ -390,7 +390,7 @@ dependencies = [
 
 [[package]]
 name = "catcloud-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "catcloud-core",
@@ -406,7 +406,7 @@ dependencies = [
 
 [[package]]
 name = "catcloud-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "catcloud-desktop"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
