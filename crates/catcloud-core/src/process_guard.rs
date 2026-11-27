@@ -2104,8 +2104,10 @@ pub fn write_config_reload_ack(data_dir: &Path, ack: &ConfigReloadAck) -> CatRes
     let run_dir = config_reload_run_dir(data_dir);
     let path = run_dir.join(CONFIG_RELOAD_ACK_FILE);
     let bytes = serde_json::to_vec_pretty(ack)?;
-    AppPaths::atomic_write(&path, &bytes)?;
+    // Clear the matching request BEFORE publishing the ack so any reader observing the ack
+    // sees a guaranteed happens-before clean request state across all filesystems.
     let _ = clear_config_reload_request_if_matching(data_dir, &ack.req_id);
+    AppPaths::atomic_write(&path, &bytes)?;
     Ok(())
 }
 
