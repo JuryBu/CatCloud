@@ -6,6 +6,7 @@ import {
   type ApplyUpdateRestartResultDto,
   type CampusPortalStatus,
   type CoreRuntimeInfo,
+  type DanglingRulesAudit,
   DEFAULT_APP_CONFIG,
   DEFAULT_GLOBAL_PREACCEL_STATUS,
   type ExitIpInfo,
@@ -689,6 +690,8 @@ export interface AppState {
   tunAdminPromptReason: string | null;
   pendingUpdate: PendingUpdatePromptDto | null;
   updateModalVisible: boolean;
+  danglingRulesAudit: DanglingRulesAudit | null;
+  repairingDanglingRules: boolean;
   bgTasks: BgTasksState;
   sessionDrafts: SessionDraftsState;
 }
@@ -1101,6 +1104,8 @@ let state: AppState = {
   tunAdminPromptReason: null,
   pendingUpdate: null,
   updateModalVisible: false,
+  danglingRulesAudit: null,
+  repairingDanglingRules: false,
   bgTasks: createInitialBgTasks(),
   sessionDrafts: createInitialSessionDrafts(),
 };
@@ -2816,7 +2821,12 @@ export const appActions = {
         !isLangArg && typeof langOrPage === "string" && langOrPage.trim().length > 0
           ? langOrPage.trim()
           : state.activeNav;
-      const resolvedMode: AgentPromptMode = mode === "readonly" ? "readonly" : "autopilot";
+      const resolvedMode: AgentPromptMode =
+        mode === "readonly"
+          ? "readonly"
+          : mode === "troubleshoot_issue"
+            ? "troubleshoot_issue"
+            : "autopilot";
       const dto = await catcloudApi.buildAgentBootstrapPrompt(targetLang, targetPage, resolvedMode);
       const text = dto.prompt.trim();
       if (!text) {
@@ -2828,7 +2838,9 @@ export const appActions = {
         pushToast(
           resolvedMode === "readonly"
             ? "已复制只读体检指令（仅查不改），直接粘贴发给 Codex / Claude Code / Antigravity 即可"
-            : "已复制本机 AI 全权托管指令（含精确 CLI 路径与手册索引），直接粘贴发给 Codex / Claude Code / Antigravity 即可开始代配",
+            : resolvedMode === "troubleshoot_issue"
+              ? "已复制「AI 排障 + 帮提 Issue」指令，发给你的本机 AI 即可自动排查修复或整理脱敏 Issue"
+              : "已复制本机 AI 全权托管指令（含精确 CLI 路径与手册索引），直接粘贴发给 Codex / Claude Code / Antigravity 即可开始代配",
           "ok",
           5400
         );
@@ -3496,6 +3508,48 @@ export const appActions = {
 
   async refreshAllData(): Promise<void> {
     await hydrateFromBackend();
+    void this.refreshDanglingRulesAudit();
+  },
+
+  async refreshDanglingRulesAudit(): Promise<DanglingRulesAudit | null> {
+    try {
+      const audit = await catcloudApi.auditDanglingRules();
+      setState((prev) => ({
+        ...prev,
+        danglingRulesAudit: audit,
+      }));
+      return audit;
+    } catch {
+      return null;
+    }
+  },
+
+  async repairDanglingRules(
+    mode: "remove" | "rewrite",
+    targetGroup?: string | null
+  ): Promise<boolean> {
+    if (state.repairingDanglingRules) return false;
+    setState((prev) => ({ ...prev, repairingDanglingRules: true }));
+    try {
+      const report = await catcloudApi.repairDanglingRules(mode, targetGroup ?? null, true);
+      await hydrateFromBackend();
+      await this.refreshDanglingRulesAudit();
+      if (report.removed_count > 0 || report.rewritten_count > 0) {
+        const msg =
+          mode === "rewrite"
+            ? `已将 ${report.rewritten_count} 条悬空规则改为「${report.target_group ?? "默认路线"}」并应用`
+            : `已一键清理 ${report.removed_count} 条失效分流规则并应用`;
+        pushToast(msg, "ok", 4600);
+      } else {
+        pushToast("未发现需要清理的失效分流规则", "info");
+      }
+      return true;
+    } catch (err) {
+      pushToast(`修复失效规则失败：${formatErrorMessage(err)}`, "warn", 5200);
+      return false;
+    } finally {
+      setState((prev) => ({ ...prev, repairingDanglingRules: false }));
+    }
   },
 
   previewPersonalization(patch: Partial<AppConfig["personalization"]>): void {

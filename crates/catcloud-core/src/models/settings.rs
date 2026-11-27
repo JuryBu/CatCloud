@@ -499,12 +499,26 @@ pub enum OverrideMode {
 /// Hard upper bound (1 MiB) for inline YAML merge-patch overrides stored in `config.json`.
 pub const MAX_INLINE_OVERRIDE_YAML_BYTES: usize = 1024 * 1024;
 
+/// Tracks migrated global prepend/append rules imported alongside a specific subscription
+/// so deleting that subscription cascades cleanly without disturbing hand-authored rules.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SubscriptionRuleBinding {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prepend_rules: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub append_rules: Vec<String>,
+}
+
 /// Global user rules and external merge/script override settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RulesAndOverrideConfig {
     pub global_prepend_rules: Vec<String>,
     pub global_append_rules: Vec<String>,
+    /// Per-subscription rule provenance for cascading cleanup on `delete_subscription`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subscription_rule_bindings: BTreeMap<String, SubscriptionRuleBinding>,
     pub override_mode: OverrideMode,
     pub override_merge_path: Option<String>,
     pub override_script_path: Option<String>,
@@ -532,6 +546,7 @@ impl Default for RulesAndOverrideConfig {
         Self {
             global_prepend_rules: Vec::new(),
             global_append_rules: Vec::new(),
+            subscription_rule_bindings: BTreeMap::new(),
             override_mode: OverrideMode::Disabled,
             override_merge_path: None,
             override_script_path: None,

@@ -13,9 +13,11 @@ pub use adapter::{
 };
 pub use live_capture::*;
 pub use migrator::{
-    MigrationImportOptions, MigrationImportReport, MigrationPreview, MigrationSourceKind,
+    MigrationDanglingRulePolicy, MigrationImportOptions, MigrationImportReport, MigrationPreview,
+    MigrationRuleApplyOutcome, MigrationSourceKind, apply_migration_rules_for_subscription,
     apply_migration_rules_to_config, discover_known_client_paths, import_migration_preview,
-    preview_from_file, preview_from_text, scan_local_clients, scan_path_readonly,
+    merge_subscription_migrated_rules, preview_from_file, preview_from_text,
+    remove_subscription_migrated_rules, scan_local_clients, scan_path_readonly,
 };
 pub use parser::{
     DEFAULT_SUBSCRIPTION_TIMEOUT, DEFAULT_SUBSCRIPTION_USER_AGENT, FetchOptions,
@@ -554,9 +556,11 @@ rules:
         cfg.rules_override
             .global_prepend_rules
             .push("DOMAIN,keep-user-rule.example.invalid,DIRECT".to_string());
+        // Issue #4: valid DIRECT prepend rules are preserved while dangling external group rules
+        // (e.g. targeting non-existent third-party `PROXY`) are filtered out safely.
         let (added_pre, added_app) = apply_migration_rules_to_config(&mut cfg, &clash_preview);
         assert_eq!(added_pre, 2);
-        assert_eq!(added_app, 1);
+        assert_eq!(added_app, 0);
         assert!(
             cfg.rules_override
                 .global_prepend_rules

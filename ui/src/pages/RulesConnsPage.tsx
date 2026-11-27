@@ -1581,9 +1581,12 @@ export function RulesConnsPage() {
 
       const meta = parseCompiledPreviewMeta(previewRes);
       if (!meta.validationOk && meta.errors.length > 0 && trimmed.length > 0) {
-        const errSummary = meta.errors
-          .map((item) => (item.code ? `[${item.code}] ${item.message}` : item.message))
-          .join("；");
+        const previewErrors = meta.errors.slice(0, 3);
+        const errSummary =
+          previewErrors
+            .map((item) => (item.code ? `[${item.code}] ${item.message}` : item.message))
+            .join("；") +
+          (meta.errors.length > 3 ? ` 等共 ${meta.errors.length} 项校验异常` : "");
         await catcloudApi
           .saveExtendedSettings({
             rules_override: { inline_override_yaml: prevPayload },

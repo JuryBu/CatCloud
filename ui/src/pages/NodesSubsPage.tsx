@@ -4156,6 +4156,7 @@ export function NodesSubsPage({
         setImportSuccessBanner(null);
       }
       setPendingDeleteSub(null);
+      void appActions.refreshDanglingRulesAudit();
       appActions.showToast(`已移除订阅：${sub.name}（同时移除 ${removedIds.size} 个节点）`, "info");
     } catch (err) {
       appActions.showToast(`移除订阅失败：${formatErrorMessage(err)}`, "warn");
@@ -4166,45 +4167,6 @@ export function NodesSubsPage({
 
   /* ---------- Drawer Callbacks ---------- */
 
-  const persistMigratedRules = async (
-    prependRules: string[],
-    appendRules: string[]
-  ): Promise<{ savedCount: number; error: string | null }> => {
-    if (prependRules.length === 0 && appendRules.length === 0) {
-      return { savedCount: 0, error: null };
-    }
-    try {
-      const fullCfg = await catcloudApi.getFullConfig();
-      const prevPrepend = Array.isArray(fullCfg.rules_override?.global_prepend_rules)
-        ? fullCfg.rules_override.global_prepend_rules
-        : [];
-      const prevAppend = Array.isArray(fullCfg.rules_override?.global_append_rules)
-        ? fullCfg.rules_override.global_append_rules
-        : [];
-      const global_prepend_rules = Array.from(
-        new Set([...prevPrepend, ...prependRules])
-      );
-      const global_append_rules = Array.from(
-        new Set([...prevAppend, ...appendRules])
-      );
-      await catcloudApi.saveExtendedSettings({
-        rules_override: {
-          global_prepend_rules,
-          global_append_rules,
-        },
-      });
-      return {
-        savedCount: prependRules.length + appendRules.length,
-        error: null,
-      };
-    } catch (err) {
-      return {
-        savedCount: 0,
-        error: formatErrorMessage(err),
-      };
-    }
-  };
-
   const handleMigrationImport = async (
     preview: MigrationPreviewItem,
     customName: string,
@@ -4214,14 +4176,20 @@ export function NodesSubsPage({
       try {
         const outcome = await catcloudApi.applyMigrationNodesWithMeta(
           customName,
-          preview.nodes
+          preview.nodes,
+          {
+            includeRules,
+            prependRules: includeRules ? preview.prepend_rules : [],
+            appendRules: includeRules ? preview.append_rules : [],
+            danglingRulePolicy: "drop",
+          }
         );
         const count = outcome.imported_count;
         const importedSubId = outcome.sub_id || null;
-        const ruleRes = includeRules
-          ? await persistMigratedRules(preview.prepend_rules, preview.append_rules)
-          : { savedCount: 0, error: null };
+        const savedRulesCount = outcome.saved_rules_count ?? 0;
+        const droppedDangling = outcome.dropped_dangling_rules_count ?? 0;
         await syncListsFromBackend();
+        void appActions.refreshDanglingRulesAudit();
         if (importedSubId) {
           setFilterSubId(importedSubId);
         }
@@ -4232,17 +4200,17 @@ export function NodesSubsPage({
             subId: importedSubId,
           });
         }
-        if (ruleRes.error) {
-          appActions.showToast(
-            `已导入 ${count} 个节点，但分流规则保存失败：${ruleRes.error}`,
-            "warn"
-          );
-        } else {
-          appActions.showToast(
-            `导入完成：已保存 ${count} 个节点${ruleRes.savedCount > 0 ? `、${ruleRes.savedCount} 条分流规则` : ""}（原软件未改动）`,
-            "ok"
-          );
-        }
+        const rulesSuffix =
+          savedRulesCount > 0 ? `、${savedRulesCount} 条有效分流规则` : "";
+        const droppedSuffix =
+          droppedDangling > 0
+            ? `（已自动过滤 ${droppedDangling} 条指向不存在分组的旧规则）`
+            : "（原软件未改动）";
+        appActions.showToast(
+          `导入完成：已保存 ${count} 个节点${rulesSuffix}${droppedSuffix}`,
+          "ok",
+          droppedDangling > 0 ? 5200 : undefined
+        );
         return true;
       } catch (err) {
         appActions.showToast(`导入节点失败：${formatErrorMessage(err)}`, "warn");
@@ -4274,17 +4242,13 @@ export function NodesSubsPage({
     appActions.syncNodes([...nodes, ...importedNodes]);
     setFilterSubId(subId);
 
-    const ruleRes = includeRules
-      ? await persistMigratedRules(preview.prepend_rules, preview.append_rules)
-      : { savedCount: 0, error: null };
-
     setImportSuccessBanner({
       count: importedNodes.length,
       sourceName: customName,
       subId,
     });
     appActions.showToast(
-      `导入完成：已保存 ${importedNodes.length} 个节点${ruleRes.savedCount > 0 ? `、${ruleRes.savedCount} 条分流规则` : ""}（原软件未改动）`,
+      `导入完成：已保存 ${importedNodes.length} 个节点（原软件未改动）`,
       "ok"
     );
     return true;

@@ -54,7 +54,7 @@ export const NAV_ITEMS: readonly NavItemSpec[] = [
   { id: "nodes", section: "network", label: "节点与测速", shortDesc: "节点管理、订阅导入与测速", icon: Globe },
   { id: "groups", section: "network", label: "智能多选组", shortDesc: "路线分组与自动优选", icon: Layers },
   { id: "preaccel", section: "network", label: "国内提速", shortDesc: "国内中转与稳连加速", icon: Zap },
-  { id: "ai", section: "ai", label: "AI 帮手", shortDesc: "不会配？点这里帮你搞定", icon: Bot },
+  { id: "ai", section: "ai", label: "AI 帮手", shortDesc: "全能代管 · 排障 · 提反馈", icon: Bot },
   { id: "settings", section: "assist", label: "设置", shortDesc: "外观、启动与偏好", icon: SlidersHorizontal },
   { id: "rules", section: "assist", label: "分流与连接", shortDesc: "网站分流与当前连接", icon: Network },
   { id: "logs", section: "assist", label: "运行日志", shortDesc: "查看内核运行记录", icon: ScrollText },

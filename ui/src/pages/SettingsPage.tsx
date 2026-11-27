@@ -550,9 +550,6 @@ function buildExtendedPatch(
     ...(listenPort !== null ? { dns_listen_port: listenPort } : {}),
     system_proxy: {
       bypass: splitCsvOrLines(ext.bypassDomains),
-      pac: {
-        enabled: false,
-      },
     },
     dns: {
       override_dns: ext.overrideDns,
@@ -590,7 +587,6 @@ function buildExtendedPatch(
       startup_page: ext.startupPage,
       tray_click_action: ext.trayClickAction,
       hotkeys: {
-        enabled: true,
         toggle_system_proxy: ext.hotkeys.toggleProxy?.trim() || null,
         switch_next_best: ext.hotkeys.switchNextBest?.trim() || null,
         show_main_window: ext.hotkeys.toggleMainWindow?.trim() || null,
@@ -635,11 +631,13 @@ function buildMergedSettingsPatch(
   const extCoreRuntime = (baseExt.core_runtime as Record<string, unknown>) ?? {};
   const extBehavior = (baseExt.behavior as Record<string, unknown>) ?? {};
 
+  const resolvedDnsPort =
+    typeof baseExt.dns_listen_port === "number" ? baseExt.dns_listen_port : draft.dns_listen_port;
   return {
     ...baseExt,
     mixed_port: draft.mixed_port,
     controller_port: draft.controller_port,
-    dns_listen_port: draft.dns_listen_port,
+    dns_listen_port: resolvedDnsPort,
     proxy_mode: draft.proxy_mode,
     unified_delay: draft.unified_delay,
     core_ipv6: draft.ipv6_core_enabled,

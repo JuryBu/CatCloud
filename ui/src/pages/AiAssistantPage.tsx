@@ -351,7 +351,6 @@ export function AiAssistantPage() {
     Boolean(aiRouteHint?.moduleId)
   );
   const [cliAccordionOpen, setCliAccordionOpen] = useState<boolean>(false);
-  const [issueAccordionOpen, setIssueAccordionOpen] = useState<boolean>(false);
   const [issueSummary, setIssueSummary] = useState<string>("");
 
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -536,9 +535,16 @@ export function AiAssistantPage() {
     }
   };
 
-  const handleCopyAgentBootstrap = async (mode: "autopilot" | "readonly" = "autopilot") => {
+  const handleCopyAgentBootstrap = async (
+    mode: "autopilot" | "readonly" | "troubleshoot_issue" = "autopilot"
+  ) => {
     if (busyAction) return;
-    const actionKey = mode === "readonly" ? "agent-readonly" : "agent-autopilot";
+    const actionKey =
+      mode === "readonly"
+        ? "agent-readonly"
+        : mode === "troubleshoot_issue"
+          ? "agent-troubleshoot-issue"
+          : "agent-autopilot";
     setBusyAction(actionKey);
     try {
       const ok = await appActions.copyAgentBootstrapPrompt(docLang, mode);
@@ -907,6 +913,80 @@ export function AiAssistantPage() {
         </section>
       </div>
 
+      {/* Directly Visible Troubleshooting & One-Click Issue Feedback Strip (never buried at bottom) */}
+      <section className="cc-card cc-glass rounded-2xl border-[var(--amber)]/45 bg-[var(--amber-soft)]/35 p-4">
+        <div className="flex flex-col gap-3">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-2.5">
+              <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[var(--amber)]/45 bg-[var(--surface)] text-[var(--amber)]">
+                <MessageSquareWarning className="h-4 w-4" />
+              </span>
+              <div className="min-w-0">
+                <h2 className="text-xs font-bold text-[var(--text)]">
+                  {dict.aiHub.quickFeedbackBannerTitle}
+                </h2>
+                <p className="mt-0.5 text-[11.5px] leading-relaxed text-[var(--text-secondary)]">
+                  {dict.aiHub.quickFeedbackBannerDesc}
+                </p>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => void handleCopyAgentBootstrap("troubleshoot_issue")}
+              className="inline-flex shrink-0 cursor-pointer items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:opacity-60"
+            >
+              {copiedKey === "agent-troubleshoot-issue" ? (
+                <Check className="h-3.5 w-3.5" />
+              ) : busyAction === "agent-troubleshoot-issue" ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Stethoscope className="h-3.5 w-3.5" />
+              )}
+              <span>
+                {copiedKey === "agent-troubleshoot-issue"
+                  ? dict.common.copied
+                  : dict.aiHub.copyTroubleshootIssueBtn}
+              </span>
+            </button>
+          </div>
+
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <input
+              type="text"
+              value={issueSummary}
+              onChange={(e) => setIssueSummary(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleOpenIssue(issueSummary);
+                }
+              }}
+              placeholder={
+                isZh
+                  ? "可选：用一句话描述遇到的问题（例如：删除旧订阅后核心无法启动）"
+                  : "Optional: one-line summary of the issue you encountered"
+              }
+              className="min-w-0 flex-1 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3 py-2 text-xs text-[var(--text)] placeholder:text-[var(--muted)] outline-none focus:border-[var(--accent)]"
+            />
+            <button
+              type="button"
+              disabled={busyAction === "github-issue"}
+              onClick={() => void handleOpenIssue(issueSummary)}
+              className="inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
+            >
+              {busyAction === "github-issue" ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <ExternalLink className="h-3.5 w-3.5 text-[var(--amber)]" />
+              )}
+              <span>{dict.aiHub.issueButton}</span>
+            </button>
+          </div>
+        </div>
+      </section>
+
       {/* Collapsible Bundled Manuals (8 docs): Collapsed by Default with Chapter Preview Chips */}
       <section className="cc-card cc-glass overflow-hidden rounded-2xl">
         <button
@@ -1188,78 +1268,6 @@ export function AiAssistantPage() {
                   </div>
                 );
               })}
-            </div>
-          </div>
-        )}
-      </section>
-
-      {/* Bottom Collapsed Accordion 2: One-Click GitHub Issue Feedback */}
-      <section className="cc-card cc-glass overflow-hidden rounded-2xl">
-        <button
-          type="button"
-          onClick={() => setIssueAccordionOpen((open) => !open)}
-          aria-expanded={issueAccordionOpen}
-          className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left transition-colors hover:bg-[var(--surface)]/60"
-        >
-          <div className="flex min-w-0 items-center gap-2.5">
-            <MessageSquareWarning className="h-4 w-4 shrink-0 text-[var(--amber)]" />
-            <div className="min-w-0">
-              <div className="truncate text-xs font-semibold text-[var(--text)]">
-                {dict.aiHub.issueCardTitle}
-              </div>
-              <p className="truncate text-[11px] text-[var(--muted)]">
-                {isZh
-                  ? "自动复制脱敏环境与异常摘要并拉起 GitHub Issue 新建页"
-                  : "Copies sanitized diagnostics automatically and opens a pre-filled GitHub Issue"}
-              </p>
-            </div>
-          </div>
-          <span className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)]">
-            {issueAccordionOpen ? (isZh ? "收起" : "Hide") : isZh ? "展开" : "Show"}
-            {issueAccordionOpen ? (
-              <ChevronDown className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5" />
-            )}
-          </span>
-        </button>
-
-        {issueAccordionOpen && (
-          <div className="space-y-3 border-t border-[var(--line)] p-4">
-            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">
-              {dict.aiHub.issueCardDesc}
-            </p>
-            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-              <input
-                type="text"
-                value={issueSummary}
-                onChange={(e) => setIssueSummary(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void handleOpenIssue(issueSummary);
-                  }
-                }}
-                placeholder={
-                  isZh
-                    ? "可选：用一句话描述遇到的问题（例如：开启虚拟网卡后无法访问某网站）"
-                    : "Optional: one-line summary of the issue you encountered"
-                }
-                className="min-w-0 flex-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs text-[var(--text)] placeholder:text-[var(--muted)] outline-none focus:border-[var(--accent)]"
-              />
-              <button
-                type="button"
-                disabled={busyAction === "github-issue"}
-                onClick={() => void handleOpenIssue(issueSummary)}
-                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-              >
-                {busyAction === "github-issue" ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <ExternalLink className="h-3.5 w-3.5" />
-                )}
-                <span>{dict.aiHub.issueButton}</span>
-              </button>
             </div>
           </div>
         )}

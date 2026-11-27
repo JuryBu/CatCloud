@@ -584,6 +584,14 @@ export function HomePage() {
   const ipMasked = useAppSelector((s) => s.sessionDrafts.home.ipMasked);
   const mascotState = useAppSelector((s) => s.mascotState);
   const initialized = useAppSelector((s) => s.initialized);
+  const danglingRulesAudit = useAppSelector((s) => s.danglingRulesAudit);
+  const repairingDanglingRules = useAppSelector((s) => s.repairingDanglingRules);
+
+  useEffect(() => {
+    if (initialized) {
+      void appActions.refreshDanglingRulesAudit();
+    }
+  }, [initialized]);
 
   const [togglingProxy, setTogglingProxy] = useState(false);
   const [togglingPreAccel, setTogglingPreAccel] = useState(false);
@@ -1525,6 +1533,118 @@ export function HomePage() {
           </div>
         </section>
       )}
+
+      {/* Self-Healing Banner for Dangling Rules (Issue #4) or Core Startup Errors (0px when healthy) */}
+      {initialized && danglingRulesAudit && danglingRulesAudit.total_dangling > 0 && (
+        <section
+          role="alert"
+          className="cc-card cc-glass rounded-2xl border-[var(--amber)]/65 bg-[var(--amber-soft)]/50 p-4"
+        >
+          <div className="flex flex-col gap-3">
+            <div className="flex items-start gap-2.5">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[var(--amber)]" />
+              <div className="min-w-0 flex-1">
+                <h2 className="text-xs font-bold text-[var(--text)]">
+                  {formatI18nTemplate(dict.home.danglingAlertTitle, {
+                    count: danglingRulesAudit.total_dangling,
+                    target:
+                      danglingRulesAudit.groups.length === 1
+                        ? danglingRulesAudit.groups[0].target
+                        : danglingRulesAudit.groups
+                            .slice(0, 2)
+                            .map((g) => `${g.target}(${g.count})`)
+                            .join(" / "),
+                  })}
+                </h2>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-[var(--text-secondary)]">
+                  {dict.home.danglingAlertDesc}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                disabled={repairingDanglingRules}
+                onClick={() => void appActions.repairDanglingRules("remove")}
+                className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+              >
+                <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                <span>{dict.home.danglingRemoveBtn}</span>
+              </button>
+              <button
+                type="button"
+                disabled={repairingDanglingRules}
+                onClick={() =>
+                  void appActions.repairDanglingRules(
+                    "rewrite",
+                    danglingRulesAudit.default_fallback_group
+                  )
+                }
+                className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-[var(--accent)]/55 bg-[var(--surface)] px-3 py-1.5 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
+              >
+                <RefreshCw className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                <span>
+                  {formatI18nTemplate(dict.home.danglingRewriteBtn, {
+                    group: danglingRulesAudit.default_fallback_group,
+                  })}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() =>
+                  void appActions.copyAgentBootstrapPrompt(uiLang, "troubleshoot_issue")
+                }
+                className="inline-flex cursor-pointer items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              >
+                <Bot className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                <span>{dict.home.askAiFixOrIssueBtn}</span>
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {initialized &&
+        (!danglingRulesAudit || danglingRulesAudit.total_dangling === 0) &&
+        (runtime.status === "error" || Boolean(runtime.last_error?.trim())) && (
+          <section
+            role="alert"
+            className="cc-card cc-glass rounded-2xl border-[var(--red)]/50 bg-[var(--red-soft)]/35 p-4"
+          >
+            <div className="flex flex-col gap-2.5 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex min-w-0 items-start gap-2.5">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[var(--red)]" />
+                <div className="min-w-0">
+                  <div className="text-xs font-bold text-[var(--text)]">
+                    {dict.home.coreErrorBannerTitle}
+                  </div>
+                  <p className="mt-0.5 break-words text-[11.5px] leading-relaxed text-[var(--text-secondary)]">
+                    {runtime.last_error?.trim() || "请查看运行日志或交给 AI 帮手快速定位原因"}
+                  </p>
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => appActions.setNav("logs")}
+                  className="inline-flex cursor-pointer items-center gap-1 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-2.5 py-1.5 text-[11.5px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)]"
+                >
+                  <span>{dict.home.dnsDiagOpenLogs}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    void appActions.copyAgentBootstrapPrompt(uiLang, "troubleshoot_issue")
+                  }
+                  className="inline-flex cursor-pointer items-center gap-1 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-[11.5px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                >
+                  <Bot className="h-3.5 w-3.5 shrink-0" />
+                  <span>{dict.home.askAiFixOrIssueBtn}</span>
+                </button>
+              </div>
+            </div>
+          </section>
+        )}
 
       {/* 0-Node Onboarding Guide Card: direct boost-only or import-as-main entry actions */}
       {initialized && nodes.length === 0 && (

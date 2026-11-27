@@ -30,7 +30,7 @@ export type GlobalPreAccelScope = "proxy_apps_only" | "all_non_443_tcp";
 export type GlobalPreAccelMode = "off" | "windivert" | "local_socks5" | "suspended_for_tun";
 export type PreAccelDispatchStrategy = "auto" | "load_balance" | "fallback";
 export type PreAccelLbStrategy = "round_robin" | "consistent_hashing";
-export type AgentPromptMode = "autopilot" | "readonly";
+export type AgentPromptMode = "autopilot" | "readonly" | "troubleshoot_issue";
 
 export interface DnsTlsDiagnostics {
   status: "healthy" | "degraded_recovered" | "cert_verification_failed" | string;
@@ -527,6 +527,7 @@ export type NodeHealthHint = NodeHealthHintDto;
 export interface CoreRuntimeInfo {
   running: boolean;
   status: CoreHealthStatus;
+  last_error?: string | null;
   core_name: string;
   core_version: string;
   proxy_mode: ProxyMode;
@@ -1174,6 +1175,29 @@ export interface PendingUpdatePromptDto {
 export interface MigrationApplyOutcome {
   imported_count: number;
   sub_id: string;
+  saved_rules_count?: number;
+  dropped_dangling_rules_count?: number;
+  rewritten_dangling_rules_count?: number;
+  dropped_dangling_targets?: Array<[string, number]>;
+}
+
+export interface DanglingRuleGroupSummary {
+  target: string;
+  count: number;
+  sample_rules: string[];
+}
+
+export interface DanglingRulesAudit {
+  total_dangling: number;
+  groups: DanglingRuleGroupSummary[];
+  default_fallback_group: string;
+}
+
+export interface DanglingRuleRepairReport {
+  removed_count: number;
+  rewritten_count: number;
+  target_group: string | null;
+  affected_targets: string[];
 }
 
 export interface SkipUpdateResultDto {
@@ -4413,7 +4437,12 @@ export const catcloudApi = {
     mode: AgentPromptMode = "autopilot"
   ): Promise<AgentBootstrapPromptDto> {
     const normalizedLang = normalizeUiLanguage(lang ?? mockConfig.personalization.ui_language);
-    const resolvedMode: AgentPromptMode = mode === "readonly" ? "readonly" : "autopilot";
+    const resolvedMode: AgentPromptMode =
+      mode === "readonly"
+        ? "readonly"
+        : mode === "troubleshoot_issue"
+          ? "troubleshoot_issue"
+          : "autopilot";
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<AgentBootstrapPromptDto>("build_agent_bootstrap_prompt", {
         lang: normalizedLang,
@@ -4447,12 +4476,26 @@ export const catcloudApi = {
             "2. 严禁修改配置、节点、分流或中转，给出清晰的人话诊断结论与可选下一步建议即可。",
             "3. 隐私红线：严禁在回复中复述明文密码、UUID、订阅完整 URL 或真实公网中转 IP。",
           ].join("\n")
-        : [
-            `请全程使用「${langDisplay}」与我沟通，我现在授权你作为本机 AI Agent（Codex / Claude Code / Antigravity）全权帮我配置与排查猫猫云梯（CatCloud）。`,
-            "",
-            `- 可执行 CLI：\`${cliPath}\``,
-            `- 数据目录：\`${dataDir}\``,
-            `- 随装手册索引：\`${docsIndex}\``,
+        : resolvedMode === "troubleshoot_issue"
+          ? [
+              `请全程使用「${langDisplay}」作为我的本机猫猫云梯（CatCloud）排障与反馈 AI 助手，先帮我定位并尝试修复问题，若确认为软件缺陷请帮我整理脱敏 GitHub Issue 提交到 JuryBu/CatCloud。`,
+              "",
+              `- 可执行 CLI：\`${cliPath}\``,
+              `- 数据目录：\`${dataDir}\``,
+              `- 排障手册索引：\`${docsIndex}\`（优先看 \`00-general-troubleshooting.md\`）`,
+              `- 当前所在界面：${currentPage || "overview"}`,
+              "",
+              "## 排障与反馈步骤",
+              "1. 先运行 `status --json`、`config validate --json`、`net doctor --json`、`logs tail --lines 80 --since 30m --json`。",
+              "2. 若检测到悬空分流规则等可安全自愈的配置异常，请用 `config repair-rules` + `config reload --json` 直接修好。",
+              "3. 若为软件本身 Bug，整理脱敏复现报告与诊断摘要，经我确认后可用 `gh issue create --repo JuryBu/CatCloud` 提交（严禁泄露任何密码、UUID、订阅链接或真实中转 IP）。",
+            ].join("\n")
+          : [
+              `请全程使用「${langDisplay}」与我沟通，我现在授权你作为本机 AI Agent（Codex / Claude Code / Antigravity）全权帮我配置与排查猫猫云梯（CatCloud）。`,
+              "",
+              `- 可执行 CLI：\`${cliPath}\``,
+              `- 数据目录：\`${dataDir}\``,
+              `- 随装手册索引：\`${docsIndex}\``,
             `- 当前所在界面：${currentPage || "overview"}`,
             "",
             "## 全权托管约定",
@@ -4756,12 +4799,22 @@ export const catcloudApi = {
 
   async applyMigrationNodesWithMeta(
     sourceName: string,
-    nodes: ProxyNode[]
+    nodes: ProxyNode[],
+    options?: {
+      includeRules?: boolean;
+      prependRules?: string[];
+      appendRules?: string[];
+      danglingRulePolicy?: "drop" | "rewrite";
+    }
   ): Promise<MigrationApplyOutcome> {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<MigrationApplyOutcome>("apply_migration_nodes_with_meta", {
         sourceName,
         nodes,
+        includeRules: options?.includeRules ?? false,
+        prependRules: options?.prependRules ?? [],
+        appendRules: options?.appendRules ?? [],
+        danglingRulePolicy: options?.danglingRulePolicy ?? null,
       });
     }
     const cleanName = sourceName.trim() || "迁移导入";
@@ -4786,7 +4839,123 @@ export const catcloudApi = {
       sub_id: subId,
     }));
     mockNodes.push(...reboundNodes);
-    return { imported_count: reboundNodes.length, sub_id: subId };
+    const savedRulesCount = options?.includeRules
+      ? (options.prependRules?.length ?? 0) + (options.appendRules?.length ?? 0)
+      : 0;
+    return {
+      imported_count: reboundNodes.length,
+      sub_id: subId,
+      saved_rules_count: savedRulesCount,
+      dropped_dangling_rules_count: 0,
+      rewritten_dangling_rules_count: 0,
+      dropped_dangling_targets: [],
+    };
+  },
+
+  async auditDanglingRules(): Promise<DanglingRulesAudit> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<DanglingRulesAudit>("audit_dangling_rules");
+    }
+    const validTargets = new Set<string>([
+      "DIRECT",
+      "REJECT",
+      "REJECT-DROP",
+      "PASS",
+      "COMPATIBLE",
+      "🐱 猫猫云梯",
+      "单节点直选",
+      ...mockGroups.map((g) => g.name.trim()).filter(Boolean),
+      ...mockNodes.filter((n) => n.enabled).map((n) => n.name.trim()).filter(Boolean),
+    ]);
+    const rules = [
+      ...(mockFullConfig.rules_override?.global_prepend_rules ?? []),
+      ...(mockFullConfig.rules_override?.global_append_rules ?? []),
+    ];
+    const counts = new Map<string, { count: number; samples: string[] }>();
+    let total = 0;
+    for (const raw of rules) {
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed.startsWith("#")) continue;
+      const parts = trimmed.split(",").map((s) => s.trim());
+      if (parts.length < 3) continue;
+      while (parts.length > 2 && /^(no-resolve|src)$/i.test(parts[parts.length - 1])) {
+        parts.pop();
+      }
+      const target = parts[parts.length - 1];
+      if (!target || validTargets.has(target) || validTargets.has(target.toUpperCase())) continue;
+      total += 1;
+      const cur = counts.get(target) ?? { count: 0, samples: [] };
+      cur.count += 1;
+      if (cur.samples.length < 3) cur.samples.push(trimmed);
+      counts.set(target, cur);
+    }
+    const groups: DanglingRuleGroupSummary[] = Array.from(counts.entries())
+      .map(([target, v]) => ({ target, count: v.count, sample_rules: v.samples }))
+      .sort((a, b) => b.count - a.count || a.target.localeCompare(b.target));
+    const fallbackGroup =
+      mockGroups.find((g) => g.id === mockRuntime.active_group_id)?.name ??
+      mockGroups[0]?.name ??
+      "🐱 猫猫云梯";
+    return {
+      total_dangling: total,
+      groups,
+      default_fallback_group: fallbackGroup,
+    };
+  },
+
+  async repairDanglingRules(
+    mode: "remove" | "rewrite",
+    targetGroup?: string | null,
+    restartCoreIfNeeded = true
+  ): Promise<DanglingRuleRepairReport> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<DanglingRuleRepairReport>("repair_dangling_rules", {
+        mode,
+        targetGroup: targetGroup ?? null,
+        restartCoreIfNeeded,
+      });
+    }
+    const audit = await this.auditDanglingRules();
+    const affected = audit.groups.map((g) => g.target);
+    const badSet = new Set(affected);
+    const dest = (targetGroup ?? "").trim() || audit.default_fallback_group;
+    let removed = 0;
+    let rewritten = 0;
+    const processList = (list: string[]) => {
+      const next: string[] = [];
+      for (const raw of list) {
+        const parts = raw.trim().split(",").map((s) => s.trim());
+        let idx = parts.length - 1;
+        while (idx > 1 && /^(no-resolve|src)$/i.test(parts[idx])) idx -= 1;
+        const target = parts[idx];
+        if (target && badSet.has(target)) {
+          if (mode === "rewrite") {
+            parts[idx] = dest;
+            next.push(parts.join(","));
+            rewritten += 1;
+          } else {
+            removed += 1;
+          }
+        } else {
+          next.push(raw);
+        }
+      }
+      return next;
+    };
+    if (mockFullConfig.rules_override) {
+      mockFullConfig.rules_override.global_prepend_rules = processList(
+        mockFullConfig.rules_override.global_prepend_rules ?? []
+      );
+      mockFullConfig.rules_override.global_append_rules = processList(
+        mockFullConfig.rules_override.global_append_rules ?? []
+      );
+    }
+    return {
+      removed_count: removed,
+      rewritten_count: rewritten,
+      target_group: mode === "rewrite" ? dest : null,
+      affected_targets: affected,
+    };
   },
 
   async listRunningProcesses(onlyLikelyProxy: boolean): Promise<ProcessCandidateDto[]> {

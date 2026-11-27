@@ -1161,6 +1161,8 @@ pub struct CoreRuntimeInfoDto {
     pub autostart_enabled: bool,
     pub portable_mode: bool,
     pub last_update_check: Option<String>,
+    #[serde(default)]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2872,6 +2874,7 @@ fn build_runtime_info_dto_with_verify_override(
         autostart_enabled: cfg.behavior.autostart,
         portable_mode: state.paths.is_portable,
         last_update_check: cfg.update.last_checked_at.clone(),
+        last_error: state.last_app_error_snapshot(),
     })
 }
 
@@ -3870,13 +3873,12 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         )?;
     }
     if !compiled.validation.ok {
-        let summary = compiled
-            .validation
-            .issues
-            .iter()
-            .map(|i| i.message.as_str())
-            .collect::<Vec<_>>()
-            .join("；");
+        let fallback_hint =
+            catcloud_core::core_adapter::resolve_default_fallback_group_name(&eff_cfg, &groups);
+        let summary = catcloud_core::core_adapter::format_static_validation_summary_zh(
+            &compiled.validation,
+            Some(&fallback_hint),
+        );
         let msg = format!("代理配置静态预检未通过：{summary}");
         state.log_app_event("error", "核心", &msg);
         return Err(msg);
@@ -6655,12 +6657,12 @@ fn validate_inline_override_yaml_compile(
 
     let errors = compiled.validation.errors();
     if !errors.is_empty() {
-        let summary = errors
-            .iter()
-            .take(3)
-            .map(|issue| issue.message.as_str())
-            .collect::<Vec<_>>()
-            .join("；");
+        let fallback_hint =
+            catcloud_core::core_adapter::resolve_default_fallback_group_name(candidate_cfg, &groups);
+        let summary = catcloud_core::core_adapter::format_static_validation_summary_zh(
+            &compiled.validation,
+            Some(&fallback_hint),
+        );
         return Err(if has_inline {
             format!("内联 YAML 覆写合并后静态校验未通过，未保存修改：{summary}")
         } else {
@@ -8026,6 +8028,25 @@ pub async fn upsert_multi_group(
         db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
         (existing_group, existing_prev, prev_name, next_name)
     };
+    let prev_cfg_before_rename = state.snapshot_config();
+    let mut cfg_rules_cascaded = false;
+    if let Some(ref old_g) = prev_group {
+        if old_g.name.trim() != group.name.trim() {
+            let mut next_cfg = prev_cfg_before_rename.clone();
+            let touched = catcloud_core::core_adapter::cascade_group_name_change_in_global_rules(
+                &mut next_cfg,
+                &old_g.name,
+                Some(&group.name),
+            );
+            if touched > 0 {
+                config::save(&state.paths, &next_cfg).map_err(|e| e.to_string())?;
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = next_cfg;
+                }
+                cfg_rules_cascaded = true;
+            }
+        }
+    }
     if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
         if outcome.rejected {
             if let Ok(db) = state.storage.lock() {
@@ -8036,6 +8057,12 @@ pub async fn upsert_multi_group(
                     None => {
                         let _ = db.delete_multi_group(&group.id);
                     }
+                }
+            }
+            if cfg_rules_cascaded {
+                let _ = config::save(&state.paths, &prev_cfg_before_rename);
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = prev_cfg_before_rename.clone();
                 }
             }
             let cfg = state.snapshot_config();
@@ -8112,6 +8139,16 @@ pub async fn delete_multi_group(
         let active_changed = cfg.active_group_id.as_deref() == Some(group_id.as_str());
         if active_changed {
             cfg.active_group_id = next_fallback_group_id;
+        }
+        let cascaded_rules = prev_group.as_ref().map_or(0, |old_g| {
+            catcloud_core::core_adapter::cascade_group_name_change_in_global_rules(
+                &mut cfg,
+                &old_g.name,
+                None,
+            )
+        });
+        let cfg_mutated = active_changed || cascaded_rules > 0;
+        if cfg_mutated {
             config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
             if let Ok(mut guard) = state.config.write() {
                 *guard = cfg.clone();
@@ -8124,7 +8161,7 @@ pub async fn delete_multi_group(
                         let _ = db.upsert_multi_group(old_group);
                     }
                 }
-                if active_changed {
+                if cfg_mutated {
                     let _ = config::save(&state.paths, &prev_cfg);
                     if let Ok(mut guard) = state.config.write() {
                         *guard = prev_cfg.clone();
@@ -9368,6 +9405,27 @@ pub async fn delete_subscription(
         db.delete_subscription(&sub_id).map_err(|e| e.to_string())?
     };
     if deleted {
+        let removed_migrated_rules = {
+            let mut cfg = state.snapshot_config();
+            let removed = catcloud_core::subscription::remove_subscription_migrated_rules(
+                &mut cfg,
+                &sub_id,
+            );
+            if removed > 0 {
+                let _ = config::save(&state.paths, &cfg);
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = cfg;
+                }
+            }
+            removed
+        };
+        if removed_migrated_rules > 0 {
+            state.log_app_event(
+                "info",
+                "订阅",
+                &format!("删除订阅时已自动清理其带入的 {removed_migrated_rules} 条分流规则"),
+            );
+        }
         let _ = remap_active_single_node_id_if_needed(&state, &HashMap::new())?;
         prune_node_health_pool_from_db(&state);
 
@@ -9457,7 +9515,7 @@ fn remap_active_single_node_id_if_needed(
             .ok()
             .and_then(|db| db.get_node(&current_id).ok())
             .flatten()
-            .is_some();
+            .is_some_and(|n| n.enabled);
         if still_exists {
             return Ok(false);
         }
@@ -9580,6 +9638,19 @@ pub async fn merge_subscriptions(
         )
         .map_err(|e| e.to_string())?
     };
+    {
+        let mut cfg = state.snapshot_config();
+        if catcloud_core::subscription::merge_subscription_migrated_rules(
+            &mut cfg,
+            &source_sub_id,
+            &target_sub_id,
+        ) {
+            let _ = config::save(&state.paths, &cfg);
+            if let Ok(mut guard) = state.config.write() {
+                *guard = cfg;
+            }
+        }
+    }
     let _ = remap_active_single_node_id_if_needed(&state, &outcome.id_remap)?;
     prune_node_health_pool_from_db(&state);
     let _ = trigger_reload_if_running(&app, &state, false).await;
@@ -11594,9 +11665,12 @@ pub async fn refresh_subscription(
             Err(sanitized_err)
         }
         Ok(val) => {
+            let _ = remap_active_single_node_id_if_needed(&state, &HashMap::new());
             prune_node_health_pool_from_db(&state);
             let _ = trigger_reload_if_running(&app, &state, false).await;
             let cfg = state.snapshot_config();
+            emit_groups_updated(&app);
+            emit_nodes_updated(&app);
             emit_config_updated(&app, &cfg);
             sync_app_side_effects(&app, &state, &cfg);
             Ok(val)
@@ -16261,6 +16335,14 @@ fn persist_migration_nodes(
 pub struct MigrationApplyOutcome {
     pub imported_count: usize,
     pub sub_id: String,
+    #[serde(default)]
+    pub saved_rules_count: usize,
+    #[serde(default)]
+    pub dropped_dangling_rules_count: usize,
+    #[serde(default)]
+    pub rewritten_dangling_rules_count: usize,
+    #[serde(default)]
+    pub dropped_dangling_targets: Vec<(String, usize)>,
 }
 
 async fn apply_migration_nodes_with_meta_internal(
@@ -16268,13 +16350,77 @@ async fn apply_migration_nodes_with_meta_internal(
     state: &AppState,
     source_name: String,
     nodes: Vec<ProxyNode>,
+    include_rules: bool,
+    prepend_rules: Vec<String>,
+    append_rules: Vec<String>,
+    dangling_rule_policy: Option<String>,
 ) -> Result<MigrationApplyOutcome, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let (sub_id, count) = {
         let mut db = state.storage.lock().map_err(|e| e.to_string())?;
         persist_migration_nodes(&mut db, source_name, nodes)?
     };
     prune_node_health_pool_from_db(state);
     let created_default_group = ensure_default_group_if_empty(state);
+
+    let mut rule_outcome = catcloud_core::subscription::MigrationRuleApplyOutcome::default();
+    if include_rules && (!prepend_rules.is_empty() || !append_rules.is_empty()) {
+        let (all_groups, all_nodes) = {
+            let db = state.storage.lock().map_err(|e| e.to_string())?;
+            let g = db.list_multi_groups().map_err(|e| e.to_string())?;
+            let n = db.list_nodes().map_err(|e| e.to_string())?;
+            (g, n)
+        };
+        let mut cfg = state.snapshot_config();
+        let policy = match dangling_rule_policy
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("rewrite" | "rewrite_default") => {
+                let fallback = catcloud_core::core_adapter::resolve_default_fallback_group_name(
+                    &cfg,
+                    &all_groups,
+                );
+                catcloud_core::subscription::MigrationDanglingRulePolicy::RewriteTo(fallback)
+            }
+            _ => catcloud_core::subscription::MigrationDanglingRulePolicy::Drop,
+        };
+        rule_outcome = catcloud_core::subscription::apply_migration_rules_for_subscription(
+            &mut cfg,
+            &sub_id,
+            &prepend_rules,
+            &append_rules,
+            &all_groups,
+            &all_nodes,
+            policy,
+        );
+        if rule_outcome.added_prepend > 0 || rule_outcome.added_append > 0 {
+            config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+            if let Ok(mut guard) = state.config.write() {
+                *guard = cfg;
+            }
+        }
+        if rule_outcome.dropped_dangling_count > 0 {
+            let target_list: Vec<String> = rule_outcome
+                .dropped_targets
+                .iter()
+                .take(3)
+                .map(|(t, c)| format!("「{t}」({c} 条)"))
+                .collect();
+            state.log_app_event(
+                "info",
+                "迁移导入",
+                &format!(
+                    "导入规则时已自动过滤 {} 条指向不存在分组的旧规则（{}），避免阻断核心启动",
+                    rule_outcome.dropped_dangling_count,
+                    target_list.join("、")
+                ),
+            );
+        }
+    }
+
     if let Some(outcome) = trigger_reload_if_running(app, state, false).await {
         if outcome.rejected {
             let detail = outcome
@@ -16298,6 +16444,10 @@ async fn apply_migration_nodes_with_meta_internal(
     Ok(MigrationApplyOutcome {
         imported_count: count,
         sub_id,
+        saved_rules_count: rule_outcome.added_prepend + rule_outcome.added_append,
+        dropped_dangling_rules_count: rule_outcome.dropped_dangling_count,
+        rewritten_dangling_rules_count: rule_outcome.rewritten_dangling_count,
+        dropped_dangling_targets: rule_outcome.dropped_targets,
     })
 }
 
@@ -16307,8 +16457,22 @@ pub async fn apply_migration_nodes_with_meta(
     state: State<'_, AppState>,
     source_name: String,
     nodes: Vec<ProxyNode>,
+    include_rules: Option<bool>,
+    prepend_rules: Option<Vec<String>>,
+    append_rules: Option<Vec<String>>,
+    dangling_rule_policy: Option<String>,
 ) -> Result<MigrationApplyOutcome, String> {
-    apply_migration_nodes_with_meta_internal(&app, &state, source_name, nodes).await
+    apply_migration_nodes_with_meta_internal(
+        &app,
+        &state,
+        source_name,
+        nodes,
+        include_rules.unwrap_or(false),
+        prepend_rules.unwrap_or_default(),
+        append_rules.unwrap_or_default(),
+        dangling_rule_policy,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -16318,9 +16482,125 @@ pub async fn apply_migration_nodes(
     source_name: String,
     nodes: Vec<ProxyNode>,
 ) -> Result<usize, String> {
-    apply_migration_nodes_with_meta_internal(&app, &state, source_name, nodes)
-        .await
-        .map(|o| o.imported_count)
+    apply_migration_nodes_with_meta_internal(
+        &app,
+        &state,
+        source_name,
+        nodes,
+        false,
+        Vec::new(),
+        Vec::new(),
+        None,
+    )
+    .await
+    .map(|o| o.imported_count)
+}
+
+#[tauri::command]
+pub fn audit_dangling_rules(
+    state: State<'_, AppState>,
+) -> Result<catcloud_core::core_adapter::DanglingRulesAudit, String> {
+    let cfg = state.snapshot_config();
+    let (groups, nodes) = {
+        let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let g = db.list_multi_groups().map_err(|e| e.to_string())?;
+        let n = db.list_nodes().map_err(|e| e.to_string())?;
+        (g, n)
+    };
+    Ok(catcloud_core::core_adapter::audit_dangling_global_rules(
+        &cfg, &groups, &nodes,
+    ))
+}
+
+#[tauri::command]
+pub async fn repair_dangling_rules(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    mode: String,
+    target_group: Option<String>,
+    restart_core_if_needed: Option<bool>,
+) -> Result<catcloud_core::core_adapter::DanglingRuleRepairReport, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let (groups, nodes) = {
+        let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let g = db.list_multi_groups().map_err(|e| e.to_string())?;
+        let n = db.list_nodes().map_err(|e| e.to_string())?;
+        (g, n)
+    };
+    let mut cfg = state.snapshot_config();
+    let action = match mode.trim().to_ascii_lowercase().as_str() {
+        "remove" | "delete" | "clean" => catcloud_core::core_adapter::DanglingRuleRepairAction::Remove,
+        "rewrite" | "remap" => {
+            let valid_targets =
+                catcloud_core::core_adapter::collect_valid_rule_target_names(&groups, &nodes);
+            let dest = target_group
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && valid_targets.contains(*s))
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    catcloud_core::core_adapter::resolve_default_fallback_group_name(&cfg, &groups)
+                });
+            catcloud_core::core_adapter::DanglingRuleRepairAction::RewriteToGroup {
+                target_group: dest,
+            }
+        }
+        other => {
+            return Err(format!(
+                "不支持的规则修复方式 `{other}`（仅支持 remove 或 rewrite）"
+            ));
+        }
+    };
+
+    let report = catcloud_core::core_adapter::repair_dangling_global_rules(
+        &mut cfg, &groups, &nodes, action, None,
+    );
+    let changed = report.removed_count > 0 || report.rewritten_count > 0;
+    if changed {
+        config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = cfg.clone();
+        }
+        state.clear_app_error();
+        state.log_app_event(
+            "info",
+            "分流规则",
+            &format!(
+                "已修复悬空分流规则：清理 {} 条、改写 {} 条{}",
+                report.removed_count,
+                report.rewritten_count,
+                report
+                    .target_group
+                    .as_deref()
+                    .map(|g| format!("（目标分组「{g}」）"))
+                    .unwrap_or_default()
+            ),
+        );
+    }
+
+    let core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    if changed {
+        if core_running {
+            let _ = trigger_reload_if_running(&app, &state, false).await;
+        } else if restart_core_if_needed.unwrap_or(false)
+            && (cfg.system_proxy.enabled || cfg.tun.enabled)
+            && has_enabled_nodes(&state).unwrap_or(false)
+        {
+            if let Err(err) = start_core_internal(&app, &state).await {
+                state.log_app_event(
+                    "warning",
+                    "分流规则",
+                    &format!("悬空规则已修复，但重新拉起核心仍未通过：{err}"),
+                );
+            }
+        }
+    }
+
+    let latest_cfg = state.snapshot_config();
+    emit_config_updated(&app, &latest_cfg);
+    sync_app_side_effects(&app, &state, &latest_cfg);
+    Ok(report)
 }
 
 #[tauri::command]
@@ -20375,14 +20655,14 @@ fn prepare_and_apply_backup_bundle_core(
         )?;
     }
     if !compiled.validation.ok {
-        let summary = compiled
-            .validation
-            .errors()
-            .iter()
-            .take(3)
-            .map(|i| i.message.as_str())
-            .collect::<Vec<_>>()
-            .join("；");
+        let fallback_hint = catcloud_core::core_adapter::resolve_default_fallback_group_name(
+            &eff_candidate,
+            &projected_groups,
+        );
+        let summary = catcloud_core::core_adapter::format_static_validation_summary_zh(
+            &compiled.validation,
+            Some(&fallback_hint),
+        );
         return Err(format!("备份配置静态防环预检未通过，已拒绝恢复：{summary}"));
     }
 

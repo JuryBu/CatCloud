@@ -13,7 +13,7 @@ use crate::preaccel::generator::{
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Number, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use url::Url;
@@ -448,8 +448,523 @@ fn extract_mihomo_rule_raw_target(rule: &str) -> Option<&str> {
 
 /// Extract a non-builtin proxy or proxy-group target name from a Mihomo rule line, ignoring
 /// built-in actions (`DIRECT`, `REJECT`, `REJECT-DROP`, `PASS`, `COMPATIBLE`, case-insensitive).
-fn extract_mihomo_rule_target(rule: &str) -> Option<&str> {
+pub fn extract_mihomo_rule_target(rule: &str) -> Option<&str> {
     extract_mihomo_rule_raw_target(rule).filter(|target| !is_builtin_rule_action(target))
+}
+
+/// Return `true` when `target` is a built-in Mihomo routing action (`DIRECT`, `REJECT`,
+/// `REJECT-DROP`, `PASS`, `COMPATIBLE`, case-insensitive).
+pub fn is_builtin_mihomo_rule_target(target: &str) -> bool {
+    is_builtin_rule_action(target)
+}
+
+/// Rewrite the proxy/group target segment of a Mihomo rule line while preserving rule type,
+/// payload/logical expression, and trailing flags (`no-resolve`, `src`).
+pub fn rewrite_mihomo_rule_target(rule: &str, new_target: &str) -> Option<String> {
+    let trimmed = rule.trim();
+    let replacement = new_target.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') || replacement.is_empty() {
+        return None;
+    }
+    let (raw_type, rest) = trimmed.split_once(',')?;
+    let rule_type = raw_type.trim();
+    if rule_type.is_empty() || rule_type.eq_ignore_ascii_case("SUB-RULE") {
+        return None;
+    }
+    if rule_type.eq_ignore_ascii_case("MATCH") {
+        let target = rest.trim();
+        if target.is_empty() || target.contains(',') {
+            return None;
+        }
+        return Some(format!("{rule_type},{replacement}"));
+    }
+    if is_logical_rule_type(rule_type) {
+        let mut remainder = rest.trim();
+        let mut trailing_flags: Vec<&str> = Vec::new();
+        while let Some((head, tail)) = remainder.rsplit_once(',') {
+            let candidate = tail.trim();
+            if candidate.is_empty() {
+                return None;
+            }
+            if is_mihomo_rule_flag(candidate) {
+                trailing_flags.push(candidate);
+                remainder = head.trim();
+                continue;
+            }
+            if !candidate.contains('(')
+                && !candidate.contains(')')
+                && has_balanced_parens(head)
+            {
+                trailing_flags.reverse();
+                let mut rebuilt = format!("{rule_type},{},{replacement}", head.trim());
+                for flag in trailing_flags {
+                    rebuilt.push(',');
+                    rebuilt.push_str(flag);
+                }
+                return Some(rebuilt);
+            }
+            return None;
+        }
+        return None;
+    }
+
+    let mut parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    if parts.len() < 3 || parts[1].is_empty() {
+        return None;
+    }
+    let mut trailing_flags: Vec<&str> = Vec::new();
+    while parts.len() > 2 && parts.last().is_some_and(|tok| is_mihomo_rule_flag(tok)) {
+        if let Some(flag) = parts.pop() {
+            trailing_flags.push(flag);
+        }
+    }
+    if parts.len() < 3 {
+        return None;
+    }
+    let last_slot = parts.last_mut()?;
+    if last_slot.is_empty() {
+        return None;
+    }
+    *last_slot = replacement;
+    trailing_flags.reverse();
+    parts.extend(trailing_flags);
+    Some(parts.join(","))
+}
+
+/// Summary of dangling global rules pointing to one non-existent proxy or proxy-group name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DanglingRuleGroupSummary {
+    pub target: String,
+    pub count: usize,
+    pub sample_rules: Vec<String>,
+}
+
+/// Read-only audit of global prepend/append rules referencing non-existent proxy/group targets.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DanglingRulesAudit {
+    pub total_dangling: usize,
+    pub groups: Vec<DanglingRuleGroupSummary>,
+    pub default_fallback_group: String,
+}
+
+/// Self-healing repair strategy for dangling global rules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum DanglingRuleRepairAction {
+    Remove,
+    RewriteToGroup { target_group: String },
+}
+
+/// Structured outcome after repairing dangling global rules.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DanglingRuleRepairReport {
+    pub removed_count: usize,
+    pub rewritten_count: usize,
+    pub target_group: Option<String>,
+    pub affected_targets: Vec<String>,
+}
+
+/// Collect the set of non-builtin rule targets currently valid for a given set of multi-groups
+/// and proxy nodes (group names, built-in fallback/single group names, and enabled node names).
+pub fn collect_valid_rule_target_names(
+    groups: &[MultiGroup],
+    nodes: &[ProxyNode],
+) -> HashSet<String> {
+    let mut valid = HashSet::new();
+    valid.insert(DEFAULT_FALLBACK_GROUP_NAME.to_string());
+    valid.insert(SINGLE_NODE_GROUP_NAME.to_string());
+    for g in groups {
+        let name = g.name.trim();
+        if !name.is_empty() {
+            valid.insert(name.to_string());
+        }
+    }
+    for n in nodes.iter().filter(|n| n.enabled) {
+        let name = n.name.trim();
+        if !name.is_empty() {
+            valid.insert(name.to_string());
+        }
+    }
+    valid
+}
+
+/// Resolve the most appropriate existing proxy-group name to use as a default fallback target.
+pub fn resolve_default_fallback_group_name(cfg: &AppConfig, groups: &[MultiGroup]) -> String {
+    if cfg.route_mode == RouteTargetMode::Single
+        && cfg
+            .active_single_node_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        return SINGLE_NODE_GROUP_NAME.to_string();
+    }
+    if let Some(active_id) = cfg.active_group_id.as_deref() {
+        if let Some(found) = groups
+            .iter()
+            .find(|g| g.id == active_id && !g.name.trim().is_empty())
+        {
+            return found.name.trim().to_string();
+        }
+    }
+    if let Some(first) = groups.iter().find(|g| !g.name.trim().is_empty()) {
+        return first.name.trim().to_string();
+    }
+    DEFAULT_FALLBACK_GROUP_NAME.to_string()
+}
+
+/// Cascade group rename (`new_name = Some(...)`) or deletion (`new_name = None`) across
+/// `cfg.rules_override.global_prepend_rules`, `global_append_rules`, and `subscription_rule_bindings`,
+/// preventing `unknown_rule_target` static validation failures after renaming/deleting a group.
+pub fn cascade_group_name_change_in_global_rules(
+    cfg: &mut AppConfig,
+    old_group_name: &str,
+    new_group_name: Option<&str>,
+) -> usize {
+    let old_name = old_group_name.trim();
+    if old_name.is_empty() {
+        return 0;
+    }
+    let next_name = new_group_name.map(str::trim).filter(|s| !s.is_empty());
+    if next_name == Some(old_name) {
+        return 0;
+    }
+    let mut touched = 0usize;
+    let mut transform = |list: &mut Vec<String>| {
+        let mut out: Vec<String> = Vec::with_capacity(list.len());
+        let mut seen: HashSet<String> = HashSet::new();
+        for raw in list.drain(..) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if extract_mihomo_rule_target(trimmed) == Some(old_name) {
+                touched += 1;
+                if let Some(dest) = next_name {
+                    if let Some(rebuilt) = rewrite_mihomo_rule_target(trimmed, dest) {
+                        if seen.insert(rebuilt.clone()) {
+                            out.push(rebuilt);
+                        }
+                    }
+                }
+            } else if seen.insert(trimmed.to_string()) {
+                out.push(trimmed.to_string());
+            }
+        }
+        *list = out;
+    };
+    transform(&mut cfg.rules_override.global_prepend_rules);
+    transform(&mut cfg.rules_override.global_append_rules);
+
+    if touched > 0 {
+        let mut empty_keys: Vec<String> = Vec::new();
+        for (sub_id, binding) in &mut cfg.rules_override.subscription_rule_bindings {
+            let sync_one = |list: &mut Vec<String>| {
+                let mut out: Vec<String> = Vec::with_capacity(list.len());
+                let mut seen: HashSet<String> = HashSet::new();
+                for raw in list.drain(..) {
+                    let trimmed = raw.trim();
+                    if extract_mihomo_rule_target(trimmed) == Some(old_name) {
+                        if let Some(dest) = next_name {
+                            if let Some(rebuilt) = rewrite_mihomo_rule_target(trimmed, dest) {
+                                if seen.insert(rebuilt.clone()) {
+                                    out.push(rebuilt);
+                                }
+                            }
+                        }
+                    } else if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                        out.push(trimmed.to_string());
+                    }
+                }
+                *list = out;
+            };
+            sync_one(&mut binding.prepend_rules);
+            sync_one(&mut binding.append_rules);
+            if binding.prepend_rules.is_empty() && binding.append_rules.is_empty() {
+                empty_keys.push(sub_id.clone());
+            }
+        }
+        for k in empty_keys {
+            cfg.rules_override.subscription_rule_bindings.remove(&k);
+        }
+    }
+
+    touched
+}
+
+/// Inspect `cfg.rules_override.global_prepend_rules` and `global_append_rules` for rules
+/// referencing proxy/group names that do not exist in the current library.
+pub fn audit_dangling_global_rules(
+    cfg: &AppConfig,
+    groups: &[MultiGroup],
+    nodes: &[ProxyNode],
+) -> DanglingRulesAudit {
+    let valid_targets = collect_valid_rule_target_names(groups, nodes);
+    let mut by_target: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+    let mut total_dangling = 0usize;
+
+    for raw in cfg
+        .rules_override
+        .global_prepend_rules
+        .iter()
+        .chain(cfg.rules_override.global_append_rules.iter())
+    {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(target) = extract_mihomo_rule_target(trimmed) {
+            if !valid_targets.contains(target) {
+                total_dangling += 1;
+                let entry = by_target
+                    .entry(target.to_string())
+                    .or_insert_with(|| (0, Vec::new()));
+                entry.0 += 1;
+                if entry.1.len() < 3 {
+                    entry.1.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    let mut summary_groups: Vec<DanglingRuleGroupSummary> = by_target
+        .into_iter()
+        .map(|(target, (count, sample_rules))| DanglingRuleGroupSummary {
+            target,
+            count,
+            sample_rules,
+        })
+        .collect();
+    summary_groups.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.target.cmp(&b.target)));
+
+    DanglingRulesAudit {
+        total_dangling,
+        groups: summary_groups,
+        default_fallback_group: resolve_default_fallback_group_name(cfg, groups),
+    }
+}
+
+/// Repair dangling global rules in `cfg.rules_override` either by removing them or by rewriting
+/// their target to a valid existing group, keeping `subscription_rule_bindings` consistent.
+pub fn repair_dangling_global_rules(
+    cfg: &mut AppConfig,
+    groups: &[MultiGroup],
+    nodes: &[ProxyNode],
+    action: DanglingRuleRepairAction,
+    only_targets: Option<&[String]>,
+) -> DanglingRuleRepairReport {
+    let valid_targets = collect_valid_rule_target_names(groups, nodes);
+    let filter_set: Option<HashSet<String>> = only_targets.map(|list| {
+        list.iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    });
+    let mut affected_set: BTreeSet<String> = BTreeSet::new();
+    let mut removed_count = 0usize;
+    let mut rewritten_count = 0usize;
+    let rewrite_target: Option<String> = match &action {
+        DanglingRuleRepairAction::Remove => None,
+        DanglingRuleRepairAction::RewriteToGroup { target_group } => {
+            let t = target_group.trim();
+            if t.is_empty() {
+                Some(resolve_default_fallback_group_name(cfg, groups))
+            } else {
+                Some(t.to_string())
+            }
+        }
+    };
+
+    let mut rewrite_map: HashMap<String, Option<String>> = HashMap::new();
+    let mut process_vec = |rules: &mut Vec<String>| {
+        let mut next: Vec<String> = Vec::with_capacity(rules.len());
+        let mut seen: HashSet<String> = HashSet::new();
+        for raw in rules.drain(..) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let is_dangling_hit = extract_mihomo_rule_target(trimmed).and_then(|target| {
+                if !valid_targets.contains(target)
+                    && filter_set
+                        .as_ref()
+                        .is_none_or(|f| f.contains(target))
+                {
+                    Some(target.to_string())
+                } else {
+                    None
+                }
+            });
+
+            if let Some(dangling_target) = is_dangling_hit {
+                affected_set.insert(dangling_target);
+                if let Some(dest) = rewrite_target.as_deref() {
+                    if let Some(rebuilt) = rewrite_mihomo_rule_target(trimmed, dest) {
+                        rewritten_count += 1;
+                        rewrite_map.insert(trimmed.to_string(), Some(rebuilt.clone()));
+                        if seen.insert(rebuilt.clone()) {
+                            next.push(rebuilt);
+                        }
+                    } else {
+                        removed_count += 1;
+                        rewrite_map.insert(trimmed.to_string(), None);
+                    }
+                } else {
+                    removed_count += 1;
+                    rewrite_map.insert(trimmed.to_string(), None);
+                }
+            } else if seen.insert(trimmed.to_string()) {
+                next.push(trimmed.to_string());
+            }
+        }
+        *rules = next;
+    };
+
+    process_vec(&mut cfg.rules_override.global_prepend_rules);
+    process_vec(&mut cfg.rules_override.global_append_rules);
+
+    // Keep subscription_rule_bindings synchronized so future deletes stay exact.
+    if !rewrite_map.is_empty() {
+        let mut empty_sub_ids: Vec<String> = Vec::new();
+        for (sub_id, binding) in &mut cfg.rules_override.subscription_rule_bindings {
+            let sync_list = |list: &mut Vec<String>| {
+                let mut out: Vec<String> = Vec::with_capacity(list.len());
+                let mut seen: HashSet<String> = HashSet::new();
+                for r in list.drain(..) {
+                    let key = r.trim();
+                    if let Some(mapped) = rewrite_map.get(key) {
+                        if let Some(rebuilt) = mapped {
+                            if seen.insert(rebuilt.clone()) {
+                                out.push(rebuilt.clone());
+                            }
+                        }
+                    } else if !key.is_empty() && seen.insert(key.to_string()) {
+                        out.push(key.to_string());
+                    }
+                }
+                *list = out;
+            };
+            sync_list(&mut binding.prepend_rules);
+            sync_list(&mut binding.append_rules);
+            if binding.prepend_rules.is_empty() && binding.append_rules.is_empty() {
+                empty_sub_ids.push(sub_id.clone());
+            }
+        }
+        for id in empty_sub_ids {
+            cfg.rules_override.subscription_rule_bindings.remove(&id);
+        }
+    }
+
+    DanglingRuleRepairReport {
+        removed_count,
+        rewritten_count,
+        target_group: rewrite_target,
+        affected_targets: affected_set.into_iter().collect(),
+    }
+}
+
+/// Extract the missing proxy/group name from an `unknown_rule_target` static validation message.
+fn parse_unknown_rule_target_from_issue(msg: &str) -> Option<&str> {
+    let marker = "unknown proxy or proxy-group `";
+    let rest = msg.split_once(marker)?.1;
+    let target = rest.strip_suffix('`').unwrap_or_else(|| rest.split('`').next().unwrap_or(rest));
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+/// Aggregate static validation errors into concise, actionable Simplified Chinese prose
+/// (preventing hundreds of repetitive `unknown_rule_target` lines from flooding UI or logs).
+pub fn format_static_validation_summary_zh(
+    report: &StaticValidationReport,
+    fallback_group_hint: Option<&str>,
+) -> String {
+    let errors = report.errors();
+    if errors.is_empty() {
+        return String::new();
+    }
+
+    let mut unknown_targets: BTreeMap<String, usize> = BTreeMap::new();
+    let mut other_by_code: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+    for issue in errors {
+        if issue.code == "unknown_rule_target" {
+            let target = parse_unknown_rule_target_from_issue(&issue.message)
+                .unwrap_or("未知分组")
+                .to_string();
+            *unknown_targets.entry(target).or_insert(0) += 1;
+        } else {
+            other_by_code
+                .entry(issue.code.clone())
+                .or_default()
+                .push(issue.message.clone());
+        }
+    }
+
+    let mut segments: Vec<String> = Vec::new();
+    if !unknown_targets.is_empty() {
+        let mut sorted: Vec<(String, usize)> = unknown_targets.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let total: usize = sorted.iter().map(|(_, c)| *c).sum();
+        let fallback_name = fallback_group_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(DEFAULT_FALLBACK_GROUP_NAME);
+        if sorted.len() == 1 {
+            let (name, count) = &sorted[0];
+            segments.push(format!(
+                "共有 {count} 条分流规则指向不存在的分组「{name}」（可在首页或分流页一键清理，或改为「{fallback_name}」）"
+            ));
+        } else {
+            let shown: Vec<String> = sorted
+                .iter()
+                .take(3)
+                .map(|(name, count)| format!("「{name}」({count} 条)"))
+                .collect();
+            let extra = if sorted.len() > 3 {
+                format!(" 等 {} 个分组", sorted.len())
+            } else {
+                String::new()
+            };
+            segments.push(format!(
+                "共有 {total} 条分流规则指向不存在的分组：{}{}（可一键清理或改为「{fallback_name}」）",
+                shown.join("、"),
+                extra
+            ));
+        }
+    }
+
+    for (code, msgs) in other_by_code {
+        let count = msgs.len();
+        match code.as_str() {
+            "missing_relay_direct_rule" => {
+                segments.push(format!(
+                    "有 {count} 条国内提速中转缺少防环直连规则（{}）",
+                    msgs[0]
+                ));
+            }
+            "empty_proxy_group" => {
+                segments.push(format!(
+                    "有 {count} 个路线分组为空，请先导入节点或检查分组成员（{}）",
+                    msgs[0]
+                ));
+            }
+            "group_cycle" => {
+                segments.push(format!("检测到代理分组循环引用：{}", msgs[0]));
+            }
+            _ => {
+                if count <= 2 {
+                    segments.push(msgs.join("；"));
+                } else {
+                    segments.push(format!("{} 等共 {count} 项校验异常（{code}）", msgs[0]));
+                }
+            }
+        }
+    }
+
+    segments.join("；")
 }
 
 /// Expand a multi-group match rule into one or more Mihomo rule strings.
@@ -2203,11 +2718,7 @@ fn export_gateway_relay_fragment(
         let validation = validate_compiled_yaml(&body_yaml, &relay_servers_for_validation)?;
         let hard_errors = validation.errors();
         if !hard_errors.is_empty() {
-            let summary = hard_errors
-                .iter()
-                .map(|i| format!("[{}] {}", i.code, i.message))
-                .collect::<Vec<_>>()
-                .join("; ");
+            let summary = format_static_validation_summary_zh(&validation, None);
             return Err(CatError::Validation(format!(
                 "国内提速片段静态防环校验未通过，已阻止导出坏配置：{summary}"
             )));
@@ -2458,11 +2969,8 @@ fn export_gateway_transparent_full(
     let final_validation = validate_compiled_yaml(&locked_yaml, &relay_servers_for_validation)?;
     let hard_errors = final_validation.errors();
     if !hard_errors.is_empty() {
-        let summary = hard_errors
-            .iter()
-            .map(|i| format!("[{}] {}", i.code, i.message))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let fallback_hint = resolve_default_fallback_group_name(&gw_cfg, groups);
+        let summary = format_static_validation_summary_zh(&final_validation, Some(&fallback_hint));
         return Err(CatError::Validation(format!(
             "透明网关配置静态校验未通过，已阻止导出坏配置：{summary}"
         )));
@@ -2692,11 +3200,7 @@ fn export_gateway_preferred_nodes(
     let validation = validate_compiled_yaml(&body_yaml, &relay_servers_for_validation)?;
     let hard_errors = validation.errors();
     if !hard_errors.is_empty() {
-        let summary = hard_errors
-            .iter()
-            .map(|i| format!("[{}] {}", i.code, i.message))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let summary = format_static_validation_summary_zh(&validation, None);
         return Err(CatError::Validation(format!(
             "优选节点片段静态防环校验未通过，已阻止导出坏配置：{summary}"
         )));
@@ -9052,7 +9556,11 @@ rules:
             },
         )
         .expect_err("transparent gateway must return Err when static validation has Error");
-        assert!(err.to_string().contains("unknown_rule_target"));
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("NonExistentGroup") && err_msg.contains("不存在的分组"),
+            "expected aggregated zh-CN dangling target error, got: {err_msg}"
+        );
     }
 
     #[test]

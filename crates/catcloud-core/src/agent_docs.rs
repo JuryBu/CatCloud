@@ -1954,12 +1954,16 @@ fn describe_current_page(current_page: &str, lang: &str) -> (String, &'static st
 pub enum AgentPromptMode {
     Autopilot,
     Readonly,
+    TroubleshootIssue,
 }
 
 impl AgentPromptMode {
     pub fn from_opt_str(raw: Option<&str>) -> Self {
         match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
             Some("readonly" | "read_only" | "inspect" | "check") => Self::Readonly,
+            Some("issue" | "troubleshoot" | "troubleshoot_issue" | "feedback" | "report") => {
+                Self::TroubleshootIssue
+            }
             _ => Self::Autopilot,
         }
     }
@@ -1997,11 +2001,25 @@ pub fn render_agent_bootstrap_prompt_with_mode(
              - Data directory flag: `--data-dir \"{data}\"` (always pass `--json`)\n\
              - Authoritative local docs index: `{index}` (start with `{suggested_doc}` for current page: **{page_label}**)\n\n\
              Autopilot Authorization:\n\
-             1. **Inspect automatically first**: Read `{index}` (and `{suggested_doc}`) as needed, then run read-only diagnostics (`status --json`, `net doctor --json`, `logs tail --lines 50 --json`) using the exact CLI path above.\n\
-             2. **Execute end-to-end directly**: You are pre-authorized to import subscriptions/nodes I provide (or migrate existing local clients), run zero-interference speed tests to pick the fastest golden nodes, build/tune Smart Groups, configure Domestic Boost (multi-cloud balancing or fallback), and run `config reload --json` to make changes live without pausing on routine steps.\n\
-             3. **Confirm only high-risk actions**: Ask me before destructive deletions (removing subscriptions/resetting config) or remote SSH server deployment / secret rotation.\n\
-             4. **Strict secret redline**: Keep default sanitized output; NEVER echo, print, or leak plaintext passwords, UUIDs, tokens, private keys, subscription URLs, or unmasked relay IPs.\n\n\
+             1. **Inspect automatically first**: Read `{index}` (and `{suggested_doc}`) as needed, then run read-only diagnostics (`status --json`, `net doctor --json`, `config validate --json`, `logs tail --lines 50 --json`) using the exact CLI path above.\n\
+             2. **Execute end-to-end directly**: You are pre-authorized to import subscriptions/nodes I provide (or migrate existing local clients), run zero-interference speed tests to pick the fastest golden nodes, build/tune Smart Groups, repair dangling rules (`config repair-rules`), configure Domestic Boost, and run `config reload --json` to make changes live without pausing on routine steps.\n\
+             3. **Troubleshoot & Report Real Bugs**: If you hit a genuine CatCloud software bug that cannot be solved by config repair, draft a strictly sanitized reproduction report and (after my confirmation) help me file a GitHub Issue on `JuryBu/CatCloud` (via `gh` if available, or provide a ready-to-paste summary).\n\
+             4. **Confirm only high-risk actions & strict secret redline**: Ask before destructive deletions, remote SSH deployment, or publishing a GitHub Issue; NEVER echo, print, or leak plaintext passwords, UUIDs, tokens, private keys, subscription URLs, or unmasked relay IPs.\n\n\
              Start immediately by checking my current state, carry out the needed setup, and report a concise plain-language verification summary.",
+            lang_lock_line(norm)
+        ),
+        ("en", AgentPromptMode::TroubleshootIssue) => format!(
+            "{}\n\n\
+             You are my local CatCloud troubleshooting & feedback AI Agent (Codex / Claude Code / Antigravity). Please diagnose what went wrong in this running instance, fix safe configuration issues if possible, or prepare a sanitized GitHub Issue for `JuryBu/CatCloud`:\n\
+             - CLI executable: `{cli}`\n\
+             - Data directory flag: `--data-dir \"{data}\"` (always pass `--json`)\n\
+             - Troubleshooting manual: `{index}` (start with `00-general-troubleshooting.md`; current page: **{page_label}**)\n\n\
+             Workflow:\n\
+             1. **Read-only diagnosis first**: Run `status --json`, `config validate --json`, `net doctor --json`, and `logs tail --lines 80 --since 30m --json`.\n\
+             2. **Auto-fix safe config issues**: If you find dangling migrated rules (`unknown_rule_target`) or simple config mismatches, explain clearly and fix them with `config repair-rules` + `config reload --json`.\n\
+             3. **File a sanitized GitHub Issue for real bugs**: If it is a CatCloud software defect, compile a concise, zero-secret reproduction report (version, OS, exact steps, expected vs actual, sanitized diagnostic summary). Ask my confirmation before submitting via `gh issue create --repo JuryBu/CatCloud` (or give me the ready-to-paste markdown).\n\
+             4. **Zero-secret redline**: NEVER include plaintext passwords, UUIDs, tokens, private keys, subscription URLs, or unmasked relay IPs.\n\n\
+             Start diagnosing immediately and explain what you found in plain language.",
             lang_lock_line(norm)
         ),
         ("en", AgentPromptMode::Readonly) => format!(
@@ -2025,11 +2043,25 @@ pub fn render_agent_bootstrap_prompt_with_mode(
              - データディレクトリ引数：`--data-dir \"{data}\"`（常に `--json` を付与）\n\
              - ローカル権威マニュアル目次：`{index}`（現在画面「**{page_label}**」向け推奨章：`{suggested_doc}`）\n\n\
              全自動代行ルール：\n\
-             1. **まず自動で現状診断**：`{index}` と `{suggested_doc}` を必要時に読み、上記 CLI で `status --json` / `net doctor --json` / `logs tail --lines 50 --json` を実行して現状を把握すること。\n\
-             2. **そのまま一気通貫で設定・反映**：購読/ノード取り込み、無干渉速度テストでの最速ゴールデンノード選定、スマートグループ構築、国内高速化設定、および `config reload --json` によるホットリロード検証まで都度確認せず自律完了してよい。\n\
-             3. **高リスク操作のみ事前確認**：購読・設定の破壊的削除やリモート SSH サーバー構築/鍵ローテーションの前だけ必ず確認を取ること。\n\
-             4. **秘密保護レッドライン**：平文パスワード・UUID・トークン・秘密鍵・購読 URL・未マスク中継 IP を絶対に出力・復唱しないこと。\n\n\
+             1. **まず自動で現状診断**：`{index}` と `{suggested_doc}` を必要時に読み、上記 CLI で `status --json` / `config validate --json` / `net doctor --json` / `logs tail --lines 50 --json` を実行して現状を把握すること。\n\
+             2. **そのまま一気通貫で設定・反映**：購読/ノード取り込み、速度テスト、スマートグループ構築、残留ルール修復（`config repair-rules`）、国内高速化設定、`config reload --json` 反映まで自律完了してよい。\n\
+             3. **不具合なら脱敏 Issue 作成を支援**：ソフトウェア側の不具合と判断した場合は脱敏済みの再現報告を作成し、確認のうえで `JuryBu/CatCloud` への GitHub Issue 提出を支援すること。\n\
+             4. **高リスク操作の事前確認と秘密保護**：破壊的削除・SSH 構築・Issue 公開送信前は確認し、平文パスワード・UUID・トークン・秘密鍵・購読 URL・未マスク中継 IP は絶対に出力しないこと。\n\n\
              すぐ現状診断から始め、必要な設定と反映を完了したうえで分かりやすい日本語で検証結果を報告してください。",
+            lang_lock_line(norm)
+        ),
+        ("ja", AgentPromptMode::TroubleshootIssue) => format!(
+            "{}\n\n\
+             あなたは私のローカル CatCloud 障害診断・フィードバック支援 AI エージェントです。以下の実インスタンスで発生した問題を調査し、設定起因なら修復、ソフト不具合なら `JuryBu/CatCloud` 向け脱敏 Issue を作成してください：\n\
+             - CLI 実行ファイル：`{cli}`\n\
+             - データディレクトリ引数：`--data-dir \"{data}\"`（常に `--json` を付与）\n\
+             - マニュアル目次：`{index}`（`00-general-troubleshooting.md` を参照、現在画面：**{page_label}**）\n\n\
+             手順：\n\
+             1. `status --json`、`config validate --json`、`net doctor --json`、`logs tail --lines 80 --since 30m --json` で読み取り専用診断を行う。\n\
+             2. 残留ルール（`unknown_rule_target`）等の設定起因なら `config repair-rules` と `config reload --json` で修復して検証する。\n\
+             3. ソフト不具合なら秘密情報を完全除去した再現手順・診断要約を作成し、同意を得たうえで `gh issue create --repo JuryBu/CatCloud` または貼付用 Markdown を提示する。\n\
+             4. 平文パスワード・UUID・トークン・秘密鍵・購読 URL・未マスク IP は絶対に含めないこと。\n\n\
+             すぐ診断を開始し、原因と対処を分かりやすく報告してください。",
             lang_lock_line(norm)
         ),
         ("ja", AgentPromptMode::Readonly) => format!(
@@ -2053,11 +2085,25 @@ pub fn render_agent_bootstrap_prompt_with_mode(
              - Флаг каталога данных: `--data-dir \"{data}\"` (всегда добавляй `--json`)\n\
              - Индекс локальной документации: `{index}` (текущий экран: **{page_label}**, рекомендуемая глава: `{suggested_doc}`)\n\n\
              Полномочия автонастройки:\n\
-             1. **Автодиагностика**: прочитай `{index}` и `{suggested_doc}`, затем проверь состояние через `status --json`, `net doctor --json`, `logs tail --lines 50 --json`.\n\
-             2. **Выполнение под ключ**: тебе разрешено самостоятельно импортировать подписки/узлы, запустить тесты скорости и отобрать лучшие золотые узлы, создать и настроить «Умные группы», подключить «Ускорение 443» и применить изменения через `config reload --json` без лишних остановок.\n\
-             3. **Подтверждение только для рисков**: спрашивай согласие только перед необратимым удалением подписок/данных или удалённым SSH-развёртыванием/ротацией ключей.\n\
-             4. **Запрет утечки секретов**: никогда не выводи и не повторяй открытые пароли, UUID, токены, приватные ключи, ссылки подписок и немаскированные IP.\n\n\
+             1. **Автодиагностика**: прочитай `{index}` и `{suggested_doc}`, затем проверь состояние через `status --json`, `config validate --json`, `net doctor --json`, `logs tail --lines 50 --json`.\n\
+             2. **Выполнение под ключ**: импортируй подписки/узлы, отбирай золотые узлы, настраивай «Умные группы», очищай битые правила (`config repair-rules`), подключай «Ускорение 443» и применяй через `config reload --json`.\n\
+             3. **Диагностика и помощь с Issue**: если обнаружена реальная ошибка самого CatCloud, подготовь очищенный от секретов отчёт и (с моего согласия) помоги создать GitHub Issue в `JuryBu/CatCloud`.\n\
+             4. **Риски и запрет утечки секретов**: спрашивай перед удалением подписок, SSH-деплоем или публикацией Issue; никогда не выводи пароли, UUID, токены, ключи, ссылки подписок и немаскированные IP.\n\n\
              Сразу начни с диагностики, выполни настройку и дай краткий понятный отчёт о проверке.",
+            lang_lock_line(norm)
+        ),
+        ("ru", AgentPromptMode::TroubleshootIssue) => format!(
+            "{}\n\n\
+             Ты мой локальный AI-агент диагностики и обратной связи CatCloud. Проверь сбой в этом экземпляре, почини безопасные ошибки конфигурации или подготовь очищенный GitHub Issue для `JuryBu/CatCloud`:\n\
+             - Исполняемый CLI: `{cli}`\n\
+             - Флаг каталога данных: `--data-dir \"{data}\"` (всегда с `--json`)\n\
+             - Документация: `{index}` (начни с `00-general-troubleshooting.md`; экран: **{page_label}**)\n\n\
+             Порядок действий:\n\
+             1. Выполни `status --json`, `config validate --json`, `net doctor --json`, `logs tail --lines 80 --since 30m --json`.\n\
+             2. Если найдены висячие правила (`unknown_rule_target`) или простая ошибка конфигурации — исправь через `config repair-rules` и `config reload --json`.\n\
+             3. Если это баг CatCloud — составь краткий отчёт без секретов и после моего согласия отправь через `gh issue create --repo JuryBu/CatCloud` (или дай готовый Markdown).\n\
+             4. Строго без паролей, UUID, токенов, ключей, ссылок подписок и немаскированных IP.\n\n\
+             Начинай диагностику и коротко объясни причину.",
             lang_lock_line(norm)
         ),
         ("ru", AgentPromptMode::Readonly) => format!(
@@ -2081,11 +2127,25 @@ pub fn render_agent_bootstrap_prompt_with_mode(
              - 实例数据目录参数：`--data-dir \"{data}\"`（所有命令统一加 `--json`）\n\
              - 随装权威手册总目录：`{index}`（当前所在页面：**{page_label}**，推荐优先读 `{suggested_doc}`）\n\n\
              全权代办授权：\n\
-             1. **自动先体检现状**：按需读取 `{index}` 与 `{suggested_doc}`，立即使用上面的精确 CLI 路径和 `--data-dir` 跑 `status --json`、`net doctor --json`、`logs tail --lines 50 --json` 摸清现状。\n\
-             2. **直接端到端帮我配好并热载生效**：无需每一步都反复打断问我——可直接帮我导入提供的订阅/节点（或只读迁移本机已有软件）、跑零干扰测速挑出最快黄金节点、建好并调优「智能多选组」防断流、按需配置「国内提速」，并执行 `config reload --json` 热载验收。\n\
-             3. **仅高风险操作前再确认**：只有涉及不可逆删除（删订阅/清配置）或远程 SSH 服务器部署/轮换密钥前，才先向我确认。\n\
-             4. **严守脱敏红线**：保持默认脱敏输出；严禁在对话、摘要或 Issue 中打印、复述任何明文密码、UUID、Token、私钥、订阅原链接或未脱敏中转 IP。\n\n\
+             1. **自动先体检现状**：按需读取 `{index}` 与 `{suggested_doc}`，立即使用上面的精确 CLI 路径和 `--data-dir` 跑 `status --json`、`config validate --json`、`net doctor --json`、`logs tail --lines 50 --json` 摸清现状。\n\
+             2. **直接端到端帮我配好并热载生效**：无需每一步都反复打断问我——可直接帮我导入提供的订阅/节点（或只读迁移本机已有软件）、跑零干扰测速挑出最快黄金节点、建好并调优「智能多选组」、修复悬空失效分流规则（`config repair-rules`）、按需配置「国内提速」，并执行 `config reload --json` 免重启热切验收。\n\
+             3. **排查异常并协助反馈软件 Bug**：如果发现是猫猫云梯软件本身的缺陷，请整理一份完全脱敏的复现步骤与诊断摘要，经我确认后可用本机 `gh` 直接帮我向 `JuryBu/CatCloud` 提交 GitHub Issue（或给出可直接粘贴的反馈稿）。\n\
+             4. **仅高风险操作前再确认 & 严守脱敏红线**：只有涉及不可逆删除、远程 SSH 部署/改密、或对外公开发布 GitHub Issue 前才向我确认；严禁在对话、摘要或 Issue 中打印、复述任何明文密码、UUID、Token、私钥、订阅原链接或未脱敏中转 IP。\n\n\
              请直接开始体检现状并替我推进配置，完成后用简洁大白话告诉我验收结果和还缺什么资料。",
+            lang_lock_line(norm)
+        ),
+        (_, AgentPromptMode::TroubleshootIssue) => format!(
+            "{}\n\n\
+             请你作为我的本机猫猫云梯（CatCloud）排障与反馈 AI 助手（Codex / Claude Code / Antigravity），帮我查清当前实例遇到的问题——能直接修好的配置问题直接帮我修好，如果是软件本身的 Bug 请直接帮我整理并提交脱敏 GitHub Issue：\n\
+             - CLI 绝对路径：`{cli}`\n\
+             - 实例数据目录参数：`--data-dir \"{data}\"`（所有命令统一加 `--json`）\n\
+             - 排障权威手册：`{index}`（优先读 `00-general-troubleshooting.md`；当前页面：**{page_label}**）\n\n\
+             排障与反馈步骤：\n\
+             1. **先做只读听诊**：立刻运行 `status --json`、`config validate --json`、`net doctor --json` 和 `logs tail --lines 80 --since 30m --json` 定位具体报错与根因。\n\
+             2. **常见配置异常直接自愈**：若发现悬空分流规则（`unknown_rule_target`）等可安全修复的配置问题，请先说明原因并用 `config repair-rules --mode remove --json`（或 `--mode rewrite`）+ `config reload --json` 帮我直接修好验证。\n\
+             3. **确认是软件 Bug 则帮提脱敏 Issue**：若排查后确属猫猫云梯软件缺陷，请整理结构化、零隐私泄露的复现步骤、环境信息与关键日志摘要；经我确认后，若本机已登录 `gh` 可直接执行 `gh issue create --repo JuryBu/CatCloud` 代为提交，否则给我可直接粘贴的 Markdown 与预填链接。\n\
+             4. **严守脱敏红线**：绝不在对话或 Issue 中包含任何明文密码、UUID、Token、私钥、订阅链接或未脱敏中转 IP。\n\n\
+             请立即开始排查，并用大白话告诉我问题出在哪、怎么修或是否需要提交 Issue。",
             lang_lock_line(norm)
         ),
         (_, AgentPromptMode::Readonly) => format!(

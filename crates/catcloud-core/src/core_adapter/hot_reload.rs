@@ -656,16 +656,17 @@ impl HotReloadCoordinator {
 
         // 6. Static anti-loop and syntax pre-flight gate: reject before touching active runtime.yaml.
         if !compiled.validation.ok {
-            let summary = compiled
-                .validation
-                .errors()
-                .iter()
-                .map(|i| format!("[{}] {}", i.code, i.message))
-                .collect::<Vec<_>>()
-                .join("; ");
+            let fallback_hint = super::resolve_default_fallback_group_name(
+                &effective_cfg,
+                &snapshot.groups,
+            );
+            let summary = super::format_static_validation_summary_zh(
+                &compiled.validation,
+                Some(&fallback_hint),
+            );
             return rejected_outcome(
                 level,
-                format!("static anti-loop/config pre-flight rejected reload: {summary}"),
+                format!("代理配置静态预检未通过：{summary}"),
             );
         }
 
@@ -756,18 +757,17 @@ impl HotReloadCoordinator {
                     }
                 }
                 if !compiled.validation.ok {
-                    let summary = compiled
-                        .validation
-                        .errors()
-                        .iter()
-                        .map(|i| format!("[{}] {}", i.code, i.message))
-                        .collect::<Vec<_>>()
-                        .join("; ");
+                    let fallback_hint = super::resolve_default_fallback_group_name(
+                        &effective_cfg,
+                        &snapshot.groups,
+                    );
+                    let summary = super::format_static_validation_summary_zh(
+                        &compiled.validation,
+                        Some(&fallback_hint),
+                    );
                     return rejected_outcome(
                         ReloadLevel::L3CoreRestart,
-                        format!(
-                            "static anti-loop/config pre-flight rejected L3 MTU reload: {summary}"
-                        ),
+                        format!("代理配置静态预检未通过（L3 MTU 重载）：{summary}"),
                     );
                 }
                 compiled_tun_is_enabled = compiled_tun_enabled(&compiled.value);

@@ -568,47 +568,272 @@ pub fn import_migration_preview(
     })
 }
 
-/// Merge migrated prepend/append rules into `AppConfig.rules_override` without duplicating
-/// or overwriting existing user-defined rules. Returns `(added_prepend, added_append)`.
-pub fn apply_migration_rules_to_config(
+/// Policy for handling migrated rules whose target references a proxy/group not present in CatCloud.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MigrationDanglingRulePolicy {
+    /// Drop rules targeting non-existent third-party groups (safe default; keeps `DIRECT`/`REJECT`/valid groups).
+    Drop,
+    /// Rewrite dangling rule targets to the specified existing CatCloud group name.
+    RewriteTo(String),
+}
+
+/// Structured summary of migrated rule sanitization, persistence, and subscription binding.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationRuleApplyOutcome {
+    pub added_prepend: usize,
+    pub added_append: usize,
+    pub dropped_dangling_count: usize,
+    pub rewritten_dangling_count: usize,
+    pub dropped_targets: Vec<(String, usize)>,
+}
+
+/// Sanitize and merge migrated prepend/append rules into `AppConfig.rules_override` while
+/// recording per-subscription ownership (`subscription_rule_bindings`) so deleting that
+/// subscription cleanly cascades and removes the rules it brought in.
+pub fn apply_migration_rules_for_subscription(
     cfg: &mut AppConfig,
-    preview: &MigrationPreview,
-) -> (usize, usize) {
-    let mut added_prepend = 0usize;
+    sub_id: &str,
+    prepend_rules: &[String],
+    append_rules: &[String],
+    groups: &[crate::models::MultiGroup],
+    nodes: &[ProxyNode],
+    policy: MigrationDanglingRulePolicy,
+) -> MigrationRuleApplyOutcome {
+    use crate::core_adapter::{
+        collect_valid_rule_target_names, extract_mihomo_rule_target, rewrite_mihomo_rule_target,
+    };
+    use std::collections::BTreeMap;
+
+    let valid_targets = collect_valid_rule_target_names(groups, nodes);
+    let mut outcome = MigrationRuleApplyOutcome::default();
+    let mut dropped_by_target: BTreeMap<String, usize> = BTreeMap::new();
+
     let mut existing_prepend: HashSet<String> = cfg
         .rules_override
         .global_prepend_rules
         .iter()
         .map(|r| r.trim().to_string())
         .collect();
-    for rule in &preview.prepend_rules {
-        let trimmed = rule.trim();
-        if !trimmed.is_empty() && existing_prepend.insert(trimmed.to_string()) {
-            cfg.rules_override
-                .global_prepend_rules
-                .push(trimmed.to_string());
-            added_prepend += 1;
-        }
-    }
-
-    let mut added_append = 0usize;
     let mut existing_append: HashSet<String> = cfg
         .rules_override
         .global_append_rules
         .iter()
         .map(|r| r.trim().to_string())
         .collect();
-    for rule in &preview.append_rules {
-        let trimmed = rule.trim();
-        if !trimmed.is_empty() && existing_append.insert(trimmed.to_string()) {
-            cfg.rules_override
-                .global_append_rules
-                .push(trimmed.to_string());
-            added_append += 1;
+
+    let mut bound_prepend: Vec<String> = Vec::new();
+    let mut bound_append: Vec<String> = Vec::new();
+
+    let mut sanitize_one = |raw: &str| -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            return None;
+        }
+        let upper = trimmed.to_ascii_uppercase();
+        if upper == "MATCH" || upper.starts_with("MATCH,") {
+            return None;
+        }
+        if let Some(target) = extract_mihomo_rule_target(trimmed) {
+            if !valid_targets.contains(target) {
+                match &policy {
+                    MigrationDanglingRulePolicy::Drop => {
+                        outcome.dropped_dangling_count += 1;
+                        *dropped_by_target.entry(target.to_string()).or_insert(0) += 1;
+                        return None;
+                    }
+                    MigrationDanglingRulePolicy::RewriteTo(dest) => {
+                        let dest_trimmed = dest.trim();
+                        if dest_trimmed.is_empty() {
+                            outcome.dropped_dangling_count += 1;
+                            *dropped_by_target.entry(target.to_string()).or_insert(0) += 1;
+                            return None;
+                        }
+                        if let Some(rebuilt) = rewrite_mihomo_rule_target(trimmed, dest_trimmed) {
+                            outcome.rewritten_dangling_count += 1;
+                            return Some(rebuilt);
+                        }
+                        outcome.dropped_dangling_count += 1;
+                        *dropped_by_target.entry(target.to_string()).or_insert(0) += 1;
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(trimmed.to_string())
+    };
+
+    for raw in prepend_rules {
+        if let Some(cleaned) = sanitize_one(raw) {
+            if existing_prepend.insert(cleaned.clone()) {
+                cfg.rules_override.global_prepend_rules.push(cleaned.clone());
+                outcome.added_prepend += 1;
+                bound_prepend.push(cleaned);
+            } else if !sub_id.trim().is_empty() && !bound_prepend.contains(&cleaned) {
+                // Only record provenance for rules not already user-authored if another binding owns it,
+                // or track freshly imported rules strictly.
+                let owned_by_other_sub = cfg
+                    .rules_override
+                    .subscription_rule_bindings
+                    .values()
+                    .any(|b| b.prepend_rules.iter().any(|r| r.trim() == cleaned));
+                if owned_by_other_sub {
+                    bound_prepend.push(cleaned);
+                }
+            }
         }
     }
 
-    (added_prepend, added_append)
+    for raw in append_rules {
+        if let Some(cleaned) = sanitize_one(raw) {
+            if existing_append.insert(cleaned.clone()) {
+                cfg.rules_override.global_append_rules.push(cleaned.clone());
+                outcome.added_append += 1;
+                bound_append.push(cleaned);
+            } else if !sub_id.trim().is_empty() && !bound_append.contains(&cleaned) {
+                let owned_by_other_sub = cfg
+                    .rules_override
+                    .subscription_rule_bindings
+                    .values()
+                    .any(|b| b.append_rules.iter().any(|r| r.trim() == cleaned));
+                if owned_by_other_sub {
+                    bound_append.push(cleaned);
+                }
+            }
+        }
+    }
+
+    let trimmed_sub = sub_id.trim();
+    if !trimmed_sub.is_empty() && (!bound_prepend.is_empty() || !bound_append.is_empty()) {
+        let entry = cfg
+            .rules_override
+            .subscription_rule_bindings
+            .entry(trimmed_sub.to_string())
+            .or_default();
+        for r in bound_prepend {
+            if !entry.prepend_rules.contains(&r) {
+                entry.prepend_rules.push(r);
+            }
+        }
+        for r in bound_append {
+            if !entry.append_rules.contains(&r) {
+                entry.append_rules.push(r);
+            }
+        }
+    }
+
+    let mut dropped_targets: Vec<(String, usize)> = dropped_by_target.into_iter().collect();
+    dropped_targets.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    outcome.dropped_targets = dropped_targets;
+    outcome
+}
+
+/// Cascade-delete global prepend/append rules bound exclusively to `sub_id`, preserving any rule
+/// still referenced by another surviving subscription or authored manually by the user.
+pub fn remove_subscription_migrated_rules(cfg: &mut AppConfig, sub_id: &str) -> usize {
+    let key = sub_id.trim();
+    if key.is_empty() {
+        return 0;
+    }
+    let Some(removed_binding) = cfg
+        .rules_override
+        .subscription_rule_bindings
+        .remove(key)
+    else {
+        return 0;
+    };
+
+    let still_owned_prepend: HashSet<String> = cfg
+        .rules_override
+        .subscription_rule_bindings
+        .values()
+        .flat_map(|b| b.prepend_rules.iter().map(|r| r.trim().to_string()))
+        .collect();
+    let still_owned_append: HashSet<String> = cfg
+        .rules_override
+        .subscription_rule_bindings
+        .values()
+        .flat_map(|b| b.append_rules.iter().map(|r| r.trim().to_string()))
+        .collect();
+
+    let drop_prepend: HashSet<String> = removed_binding
+        .prepend_rules
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty() && !still_owned_prepend.contains(r))
+        .collect();
+    let drop_append: HashSet<String> = removed_binding
+        .append_rules
+        .into_iter()
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty() && !still_owned_append.contains(r))
+        .collect();
+
+    let before_pre = cfg.rules_override.global_prepend_rules.len();
+    cfg.rules_override
+        .global_prepend_rules
+        .retain(|r| !drop_prepend.contains(r.trim()));
+    let before_app = cfg.rules_override.global_append_rules.len();
+    cfg.rules_override
+        .global_append_rules
+        .retain(|r| !drop_append.contains(r.trim()));
+
+    (before_pre - cfg.rules_override.global_prepend_rules.len())
+        + (before_app - cfg.rules_override.global_append_rules.len())
+}
+
+/// Transfer migrated rule provenance from `source_sub_id` to `target_sub_id` when merging
+/// subscriptions so a future delete of `target_sub_id` still cascades cleanly.
+pub fn merge_subscription_migrated_rules(
+    cfg: &mut AppConfig,
+    source_sub_id: &str,
+    target_sub_id: &str,
+) -> bool {
+    let src = source_sub_id.trim();
+    let dst = target_sub_id.trim();
+    if src.is_empty() || dst.is_empty() || src == dst {
+        return false;
+    }
+    let Some(src_binding) = cfg
+        .rules_override
+        .subscription_rule_bindings
+        .remove(src)
+    else {
+        return false;
+    };
+    let dst_binding = cfg
+        .rules_override
+        .subscription_rule_bindings
+        .entry(dst.to_string())
+        .or_default();
+    for r in src_binding.prepend_rules {
+        if !dst_binding.prepend_rules.contains(&r) {
+            dst_binding.prepend_rules.push(r);
+        }
+    }
+    for r in src_binding.append_rules {
+        if !dst_binding.append_rules.contains(&r) {
+            dst_binding.append_rules.push(r);
+        }
+    }
+    true
+}
+
+/// Merge migrated prepend/append rules into `AppConfig.rules_override` without duplicating
+/// or overwriting existing user-defined rules. Returns `(added_prepend, added_append)`.
+pub fn apply_migration_rules_to_config(
+    cfg: &mut AppConfig,
+    preview: &MigrationPreview,
+) -> (usize, usize) {
+    let outcome = apply_migration_rules_for_subscription(
+        cfg,
+        "",
+        &preview.prepend_rules,
+        &preview.append_rules,
+        &[],
+        &preview.nodes,
+        MigrationDanglingRulePolicy::Drop,
+    );
+    (outcome.added_prepend, outcome.added_append)
 }
 
 // ============================================================================
@@ -1778,5 +2003,169 @@ items:
         assert_ne!(id1, id2);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn issue4_dirty_clash_migration_filters_dangling_rules_cascades_delete_and_repairs_legacy() {
+        use crate::core_adapter::{
+            CompileInput, CoreAllocatedPorts, DanglingRuleRepairAction,
+            audit_dangling_global_rules, compile_mihomo_config,
+            format_static_validation_summary_zh, repair_dangling_global_rules,
+        };
+        use crate::models::ProxyMode;
+
+        // Build a dirty third-party Clash YAML replicating Issue #4:
+        // 74 DIRECT rules + 165 rules targeting non-existent third-party group "节点列表" + MATCH
+        let mut yaml = String::from(
+            "proxies:\n  - name: Dirty-HK-01\n    type: ss\n    server: 198.51.100.10\n    port: 443\n    cipher: aes-128-gcm\n    password: demo\nproxy-groups:\n  - name: 节点列表\n    type: select\n    proxies: [Dirty-HK-01]\nrules:\n",
+        );
+        for i in 0..74 {
+            yaml.push_str(&format!("  - DOMAIN-SUFFIX,cn-site-{i}.cn,DIRECT\n"));
+        }
+        for i in 0..165 {
+            yaml.push_str(&format!("  - DOMAIN-SUFFIX,ai-site-{i}.example.com,节点列表\n"));
+        }
+        yaml.push_str("  - MATCH,节点列表\n");
+
+        let preview = preview_from_text(&yaml).expect("parse dirty clash yaml");
+        assert_eq!(preview.nodes.len(), 1);
+        assert_eq!(preview.prepend_rules.len() + preview.append_rules.len(), 239);
+
+        let mut storage = Storage::open_in_memory().expect("in-memory db");
+        let rep = import_migration_preview(
+            &mut storage,
+            &preview,
+            &MigrationImportOptions::new("sub-dirty-1", "Dirty Old Client"),
+        )
+        .expect("import dirty preview");
+        assert_eq!(rep.imported_node_count, 1);
+        let _ = storage.ensure_default_group_if_empty().expect("default group");
+
+        let mut cfg = AppConfig::default();
+        cfg.proxy_mode = ProxyMode::Global;
+        // User also has 1 hand-authored rule that MUST survive deleting the migrated sub.
+        cfg.rules_override
+            .global_append_rules
+            .push("DOMAIN-SUFFIX,hand-authored.example.org,DIRECT".to_string());
+
+        let groups = storage.list_multi_groups().unwrap();
+        let nodes = storage.list_nodes().unwrap();
+        let rule_out = apply_migration_rules_for_subscription(
+            &mut cfg,
+            "sub-dirty-1",
+            &preview.prepend_rules,
+            &preview.append_rules,
+            &groups,
+            &nodes,
+            MigrationDanglingRulePolicy::Drop,
+        );
+        assert_eq!(rule_out.dropped_dangling_count, 165);
+        assert_eq!(rule_out.added_prepend + rule_out.added_append, 74);
+        assert_eq!(rule_out.dropped_targets, vec![("节点列表".to_string(), 165)]);
+
+        // Immediately compiles cleanly with 0 unknown_rule_target!
+        let ports = CoreAllocatedPorts {
+            bind_host: "127.0.0.1".to_string(),
+            mixed_port: 17890,
+            controller_port: 19090,
+            dns_port: 11053,
+            shifted: Vec::new(),
+        };
+        let empty_filter = HashMap::new();
+        let compiled_ok = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &[],
+            controller_secret: "test-secret",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty_filter,
+        })
+        .expect("compile after sanitized migration");
+        assert!(
+            compiled_ok.validation.ok,
+            "sanitized migration must pass static validation: {:?}",
+            compiled_ok.validation.issues
+        );
+
+        // Deleting the subscription cascades cleanly and removes all 74 migrated rules
+        // while keeping the user's hand-authored rule intact.
+        assert!(storage.delete_subscription("sub-dirty-1").unwrap());
+        let removed_rules = remove_subscription_migrated_rules(&mut cfg, "sub-dirty-1");
+        assert_eq!(removed_rules, 74);
+        assert_eq!(
+            cfg.rules_override.global_append_rules,
+            vec!["DOMAIN-SUFFIX,hand-authored.example.org,DIRECT".to_string()]
+        );
+        assert!(cfg.rules_override.subscription_rule_bindings.is_empty());
+
+        // Legacy v0.1.1 dirty config self-healing test: simulate 165 pre-existing dangling rules
+        let mut legacy_cfg = AppConfig::default();
+        legacy_cfg.proxy_mode = ProxyMode::Global;
+        for i in 0..165 {
+            legacy_cfg
+                .rules_override
+                .global_append_rules
+                .push(format!("DOMAIN-SUFFIX,legacy-{i}.example.com,节点列表"));
+        }
+        let audit = audit_dangling_global_rules(&legacy_cfg, &groups, &nodes);
+        assert_eq!(audit.total_dangling, 165);
+        assert_eq!(audit.groups.len(), 1);
+        assert_eq!(audit.groups[0].target, "节点列表");
+        assert_eq!(audit.groups[0].count, 165);
+
+        let compiled_bad = compile_mihomo_config(&CompileInput {
+            config: &legacy_cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &[],
+            controller_secret: "test-secret",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty_filter,
+        })
+        .expect("compile legacy dirty config");
+        assert!(!compiled_bad.validation.ok);
+        let summary_zh =
+            format_static_validation_summary_zh(&compiled_bad.validation, Some(&audit.default_fallback_group));
+        assert!(
+            summary_zh.contains("165 条") && summary_zh.contains("节点列表") && summary_zh.len() < 300,
+            "summary must aggregate 165 errors into concise zh-CN message, got: {summary_zh}"
+        );
+
+        // Test RewriteToGroup repair mode
+        let mut rewrite_cfg = legacy_cfg.clone();
+        let rw_rep = repair_dangling_global_rules(
+            &mut rewrite_cfg,
+            &groups,
+            &nodes,
+            DanglingRuleRepairAction::RewriteToGroup {
+                target_group: audit.default_fallback_group.clone(),
+            },
+            None,
+        );
+        assert_eq!(rw_rep.rewritten_count, 165);
+        assert_eq!(rw_rep.removed_count, 0);
+        assert_eq!(
+            audit_dangling_global_rules(&rewrite_cfg, &groups, &nodes).total_dangling,
+            0
+        );
+
+        // Test Remove repair mode
+        let rm_rep = repair_dangling_global_rules(
+            &mut legacy_cfg,
+            &groups,
+            &nodes,
+            DanglingRuleRepairAction::Remove,
+            None,
+        );
+        assert_eq!(rm_rep.removed_count, 165);
+        assert_eq!(
+            audit_dangling_global_rules(&legacy_cfg, &groups, &nodes).total_dangling,
+            0
+        );
     }
 }

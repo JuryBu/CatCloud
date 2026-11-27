@@ -23,11 +23,17 @@ pub use binary_resolver::{
 };
 pub use config_compiler::{
     CompileInput, CompileStats, CompiledCoreConfig, CompiledGroupMapping,
-    DEFAULT_FALLBACK_GROUP_NAME, MAX_YAML_BYTES, PREACCEL_FALLBACK_GROUP_NAME,
+    DEFAULT_FALLBACK_GROUP_NAME, DanglingRuleGroupSummary, DanglingRuleRepairAction,
+    DanglingRuleRepairReport, DanglingRulesAudit, MAX_YAML_BYTES, PREACCEL_FALLBACK_GROUP_NAME,
     PREACCEL_SELECT_GROUP_NAME, SINGLE_NODE_GROUP_NAME, StaticCheckIssue, StaticCheckSeverity,
-    StaticValidationReport, apply_yaml_merge_patch, build_default_ai_routing_rules,
-    compile_mihomo_config, compile_mihomo_config_with_runtime_dir, expand_group_match_rule,
-    redact_compiled_yaml_for_preview, sanitize_business_node_transport, validate_compiled_yaml,
+    StaticValidationReport, apply_yaml_merge_patch, audit_dangling_global_rules,
+    build_default_ai_routing_rules, cascade_group_name_change_in_global_rules,
+    collect_valid_rule_target_names, compile_mihomo_config,
+    compile_mihomo_config_with_runtime_dir, expand_group_match_rule, extract_mihomo_rule_target,
+    format_static_validation_summary_zh, is_builtin_mihomo_rule_target,
+    redact_compiled_yaml_for_preview, repair_dangling_global_rules,
+    resolve_default_fallback_group_name, rewrite_mihomo_rule_target,
+    sanitize_business_node_transport, validate_compiled_yaml,
 };
 pub use dns_diag::{
     DNS_TLS_CATEGORY, DNS_TLS_STATUS_CERT_FAILED, DNS_TLS_STATUS_DEGRADED_RECOVERED,

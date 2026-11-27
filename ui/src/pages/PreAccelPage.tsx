@@ -1181,13 +1181,8 @@ export function PreAccelPage() {
       await catcloudApi.saveExtendedSettings({
         preaccel: { campus_portal_guard: next },
       });
-      appActions.syncConfig({
-        ...config,
-        preaccel: {
-          ...config.preaccel,
-          campus_portal_guard: next,
-        },
-      });
+      const freshCfg = await catcloudApi.getConfig();
+      appActions.syncConfig(freshCfg);
       appActions.showToast(
         next ? "已开启校园网登录页自动放行" : "已关闭校园网登录页自动放行",
         "ok"

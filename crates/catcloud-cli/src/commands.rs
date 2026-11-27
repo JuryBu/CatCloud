@@ -2,11 +2,13 @@ use anyhow::{Context, Result};
 use catcloud_core::agent_docs;
 use catcloud_core::config::{self, ConfigValidationIssue, ValidationSeverity};
 use catcloud_core::core_adapter::config_compiler::{
-    CompileInput, DEFAULT_FALLBACK_GROUP_NAME, GatewayExportOptions, GatewayExportOutput,
-    GatewayExportProfile, PREACCEL_SELECT_GROUP_NAME, PreAccelTransportDiagnostics,
-    SINGLE_NODE_GROUP_NAME, StaticCheckIssue, StaticValidationReport,
-    build_preaccel_transport_diagnostics, compile_mihomo_config_with_runtime_dir,
-    export_gateway_yaml, validate_compiled_yaml,
+    CompileInput, DEFAULT_FALLBACK_GROUP_NAME, DanglingRuleRepairAction, GatewayExportOptions,
+    GatewayExportOutput, GatewayExportProfile, PREACCEL_SELECT_GROUP_NAME,
+    PreAccelTransportDiagnostics, SINGLE_NODE_GROUP_NAME, StaticCheckIssue,
+    StaticValidationReport, audit_dangling_global_rules, build_preaccel_transport_diagnostics,
+    compile_mihomo_config_with_runtime_dir, export_gateway_yaml,
+    format_static_validation_summary_zh, repair_dangling_global_rules,
+    resolve_default_fallback_group_name, validate_compiled_yaml,
 };
 use catcloud_core::core_adapter::dns_diag::{
     DNS_TLS_STATUS_CERT_FAILED, DNS_TLS_STATUS_DEGRADED_RECOVERED, DnsTlsDiagnostics,
@@ -72,8 +74,10 @@ use catcloud_core::strategy::evaluator::evaluate_group_candidates;
 use catcloud_core::strategy::formula::validate_formula;
 use catcloud_core::strategy::health_pool::read_watchdog_state_snapshot;
 use catcloud_core::subscription::migrator::{
-    MigrationImportOptions, MigrationPreview, generate_migration_subscription_id,
-    import_migration_preview, scan_custom_path_readonly, scan_local_clients,
+    MigrationDanglingRulePolicy, MigrationImportOptions, MigrationPreview,
+    apply_migration_rules_for_subscription, generate_migration_subscription_id,
+    import_migration_preview, merge_subscription_migrated_rules,
+    remove_subscription_migrated_rules, scan_custom_path_readonly, scan_local_clients,
 };
 use catcloud_core::subscription::parser::{
     FetchOptions, apply_parsed_subscription, fetch_and_parse_subscription_with_fallback,
@@ -501,6 +505,9 @@ pub struct NodeMigrateArgs {
     pub file: Option<PathBuf>,
     #[arg(long)]
     pub apply: bool,
+    /// Also import sanitized valid routing rules (dangling third-party group targets are dropped and bound to subscription)
+    #[arg(long)]
+    pub include_rules: bool,
 }
 
 #[derive(Args, Debug)]
@@ -707,6 +714,18 @@ pub struct ReloadArgs {
 pub enum ConfigCommand {
     /// Validate config.json, compiled Mihomo YAML, and anti-loop preflight checks
     Validate,
+    /// Audit and repair dangling global rules targeting non-existent proxy groups
+    RepairRules {
+        /// Repair strategy: remove | rewrite
+        #[arg(long, default_value = "remove")]
+        mode: String,
+        /// Target existing group name when `--mode rewrite` (defaults to active/first group)
+        #[arg(long)]
+        target: Option<String>,
+        /// Preview affected rules without writing config.json or reloading
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Validate, write runtime.yaml (with mihomo -t when available), and hot-reload live instance
     Reload(ReloadArgs),
     /// Print or export compiled Mihomo YAML (redacted by default)
@@ -1056,7 +1075,11 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 };
                 if args.apply {
                     let mut db = open_storage(paths)?;
+                    let mut cfg = config::load_or_init(paths)?;
+                    let mut cfg_dirty = false;
                     let mut reports = Vec::new();
+                    let mut total_saved_rules = 0usize;
+                    let mut total_dropped_dangling = 0usize;
                     for p in &previews {
                         if !p.nodes.is_empty() {
                             let sub_id = generate_migration_subscription_id();
@@ -1079,8 +1102,30 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             let mut rep = import_migration_preview(
                                 &mut db,
                                 p,
-                                &MigrationImportOptions::new(sub_id, sub_name),
+                                &MigrationImportOptions::new(sub_id.clone(), sub_name),
                             )?;
+                            let _ = db.ensure_default_group_if_empty()?;
+                            if args.include_rules
+                                && (!p.prepend_rules.is_empty() || !p.append_rules.is_empty())
+                            {
+                                let all_groups = db.list_multi_groups()?;
+                                let all_nodes = db.list_nodes()?;
+                                let rule_outcome = apply_migration_rules_for_subscription(
+                                    &mut cfg,
+                                    &sub_id,
+                                    &p.prepend_rules,
+                                    &p.append_rules,
+                                    &all_groups,
+                                    &all_nodes,
+                                    MigrationDanglingRulePolicy::Drop,
+                                );
+                                total_saved_rules +=
+                                    rule_outcome.added_prepend + rule_outcome.added_append;
+                                total_dropped_dangling += rule_outcome.dropped_dangling_count;
+                                if rule_outcome.added_prepend > 0 || rule_outcome.added_append > 0 {
+                                    cfg_dirty = true;
+                                }
+                            }
                             rep.warnings = rep
                                 .warnings
                                 .iter()
@@ -1088,6 +1133,9 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                                 .collect();
                             reports.push(rep);
                         }
+                    }
+                    if cfg_dirty {
+                        config::save(paths, &cfg)?;
                     }
                     drop(db);
                     let live_reload_signaled = if !reports.is_empty() {
@@ -1100,6 +1148,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         "sanitized": true,
                         "applied": true,
                         "reports": reports,
+                        "saved_rules_count": total_saved_rules,
+                        "dropped_dangling_rules_count": total_dropped_dangling,
                         "live_reload_signaled": live_reload_signaled,
                     });
                     emit_output(as_json, &out, &format!("Applied {} migration(s).", reports.len()))
@@ -1329,8 +1379,15 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     })?
                     .len();
                 let removed = db.delete_subscription(&sub_id)?;
+                let mut removed_rules = 0usize;
                 if removed {
                     let _ = sync_active_single_node_after_mutation(paths, &db, &HashMap::new())?;
+                    if let Ok(mut cfg) = config::load_or_init(paths) {
+                        removed_rules = remove_subscription_migrated_rules(&mut cfg, &sub_id);
+                        if removed_rules > 0 {
+                            config::save(paths, &cfg)?;
+                        }
+                    }
                 }
                 drop(db);
                 let live_reload_signaled = if removed {
@@ -1343,13 +1400,14 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "sub_id": sub_id,
                     "removed": removed,
                     "removed_nodes": if removed { existing_nodes } else { 0 },
+                    "removed_rules": removed_rules,
                     "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
                     &out,
                     &format!(
-                        "Subscription `{sub_id}` removed={removed} (nodes={}).",
+                        "Subscription `{sub_id}` removed={removed} (nodes={}, rules={removed_rules}).",
                         if removed { existing_nodes } else { 0 }
                     ),
                 )
@@ -1385,6 +1443,11 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let report =
                     db.merge_subscriptions(&source, &target, name.as_deref(), !no_dedup, false)?;
                 let _ = sync_active_single_node_after_mutation(paths, &db, &report.id_remap)?;
+                if let Ok(mut cfg) = config::load_or_init(paths) {
+                    if merge_subscription_migrated_rules(&mut cfg, &source, &target) {
+                        config::save(paths, &cfg)?;
+                    }
+                }
                 drop(db);
                 let live_reload_signaled =
                     signal_config_reload_for_data_dir(&paths.root_data_dir);
@@ -2328,6 +2391,61 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     anyhow::bail!("configuration validation failed");
                 }
                 Ok(())
+            }
+
+            ConfigCommand::RepairRules {
+                mode,
+                target,
+                dry_run,
+            } => {
+                let mut cfg = config::load_or_init(paths)?;
+                let db = open_storage(paths)?;
+                let groups = db.list_multi_groups()?;
+                let nodes = db.list_nodes()?;
+                drop(db);
+                let audit_before = audit_dangling_global_rules(&cfg, &groups, &nodes);
+                let action = match mode.trim().to_ascii_lowercase().as_str() {
+                    "remove" | "delete" | "clean" => DanglingRuleRepairAction::Remove,
+                    "rewrite" | "remap" => {
+                        let dest = target
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(ToOwned::to_owned)
+                            .unwrap_or_else(|| resolve_default_fallback_group_name(&cfg, &groups));
+                        DanglingRuleRepairAction::RewriteToGroup { target_group: dest }
+                    }
+                    other => anyhow::bail!(
+                        "unsupported --mode `{other}` (expected `remove` or `rewrite`)"
+                    ),
+                };
+                let report = repair_dangling_global_rules(&mut cfg, &groups, &nodes, action, None);
+                let changed = report.removed_count > 0 || report.rewritten_count > 0;
+                let mut live_reload_signaled = false;
+                if !dry_run && changed {
+                    config::save(paths, &cfg)?;
+                    live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
+                }
+                let audit_after = if dry_run {
+                    audit_before.clone()
+                } else {
+                    audit_dangling_global_rules(&cfg, &groups, &nodes)
+                };
+                let out = json!({
+                    "ok": true,
+                    "sanitized": true,
+                    "dry_run": dry_run,
+                    "changed": changed,
+                    "audit_before": audit_before,
+                    "report": report,
+                    "audit_after": audit_after,
+                    "live_reload_signaled": live_reload_signaled,
+                });
+                let human = format!(
+                    "Dangling rules repair (dry_run={dry_run}): removed={}, rewritten={}, remaining={}.",
+                    report.removed_count, report.rewritten_count, audit_after.total_dangling
+                );
+                emit_output(as_json, &out, &human)
             }
 
             ConfigCommand::Reload(args) => {
@@ -6736,12 +6854,20 @@ async fn build_config_validate_payload(paths: &AppPaths) -> Result<(bool, Value,
         },
         Some(&paths.runtime_dir),
     )?;
-    let relay_servers: Vec<String> = relays
-        .iter()
-        .filter(|r| r.enabled)
-        .map(|r| r.server.clone())
-        .collect();
+    let relay_servers: Vec<String> = if cfg.preaccel.enabled {
+        relays
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.server.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
     let static_report = validate_compiled_yaml(&compiled.yaml, &relay_servers)?;
+    let dangling_audit = audit_dangling_global_rules(&cfg, &groups, &nodes);
+    let fallback_group_hint = resolve_default_fallback_group_name(&cfg, &groups);
+    let static_summary_zh =
+        format_static_validation_summary_zh(&static_report, Some(&fallback_group_hint));
     let conflict_blocks_start = !third_party_conflicts.is_empty() && !cfg.port_guard_auto_shift;
     let ok = cfg_issues.is_empty() && static_report.ok && !conflict_blocks_start;
     let sanitized_cfg_issues = redact_config_issues(&cfg_issues);
@@ -6763,6 +6889,8 @@ async fn build_config_validate_payload(paths: &AppPaths) -> Result<(bool, Value,
         "sanitized": true,
         "config_issues": sanitized_cfg_issues,
         "static_validation": sanitized_static,
+        "static_validation_summary_zh": static_summary_zh,
+        "dangling_rules_audit": dangling_audit,
         "stats": compiled.stats,
         "ports": ports,
         "active_core_ports": active_ports.to_active_core_ports_json(),
@@ -10510,6 +10638,7 @@ mod tests {
                         scan: false,
                         file: Some(src_dir.clone()),
                         apply: true,
+                        include_rules: false,
                     }),
                 },
             )
@@ -14195,6 +14324,160 @@ mod tests {
         .await
         .expect("enabling preaccel with >=1 enabled relay must succeed");
         assert!(config::load_or_init(&paths).unwrap().preaccel.enabled);
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn issue4_cli_validate_skips_relay_direct_when_preaccel_off_and_repair_rules_heals_legacy() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-issue4-dirty-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        // 1. Seed a dirty third-party Clash YAML file with 10 DIRECT rules + 25 rules targeting
+        //    non-existent group "节点列表" + MATCH, plus an enabled relay while preaccel is OFF.
+        let dirty_yaml_path = temp_root.join("old_client.yaml");
+        let mut yaml = String::from(
+            "proxies:\n  - name: Dirty-SG-01\n    type: ss\n    server: 198.51.100.88\n    port: 443\n    cipher: aes-128-gcm\n    password: demo\nproxy-groups:\n  - name: 节点列表\n    type: select\n    proxies: [Dirty-SG-01]\nrules:\n",
+        );
+        for i in 0..10 {
+            yaml.push_str(&format!("  - DOMAIN-SUFFIX,cn-{i}.cn,DIRECT\n"));
+        }
+        for i in 0..25 {
+            yaml.push_str(&format!("  - DOMAIN-SUFFIX,app-{i}.example.com,节点列表\n"));
+        }
+        yaml.push_str("  - MATCH,节点列表\n");
+        std::fs::write(&dirty_yaml_path, yaml).expect("write dirty yaml");
+
+        // Add an enabled relay while cfg.preaccel.enabled == false
+        {
+            let db = open_storage(&paths).expect("open db");
+            let relay = PreAccelRelay {
+                id: "relay-off-test".to_string(),
+                name: "Disabled PreAccel Relay".to_string(),
+                provider: "aliyun".to_string(),
+                region: "CN-SH".to_string(),
+                protocol: "anytls".to_string(),
+                server: "203.0.113.55".to_string(),
+                port: 443,
+                password: "secret-demo-password".to_string(),
+                skip_cert_verify: true,
+                enabled: true,
+                ..Default::default()
+            };
+            db.upsert_preaccel_relay(&relay).expect("upsert relay");
+        }
+        let mut cfg = config::load_or_init(&paths).expect("load cfg");
+        cfg.preaccel.enabled = false;
+        cfg.proxy_mode = ProxyMode::Global;
+        config::save(&paths, &cfg).expect("save cfg");
+
+        // 2. Migrate with --apply --include-rules: must filter the 25 dangling rules, keep 10 DIRECT,
+        //    create default group, and pass `config validate` with ZERO `missing_relay_direct_rule`!
+        dispatch(
+            &paths,
+            true,
+            Commands::Node {
+                action: NodeCommand::Migrate(NodeMigrateArgs {
+                    scan: false,
+                    file: Some(dirty_yaml_path.clone()),
+                    apply: true,
+                    include_rules: true,
+                }),
+            },
+        )
+        .await
+        .expect("migrate dirty yaml with rules");
+
+        let (ok_after_migrate, val_json, _) =
+            build_config_validate_payload(&paths).await.expect("validate after migrate");
+        assert!(
+            ok_after_migrate,
+            "config validate must pass when preaccel=false and migrated dangling rules were filtered: {val_json}"
+        );
+        let static_issues = val_json["static_validation"]["issues"]
+            .as_array()
+            .expect("issues array");
+        assert!(
+            !static_issues
+                .iter()
+                .any(|i| i["code"] == "missing_relay_direct_rule"),
+            "must not emit missing_relay_direct_rule when preaccel is disabled: {static_issues:?}"
+        );
+
+        let sub_id = {
+            let db = open_storage(&paths).unwrap();
+            assert!(!db.list_multi_groups().unwrap().is_empty());
+            db.list_subscriptions().unwrap()[0].id.clone()
+        };
+        let cfg_mid = config::load_or_init(&paths).unwrap();
+        assert_eq!(
+            cfg_mid.rules_override.global_prepend_rules.len()
+                + cfg_mid.rules_override.global_append_rules.len(),
+            10
+        );
+
+        // 3. Removing the migrated subscription cascades and cleans up all 10 imported rules.
+        dispatch(
+            &paths,
+            true,
+            Commands::Sub {
+                action: SubCommand::Remove { sub_id },
+            },
+        )
+        .await
+        .expect("remove migrated subscription");
+        let cfg_after_del = config::load_or_init(&paths).unwrap();
+        assert!(
+            cfg_after_del.rules_override.global_prepend_rules.is_empty()
+                && cfg_after_del.rules_override.global_append_rules.is_empty(),
+            "deleting migrated sub must remove its bound rules"
+        );
+
+        // 4. Simulate legacy v0.1.1 config with 25 leftover dangling rules -> validate fails with
+        //    concise Chinese summary -> `config repair-rules --mode remove` heals it to 0 dangling.
+        let mut legacy_cfg = config::load_or_init(&paths).unwrap();
+        for i in 0..25 {
+            legacy_cfg
+                .rules_override
+                .global_append_rules
+                .push(format!("DOMAIN-SUFFIX,leftover-{i}.example.com,节点列表"));
+        }
+        config::save(&paths, &legacy_cfg).unwrap();
+
+        let (ok_legacy, legacy_json, _) =
+            build_config_validate_payload(&paths).await.expect("validate legacy dirty cfg");
+        assert!(!ok_legacy);
+        assert_eq!(legacy_json["dangling_rules_audit"]["total_dangling"], 25);
+        let summary_zh = legacy_json["static_validation_summary_zh"]
+            .as_str()
+            .unwrap_or("");
+        assert!(
+            summary_zh.contains("25 条") && summary_zh.contains("节点列表"),
+            "expected concise zh summary, got: {summary_zh}"
+        );
+
+        dispatch(
+            &paths,
+            true,
+            Commands::Config {
+                action: ConfigCommand::RepairRules {
+                    mode: "remove".to_string(),
+                    target: None,
+                    dry_run: false,
+                },
+            },
+        )
+        .await
+        .expect("repair dangling rules via CLI");
+
+        let (ok_healed, _, _) =
+            build_config_validate_payload(&paths).await.expect("validate after repair");
+        assert!(ok_healed, "config validate must pass after repair-rules");
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

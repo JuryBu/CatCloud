@@ -682,6 +682,8 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::preview_migration_from_text,
             commands::apply_migration_nodes,
             commands::apply_migration_nodes_with_meta,
+            commands::audit_dangling_rules,
+            commands::repair_dangling_rules,
             commands::list_running_processes,
             commands::inspect_process_source,
             commands::list_desktop_app_candidates,

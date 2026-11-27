@@ -105,6 +105,11 @@ export function OnboardingModal() {
     appActions.openNodesWorkspace("subs", null, "share");
   };
 
+  const handleGoAiIssue = () => {
+    void appActions.closeOnboardingModal(true);
+    appActions.openAiAssistant("troubleshooting", "agent");
+  };
+
   return createPortal(
     <div
       className="fixed inset-0 z-[70] flex items-center justify-center bg-black/62 p-4 backdrop-blur-[3px]"
@@ -303,6 +308,15 @@ export function OnboardingModal() {
                     ? dict.common.copied
                     : dict.onboarding.copyWebGuideBtn}
                 </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={handleGoAiIssue}
+                className="inline-flex cursor-pointer items-center justify-center gap-1 rounded-xl border border-transparent px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line)] hover:bg-[var(--surface)] hover:text-[var(--accent)]"
+              >
+                <span>{dict.onboarding.troubleshootIssueBtn}</span>
+                <ArrowRight className="h-3.5 w-3.5 shrink-0" />
               </button>
             </div>
 

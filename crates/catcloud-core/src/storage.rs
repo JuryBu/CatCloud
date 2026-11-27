@@ -859,14 +859,29 @@ impl Storage {
                 }
             }
 
+            let mut removed_ids: HashSet<String> = HashSet::new();
             for old_id in existing_ids {
                 if !incoming_ids.contains(old_id.as_str()) {
                     tx.execute("DELETE FROM nodes WHERE id = ?1", params![old_id])?;
+                    removed_ids.insert(old_id);
                 }
             }
 
             for node in new_nodes {
                 upsert_node_with_conn(tx, node)?;
+            }
+
+            if !removed_ids.is_empty() {
+                let live_node_ids = load_all_node_ids_in_tx(tx)?;
+                let empty_remap = HashMap::new();
+                remap_multi_groups_in_tx(
+                    tx,
+                    &empty_remap,
+                    &removed_ids,
+                    None,
+                    None,
+                    Some(&live_node_ids),
+                )?;
             }
 
             Ok(new_nodes.len())
@@ -1325,9 +1340,15 @@ impl Storage {
     }
 
     pub fn delete_multi_group(&self, id: &str) -> CatResult<bool> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM multi_groups WHERE id = ?1", params![id])?;
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute("DELETE FROM multi_groups WHERE id = ?1", params![id])?;
+        if changed > 0 {
+            tx.execute(
+                "UPDATE multi_groups SET fallback_pool_id = NULL WHERE fallback_pool_id = ?1",
+                params![id],
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 
