@@ -1901,10 +1901,32 @@ pub fn signal_graceful_exit_for_data_dir(data_dir: &Path) -> bool {
 
     #[cfg(unix)]
     {
+        use std::fs::OpenOptions;
+        use std::os::unix::io::AsRawFd;
+
         let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
         let run_dir = canonical.join("run");
         let lock_path = run_dir.join("instance.lock");
-        if !lock_path.exists() {
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+            return false;
+        };
+        // Probe whether a live primary instance currently holds the exclusive flock.
+        // Because BSD flock is per-open-file-description, a fresh open returns EWOULDBLOCK
+        // while the lock is held (including from another guard inside the same process), and
+        // succeeds with 0 once release() unlocked/closed the descriptor or the process exited.
+        // SAFETY: Valid file descriptor owned by `file` for non-blocking advisory flock probe.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            // SAFETY: Immediately release probe lock; no live primary instance holds it.
+            unsafe {
+                let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+            }
+            return false;
+        }
+        let raw_os = std::io::Error::last_os_error().raw_os_error();
+        let held_by_live_instance =
+            raw_os == Some(libc::EWOULDBLOCK) || raw_os == Some(libc::EAGAIN);
+        if !held_by_live_instance {
             return false;
         }
         let signal_path = run_dir.join("graceful_exit.signal");
