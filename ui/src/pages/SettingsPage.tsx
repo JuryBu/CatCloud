@@ -409,6 +409,53 @@ function formatNameserverPolicy(policy?: Record<string, string[]>): string {
     .join("\n");
 }
 
+function stripIpv6Brackets(raw: string, fallbackHost: string): string {
+  const t = raw.trim();
+  if (!t) return fallbackHost;
+  if (t.startsWith("[") && t.endsWith("]")) {
+    return t.slice(1, -1).trim() || fallbackHost;
+  }
+  return t;
+}
+
+function splitHostPort(
+  raw: string,
+  fallbackHost = "127.0.0.1"
+): { host: string; port: number | null } {
+  const trimmed = raw.trim();
+  if (!trimmed) return { host: fallbackHost, port: null };
+  const lastColon = trimmed.lastIndexOf(":");
+  if (lastColon < 0) {
+    return { host: stripIpv6Brackets(trimmed, fallbackHost), port: null };
+  }
+  const closeBracket = trimmed.lastIndexOf("]");
+  if (closeBracket >= 0 && lastColon < closeBracket) {
+    // Bracketed IPv6 without port (e.g. "[::1]") -> normalize to bare "::1"
+    return { host: stripIpv6Brackets(trimmed, fallbackHost), port: null };
+  }
+  if (closeBracket < 0 && trimmed.indexOf(":") !== lastColon) {
+    // Unbracketed IPv6 literal without port (e.g. "::1")
+    return { host: trimmed, port: null };
+  }
+  const host = stripIpv6Brackets(trimmed.slice(0, lastColon), fallbackHost);
+  const portRaw = trimmed.slice(lastColon + 1).trim();
+  const parsedPort = portRaw ? Number(portRaw) : NaN;
+  const port =
+    Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535
+      ? parsedPort
+      : null;
+  return { host, port };
+}
+
+function formatDnsListenAddr(hostRaw: string, port: number): string {
+  const host = hostRaw.trim() || "127.0.0.1";
+  const formattedHost =
+    host.includes(":") && !host.startsWith("[") && !host.endsWith("]")
+      ? `[${host}]`
+      : host;
+  return `${formattedHost}:${port}`;
+}
+
 function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
   const dns = full.dns;
   const sp = full.system_proxy;
@@ -435,7 +482,7 @@ function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
         : DEFAULT_WEBUI_ENTRIES,
     logLevel: (full.log_level as LogLevel | undefined) ?? DEFAULT_EXTENDED.logLevel,
     overrideDns: dns?.override_dns ?? DEFAULT_EXTENDED.overrideDns,
-    dnsListen: `${dnsHost}:${dnsPort}`,
+    dnsListen: formatDnsListenAddr(dnsHost, dnsPort),
     useHosts: dns?.use_hosts ?? DEFAULT_EXTENDED.useHosts,
     useSystemHosts: dns?.use_system_hosts ?? DEFAULT_EXTENDED.useSystemHosts,
     respectRules: dns?.respect_rules ?? DEFAULT_EXTENDED.respectRules,
@@ -493,15 +540,14 @@ function buildExtendedPatch(
   ext: ExtendedSettings,
   includeAppendRules = false
 ): Record<string, unknown> {
-  const [listenHost, listenPortRaw] = ext.dnsListen.split(":");
-  const listenPort = Number(listenPortRaw);
+  const { host: listenHost, port: listenPort } = splitHostPort(ext.dnsListen);
   return {
     allow_lan: ext.allowLan,
     log_level: ext.logLevel,
     controller_secret: ext.controllerSecret.trim() ? ext.controllerSecret.trim() : null,
     webui_urls: ext.webuiUrls,
-    dns_listen_host: listenHost?.trim() || "127.0.0.1",
-    ...(Number.isFinite(listenPort) && listenPort > 0 ? { dns_listen_port: listenPort } : {}),
+    dns_listen_host: listenHost || "127.0.0.1",
+    ...(listenPort !== null ? { dns_listen_port: listenPort } : {}),
     system_proxy: {
       bypass: splitCsvOrLines(ext.bypassDomains),
       pac: {
@@ -844,8 +890,81 @@ const VALID_SETTINGS_TABS: readonly SettingsTabId[] = [
   "updates",
 ];
 
+const SETTINGS_TAB_VALIDATOR = oneOfPref(VALID_SETTINGS_TABS);
+
 function isValidSettingsTab(value: string): value is SettingsTabId {
   return (VALID_SETTINGS_TABS as readonly string[]).includes(value);
+}
+
+function NumericDraftInput({
+  value,
+  min,
+  max,
+  fallback,
+  onCommit,
+  className,
+}: {
+  value: number;
+  min?: number;
+  max?: number;
+  fallback: number;
+  onCommit: (next: number) => void;
+  className?: string;
+}) {
+  const [text, setText] = useState<string>(() => String(value));
+  const focusedRef = useRef(false);
+
+  useEffect(() => {
+    if (!focusedRef.current) {
+      setText(String(value));
+    }
+  }, [value]);
+
+  const clampValue = (n: number): number => {
+    let result = Math.round(n);
+    if (min !== undefined && result < min) result = min;
+    if (max !== undefined && result > max) result = max;
+    return result;
+  };
+
+  return (
+    <input
+      type="number"
+      min={min}
+      max={max}
+      value={text}
+      onFocus={() => {
+        focusedRef.current = true;
+      }}
+      onChange={(e) => {
+        const raw = e.target.value;
+        setText(raw);
+        const trimmed = raw.trim();
+        if (!trimmed) return;
+        const parsed = Number(trimmed);
+        if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return;
+        if (min !== undefined && parsed < min) return;
+        if (max !== undefined && parsed > max) return;
+        if (parsed !== value) {
+          onCommit(parsed);
+        }
+      }}
+      onBlur={() => {
+        focusedRef.current = false;
+        const trimmed = text.trim();
+        const parsed = trimmed ? Number(trimmed) : NaN;
+        const resolved =
+          Number.isFinite(parsed) && parsed > 0
+            ? clampValue(parsed)
+            : clampValue(Number.isFinite(value) && value > 0 ? value : fallback);
+        if (resolved !== value) {
+          onCommit(resolved);
+        }
+        setText(String(resolved));
+      }}
+      className={className}
+    />
+  );
 }
 
 interface SettingsSessionDraftCache {
@@ -929,18 +1048,18 @@ export function SettingsPage() {
     }
   }, [platformOs, setSelectedShell]);
 
-  const [tab, setTab] = useState<SettingsTabId>(() => {
-    if (settingsTabHint) return settingsTabHint;
-    if (isValidSettingsTab(savedSettingsTab)) return savedSettingsTab;
-    return "system";
-  });
+  const [tab, setTab] = usePersistedState<SettingsTabId>(
+    "settings.activeTab",
+    isValidSettingsTab(savedSettingsTab) ? savedSettingsTab : "system",
+    SETTINGS_TAB_VALIDATOR
+  );
 
   useEffect(() => {
     if (settingsTabHint) {
       setTab(settingsTabHint);
       appActions.consumeSettingsTabHint();
     }
-  }, [settingsTabHint]);
+  }, [settingsTabHint, setTab]);
 
   useEffect(() => {
     if (tab !== appStore.getState().sessionDrafts.settings.tab) {
@@ -1020,11 +1139,19 @@ export function SettingsPage() {
   const appendRulesDirtyRef = useRef(appendRulesDirty);
   appendRulesDirtyRef.current = appendRulesDirty;
   const savedExtRef = useRef<ExtendedSettings | null>(null);
+  const updateExitFallbackTimerRef = useRef<number | null>(null);
+  const clearUpdateExitFallbackTimer = () => {
+    if (updateExitFallbackTimerRef.current !== null) {
+      window.clearTimeout(updateExitFallbackTimerRef.current);
+      updateExitFallbackTimerRef.current = null;
+    }
+  };
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      clearUpdateExitFallbackTimer();
     };
   }, []);
 
@@ -1197,8 +1324,8 @@ export function SettingsPage() {
     patchDraft({ dns_listen_port: nextPort });
     if (extLoaded) {
       setExt((prev) => {
-        const host = prev.dnsListen.split(":")[0]?.trim() || "127.0.0.1";
-        return { ...prev, dnsListen: `${host}:${nextPort}` };
+        const { host } = splitHostPort(prev.dnsListen);
+        return { ...prev, dnsListen: formatDnsListenAddr(host, nextPort) };
       });
     }
   };
@@ -1209,8 +1336,8 @@ export function SettingsPage() {
       return;
     }
     patchExt("dnsListen", nextAddr);
-    const portPart = Number(nextAddr.split(":")[1]);
-    if (Number.isFinite(portPart) && portPart > 0 && portPart <= 65535) {
+    const { port: portPart } = splitHostPort(nextAddr);
+    if (portPart !== null) {
       setDraft((prev) => ({ ...prev, dns_listen_port: portPart }));
     }
   };
@@ -1446,6 +1573,7 @@ export function SettingsPage() {
 
   const handleApplyPendingUpdate = async () => {
     if (updateActionBusy !== null) return;
+    clearUpdateExitFallbackTimer();
     setUpdateActionBusy("apply");
     let exitingNow = false;
     try {
@@ -1454,6 +1582,17 @@ export function SettingsPage() {
         appActions.showToast(dict.updateModal.cancelledHint, "info");
       } else if (res.exiting) {
         exitingNow = true;
+        // Safety unlock fallback matching UpdateReadyModal: never leave buttons permanently locked if graceful exit stalls.
+        updateExitFallbackTimerRef.current = window.setTimeout(() => {
+          updateExitFallbackTimerRef.current = null;
+          if (!mountedRef.current) return;
+          setUpdateActionBusy(null);
+          appActions.showToast(
+            `${dict.updateModal.applyErrorPrefix}${res.message?.trim() || dict.updateModal.exitTimeoutFallback}`,
+            "warn",
+            5000
+          );
+        }, 12_000);
       } else if (res.started) {
         const localizedStartedHint =
           res.apply_action === "reveal_archive"
@@ -1467,7 +1606,7 @@ export function SettingsPage() {
         );
       } else {
         appActions.showToast(
-          `${dict.updateModal.applyErrorPrefix}${res.message || "unknown error"}`,
+          `${dict.updateModal.applyErrorPrefix}${res.message || dict.updateModal.unknownErrorFallback}`,
           "warn"
         );
       }
@@ -1478,7 +1617,10 @@ export function SettingsPage() {
       );
     } finally {
       if (!exitingNow) {
-        setUpdateActionBusy(null);
+        clearUpdateExitFallbackTimer();
+        if (mountedRef.current) {
+          setUpdateActionBusy(null);
+        }
       }
     }
   };
@@ -1923,15 +2065,13 @@ export function SettingsPage() {
                 />
                 <label className="rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2 text-[11px] text-[var(--muted)]">
                   检查间隔（秒）
-                  <input
-                    type="number"
+                  <NumericDraftInput
                     min={5}
                     max={300}
+                    fallback={30}
                     value={draft.proxy_guard_interval_sec}
-                    onChange={(e) =>
-                      patchDraft({
-                        proxy_guard_interval_sec: Math.max(5, Number(e.target.value) || 30),
-                      })
+                    onCommit={(nextVal) =>
+                      patchDraft({ proxy_guard_interval_sec: nextVal })
                     }
                     className={`${INPUT_CLS} mt-1 cc-mono`}
                   />
@@ -2059,34 +2199,34 @@ export function SettingsPage() {
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                 <label className="min-w-0 text-[11px] text-[var(--muted)]">
                   混合端口
-                  <input
-                    type="number"
+                  <NumericDraftInput
+                    min={1}
+                    max={65535}
+                    fallback={17890}
                     value={draft.mixed_port}
-                    onChange={(e) =>
-                      patchDraft({ mixed_port: Number(e.target.value) || 17890 })
-                    }
+                    onCommit={(nextVal) => patchDraft({ mixed_port: nextVal })}
                     className={`${INPUT_CLS} mt-1 cc-mono`}
                   />
                 </label>
                 <label className="min-w-0 text-[11px] text-[var(--muted)]">
                   控制端口
-                  <input
-                    type="number"
+                  <NumericDraftInput
+                    min={1}
+                    max={65535}
+                    fallback={19090}
                     value={draft.controller_port}
-                    onChange={(e) =>
-                      patchDraft({ controller_port: Number(e.target.value) || 19090 })
-                    }
+                    onCommit={(nextVal) => patchDraft({ controller_port: nextVal })}
                     className={`${INPUT_CLS} mt-1 cc-mono`}
                   />
                 </label>
                 <label className="min-w-0 text-[11px] text-[var(--muted)]">
                   DNS 端口
-                  <input
-                    type="number"
+                  <NumericDraftInput
+                    min={1}
+                    max={65535}
+                    fallback={11053}
                     value={draft.dns_listen_port}
-                    onChange={(e) =>
-                      handleDnsPortChange(Number(e.target.value) || 11053)
-                    }
+                    onCommit={(nextVal) => handleDnsPortChange(nextVal)}
                     className={`${INPUT_CLS} mt-1 cc-mono`}
                   />
                 </label>
@@ -3377,15 +3517,16 @@ export function SettingsPage() {
               </div>
               <label className="text-[11px] text-[var(--muted)]">
                 {dict.settings.updateIntervalLabel}
-                <input
-                  type="number"
+                <NumericDraftInput
                   min={30}
+                  max={43200}
+                  fallback={360}
                   value={draft.update.check_interval_min}
-                  onChange={(e) =>
+                  onCommit={(nextVal) =>
                     patchDraft({
                       update: {
                         ...draft.update,
-                        check_interval_min: Math.max(30, Number(e.target.value) || 360),
+                        check_interval_min: nextVal,
                       },
                     })
                   }

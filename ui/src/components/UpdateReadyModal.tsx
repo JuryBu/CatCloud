@@ -16,7 +16,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { catcloudApi, formatErrorMessage } from "../api/tauri";
 import { normalizeUiLanguage, useUiDict } from "../i18n";
@@ -51,13 +51,25 @@ export function UpdateReadyModal() {
     text: string;
     showReleaseFallback?: boolean;
   } | null>(null);
+  const exitFallbackTimerRef = useRef<number | null>(null);
+
+  const clearExitFallbackTimer = () => {
+    if (exitFallbackTimerRef.current !== null) {
+      window.clearTimeout(exitFallbackTimerRef.current);
+      exitFallbackTimerRef.current = null;
+    }
+  };
 
   const targetVersion = pendingUpdate?.target_version ?? "";
   const isBusy = busyAction !== null;
 
   useEffect(() => {
+    clearExitFallbackTimer();
     setBusyAction(null);
     setInlineNotice(null);
+    return () => {
+      clearExitFallbackTimer();
+    };
   }, [targetVersion, updateModalVisible]);
 
   useEffect(() => {
@@ -156,6 +168,7 @@ export function UpdateReadyModal() {
 
   const handleApplyUpdate = async () => {
     if (isBusy) return;
+    clearExitFallbackTimer();
     setBusyAction("apply");
     setInlineNotice(null);
     let exitingNow = false;
@@ -168,6 +181,16 @@ export function UpdateReadyModal() {
         });
       } else if (res.exiting) {
         exitingNow = true;
+        // Safety unlock fallback: if graceful exit stalls unexpectedly, unlock buttons so user is never stuck.
+        exitFallbackTimerRef.current = window.setTimeout(() => {
+          exitFallbackTimerRef.current = null;
+          setBusyAction(null);
+          setInlineNotice({
+            tone: "error",
+            text: `${dict.updateModal.applyErrorPrefix}${res.message?.trim() || dict.updateModal.exitTimeoutFallback}`,
+            showReleaseFallback: true,
+          });
+        }, 12_000);
       } else if (res.started) {
         const localizedStartedHint =
           res.apply_action === "reveal_archive"
@@ -183,7 +206,7 @@ export function UpdateReadyModal() {
       } else {
         setInlineNotice({
           tone: "error",
-          text: `${dict.updateModal.applyErrorPrefix}${res.message || "unknown error"}`,
+          text: `${dict.updateModal.applyErrorPrefix}${res.message || dict.updateModal.unknownErrorFallback}`,
           showReleaseFallback: true,
         });
       }
@@ -195,6 +218,7 @@ export function UpdateReadyModal() {
       });
     } finally {
       if (!exitingNow) {
+        clearExitFallbackTimer();
         setBusyAction(null);
       }
     }

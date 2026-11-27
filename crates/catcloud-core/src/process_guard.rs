@@ -24,6 +24,17 @@ use std::os::windows::process::CommandExt;
 /// primary instance enough time to flush state and release its lock.
 pub const RESTART_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// Fixed Windows named event exposed exclusively by standard installed instances
+/// (including UAC-elevated installed instances using `--data-dir %APPDATA%\CatCloud`)
+/// so installers/uninstallers can trigger a deterministic cross-IL graceful shutdown
+/// without ever affecting portable deployments or isolated sandboxes.
+pub const INSTALLED_GRACEFUL_EXIT_EVENT_NAME: &str = r"Local\CatCloud_GracefulExit_Installed_v1";
+
+/// Format the per-`data_dir` Windows named graceful-exit event name for `instance_hash`.
+pub fn graceful_exit_event_name_for_hash(instance_hash: &str) -> String {
+    format!(r"Local\CatCloud_GracefulExit_{instance_hash}")
+}
+
 /// Compatibility alias for `JobGuard`.
 pub type ProcessGuard = JobGuard;
 
@@ -65,13 +76,17 @@ pub enum AcquireOutcome {
 /// matching `AppPaths::from_data_dir` byte-for-byte.
 pub fn compute_instance_hash(data_dir: &Path) -> CatResult<String> {
     std::fs::create_dir_all(data_dir)?;
+    Ok(compute_instance_hash_readonly(data_dir))
+}
+
+fn compute_instance_hash_readonly(data_dir: &Path) -> String {
     let canonical = crate::paths::normalize_os_path(
         &std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf()),
     );
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().to_lowercase().as_bytes());
     let digest = hex::encode(hasher.finalize());
-    Ok(digest[..8].to_string())
+    digest[..8].to_string()
 }
 
 // ============================================================================
@@ -1419,6 +1434,38 @@ unsafe extern "system" {
         security_descriptor: *mut *mut std::ffi::c_void,
         security_descriptor_size: *mut u32,
     ) -> i32;
+    fn GetSecurityInfo(
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        object_type: u32,
+        security_info: u32,
+        ppsid_owner: *mut *mut std::ffi::c_void,
+        ppsid_group: *mut *mut std::ffi::c_void,
+        pp_dacl: *mut *mut std::ffi::c_void,
+        pp_sacl: *mut *mut std::ffi::c_void,
+        pp_security_descriptor: *mut *mut std::ffi::c_void,
+    ) -> u32;
+    fn SetSecurityInfo(
+        handle: windows_sys::Win32::Foundation::HANDLE,
+        object_type: u32,
+        security_info: u32,
+        psid_owner: *mut std::ffi::c_void,
+        psid_group: *mut std::ffi::c_void,
+        p_dacl: *mut std::ffi::c_void,
+        p_sacl: *mut std::ffi::c_void,
+    ) -> u32;
+    fn GetSecurityDescriptorSacl(
+        p_security_descriptor: *mut std::ffi::c_void,
+        lpb_sacl_present: *mut i32,
+        p_sacl: *mut *mut std::ffi::c_void,
+        lpb_sacl_defaulted: *mut i32,
+    ) -> i32;
+    fn ConvertSecurityDescriptorToStringSecurityDescriptorW(
+        security_descriptor: *mut std::ffi::c_void,
+        requested_string_sd_revision: u32,
+        security_information: u32,
+        string_security_descriptor: *mut *mut u16,
+        string_security_descriptor_len: *mut u32,
+    ) -> i32;
 }
 
 #[cfg(target_os = "windows")]
@@ -1518,45 +1565,366 @@ fn create_named_mutex_with_cross_il_sd(
 }
 
 #[cfg(target_os = "windows")]
+fn query_kernel_object_label_sddl(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
+    const SE_KERNEL_OBJECT: u32 = 6;
+    const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
+    const SDDL_REVISION_1: u32 = 1;
+
+    if handle.is_null() {
+        return None;
+    }
+
+    let mut sd: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: Querying mandatory label security info for a live kernel object handle.
+    let rc = unsafe {
+        GetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 || sd.is_null() {
+        return None;
+    }
+
+    let mut wide_sddl: *mut u16 = std::ptr::null_mut();
+    let mut wide_len: u32 = 0;
+    // SAFETY: Converting the returned security descriptor's label SACL to SDDL string.
+    let ok = unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            sd,
+            SDDL_REVISION_1,
+            LABEL_SECURITY_INFORMATION,
+            &mut wide_sddl,
+            &mut wide_len,
+        )
+    };
+    let result = if ok != 0 && !wide_sddl.is_null() {
+        let mut len = 0usize;
+        // SAFETY: `wide_sddl` is a NUL-terminated UTF-16 buffer allocated by Win32.
+        unsafe {
+            while *wide_sddl.add(len) != 0 {
+                len += 1;
+            }
+            let slice = std::slice::from_raw_parts(wide_sddl, len);
+            Some(String::from_utf16_lossy(slice))
+        }
+    } else {
+        None
+    };
+
+    unsafe {
+        if !wide_sddl.is_null() {
+            let _ = LocalFree(wide_sddl.cast());
+        }
+        let _ = LocalFree(sd);
+    }
+
+    result
+}
+
+#[cfg(target_os = "windows")]
+fn sddl_allows_medium_il_mandatory_label(sddl: &str) -> bool {
+    let upper = sddl.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+
+    // Locate the top-level `S:` SACL section (outside parentheses) and slice until the next
+    // top-level SDDL section (`O:`, `G:`, `D:`), if any.
+    let mut depth = 0usize;
+    let mut sacl_start: Option<usize> = None;
+    let mut sacl_end = bytes.len();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'S' if depth == 0 && sacl_start.is_none() && i + 1 < bytes.len() && bytes[i + 1] == b':' => {
+                sacl_start = Some(i + 2);
+                i += 2;
+                continue;
+            }
+            b'O' | b'G' | b'D'
+                if depth == 0
+                    && sacl_start.is_some()
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1] == b':' =>
+            {
+                sacl_end = i;
+                break;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let Some(start) = sacl_start else {
+        return false;
+    };
+    let sacl_section = &upper[start..sacl_end];
+
+    let mut has_medium_or_low_ml = false;
+    let mut ace_start: Option<usize> = None;
+    for (idx, ch) in sacl_section.char_indices() {
+        match ch {
+            '(' => ace_start = Some(idx + 1),
+            ')' => {
+                if let Some(a_start) = ace_start.take() {
+                    let ace = &sacl_section[a_start..idx];
+                    let fields: Vec<&str> = ace.split(';').map(str::trim).collect();
+                    if fields.len() >= 6 && fields[0] == "ML" {
+                        let trustee = fields[5];
+                        if matches!(trustee, "HI" | "SI" | "S-1-16-12288" | "S-1-16-16384") {
+                            return false;
+                        }
+                        if matches!(trustee, "ME" | "LW" | "S-1-16-8192" | "S-1-16-4096") {
+                            has_medium_or_low_ml = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    has_medium_or_low_ml
+}
+
+#[cfg(target_os = "windows")]
+fn verify_event_medium_mandatory_label(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    event_label: &str,
+) -> bool {
+    let Some(sddl) = query_kernel_object_label_sddl(handle) else {
+        tracing::warn!(
+            event = event_label,
+            "failed to query mandatory label SDDL on cross-IL named event"
+        );
+        return false;
+    };
+    let has_me = sddl_allows_medium_il_mandatory_label(&sddl);
+    if !has_me {
+        tracing::warn!(
+            event = event_label,
+            actual_sddl = %sddl,
+            "cross-IL named event does not carry a Medium/Low mandatory label (ME/LW); Medium-IL callers may receive ERROR_ACCESS_DENIED"
+        );
+    }
+    has_me
+}
+
+#[cfg(target_os = "windows")]
+fn repair_event_medium_mandatory_label(
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    event_label: &str,
+) -> bool {
+    const SE_KERNEL_OBJECT: u32 = 6;
+    const LABEL_SECURITY_INFORMATION: u32 = 0x0000_0010;
+    const ML_MEDIUM_SDDL: &str = "S:(ML;;NW;;;ME)";
+
+    if handle.is_null() {
+        return false;
+    }
+    let Some(sd) = OwnedSecurityDescriptor::from_sddl(ML_MEDIUM_SDDL) else {
+        tracing::warn!(
+            event = event_label,
+            "failed to construct S:(ML;;NW;;;ME) security descriptor for mandatory label repair"
+        );
+        return false;
+    };
+    let mut sacl_present: i32 = 0;
+    let mut sacl_defaulted: i32 = 0;
+    let mut p_sacl: *mut std::ffi::c_void = std::ptr::null_mut();
+    // SAFETY: `sd.0` is a valid Win32 security descriptor kept alive until after `SetSecurityInfo`.
+    let got_sacl = unsafe {
+        GetSecurityDescriptorSacl(sd.0, &mut sacl_present, &mut p_sacl, &mut sacl_defaulted)
+    };
+    if got_sacl == 0 || sacl_present == 0 || p_sacl.is_null() {
+        tracing::warn!(
+            event = event_label,
+            "failed to extract SACL from S:(ML;;NW;;;ME) security descriptor"
+        );
+        return false;
+    }
+    // SAFETY: Applies only `LABEL_SECURITY_INFORMATION` onto a valid kernel event handle while
+    // `sd` (backing `p_sacl`) remains alive.
+    let rc = unsafe {
+        SetSecurityInfo(
+            handle,
+            SE_KERNEL_OBJECT,
+            LABEL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            p_sacl,
+        )
+    };
+    drop(sd);
+    if rc != 0 {
+        tracing::warn!(
+            event = event_label,
+            win32_err = rc,
+            "SetSecurityInfo(LABEL_SECURITY_INFORMATION) failed while repairing cross-IL named event mandatory label"
+        );
+        return false;
+    }
+    let verified = verify_event_medium_mandatory_label(handle, event_label);
+    if verified {
+        tracing::info!(
+            event = event_label,
+            "repaired pre-existing cross-IL named event mandatory label to S:(ML;;NW;;;ME)"
+        );
+    } else {
+        tracing::warn!(
+            event = event_label,
+            "mandatory label re-verification still failed after SetSecurityInfo repair"
+        );
+    }
+    verified
+}
+
+#[cfg(target_os = "windows")]
+fn finalize_created_named_event(
+    ev: windows_sys::Win32::Foundation::HANDLE,
+    last_err: u32,
+    event_label: &str,
+    strict_ml_check: bool,
+    sd_variant: &str,
+) {
+    use windows_sys::Win32::Foundation::ERROR_ALREADY_EXISTS;
+    use windows_sys::Win32::System::Threading::ResetEvent;
+
+    if last_err == ERROR_ALREADY_EXISTS {
+        tracing::warn!(
+            event = event_label,
+            sd_variant = sd_variant,
+            "CreateEventW opened existing named event (ERROR_ALREADY_EXISTS); OS preserved prior security descriptor"
+        );
+        // Clear any stale pre-existing signaled state before attaching listeners.
+        unsafe {
+            let _ = ResetEvent(ev);
+        }
+    }
+    if strict_ml_check && !verify_event_medium_mandatory_label(ev, event_label) {
+        if last_err == ERROR_ALREADY_EXISTS {
+            let _ = repair_event_medium_mandatory_label(ev, event_label);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn create_named_event_with_cross_il_sd(
     wide_event: &[u16],
+    event_label: &str,
+    strict_ml_check: bool,
 ) -> windows_sys::Win32::Foundation::HANDLE {
+    use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Threading::CreateEventW;
 
     if let Some(sd) = OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_WITH_ML) {
         let sa = sd.as_security_attributes();
         // SAFETY: Valid SECURITY_ATTRIBUTES and NUL-terminated UTF-16 event name.
         let ev = unsafe { CreateEventW(&sa, 0, 0, wide_event.as_ptr()) };
+        let last_err = unsafe { GetLastError() };
         if !ev.is_null() {
+            finalize_created_named_event(ev, last_err, event_label, strict_ml_check, "with_ml");
             return ev;
         }
+        tracing::warn!(
+            event = event_label,
+            win32_err = last_err,
+            "CreateEventW with S:(ML;;NW;;;ME) failed; falling back to DACL-only SDDL"
+        );
+    } else if strict_ml_check {
+        tracing::warn!(
+            event = event_label,
+            "failed to parse CROSS_IL_SDDL_WITH_ML; falling back to DACL-only SDDL"
+        );
     }
 
     if let Some(sd) = OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_DACL_ONLY) {
         let sa = sd.as_security_attributes();
         // SAFETY: Valid SECURITY_ATTRIBUTES and NUL-terminated UTF-16 event name.
         let ev = unsafe { CreateEventW(&sa, 0, 0, wide_event.as_ptr()) };
+        let last_err = unsafe { GetLastError() };
         if !ev.is_null() {
+            finalize_created_named_event(ev, last_err, event_label, strict_ml_check, "dacl_only");
             return ev;
         }
     }
 
     // SAFETY: Fallback to default security descriptor.
-    unsafe { CreateEventW(std::ptr::null(), 0, 0, wide_event.as_ptr()) }
+    let ev = unsafe { CreateEventW(std::ptr::null(), 0, 0, wide_event.as_ptr()) };
+    if !ev.is_null() {
+        let last_err = unsafe { GetLastError() };
+        finalize_created_named_event(ev, last_err, event_label, strict_ml_check, "default_sd");
+    }
+    ev
+}
+
+#[cfg(target_os = "windows")]
+fn signal_named_event(wide_event: &[u16]) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+    // SAFETY: Opening existing named event with EVENT_MODIFY_STATE only.
+    unsafe {
+        let ev = OpenEventW(EVENT_MODIFY_STATE, 0, wide_event.as_ptr());
+        if !ev.is_null() {
+            let ok = SetEvent(ev) != 0;
+            let _ = CloseHandle(ev);
+            return ok;
+        }
+    }
+    false
 }
 
 #[cfg(target_os = "windows")]
 fn signal_existing_wakeup_event(wide_event: &[u16]) {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    let _ = signal_named_event(wide_event);
+}
 
-    // SAFETY: Opening existing named wakeup event with EVENT_MODIFY_STATE only.
-    unsafe {
-        let ev = OpenEventW(EVENT_MODIFY_STATE, 0, wide_event.as_ptr());
-        if !ev.is_null() {
-            let _ = SetEvent(ev);
-            let _ = CloseHandle(ev);
+/// Trigger deterministic cross-IL graceful shutdown for the running instance scoped to `data_dir`.
+/// Returns `true` if a live listener event/signal was found and signaled, `false` otherwise.
+pub fn signal_graceful_exit_for_data_dir(data_dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let instance_hash = compute_instance_hash_readonly(data_dir);
+        let event_name = graceful_exit_event_name_for_hash(&instance_hash);
+        let wide = to_wide_null(&event_name);
+        signal_named_event(&wide)
+    }
+
+    #[cfg(unix)]
+    {
+        let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
+        let run_dir = canonical.join("run");
+        let lock_path = run_dir.join("instance.lock");
+        if !lock_path.exists() {
+            return false;
         }
+        let signal_path = run_dir.join("graceful_exit.signal");
+        std::fs::write(&signal_path, format!("{}", std::process::id())).is_ok()
+    }
+}
+
+/// Trigger deterministic cross-IL graceful shutdown for the standard installed CatCloud instance
+/// (`Local\CatCloud_GracefulExit_Installed_v1` on Windows). Never touches portable or sandbox runs.
+pub fn signal_graceful_exit_installed() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let wide = to_wide_null(INSTALLED_GRACEFUL_EXIT_EVENT_NAME);
+        signal_named_event(&wide)
+    }
+
+    #[cfg(unix)]
+    {
+        let std_dir = AppPaths::standard_os_data_dir();
+        signal_graceful_exit_for_data_dir(&std_dir)
     }
 }
 
@@ -1565,7 +1933,10 @@ fn signal_existing_wakeup_event(wide_event: &[u16]) {
 // ============================================================================
 
 /// Per-`canonical_data_dir` single-instance guard:
-/// - Windows: `Local\CatCloud_SI_<instance_hash>` Named Mutex + `Local\CatCloud_Wake_<instance_hash>` Named Event.
+/// - Windows: `Local\CatCloud_SI_<instance_hash>` Named Mutex + `Local\CatCloud_Wake_<instance_hash>`
+///   Named Event + `Local\CatCloud_GracefulExit_<instance_hash>` Named Event (+ optional
+///   `Local\CatCloud_GracefulExit_Installed_v1` for standard installed instances) + dedicated
+///   anonymous `stop_event` at `WaitForMultipleObjects` index `0`.
 /// - Unix: `<canonical_data_dir>/run/instance.lock` advisory `flock` lock.
 ///
 /// Two instances using different `data_dir` paths (e.g., primary install vs `%TEMP%` E2E sandbox)
@@ -1578,11 +1949,19 @@ pub struct SingleInstanceGuard {
     #[cfg(target_os = "windows")]
     mutex_handle: Mutex<Option<SendHandle>>,
     #[cfg(target_os = "windows")]
+    stop_event_handle: Mutex<Option<SendHandle>>,
+    #[cfg(target_os = "windows")]
     event_handle: Mutex<Option<SendHandle>>,
+    #[cfg(target_os = "windows")]
+    graceful_exit_event_handle: Mutex<Option<SendHandle>>,
+    #[cfg(target_os = "windows")]
+    installed_graceful_exit_event_handle: Mutex<Option<SendHandle>>,
     #[cfg(unix)]
     lock_file: Mutex<Option<std::fs::File>>,
     #[cfg(unix)]
     wakeup_signal_path: PathBuf,
+    #[cfg(unix)]
+    graceful_exit_signal_path: PathBuf,
 }
 
 impl std::fmt::Debug for SingleInstanceGuard {
@@ -1598,28 +1977,51 @@ impl SingleInstanceGuard {
     /// Acquire the single-instance lock for `paths`.
     /// When `restarting` is true (e.g. `--restarting` CLI flag), waits up to 12 seconds for the
     /// exiting primary instance to release the lock before giving up.
+    /// Registers the standard installed graceful-exit event exclusively when
+    /// `paths.is_standard_installed_instance()` is `true`.
     pub fn acquire_for_paths(paths: &AppPaths, restarting: bool) -> CatResult<AcquireOutcome> {
         let timeout = if restarting {
             RESTART_WAIT_TIMEOUT
         } else {
             Duration::ZERO
         };
-        Self::acquire(&paths.root_data_dir, timeout)
+        let register_installed_exit = paths.is_standard_installed_instance();
+        Self::acquire_with_options(&paths.root_data_dir, timeout, register_installed_exit)
     }
 
-    /// Acquire the single-instance lock scoped strictly to `canonical_data_dir`.
+    /// Acquire the single-instance lock scoped strictly to `canonical_data_dir` without registering
+    /// the global installed graceful-exit event.
     pub fn acquire(data_dir: &Path, wait_timeout: Duration) -> CatResult<AcquireOutcome> {
+        Self::acquire_with_options(data_dir, wait_timeout, false)
+    }
+
+    fn acquire_with_options(
+        data_dir: &Path,
+        wait_timeout: Duration,
+        register_installed_exit: bool,
+    ) -> CatResult<AcquireOutcome> {
         let instance_hash = compute_instance_hash(data_dir)?;
 
         #[cfg(target_os = "windows")]
         {
-            Self::acquire_windows(instance_hash, wait_timeout)
+            Self::acquire_windows(instance_hash, wait_timeout, register_installed_exit)
         }
 
         #[cfg(unix)]
         {
+            let _ = register_installed_exit;
             Self::acquire_unix(data_dir, instance_hash, wait_timeout)
         }
+    }
+
+    /// Trigger graceful shutdown for a running instance scoped to `data_dir`.
+    pub fn signal_graceful_exit_for_data_dir(data_dir: &Path) -> bool {
+        signal_graceful_exit_for_data_dir(data_dir)
+    }
+
+    /// Trigger graceful shutdown for the standard installed CatCloud instance.
+    pub fn signal_graceful_exit_installed() -> bool {
+        signal_graceful_exit_installed()
     }
 
     pub fn instance_hash(&self) -> &str {
@@ -1634,15 +2036,19 @@ impl SingleInstanceGuard {
     fn acquire_windows(
         instance_hash: String,
         wait_timeout: Duration,
+        register_installed_exit: bool,
     ) -> CatResult<AcquireOutcome> {
-        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS};
+        use windows_sys::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError};
+        use windows_sys::Win32::System::Threading::CreateEventW;
 
         const ERROR_ACCESS_DENIED_CODE: u32 = 5;
 
         let mutex_name = format!("Local\\CatCloud_SI_{instance_hash}");
         let event_name = format!("Local\\CatCloud_Wake_{instance_hash}");
+        let graceful_exit_name = graceful_exit_event_name_for_hash(&instance_hash);
         let wide_mutex = to_wide_null(&mutex_name);
         let wide_event = to_wide_null(&event_name);
+        let wide_graceful_exit = to_wide_null(&graceful_exit_name);
         let deadline = Instant::now() + wait_timeout;
 
         loop {
@@ -1665,21 +2071,67 @@ impl SingleInstanceGuard {
             }
 
             if last_err != ERROR_ALREADY_EXISTS {
-                // We are the primary instance; create auto-reset wakeup event with cross-IL SD
-                // so a Medium IL secondary launch can still signal a High IL primary window.
-                let ev = create_named_event_with_cross_il_sd(&wide_event);
-                let ev_opt = if ev.is_null() {
+                // Dedicated anonymous manual-reset stop event (always index 0 in WaitForMultipleObjects).
+                // SAFETY: Creating an anonymous manual-reset event with default security descriptor.
+                let stop_ev = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+                if stop_ev.is_null() {
+                    let err = unsafe { GetLastError() };
+                    unsafe {
+                        let _ = CloseHandle(handle);
+                    }
+                    return Err(CatError::Process(format!(
+                        "CreateEventW(anonymous stop_event) failed with Win32 error {err}"
+                    )));
+                }
+
+                // Auto-reset wakeup event with cross-IL SD so Medium IL secondary launch can still
+                // signal a High IL primary window.
+                let wake_ev = create_named_event_with_cross_il_sd(&wide_event, &event_name, false);
+                let wake_ev_opt = if wake_ev.is_null() {
                     None
                 } else {
-                    Some(SendHandle(ev))
+                    Some(SendHandle(wake_ev))
                 };
+
+                // Per-data_dir cross-IL graceful exit event (strictly checked for S:(ML;;NW;;;ME)).
+                let exit_ev = create_named_event_with_cross_il_sd(
+                    &wide_graceful_exit,
+                    &graceful_exit_name,
+                    true,
+                );
+                let exit_ev_opt = if exit_ev.is_null() {
+                    None
+                } else {
+                    Some(SendHandle(exit_ev))
+                };
+
+                // Optional global installed graceful-exit event (only for standard installed instances).
+                let installed_exit_opt = if register_installed_exit {
+                    let wide_installed = to_wide_null(INSTALLED_GRACEFUL_EXIT_EVENT_NAME);
+                    let inst_ev = create_named_event_with_cross_il_sd(
+                        &wide_installed,
+                        INSTALLED_GRACEFUL_EXIT_EVENT_NAME,
+                        true,
+                    );
+                    if inst_ev.is_null() {
+                        None
+                    } else {
+                        Some(SendHandle(inst_ev))
+                    }
+                } else {
+                    None
+                };
+
                 return Ok(AcquireOutcome::Primary(Self {
                     instance_hash,
                     lock_identifier: mutex_name,
                     stop_flag: Arc::new(AtomicBool::new(false)),
                     listener_thread: Mutex::new(None),
                     mutex_handle: Mutex::new(Some(SendHandle(handle))),
-                    event_handle: Mutex::new(ev_opt),
+                    stop_event_handle: Mutex::new(Some(SendHandle(stop_ev))),
+                    event_handle: Mutex::new(wake_ev_opt),
+                    graceful_exit_event_handle: Mutex::new(exit_ev_opt),
+                    installed_graceful_exit_event_handle: Mutex::new(installed_exit_opt),
                 }));
             }
 
@@ -1713,6 +2165,7 @@ impl SingleInstanceGuard {
         std::fs::create_dir_all(&run_dir)?;
         let lock_path = run_dir.join("instance.lock");
         let wakeup_signal_path = run_dir.join("wakeup.signal");
+        let graceful_exit_signal_path = run_dir.join("graceful_exit.signal");
         let deadline = Instant::now() + wait_timeout;
 
         loop {
@@ -1730,6 +2183,7 @@ impl SingleInstanceGuard {
                 let _ = write!(file, "{}", std::process::id());
                 let _ = file.flush();
                 let _ = std::fs::remove_file(&wakeup_signal_path);
+                let _ = std::fs::remove_file(&graceful_exit_signal_path);
                 return Ok(AcquireOutcome::Primary(Self {
                     instance_hash,
                     lock_identifier: lock_path.to_string_lossy().to_string(),
@@ -1737,6 +2191,7 @@ impl SingleInstanceGuard {
                     listener_thread: Mutex::new(None),
                     lock_file: Mutex::new(Some(file)),
                     wakeup_signal_path,
+                    graceful_exit_signal_path,
                 }));
             }
 
@@ -1760,10 +2215,26 @@ impl SingleInstanceGuard {
     }
 
     /// Start a background listener that invokes `on_wake` whenever a secondary launch
-    /// tries to open the same `data_dir`.
+    /// tries to open the same `data_dir` (compatibility wrapper over [`start_instance_listeners`]).
     pub fn start_wakeup_listener<F>(&self, on_wake: F) -> CatResult<()>
     where
         F: Fn() + Send + 'static,
+    {
+        self.start_instance_listeners(on_wake, || {})
+    }
+
+    /// Start the unified background listener watching both secondary-instance wake signals
+    /// (`on_wake`) and deterministic cross-IL graceful shutdown events (`on_graceful_exit`).
+    ///
+    /// On Windows, `WaitForMultipleObjects` always reserves index `0` for the dedicated anonymous
+    /// `stop_event`. Upon receiving any graceful-exit event, the listener immediately sets
+    /// `stop_flag = true`, dispatches `on_graceful_exit` asynchronously on a detached thread, and
+    /// immediately `break`s out of the loop so `RunEvent::Exit -> release() -> join()` can never
+    /// self-deadlock.
+    pub fn start_instance_listeners<FW, FE>(&self, on_wake: FW, on_graceful_exit: FE) -> CatResult<()>
+    where
+        FW: Fn() + Send + 'static,
+        FE: Fn() + Send + 'static,
     {
         let mut slot = self
             .listener_thread
@@ -1778,36 +2249,121 @@ impl SingleInstanceGuard {
         #[cfg(target_os = "windows")]
         {
             use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-            use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
+            use windows_sys::Win32::System::Threading::{INFINITE, WaitForMultipleObjects};
 
-            let ev_raw = {
-                let guard = self.event_handle.lock().unwrap_or_else(|e| e.into_inner());
+            let stop_addr = {
+                let guard = self
+                    .stop_event_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 guard.as_ref().map(|h| h.0 as usize)
             };
-            let Some(ev_addr) = ev_raw else {
+            let Some(stop_addr) = stop_addr else {
                 return Err(CatError::Process(
-                    "wakeup event handle is not initialized".into(),
+                    "anonymous stop event handle is not initialized".into(),
                 ));
             };
 
+            let wake_addr = {
+                let guard = self.event_handle.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|h| h.0 as usize)
+            };
+            let exit_addr = {
+                let guard = self
+                    .graceful_exit_event_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|h| h.0 as usize)
+            };
+            let installed_exit_addr = {
+                let guard = self
+                    .installed_graceful_exit_event_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|h| h.0 as usize)
+            };
+
+            if wake_addr.is_none() && exit_addr.is_none() && installed_exit_addr.is_none() {
+                return Err(CatError::Process(
+                    "no instance listener event handles are initialized".into(),
+                ));
+            }
+
             let handle = std::thread::Builder::new()
-                .name("catcloud-wakeup-listener".into())
+                .name("catcloud-instance-listener".into())
                 .spawn(move || {
-                    let ev_handle = ev_addr as windows_sys::Win32::Foundation::HANDLE;
+                    let mut handles: Vec<windows_sys::Win32::Foundation::HANDLE> =
+                        Vec::with_capacity(4);
+                    // Index 0 is ALWAYS the dedicated anonymous stop_event.
+                    handles.push(stop_addr as windows_sys::Win32::Foundation::HANDLE);
+
+                    let wake_idx = wake_addr.map(|addr| {
+                        let idx = handles.len();
+                        handles.push(addr as windows_sys::Win32::Foundation::HANDLE);
+                        idx
+                    });
+                    let exit_idx = exit_addr.map(|addr| {
+                        let idx = handles.len();
+                        handles.push(addr as windows_sys::Win32::Foundation::HANDLE);
+                        idx
+                    });
+                    let installed_exit_idx = installed_exit_addr.map(|addr| {
+                        let idx = handles.len();
+                        handles.push(addr as windows_sys::Win32::Foundation::HANDLE);
+                        idx
+                    });
+
+                    let mut on_graceful_exit = Some(on_graceful_exit);
+
                     while !stop.load(Ordering::Acquire) {
-                        // SAFETY: `event_handle` stays alive until `release()` joins this thread.
-                        let res = unsafe { WaitForSingleObject(ev_handle, INFINITE) };
+                        // SAFETY: All event handles stay alive until `release()` joins this thread.
+                        let res = unsafe {
+                            WaitForMultipleObjects(
+                                handles.len() as u32,
+                                handles.as_ptr(),
+                                0,
+                                INFINITE,
+                            )
+                        };
                         if stop.load(Ordering::Acquire) {
                             break;
                         }
-                        if res == WAIT_OBJECT_0 {
+                        let Some(signaled_idx) = res.checked_sub(WAIT_OBJECT_0).map(|v| v as usize)
+                        else {
+                            break;
+                        };
+                        if signaled_idx == 0 {
+                            // Dedicated stop_event signaled.
+                            break;
+                        }
+                        if Some(signaled_idx) == wake_idx {
                             on_wake();
+                        } else if Some(signaled_idx) == exit_idx
+                            || Some(signaled_idx) == installed_exit_idx
+                        {
+                            // Set stop_flag=true, dispatch callback asynchronously, and break
+                            // immediately so RunEvent::Exit -> si.release() -> join() NEVER deadlocks.
+                            stop.store(true, Ordering::Release);
+                            if let Some(cb) = on_graceful_exit.take() {
+                                let spawn_res = std::thread::Builder::new()
+                                    .name("catcloud-graceful-exit-dispatch".into())
+                                    .spawn(move || {
+                                        cb();
+                                    });
+                                if let Err(err) = spawn_res {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "failed to spawn graceful-exit dispatch thread"
+                                    );
+                                }
+                            }
+                            break;
                         } else {
                             break;
                         }
                     }
                 })
-                .map_err(|e| CatError::Process(format!("failed to spawn wakeup thread: {e}")))?;
+                .map_err(|e| CatError::Process(format!("failed to spawn instance listener: {e}")))?;
 
             *slot = Some(handle);
             Ok(())
@@ -1815,13 +2371,29 @@ impl SingleInstanceGuard {
 
         #[cfg(unix)]
         {
-            let signal_path = self.wakeup_signal_path.clone();
+            let wake_path = self.wakeup_signal_path.clone();
+            let exit_path = self.graceful_exit_signal_path.clone();
             let handle = std::thread::Builder::new()
-                .name("catcloud-wakeup-listener".into())
+                .name("catcloud-instance-listener".into())
                 .spawn(move || {
+                    let mut on_graceful_exit = Some(on_graceful_exit);
                     while !stop.load(Ordering::Acquire) {
-                        if signal_path.exists() {
-                            let _ = std::fs::remove_file(&signal_path);
+                        if exit_path.exists() {
+                            let _ = std::fs::remove_file(&exit_path);
+                            if !stop.load(Ordering::Acquire) {
+                                stop.store(true, Ordering::Release);
+                                if let Some(cb) = on_graceful_exit.take() {
+                                    let _ = std::thread::Builder::new()
+                                        .name("catcloud-graceful-exit-dispatch".into())
+                                        .spawn(move || {
+                                            cb();
+                                        });
+                                }
+                            }
+                            break;
+                        }
+                        if wake_path.exists() {
+                            let _ = std::fs::remove_file(&wake_path);
                             if !stop.load(Ordering::Acquire) {
                                 on_wake();
                             }
@@ -1829,24 +2401,25 @@ impl SingleInstanceGuard {
                         std::thread::sleep(Duration::from_millis(120));
                     }
                 })
-                .map_err(|e| CatError::Process(format!("failed to spawn wakeup thread: {e}")))?;
+                .map_err(|e| CatError::Process(format!("failed to spawn instance listener: {e}")))?;
 
             *slot = Some(handle);
             Ok(())
         }
     }
 
-    /// Immediately break the blocking wakeup wait (`WaitForSingleObject(INFINITE)`) so shutdown
-    /// releases the single-instance lock in 0ms without blocking.
+    /// Immediately break the blocking instance listener wait via the dedicated anonymous
+    /// `stop_event` so shutdown releases the single-instance lock in 0ms without touching
+    /// wakeup or graceful-exit named events.
     pub fn signal_stop(&self) {
         self.stop_flag.store(true, Ordering::Release);
         #[cfg(target_os = "windows")]
         {
             use windows_sys::Win32::System::Threading::SetEvent;
-            if let Ok(guard) = self.event_handle.lock() {
+            if let Ok(guard) = self.stop_event_handle.lock() {
                 if let Some(ref ev) = *guard {
                     if !ev.0.is_null() {
-                        // SAFETY: `ev.0` is a live auto-reset Win32 Event handle.
+                        // SAFETY: `ev.0` is a live anonymous manual-reset Win32 Event handle.
                         unsafe {
                             let _ = SetEvent(ev.0);
                         }
@@ -1856,7 +2429,7 @@ impl SingleInstanceGuard {
         }
     }
 
-    /// Stop any wakeup listener and immediately release the underlying OS lock handles.
+    /// Stop any background listener and deterministically close every OS handle owned by this guard.
     pub fn release(&mut self) {
         self.signal_stop();
         if let Ok(mut slot) = self.listener_thread.lock() {
@@ -1868,26 +2441,23 @@ impl SingleInstanceGuard {
         #[cfg(target_os = "windows")]
         {
             use windows_sys::Win32::Foundation::CloseHandle;
-            if let Ok(mut ev_slot) = self.event_handle.lock() {
-                if let Some(ev) = ev_slot.take() {
-                    if !ev.0.is_null() {
-                        // SAFETY: Listener thread has already joined; safe to close event handle.
-                        unsafe {
-                            let _ = CloseHandle(ev.0);
+            let close_slot = |slot: &Mutex<Option<SendHandle>>| {
+                if let Ok(mut guard) = slot.lock() {
+                    if let Some(h) = guard.take() {
+                        if !h.0.is_null() {
+                            // SAFETY: Listener thread has already joined; safe to close handle.
+                            unsafe {
+                                let _ = CloseHandle(h.0);
+                            }
                         }
                     }
                 }
-            }
-            if let Ok(mut mtx_slot) = self.mutex_handle.lock() {
-                if let Some(mtx) = mtx_slot.take() {
-                    if !mtx.0.is_null() {
-                        // SAFETY: Closing our owned named mutex handle immediately releases the lock.
-                        unsafe {
-                            let _ = CloseHandle(mtx.0);
-                        }
-                    }
-                }
-            }
+            };
+            close_slot(&self.stop_event_handle);
+            close_slot(&self.event_handle);
+            close_slot(&self.graceful_exit_event_handle);
+            close_slot(&self.installed_graceful_exit_event_handle);
+            close_slot(&self.mutex_handle);
         }
 
         #[cfg(unix)]
@@ -1903,6 +2473,7 @@ impl SingleInstanceGuard {
                 }
             }
             let _ = std::fs::remove_file(&self.wakeup_signal_path);
+            let _ = std::fs::remove_file(&self.graceful_exit_signal_path);
         }
     }
 }
@@ -2282,5 +2853,215 @@ mod tests {
             format_msiexec_install_params("C:\\Temp\\bad\0.msi"),
             Err(CatError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn graceful_exit_listener_dispatches_asynchronously_without_release_deadlock_and_isolates_dirs() {
+        let dir_a = make_temp_dir("graceful-a");
+        let dir_b = make_temp_dir("graceful-b");
+
+        let guard_a = Arc::new(Mutex::new(Some(
+            match SingleInstanceGuard::acquire(&dir_a, Duration::ZERO).unwrap() {
+                AcquireOutcome::Primary(g) => g,
+                AcquireOutcome::SecondaryWokePrimary => panic!("expected primary A"),
+            },
+        )));
+        let mut guard_b = match SingleInstanceGuard::acquire(&dir_b, Duration::ZERO).unwrap() {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary B"),
+        };
+
+        let woke_a = Arc::new(AtomicUsize::new(0));
+        let exited_a = Arc::new(AtomicUsize::new(0));
+        let exited_b = Arc::new(AtomicUsize::new(0));
+        let released_from_cb = Arc::new(AtomicBool::new(false));
+
+        let woke_a_c = Arc::clone(&woke_a);
+        let exited_a_c = Arc::clone(&exited_a);
+        let guard_a_c = Arc::clone(&guard_a);
+        let released_c = Arc::clone(&released_from_cb);
+
+        guard_a
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .start_instance_listeners(
+                move || {
+                    woke_a_c.fetch_add(1, Ordering::SeqCst);
+                },
+                move || {
+                    exited_a_c.fetch_add(1, Ordering::SeqCst);
+                    // Simulate RunEvent::Exit -> si.release() -> join() triggered directly from
+                    // the graceful-exit callback: MUST complete without self-deadlocking!
+                    if let Some(mut g) = guard_a_c.lock().unwrap().take() {
+                        g.release();
+                        released_c.store(true, Ordering::SeqCst);
+                    }
+                },
+            )
+            .unwrap();
+
+        let exited_b_c = Arc::clone(&exited_b);
+        guard_b
+            .start_instance_listeners(
+                || {},
+                move || {
+                    exited_b_c.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+
+        // Signaling dir_a MUST wake only dir_a's graceful-exit callback (never wake, never dir_b)
+        // and release() inside callback must finish promptly without deadlocking.
+        assert!(signal_graceful_exit_for_data_dir(&dir_a));
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !released_from_cb.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(exited_a.load(Ordering::SeqCst), 1);
+        assert!(
+            released_from_cb.load(Ordering::SeqCst),
+            "release() called from graceful_exit callback must not deadlock"
+        );
+        assert_eq!(woke_a.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            exited_b.load(Ordering::SeqCst),
+            0,
+            "graceful exit for dir_a must NOT touch isolated dir_b"
+        );
+
+        // After release(), dir_a's graceful-exit event is closed and lock can be re-acquired cleanly.
+        assert!(
+            !signal_graceful_exit_for_data_dir(&dir_a),
+            "closed graceful-exit handle must no longer be signalable"
+        );
+        let reacquired = SingleInstanceGuard::acquire(&dir_a, Duration::ZERO).unwrap();
+        assert!(matches!(reacquired, AcquireOutcome::Primary(_)));
+        drop(reacquired);
+
+        guard_b.release();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_graceful_exit_event_carries_medium_mandatory_label_and_installed_event_works() {
+        let dir = make_temp_dir("installed-ml-check");
+        let mut guard = match SingleInstanceGuard::acquire_with_options(&dir, Duration::ZERO, true)
+            .unwrap()
+        {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary"),
+        };
+
+        // Verify both per-data_dir and installed graceful-exit events carry S:(ML;;NW;;;ME).
+        {
+            let per_dir_ev = guard.graceful_exit_event_handle.lock().unwrap();
+            let h = per_dir_ev.as_ref().expect("per-data_dir graceful exit event").0;
+            assert!(
+                verify_event_medium_mandatory_label(h, "test-per-dir"),
+                "per-data_dir graceful exit event must carry Medium mandatory label"
+            );
+        }
+        {
+            let inst_ev = guard.installed_graceful_exit_event_handle.lock().unwrap();
+            let h = inst_ev
+                .as_ref()
+                .expect("installed graceful exit event when register_installed_exit=true")
+                .0;
+            assert!(
+                verify_event_medium_mandatory_label(h, INSTALLED_GRACEFUL_EXIT_EVENT_NAME),
+                "installed graceful exit event must carry Medium mandatory label"
+            );
+        }
+
+        let exited = Arc::new(AtomicUsize::new(0));
+        let exited_c = Arc::clone(&exited);
+        guard
+            .start_instance_listeners(
+                || {},
+                move || {
+                    exited_c.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+
+        assert!(signal_graceful_exit_installed());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while exited.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(exited.load(Ordering::SeqCst), 1);
+
+        guard.release();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn sddl_medium_mandatory_label_parser_accepts_valid_variants_and_rejects_high_il() {
+        assert!(sddl_allows_medium_il_mandatory_label("S:(ML;;NW;;;ME)"));
+        assert!(sddl_allows_medium_il_mandatory_label(
+            "S:AI(ML;OICI;NW;;;ME)"
+        ));
+        assert!(sddl_allows_medium_il_mandatory_label(
+            "S:(ML;;NWNX;;;S-1-16-8192)"
+        ));
+        assert!(sddl_allows_medium_il_mandatory_label("S:(ML;;NW;;;LW)"));
+        assert!(sddl_allows_medium_il_mandatory_label(
+            "D:(A;;GA;;;BA)S:P(ML;;NW;;;S-1-16-4096)"
+        ));
+
+        assert!(!sddl_allows_medium_il_mandatory_label("S:(ML;;NW;;;HI)"));
+        assert!(!sddl_allows_medium_il_mandatory_label("S:(ML;;NW;;;SI)"));
+        assert!(!sddl_allows_medium_il_mandatory_label(
+            "S:(ML;;NW;;;S-1-16-12288)"
+        ));
+        assert!(!sddl_allows_medium_il_mandatory_label(
+            "S:(ML;;NW;;;S-1-16-16384)"
+        ));
+        assert!(!sddl_allows_medium_il_mandatory_label(
+            "S:(ML;;NW;;;ME)(ML;;NW;;;HI)"
+        ));
+        assert!(!sddl_allows_medium_il_mandatory_label("D:(A;;GA;;;BA)"));
+        assert!(!sddl_allows_medium_il_mandatory_label("D:(ML;;NW;;;ME)"));
+        assert!(!sddl_allows_medium_il_mandatory_label(""));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn create_named_event_repairs_preexisting_event_missing_medium_mandatory_label() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::CreateEventW;
+
+        let ev_name = format!(
+            "Local\\CatCloudRepairMlTest_{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let wide = to_wide_null(&ev_name);
+
+        // Pre-create the event with DACL-only SDDL (no explicit Medium mandatory label).
+        let dacl_sd = OwnedSecurityDescriptor::from_sddl(CROSS_IL_SDDL_DACL_ONLY)
+            .expect("parse DACL-only SDDL");
+        let sa = dacl_sd.as_security_attributes();
+        let pre_ev = unsafe { CreateEventW(&sa, 0, 0, wide.as_ptr()) };
+        assert!(!pre_ev.is_null(), "pre-creating named event must succeed");
+
+        // Opening the same name via `create_named_event_with_cross_il_sd` hits ERROR_ALREADY_EXISTS
+        // and must actively repair the mandatory label to S:(ML;;NW;;;ME) via SetSecurityInfo.
+        let opened_ev = create_named_event_with_cross_il_sd(&wide, &ev_name, true);
+        assert!(!opened_ev.is_null());
+        assert!(
+            verify_event_medium_mandatory_label(opened_ev, &ev_name),
+            "pre-existing named event must carry Medium mandatory label after ERROR_ALREADY_EXISTS repair"
+        );
+
+        unsafe {
+            let _ = CloseHandle(opened_ev);
+            let _ = CloseHandle(pre_ev);
+        }
     }
 }

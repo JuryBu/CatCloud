@@ -2,8 +2,8 @@
 
 use crate::error::CatResult;
 use crate::models::{
-    DEFAULT_COST_EFFECTIVE_FORMULA, DynamicFilterSpec, MultiGroup, MultiGroupMode, ProbeSnapshot,
-    ProxyNode, TriggerRule,
+    DEFAULT_COST_EFFECTIVE_FORMULA, DynamicFilterSpec, MultiGroup, MultiGroupMode, ProbeKind,
+    ProbeSnapshot, ProxyNode, TriggerRule, infer_builtin_probe_kind,
 };
 use crate::strategy::formula::{DEFAULT_MISSING_PING_MS, EvalContext, FormulaExpr};
 use crate::strategy::health_pool::{NodeHealthPool, RuntimeDualHealth, RuntimeNodeHealth};
@@ -70,11 +70,44 @@ pub fn build_eval_context_for_probe(
         .or_else(|| snap.down_mbps.filter(|v| v.is_finite()))
         .unwrap_or(0.0);
 
-    let ping_ms = primary_id
-        .and_then(|pid| snap.per_probe_ping_ms.get(pid).copied())
-        .filter(|v| v.is_finite())
-        .or_else(|| snap.latency_ms.filter(|v| v.is_finite()))
-        .unwrap_or(if ok { 0.0 } else { DEFAULT_MISSING_PING_MS });
+    let primary_explicitly_failed =
+        primary_id.and_then(|pid| snap.per_probe_ok.get(pid).copied()) == Some(false);
+
+    let primary_is_latency = primary_id.is_some_and(|pid| {
+        if let Some(kind) = infer_builtin_probe_kind(pid) {
+            return kind == ProbeKind::Latency;
+        }
+        // For custom probe IDs without a registry lookup here, reject probes that clearly produce
+        // throughput/unlock results and require an explicit latency/ping whitelist token so
+        // non-latency probes like `netflix_check` are never mistaken for latency.
+        if snap.per_probe_up_mbps.contains_key(pid)
+            || snap.per_probe_down_mbps.contains_key(pid)
+            || snap.unlocked_sites.contains_key(pid)
+        {
+            return false;
+        }
+        let lower = pid.to_ascii_lowercase();
+        let has_latency_token = lower == "builtin_latency"
+            || lower.contains("latency")
+            || lower.contains("ping");
+        let has_non_latency_token = lower.contains("upload")
+            || lower.contains("download")
+            || lower.contains("unlock")
+            || lower.contains("keepalive")
+            || lower.contains("google_cn");
+        has_latency_token && !has_non_latency_token
+    });
+
+    let ping_ms = if primary_explicitly_failed {
+        DEFAULT_MISSING_PING_MS
+    } else {
+        primary_id
+            .filter(|_| primary_is_latency)
+            .and_then(|pid| snap.per_probe_ping_ms.get(pid).copied())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .or_else(|| snap.latency_ms.filter(|v| v.is_finite() && *v > 0.0))
+            .unwrap_or(DEFAULT_MISSING_PING_MS)
+    };
 
     let jitter_ms = snap.jitter_ms.filter(|v| v.is_finite()).unwrap_or(0.0);
     let loss_pct = snap
@@ -1244,5 +1277,94 @@ mod tests {
             .find(|c| c.node_id == "n-unprobed")
             .expect("unprobed candidate");
         assert_eq!(unprobed.tested_at, None);
+    }
+
+    #[test]
+    fn build_eval_context_penalizes_missing_or_non_positive_latency_and_ignores_non_latency_primary() {
+        let node = test_node("n-eval", "JP-Eval", "JP");
+
+        // 1. Snapshot with ok=true but missing latency_ms MUST get DEFAULT_MISSING_PING_MS (never 0ms!).
+        let no_lat_snap = ProbeSnapshot {
+            node_id: "n-eval".to_string(),
+            ok: true,
+            latency_ms: None,
+            ..Default::default()
+        };
+        let ctx_missing = build_eval_context_for_probe(&node, Some(&no_lat_snap), None);
+        assert_eq!(ctx_missing.ping_ms, DEFAULT_MISSING_PING_MS);
+
+        // 2. Non-positive latency_ms (0.0 or -5.0) MUST also fall back to DEFAULT_MISSING_PING_MS.
+        let zero_lat_snap = ProbeSnapshot {
+            node_id: "n-eval".to_string(),
+            ok: true,
+            latency_ms: Some(0.0),
+            ..Default::default()
+        };
+        let ctx_zero = build_eval_context_for_probe(&node, Some(&zero_lat_snap), None);
+        assert_eq!(ctx_zero.ping_ms, DEFAULT_MISSING_PING_MS);
+
+        // 3. Non-latency primary_probe_id (builtin_upload or builtin_unlock_windsurf) MUST NOT leak
+        //    its transfer/page duration from per_probe_ping_ms into ctx.ping_ms.
+        let mut mixed_snap = ProbeSnapshot {
+            node_id: "n-eval".to_string(),
+            ok: true,
+            latency_ms: Some(44.5),
+            up_mbps: Some(32.0),
+            ..Default::default()
+        };
+        mixed_snap
+            .per_probe_ping_ms
+            .insert("builtin_latency".to_string(), 44.5);
+        mixed_snap
+            .per_probe_ping_ms
+            .insert("builtin_upload".to_string(), 3200.0);
+        mixed_snap
+            .per_probe_up_mbps
+            .insert("builtin_upload".to_string(), 32.0);
+        mixed_snap
+            .per_probe_ping_ms
+            .insert("builtin_unlock_windsurf".to_string(), 1423.0);
+        mixed_snap
+            .per_probe_ping_ms
+            .insert("custom_ping".to_string(), 29.0);
+
+        let ctx_up = build_eval_context_for_probe(&node, Some(&mixed_snap), Some("builtin_upload"));
+        assert_eq!(ctx_up.ping_ms, 44.5);
+        assert_eq!(ctx_up.up_mbps, 32.0);
+
+        let ctx_ws = build_eval_context_for_probe(
+            &node,
+            Some(&mixed_snap),
+            Some("builtin_unlock_windsurf"),
+        );
+        assert_eq!(ctx_ws.ping_ms, 44.5);
+
+        // 4. Legitimate Latency primary_probe_id (builtin_latency or custom_ping) IS honored.
+        let ctx_custom =
+            build_eval_context_for_probe(&node, Some(&mixed_snap), Some("custom_ping"));
+        assert_eq!(ctx_custom.ping_ms, 29.0);
+
+        // 5. Unknown custom non-latency ID (e.g. `netflix_check` without "unlock" substring) MUST
+        //    NOT be treated as Latency; it keeps top-level `snap.latency_ms` instead of page duration.
+        mixed_snap
+            .per_probe_ok
+            .insert("netflix_check".to_string(), true);
+        mixed_snap
+            .per_probe_ping_ms
+            .insert("netflix_check".to_string(), 1850.0);
+        let ctx_netflix =
+            build_eval_context_for_probe(&node, Some(&mixed_snap), Some("netflix_check"));
+        assert!(ctx_netflix.ok);
+        assert_eq!(ctx_netflix.ping_ms, 44.5);
+
+        // 6. Explicit primary_probe_id that FAILED (`per_probe_ok == Some(false)`) MUST yield
+        //    `DEFAULT_MISSING_PING_MS` (9999.0), NEVER falling back to `snap.latency_ms`!
+        mixed_snap
+            .per_probe_ok
+            .insert("custom_latency_hk".to_string(), false);
+        let ctx_primary_failed =
+            build_eval_context_for_probe(&node, Some(&mixed_snap), Some("custom_latency_hk"));
+        assert!(!ctx_primary_failed.ok);
+        assert_eq!(ctx_primary_failed.ping_ms, DEFAULT_MISSING_PING_MS);
     }
 }

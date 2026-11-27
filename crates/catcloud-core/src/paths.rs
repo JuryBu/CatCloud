@@ -106,7 +106,7 @@ impl AppPaths {
         (std_dir, false)
     }
 
-    fn standard_os_data_dir() -> PathBuf {
+    pub(crate) fn standard_os_data_dir() -> PathBuf {
         #[cfg(target_os = "windows")]
         {
             if let Ok(appdata) = std::env::var("APPDATA") {
@@ -224,6 +224,31 @@ impl AppPaths {
                 .unwrap_or_else(|_| self.root_data_dir.clone()),
         );
         path_is_within_dir(&norm_root, &norm_exe_dir)
+    }
+
+    /// Return `true` strictly when this instance runs against the standard installed OS user data
+    /// directory (including both normal installed launches and UAC-elevated installed launches
+    /// passed `--data-dir %APPDATA%\CatCloud`), while returning `false` for true self-updatable
+    /// portable deployments and isolated `--data-dir %TEMP%\...` sandboxes.
+    pub fn is_standard_installed_instance(&self) -> bool {
+        if self.is_self_updatable_portable() {
+            return false;
+        }
+        let standard_dir = Self::standard_os_data_dir();
+        let norm_root = canonical_or_normalized(&self.root_data_dir);
+        let norm_std = canonical_or_normalized(&standard_dir);
+        paths_equal_normalized(&norm_root, &norm_std)
+    }
+
+    /// Deterministic variant of `is_standard_installed_instance` accepting explicit executable
+    /// and standard OS data directories for unit tests and diagnostics.
+    pub fn is_standard_installed_instance_for(&self, exe_dir: &Path, standard_dir: &Path) -> bool {
+        if self.is_self_updatable_portable_for_exe_dir(exe_dir) {
+            return false;
+        }
+        let norm_root = canonical_or_normalized(&self.root_data_dir);
+        let norm_std = canonical_or_normalized(standard_dir);
+        paths_equal_normalized(&norm_root, &norm_std)
     }
 
     /// Parse `--data-dir <PATH>` from raw process args before Tauri initializes.
@@ -346,6 +371,44 @@ impl AppPaths {
             }
             Ok(())
         }
+    }
+}
+
+fn canonical_or_normalized(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return normalize_os_path(&canon);
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            return normalize_os_path(&canon_parent.join(name));
+        }
+    }
+    normalize_os_path(path)
+}
+
+fn paths_equal_normalized(a: &Path, b: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::Component;
+        let a_comps: Vec<Component<'_>> = a.components().collect();
+        let b_comps: Vec<Component<'_>> = b.components().collect();
+        if a_comps.is_empty() || a_comps.len() != b_comps.len() {
+            return false;
+        }
+        a_comps.iter().zip(b_comps.iter()).all(|(ac, bc)| match (ac, bc) {
+            (Component::Normal(x), Component::Normal(y)) => {
+                x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy())
+            }
+            (Component::Prefix(x), Component::Prefix(y)) => x
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&y.as_os_str().to_string_lossy()),
+            (x, y) => x == y,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        !a.as_os_str().is_empty() && a == b
     }
 }
 
@@ -621,6 +684,73 @@ mod tests {
         assert!(root_cli.parent().and_then(Path::parent).is_none());
         let (_, root_cli_portable) = AppPaths::detect_portable_or_standard(root_cli);
         assert!(!root_cli_portable);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn is_standard_installed_instance_distinguishes_all_four_runtime_modes() {
+        let root = std::env::temp_dir().join(format!(
+            "catcloud-installed-detect-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let installed_exe_dir = root.join("ProgramFiles").join("CatCloud");
+        let portable_exe_dir = root.join("PortableApp");
+        let std_appdata_dir = root.join("Roaming").join("CatCloud");
+        let sandbox_temp_dir = root.join("TempSandbox");
+
+        std::fs::create_dir_all(&installed_exe_dir).unwrap();
+        std::fs::create_dir_all(&portable_exe_dir).unwrap();
+        std::fs::write(portable_exe_dir.join("portable.flag"), b"1").unwrap();
+
+        // 1. Standard installed launch (is_portable = false, data_dir == standard_dir) -> true
+        let normal_installed =
+            AppPaths::from_data_dir(std_appdata_dir.clone(), false).expect("normal installed");
+        assert!(
+            normal_installed.is_standard_installed_instance_for(&installed_exe_dir, &std_appdata_dir)
+        );
+
+        // 2. UAC-elevated installed launch (`--data-dir %APPDATA%\CatCloud`, so `is_portable == true`,
+        //    yet NOT inside a portable exe dir and data_dir == standard_dir) -> true!
+        let elevated_installed =
+            AppPaths::from_data_dir(std_appdata_dir.clone(), true).expect("elevated installed");
+        assert!(elevated_installed.is_portable);
+        assert!(
+            !elevated_installed.is_self_updatable_portable_for_exe_dir(&installed_exe_dir)
+        );
+        assert!(
+            elevated_installed
+                .is_standard_installed_instance_for(&installed_exe_dir, &std_appdata_dir)
+        );
+
+        // Windows case-insensitivity check on standard_dir comparison
+        #[cfg(target_os = "windows")]
+        {
+            let upper_std = PathBuf::from(std_appdata_dir.to_string_lossy().to_uppercase());
+            assert!(
+                elevated_installed
+                    .is_standard_installed_instance_for(&installed_exe_dir, &upper_std)
+            );
+        }
+
+        // 3. True portable deployment (`<portable_exe_dir>/portable.flag` + `<portable_exe_dir>/data`) -> false
+        let portable_paths =
+            AppPaths::from_data_dir(portable_exe_dir.join("data"), true).expect("portable");
+        assert!(
+            !portable_paths.is_standard_installed_instance_for(&portable_exe_dir, &std_appdata_dir)
+        );
+        // Even if standard_dir happened to match portable data dir, self-updatable portable still returns false.
+        assert!(
+            !portable_paths
+                .is_standard_installed_instance_for(&portable_exe_dir, &portable_exe_dir.join("data"))
+        );
+
+        // 4. Isolated `--data-dir %TEMP%\...` sandbox -> false
+        let sandbox_paths =
+            AppPaths::from_data_dir(sandbox_temp_dir, true).expect("sandbox");
+        assert!(
+            !sandbox_paths.is_standard_installed_instance_for(&installed_exe_dir, &std_appdata_dir)
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

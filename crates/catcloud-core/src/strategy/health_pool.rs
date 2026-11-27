@@ -55,7 +55,7 @@ pub enum RuntimeDualHealth {
 }
 
 /// Compact runtime health hint DTO exposed to the UI via `RuntimeInfoDto.node_health_hints`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct NodeHealthHintDto {
     pub latency_ms: Option<f64>,
     /// One of `"healthy"`, `"degraded"`, `"cooldown"`, or `"probation"`.
@@ -68,6 +68,9 @@ pub struct NodeHealthHintDto {
     /// `"cooldown_s3"`, `"recovery_pending"`, or `"probation"`).
     #[serde(default)]
     pub stage: String,
+    /// UTC Unix timestamp in milliseconds of the latest confirmed background health probe.
+    #[serde(default)]
+    pub probed_at_ms: Option<i64>,
 }
 
 /// Per-node runtime health metrics, penalty, cooldown, and recovery state.
@@ -82,6 +85,7 @@ pub struct RuntimeNodeHealth {
     pub recovery_streak: u32,
     pub probation_remaining: u8,
     pub last_probed_at: Option<Instant>,
+    pub last_probed_at_utc_ms: Option<i64>,
     pub last_recovery_check_at: Option<Instant>,
 }
 
@@ -222,7 +226,8 @@ impl NodeHealthPool {
         self.nodes.is_empty()
     }
 
-    /// Record a confirmed dual-probe outcome at monotonic timestamp `now`.
+    /// Record a confirmed dual-probe outcome at monotonic timestamp `now`, stamping the current
+    /// UTC Unix millisecond wall-clock time for cross-source freshness comparison.
     ///
     /// Callers should perform retry-before-penalize (e.g. an immediate 1.5s re-check on first
     /// failure) before recording `RuntimeDualHealth::Failed` so transient jitter never triggers
@@ -234,6 +239,25 @@ impl NodeHealthPool {
         raw_latency_ms: Option<f64>,
         now: Instant,
     ) {
+        self.record_probe_result_at_utc(
+            node_id,
+            health,
+            raw_latency_ms,
+            now,
+            chrono::Utc::now().timestamp_millis(),
+        );
+    }
+
+    /// Record a confirmed dual-probe outcome at monotonic timestamp `now` with an explicit UTC
+    /// Unix millisecond timestamp `probed_at_ms`.
+    pub fn record_probe_result_at_utc(
+        &mut self,
+        node_id: &str,
+        health: RuntimeDualHealth,
+        raw_latency_ms: Option<f64>,
+        now: Instant,
+        probed_at_ms: i64,
+    ) {
         let trimmed = node_id.trim();
         if trimmed.is_empty() {
             return;
@@ -242,6 +266,7 @@ impl NodeHealthPool {
         let was_needing_recovery = entry.needs_recovery_attention();
 
         entry.last_probed_at = Some(now);
+        entry.last_probed_at_utc_ms = Some(probed_at_ms);
         if was_needing_recovery {
             entry.last_recovery_check_at = Some(now);
         }
@@ -432,7 +457,14 @@ impl NodeHealthPool {
             {
                 None
             } else {
-                entry.last_raw_latency_ms.or(entry.ewma_latency_ms)
+                entry
+                    .ewma_latency_ms
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .or_else(|| {
+                        entry
+                            .last_raw_latency_ms
+                            .filter(|v| v.is_finite() && *v > 0.0)
+                    })
             };
             out.insert(
                 id.clone(),
@@ -442,20 +474,29 @@ impl NodeHealthPool {
                     cooldown_remaining_sec: entry.cooldown_remaining_sec(now),
                     reason: entry.reason_zh(now),
                     stage: entry.stage_label(now),
+                    probed_at_ms: entry.last_probed_at_utc_ms,
                 },
             );
         }
         out
     }
 
-    /// Return the freshest live latency (raw RTT preferred, EWMA fallback) for a healthy/degraded node.
+    /// Return the smoothed live latency (EWMA preferred, raw RTT fallback) for a healthy/degraded node,
+    /// aligned with `evaluator.rs::apply_runtime_health_to_context` so UI and scoring see the same value.
     /// Returns `None` if the node is unprobed or its latest confirmed probe was `Failed`.
     pub fn live_latency_ms(&self, node_id: &str) -> Option<f64> {
         let entry = self.nodes.get(node_id)?;
         if entry.last_health == Some(RuntimeDualHealth::Failed) {
             return None;
         }
-        entry.last_raw_latency_ms.or(entry.ewma_latency_ms)
+        entry
+            .ewma_latency_ms
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .or_else(|| {
+                entry
+                    .last_raw_latency_ms
+                    .filter(|v| v.is_finite() && *v > 0.0)
+            })
     }
 
     /// Return EWMA smoothed latency for a node when available.
@@ -669,7 +710,9 @@ mod tests {
         let h2 = pool.get("n1").expect("n1 tracked");
         assert!((h2.ewma_latency_ms.unwrap() - 135.0).abs() < 1e-6);
         assert!((h2.last_raw_latency_ms.unwrap() - 200.0).abs() < 1e-6);
-        assert_eq!(pool.live_latency_ms("n1"), Some(200.0));
+        assert!((pool.live_latency_ms("n1").unwrap() - 135.0).abs() < 1e-6);
+        let hints = pool.build_hints_snapshot(t0 + Duration::from_secs(25));
+        assert!((hints["n1"].latency_ms.unwrap() - 135.0).abs() < 1e-6);
     }
 
     #[test]
@@ -1008,5 +1051,53 @@ mod tests {
         assert_eq!(loaded.cooldown_nodes.len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hints_snapshot_exposes_utc_probed_at_ms_and_handles_unprobed_and_serde_default() {
+        let mut pool = NodeHealthPool::new();
+        let t0 = Instant::now();
+
+        // 1. Default unprobed entry has probed_at_ms == None.
+        pool.nodes
+            .insert("n-unprobed".to_string(), RuntimeNodeHealth::default());
+        let hints0 = pool.build_hints_snapshot(t0);
+        assert_eq!(hints0["n-unprobed"].probed_at_ms, None);
+
+        // 2. Real probe via `record_probe_result` stamps current UTC Unix ms.
+        let before_ms = chrono::Utc::now().timestamp_millis();
+        pool.record_probe_result("n-live", RuntimeDualHealth::FullHealthy, Some(48.0), t0);
+        let after_ms = chrono::Utc::now().timestamp_millis();
+        let live_ts = pool
+            .build_hints_snapshot(t0)
+            .get("n-live")
+            .and_then(|h| h.probed_at_ms)
+            .expect("probed_at_ms must be populated after record_probe_result");
+        assert!(
+            live_ts >= before_ms && live_ts <= after_ms,
+            "probed_at_ms ({live_ts}) must lie within [{before_ms}, {after_ms}]"
+        );
+
+        // 3. Explicit UTC timestamp helper preserves exact value and survives serde roundtrip.
+        let fixed_ts = 1_795_750_000_123_i64;
+        pool.record_probe_result_at_utc(
+            "n-fixed",
+            RuntimeDualHealth::Degraded,
+            Some(92.0),
+            t0,
+            fixed_ts,
+        );
+        let hint = pool.build_hints_snapshot(t0).remove("n-fixed").unwrap();
+        assert_eq!(hint.probed_at_ms, Some(fixed_ts));
+        let json = serde_json::to_string(&hint).unwrap();
+        let roundtrip: NodeHealthHintDto = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.probed_at_ms, Some(fixed_ts));
+
+        // 4. Legacy JSON without `probed_at_ms` deserializes safely with `None`.
+        let legacy: NodeHealthHintDto = serde_json::from_str(
+            r#"{"latency_ms":55.0,"status":"healthy","cooldown_remaining_sec":0}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.probed_at_ms, None);
     }
 }

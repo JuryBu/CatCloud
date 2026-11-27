@@ -19,7 +19,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { Suspense, lazy, useEffect, useRef, useState } from "react";
-import { normalizeUiLanguage, type UiLanguage, useUiDict } from "../i18n";
+import { formatI18nTemplate, normalizeUiLanguage, type UiLanguage, useUiDict } from "../i18n";
 import {
   BUILTIN_WALLPAPER_PRESETS,
   type MascotState,
@@ -210,6 +210,24 @@ export function Sidebar() {
   const multiGroupHasDirty = useAppSelector((s) => s.sessionDrafts.multiGroup.hasDirtyDrafts);
   const settingsHasDirty = useAppSelector((s) => s.sessionDrafts.settings.hasDirtyDrafts);
   const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
+  const pendingUpdate = useAppSelector((s) => s.pendingUpdate);
+  const updateMode = useAppSelector((s) => s.config.update.mode);
+
+  const isNextLaunchSilentBadge = Boolean(
+    pendingUpdate &&
+      (pendingUpdate.silent_badge_only || updateMode === "next_launch")
+  );
+  const pendingUpdateBadgeTitle = pendingUpdate
+    ? isNextLaunchSilentBadge
+      ? dict.update.nextLaunchBadgeTip
+      : formatI18nTemplate(dict.settings.updateReadyTitle, {
+          version: pendingUpdate.target_version,
+        })
+    : "";
+  const handleOpenPendingUpdate = () => {
+    if (!pendingUpdate) return;
+    appActions.openUpdateModal();
+  };
 
   const [themeMenuOpen, setThemeMenuOpen] = useState(false);
   const [localPetting, setLocalPetting] = useState(false);
@@ -451,9 +469,13 @@ export function Sidebar() {
         : item.id === "settings"
           ? settingsHasDirty
           : false;
+    const hasSettingsUpdateBadge = item.id === "settings" && Boolean(pendingUpdate);
     const showBgDot =
-      !isActive && hasBgTask && !(item.id === "nodes" && isProbeRunning);
-    const showDirtyDot = !isActive && !showBgDot && hasDirtyDraft;
+      !isActive &&
+      !hasSettingsUpdateBadge &&
+      hasBgTask &&
+      !(item.id === "nodes" && isProbeRunning);
+    const showDirtyDot = !isActive && !hasSettingsUpdateBadge && !showBgDot && hasDirtyDraft;
     const bgDotTitle =
       item.id === "overview"
         ? "后台正在检测网站连通或出口信息，切回即可查看"
@@ -478,6 +500,51 @@ export function Sidebar() {
       (item.id === "overview" && runtime.captive_portal_required) ||
       showBgDot ||
       showDirtyDot;
+
+    if (hasSettingsUpdateBadge && pendingUpdate) {
+      return (
+        <div key={item.id} className="relative flex w-full items-center gap-1">
+          <button
+            type="button"
+            onClick={() => appActions.setNav(item.id)}
+            aria-current={isActive ? "page" : undefined}
+            className={`group relative flex min-w-0 flex-1 items-center gap-2.5 rounded-xl px-2.5 py-[7px] text-left text-[13px] transition-colors ${
+              isActive
+                ? "bg-[var(--accent-soft)] font-semibold text-[var(--text)]"
+                : "text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--text)]"
+            }`}
+          >
+            {isActive && (
+              <span
+                className="absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-[var(--accent)]"
+                aria-hidden="true"
+              />
+            )}
+            <Icon
+              className={`h-4 w-4 shrink-0 transition-colors ${
+                isActive
+                  ? "text-[var(--accent)]"
+                  : "text-[var(--muted)] group-hover:text-[var(--text)]"
+              }`}
+            />
+            <span className="truncate">{resolveNavLabel(item.id)}</span>
+          </button>
+          <button
+            type="button"
+            onClick={handleOpenPendingUpdate}
+            title={pendingUpdateBadgeTitle}
+            aria-label={pendingUpdateBadgeTitle}
+            className="inline-flex max-w-[82px] shrink-0 cursor-pointer items-center gap-1 rounded-full bg-[var(--accent)] px-1.5 py-0.5 text-[10px] font-semibold leading-none text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90"
+          >
+            <span
+              className="cc-pulse-dot h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent-ink)]"
+              aria-hidden="true"
+            />
+            <span className="cc-mono truncate">v{pendingUpdate.target_version}</span>
+          </button>
+        </div>
+      );
+    }
 
     return (
       <button
@@ -586,6 +653,21 @@ export function Sidebar() {
             </div>
             <div className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--muted)]">
               <span className="cc-mono truncate">v{runtime.app_version}</span>
+              {pendingUpdate && (
+                <button
+                  type="button"
+                  onClick={handleOpenPendingUpdate}
+                  title={pendingUpdateBadgeTitle}
+                  aria-label={pendingUpdateBadgeTitle}
+                  className="inline-flex h-4 shrink-0 cursor-pointer items-center gap-0.5 rounded-full bg-[var(--accent)] px-1 text-[9px] font-bold leading-none text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90"
+                >
+                  <span
+                    className="cc-pulse-dot h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent-ink)]"
+                    aria-hidden="true"
+                  />
+                  <span>↑</span>
+                </button>
+              )}
             </div>
           </div>
         </div>

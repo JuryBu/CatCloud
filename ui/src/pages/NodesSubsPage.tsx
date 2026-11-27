@@ -60,8 +60,14 @@ import {
 } from "../components/ContinentRegionFilter";
 import { GroupMembershipPopover } from "../components/GroupMembershipPopover";
 import { ShareBundleModal, type ShareBundleTransport } from "../components/ShareBundleModal";
-import { normalizeUiLanguage, useUiDict } from "../i18n";
+import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
+import {
+  getLatencyTooltipKey,
+  hasValidDownMbps,
+  hasValidUpMbps,
+  resolveNodeDisplayLatency,
+} from "../utils/latencyDisplay";
 import {
   type ContinentId,
   buildContinentRegionStats,
@@ -3468,20 +3474,79 @@ export function NodesSubsPage({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [pendingDeleteSub, deletingSub]);
 
-  // Multi-dimensional node filters, sorting & pagination
-  const [keyword, setKeyword] = useState("");
-  const [filterSubId, setFilterSubId] = useState<string>("all");
-  const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
-  const [filterRegion, setFilterRegion] = useState<string>("all");
-  const [filterMultiplier, setFilterMultiplier] =
-    useState<MultiplierRange>("all");
-  const [filterProtocol, setFilterProtocol] = useState<string>("all");
-  const [filter443, setFilter443] = useState<Native443Filter>("all");
-  const [healthFilters, setHealthFilters] = useState<HealthFilters>({
-    googleClean: false,
-    keepalive60s: false,
-    aiUnlocked: false,
-  });
+  // Multi-dimensional node filters, sorting & pagination (persisted across tab switches & reloads)
+  const isStringPref = (raw: unknown): string | undefined =>
+    typeof raw === "string" ? raw : undefined;
+  const [keyword, setKeyword] = usePersistedState<string>(
+    "nodes.keyword",
+    "",
+    isStringPref
+  );
+  const [filterSubId, setFilterSubId] = usePersistedState<string>(
+    "nodes.filterSubId",
+    "all",
+    isStringPref
+  );
+  const [filterContinent, setFilterContinent] = usePersistedState<ContinentId>(
+    "nodes.filterContinent",
+    "all",
+    oneOfPref([
+      "all",
+      "common",
+      "asia",
+      "middle_east",
+      "europe",
+      "north_america",
+      "south_america",
+      "oceania",
+      "africa",
+      "other",
+    ] as const)
+  );
+  const [filterRegion, setFilterRegion] = usePersistedState<string>(
+    "nodes.filterRegion",
+    "all",
+    isStringPref
+  );
+  const [filterMultiplier, setFilterMultiplier] = usePersistedState<MultiplierRange>(
+    "nodes.filterMultiplier",
+    "all",
+    oneOfPref(["all", "le1", "1to2", "ge3"] as const)
+  );
+  const [filterProtocol, setFilterProtocol] = usePersistedState<string>(
+    "nodes.filterProtocol",
+    "all",
+    isStringPref
+  );
+  const [filter443, setFilter443] = usePersistedState<Native443Filter>(
+    "nodes.filter443",
+    "all",
+    oneOfPref(["all", "only_443", "non_443"] as const)
+  );
+  const [healthFilters, setHealthFilters] = usePersistedState<HealthFilters>(
+    "nodes.healthFilters",
+    {
+      googleClean: false,
+      keepalive60s: false,
+      aiUnlocked: false,
+    },
+    (raw: unknown): HealthFilters | undefined => {
+      if (!raw || typeof raw !== "object") return undefined;
+      const obj = raw as Partial<HealthFilters>;
+      if (
+        typeof obj.googleClean === "boolean" &&
+        typeof obj.keepalive60s === "boolean" &&
+        typeof obj.aiUnlocked === "boolean"
+      ) {
+        return {
+          googleClean: obj.googleClean,
+          keepalive60s: obj.keepalive60s,
+          aiUnlocked: obj.aiUnlocked,
+        };
+      }
+      return undefined;
+    }
+  );
   const [sortBy, setSortBy] = usePersistedState<NodeSortBy>(
     "nodes.sortBy",
     "default",
@@ -3690,25 +3755,28 @@ export function NodesSubsPage({
 
     if (sortBy === "default") return matched;
 
+    const healthHints = runtime.node_health_hints;
     return [...matched].sort((a, b) => {
       const pa = storeProbes[a.id];
       const pb = storeProbes[b.id];
       if (sortBy === "latency") {
-        const aOk = pa?.ok !== false && pa?.latency_ms != null;
-        const bOk = pb?.ok !== false && pb?.latency_ms != null;
+        const ra = resolveNodeDisplayLatency(pa, healthHints?.[a.id]);
+        const rb = resolveNodeDisplayLatency(pb, healthHints?.[b.id]);
+        const aOk = ra.ok && ra.latencyMs !== null;
+        const bOk = rb.ok && rb.latencyMs !== null;
         if (aOk !== bOk) return aOk ? -1 : 1;
-        if (aOk && bOk) return (pa!.latency_ms ?? 99999) - (pb!.latency_ms ?? 99999);
+        if (aOk && bOk) return (ra.latencyMs ?? 99999) - (rb.latencyMs ?? 99999);
         return a.name.localeCompare(b.name);
       }
       if (sortBy === "up") {
-        const aHas = pa?.up_mbps != null;
-        const bHas = pb?.up_mbps != null;
+        const aHas = hasValidUpMbps(pa);
+        const bHas = hasValidUpMbps(pb);
         if (aHas !== bHas) return aHas ? -1 : 1;
         if (aHas && bHas) return (pb!.up_mbps ?? -1) - (pa!.up_mbps ?? -1);
         return a.name.localeCompare(b.name);
       }
-      const aHas = pa?.down_mbps != null;
-      const bHas = pb?.down_mbps != null;
+      const aHas = hasValidDownMbps(pa);
+      const bHas = hasValidDownMbps(pb);
       if (aHas !== bHas) return aHas ? -1 : 1;
       if (aHas && bHas) return (pb!.down_mbps ?? -1) - (pa!.down_mbps ?? -1);
       return a.name.localeCompare(b.name);
@@ -3725,6 +3793,7 @@ export function NodesSubsPage({
     healthFilters,
     sortBy,
     storeProbes,
+    runtime.node_health_hints,
     subNameMap,
     embeddedSubsOnly,
   ]);
@@ -4129,16 +4198,24 @@ export function NodesSubsPage({
   ): Promise<boolean> => {
     if (inTauri) {
       try {
-        const count = await catcloudApi.applyMigrationNodes(customName, preview.nodes);
+        const outcome = await catcloudApi.applyMigrationNodesWithMeta(
+          customName,
+          preview.nodes
+        );
+        const count = outcome.imported_count;
+        const importedSubId = outcome.sub_id || null;
         const ruleRes = includeRules
           ? await persistMigratedRules(preview.prepend_rules, preview.append_rules)
           : { savedCount: 0, error: null };
         await syncListsFromBackend();
+        if (importedSubId) {
+          setFilterSubId(importedSubId);
+        }
         if (count > 0) {
           setImportSuccessBanner({
             count,
             sourceName: customName,
-            subId: null,
+            subId: importedSubId,
           });
         }
         if (ruleRes.error) {
@@ -4283,14 +4360,19 @@ export function NodesSubsPage({
   ): Promise<boolean> => {
     const { name, outcome, selectedNodes, targetMode, targetSubId, updateMode } = payload;
     const cleanName = name.trim() || `抓取 · ${outcome.target_name || "桌面软件"}`;
-    const capturedNodes =
-      Array.isArray(selectedNodes) && selectedNodes.length > 0
-        ? selectedNodes
-        : Array.isArray(outcome.nodes)
-          ? outcome.nodes
-          : [];
+    const hasExplicitSelection = Array.isArray(selectedNodes);
+    const capturedNodes = hasExplicitSelection
+      ? selectedNodes
+      : Array.isArray(outcome.nodes)
+        ? outcome.nodes
+        : [];
     if (!outcome.supported || capturedNodes.length === 0) {
-      appActions.showToast("未捕获到可导入节点，原有分组已保留不动", "warn");
+      appActions.showToast(
+        hasExplicitSelection
+          ? "请至少勾选 1 个节点后再导入，原有分组已保留不动"
+          : "未捕获到可导入节点，原有分组已保留不动",
+        "warn"
+      );
       return false;
     }
 
@@ -4351,16 +4433,21 @@ export function NodesSubsPage({
     if (inTauri) {
       try {
         if (useMigratedPersistence) {
-          const importedCount = await catcloudApi.applyMigrationNodes(
+          const applied = await catcloudApi.applyMigrationNodesWithMeta(
             cleanName,
             capturedNodes
           );
+          const importedCount = applied.imported_count;
+          const importedSubId = applied.sub_id || null;
           await syncListsFromBackend();
+          if (importedSubId) {
+            setFilterSubId(importedSubId);
+          }
           if (importedCount > 0) {
             setImportSuccessBanner({
               count: importedCount,
               sourceName: cleanName,
-              subId: null,
+              subId: importedSubId,
             });
           }
           appActions.showToast(
@@ -4388,7 +4475,7 @@ export function NodesSubsPage({
         };
         const saved = await catcloudApi.upsertSubscription(nextSub);
         let importedCount = 0;
-        let usedFallbackSnapshot = false;
+        let finalSubId: string | null = saved.id;
         try {
           const refreshed = await catcloudApi.refreshSubscription(saved.id);
           importedCount = refreshed.node_count;
@@ -4401,21 +4488,22 @@ export function NodesSubsPage({
           } catch {
             /* ignore empty subscription cleanup failure */
           }
-          importedCount = await catcloudApi.applyMigrationNodes(
+          const fallbackRes = await catcloudApi.applyMigrationNodesWithMeta(
             cleanName,
             capturedNodes
           );
-          usedFallbackSnapshot = true;
+          importedCount = fallbackRes.imported_count;
+          finalSubId = fallbackRes.sub_id || null;
         }
         await syncListsFromBackend();
-        if (!usedFallbackSnapshot) {
-          setFilterSubId(saved.id);
+        if (finalSubId) {
+          setFilterSubId(finalSubId);
         }
         if (importedCount > 0) {
           setImportSuccessBanner({
             count: importedCount,
             sourceName: cleanName,
-            subId: usedFallbackSnapshot ? null : saved.id,
+            subId: finalSubId,
           });
         }
         appActions.showToast(
@@ -5949,7 +6037,7 @@ export function NodesSubsPage({
           />
         )}
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[860px] table-fixed border-collapse text-left text-xs">
+          <table className="w-full min-w-[880px] table-fixed border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--muted)]">
                 <th className="w-8 px-2 py-2.5 text-center">
@@ -5961,7 +6049,7 @@ export function NodesSubsPage({
                     className="accent-[var(--accent)]"
                   />
                 </th>
-                <th className="min-w-[240px] whitespace-nowrap px-2 py-2.5">
+                <th className="w-[260px] min-w-[240px] whitespace-nowrap px-2 py-2.5">
                   节点名称 / 来源 / 分组
                 </th>
                 <th className="w-[122px] whitespace-nowrap px-1.5 py-2.5">
@@ -6108,43 +6196,112 @@ export function NodesSubsPage({
 
                       {/* Health Snapshot Badges: Latency, Up/Down Speed, Google Clean/CN & AI Unlocks */}
                       <td className="w-[194px] px-1.5 py-2.5 align-middle">
+                        {(() => {
+                          const healthHint = runtime.node_health_hints?.[node.id];
+                          const resolvedLat = resolveNodeDisplayLatency(probe, healthHint);
+                          const tipKey = getLatencyTooltipKey(resolvedLat);
+                          const latBaseTip =
+                            tipKey === "probeHot"
+                              ? dict.latency.probeHotTooltip
+                              : tipKey === "healthCold"
+                                ? dict.latency.healthColdTooltip
+                                : tipKey === "failed"
+                                  ? dict.latency.failedTooltip
+                                  : dict.latency.untestedTooltip;
+                          const tipTags: string[] = [];
+                          if (resolvedLat.isProbation) tipTags.push(dict.latency.probationBadge);
+                          if (resolvedLat.isDegraded) tipTags.push(dict.latency.degradedBadge);
+                          if (
+                            healthHint?.status === "cooldown" &&
+                            healthHint.cooldown_remaining_sec > 0
+                          ) {
+                            tipTags.push(
+                              formatI18nTemplate(dict.latency.cooldownSec, {
+                                sec: Math.ceil(healthHint.cooldown_remaining_sec),
+                              })
+                            );
+                          }
+                          const latTooltip =
+                            tipTags.length > 0 ? `${latBaseTip} · ${tipTags.join(" · ")}` : latBaseTip;
+                          const isCooldown =
+                            healthHint?.status === "cooldown" && resolvedLat.state === "failed";
+                          const sourceShort =
+                            resolvedLat.latencyMs !== null
+                              ? resolvedLat.source === "health"
+                                ? dict.latency.sourceHealthShort
+                                : resolvedLat.source === "probe"
+                                  ? dict.latency.sourceProbeShort
+                                  : null
+                              : null;
+                          const stateBadge = resolvedLat.isDegraded
+                            ? dict.latency.degradedBadge
+                            : resolvedLat.isProbation
+                              ? dict.latency.probationBadge
+                              : null;
+                          const hasUp = hasValidUpMbps(probe);
+                          const hasDown = hasValidDownMbps(probe);
+                          return (
                         <div className="flex flex-col gap-1 text-[10px]">
-                          <div className="flex items-center gap-2 cc-mono">
+                          <div className="flex flex-wrap items-center gap-1.5 cc-mono">
                             <span
-                              className={`shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 font-semibold ${
-                                probe?.ok === false
-                                  ? "bg-[var(--red-soft)] text-[var(--red)]"
-                                  : probe?.latency_ms != null
-                                    ? probe.latency_ms <= 140
-                                      ? "bg-[var(--green-soft)] text-[var(--green)]"
-                                      : probe.latency_ms <= 300
-                                        ? "bg-[var(--amber-soft)] text-[var(--amber)]"
-                                        : "bg-[var(--red-soft)] text-[var(--red)]"
-                                    : "bg-[var(--bg-elevated)] text-[var(--muted)]"
+                              title={latTooltip}
+                              className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 font-semibold ${
+                                isCooldown
+                                  ? "bg-[var(--amber-soft)] text-[var(--amber)]"
+                                  : resolvedLat.state === "failed"
+                                    ? "bg-[var(--red-soft)] text-[var(--red)]"
+                                    : resolvedLat.latencyMs !== null
+                                      ? resolvedLat.latencyMs <= 140
+                                        ? "bg-[var(--green-soft)] text-[var(--green)]"
+                                        : resolvedLat.latencyMs <= 300
+                                          ? "bg-[var(--amber-soft)] text-[var(--amber)]"
+                                          : "bg-[var(--red-soft)] text-[var(--red)]"
+                                      : "bg-[var(--bg-elevated)] text-[var(--muted)]"
                               }`}
                             >
-                              {probe?.ok === false
-                                ? "超时"
-                                : probe?.latency_ms != null
-                                  ? `${Math.round(probe.latency_ms)} ms`
-                                  : "未测速"}
+                              <span>
+                                {resolvedLat.latencyMs !== null
+                                  ? `${Math.round(resolvedLat.latencyMs)} ms`
+                                  : isCooldown
+                                    ? healthHint && healthHint.cooldown_remaining_sec > 0
+                                      ? formatI18nTemplate(dict.latency.cooldownSec, {
+                                          sec: Math.ceil(healthHint.cooldown_remaining_sec),
+                                        })
+                                      : dict.latency.cooldownActive
+                                    : resolvedLat.state === "failed"
+                                      ? dict.latency.timeoutShort
+                                      : dict.latency.untestedShort}
+                              </span>
+                              {sourceShort && (
+                                <span className="font-sans text-[9px] font-normal opacity-80">
+                                  {sourceShort}
+                                </span>
+                              )}
                             </span>
-                            {(probe?.up_mbps != null || probe?.down_mbps != null) && (
+                            {stateBadge && (
+                              <span
+                                title={latTooltip}
+                                className="rounded bg-[var(--amber-soft)] px-1 py-0.5 font-sans text-[9px] font-medium text-[var(--amber)]"
+                              >
+                                {stateBadge}
+                              </span>
+                            )}
+                            {(hasUp || hasDown) && (
                               <div
                                 className="flex flex-col leading-tight text-[11px]"
                                 title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
                               >
-                                {probe?.up_mbps != null && (
+                                {hasUp && (
                                   <span className="whitespace-nowrap font-medium text-[var(--coral)]">
-                                    ↑{probe.up_mbps.toFixed(1)} Mbps
+                                    ↑{probe!.up_mbps!.toFixed(1)} Mbps
                                   </span>
                                 )}
-                                {probe?.down_mbps != null && (
+                                {hasDown && (
                                   <span className="whitespace-nowrap font-medium text-[var(--sky)]">
                                     ↓
-                                    {probe.down_mbps >= 100
-                                      ? Math.round(probe.down_mbps)
-                                      : probe.down_mbps.toFixed(1)}{" "}
+                                    {probe!.down_mbps! >= 100
+                                      ? Math.round(probe!.down_mbps!)
+                                      : probe!.down_mbps!.toFixed(1)}{" "}
                                     Mbps
                                   </span>
                                 )}
@@ -6215,6 +6372,8 @@ export function NodesSubsPage({
                               )}
                           </div>
                         </div>
+                          );
+                        })()}
                       </td>
 
                       {/* Single-Node Relay 3-State Override */}
@@ -6379,7 +6538,7 @@ export function NodesSubsPage({
               aria-modal="true"
               aria-label={dict.nodes.mergeSubsTitle}
               onClick={(e) => e.stopPropagation()}
-              className="cc-surface w-full max-w-lg rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+              className="cc-surface max-h-[calc(100vh-2rem)] w-full max-w-lg overflow-y-auto rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-center gap-2.5">
@@ -6559,7 +6718,7 @@ export function NodesSubsPage({
               aria-modal="true"
               aria-label="确认删除订阅"
               onClick={(e) => e.stopPropagation()}
-              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+              className="cc-surface max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-start gap-3">

@@ -1219,15 +1219,29 @@ export function RulesConnsPage() {
     const list: ManagedRuleItem[] = [];
     for (const grp of groups) {
       grp.match_rules.forEach((raw, idx) => {
-        const parts = raw.split(",");
-        const rType = (parts[0] ?? "DOMAIN-SUFFIX").trim().toUpperCase();
-        const val = (parts[1] ?? raw).trim();
+        const trimmed = raw.trim();
+        const parts = splitRuleTopLevel(trimmed);
+        let rType = "DOMAIN-SUFFIX";
+        let val = trimmed;
+        let noResolve = false;
+        if (parts && parts.length >= 2) {
+          rType = (parts[0] ?? "DOMAIN-SUFFIX").trim().toUpperCase();
+          let endIdx = parts.length;
+          while (endIdx > 2 && isRuleFlagToken(parts[endIdx - 1])) {
+            endIdx -= 1;
+          }
+          const extraParts = parts.slice(endIdx);
+          noResolve = extraParts.some((p) => p.trim().toLowerCase() === "no-resolve");
+          val = parts.slice(1, endIdx).join(",").trim() || trimmed;
+        }
         list.push({
           id: `grp-${grp.id}-${idx}`,
           layer: "group",
           ruleType: rType,
           value: val,
           target: grp.name,
+          noResolve,
+          rawLine: trimmed,
           groupId: grp.id,
         });
       });
@@ -1354,12 +1368,41 @@ export function RulesConnsPage() {
   };
 
   const handleCopyYaml = async () => {
-    if (!compiledPreview?.yaml) {
+    const text = compiledPreview?.yaml;
+    if (!text) {
       appActions.showToast("暂无可复制的编译配置", "warn");
       return;
     }
-    try {
-      await navigator.clipboard.writeText(compiledPreview.yaml);
+    let copied = false;
+    if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        copied = false;
+      }
+    }
+    if (!copied && typeof document !== "undefined") {
+      const textarea = document.createElement("textarea");
+      textarea.value = text;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.left = "-9999px";
+      textarea.style.top = "0";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      try {
+        textarea.focus();
+        textarea.select();
+        textarea.setSelectionRange(0, text.length);
+        copied = document.execCommand("copy");
+      } catch {
+        copied = false;
+      } finally {
+        document.body.removeChild(textarea);
+      }
+    }
+    if (copied) {
       setCopiedYaml(true);
       appActions.showToast("已复制后端编译生成的脱敏配置", "ok");
       if (copiedYamlTimerRef.current !== null) {
@@ -1369,7 +1412,7 @@ export function RulesConnsPage() {
         copiedYamlTimerRef.current = null;
         setCopiedYaml(false);
       }, 1800);
-    } catch {
+    } else {
       appActions.showToast("剪贴板不可用，请手动选中复制", "warn");
     }
   };

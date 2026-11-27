@@ -17,6 +17,7 @@ import {
   catcloudApi,
   formatErrorMessage,
 } from "../api/tauri";
+import { normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
 import {
   TITLE_BAR_SAFE_TOP_PX,
@@ -198,6 +199,10 @@ export function GroupMembershipPopover({
   const runtime = useAppSelector((s) => s.runtime);
   const activeNav = useAppSelector((s) => s.activeNav);
   const workspaceTab = useAppSelector((s) => s.sessionDrafts.nodesWorkspace.tab);
+  const uiLang = normalizeUiLanguage(
+    useAppSelector((s) => s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
   const popoverId = useId();
 
   const triggerRef = useRef<HTMLButtonElement | null>(null);
@@ -209,6 +214,7 @@ export function GroupMembershipPopover({
   const [pendingGroupCounts, setPendingGroupCounts] = useState<
     Record<string, number>
   >({});
+  const [confirmRemoveGroupId, setConfirmRemoveGroupId] = useState<string | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -307,6 +313,7 @@ export function GroupMembershipPopover({
 
   const closePopover = useCallback((restoreFocus = false) => {
     setOpen(false);
+    setConfirmRemoveGroupId(null);
     if (restoreFocus) {
       triggerRef.current?.focus();
     }
@@ -471,9 +478,8 @@ export function GroupMembershipPopover({
     ev.stopPropagation();
   };
 
-  const handleToggleGroup = (group: MultiGroup) => {
-    const currentlyJoined = joinedGroupIdSet.has(group.id);
-    const desiredInGroup = !currentlyJoined;
+  const commitToggleGroup = (group: MultiGroup, desiredInGroup: boolean) => {
+    setConfirmRemoveGroupId(null);
     setPendingGroupCounts((prev) => ({
       ...prev,
       [group.id]: (prev[group.id] ?? 0) + 1,
@@ -497,6 +503,24 @@ export function GroupMembershipPopover({
         });
       }
     );
+  };
+
+  const handleToggleGroup = (group: MultiGroup) => {
+    const currentlyJoined = joinedGroupIdSet.has(group.id);
+    const desiredInGroup = !currentlyJoined;
+    const isActiveNodeHere =
+      currentlyJoined &&
+      (group.active_node_id === node.id ||
+        (runtime.route_mode !== "single" &&
+          runtime.active_group_id === group.id &&
+          runtime.active_node_id === node.id));
+
+    if (!desiredInGroup && isActiveNodeHere) {
+      setConfirmRemoveGroupId((prev) => (prev === group.id ? null : group.id));
+      return;
+    }
+
+    commitToggleGroup(group, desiredInGroup);
   };
 
   return (
@@ -612,72 +636,111 @@ export function GroupMembershipPopover({
                 const isRunningGroup =
                   runtime.route_mode !== "single" &&
                   runtime.active_group_id === group.id;
-                const isActiveNodeHere = checked && group.active_node_id === node.id;
+                const isActiveNodeHere =
+                  checked &&
+                  (group.active_node_id === node.id ||
+                    (isRunningGroup && runtime.active_node_id === node.id));
+                const isConfirmingRemove = checked && confirmRemoveGroupId === group.id;
                 const isPending = (pendingGroupCounts[group.id] ?? 0) > 0;
                 const displayName = formatGroupName(group.name);
 
                 return (
-                  <button
-                    key={group.id}
-                    type="button"
-                    role="menuitemcheckbox"
-                    aria-checked={checked}
-                    onMouseDown={(ev) => {
-                      ev.preventDefault();
-                      ev.stopPropagation();
-                    }}
-                    onClick={(ev) => {
-                      ev.stopPropagation();
-                      handleToggleGroup(group);
-                    }}
-                    className={`flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors ${
-                      checked
-                        ? "bg-[var(--green-soft)]/70 text-[var(--text)] hover:bg-[var(--green-soft)]"
-                        : "text-[var(--text)] hover:bg-[var(--card-hover)]"
-                    }`}
-                  >
-                    <div className="flex min-w-0 flex-1 items-center gap-2">
-                      <span
-                        className={`inline-flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
-                          checked
-                            ? "border-[var(--green)] bg-[var(--green)] text-[var(--accent-ink)]"
-                            : "border-[var(--line-strong)] bg-[var(--bg-elevated)]"
-                        }`}
-                        aria-hidden="true"
-                      >
-                        {checked && <Check className="h-3 w-3 stroke-[2.5]" />}
-                      </span>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1">
-                          <span
-                            className={`truncate text-xs ${
-                              checked ? "font-semibold text-[var(--text)]" : "font-medium"
-                            }`}
-                            title={displayName}
-                          >
-                            {displayName}
-                          </span>
-                          {isRunningGroup && (
-                            <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--accent-soft)] px-1.5 py-0.2 text-[9.5px] font-semibold text-[var(--accent)]">
-                              当前运行
+                  <div key={group.id} className="space-y-1">
+                    <button
+                      type="button"
+                      role="menuitemcheckbox"
+                      aria-checked={checked}
+                      onMouseDown={(ev) => {
+                        ev.preventDefault();
+                        ev.stopPropagation();
+                      }}
+                      onClick={(ev) => {
+                        ev.stopPropagation();
+                        handleToggleGroup(group);
+                      }}
+                      className={`flex w-full cursor-pointer items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-left text-xs transition-colors ${
+                        checked
+                          ? "bg-[var(--green-soft)]/70 text-[var(--text)] hover:bg-[var(--green-soft)]"
+                          : "text-[var(--text)] hover:bg-[var(--card-hover)]"
+                      }`}
+                    >
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        <span
+                          className={`inline-flex h-4 w-4 shrink-0 items-center justify-center rounded border transition-colors ${
+                            checked
+                              ? "border-[var(--green)] bg-[var(--green)] text-[var(--accent-ink)]"
+                              : "border-[var(--line-strong)] bg-[var(--bg-elevated)]"
+                          }`}
+                          aria-hidden="true"
+                        >
+                          {checked && <Check className="h-3 w-3 stroke-[2.5]" />}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-center gap-1">
+                            <span
+                              className={`truncate text-xs ${
+                                checked ? "font-semibold text-[var(--text)]" : "font-medium"
+                              }`}
+                              title={displayName}
+                            >
+                              {displayName}
                             </span>
+                            {isRunningGroup && (
+                              <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--accent-soft)] px-1.5 py-0.2 text-[9.5px] font-semibold text-[var(--accent)]">
+                                当前运行
+                              </span>
+                            )}
+                          </div>
+                          {isActiveNodeHere && (
+                            <div className="mt-0.5 text-[10px] text-[var(--amber)]">
+                              {dict.groups.activeRemoveConfirmTip}
+                            </div>
                           )}
                         </div>
-                        {isActiveNodeHere && (
-                          <div className="mt-0.5 text-[10px] text-[var(--amber)]">
-                            当前在用节点 · 取消勾选将自动切线
-                          </div>
-                        )}
                       </div>
-                    </div>
 
-                    <span className="inline-flex shrink-0 items-center gap-1 cc-mono text-[10px] text-[var(--muted)]">
-                      {isPending && (
-                        <RefreshCw className="h-2.5 w-2.5 animate-spin text-[var(--accent)]" />
-                      )}
-                      <span>{group.member_node_ids.length} 节点</span>
-                    </span>
-                  </button>
+                      <span className="inline-flex shrink-0 items-center gap-1 cc-mono text-[10px] text-[var(--muted)]">
+                        {isPending && (
+                          <RefreshCw className="h-2.5 w-2.5 animate-spin text-[var(--accent)]" />
+                        )}
+                        <span>{group.member_node_ids.length} 节点</span>
+                      </span>
+                    </button>
+
+                    {isConfirmingRemove && (
+                      <div
+                        className="rounded-lg border border-[var(--amber)]/50 bg-[var(--amber-soft)] px-2.5 py-2 text-[10.5px]"
+                        onMouseDown={(ev) => ev.stopPropagation()}
+                        onClick={(ev) => ev.stopPropagation()}
+                      >
+                        <p className="leading-snug text-[var(--text)]">
+                          {dict.groups.removeActiveProtectedHint}
+                        </p>
+                        <div className="mt-1.5 flex items-center justify-end gap-1.5">
+                          <button
+                            type="button"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              setConfirmRemoveGroupId(null);
+                            }}
+                            className="rounded-md border border-[var(--line)] bg-[var(--card)] px-2 py-0.5 text-[10px] font-medium text-[var(--text-secondary)] hover:text-[var(--text)]"
+                          >
+                            {dict.common.cancel}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={(ev) => {
+                              ev.stopPropagation();
+                              commitToggleGroup(group, false);
+                            }}
+                            className="rounded-md bg-[var(--amber)] px-2 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)] hover:opacity-90"
+                          >
+                            {dict.common.confirm}
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
                 );
               })}
             </div>

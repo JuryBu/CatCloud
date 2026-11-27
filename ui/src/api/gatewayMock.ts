@@ -291,20 +291,33 @@ export function buildMockGatewayExportOutput(
     (r) => `  - IP-CIDR,${maskServer(r.server)}/32,DIRECT,no-resolve`
   );
 
+  const UDP_ONLY_PROTOCOLS = new Set(["hysteria2", "hy2", "hysteria", "tuic", "wireguard"]);
   const buildNodeProxyLines = (list: ProxyNode[]) =>
-    list.flatMap((n) => [
-      `  - name: "${n.name}"`,
-      `    type: ${n.protocol}`,
-      `    server: ${maskServer(n.server)}`,
-      `    port: ${n.port}`,
-      ...(n.protocol === "vless"
-        ? [`    uuid: "${redact ? "***REDACTED***" : "00000000-0000-4000-8000-000000000000"}"`]
-        : [`    password: "${redact ? "***REDACTED***" : "<DEMO_NODE_SECRET>"}"`]),
-      `    udp: true`,
-      ...(!n.is_443_native && enabledRelays.length > 0
-        ? [`    dialer-proxy: "⚡ 国内预加速入口"`]
-        : []),
-    ]);
+    list.flatMap((n) => {
+      const proto = n.protocol.trim().toLowerCase();
+      const isTcpProxy = !UDP_ONLY_PROTOCOLS.has(proto);
+      return [
+        `  - name: "${n.name}"`,
+        `    type: ${n.protocol}`,
+        `    server: ${maskServer(n.server)}`,
+        `    port: ${n.port}`,
+        ...(n.protocol === "vless"
+          ? [`    uuid: "${redact ? "***REDACTED***" : "00000000-0000-4000-8000-000000000000"}"`]
+          : [`    password: "${redact ? "***REDACTED***" : "<DEMO_NODE_SECRET>"}"`]),
+        ...(isTcpProxy ? [`    tfo: false`] : []),
+        ...(proto === "anytls"
+          ? [
+              `    min-idle-session: 0`,
+              `    idle-session-check-interval: 30`,
+              `    idle-session-timeout: 30`,
+            ]
+          : []),
+        `    udp: true`,
+        ...(!n.is_443_native && isTcpProxy && enabledRelays.length > 0
+          ? [`    dialer-proxy: "⚡ 国内预加速入口"`]
+          : []),
+      ];
+    });
 
   if (options.profile === "relay_fragment") {
     const lines = [
@@ -398,13 +411,32 @@ export function buildMockGatewayExportOutput(
   const prependRules = ctx.fullConfig.rules_override?.global_prepend_rules ?? [];
   const appendRules = ctx.fullConfig.rules_override?.global_append_rules ?? [];
   const primaryGroupName = ctx.groups[0]?.name || "猫云主代理组";
+  const fallbackDomesticDirectRules = [
+    "  - DOMAIN-SUFFIX,cn,DIRECT",
+    "  - DOMAIN-SUFFIX,qq.com,DIRECT",
+    "  - DOMAIN-SUFFIX,qpic.cn,DIRECT",
+    "  - DOMAIN-SUFFIX,qlogo.cn,DIRECT",
+    "  - DOMAIN-SUFFIX,gtimg.cn,DIRECT",
+    "  - DOMAIN-SUFFIX,gtimg.com,DIRECT",
+    "  - DOMAIN-SUFFIX,weixin.qq.com,DIRECT",
+    "  - DOMAIN-SUFFIX,wechat.com,DIRECT",
+    "  - DOMAIN-SUFFIX,qcloud.com,DIRECT",
+    "  - DOMAIN-SUFFIX,myqcloud.com,DIRECT",
+    "  - DOMAIN-SUFFIX,tencent.com,DIRECT",
+    "  - DOMAIN-SUFFIX,aliyun.com,DIRECT",
+    "  - DOMAIN-SUFFIX,baidu.com,DIRECT",
+    "  - DOMAIN-SUFFIX,bilibili.com,DIRECT",
+    "  - DOMAIN-SUFFIX,taobao.com,DIRECT",
+    "  - DOMAIN-SUFFIX,jd.com,DIRECT",
+    "  - DOMAIN-SUFFIX,163.com,DIRECT",
+  ];
   const baseRules = [
     ...relayAntiLoopRules,
     "  - IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
     "  - IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
     "  - IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
     ...prependRules.map((r) => `  - ${r}`),
-    ...(customOnly ? [] : ["  - GEOSITE,cn,DIRECT", "  - GEOIP,CN,DIRECT,no-resolve"]),
+    ...(customOnly ? [] : fallbackDomesticDirectRules),
     ...appendRules.map((r) => `  - ${r}`),
     `  - MATCH,${primaryGroupName}`,
   ];

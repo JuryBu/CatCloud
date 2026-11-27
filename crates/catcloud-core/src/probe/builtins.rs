@@ -1567,13 +1567,11 @@ pub async fn run_upload_probe_with_config(
     {
         Ok(v) => v,
         Err(err) => {
-            let mut rec = failed_record(
+            return failed_record(
                 node_id,
                 &def.id,
                 format!("fast_fuse_upload_abort(stage1={stage1_bytes}B): {err}"),
             );
-            rec.up_mbps = Some(0.0);
-            return rec;
         }
     };
 
@@ -1584,7 +1582,7 @@ pub async fn run_upload_probe_with_config(
             tested_at: now_rfc3339(),
             ok: false,
             latency_ms: Some(stage1_ms),
-            up_mbps: Some(stage1_mbps),
+            up_mbps: None,
             detail: Some(format!(
                 "fast_fuse_triggered: stage1_bytes={stage1_bytes}, up_mbps={stage1_mbps:.2} < {:.2}",
                 cfg.fuse_min_mbps
@@ -1637,7 +1635,7 @@ pub async fn run_upload_probe_with_config(
             tested_at: now_rfc3339(),
             ok: false,
             latency_ms: Some(stage1_ms),
-            up_mbps: Some(stage1_mbps),
+            up_mbps: None,
             detail: Some(format!(
                 "stage2_upload_failed(bytes={target_bytes}, stage1_mbps={stage1_mbps:.2}): {err}"
             )),
@@ -1730,13 +1728,11 @@ pub async fn run_download_probe_with_config(
     {
         Ok(v) => v,
         Err(err) => {
-            let mut rec = failed_record(
+            return failed_record(
                 node_id,
                 &def.id,
                 format!("fast_fuse_download_abort(stage1={stage1_bytes}B): {err}"),
             );
-            rec.down_mbps = Some(0.0);
-            return rec;
         }
     };
 
@@ -1747,7 +1743,7 @@ pub async fn run_download_probe_with_config(
             tested_at: now_rfc3339(),
             ok: false,
             latency_ms: Some(stage1_ms),
-            down_mbps: Some(stage1_mbps),
+            down_mbps: None,
             detail: Some(format!(
                 "fast_fuse_triggered: stage1_read={stage1_read}, down_mbps={stage1_mbps:.2} < {:.2}",
                 cfg.fuse_min_mbps
@@ -1789,7 +1785,11 @@ pub async fn run_download_probe_with_config(
             tested_at: now_rfc3339(),
             ok: stage2_read > 0,
             latency_ms: Some(stage2_ms),
-            down_mbps: Some(stage2_mbps),
+            down_mbps: if stage2_read > 0 {
+                Some(stage2_mbps)
+            } else {
+                None
+            },
             detail: Some(format!(
                 "scaled_download_ok: stage1_mbps={stage1_mbps:.2}, stage2_read={stage2_read}, down_mbps={stage2_mbps:.2}"
             )),
@@ -1801,7 +1801,7 @@ pub async fn run_download_probe_with_config(
             tested_at: now_rfc3339(),
             ok: false,
             latency_ms: Some(stage1_ms),
-            down_mbps: Some(stage1_mbps),
+            down_mbps: None,
             detail: Some(format!(
                 "stage2_download_failed(bytes={target_bytes}, stage1_mbps={stage1_mbps:.2}): {err}"
             )),
@@ -2656,6 +2656,175 @@ mod tests {
         assert!(!rec_fail.ok);
         assert!(rec_fail.latency_ms.is_none());
         assert_eq!(rec_fail.loss_pct, Some(100.0));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn throughput_stage2_failure_and_stage1_abort_never_leak_residual_mbps() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let up_hits = Arc::new(AtomicUsize::new(0));
+        let down_hits = Arc::new(AtomicUsize::new(0));
+        let c_up = Arc::clone(&up_hits);
+        let c_down = Arc::clone(&down_hits);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let c_up = Arc::clone(&c_up);
+                let c_down = Arc::clone(&c_down);
+                tokio::spawn(async move {
+                    let mut buf = Vec::with_capacity(4096);
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        buf.clear();
+                        let mut header_end = None;
+                        while header_end.is_none() {
+                            let n = socket.read(&mut tmp).await.unwrap_or(0);
+                            if n == 0 {
+                                return;
+                            }
+                            buf.extend_from_slice(&tmp[..n]);
+                            header_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+                        }
+                        let hend = header_end.unwrap();
+                        let header_str = String::from_utf8_lossy(&buf[..hend]);
+                        let first = header_str.lines().next().unwrap_or("");
+                        let path = first.split_whitespace().nth(1).unwrap_or("/");
+                        let content_len: usize = header_str
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        let mut read_body = buf.len().saturating_sub(hend + 4);
+                        while read_body < content_len {
+                            let n = socket.read(&mut tmp).await.unwrap_or(0);
+                            if n == 0 {
+                                break;
+                            }
+                            read_body += n;
+                        }
+
+                        if path.starts_with("/up_stage2_fail") {
+                            let hit = c_up.fetch_add(1, Ordering::SeqCst);
+                            if hit == 0 {
+                                let _ = socket
+                                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                                    .await;
+                            } else {
+                                let _ = socket
+                                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                    .await;
+                            }
+                            return;
+                        } else if path.starts_with("/down_stage2_fail") {
+                            let hit = c_down.fetch_add(1, Ordering::SeqCst);
+                            if hit == 0 {
+                                let body = vec![b'D'; 16 * 1024];
+                                let hdr = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = socket.write_all(hdr.as_bytes()).await;
+                                let _ = socket.write_all(&body).await;
+                            } else {
+                                let _ = socket
+                                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                    .await;
+                            }
+                            return;
+                        } else {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let cfg = ThroughputProbeConfig {
+            fuse_bytes: 16 * 1024,
+            fuse_min_mbps: 0.01,
+            max_payload_bytes: 64 * 1024,
+        };
+
+        // 1. Stage-2 upload failure -> ok=false AND up_mbps=None (stage1_mbps kept in detail only)
+        let up_def = ProbeDefinition {
+            id: "builtin_upload".to_string(),
+            kind: crate::models::ProbeKind::Upload,
+            target_url: format!("http://127.0.0.1:{port}/up_stage2_fail"),
+            method: "POST".to_string(),
+            expected_status: Some(200),
+            payload_bytes: Some(32 * 1024),
+            timeout_ms: 3000,
+            ..Default::default()
+        };
+        let up_rec = run_upload_probe_with_config(&client, "n1", &up_def, &cfg).await;
+        assert!(!up_rec.ok);
+        assert_eq!(up_rec.up_mbps, None);
+        assert!(
+            up_rec
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("stage2_upload_failed")
+        );
+
+        // 2. Stage-2 download failure -> ok=false AND down_mbps=None
+        let down_def = ProbeDefinition {
+            id: "builtin_download".to_string(),
+            kind: crate::models::ProbeKind::Download,
+            target_url: format!("http://127.0.0.1:{port}/down_stage2_fail?bytes=32768"),
+            method: "GET".to_string(),
+            expected_status: Some(200),
+            payload_bytes: Some(32 * 1024),
+            timeout_ms: 3000,
+            ..Default::default()
+        };
+        let down_rec = run_download_probe_with_config(&client, "n1", &down_def, &cfg).await;
+        assert!(!down_rec.ok);
+        assert_eq!(down_rec.down_mbps, None);
+        assert!(
+            down_rec
+                .detail
+                .as_deref()
+                .unwrap_or("")
+                .contains("stage2_download_failed")
+        );
+
+        // 3. Stage-1 HTTP error abort -> ok=false AND up_mbps/down_mbps == None (not Some(0.0))
+        let abort_up = ProbeDefinition {
+            target_url: format!("http://127.0.0.1:{port}/abort_500"),
+            ..up_def
+        };
+        let rec_abort_up = run_upload_probe_with_config(&client, "n1", &abort_up, &cfg).await;
+        assert!(!rec_abort_up.ok);
+        assert_eq!(rec_abort_up.up_mbps, None);
+
+        let abort_down = ProbeDefinition {
+            target_url: format!("http://127.0.0.1:{port}/abort_500"),
+            ..down_def
+        };
+        let rec_abort_down = run_download_probe_with_config(&client, "n1", &abort_down, &cfg).await;
+        assert!(!rec_abort_down.ok);
+        assert_eq!(rec_abort_down.down_mbps, None);
 
         server.abort();
     }

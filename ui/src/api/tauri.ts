@@ -426,6 +426,7 @@ export interface ProbeSnapshot {
   per_probe_down_mbps: Record<string, number>;
   per_probe_ping_ms: Record<string, number>;
   per_probe_detail?: Record<string, string>;
+  per_probe_tested_at?: Record<string, string>;
 }
 
 export interface DynamicFilterSpec {
@@ -518,6 +519,7 @@ export interface NodeHealthHintDto {
   cooldown_remaining_sec: number;
   reason?: string;
   stage?: string;
+  probed_at_ms?: number | null;
 }
 
 export type NodeHealthHint = NodeHealthHintDto;
@@ -1165,6 +1167,12 @@ export interface PendingUpdatePromptDto {
   installer_filename: string | null;
   dismissed_in_session: boolean;
   is_elevated: boolean;
+  silent_badge_only?: boolean;
+}
+
+export interface MigrationApplyOutcome {
+  imported_count: number;
+  sub_id: string;
 }
 
 export interface SkipUpdateResultDto {
@@ -1485,6 +1493,23 @@ function subscribeTauriEvent<T>(event: string, onEvent: (payload: T) => void): (
   };
 }
 
+function subscribeTauriEmptyEvent(event: string, onEvent: () => void): () => void {
+  let disposed = false;
+  let unlisten: (() => void) | null = null;
+  if (isTauriEnv()) {
+    void tauriListen<unknown>(event, () => {
+      if (!disposed) onEvent();
+    }).then((fn) => {
+      if (disposed) fn?.();
+      else unlisten = fn;
+    });
+  }
+  return () => {
+    disposed = true;
+    unlisten?.();
+  };
+}
+
 /* ============================================================================
  * Sanitized Browser Preview Fallback Data (RFC 5737 IPs & Placeholder Labels)
  * ============================================================================ */
@@ -1674,7 +1699,12 @@ const makeMockProbe = (
   yt_gl,
   per_probe_up_mbps: { antigravity: up_mbps },
   per_probe_down_mbps: { dl: down_mbps },
-  per_probe_ping_ms: { chatgpt: chatgptPing },
+  per_probe_ping_ms: { builtin_latency: latency_ms, chatgpt: chatgptPing },
+  per_probe_tested_at: {
+    builtin_latency: MOCK_PROBE_BASE.tested_at,
+    builtin_upload: MOCK_PROBE_BASE.tested_at,
+    builtin_download: MOCK_PROBE_BASE.tested_at,
+  },
 });
 
 const MOCK_PROBES: Record<string, ProbeSnapshot> = {
@@ -1924,6 +1954,7 @@ function buildMockPendingUpdateDto(
     installer_filename: installerFilename,
     dismissed_in_session: false,
     is_elevated: getPreviewQueryParam("update_modal_elevated") === "1",
+    silent_badge_only: getPreviewQueryParam("update_modal_silent") === "1",
   };
 }
 
@@ -1931,6 +1962,28 @@ let mockPendingUpdate: PendingUpdatePromptDto | null = previewUpdateModal
   ? buildMockPendingUpdateDto("0.1.0", DEFAULT_APP_CONFIG.update.repo)
   : null;
 const mockUpdateReadyListeners = new Set<(payload: PendingUpdatePromptDto) => void>();
+const mockGroupsUpdatedListeners = new Set<() => void>();
+const mockRelaysUpdatedListeners = new Set<() => void>();
+
+function emitMockGroupsUpdated(): void {
+  for (const listener of mockGroupsUpdatedListeners) {
+    try {
+      listener();
+    } catch {
+      /* ignore mock listener error */
+    }
+  }
+}
+
+function emitMockRelaysUpdated(): void {
+  for (const listener of mockRelaysUpdatedListeners) {
+    try {
+      listener();
+    } catch {
+      /* ignore mock listener error */
+    }
+  }
+}
 
 let mockConfig: AppConfig = {
   ...structuredClone(DEFAULT_APP_CONFIG),
@@ -2647,6 +2700,20 @@ export const catcloudApi = {
     return structuredClone(mockConfig);
   },
 
+  async markOnboardingCompleted(): Promise<void> {
+    if (isTauriEnv()) {
+      await tauriInvokeOrThrow<void>("mark_onboarding_completed");
+      return;
+    }
+    mockConfig = {
+      ...mockConfig,
+      personalization: {
+        ...mockConfig.personalization,
+        onboarding_completed: true,
+      },
+    };
+  },
+
   async getFullConfig(): Promise<FullAppConfig> {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<FullAppConfig>("get_full_config");
@@ -3001,6 +3068,7 @@ export const catcloudApi = {
     const idx = mockGroups.findIndex((g) => g.id === group.id);
     if (idx >= 0) mockGroups[idx] = structuredClone(group);
     else mockGroups.push(structuredClone(group));
+    emitMockGroupsUpdated();
     return structuredClone(group);
   },
 
@@ -3010,7 +3078,9 @@ export const catcloudApi = {
     }
     const before = mockGroups.length;
     mockGroups = mockGroups.filter((g) => g.id !== groupId);
-    return mockGroups.length < before;
+    const deleted = mockGroups.length < before;
+    if (deleted) emitMockGroupsUpdated();
+    return deleted;
   },
 
   async updateMultiGroupMembers(groupId: string, memberNodeIds: string[]): Promise<MultiGroup> {
@@ -3020,6 +3090,7 @@ export const catcloudApi = {
     const found = mockGroups.find((g) => g.id === groupId);
     if (!found) throw new Error(`Group ${groupId} not found`);
     found.member_node_ids = [...memberNodeIds];
+    emitMockGroupsUpdated();
     return structuredClone(found);
   },
 
@@ -3126,10 +3197,24 @@ export const catcloudApi = {
           maxTier === "latency"
             ? (existing?.unlocked_sites ?? {})
             : (existing?.unlocked_sites ?? { gemini: true, chatgpt: true, claude: true, windsurf: true }),
-        per_probe_ok: existing?.per_probe_ok ?? {},
+        per_probe_ok: {
+          ...(existing?.per_probe_ok ?? {}),
+          builtin_latency: true,
+          ...(maxTier === "full" ? { builtin_upload: true, builtin_download: true } : {}),
+        },
         per_probe_up_mbps: existing?.per_probe_up_mbps ?? {},
         per_probe_down_mbps: existing?.per_probe_down_mbps ?? {},
-        per_probe_ping_ms: existing?.per_probe_ping_ms ?? {},
+        per_probe_ping_ms: {
+          ...(existing?.per_probe_ping_ms ?? {}),
+          builtin_latency: existing?.latency_ms ?? 72,
+        },
+        per_probe_tested_at: {
+          ...(existing?.per_probe_tested_at ?? {}),
+          builtin_latency: nowIso,
+          ...(maxTier === "full"
+            ? { builtin_upload: nowIso, builtin_download: nowIso }
+            : {}),
+        },
       };
       mockProbes[id] = out[id];
     }
@@ -3727,6 +3812,7 @@ export const catcloudApi = {
     const idx = mockRelays.findIndex((r) => r.id === relay.id);
     if (idx >= 0) mockRelays[idx] = structuredClone(relay);
     else mockRelays.push(structuredClone(relay));
+    emitMockRelaysUpdated();
     return structuredClone(relay);
   },
 
@@ -3736,7 +3822,9 @@ export const catcloudApi = {
     }
     const before = mockRelays.length;
     mockRelays = mockRelays.filter((r) => r.id !== relayId);
-    return mockRelays.length < before;
+    const deleted = mockRelays.length < before;
+    if (deleted) emitMockRelaysUpdated();
+    return deleted;
   },
 
   async togglePreAccel(enabled: boolean): Promise<boolean> {
@@ -4588,7 +4676,43 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<number>("apply_migration_nodes", { sourceName, nodes });
     }
-    return nodes.length;
+    const outcome = await this.applyMigrationNodesWithMeta(sourceName, nodes);
+    return outcome.imported_count;
+  },
+
+  async applyMigrationNodesWithMeta(
+    sourceName: string,
+    nodes: ProxyNode[]
+  ): Promise<MigrationApplyOutcome> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<MigrationApplyOutcome>("apply_migration_nodes_with_meta", {
+        sourceName,
+        nodes,
+      });
+    }
+    const cleanName = sourceName.trim() || "迁移导入";
+    const subId = `sub-migrated-${Date.now()}`;
+    const nowIso = new Date().toISOString();
+    mockSubscriptions.push({
+      id: subId,
+      name: cleanName,
+      kind: "migrated",
+      url_or_cmd: `migrated://${subId}`,
+      refresh_interval_sec: 0,
+      traffic_used_bytes: 0,
+      traffic_total_bytes: 0,
+      expires_at: null,
+      last_ok_at: nowIso,
+      last_error: null,
+      enabled: true,
+    });
+    const reboundNodes = nodes.map((n, idx) => ({
+      ...structuredClone(n),
+      id: `${subId}-n-${idx + 1}`,
+      sub_id: subId,
+    }));
+    mockNodes.push(...reboundNodes);
+    return { imported_count: reboundNodes.length, sub_id: subId };
   },
 
   async listRunningProcesses(onlyLikelyProxy: boolean): Promise<ProcessCandidateDto[]> {
@@ -5328,6 +5452,26 @@ export const catcloudApi = {
     mockUpdateReadyListeners.add(cb);
     return () => {
       mockUpdateReadyListeners.delete(cb);
+    };
+  },
+
+  subscribeGroupsUpdated(onUpdate: () => void): () => void {
+    if (isTauriEnv()) {
+      return subscribeTauriEmptyEvent("catcloud://groups-updated", onUpdate);
+    }
+    mockGroupsUpdatedListeners.add(onUpdate);
+    return () => {
+      mockGroupsUpdatedListeners.delete(onUpdate);
+    };
+  },
+
+  subscribeRelaysUpdated(onUpdate: () => void): () => void {
+    if (isTauriEnv()) {
+      return subscribeTauriEmptyEvent("catcloud://relays-updated", onUpdate);
+    }
+    mockRelaysUpdatedListeners.add(onUpdate);
+    return () => {
+      mockRelaysUpdatedListeners.delete(onUpdate);
     };
   },
 };

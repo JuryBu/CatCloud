@@ -449,6 +449,7 @@ fn is_node_raw_host_key(key: &str) -> bool {
             | "host"
             | "obfs-host"
             | "obfs_host"
+            | "endpoint"
     )
 }
 
@@ -719,6 +720,7 @@ fn is_json_ip_or_upstream_host_key(key: &str) -> bool {
             | "servername"
             | "server_name"
             | "server-name"
+            | "endpoint"
     )
 }
 
@@ -913,7 +915,14 @@ fn is_yaml_block_host_seq_key(key: &str) -> bool {
     let lower = key.trim().to_ascii_lowercase();
     matches!(
         lower.as_str(),
-        "host" | "sni" | "servername" | "server-name" | "server_name" | "obfs-host" | "obfs_host"
+        "host"
+            | "sni"
+            | "servername"
+            | "server-name"
+            | "server_name"
+            | "obfs-host"
+            | "obfs_host"
+            | "endpoint"
     )
 }
 
@@ -1065,6 +1074,7 @@ fn redact_yaml_extra_fields(line: &str) -> String {
                 ("host", true),
                 ("obfs-host", true),
                 ("obfs_host", true),
+                ("endpoint", true),
                 ("username", false),
             ] {
                 let klen = key.len();
@@ -3150,6 +3160,51 @@ rules:
         assert_eq!(
             sanitize_log_line("password: 'abc\\' next=ok"),
             "password: '<REDACTED>' next=ok"
+        );
+    }
+
+    #[test]
+    fn redacts_wireguard_peer_endpoint_in_compiled_yaml_and_readonly_node() {
+        let yaml = concat!(
+            "proxies:\n",
+            "  - name: WG-01\n",
+            "    type: wireguard\n",
+            "    server: wg.private-corp.example\n",
+            "    port: 51820\n",
+            "    private-key: wg-secret-priv\n",
+            "    peers:\n",
+            "      - endpoint: peer.private-corp.example:51820\n",
+            "        public-key: wg-secret-pub\n",
+        );
+        let clean = redact_compiled_yaml(yaml);
+        assert!(!clean.contains("private-corp"));
+        assert!(!clean.contains("wg-secret-priv"));
+        assert!(!clean.contains("wg-secret-pub"));
+        let parsed: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&clean).expect("valid redacted wireguard YAML");
+        assert_eq!(
+            parsed["proxies"][0]["peers"][0]["endpoint"].as_str(),
+            Some("***.example:51820")
+        );
+
+        let node = ProxyNode {
+            id: "wg1".to_string(),
+            sub_id: "sub1".to_string(),
+            name: "WG-01".to_string(),
+            protocol: "wireguard".to_string(),
+            server: "wg.private-corp.example".to_string(),
+            port: 51820,
+            raw_config: serde_json::json!({
+                "type": "wireguard",
+                "server": "wg.private-corp.example",
+                "peers": [{ "endpoint": "peer.private-corp.example:51820" }]
+            }),
+            ..Default::default()
+        };
+        let redacted_node = redact_node_for_readonly(&node);
+        assert_eq!(
+            redacted_node.raw_config["peers"][0]["endpoint"].as_str(),
+            Some("***.example:51820")
         );
     }
 }

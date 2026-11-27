@@ -1,5 +1,6 @@
 ﻿!include LogicLib.nsh
 !include x64.nsh
+!include "${__FILEDIR__}\graceful-shutdown.nsh"
 
 !macro NSIS_HOOK_PREINSTALL
   !if "${ARCH}" == "arm64"
@@ -21,4 +22,9 @@
       ${EndIf}
     ${EndIf}
   !endif
+  !insertmacro CatCloudGracefulShutdownRunning "INSTALL"
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro CatCloudGracefulShutdownRunning "UNINSTALL"
 !macroend

@@ -21,6 +21,7 @@ import {
   type PreAccelComparisonResult,
   type PreAccelRelay,
   type PreAccelSpeedTestResult,
+  type ProbeKind,
   type ProbeRunSummary,
   type ProbeSnapshot,
   type ProxyMode,
@@ -53,6 +54,7 @@ import {
   normalizePreAccelVerifyState,
   resolvePreAccelSummary,
 } from "../utils/preaccelStatus";
+import { mergeProbeSnapshotSafe } from "../utils/probeSnapshotMerge";
 
 export type { UiLanguage };
 
@@ -104,6 +106,7 @@ export interface ToastNotice {
 
 export const TRAFFIC_HISTORY_CAPACITY = 600;
 const UI_PREFS_STORAGE_KEY = "catcloud.ui.prefs.v1";
+const ONBOARDING_PENDING_SYNC_KEY = "catcloud.onboarding.pending_sync.v1";
 
 /**
  * Fixed-length 600-point Float64Array ring buffer (1s x 600 = full 10 minutes).
@@ -286,6 +289,28 @@ function saveCachedUiPrefs(p: AppConfig["personalization"]): void {
         onboarding_completed: p.onboarding_completed,
       })
     );
+  } catch {
+    /* ignore storage quota errors */
+  }
+}
+
+function hasPendingOnboardingSync(): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    return window.localStorage.getItem(ONBOARDING_PENDING_SYNC_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setPendingOnboardingSync(pending: boolean): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (pending) {
+      window.localStorage.setItem(ONBOARDING_PENDING_SYNC_KEY, "1");
+    } else {
+      window.localStorage.removeItem(ONBOARDING_PENDING_SYNC_KEY);
+    }
   } catch {
     /* ignore storage quota errors */
   }
@@ -575,6 +600,7 @@ export interface SessionDraftsState {
     onlyTested: boolean;
     onlyGoogleClean: boolean;
     onlyAiUnlocked: boolean;
+    goldenManualSortOverride?: boolean;
     page: number;
     selectedIds: string[];
   };
@@ -629,6 +655,7 @@ export interface AppState {
   latestTraffic: TrafficSample;
   trafficVersion: number;
   toast: ToastNotice | null;
+  onboardingHydratedOk: boolean;
   onboardingModalOpen: boolean;
   onboardingAutoSkipped: boolean;
   tunAdminPromptOpen: boolean;
@@ -901,49 +928,6 @@ function buildPendingExitIp(coreRunning: boolean): ExitIpInfo {
   };
 }
 
-function mergeProbeSnapshotSafe(
-  prev: ProbeSnapshot | undefined,
-  incoming: ProbeSnapshot
-): ProbeSnapshot {
-  if (!prev) return incoming;
-  const incomingUnlocked = incoming.unlocked_sites ?? {};
-  const hasIncomingUnlocked = Object.keys(incomingUnlocked).length > 0;
-  return {
-    ...prev,
-    ...incoming,
-    up_mbps: incoming.up_mbps ?? prev.up_mbps,
-    down_mbps: incoming.down_mbps ?? prev.down_mbps,
-    cf_loc: incoming.cf_loc ?? prev.cf_loc,
-    yt_gl: incoming.yt_gl ?? prev.yt_gl,
-    google_clean: incoming.google_clean ?? prev.google_clean,
-    google_risk_mismatch:
-      incoming.google_clean !== null && incoming.google_clean !== undefined
-        ? incoming.google_risk_mismatch
-        : prev.google_risk_mismatch,
-    keepalive_60s_ok: incoming.keepalive_60s_ok ?? prev.keepalive_60s_ok,
-    unlocked_sites: hasIncomingUnlocked
-      ? { ...(prev.unlocked_sites ?? {}), ...incomingUnlocked }
-      : (prev.unlocked_sites ?? {}),
-    per_probe_ok: { ...(prev.per_probe_ok ?? {}), ...(incoming.per_probe_ok ?? {}) },
-    per_probe_up_mbps: {
-      ...(prev.per_probe_up_mbps ?? {}),
-      ...(incoming.per_probe_up_mbps ?? {}),
-    },
-    per_probe_down_mbps: {
-      ...(prev.per_probe_down_mbps ?? {}),
-      ...(incoming.per_probe_down_mbps ?? {}),
-    },
-    per_probe_ping_ms: {
-      ...(prev.per_probe_ping_ms ?? {}),
-      ...(incoming.per_probe_ping_ms ?? {}),
-    },
-    per_probe_detail: {
-      ...(prev.per_probe_detail ?? {}),
-      ...(incoming.per_probe_detail ?? {}),
-    },
-  };
-}
-
 function createInitialBgTasks(): BgTasksState {
   return {
     preaccel: {
@@ -1025,6 +1009,7 @@ function createInitialSessionDrafts(): SessionDraftsState {
       onlyTested: false,
       onlyGoogleClean: false,
       onlyAiUnlocked: false,
+      goldenManualSortOverride: false,
       page: 1,
       selectedIds: [],
     },
@@ -1082,6 +1067,7 @@ let state: AppState = {
   latestTraffic: initialTraffic,
   trafficVersion: initialTrafficVersion,
   toast: null,
+  onboardingHydratedOk: false,
   onboardingModalOpen: false,
   onboardingAutoSkipped: false,
   tunAdminPromptOpen: false,
@@ -1495,6 +1481,19 @@ function patchUpdateSlice(patch: {
 }
 
 let pendingUpdateRefreshSeq = 0;
+let knownLatencyProbeIds: Set<string> = new Set(["builtin_latency"]);
+
+function syncKnownLatencyProbeIds(
+  defs: ReadonlyArray<{ id: string; kind: ProbeKind }>
+): void {
+  const next = new Set<string>(["builtin_latency"]);
+  for (const def of defs) {
+    if (def.kind === "latency" && def.id.trim().length > 0) {
+      next.add(def.id.trim());
+    }
+  }
+  knownLatencyProbeIds = next;
+}
 
 const patchSettingsBg = (settingsPatch: Partial<BgTasksState["settings"]>) =>
   patchUpdateSlice({ settingsPatch });
@@ -1543,10 +1542,105 @@ let disposeStrategySwitch: (() => void) | null = null;
 let disposeConfigUpdate: (() => void) | null = null;
 let disposeTunNeedsAdmin: (() => void) | null = null;
 let disposeUpdateReady: (() => void) | null = null;
+let disposeGroupsUpdated: (() => void) | null = null;
+let disposeRelaysUpdated: (() => void) | null = null;
+let groupsRefreshDebounceTimer: number | null = null;
+let relaysRefreshDebounceTimer: number | null = null;
+let groupsRefreshSeq = 0;
+let relaysRefreshSeq = 0;
 let themeClockTimer: number | null = null;
 let trafficBackfillInFlight = false;
 let globalPreAccelRefreshInFlight = false;
 let globalPreAccelRefreshPending = false;
+
+function scheduleGroupsRefresh(): void {
+  if (typeof window === "undefined") {
+    const mySeq = ++groupsRefreshSeq;
+    void catcloudApi
+      .listGroups()
+      .then((latestGroups) => {
+        if (!bootStarted || mySeq !== groupsRefreshSeq) return;
+        setState((prev) => ({ ...prev, groups: latestGroups }));
+      })
+      .catch(() => {
+        /* ignore transient cross-window group refresh error */
+      });
+    return;
+  }
+  if (groupsRefreshDebounceTimer !== null) {
+    window.clearTimeout(groupsRefreshDebounceTimer);
+  }
+  groupsRefreshDebounceTimer = window.setTimeout(() => {
+    groupsRefreshDebounceTimer = null;
+    const mySeq = ++groupsRefreshSeq;
+    void catcloudApi
+      .listGroups()
+      .then((latestGroups) => {
+        if (!bootStarted || mySeq !== groupsRefreshSeq) return;
+        setState((prev) => ({ ...prev, groups: latestGroups }));
+      })
+      .catch(() => {
+        /* ignore transient cross-window group refresh error */
+      });
+  }, 100);
+}
+
+function scheduleRelaysRefresh(): void {
+  if (typeof window === "undefined") {
+    const mySeq = ++relaysRefreshSeq;
+    void catcloudApi
+      .listPreAccelRelays()
+      .then((latestRelays) => {
+        if (!bootStarted || mySeq !== relaysRefreshSeq) return;
+        setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+      })
+      .catch(() => {
+        /* ignore transient cross-window relay refresh error */
+      });
+    return;
+  }
+  if (relaysRefreshDebounceTimer !== null) {
+    window.clearTimeout(relaysRefreshDebounceTimer);
+  }
+  relaysRefreshDebounceTimer = window.setTimeout(() => {
+    relaysRefreshDebounceTimer = null;
+    const mySeq = ++relaysRefreshSeq;
+    void catcloudApi
+      .listPreAccelRelays()
+      .then((latestRelays) => {
+        if (!bootStarted || mySeq !== relaysRefreshSeq) return;
+        setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
+      })
+      .catch(() => {
+        /* ignore transient cross-window relay refresh error */
+      });
+  }, 100);
+}
+
+async function persistOnboardingCompletedLight(): Promise<void> {
+  const nextPersonalization: AppConfig["personalization"] = {
+    ...state.config.personalization,
+    onboarding_completed: true,
+  };
+  saveCachedUiPrefs(nextPersonalization);
+  setPendingOnboardingSync(true);
+  setState((prev) => ({
+    ...prev,
+    config: {
+      ...prev.config,
+      personalization: {
+        ...prev.config.personalization,
+        onboarding_completed: true,
+      },
+    },
+  }));
+  try {
+    await catcloudApi.markOnboardingCompleted();
+    setPendingOnboardingSync(false);
+  } catch {
+    /* Keep local optimistic pending-sync fallback so onboarding never re-pops on next launch */
+  }
+}
 
 function syncResolvedThemeFromClock(): void {
   const p = state.config.personalization;
@@ -1730,6 +1824,7 @@ async function hydrateFromBackend(): Promise<void> {
     catcloudApi.listGroups(),
     catcloudApi.listNodes(),
     catcloudApi.listProbeSnapshots(),
+    catcloudApi.listProbeDefinitions(),
     catcloudApi.listSubscriptions(),
     catcloudApi.listPreAccelRelays(),
     catcloudApi.getFullConfig(),
@@ -1745,6 +1840,7 @@ async function hydrateFromBackend(): Promise<void> {
     groupsRes,
     nodesRes,
     probesRes,
+    probeDefsRes,
     subsRes,
     relaysRes,
     fullCfgRes,
@@ -1754,7 +1850,28 @@ async function hydrateFromBackend(): Promise<void> {
     pendingUpdateRes,
   ] = results;
 
-  const cfg = cfgRes.status === "fulfilled" ? cfgRes.value : state.config;
+  if (probeDefsRes.status === "fulfilled" && Array.isArray(probeDefsRes.value)) {
+    syncKnownLatencyProbeIds(probeDefsRes.value);
+  }
+
+  const configHydratedOk = cfgRes.status === "fulfilled";
+  const cfg = configHydratedOk ? cfgRes.value : state.config;
+  const pendingOnboardingSync = hasPendingOnboardingSync();
+  if (configHydratedOk && cfg.personalization.onboarding_completed === true && pendingOnboardingSync) {
+    setPendingOnboardingSync(false);
+  }
+  const effectiveOnboardingCompleted =
+    cfg.personalization.onboarding_completed === true || pendingOnboardingSync;
+  if (configHydratedOk && pendingOnboardingSync && cfg.personalization.onboarding_completed !== true) {
+    void catcloudApi
+      .markOnboardingCompleted()
+      .then(() => {
+        setPendingOnboardingSync(false);
+      })
+      .catch(() => {
+        /* keep pending sync flag until backend write succeeds */
+      });
+  }
   const hydratedAutoDownload =
     typeof cfg.update?.auto_download === "boolean"
       ? cfg.update.auto_download
@@ -1788,6 +1905,10 @@ async function hydrateFromBackend(): Promise<void> {
           auto_download: hydratedAutoDownload,
           skipped_version: hydratedSkippedVersion,
         },
+        personalization: {
+          ...cfg.personalization,
+          onboarding_completed: effectiveOnboardingCompleted,
+        },
       }
     : {
         ...cfg,
@@ -1803,6 +1924,7 @@ async function hydrateFromBackend(): Promise<void> {
         personalization: {
           ...cfg.personalization,
           ...loadCachedUiPrefs(),
+          ...(effectiveOnboardingCompleted ? { onboarding_completed: true } : {}),
         },
       };
 
@@ -1898,6 +2020,7 @@ async function hydrateFromBackend(): Promise<void> {
     const shouldOpenUpdateModal =
       isMainWindow &&
       resolvedPendingUpdate !== null &&
+      !resolvedPendingUpdate.silent_badge_only &&
       (!resolvedPendingUpdate.dismissed_in_session ||
         (!inDesktop && hasPreviewUpdateModalFlag()));
     const resolvedUpdateModalVisible =
@@ -1907,6 +2030,7 @@ async function hydrateFromBackend(): Promise<void> {
     return {
       ...prev,
       initialized: true,
+      onboardingHydratedOk: prev.onboardingHydratedOk || configHydratedOk,
       activeNav: startupNav ?? prev.activeNav,
       config: alignConfigWithRuntimeTun(mergedConfig, resolvedRuntime),
       resolvedTheme: resolved,
@@ -2139,7 +2263,10 @@ export const appStore = {
           ev.node_id && ev.snapshot
             ? {
                 ...prev.probes,
-                [ev.node_id]: mergeProbeSnapshotSafe(prev.probes[ev.node_id], ev.snapshot),
+                [ev.node_id]: mergeProbeSnapshotSafe(prev.probes[ev.node_id], ev.snapshot, {
+                  authoritative: true,
+                  latencyProbeIds: knownLatencyProbeIds,
+                }),
               }
             : prev.probes;
 
@@ -2290,10 +2417,21 @@ export const appStore = {
         setState((prev) => ({
           ...prev,
           pendingUpdate: dto,
-          updateModalVisible: !dto.dismissed_in_session ? true : prev.updateModalVisible,
+          updateModalVisible:
+            !dto.silent_badge_only && !dto.dismissed_in_session
+              ? true
+              : prev.updateModalVisible,
         }));
       });
     }
+
+    disposeGroupsUpdated = catcloudApi.subscribeGroupsUpdated(() => {
+      scheduleGroupsRefresh();
+    });
+
+    disposeRelaysUpdated = catcloudApi.subscribeRelaysUpdated(() => {
+      scheduleRelaysRefresh();
+    });
 
     if (isTauriEnv()) {
       let tunAdminDisposed = false;
@@ -2373,6 +2511,20 @@ export const appStore = {
     disposeTunNeedsAdmin = null;
     disposeUpdateReady?.();
     disposeUpdateReady = null;
+    disposeGroupsUpdated?.();
+    disposeGroupsUpdated = null;
+    disposeRelaysUpdated?.();
+    disposeRelaysUpdated = null;
+    if (groupsRefreshDebounceTimer !== null) {
+      window.clearTimeout(groupsRefreshDebounceTimer);
+      groupsRefreshDebounceTimer = null;
+    }
+    if (relaysRefreshDebounceTimer !== null) {
+      window.clearTimeout(relaysRefreshDebounceTimer);
+      relaysRefreshDebounceTimer = null;
+    }
+    groupsRefreshSeq += 1;
+    relaysRefreshSeq += 1;
     if (typeof window !== "undefined") {
       window.removeEventListener("hashchange", handleHashChange);
       window.removeEventListener("storage", handleStorageSync);
@@ -2521,7 +2673,7 @@ export const appActions = {
   },
 
   async markOnboardingCompleted(): Promise<void> {
-    if (state.config.personalization.onboarding_completed === true) {
+    if (state.config.personalization.onboarding_completed === true && !hasPendingOnboardingSync()) {
       return;
     }
     setState((prev) => ({
@@ -2529,7 +2681,7 @@ export const appActions = {
       onboardingModalOpen: true,
       onboardingAutoSkipped: true,
     }));
-    await appActions.updatePersonalization({ onboarding_completed: true });
+    await persistOnboardingCompletedLight();
   },
 
   async closeOnboardingModal(markCompleted = true): Promise<void> {
@@ -2538,8 +2690,11 @@ export const appActions = {
       onboardingModalOpen: false,
       onboardingAutoSkipped: prev.onboardingAutoSkipped || markCompleted,
     }));
-    if (markCompleted && state.config.personalization.onboarding_completed !== true) {
-      await appActions.updatePersonalization({ onboarding_completed: true });
+    if (
+      markCompleted &&
+      (state.config.personalization.onboarding_completed !== true || hasPendingOnboardingSync())
+    ) {
+      await persistOnboardingCompletedLight();
     }
   },
 
@@ -2784,13 +2939,11 @@ export const appActions = {
 
     if (target) {
       let relays = state.preAccelRelays;
-      if (!relays.some((r) => r.enabled) && isTauriEnv()) {
-        try {
-          relays = await catcloudApi.listPreAccelRelays();
-          setState((prev) => ({ ...prev, preAccelRelays: relays }));
-        } catch {
-          /* fall through to empty relay guard */
-        }
+      try {
+        relays = await catcloudApi.listPreAccelRelays();
+        setState((prev) => ({ ...prev, preAccelRelays: relays }));
+      } catch {
+        /* fall back to cached relays on transient IPC failure */
       }
       const hasEnabledRelay = relays.some((r) => r.enabled);
       if (!hasEnabledRelay) {
@@ -3189,6 +3342,7 @@ export const appActions = {
       if (reqSeq !== personalizationReqSeq) {
         return;
       }
+      saveCachedUiPrefs(prevConfig.personalization);
       applyPersonalizationToDom(prevResolved, prevConfig.personalization, state.windowMode);
       setState((prev) => ({ ...prev, config: prevConfig, resolvedTheme: prevResolved }));
       pushToast(`个性化配置保存失败：${formatErrorMessage(err)}`, "warn");
@@ -4379,7 +4533,10 @@ export const appActions = {
               if (result.snapshots && Object.keys(result.snapshots).length > 0) {
                 nextProbes = { ...prev.probes };
                 for (const [nid, incoming] of Object.entries(result.snapshots)) {
-                  nextProbes[nid] = mergeProbeSnapshotSafe(prev.probes[nid], incoming);
+                  nextProbes[nid] = mergeProbeSnapshotSafe(prev.probes[nid], incoming, {
+                    authoritative: true,
+                    latencyProbeIds: knownLatencyProbeIds,
+                  });
                 }
               }
               return {
@@ -4560,7 +4717,9 @@ export const appActions = {
                       ...prev,
                       probes: {
                         ...prev.probes,
-                        [nodeId]: mergeProbeSnapshotSafe(prev.probes[nodeId], streamedSnap),
+                        [nodeId]: mergeProbeSnapshotSafe(prev.probes[nodeId], streamedSnap, {
+                          latencyProbeIds: knownLatencyProbeIds,
+                        }),
                       },
                       probeProgress: {
                         running: true,
@@ -4972,7 +5131,10 @@ export const appActions = {
             setState((prev) => {
               const nextProbes = { ...prev.probes };
               for (const [nid, incoming] of Object.entries(res.snapshots)) {
-                nextProbes[nid] = mergeProbeSnapshotSafe(prev.probes[nid], incoming);
+                nextProbes[nid] = mergeProbeSnapshotSafe(prev.probes[nid], incoming, {
+                  authoritative: isTauriEnv(),
+                  latencyProbeIds: knownLatencyProbeIds,
+                });
               }
               return { ...prev, probes: nextProbes };
             });
@@ -5103,6 +5265,10 @@ export const appActions = {
       },
       { mascot: true }
     );
+  },
+
+  syncProbeDefinitions(defs: ReadonlyArray<{ id: string; kind: ProbeKind }>): void {
+    syncKnownLatencyProbeIds(defs);
   },
 
   openUpdateModal(): void {

@@ -34,6 +34,11 @@ import {
   useLatestTraffic,
   type ResolvedTheme,
 } from "../store/appStore";
+import {
+  type ResolvedNodeLatency,
+  getLatencyTooltipKey,
+  resolveNodeDisplayLatency,
+} from "../utils/latencyDisplay";
 import { resolvePlatformOs } from "../utils/platform";
 import {
   type PreAccelSummary,
@@ -665,6 +670,7 @@ export function CapsuleWindow() {
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
   const groups = useAppSelector((s) => s.groups);
+  const probes = useAppSelector((s) => s.probes);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const themeMode = useAppSelector((s) => s.config.personalization.theme_mode);
   const trayIconMode = useAppSelector((s) => s.config.personalization.tray_icon_mode);
@@ -849,10 +855,20 @@ export function CapsuleWindow() {
         await win.setMinSize(new LogicalSize(18, 18)).catch(() => {
           /* ignore if platform ignores minSize updates */
         });
-        await win.setSize(new LogicalSize(pillSize.w, pillSize.h));
-        await win.setPosition(
-          new PhysicalPosition(Math.round(targetPos.x), Math.round(targetPos.y))
+        const targetPhysicalPos = new PhysicalPosition(
+          Math.round(targetPos.x),
+          Math.round(targetPos.y)
         );
+        const targetPillSize = new LogicalSize(pillSize.w, pillSize.h);
+        // Right/bottom dock anchors shift the top-left origin toward the edge when shrinking:
+        // move first then shrink so the small pill never flashes detached mid-screen.
+        if (edge === "right" || edge === "bottom") {
+          await win.setPosition(targetPhysicalPos);
+          await win.setSize(targetPillSize);
+        } else {
+          await win.setSize(targetPillSize);
+          await win.setPosition(targetPhysicalPos);
+        }
         programmaticMoveUntilRef.current = Date.now() + 340;
       } catch {
         try {
@@ -905,21 +921,35 @@ export function CapsuleWindow() {
         );
         const win = getCurrentWindow();
 
-        if (rects) {
-          const targetPhysW = Math.round(exp.w * rects.scale);
-          const targetPhysH = Math.round(exp.h * rects.scale);
-          const targetPos = computeAnchoredPosition(
-            edge,
-            targetPhysW,
-            targetPhysH,
-            rects.winRect,
-            rects.bounds
-          );
-          await win.setPosition(
-            new PhysicalPosition(Math.round(targetPos.x), Math.round(targetPos.y))
-          );
+        const targetExpSize = new LogicalSize(exp.w, exp.h);
+        const targetPhysicalPos = rects
+          ? (() => {
+              const targetPhysW = Math.round(exp.w * rects.scale);
+              const targetPhysH = Math.round(exp.h * rects.scale);
+              const targetPos = computeAnchoredPosition(
+                edge,
+                targetPhysW,
+                targetPhysH,
+                rects.winRect,
+                rects.bounds
+              );
+              return new PhysicalPosition(Math.round(targetPos.x), Math.round(targetPos.y));
+            })()
+          : null;
+
+        // Right/bottom dock anchors shift the top-left origin away from the edge when expanding:
+        // grow first then shift into place so the small pill never jumps away from the edge.
+        if (edge === "right" || edge === "bottom") {
+          await win.setSize(targetExpSize);
+          if (targetPhysicalPos) {
+            await win.setPosition(targetPhysicalPos);
+          }
+        } else {
+          if (targetPhysicalPos) {
+            await win.setPosition(targetPhysicalPos);
+          }
+          await win.setSize(targetExpSize);
         }
-        await win.setSize(new LogicalSize(exp.w, exp.h));
         await win.setMinSize(new LogicalSize(CAPSULE_MIN_W, CAPSULE_MIN_H)).catch(() => {});
 
         if (mountedRef.current) {
@@ -1702,12 +1732,61 @@ export function CapsuleWindow() {
   const displayGroupName =
     runtime.active_group_name?.trim() || (isZh ? "默认分组" : "Default Group");
 
-  const liveLatencyMs =
+  const activeGroupForLatency =
+    groups.find((g) => g.id === runtime.active_group_id) ?? null;
+  const activeNodeIdForLatency = isSingleMode
+    ? runtime.active_node_id || ""
+    : runtime.active_node_id || activeGroupForLatency?.active_node_id || "";
+  const activeNodeProbe = activeNodeIdForLatency
+    ? probes[activeNodeIdForLatency]
+    : undefined;
+  const activeHealthHint = activeNodeIdForLatency
+    ? runtime.node_health_hints?.[activeNodeIdForLatency]
+    : undefined;
+  const runtimeFallbackLatencyMs =
     typeof runtime.active_node_latency_ms === "number" &&
     Number.isFinite(runtime.active_node_latency_ms) &&
     runtime.active_node_latency_ms > 0
       ? runtime.active_node_latency_ms
       : null;
+  const rawResolvedActiveLatency = resolveNodeDisplayLatency(
+    activeNodeProbe,
+    activeHealthHint
+  );
+  const resolvedActiveLatency: ResolvedNodeLatency =
+    rawResolvedActiveLatency.state === "untested" &&
+    rawResolvedActiveLatency.source === "none" &&
+    runtimeFallbackLatencyMs !== null
+      ? {
+          latencyMs: runtimeFallbackLatencyMs,
+          ok: true,
+          source: "probe",
+          state: "healthy",
+          isProbation: false,
+          isDegraded: false,
+        }
+      : rawResolvedActiveLatency;
+  const liveLatencyMs = resolvedActiveLatency.latencyMs;
+  const capsuleLatencyTooltip = (() => {
+    const tipKey = getLatencyTooltipKey(resolvedActiveLatency);
+    const base =
+      tipKey === "probeHot"
+        ? dict.latency.probeHotTooltip
+        : tipKey === "healthCold"
+          ? dict.latency.healthColdTooltip
+          : tipKey === "failed"
+            ? dict.latency.failedTooltip
+            : dict.latency.untestedTooltip;
+    const tags: string[] = [];
+    if (resolvedActiveLatency.source === "probe") {
+      tags.push(dict.latency.sourceProbeShort);
+    } else if (resolvedActiveLatency.source === "health") {
+      tags.push(dict.latency.sourceHealthShort);
+    }
+    if (resolvedActiveLatency.isProbation) tags.push(dict.latency.probationBadge);
+    if (resolvedActiveLatency.isDegraded) tags.push(dict.latency.degradedBadge);
+    return tags.length > 0 ? `${base} (${tags.join(" · ")})` : base;
+  })();
 
   // Adaptive breakpoints compatible with 280..560 x 56..140.
   // Deduct the 5th PinOff button (~28px) when docked so the center slot never overflows into action buttons.
@@ -1999,7 +2078,7 @@ export function CapsuleWindow() {
   const showLatencyAlongside =
     showLatencyChip &&
     !isUltraNarrowDocked &&
-    liveLatencyMs !== null &&
+    (liveLatencyMs !== null || resolvedActiveLatency.state === "failed") &&
     (!showPriorityStatusBadge || effectiveWidth >= 400);
 
   const capsulePill = (
@@ -2147,15 +2226,23 @@ export function CapsuleWindow() {
                 {statusMeta.badge.label}
               </span>
             )}
-            {showLatencyAlongside && liveLatencyMs !== null && (
-              <span
-                className={`cc-mono cc-tabular pointer-events-none shrink-0 rounded bg-[var(--card)] px-1 py-[1px] text-[9px] font-semibold ${resolveLatencyToneClass(
-                  liveLatencyMs
-                )}`}
-              >
-                {Math.round(liveLatencyMs)}ms
-              </span>
-            )}
+            {showLatencyAlongside &&
+              (liveLatencyMs !== null || resolvedActiveLatency.state === "failed") && (
+                <span
+                  title={capsuleLatencyTooltip}
+                  className={`cc-mono cc-tabular shrink-0 rounded bg-[var(--card)] px-1 py-[1px] text-[9px] font-semibold ${
+                    resolvedActiveLatency.state === "failed"
+                      ? "text-[var(--red)]"
+                      : resolvedActiveLatency.isDegraded
+                        ? "text-[var(--amber)]"
+                        : resolveLatencyToneClass(liveLatencyMs ?? 0)
+                  }`}
+                >
+                  {liveLatencyMs !== null
+                    ? `${Math.round(liveLatencyMs)}ms`
+                    : dict.latency.timeoutShort}
+                </span>
+              )}
           </div>
 
           {isRow1HintActive && hoveredHint && (
@@ -2217,7 +2304,7 @@ export function CapsuleWindow() {
                 } ${
                   runtime.system_proxy_enabled
                     ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[var(--muted)]/55"
+                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)]"
                 }`}
                 aria-label={`${proxyHint.title}：${proxyHint.desc}`}
               >
@@ -2238,7 +2325,7 @@ export function CapsuleWindow() {
                     ? "border-[var(--accent)]/45 bg-[var(--accent-soft)] text-[var(--accent)]"
                     : runtime.tun_needs_elevation
                       ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[var(--muted)]/55"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)]"
                 }`}
                 aria-label={`${tunHint.title}：${tunHint.desc}`}
               >
@@ -2335,7 +2422,7 @@ export function CapsuleWindow() {
               ? "border-[var(--amber)] bg-[var(--amber-soft)] text-[var(--amber)] shadow-[0_0_0_1px_rgba(231,184,110,0.28)]"
               : preaccelSummary.enabled
                 ? "border-[var(--accent)]/75 bg-[var(--accent-soft)] text-[var(--accent)]"
-                : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)]/70 hover:border-[var(--accent)]/55 hover:text-[var(--text)]"
+                : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--text)]"
           }`}
         >
           {togglingPreAccel ||

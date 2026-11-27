@@ -39,6 +39,7 @@ import { createPortal } from "react-dom";
 import {
   type ExitIpInfo,
   type MultiGroupMode,
+  type NodeHealthHint,
   type ProbeSnapshot,
   type ProxyMode,
   type ProxyNode,
@@ -56,6 +57,13 @@ import {
   useAppSelector,
   useLatestTraffic,
 } from "../store/appStore";
+import {
+  type ResolvedNodeLatency,
+  getLatencyTooltipKey,
+  hasValidDownMbps,
+  hasValidUpMbps,
+  resolveNodeDisplayLatency,
+} from "../utils/latencyDisplay";
 import { resolvePlatformOs } from "../utils/platform";
 import { resolvePreAccelSummary } from "../utils/preaccelStatus";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
@@ -148,13 +156,47 @@ function getProbeAiBadges(snap: ProbeSnapshot | undefined): {
   const geminiVal = sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai;
   const claudeVal = sites.claude;
   const chatgptVal = sites.chatgpt;
+  const windsurfVal = sites.windsurf;
   const anyMeasured =
-    geminiVal !== undefined || claudeVal !== undefined || chatgptVal !== undefined;
+    geminiVal !== undefined ||
+    claudeVal !== undefined ||
+    chatgptVal !== undefined ||
+    windsurfVal !== undefined;
   const unlocked: Array<{ id: string; label: string; short: string }> = [];
   if (claudeVal === true) unlocked.push({ id: "claude", label: "Claude", short: "Claude" });
   if (geminiVal === true) unlocked.push({ id: "gemini", label: "Gemini", short: "Gemini" });
   if (chatgptVal === true) unlocked.push({ id: "chatgpt", label: "ChatGPT", short: "ChatGPT" });
+  if (windsurfVal === true) {
+    unlocked.push({ id: "windsurf", label: "Windsurf", short: "Windsurf" });
+  }
   return { unlocked, anyMeasured };
+}
+
+function formatHomeLatencyTooltip(
+  resolved: ResolvedNodeLatency,
+  dict: ReturnType<typeof useUiDict>,
+  hint?: NodeHealthHint | null
+): string {
+  const key = getLatencyTooltipKey(resolved);
+  const base =
+    key === "probeHot"
+      ? dict.latency.probeHotTooltip
+      : key === "healthCold"
+        ? dict.latency.healthColdTooltip
+        : key === "failed"
+          ? dict.latency.failedTooltip
+          : dict.latency.untestedTooltip;
+  const tags: string[] = [];
+  if (resolved.isProbation) tags.push(dict.latency.probationBadge);
+  if (resolved.isDegraded) tags.push(dict.latency.degradedBadge);
+  if (hint?.status === "cooldown" && hint.cooldown_remaining_sec > 0) {
+    tags.push(
+      formatI18nTemplate(dict.latency.cooldownSec, {
+        sec: Math.ceil(hint.cooldown_remaining_sec),
+      })
+    );
+  }
+  return tags.length > 0 ? `${base} · ${tags.join(" · ")}` : base;
 }
 
 function hasRealExitIp(info: ExitIpInfo): boolean {
@@ -761,28 +803,12 @@ export function HomePage() {
 
     const healthHints = runtime.node_health_hints;
     const resolveSortMetric = (id: string) => {
-      const p = probes[id];
-      const hint = healthHints?.[id];
-      const hintStatus = hint?.status;
-      const isCooldown = hintStatus === "cooldown";
-      const freshMs =
-        (hintStatus === "healthy" || hintStatus === "probation") &&
-        typeof hint?.latency_ms === "number" &&
-        Number.isFinite(hint.latency_ms) &&
-        hint.latency_ms > 0
-          ? hint.latency_ms
-          : null;
-      const snapMs =
-        p &&
-        p.ok !== false &&
-        typeof p.latency_ms === "number" &&
-        Number.isFinite(p.latency_ms)
-          ? p.latency_ms
-          : null;
-      const latency = freshMs ?? (isCooldown ? null : snapMs);
-      const ok = latency !== null;
-      const failed = !ok && (isCooldown || p?.ok === false);
-      return { ok, latency, failed };
+      const resolved = resolveNodeDisplayLatency(probes[id], healthHints?.[id]);
+      return {
+        ok: resolved.ok && resolved.latencyMs !== null,
+        latency: resolved.latencyMs,
+        failed: resolved.state === "failed",
+      };
     };
 
     return [...filtered].sort((a, b) => {
@@ -859,12 +885,80 @@ export function HomePage() {
     runtime.active_node_latency_ms > 0
       ? runtime.active_node_latency_ms
       : null;
-  const displayLatencyMs = liveActiveLatencyMs ?? activeNodeProbe?.latency_ms ?? null;
+  const activeNodeHealthHint = currentNodeId
+    ? runtime.node_health_hints?.[currentNodeId]
+    : undefined;
+  const rawActiveResolvedLatency = resolveNodeDisplayLatency(
+    activeNodeProbe,
+    activeNodeHealthHint
+  );
+  const activeResolvedLatency: ResolvedNodeLatency =
+    rawActiveResolvedLatency.state === "untested" &&
+    rawActiveResolvedLatency.source === "none" &&
+    liveActiveLatencyMs !== null
+      ? {
+          latencyMs: liveActiveLatencyMs,
+          ok: true,
+          source: "probe",
+          state: "healthy",
+          isProbation: false,
+          isDegraded: false,
+        }
+      : rawActiveResolvedLatency;
+  const displayLatencyMs = activeResolvedLatency.latencyMs;
   const displayLatencyOk =
-    liveActiveLatencyMs !== null ? true : activeNodeProbe ? activeNodeProbe.ok : null;
+    activeResolvedLatency.state === "failed"
+      ? false
+      : activeResolvedLatency.ok
+        ? true
+        : null;
+  const activeLatencyTooltip = formatHomeLatencyTooltip(
+    activeResolvedLatency,
+    dict,
+    activeNodeHealthHint
+  );
+  const activeLatencySourceTag =
+    activeResolvedLatency.latencyMs !== null
+      ? activeResolvedLatency.source === "health"
+        ? dict.latency.sourceHealthShort
+        : activeResolvedLatency.source === "probe"
+          ? dict.latency.sourceProbeShort
+          : null
+      : null;
+  const activeLatencyStateBadge = activeResolvedLatency.isDegraded
+    ? dict.latency.degradedBadge
+    : activeResolvedLatency.isProbation
+      ? dict.latency.probationBadge
+      : null;
+  const activeLatencyColor =
+    activeNodeHealthHint?.status === "cooldown" && activeResolvedLatency.state === "failed"
+      ? "var(--amber)"
+      : getLatencyColor(displayLatencyMs, displayLatencyOk);
+  const activeLatencyText =
+    activeResolvedLatency.latencyMs !== null
+      ? `${Math.round(activeResolvedLatency.latencyMs)} ms`
+      : activeNodeHealthHint?.status === "cooldown" &&
+          activeResolvedLatency.state === "failed"
+        ? activeNodeHealthHint.cooldown_remaining_sec > 0
+          ? formatI18nTemplate(dict.latency.cooldownSec, {
+              sec: Math.ceil(activeNodeHealthHint.cooldown_remaining_sec),
+            })
+          : dict.latency.cooldownActive
+        : activeResolvedLatency.state === "failed"
+          ? dict.latency.timeoutShort
+          : dict.latency.untestedShort;
   const displayUpMbps =
-    runtime.active_node_up_mbps ?? activeNodeProbe?.up_mbps ?? null;
-  const displayDownMbps = activeNodeProbe?.down_mbps ?? null;
+    hasValidUpMbps(activeNodeProbe)
+      ? activeNodeProbe!.up_mbps!
+      : typeof runtime.active_node_up_mbps === "number" &&
+          Number.isFinite(runtime.active_node_up_mbps) &&
+          runtime.active_node_up_mbps > 0 &&
+          activeNodeProbe?.per_probe_ok?.builtin_upload !== false
+        ? runtime.active_node_up_mbps
+        : null;
+  const displayDownMbps = hasValidDownMbps(activeNodeProbe)
+    ? activeNodeProbe!.down_mbps!
+    : null;
   const activeGoogleState = getProbeGoogleState(activeNodeProbe);
   const activeAiBadges = getProbeAiBadges(activeNodeProbe);
 
@@ -1741,22 +1835,29 @@ export function HomePage() {
                             {activeNodeSourceName}
                           </span>
                         )}
-                        <span>
+                        <span
+                          className="inline-flex items-center gap-1"
+                          title={activeLatencyTooltip}
+                        >
                           延迟{" "}
                           <strong
                             className="cc-mono font-semibold"
                             style={{
-                              color: getLatencyColor(displayLatencyMs, displayLatencyOk),
+                              color: activeLatencyColor,
                             }}
                           >
-                            {liveActiveLatencyMs !== null
-                              ? `${Math.round(liveActiveLatencyMs)} ms`
-                              : activeNodeProbe?.ok === false
-                                ? "超时"
-                                : displayLatencyMs !== null
-                                  ? `${Math.round(displayLatencyMs)} ms`
-                                  : "未测"}
+                            {activeLatencyText}
                           </strong>
+                          {activeLatencySourceTag && (
+                            <span className="rounded bg-[var(--card)] px-1 py-0.5 text-[9px] text-[var(--muted)]">
+                              {activeLatencySourceTag}
+                            </span>
+                          )}
+                          {activeLatencyStateBadge && (
+                            <span className="rounded bg-[var(--amber-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--amber)]">
+                              {activeLatencyStateBadge}
+                            </span>
+                          )}
                         </span>
                         <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
                           ↑{" "}
@@ -1856,21 +1957,28 @@ export function HomePage() {
                               </span>
                             )}
                           </span>
-                          <span className="shrink-0 whitespace-nowrap">
+                          <span
+                            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap"
+                            title={activeLatencyTooltip}
+                          >
                             <strong
                               className="cc-mono font-semibold"
                               style={{
-                                color: getLatencyColor(displayLatencyMs, displayLatencyOk),
+                                color: activeLatencyColor,
                               }}
                             >
-                              {liveActiveLatencyMs !== null
-                                ? `${Math.round(liveActiveLatencyMs)} ms`
-                                : activeNodeProbe?.ok === false
-                                  ? "超时"
-                                  : displayLatencyMs !== null
-                                    ? `${Math.round(displayLatencyMs)} ms`
-                                    : "未测"}
+                              {activeLatencyText}
                             </strong>
+                            {activeLatencySourceTag && (
+                              <span className="rounded bg-[var(--card)] px-1 py-0.5 text-[9px] text-[var(--muted)]">
+                                {activeLatencySourceTag}
+                              </span>
+                            )}
+                            {activeLatencyStateBadge && (
+                              <span className="rounded bg-[var(--amber-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--amber)]">
+                                {activeLatencyStateBadge}
+                              </span>
+                            )}
                           </span>
                           <span
                             className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap cc-mono"
@@ -2028,39 +2136,51 @@ export function HomePage() {
                               const isCurrent = node.id === currentNodeId;
                               const snap = probes[node.id];
                               const hint = runtime.node_health_hints?.[node.id];
-                              const isHintHealthy =
-                                hint?.status === "healthy" || hint?.status === "probation";
-                              const isHintCooldown = hint?.status === "cooldown";
-                              const hintLatency =
-                                isHintHealthy &&
-                                typeof hint?.latency_ms === "number" &&
-                                Number.isFinite(hint.latency_ms) &&
-                                hint.latency_ms > 0
-                                  ? hint.latency_ms
-                                  : null;
-                              const freshLatency =
-                                isCurrent && liveActiveLatencyMs !== null
-                                  ? liveActiveLatencyMs
-                                  : hintLatency;
-                              const lat =
-                                freshLatency ??
-                                (isHintCooldown ? null : (snap?.latency_ms ?? null));
+                              const rawResolvedLat = resolveNodeDisplayLatency(snap, hint);
+                              const resolvedLat: ResolvedNodeLatency =
+                                rawResolvedLat.state === "untested" &&
+                                rawResolvedLat.source === "none" &&
+                                isCurrent &&
+                                liveActiveLatencyMs !== null
+                                  ? {
+                                      latencyMs: liveActiveLatencyMs,
+                                      ok: true,
+                                      source: "probe",
+                                      state: "healthy",
+                                      isProbation: false,
+                                      isDegraded: false,
+                                    }
+                                  : rawResolvedLat;
+                              const isHintCooldown =
+                                hint?.status === "cooldown" && resolvedLat.state === "failed";
+                              const lat = resolvedLat.latencyMs;
                               const latOk =
-                                freshLatency !== null
-                                  ? true
-                                  : isHintCooldown
-                                    ? false
-                                    : snap
-                                      ? snap.ok
-                                      : null;
-                              const up = snap?.up_mbps ?? null;
-                              const down = snap?.down_mbps ?? null;
+                                resolvedLat.state === "failed"
+                                  ? false
+                                  : resolvedLat.ok
+                                    ? true
+                                    : null;
+                              const up = hasValidUpMbps(snap) ? snap!.up_mbps! : null;
+                              const down = hasValidDownMbps(snap) ? snap!.down_mbps! : null;
                               const googleState = getProbeGoogleState(snap);
                               const aiInfo = getProbeAiBadges(snap);
-                              const latColor =
-                                isHintCooldown && freshLatency === null
-                                  ? "var(--amber)"
-                                  : getLatencyColor(lat, latOk);
+                              const latColor = isHintCooldown
+                                ? "var(--amber)"
+                                : getLatencyColor(lat, latOk);
+                              const latTooltip = formatHomeLatencyTooltip(resolvedLat, dict, hint);
+                              const latSourceShort =
+                                lat !== null
+                                  ? resolvedLat.source === "health"
+                                    ? dict.latency.sourceHealthShort
+                                    : resolvedLat.source === "probe"
+                                      ? dict.latency.sourceProbeShort
+                                      : null
+                                  : null;
+                              const latStateTag = resolvedLat.isDegraded
+                                ? dict.latency.degradedBadge
+                                : resolvedLat.isProbation
+                                  ? dict.latency.probationBadge
+                                  : null;
                               const nodeRegionCode = resolveNodeRegionCode(node);
                               const hasRegionTag = Boolean(
                                 nodeRegionCode && nodeRegionCode !== "UNK"
@@ -2104,20 +2224,31 @@ export function HomePage() {
                                       </span>
                                     )}
                                     <span
-                                      className="shrink-0 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold"
+                                      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold"
                                       style={{ color: latColor }}
+                                      title={latTooltip}
                                     >
-                                      {freshLatency !== null
-                                        ? `${Math.round(freshLatency)} ms`
+                                      {lat !== null
+                                        ? `${Math.round(lat)} ms`
                                         : isHintCooldown
                                           ? hint && hint.cooldown_remaining_sec > 0
-                                            ? `冷却 ${Math.ceil(hint.cooldown_remaining_sec)}s`
-                                            : "冷却中"
-                                          : snap?.ok === false
-                                            ? "超时"
-                                            : lat !== null
-                                              ? `${Math.round(lat)} ms`
-                                              : "未测"}
+                                            ? formatI18nTemplate(dict.latency.cooldownSec, {
+                                                sec: Math.ceil(hint.cooldown_remaining_sec),
+                                              })
+                                            : dict.latency.cooldownActive
+                                          : resolvedLat.state === "failed"
+                                            ? dict.latency.timeoutShort
+                                            : dict.latency.untestedShort}
+                                      {latSourceShort && (
+                                        <span className="rounded bg-[var(--bg-elevated)] px-1 py-[1px] font-sans text-[9px] font-normal text-[var(--muted)]">
+                                          {latSourceShort}
+                                        </span>
+                                      )}
+                                      {latStateTag && (
+                                        <span className="rounded bg-[var(--amber-soft)] px-1 py-[1px] font-sans text-[9px] font-medium text-[var(--amber)]">
+                                          {latStateTag}
+                                        </span>
+                                      )}
                                     </span>
                                   </div>
 

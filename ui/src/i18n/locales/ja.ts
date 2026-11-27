@@ -354,6 +354,8 @@ export const ja: DeepStringDict<TranslationDict> = {
     downloadReadyMsg: "v{version} のダウンロードと検証が完了しました。今すぐ更新するか次回起動時に確認できます",
     downloadManualHint: "公式リリースページからご利用環境向けのパッケージをダウンロードしてください",
     downloadFailedMsg: "更新のダウンロードに失敗しました：{error}",
+    exitTimeoutFallback: "終了待機がタイムアウトしました。再試行するか公式ダウンロードページを開いてください",
+    unknownErrorFallback: "不明なエラー",
     closeAria: "あとで通知してダイアログを閉じる",
   },
   tunPrompt: {
@@ -498,5 +500,51 @@ export const ja: DeepStringDict<TranslationDict> = {
     clipboardUnavailableToast: "クリップボードを利用できません。上のコードを手動で選択してコピーしてください",
     savedToast: "ルーター設定ファイルを保存しました：{path}",
     saveFailedToast: "設定ファイルの保存に失敗しました：{error}",
+  },
+  latency: {
+    probeHotTooltip:
+      "標準 204 ウォーム接続遅延（TLS ハンドシェイクや解放チェックの時間を除く）",
+    healthColdTooltip:
+      "バックグラウンドの 2 系統軽量ヘルスチェック遅延（接続確立を含むためウォーム測定よりやや高めになる場合があります）",
+    failedTooltip: "直近の標準遅延チェックに失敗しました",
+    untestedTooltip: "未測定",
+    sourceProbeShort: "実測",
+    sourceHealthShort: "監視",
+    probationBadge: "経過観察",
+    degradedBadge: "優先度低下",
+    testedAtLatency: "遅延測定",
+    testedAtSpeed: "帯域測定",
+    cooldownSec: "クールダウン {sec}秒",
+    cooldownActive: "クールダウン中",
+    cooldownRetryHint: "ノードはクールダウン中です（約 {sec} 秒後に再試行）",
+    cooldownHint: "ノードは一時クールダウン中です",
+    reasonPrefix: "理由: ",
+    stagePrefix: "段階: ",
+    timeoutShort: "失敗",
+    untestedShort: "未測",
+  },
+  speedTest: {
+    goldenHiddenHint:
+      "基本条件を満たすノードが {count} 件ありますが、上下帯域が未測定のためゴールデン一覧には表示されていません",
+    goldenSwitchAllBtn: "すべてのノードを表示",
+    goldenRunSpeedBtn: "候補の上下帯域を測定",
+    latencyDisabledHint:
+      "「標準遅延」が未選択のため、今回の実行ではノードの主遅延は更新されません",
+  },
+  groups: {
+    clearActiveProtectedConfirm:
+      "このグループには現在使用中のノードが含まれています。空にすると現在のルートは自動切替または停止されます。続行しますか？",
+    removeActiveProtectedHint:
+      "使用中のノードを外すと、利用可能な別のノードへ自動で切り替わります",
+    confirmClear: "空にする",
+    confirmBelowHint: "下の確認へ",
+    activeRemoveConfirmTip: "使用中ノード · 解除時は再確認が必要です",
+  },
+  shareBundle: {
+    cancelUpdateExisting: "キャンセル",
+  },
+  update: {
+    nextLaunchBadgeTip:
+      "新バージョンがバックグラウンドで準備完了しています。次回起動時にワンクリック更新を案内します",
   },
 };

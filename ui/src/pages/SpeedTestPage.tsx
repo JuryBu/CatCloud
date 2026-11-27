@@ -40,6 +40,7 @@ import {
 import {
   type DynamicFilterSpec,
   type MultiGroup,
+  type NodeHealthHint,
   type ProbeDefinition,
   type ProbeKind,
   type ProbeSnapshot,
@@ -60,6 +61,13 @@ import {
   selectIsProbeEngineBusy,
   useAppSelector,
 } from "../store/appStore";
+import {
+  type ResolvedNodeLatency,
+  getLatencyTooltipKey,
+  hasValidDownMbps,
+  hasValidUpMbps,
+  resolveNodeDisplayLatency,
+} from "../utils/latencyDisplay";
 import {
   type ContinentId,
   buildContinentRegionStats,
@@ -514,8 +522,191 @@ function isGoldenCore(snap: ProbeSnapshot | undefined): boolean {
 }
 
 function hasMeasuredSpeed(snap: ProbeSnapshot | undefined): boolean {
-  if (!snap) return false;
-  return snap.up_mbps !== null || snap.down_mbps !== null;
+  return hasValidUpMbps(snap) || hasValidDownMbps(snap);
+}
+
+interface ProbeTimestampIdSets {
+  latencyIds: ReadonlySet<string>;
+  speedIds: ReadonlySet<string>;
+}
+
+function buildProbeTimestampIdSets(
+  probeList: ReadonlyArray<Pick<ProbeItem, "id" | "kind">>
+): ProbeTimestampIdSets {
+  const latencyIds = new Set<string>(["builtin_latency"]);
+  const speedIds = new Set<string>(["builtin_upload", "builtin_download"]);
+  for (const probe of probeList) {
+    if (probe.kind === "latency") {
+      latencyIds.add(probe.id);
+    } else if (
+      probe.kind === "upload" ||
+      probe.kind === "download" ||
+      probe.kind === "external_cmd"
+    ) {
+      speedIds.add(probe.id);
+    }
+  }
+  return { latencyIds, speedIds };
+}
+
+function resolveProbeTimestamps(
+  snap: ProbeSnapshot | undefined,
+  idSets: ProbeTimestampIdSets
+): {
+  latencyAt: string | null;
+  speedAt: string | null;
+  fallbackAt: string | null;
+} {
+  if (!snap) return { latencyAt: null, speedAt: null, fallbackAt: null };
+  const map = snap.per_probe_tested_at;
+  const pickNewestIso = (candidates: Array<string | undefined | null>): string | null => {
+    let bestIso: string | null = null;
+    let bestTs = -Infinity;
+    for (const raw of candidates) {
+      if (!raw) continue;
+      const ts = Date.parse(raw);
+      if (Number.isFinite(ts) && ts > bestTs) {
+        bestTs = ts;
+        bestIso = raw;
+      }
+    }
+    return bestIso;
+  };
+  if (map && Object.keys(map).length > 0) {
+    const latencyCandidates: string[] = [];
+    const speedCandidates: string[] = [];
+    for (const [pid, ts] of Object.entries(map)) {
+      if (!ts) continue;
+      const isLat =
+        idSets.latencyIds.has(pid) ||
+        Object.prototype.hasOwnProperty.call(snap.per_probe_ping_ms ?? {}, pid);
+      const isSpeed =
+        idSets.speedIds.has(pid) ||
+        Object.prototype.hasOwnProperty.call(snap.per_probe_up_mbps ?? {}, pid) ||
+        Object.prototype.hasOwnProperty.call(snap.per_probe_down_mbps ?? {}, pid);
+      if (isLat) latencyCandidates.push(ts);
+      if (isSpeed) speedCandidates.push(ts);
+    }
+    const latencyAt = pickNewestIso(latencyCandidates);
+    const speedAt = pickNewestIso(speedCandidates);
+    return {
+      latencyAt,
+      speedAt,
+      fallbackAt: !latencyAt && !speedAt ? (snap.tested_at ?? null) : null,
+    };
+  }
+  return {
+    latencyAt: null,
+    speedAt: null,
+    fallbackAt: snap.tested_at ?? null,
+  };
+}
+
+function formatSpeedTestLatencyTooltip(
+  resolved: ResolvedNodeLatency,
+  dict: ReturnType<typeof useUiDict>,
+  hint?: NodeHealthHint | null,
+  cooldownRemainingSec = 0
+): string {
+  const tipKey = getLatencyTooltipKey(resolved);
+  const base =
+    tipKey === "probeHot"
+      ? dict.latency.probeHotTooltip
+      : tipKey === "healthCold"
+        ? dict.latency.healthColdTooltip
+        : tipKey === "failed"
+          ? dict.latency.failedTooltip
+          : dict.latency.untestedTooltip;
+  const parts: string[] = [base];
+  if (resolved.isProbation) parts.push(dict.latency.probationBadge);
+  if (resolved.isDegraded) parts.push(dict.latency.degradedBadge);
+  if (hint?.status === "cooldown") {
+    parts.push(
+      cooldownRemainingSec > 0
+        ? formatI18nTemplate(dict.latency.cooldownRetryHint, {
+            sec: cooldownRemainingSec,
+          })
+        : dict.latency.cooldownHint
+    );
+  }
+  if (hint?.reason?.trim()) {
+    parts.push(`${dict.latency.reasonPrefix}${hint.reason.trim()}`);
+  }
+  if (hint?.stage?.trim()) {
+    parts.push(`${dict.latency.stagePrefix}${hint.stage.trim()}`);
+  }
+  return parts.join(" · ");
+}
+
+const SPEEDTEST_FILTERS_PREF_KEY = "speedtest.filters.v1";
+let speedTestPersistedFiltersHydrated = false;
+
+interface PersistedSpeedTestFilters {
+  searchQuery?: string;
+  sourceFilter?: string;
+  groupFilter?: string;
+  filterContinent?: ContinentId;
+  regionFilter?: string;
+  onlyGolden?: boolean;
+  onlyTested?: boolean;
+  onlyGoogleClean?: boolean;
+  onlyAiUnlocked?: boolean;
+  goldenManualSortOverride?: boolean;
+}
+
+const VALID_CONTINENTS: readonly ContinentId[] = [
+  "all",
+  "common",
+  "asia",
+  "middle_east",
+  "europe",
+  "north_america",
+  "south_america",
+  "oceania",
+  "africa",
+  "other",
+];
+
+function validatePersistedSpeedTestFilters(
+  raw: unknown
+): PersistedSpeedTestFilters | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  const out: PersistedSpeedTestFilters = {};
+  if (typeof obj.searchQuery === "string") out.searchQuery = obj.searchQuery;
+  if (typeof obj.sourceFilter === "string") out.sourceFilter = obj.sourceFilter;
+  if (typeof obj.groupFilter === "string") out.groupFilter = obj.groupFilter;
+  if (
+    typeof obj.filterContinent === "string" &&
+    (VALID_CONTINENTS as readonly string[]).includes(obj.filterContinent)
+  ) {
+    out.filterContinent = obj.filterContinent as ContinentId;
+  }
+  if (typeof obj.regionFilter === "string") out.regionFilter = obj.regionFilter;
+  if (typeof obj.onlyGolden === "boolean") out.onlyGolden = obj.onlyGolden;
+  if (typeof obj.onlyTested === "boolean") out.onlyTested = obj.onlyTested;
+  if (typeof obj.onlyGoogleClean === "boolean") out.onlyGoogleClean = obj.onlyGoogleClean;
+  if (typeof obj.onlyAiUnlocked === "boolean") out.onlyAiUnlocked = obj.onlyAiUnlocked;
+  if (typeof obj.goldenManualSortOverride === "boolean") {
+    out.goldenManualSortOverride = obj.goldenManualSortOverride;
+  }
+  return out;
+}
+
+function persistSpeedTestFiltersFromStore(): void {
+  const d = appStore.getState().sessionDrafts.speedTest;
+  writeUiPref<PersistedSpeedTestFilters>(SPEEDTEST_FILTERS_PREF_KEY, {
+    searchQuery: d.searchQuery,
+    sourceFilter: d.sourceFilter,
+    groupFilter: d.groupFilter,
+    filterContinent: (d.filterContinent as ContinentId | undefined) ?? "all",
+    regionFilter: d.regionFilter,
+    onlyGolden: d.onlyGolden,
+    onlyTested: d.onlyTested,
+    onlyGoogleClean: d.onlyGoogleClean,
+    onlyAiUnlocked: d.onlyAiUnlocked,
+    goldenManualSortOverride: Boolean(d.goldenManualSortOverride),
+  });
 }
 
 function formatRelativeProbeTime(iso?: string | null): { short: string; full: string } | null {
@@ -631,10 +822,43 @@ export function SpeedTestPage({
   const [newProbeTimeoutMs, setNewProbeTimeoutMs] = useState(10000);
 
   // Speed test execution options & state (backed by global appStore.bgTasks)
-  const [pendingLargeRunTier, setPendingLargeRunTier] = useState<SpeedTestTier | null>(null);
+  const [pendingLargeRun, setPendingLargeRun] = useState<{
+    tier: SpeedTestTier;
+    targetNodeIds?: string[];
+    forceSkipKeepalive?: boolean;
+  } | null>(null);
   const [switchingNodeId, setSwitchingNodeId] = useState<string | null>(null);
 
-  // Filters, sorting & pagination (backed by global appStore.sessionDrafts.speedTest)
+  // Filters, sorting & pagination (backed by global appStore.sessionDrafts.speedTest + localStorage persistence)
+  useEffect(() => {
+    if (speedTestPersistedFiltersHydrated) return;
+    speedTestPersistedFiltersHydrated = true;
+    const saved = readUiPref<PersistedSpeedTestFilters | null>(
+      SPEEDTEST_FILTERS_PREF_KEY,
+      null,
+      validatePersistedSpeedTestFilters
+    );
+    if (!saved) return;
+    const patch: Partial<typeof speedTestDraft> = {};
+    if (saved.searchQuery !== undefined) patch.searchQuery = saved.searchQuery;
+    if (!initialSubId && saved.sourceFilter !== undefined) {
+      patch.sourceFilter = saved.sourceFilter;
+    }
+    if (saved.groupFilter !== undefined) patch.groupFilter = saved.groupFilter;
+    if (saved.filterContinent !== undefined) patch.filterContinent = saved.filterContinent;
+    if (saved.regionFilter !== undefined) patch.regionFilter = saved.regionFilter;
+    if (saved.onlyGolden !== undefined) patch.onlyGolden = saved.onlyGolden;
+    if (saved.onlyTested !== undefined) patch.onlyTested = saved.onlyTested;
+    if (saved.onlyGoogleClean !== undefined) patch.onlyGoogleClean = saved.onlyGoogleClean;
+    if (saved.onlyAiUnlocked !== undefined) patch.onlyAiUnlocked = saved.onlyAiUnlocked;
+    if (saved.goldenManualSortOverride !== undefined) {
+      patch.goldenManualSortOverride = saved.goldenManualSortOverride;
+    }
+    if (Object.keys(patch).length > 0) {
+      appActions.patchSessionDraft("speedTest", patch);
+    }
+  }, [initialSubId]);
+
   const searchQuery = speedTestDraft.searchQuery;
   const sourceFilter = speedTestDraft.sourceFilter;
   const groupFilter = speedTestDraft.groupFilter;
@@ -644,40 +868,54 @@ export function SpeedTestPage({
   const onlyTested = speedTestDraft.onlyTested;
   const onlyGoogleClean = speedTestDraft.onlyGoogleClean;
   const onlyAiUnlocked = speedTestDraft.onlyAiUnlocked;
+  const goldenManualSortOverride = Boolean(speedTestDraft.goldenManualSortOverride);
   const page = speedTestDraft.page;
 
   const setSearchQuery = useCallback((val: string) => {
     appActions.patchSessionDraft("speedTest", { searchQuery: val });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setSourceFilter = useCallback((val: string) => {
     appActions.patchSessionDraft("speedTest", { sourceFilter: val });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setGroupFilter = useCallback((val: string) => {
     appActions.patchSessionDraft("speedTest", { groupFilter: val });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setFilterContinent = useCallback((val: ContinentId) => {
     appActions.patchSessionDraft("speedTest", { filterContinent: val });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setRegionFilter = useCallback((val: string) => {
     appActions.patchSessionDraft("speedTest", { regionFilter: val });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setOnlyGolden = useCallback((val: boolean) => {
     appActions.patchSessionDraft("speedTest", { onlyGolden: val });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setOnlyTested = useCallback((val: boolean | ((prev: boolean) => boolean)) => {
     const cur = appStore.getState().sessionDrafts.speedTest.onlyTested;
     const next = typeof val === "function" ? val(cur) : val;
     appActions.patchSessionDraft("speedTest", { onlyTested: next });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setOnlyGoogleClean = useCallback((val: boolean | ((prev: boolean) => boolean)) => {
     const cur = appStore.getState().sessionDrafts.speedTest.onlyGoogleClean;
     const next = typeof val === "function" ? val(cur) : val;
     appActions.patchSessionDraft("speedTest", { onlyGoogleClean: next });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setOnlyAiUnlocked = useCallback((val: boolean | ((prev: boolean) => boolean)) => {
     const cur = appStore.getState().sessionDrafts.speedTest.onlyAiUnlocked;
     const next = typeof val === "function" ? val(cur) : val;
     appActions.patchSessionDraft("speedTest", { onlyAiUnlocked: next });
+    persistSpeedTestFiltersFromStore();
+  }, []);
+  const setGoldenManualSortOverride = useCallback((val: boolean) => {
+    appActions.patchSessionDraft("speedTest", { goldenManualSortOverride: val });
+    persistSpeedTestFiltersFromStore();
   }, []);
   const setPage = useCallback((val: number) => {
     appActions.patchSessionDraft("speedTest", { page: val });
@@ -694,8 +932,6 @@ export function SpeedTestPage({
     "asc",
     oneOfPref(["asc", "desc"] as const)
   );
-  // Transient flag: stays false when toggling "黄金节点" so persisted sortKey/sortDir are never mutated
-  const [goldenManualSortOverride, setGoldenManualSortOverride] = useState(false);
   const [pageSize, setPageSize] = usePersistedState<number>(
     "speedtest.pageSize",
     50,
@@ -841,6 +1077,7 @@ export function SpeedTestPage({
             }
           }
           setProbeList(mapped);
+          appActions.syncProbeDefinitions(mapped);
         }
       })
       .catch((err) => {
@@ -1094,30 +1331,21 @@ export function SpeedTestPage({
       .map((node) => {
         const snap = probes[node.id];
         const healthHint = healthHints?.[node.id];
-        const hasFreshHealthLatency = Boolean(
-          healthHint &&
-            (healthHint.status === "healthy" || healthHint.status === "probation") &&
-            typeof healthHint.latency_ms === "number" &&
-            Number.isFinite(healthHint.latency_ms) &&
-            healthHint.latency_ms > 0
-        );
-        const isCooldown = healthHint?.status === "cooldown";
+        const resolvedLatency = resolveNodeDisplayLatency(snap, healthHint);
+        const hasFreshHealthLatency =
+          resolvedLatency.source === "health" && resolvedLatency.latencyMs !== null;
+        const isCooldown =
+          healthHint?.status === "cooldown" && resolvedLatency.state === "failed";
         const cooldownRemainingSec = isCooldown
           ? Math.max(0, Math.ceil(healthHint?.cooldown_remaining_sec ?? 0))
           : 0;
-        const effectiveLatencyMs = hasFreshHealthLatency
-          ? (healthHint!.latency_ms as number)
-          : !isCooldown &&
-              snap?.ok !== false &&
-              typeof snap?.latency_ms === "number" &&
-              Number.isFinite(snap.latency_ms)
-            ? snap.latency_ms
-            : null;
-        const effectiveLatencyOk: boolean | undefined = hasFreshHealthLatency
-          ? true
-          : isCooldown
+        const effectiveLatencyMs = resolvedLatency.latencyMs;
+        const effectiveLatencyOk: boolean | undefined =
+          resolvedLatency.state === "failed"
             ? false
-            : snap?.ok;
+            : resolvedLatency.ok
+              ? true
+              : undefined;
         const sourceName = subNameById.get(node.sub_id) ?? node.sub_id;
         const regionCode = resolveNodeRegionCode(node);
         const regionLabel = getRegionLabel(regionCode);
@@ -1154,6 +1382,7 @@ export function SpeedTestPage({
           node,
           snap,
           healthHint,
+          resolvedLatency,
           hasFreshHealthLatency,
           isCooldown,
           cooldownRemainingSec,
@@ -1235,12 +1464,14 @@ export function SpeedTestPage({
     filteredRows,
     isGoldenLatencyFallback,
     goldenFallbackCandidates,
+    goldenHiddenCandidates,
     effectiveSortKey,
     effectiveSortDir,
   } = useMemo(() => {
     let list = [...baseFilteredRows];
     let fallbackActive = false;
     let fallbackCandidates: typeof baseFilteredRows = [];
+    let hiddenCandidates: typeof baseFilteredRows = [];
     let activeSortKey: SortKey = sortKey;
     let activeSortDir: SortDir = sortDir;
 
@@ -1249,6 +1480,7 @@ export function SpeedTestPage({
       const goldenFullRows = goldenCoreRows.filter((row) => row.hasMeasuredSpeed);
       if (goldenFullRows.length > 0) {
         list = [...goldenFullRows];
+        hiddenCandidates = goldenCoreRows.filter((row) => !row.hasMeasuredSpeed);
         if (!goldenManualSortOverride) {
           activeSortKey = "up";
           activeSortDir = "desc";
@@ -1277,6 +1509,7 @@ export function SpeedTestPage({
         filteredRows: list,
         isGoldenLatencyFallback: fallbackActive,
         goldenFallbackCandidates: fallbackCandidates,
+        goldenHiddenCandidates: hiddenCandidates,
         effectiveSortKey: activeSortKey,
         effectiveSortDir: activeSortDir,
       };
@@ -1294,31 +1527,27 @@ export function SpeedTestPage({
         case "latency": {
           const aVal = a.effectiveLatencyMs;
           const bVal = b.effectiveLatencyMs;
-          const aHas = !a.isCooldown && aVal !== null;
-          const bHas = !b.isCooldown && bVal !== null;
+          const aHas = a.resolvedLatency.ok && aVal !== null;
+          const bHas = b.resolvedLatency.ok && bVal !== null;
           if (aHas !== bHas) return aHas ? -1 : 1;
           if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
           diff = (aVal ?? 99999) - (bVal ?? 99999);
           break;
         }
         case "up": {
-          const aVal = a.snap?.up_mbps;
-          const bVal = b.snap?.up_mbps;
-          const aHas = aVal !== null && aVal !== undefined;
-          const bHas = bVal !== null && bVal !== undefined;
+          const aHas = hasValidUpMbps(a.snap);
+          const bHas = hasValidUpMbps(b.snap);
           if (aHas !== bHas) return aHas ? -1 : 1;
           if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
-          diff = (aVal ?? -1) - (bVal ?? -1);
+          diff = (a.snap?.up_mbps ?? -1) - (b.snap?.up_mbps ?? -1);
           break;
         }
         case "down": {
-          const aVal = a.snap?.down_mbps;
-          const bVal = b.snap?.down_mbps;
-          const aHas = aVal !== null && aVal !== undefined;
-          const bHas = bVal !== null && bVal !== undefined;
+          const aHas = hasValidDownMbps(a.snap);
+          const bHas = hasValidDownMbps(b.snap);
           if (aHas !== bHas) return aHas ? -1 : 1;
           if (!aHas && !bHas) return a.node.name.localeCompare(b.node.name);
-          diff = (aVal ?? -1) - (bVal ?? -1);
+          diff = (a.snap?.down_mbps ?? -1) - (b.snap?.down_mbps ?? -1);
           break;
         }
         case "google": {
@@ -1344,6 +1573,7 @@ export function SpeedTestPage({
       filteredRows: list,
       isGoldenLatencyFallback: fallbackActive,
       goldenFallbackCandidates: fallbackCandidates,
+      goldenHiddenCandidates: hiddenCandidates,
       effectiveSortKey: activeSortKey,
       effectiveSortDir: activeSortDir,
     };
@@ -1395,12 +1625,25 @@ export function SpeedTestPage({
     [probeList]
   );
 
+  const probeTimestampIdSets = useMemo(
+    () => buildProbeTimestampIdSets(probeList),
+    [probeList]
+  );
+
   // Auto-dismiss large-run confirmation bar when selection changes or list shrinks
   useEffect(() => {
-    if (pendingLargeRunTier && (selectedCount > 0 || totalFiltered <= 50 || isRunning)) {
-      setPendingLargeRunTier(null);
+    if (!pendingLargeRun) return;
+    if (isRunning) {
+      setPendingLargeRun(null);
+      return;
     }
-  }, [pendingLargeRunTier, selectedCount, totalFiltered, isRunning]);
+    if (
+      !pendingLargeRun.targetNodeIds &&
+      (selectedCount > 0 || totalFiltered <= 50)
+    ) {
+      setPendingLargeRun(null);
+    }
+  }, [pendingLargeRun, selectedCount, totalFiltered, isRunning]);
 
   // Selection mutation helpers
   const applySelectionAction = useCallback((nodeId: string, action: "add" | "remove") => {
@@ -1593,9 +1836,19 @@ export function SpeedTestPage({
     const activeKinds = new Set(
       probeList.filter((p) => ids.has(p.id)).map((p) => p.kind)
     );
+    const builtinLatencyProbe = probeList.find((p) => p.id === "builtin_latency");
+    const builtinLatencyDisabled = Boolean(
+      builtinLatencyProbe && !builtinLatencyProbe.enabled
+    );
     if (tier === "latency" && !activeKinds.has("latency")) {
       appActions.showToast("请先在「测速项目设置」中开启「基础延迟」", "warn");
       return null;
+    }
+    if (
+      (tier === "unlock" || tier === "full") &&
+      (!activeKinds.has("latency") || builtinLatencyDisabled)
+    ) {
+      appActions.showToast(dict.speedTest.latencyDisabledHint, "info", 4800);
     }
 
     return Array.from(ids);
@@ -1622,7 +1875,7 @@ export function SpeedTestPage({
 
     const lockedOrderIds = captureCurrentRowOrderIds();
     const effectiveUsePreaccel = usePreaccelForProbe && hasEnabledPreAccelRelay;
-    setPendingLargeRunTier(null);
+    setPendingLargeRun(null);
 
     await appActions.runIsolatedProbesBg({
       nodeIds: targetNodeIds,
@@ -1632,6 +1885,23 @@ export function SpeedTestPage({
       maxTier: tier,
       includeKeepalive: effectiveKeepalive,
     });
+  };
+
+  const handleGoldenCandidatesSpeedRun = (candidateNodeIds: string[]) => {
+    if (isBlockedByBenchmark) {
+      appActions.showToast("国内提速对比测速正在后台进行，完成后即可运行节点测速", "info");
+      return;
+    }
+    if (isRunning || isProbeEngineBusy || candidateNodeIds.length === 0) return;
+    if (candidateNodeIds.length > 50) {
+      setPendingLargeRun({
+        tier: "full",
+        targetNodeIds: candidateNodeIds,
+        forceSkipKeepalive: true,
+      });
+      return;
+    }
+    void executeProbes(candidateNodeIds, "full", true);
   };
 
   const handlePrimaryTestClick = (tier: SpeedTestTier) => {
@@ -1664,7 +1934,7 @@ export function SpeedTestPage({
     }
 
     if (totalFiltered > 50) {
-      setPendingLargeRunTier(tier);
+      setPendingLargeRun({ tier });
       return;
     }
 
@@ -1758,6 +2028,7 @@ export function SpeedTestPage({
             : prev;
         const nextList = [...syncedPrev, nextItem];
         persistProbeStates(nextList, nextKeepalive);
+        appActions.syncProbeDefinitions(nextList);
         return nextList;
       });
       setNewProbeId("");
@@ -1791,6 +2062,7 @@ export function SpeedTestPage({
       setProbeList((prev) => {
         const nextList = prev.filter((p) => p.id !== id);
         persistProbeStates(nextList, includeKeepaliveRef.current);
+        appActions.syncProbeDefinitions(nextList);
         return nextList;
       });
       appActions.showToast("已删除自定义测速项目", "info");
@@ -1845,19 +2117,14 @@ export function SpeedTestPage({
     let untested = 0;
     for (const row of filteredRows) {
       const snap = row.snap;
-      if (!snap && !row.hasFreshHealthLatency && !row.isCooldown) {
+      const resolved = row.resolvedLatency;
+      if (resolved.state === "untested" && !snap) {
         untested += 1;
         continue;
       }
-      const isLatOk =
-        row.hasFreshHealthLatency ||
-        (Boolean(snap?.ok) &&
-          typeof snap?.latency_ms === "number" &&
-          Number.isFinite(snap.latency_ms) &&
-          snap.latency_ms > 0);
-      if (isLatOk && !row.isCooldown) {
+      if (resolved.ok && resolved.latencyMs !== null) {
         latencyOk += 1;
-      } else if (row.isCooldown || snap?.ok === false) {
+      } else if (resolved.state === "failed") {
         failed += 1;
       } else {
         untested += 1;
@@ -1865,10 +2132,8 @@ export function SpeedTestPage({
       if (
         snap &&
         snap.ok !== false &&
-        snap.up_mbps !== null &&
-        snap.up_mbps > 0 &&
-        snap.down_mbps !== null &&
-        snap.down_mbps > 0
+        hasValidUpMbps(snap) &&
+        hasValidDownMbps(snap)
       ) {
         bandwidthOk += 1;
       }
@@ -2079,14 +2344,18 @@ export function SpeedTestPage({
           </div>
         )}
 
-        {/* Lightweight Confirmation Bar when Unselected List > 50 Nodes */}
-        {pendingLargeRunTier && !isRunning && (
+        {/* Lightweight Confirmation Bar when Batch Target > 50 Nodes */}
+        {pendingLargeRun && !isRunning && (() => {
+          const confirmTargetIds =
+            pendingLargeRun.targetNodeIds ?? filteredRows.map((r) => r.node.id);
+          const confirmCount = confirmTargetIds.length;
+          return (
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2.5 text-xs">
             <div className="flex items-center gap-2 text-[var(--text)]">
               <AlertTriangle className="h-4 w-4 shrink-0 text-[var(--amber)]" />
               <span>
-                当前列表共 <strong className="cc-tabular">{totalFiltered}</strong> 个节点，建议先筛选或勾选部分节点；或者直接开始「
-                {TIER_LABELS[pendingLargeRunTier]}」：
+                当前待测共 <strong className="cc-tabular">{confirmCount}</strong> 个节点，建议先筛选或分批测试；或者直接开始「
+                {TIER_LABELS[pendingLargeRun.tier]}」：
               </span>
             </div>
             <div className="flex flex-wrap items-center gap-2">
@@ -2094,8 +2363,9 @@ export function SpeedTestPage({
                 type="button"
                 onClick={() =>
                   void executeProbes(
-                    filteredRows.slice(0, 30).map((r) => r.node.id),
-                    pendingLargeRunTier
+                    confirmTargetIds.slice(0, 30),
+                    pendingLargeRun.tier,
+                    pendingLargeRun.forceSkipKeepalive ?? false
                   )
                 }
                 className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
@@ -2106,24 +2376,26 @@ export function SpeedTestPage({
                 type="button"
                 onClick={() =>
                   void executeProbes(
-                    filteredRows.map((r) => r.node.id),
-                    pendingLargeRunTier
+                    confirmTargetIds,
+                    pendingLargeRun.tier,
+                    pendingLargeRun.forceSkipKeepalive ?? false
                   )
                 }
                 className="rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)]"
               >
-                全部测完 ({totalFiltered} 个)
+                全部测完 ({confirmCount} 个)
               </button>
               <button
                 type="button"
-                onClick={() => setPendingLargeRunTier(null)}
+                onClick={() => setPendingLargeRun(null)}
                 className="rounded-lg px-2 py-1.5 text-xs text-[var(--muted)] hover:text-[var(--text)]"
               >
-                取消
+                {dict.common.cancel}
               </button>
             </div>
           </div>
-        )}
+          );
+        })()}
 
         {/* Live Progress Strip (always shown when running; idle guide banner omitted in embedded mode to stay clean) */}
         {(!embedded || isRunning || includeKeepalive) && (
@@ -2636,6 +2908,46 @@ export function SpeedTestPage({
           )}
         </div>
 
+        {/* Prominent Hint Banner when Golden Filter Hides Core-Qualified Candidates Without Speed Tests */}
+        {onlyGolden && goldenHiddenCandidates.length > 0 && (
+          <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--amber)]/50 bg-[var(--amber-soft)]/65 px-3.5 py-2 text-xs">
+            <div className="flex min-w-0 flex-1 items-center gap-2 text-[var(--text)]">
+              <AlertTriangle className="h-3.5 w-3.5 shrink-0 text-[var(--amber)]" />
+              <span className="leading-relaxed">
+                {formatI18nTemplate(dict.speedTest.goldenHiddenHint, {
+                  count: goldenHiddenCandidates.length,
+                })}
+              </span>
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  setOnlyGolden(false);
+                  setGoldenManualSortOverride(false);
+                  setPage(1);
+                }}
+                className="rounded-lg border border-[var(--line-strong)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              >
+                {dict.speedTest.goldenSwitchAllBtn}
+              </button>
+              <button
+                type="button"
+                disabled={isProbeActionDisabled}
+                onClick={() =>
+                  handleGoldenCandidatesSpeedRun(
+                    goldenHiddenCandidates.map((r) => r.node.id)
+                  )
+                }
+                className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+              >
+                <Rocket className="h-3 w-3 shrink-0" />
+                <span>{dict.speedTest.goldenRunSpeedBtn}</span>
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Gentle Fallback Banner when Golden Filter Has Only Unmeasured-Speed Candidates */}
         {isGoldenLatencyFallback && (
           <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)]/55 px-3.5 py-2 text-xs">
@@ -2647,10 +2959,8 @@ export function SpeedTestPage({
               type="button"
               disabled={isProbeActionDisabled}
               onClick={() =>
-                void executeProbes(
-                  goldenFallbackCandidates.map((r) => r.node.id),
-                  "full",
-                  true
+                handleGoldenCandidatesSpeedRun(
+                  goldenFallbackCandidates.map((r) => r.node.id)
                 )
               }
               className="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[var(--accent)] px-3 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
@@ -2807,7 +3117,7 @@ export function SpeedTestPage({
             modifierHeld ? "select-none" : ""
           }`}
         >
-          <table className="w-full min-w-[884px] table-fixed border-collapse text-left text-xs">
+          <table className="w-full min-w-[924px] table-fixed border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] text-[var(--muted)]">
                 <th className="w-8 px-2 py-2.5 text-center">
@@ -2823,21 +3133,21 @@ export function SpeedTestPage({
                 </th>
                 {(
                   [
-                    { key: "name", label: "节点名称", cls: "min-w-[178px] px-2" },
-                    { key: "source", label: "来源", cls: "w-[78px] px-1.5" },
-                    { key: "latency", label: "延迟", cls: "w-[68px] px-1.5" },
+                    { key: "name", label: "节点名称", cls: "w-[196px] min-w-[178px] px-2" },
+                    { key: "source", label: "来源", cls: "w-[84px] px-1.5" },
+                    { key: "latency", label: "延迟", cls: "w-[78px] px-1.5" },
                     {
                       key: "up",
                       label: "上传",
                       sub: "Mbps",
-                      cls: "w-[68px] px-1",
+                      cls: "w-[72px] px-1",
                       title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）",
                     },
                     {
                       key: "down",
                       label: "下载",
                       sub: "Mbps",
-                      cls: "w-[70px] px-1",
+                      cls: "w-[74px] px-1",
                       title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）",
                     },
                     { key: "google", label: "谷歌地区", cls: "w-[68px] px-1" },
@@ -2880,7 +3190,7 @@ export function SpeedTestPage({
                   node,
                   snap,
                   healthHint,
-                  hasFreshHealthLatency,
+                  resolvedLatency,
                   isCooldown,
                   cooldownRemainingSec,
                   effectiveLatencyMs,
@@ -2897,6 +3207,25 @@ export function SpeedTestPage({
                   const isFlashing = recentFlashIds.has(node.id);
                   const isProbingThis = isRunning && probeActiveNodeIdSet.has(node.id);
                   const isSwitchingThis = switchingNodeId === node.id;
+                  const latTooltip = formatSpeedTestLatencyTooltip(
+                    resolvedLatency,
+                    dict,
+                    healthHint,
+                    cooldownRemainingSec
+                  );
+                  const latSourceShort =
+                    resolvedLatency.latencyMs !== null
+                      ? resolvedLatency.source === "health"
+                        ? dict.latency.sourceHealthShort
+                        : resolvedLatency.source === "probe"
+                          ? dict.latency.sourceProbeShort
+                          : null
+                      : null;
+                  const latStateBadge = resolvedLatency.isDegraded
+                    ? dict.latency.degradedBadge
+                    : resolvedLatency.isProbation
+                      ? dict.latency.probationBadge
+                      : null;
 
                   return (
                     <tr
@@ -2944,7 +3273,7 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Node Name */}
-                      <td className="px-2 py-2">
+                      <td className="w-[196px] min-w-[178px] px-2 py-2">
                         <div className="flex min-w-0 items-center gap-1">
                           <span
                             className="min-w-0 flex-1 truncate font-semibold text-[var(--text)]"
@@ -2972,7 +3301,7 @@ export function SpeedTestPage({
                             </span>
                           )}
                         </div>
-                        <div className="mt-0.5 flex items-center gap-1 text-[10.5px] text-[var(--muted)]">
+                        <div className="mt-0.5 flex flex-wrap items-center gap-x-1 gap-y-0.5 text-[10.5px] text-[var(--muted)]">
                           <span className="truncate">{regionLabel}</span>
                           <span>·</span>
                           <span className="cc-tabular shrink-0">
@@ -2981,7 +3310,51 @@ export function SpeedTestPage({
                               : `${node.multiplier.toFixed(1)}x`}
                           </span>
                           {(() => {
-                            const rel = formatRelativeProbeTime(snap?.tested_at);
+                            const { latencyAt, speedAt, fallbackAt } =
+                              resolveProbeTimestamps(snap, probeTimestampIdSets);
+                            const latRel = formatRelativeProbeTime(latencyAt);
+                            const speedRel = formatRelativeProbeTime(speedAt);
+                            if (latRel || speedRel) {
+                              const tooltipLines: string[] = [];
+                              if (latRel) {
+                                tooltipLines.push(
+                                  `${dict.latency.testedAtLatency}: ${latRel.full}`
+                                );
+                              }
+                              if (speedRel) {
+                                tooltipLines.push(
+                                  `${dict.latency.testedAtSpeed}: ${speedRel.full}`
+                                );
+                              }
+                              const fullTitle = tooltipLines.join("\n");
+                              return (
+                                <>
+                                  {latRel && (
+                                    <>
+                                      <span>·</span>
+                                      <span
+                                        className="shrink-0 text-[10px] text-[var(--muted)]/90"
+                                        title={fullTitle}
+                                      >
+                                        {dict.latency.testedAtLatency} {latRel.short}
+                                      </span>
+                                    </>
+                                  )}
+                                  {speedRel && (
+                                    <>
+                                      <span>·</span>
+                                      <span
+                                        className="shrink-0 text-[10px] text-[var(--muted)]/90"
+                                        title={fullTitle}
+                                      >
+                                        {dict.latency.testedAtSpeed} {speedRel.short}
+                                      </span>
+                                    </>
+                                  )}
+                                </>
+                              );
+                            }
+                            const rel = formatRelativeProbeTime(fallbackAt);
                             if (!rel) return null;
                             return (
                               <>
@@ -3009,34 +3382,22 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Latency */}
-                      <td className="w-[72px] px-1.5 py-2 cc-mono cc-tabular text-[11px]">
+                      <td className="w-[78px] px-1.5 py-2 cc-mono cc-tabular text-[11px]">
                         {isCooldown ? (
                           <div>
                             <span
                               className="whitespace-nowrap font-semibold text-[var(--amber)]"
-                              title={
-                                [
-                                  cooldownRemainingSec > 0
-                                    ? `节点暂时冷却中，约 ${cooldownRemainingSec} 秒后重试`
-                                    : "节点暂时冷却中",
-                                  healthHint?.reason?.trim()
-                                    ? `原因：${healthHint.reason.trim()}`
-                                    : "",
-                                  healthHint?.stage?.trim()
-                                    ? `阶段：${healthHint.stage.trim()}`
-                                    : "",
-                                ]
-                                  .filter(Boolean)
-                                  .join(" · ")
-                              }
+                              title={latTooltip}
                             >
                               {cooldownRemainingSec > 0
-                                ? `冷却 ${cooldownRemainingSec}s`
-                                : "冷却中"}
+                                ? formatI18nTemplate(dict.latency.cooldownSec, {
+                                    sec: cooldownRemainingSec,
+                                  })
+                                : dict.latency.cooldownActive}
                             </span>
                             {healthHint?.reason?.trim() && (
                               <div
-                                className="mt-0.5 max-w-[60px] truncate font-sans text-[9.5px] text-[var(--amber)]/90"
+                                className="mt-0.5 max-w-[66px] truncate font-sans text-[9.5px] text-[var(--amber)]/90"
                                 title={healthHint.reason.trim()}
                               >
                                 {healthHint.reason.trim()}
@@ -3055,36 +3416,40 @@ export function SpeedTestPage({
                                 </div>
                               )}
                           </div>
-                        ) : hasFreshHealthLatency || snap ? (
+                        ) : resolvedLatency.state !== "untested" || snap ? (
                           <div>
                             <span
-                              className="whitespace-nowrap font-semibold"
+                              className="inline-flex flex-wrap items-center gap-0.5 whitespace-nowrap font-semibold"
                               style={{
                                 color: getLatencyColor(effectiveLatencyMs, effectiveLatencyOk),
                               }}
-                              title={
-                                [
-                                  hasFreshHealthLatency
-                                    ? healthHint?.status === "probation"
-                                      ? "实时探测恢复中延迟"
-                                      : "实时健康池最新延迟"
-                                    : "",
-                                  healthHint?.reason?.trim()
-                                    ? `状态说明：${healthHint.reason.trim()}`
-                                    : "",
-                                ]
-                                  .filter(Boolean)
-                                  .join(" · ") || undefined
-                              }
+                              title={latTooltip}
                             >
-                              {hasFreshHealthLatency && effectiveLatencyMs !== null
-                                ? `${Math.round(effectiveLatencyMs)} ms`
-                                : snap?.ok === false
-                                  ? "超时"
-                                  : effectiveLatencyMs !== null
-                                    ? `${Math.round(effectiveLatencyMs)} ms`
+                              <span>
+                                {effectiveLatencyMs !== null
+                                  ? `${Math.round(effectiveLatencyMs)} ms`
+                                  : resolvedLatency.state === "failed"
+                                    ? dict.latency.timeoutShort
                                     : "--"}
+                              </span>
                             </span>
+                            {(latSourceShort || latStateBadge) && (
+                              <div
+                                className="mt-0.5 flex flex-wrap items-center gap-0.5 font-sans text-[9px] leading-tight"
+                                title={latTooltip}
+                              >
+                                {latSourceShort && (
+                                  <span className="rounded bg-[var(--bg-elevated)] px-1 py-[1px] text-[var(--muted)]">
+                                    {latSourceShort}
+                                  </span>
+                                )}
+                                {latStateBadge && (
+                                  <span className="rounded bg-[var(--amber-soft)] px-1 py-[1px] font-medium text-[var(--amber)]">
+                                    {latStateBadge}
+                                  </span>
+                                )}
+                              </div>
+                            )}
                             {snap?.keepalive_60s_ok !== null &&
                               snap?.keepalive_60s_ok !== undefined && (
                                 <div
@@ -3099,7 +3464,9 @@ export function SpeedTestPage({
                               )}
                           </div>
                         ) : (
-                          <span className="text-[var(--muted)]">--</span>
+                          <span className="text-[var(--muted)]" title={latTooltip}>
+                            --
+                          </span>
                         )}
                       </td>
 
@@ -3108,9 +3475,9 @@ export function SpeedTestPage({
                         className="w-[72px] whitespace-nowrap px-1 py-2 cc-mono cc-tabular text-[11px]"
                         title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
                       >
-                        {snap?.up_mbps !== null && snap?.up_mbps !== undefined ? (
+                        {hasValidUpMbps(snap) ? (
                           <span className="font-semibold text-[var(--coral)]">
-                            {snap.up_mbps.toFixed(1)}
+                            {snap!.up_mbps!.toFixed(1)}
                             <span className="ml-0.5 text-[9.5px] font-normal text-[var(--muted)]">
                               Mbps
                             </span>
@@ -3125,11 +3492,11 @@ export function SpeedTestPage({
                         className="w-[74px] whitespace-nowrap px-1 py-2 cc-mono cc-tabular text-[11px]"
                         title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
                       >
-                        {snap?.down_mbps !== null && snap?.down_mbps !== undefined ? (
+                        {hasValidDownMbps(snap) ? (
                           <span className="font-semibold text-[var(--sky)]">
-                            {snap.down_mbps >= 100
-                              ? Math.round(snap.down_mbps)
-                              : snap.down_mbps.toFixed(1)}
+                            {snap!.down_mbps! >= 100
+                              ? Math.round(snap!.down_mbps!)
+                              : snap!.down_mbps!.toFixed(1)}
                             <span className="ml-0.5 text-[9.5px] font-normal text-[var(--muted)]">
                               Mbps
                             </span>
@@ -3198,7 +3565,7 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Row Actions: Primary Single-Node Use + Compact Full Probe + Lightweight Latency / +Group */}
-                      <td className="w-[204px] whitespace-nowrap px-1 py-2 text-right">
+                      <td className="w-[204px] whitespace-nowrap px-1.5 py-2 text-right">
                         <div className="inline-flex flex-nowrap items-center justify-end gap-0.5">
                           <button
                             type="button"
@@ -3328,7 +3695,7 @@ export function SpeedTestPage({
                               setGoldenManualSortOverride(false);
                               setPage(1);
                               if (nodes.length > 50) {
-                                setPendingLargeRunTier("unlock");
+                                setPendingLargeRun({ tier: "unlock" });
                               } else {
                                 void executeProbes(
                                   nodes.map((n) => n.id),

@@ -1,6 +1,7 @@
 ﻿!include LogicLib.nsh
 !include x64.nsh
 !include FileFunc.nsh
+!include "${__FILEDIR__}\graceful-shutdown.nsh"
 
 !define MUI_CUSTOMFUNCTION_GUIINIT CatCloudCheckX64GuiInit
 
@@ -39,4 +40,9 @@ Function CatCloudCheckX64GuiInit
 FunctionEnd
 
 !macro NSIS_HOOK_PREINSTALL
+  !insertmacro CatCloudGracefulShutdownRunning "INSTALL"
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro CatCloudGracefulShutdownRunning "UNINSTALL"
 !macroend

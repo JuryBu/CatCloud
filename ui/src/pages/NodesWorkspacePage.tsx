@@ -1,10 +1,14 @@
 import { ArrowLeft, Globe, Link2, Plus } from "lucide-react";
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { appActions, useAppSelector } from "../store/appStore";
+import { oneOfPref, readUiPref, usePersistedState } from "../utils/uiPrefs";
 import { NodesSubsPage } from "./NodesSubsPage";
 import { SpeedTestPage } from "./SpeedTestPage";
 
 type WorkspaceTab = "nodes" | "subs";
+
+const WORKSPACE_TAB_PREF_KEY = "nodesWorkspace.tab";
+const WORKSPACE_TAB_VALIDATOR = oneOfPref(["nodes", "subs"] as const);
 
 let workspaceInitialTabAligned = false;
 
@@ -22,7 +26,20 @@ export function NodesWorkspacePage() {
     (s) => s.bgTasks.capture.active || s.bgTasks.capture.finishing
   );
 
-  const tab: WorkspaceTab = workspaceDraft.tab;
+  const hasStoredTabRef = useRef<boolean | null>(null);
+  if (hasStoredTabRef.current === null) {
+    hasStoredTabRef.current =
+      readUiPref<WorkspaceTab | null>(WORKSPACE_TAB_PREF_KEY, null, WORKSPACE_TAB_VALIDATOR) !==
+      null;
+  }
+
+  const [persistedTab, setPersistedTab] = usePersistedState<WorkspaceTab>(
+    WORKSPACE_TAB_PREF_KEY,
+    workspaceDraft.tab,
+    WORKSPACE_TAB_VALIDATOR
+  );
+
+  const tab: WorkspaceTab = persistedTab;
   const activeSubFilter: string | null = workspaceDraft.filterSubId || null;
   const isSubsBusy =
     subsBg.refreshingAll ||
@@ -30,10 +47,19 @@ export function NodesWorkspacePage() {
     subsBg.importing ||
     captureActive;
 
+  // Keep sessionDrafts aligned with persisted sub-tab across reloads/reopens
+  useEffect(() => {
+    if (workspaceDraft.tab !== persistedTab) {
+      appActions.patchSessionDraft("nodesWorkspace", { tab: persistedTab });
+    }
+  }, [persistedTab, workspaceDraft.tab]);
+
   // Consume navigation tab hints from other pages (e.g. HomePage / MultiGroupPage)
   useEffect(() => {
     if (!nodesTabHint) return;
     workspaceInitialTabAligned = true;
+    hasStoredTabRef.current = true;
+    setPersistedTab(nodesTabHint.tab);
     appActions.patchSessionDraft("nodesWorkspace", {
       tab: nodesTabHint.tab,
       ...(nodesTabHint.subId !== undefined ? { filterSubId: nodesTabHint.subId ?? "" } : {}),
@@ -48,29 +74,36 @@ export function NodesWorkspacePage() {
     if (!nodesTabHint.action) {
       appActions.consumeNodesTabHint();
     }
-  }, [nodesTabHint]);
+  }, [nodesTabHint, setPersistedTab]);
 
-  // Align initial default tab once after first backend hydration if user hasn't picked yet
+  // Align initial default tab once after first backend hydration if user has no persisted preference yet
   useEffect(() => {
     if (!initialized || workspaceInitialTabAligned || nodesTabHint) return;
     workspaceInitialTabAligned = true;
-    if (nodes.length === 0 && tab !== "subs") {
+    if (!hasStoredTabRef.current && nodes.length === 0 && tab !== "subs") {
+      setPersistedTab("subs");
       appActions.patchSessionDraft("nodesWorkspace", { tab: "subs" });
     }
-  }, [initialized, nodes.length, nodesTabHint, tab]);
+  }, [initialized, nodes.length, nodesTabHint, setPersistedTab, tab]);
 
   const handleSelectTab = (next: WorkspaceTab) => {
     workspaceInitialTabAligned = true;
+    hasStoredTabRef.current = true;
+    setPersistedTab(next);
     appActions.patchSessionDraft("nodesWorkspace", { tab: next });
   };
 
   const handleOpenSubs = () => {
     workspaceInitialTabAligned = true;
+    hasStoredTabRef.current = true;
+    setPersistedTab("subs");
     appActions.patchSessionDraft("nodesWorkspace", { tab: "subs" });
   };
 
   const handleBackToNodes = () => {
     workspaceInitialTabAligned = true;
+    hasStoredTabRef.current = true;
+    setPersistedTab("nodes");
     appActions.patchSessionDraft("nodesWorkspace", {
       tab: "nodes",
       filterSubId: "",
@@ -83,6 +116,8 @@ export function NodesWorkspacePage() {
 
   const handleViewSubNodes = (subId: string | null) => {
     workspaceInitialTabAligned = true;
+    hasStoredTabRef.current = true;
+    setPersistedTab("nodes");
     appActions.patchSessionDraft("nodesWorkspace", {
       tab: "nodes",
       filterSubId: subId ?? "",

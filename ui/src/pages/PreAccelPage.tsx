@@ -68,6 +68,7 @@ import {
 } from "../utils/platform";
 import { resolvePreAccelSummary } from "../utils/preaccelStatus";
 import { resolveNodeRegionCode } from "../utils/regions";
+import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 
 const DETECTED_BY_LABELS: Record<string, string> = {
   system_proxy_host: "系统代理",
@@ -487,7 +488,11 @@ export function PreAccelPage() {
   const lbStrategy: PreAccelLbStrategy = config.preaccel.lb_strategy ?? "consistent_hashing";
   const [savingDispatch, setSavingDispatch] = useState(false);
   const [togglingEnabled, setTogglingEnabled] = useState(false);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = usePersistedState<boolean>(
+    "preaccel.advancedOpen",
+    false,
+    isBoolPref
+  );
   const [savingGlobalScope, setSavingGlobalScope] = useState(false);
   const [elevatingGlobal, setElevatingGlobal] = useState(false);
   const [refreshingGlobal, setRefreshingGlobal] = useState(false);
@@ -776,8 +781,18 @@ export function PreAccelPage() {
     };
   }, [sortedRelays]);
 
+  const hasValidActiveRelay = useMemo(
+    () =>
+      Boolean(
+        activeRelayId &&
+          relays.some((r) => r.enabled && r.id === activeRelayId)
+      ),
+    [activeRelayId, relays]
+  );
+
   const isMultiCloudLbStrategy =
-    dispatchStrategy === "load_balance" || (dispatchStrategy === "auto" && !activeRelayId);
+    dispatchStrategy === "load_balance" ||
+    (dispatchStrategy === "auto" && !hasValidActiveRelay);
 
   const isMultiCloudLbActive =
     physicalHostSummary.distinctHosts >= 2 && isMultiCloudLbStrategy;
@@ -817,8 +832,17 @@ export function PreAccelPage() {
       );
       if (matched) return matched.id;
     }
+    if (!isMultiCloudLbStrategy && hasValidActiveRelay && activeRelayId) {
+      return activeRelayId;
+    }
     return sortedRelays.find((r) => r.enabled)?.id ?? null;
-  }, [sortedRelays, runtime.preaccel_relay_name]);
+  }, [
+    sortedRelays,
+    runtime.preaccel_relay_name,
+    isMultiCloudLbStrategy,
+    hasValidActiveRelay,
+    activeRelayId,
+  ]);
 
   const homeCurrentNode = useMemo(() => {
     if (nodes.length === 0) return null;
@@ -1367,10 +1391,7 @@ export function PreAccelPage() {
         await catcloudApi.upsertPreAccelRelay(item);
       }
       appActions.syncPreAccelRelays(normalized);
-      const isMultiCloudLbMode =
-        isMultiCloudLbActive ||
-        dispatchStrategy === "load_balance" ||
-        (dispatchStrategy === "auto" && !activeRelayId);
+      const isMultiCloudLbMode = isMultiCloudLbActive || isMultiCloudLbStrategy;
       if (!isMultiCloudLbMode && (idx === 0 || swapIdx === 0) && normalized[0]?.enabled) {
         await catcloudApi.selectPreAccelRelay(normalized[0].id);
         const freshCfg = await catcloudApi.getConfig();
@@ -1450,44 +1471,18 @@ export function PreAccelPage() {
       return;
     }
     const switchingFromMultiCloudLb = isMultiCloudLbActive;
-    const prevRelays = relays;
-    const reordered = [
-      relay,
-      ...sortedRelays.filter((r) => r.id !== relay.id),
-    ].map((r, i) => ({ ...r, priority: i + 1 }));
-    const changed = reordered.filter((r) => {
-      const old = relays.find((item) => item.id === r.id);
-      return !old || old.priority !== r.priority;
-    });
 
     try {
-      if (switchingFromMultiCloudLb) {
-        const latestConfig = appStore.getState().config;
-        const saved = await catcloudApi.saveConfig({
-          ...latestConfig,
-          preaccel: {
-            ...latestConfig.preaccel,
-            dispatch_strategy: "fallback",
-          },
-        });
-        appActions.syncConfig(saved);
-      }
+      // Single atomic backend call: updates dispatch_strategy=fallback + active_relay_id
+      // and triggers at most one hot reload instead of cascading saveConfig + per-relay upserts.
       await catcloudApi.selectPreAccelRelay(relay.id);
-      try {
-        for (const item of changed) {
-          await catcloudApi.upsertPreAccelRelay(item);
-        }
-        setRelays(reordered);
-        appActions.syncPreAccelRelays(reordered);
-      } catch {
-        setRelays(prevRelays);
-      }
       const [freshCfg, rt] = await Promise.all([
         catcloudApi.getConfig(),
         catcloudApi.getRuntimeInfo(),
       ]);
       appActions.syncConfig(freshCfg);
       appActions.syncRuntime(rt);
+      await appActions.refreshGlobalPreAccelStatus();
       appActions.showToast(
         switchingFromMultiCloudLb
           ? `已切换为单线主备并优先使用「${relay.name}」（保留其余线路自动兜底），可随时在上方切回多云自动均衡`
@@ -1496,7 +1491,6 @@ export function PreAccelPage() {
         5200
       );
     } catch (err) {
-      setRelays(prevRelays);
       appActions.showToast(`设置主力线路失败：${formatErrorMessage(err)}`, "warn");
     }
   };
@@ -2321,13 +2315,25 @@ export function PreAccelPage() {
         <div className="grid grid-cols-1 gap-3.5 min-[1160px]:grid-cols-2">
           {sortedRelays.map((relay, idx) => {
             const enabledRank = enabledRankMap.get(relay.id);
-            const isTopEnabled = relay.enabled && enabledRank === 0;
+            const isActivePrimary = relay.id === primaryRelayId && relay.enabled;
+            const isTopEnabled =
+              relay.enabled &&
+              (primaryRelayId ? isActivePrimary : enabledRank === 0);
+            const fallbackOrder = (() => {
+              if (!relay.enabled || isTopEnabled) return 0;
+              let order = 0;
+              for (const item of sortedRelays) {
+                if (!item.enabled || item.id === primaryRelayId) continue;
+                order += 1;
+                if (item.id === relay.id) return order;
+              }
+              return enabledRank ?? 1;
+            })();
             const roleLabel = !relay.enabled
               ? "已停用"
               : isTopEnabled
                 ? "主力线路"
-                : `备用 ${enabledRank ?? 1}`;
-            const isActivePrimary = relay.id === primaryRelayId && relay.enabled;
+                : `备用 ${fallbackOrder}`;
             const isProbing = probingIdsSet.has(relay.id) || probingAll;
             const isSpeedTesting = speedTestingIdsSet.has(relay.id) || speedTestingAll;
             const hasUpSpeed = hasValidSpeed(relay.last_up_mbps);
@@ -2338,7 +2344,7 @@ export function PreAccelPage() {
             const safeSni = (relay.sni ?? "").trim();
             const hasConfigTip = relay.port !== 443 || safeSni !== "";
             const canSetPrimary =
-              relay.enabled && (isMultiCloudLbActive || !isTopEnabled || !isActivePrimary);
+              relay.enabled && (isMultiCloudLbActive || !isActivePrimary);
             const rawChainMs = relayChainLatencies[relay.id];
             const validChainMs =
               typeof rawChainMs === "number" && Number.isFinite(rawChainMs) && rawChainMs > 0

@@ -1,3 +1,4 @@
+use crate::core_adapter::config_compiler::sanitize_business_node_transport;
 use crate::error::{CatError, CatResult};
 use crate::models::{
     PreAccelDispatchStrategy, PreAccelLbStrategy, PreAccelRelay, ProxyNode, is_ipv6_only_node,
@@ -506,6 +507,7 @@ pub fn build_isolated_probe_yaml_with_preaccel(
         if !proxy_map.contains_key("port") && node.port > 0 {
             proxy_map.insert(YamlValue::from("port"), YamlValue::from(node.port));
         }
+        sanitize_business_node_transport(&mut proxy_map, &node.protocol);
 
         proxies_seq.push(YamlValue::Mapping(proxy_map));
 
@@ -740,6 +742,7 @@ pub fn build_isolated_probe_yaml_with_preaccel_pool(
         if !proxy_map.contains_key("port") && node.port > 0 {
             proxy_map.insert(YamlValue::from("port"), YamlValue::from(node.port));
         }
+        sanitize_business_node_transport(&mut proxy_map, &node.protocol);
 
         proxies_seq.push(YamlValue::Mapping(proxy_map));
 
@@ -1005,6 +1008,7 @@ pub fn generate_preaccel_comparison_yaml(
     if !direct_map.contains_key("port") && target_node.port > 0 {
         direct_map.insert(YamlValue::from("port"), YamlValue::from(target_node.port));
     }
+    sanitize_business_node_transport(&mut direct_map, &target_node.protocol);
 
     // 3. Accelerated overseas target node (cloned with dialer-proxy pointing to domestic relay)
     let mut accel_map = direct_map.clone();
@@ -1240,6 +1244,7 @@ pub fn generate_preaccel_relay_speed_yaml(
             if !base.contains_key("port") && node.port > 0 {
                 base.insert(YamlValue::from("port"), YamlValue::from(node.port));
             }
+            sanitize_business_node_transport(&mut base, &node.protocol);
             Ok(base)
         })
         .transpose()?;
@@ -3421,5 +3426,173 @@ mod tests {
         );
         assert!(!single_speed_yaml.contains("cc-rs-chain-"));
         assert!(!single_speed_yaml.contains("2001:db8::42"));
+    }
+
+    #[test]
+    fn isolated_runner_all_four_builders_sanitize_tcp_transport_and_preserve_udp_protocols() {
+        let mut anytls_node = ProxyNode {
+            id: "n-anytls".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "JP-AnyTLS".to_string(),
+            protocol: "anytls".to_string(),
+            server: "anytls.example.invalid".to_string(),
+            port: 8443,
+            raw_config: serde_json::json!({
+                "name": "JP-AnyTLS",
+                "type": "anytls",
+                "server": "anytls.example.invalid",
+                "port": 8443,
+                "password": "pw",
+                "tfo": true,
+                "min-idle-session": 5
+            }),
+            region_code: "JP".to_string(),
+            multiplier: 1.0,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let hy2_node = ProxyNode {
+            id: "n-hy2".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "SG-Hy2".to_string(),
+            protocol: "hysteria2".to_string(),
+            server: "hy2.example.invalid".to_string(),
+            port: 8443,
+            raw_config: serde_json::json!({
+                "name": "SG-Hy2",
+                "type": "hysteria2",
+                "server": "hy2.example.invalid",
+                "port": 8443,
+                "password": "pw2",
+                "tfo": true
+            }),
+            region_code: "SG".to_string(),
+            multiplier: 1.0,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        let relay = PreAccelRelay {
+            id: "r1".to_string(),
+            name: "Relay-A".to_string(),
+            provider: "Cloud".to_string(),
+            region: "East".to_string(),
+            server: "198.51.100.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "rpw".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+            supports_ipv6: false,
+        };
+
+        let check_anytls = |p: &YamlValue| {
+            assert_eq!(p["tfo"].as_bool(), Some(false));
+            assert_eq!(p["min-idle-session"].as_u64(), Some(0));
+            assert_eq!(p["idle-session-check-interval"].as_u64(), Some(30));
+            assert_eq!(p["idle-session-timeout"].as_u64(), Some(30));
+        };
+
+        // 1. build_isolated_probe_yaml_with_preaccel
+        let p1 = allocate_ephemeral_ports(3).unwrap();
+        let y1 = build_isolated_probe_yaml_with_preaccel(
+            p1[0],
+            "secret-0123456789",
+            &[(p1[1], &anytls_node), (p1[2], &hy2_node)],
+            &[],
+            Some(&relay),
+            true,
+        )
+        .unwrap();
+        let d1: YamlValue = serde_yaml_ng::from_str(&y1).unwrap();
+        let list1 = d1["proxies"].as_sequence().unwrap();
+        check_anytls(list1.iter().find(|p| p["name"] == "JP-AnyTLS").unwrap());
+        let hy2_p1 = list1.iter().find(|p| p["name"] == "SG-Hy2").unwrap();
+        assert_eq!(
+            hy2_p1["tfo"].as_bool(),
+            Some(true),
+            "UDP hysteria2 must NOT be mutated by TCP transport sanitizer"
+        );
+
+        // 2. build_isolated_probe_yaml_with_preaccel_pool
+        let p2 = allocate_ephemeral_ports(3).unwrap();
+        let y2 = build_isolated_probe_yaml_with_preaccel_pool(
+            p2[0],
+            "secret-0123456789",
+            &[(p2[1], &anytls_node), (p2[2], &hy2_node)],
+            &[],
+            &[relay.clone()],
+            PreAccelDispatchStrategy::Auto,
+            PreAccelLbStrategy::ConsistentHashing,
+            true,
+        )
+        .unwrap();
+        let d2: YamlValue = serde_yaml_ng::from_str(&y2).unwrap();
+        let list2 = d2["proxies"].as_sequence().unwrap();
+        check_anytls(list2.iter().find(|p| p["name"] == "JP-AnyTLS").unwrap());
+        assert_eq!(
+            list2.iter().find(|p| p["name"] == "SG-Hy2").unwrap()["tfo"].as_bool(),
+            Some(true)
+        );
+
+        // 3. generate_preaccel_comparison_yaml
+        let p3 = allocate_ephemeral_ports(3).unwrap();
+        let y3 = generate_preaccel_comparison_yaml(
+            &relay,
+            &anytls_node,
+            p3[1],
+            p3[2],
+            p3[0],
+            "secret-0123456789",
+            &[],
+        )
+        .unwrap();
+        let d3: YamlValue = serde_yaml_ng::from_str(&y3).unwrap();
+        let list3 = d3["proxies"].as_sequence().unwrap();
+        check_anytls(
+            list3
+                .iter()
+                .find(|p| p["name"] == CMP_DIRECT_PROXY_NAME)
+                .unwrap(),
+        );
+        check_anytls(
+            list3
+                .iter()
+                .find(|p| p["name"] == CMP_ACCEL_PROXY_NAME)
+                .unwrap(),
+        );
+
+        // 4. generate_preaccel_relay_speed_yaml
+        anytls_node.raw_config["idle-session-timeout"] = serde_json::json!(45);
+        let p4 = allocate_ephemeral_ports(2).unwrap();
+        let y4 = generate_preaccel_relay_speed_yaml(
+            &[relay.clone()],
+            Some(&anytls_node),
+            &[(relay.id, p4[1])],
+            p4[0],
+            "secret-0123456789",
+            &[],
+        )
+        .unwrap();
+        let d4: YamlValue = serde_yaml_ng::from_str(&y4).unwrap();
+        let chain = d4["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "cc-rs-chain-0")
+            .unwrap();
+        assert_eq!(chain["tfo"].as_bool(), Some(false));
+        assert_eq!(chain["min-idle-session"].as_u64(), Some(0));
+        assert_eq!(chain["idle-session-check-interval"].as_u64(), Some(30));
+        // Positive custom idle-session-timeout (45) preserved
+        assert_eq!(chain["idle-session-timeout"].as_u64(), Some(45));
     }
 }

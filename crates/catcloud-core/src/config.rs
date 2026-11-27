@@ -1,12 +1,13 @@
 use crate::error::{CatError, CatResult};
 use crate::models::{
-    AppConfig, CONFIG_SCHEMA_VERSION, OverrideMode, is_supported_ui_language,
+    AppConfig, CONFIG_SCHEMA_VERSION, DEFAULT_PREACCEL_FALLBACK_PROBE_URL,
+    DEFAULT_PREACCEL_PROBE_URL, OverrideMode, is_supported_ui_language,
 };
 use crate::paths::AppPaths;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use url::Url;
@@ -130,7 +131,19 @@ pub(crate) fn is_legacy_v3_doh_default_dns_list(list: &[String]) -> bool {
             .all(|(actual, expected)| actual.trim().eq_ignore_ascii_case(expected))
 }
 
-/// Apply idempotent in-memory schema migrations on a loaded configuration.
+fn is_valid_domestic_probe_url(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    match Url::parse(trimmed) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => parsed
+            .host_str()
+            .filter(|h| !h.is_empty())
+            .is_some_and(|host| !is_forbidden_domestic_probe_host(host)),
+        _ => false,
+    }
+}
+
+/// Apply idempotent in-memory schema migrations and self-healing normalization on a loaded or
+/// imported configuration:
 ///
 /// - `schema_version < 2`: upgrades legacy `core_runtime.gogc == 35` to `25` without touching
 ///   v2+ configs where the user manually chose `35`.
@@ -141,8 +154,12 @@ pub(crate) fn is_legacy_v3_doh_default_dns_list(list: &[String]) -> bool {
 ///   `default_nameserver`, `direct_nameserver`, `nameserver`, and `proxy_server_nameserver`
 ///   to the 4-endpoint heterogeneous pure-IP encrypted pool (DoH 443 + DoT 853, TLS verified)
 ///   without ever overwriting user-customized DNS entries.
-/// - Returns `true` if `schema_version` or any field was migrated.
-fn migrate_config_in_memory(cfg: &mut AppConfig) -> bool {
+/// - All versions: heals invalid or forbidden overseas `preaccel.probe_url` /
+///   `preaccel.fallback_probe_url` back to domestic 204 defaults, reconciles unified
+///   `preaccel.enabled` / `preaccel.global_bypass_enabled` flags, and strips blank
+///   `preaccel.active_relay_id`.
+/// - Returns `true` whenever `schema_version` or any field was actually mutated.
+pub fn migrate_config_in_memory(cfg: &mut AppConfig) -> bool {
     let mut migrated = false;
     if cfg.schema_version < 2 {
         if cfg.core_runtime.gogc == 35 {
@@ -189,11 +206,62 @@ fn migrate_config_in_memory(cfg: &mut AppConfig) -> bool {
             cfg.dns.proxy_server_nameserver = v4_encrypted();
         }
     }
+
+    if !is_valid_domestic_probe_url(&cfg.preaccel.probe_url) {
+        cfg.preaccel.probe_url = DEFAULT_PREACCEL_PROBE_URL.to_string();
+        migrated = true;
+    }
+    if !is_valid_domestic_probe_url(&cfg.preaccel.fallback_probe_url) {
+        cfg.preaccel.fallback_probe_url = DEFAULT_PREACCEL_FALLBACK_PROBE_URL.to_string();
+        migrated = true;
+    }
+
+    let before_enabled = cfg.preaccel.enabled;
+    let before_global = cfg.preaccel.global_bypass_enabled;
+    cfg.preaccel.reconcile_unified_enabled();
+    if cfg.preaccel.enabled != before_enabled
+        || cfg.preaccel.global_bypass_enabled != before_global
+    {
+        migrated = true;
+    }
+
+    if let Some(ref raw_id) = cfg.preaccel.active_relay_id {
+        let trimmed = raw_id.trim();
+        if trimmed.is_empty() {
+            cfg.preaccel.active_relay_id = None;
+            migrated = true;
+        } else if trimmed != raw_id {
+            cfg.preaccel.active_relay_id = Some(trimmed.to_string());
+            migrated = true;
+        }
+    }
+
     if cfg.schema_version < CONFIG_SCHEMA_VERSION {
         cfg.schema_version = CONFIG_SCHEMA_VERSION;
         migrated = true;
     }
     migrated
+}
+
+/// Clear a dangling `cfg.preaccel.active_relay_id` when it is blank or no longer exists in
+/// `enabled_relay_ids`. Returns `true` if `cfg.preaccel.active_relay_id` was modified.
+pub fn reconcile_dangling_active_relay(
+    cfg: &mut AppConfig,
+    enabled_relay_ids: &HashSet<String>,
+) -> bool {
+    let Some(ref raw_id) = cfg.preaccel.active_relay_id else {
+        return false;
+    };
+    let trimmed = raw_id.trim();
+    if trimmed.is_empty() || !enabled_relay_ids.contains(trimmed) {
+        cfg.preaccel.active_relay_id = None;
+        return true;
+    }
+    if trimmed != raw_id {
+        cfg.preaccel.active_relay_id = Some(trimmed.to_string());
+        return true;
+    }
+    false
 }
 
 fn load_from_disk_with_migration(paths: &AppPaths) -> CatResult<(AppConfig, bool)> {
@@ -1402,6 +1470,76 @@ mod tests {
             .import_backup(&backup_path)
             .expect_err("backup restore must reject oversized inline_override_yaml");
         assert!(restore_err.to_string().contains("rules_override.inline_override_yaml"));
+
+        cleanup_dir(&paths);
+    }
+
+    #[test]
+    fn migrate_config_in_memory_heals_overseas_probe_urls_unified_switch_and_reconciles_dangling_relay() {
+        let paths = temp_paths("s22-migrate-reconcile");
+        let mgr = ConfigManager::new(paths.clone());
+
+        // 1. Even on current schema_version == 4, overseas probe_url + split unified switch MUST
+        //    migrate and return true, persisting cleanly via load_or_init.
+        let bad_v4 = format!(
+            r#"{{
+                "schema_version": {CONFIG_SCHEMA_VERSION},
+                "preaccel": {{
+                    "enabled": false,
+                    "global_bypass_enabled": true,
+                    "probe_url": "https://www.gstatic.com/generate_204",
+                    "fallback_probe_url": "https://cp.cloudflare.com/generate_204",
+                    "active_relay_id": "   "
+                }}
+            }}"#
+        );
+        std::fs::write(&paths.config_path, &bad_v4).unwrap();
+
+        let healed = mgr.load_or_init().expect("load_or_init heals legacy v4 bad probe_url");
+        assert_eq!(healed.preaccel.probe_url, DEFAULT_PREACCEL_PROBE_URL);
+        assert_eq!(
+            healed.preaccel.fallback_probe_url,
+            DEFAULT_PREACCEL_FALLBACK_PROBE_URL
+        );
+        assert!(healed.preaccel.enabled);
+        assert!(healed.preaccel.global_bypass_enabled);
+        assert_eq!(healed.preaccel.active_relay_id, None);
+
+        // Disk file was persisted because migrate_config_in_memory returned true.
+        let persisted_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&paths.config_path).unwrap()).unwrap();
+        assert_eq!(
+            persisted_json["preaccel"]["probe_url"].as_str(),
+            Some(DEFAULT_PREACCEL_PROBE_URL)
+        );
+        assert_eq!(
+            persisted_json["preaccel"]["fallback_probe_url"].as_str(),
+            Some(DEFAULT_PREACCEL_FALLBACK_PROBE_URL)
+        );
+        assert_eq!(persisted_json["preaccel"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            persisted_json["preaccel"]["global_bypass_enabled"].as_bool(),
+            Some(true)
+        );
+        assert!(persisted_json["preaccel"]["active_relay_id"].is_null());
+
+        // Second call is strictly idempotent and returns false.
+        let mut stable = healed.clone();
+        assert!(!migrate_config_in_memory(&mut stable));
+
+        // 2. reconcile_dangling_active_relay clears missing/disabled relay IDs and keeps valid ones.
+        let enabled_ids: HashSet<String> = ["relay-a".to_string(), "relay-b".to_string()]
+            .into_iter()
+            .collect();
+        stable.preaccel.active_relay_id = Some("relay-deleted".to_string());
+        assert!(reconcile_dangling_active_relay(&mut stable, &enabled_ids));
+        assert_eq!(stable.preaccel.active_relay_id, None);
+        assert!(!reconcile_dangling_active_relay(&mut stable, &enabled_ids));
+
+        stable.preaccel.active_relay_id = Some(" relay-a ".to_string());
+        assert!(reconcile_dangling_active_relay(&mut stable, &enabled_ids));
+        assert_eq!(stable.preaccel.active_relay_id.as_deref(), Some("relay-a"));
+        assert!(!reconcile_dangling_active_relay(&mut stable, &enabled_ids));
 
         cleanup_dir(&paths);
     }

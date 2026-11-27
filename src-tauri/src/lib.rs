@@ -6,6 +6,7 @@ pub mod shortcuts;
 pub mod tray;
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -35,6 +36,10 @@ use crate::tray::{TrayAction, TrayOpenDirKind, TrayProxyMode};
 
 /// Default entry point used when launched without pre-resolved `AppPaths`.
 pub fn run() {
+    if has_shutdown_existing_cli_flag() {
+        let _ = handle_shutdown_existing_readonly();
+        return;
+    }
     catcloud_core::init_crypto_provider();
     let cli_data_dir = AppPaths::parse_cli_data_dir_from_args();
     let paths =
@@ -57,11 +62,267 @@ fn has_cli_flag(flag: &str) -> bool {
     std::env::args().skip(1).any(|a| a == flag)
 }
 
+/// Return `true` when the process was launched with `--shutdown-existing`.
+pub fn has_shutdown_existing_cli_flag() -> bool {
+    has_cli_flag("--shutdown-existing")
+}
+
+fn standard_os_data_dir_readonly() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.trim().is_empty() {
+                return PathBuf::from(appdata).join("CatCloud");
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.trim().is_empty() {
+                return PathBuf::from(home)
+                    .join("Library")
+                    .join("Application Support")
+                    .join("CatCloud");
+            }
+        }
+    }
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.trim().is_empty() {
+            return PathBuf::from(xdg).join("catcloud");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.trim().is_empty() {
+            return PathBuf::from(home).join(".local").join("share").join("catcloud");
+        }
+    }
+    PathBuf::from("data")
+}
+
+fn canonical_or_normalized_readonly(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return catcloud_core::paths::normalize_os_path(&canon);
+    }
+    if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            return catcloud_core::paths::normalize_os_path(&canon_parent.join(name));
+        }
+    }
+    catcloud_core::paths::normalize_os_path(path)
+}
+
+fn paths_equal_normalized_readonly(a: &Path, b: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::Component;
+        let a_comps: Vec<Component<'_>> = a.components().collect();
+        let b_comps: Vec<Component<'_>> = b.components().collect();
+        if a_comps.is_empty() || a_comps.len() != b_comps.len() {
+            return false;
+        }
+        a_comps.iter().zip(b_comps.iter()).all(|(ac, bc)| match (ac, bc) {
+            (Component::Normal(x), Component::Normal(y)) => {
+                x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy())
+            }
+            (Component::Prefix(x), Component::Prefix(y)) => x
+                .as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&y.as_os_str().to_string_lossy()),
+            (x, y) => x == y,
+        })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        !a.as_os_str().is_empty() && a == b
+    }
+}
+
+fn path_is_within_dir_readonly(child: &Path, parent: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use std::path::Component;
+        let parent_comps: Vec<Component<'_>> = parent.components().collect();
+        if parent_comps.is_empty() {
+            return false;
+        }
+        let child_comps: Vec<Component<'_>> = child.components().collect();
+        if child_comps.len() < parent_comps.len() {
+            return false;
+        }
+        parent_comps
+            .iter()
+            .zip(child_comps.iter())
+            .all(|(p, c)| match (p, c) {
+                (Component::Normal(a), Component::Normal(b)) => {
+                    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+                }
+                (Component::Prefix(a), Component::Prefix(b)) => a
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()),
+                (a, b) => a == b,
+            })
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        !parent.as_os_str().is_empty() && child.starts_with(parent)
+    }
+}
+
+fn detect_portable_or_standard_readonly(exe_dir: &Path, standard_dir: &Path) -> (PathBuf, bool) {
+    let flag = exe_dir.join("portable.flag");
+    let sibling_data = exe_dir.join("data");
+    if flag.is_file() || sibling_data.is_dir() {
+        return (sibling_data, true);
+    }
+    let is_cli_subdir = exe_dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name.eq_ignore_ascii_case("cli"));
+    if is_cli_subdir {
+        if let Some(parent) = exe_dir.parent() {
+            if parent.parent().is_some() && parent.join("portable.flag").is_file() {
+                return (parent.join("data"), true);
+            }
+        }
+    }
+    (standard_dir.to_path_buf(), false)
+}
+
+fn resolve_data_dir_readonly_for(
+    cli_data_dir: Option<PathBuf>,
+    env_data_dir: Option<&str>,
+    exe_dir: &Path,
+    standard_dir: &Path,
+) -> (PathBuf, bool) {
+    if let Some(dir) = cli_data_dir {
+        (dir, true)
+    } else if let Some(env_dir) = env_data_dir.filter(|v| !v.trim().is_empty()) {
+        (PathBuf::from(env_dir), true)
+    } else {
+        detect_portable_or_standard_readonly(exe_dir, standard_dir)
+    }
+}
+
+fn is_standard_installed_readonly_for(
+    root_data_dir: &Path,
+    is_portable: bool,
+    exe_dir: &Path,
+    standard_dir: &Path,
+) -> bool {
+    if is_portable {
+        let flag = exe_dir.join("portable.flag");
+        let sibling_data = exe_dir.join("data");
+        if flag.is_file() || sibling_data.is_dir() {
+            let norm_exe_dir = canonical_or_normalized_readonly(exe_dir);
+            let norm_root = canonical_or_normalized_readonly(root_data_dir);
+            if path_is_within_dir_readonly(&norm_root, &norm_exe_dir) {
+                return false;
+            }
+        }
+    }
+    let norm_root = canonical_or_normalized_readonly(root_data_dir);
+    let norm_std = canonical_or_normalized_readonly(standard_dir);
+    paths_equal_normalized_readonly(&norm_root, &norm_std)
+}
+
+fn handle_shutdown_existing_for_target(
+    root_data_dir: &Path,
+    is_standard_installed: bool,
+) -> bool {
+    let signaled_dir =
+        catcloud_core::process_guard::signal_graceful_exit_for_data_dir(root_data_dir);
+    let signaled_installed = if !signaled_dir && is_standard_installed {
+        catcloud_core::process_guard::signal_graceful_exit_installed()
+    } else {
+        false
+    };
+    let signaled = signaled_dir || signaled_installed;
+    tracing::info!(
+        data_dir = %root_data_dir.display(),
+        is_standard_installed,
+        signaled_dir,
+        signaled_installed,
+        signaled,
+        "--shutdown-existing dispatched prior to single-instance acquisition"
+    );
+    signaled
+}
+
+/// Dispatch `--shutdown-existing` using purely read-only path resolution so no directories,
+/// write probes, or WebView2 user-data folders are created on disk.
+pub fn handle_shutdown_existing_readonly() -> bool {
+    let cli_data_dir = AppPaths::parse_cli_data_dir_from_args();
+    let env_data_dir = std::env::var("CATCLOUD_DATA_DIR").ok();
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let standard_dir = standard_os_data_dir_readonly();
+    let (root_data_dir, is_portable) = resolve_data_dir_readonly_for(
+        cli_data_dir,
+        env_data_dir.as_deref(),
+        &exe_dir,
+        &standard_dir,
+    );
+    let is_standard_installed =
+        is_standard_installed_readonly_for(&root_data_dir, is_portable, &exe_dir, &standard_dir);
+    handle_shutdown_existing_for_target(&root_data_dir, is_standard_installed)
+}
+
 fn is_one_shot_launch_flag(arg: &str) -> bool {
     matches!(
         arg,
-        "--apply-staged-update" | "--silent" | "--enable-tun" | "--enable-global-preaccel"
+        "--apply-staged-update"
+            | "--silent"
+            | "--enable-tun"
+            | "--enable-global-preaccel"
+            | "--shutdown-existing"
     )
+}
+
+fn handle_shutdown_existing_flag(paths: &AppPaths) -> bool {
+    handle_shutdown_existing_for_target(
+        &paths.root_data_dir,
+        paths.is_standard_installed_instance(),
+    )
+}
+
+fn reconcile_startup_config_with_storage(
+    paths: &AppPaths,
+    cfg: &mut catcloud_core::models::AppConfig,
+    storage: &Storage,
+) -> bool {
+    let enabled_relay_ids: HashSet<String> = storage
+        .list_preaccel_relays(true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    if config::reconcile_dangling_active_relay(cfg, &enabled_relay_ids) {
+        let _ = config::save(paths, cfg);
+        true
+    } else {
+        false
+    }
+}
+
+fn apply_next_launch_silent_badge_policy(
+    state: &AppState,
+    prompt_dto: &mut commands::PendingUpdatePromptDto,
+) -> bool {
+    if state.snapshot_config().update.mode == UpdateApplyMode::NextLaunch {
+        prompt_dto.silent_badge_only = true;
+        prompt_dto.dismissed_in_session = true;
+        let _ = commands::dismiss_update_prompt_for_session_internal(
+            state,
+            &prompt_dto.target_version,
+        );
+        true
+    } else {
+        false
+    }
 }
 
 fn build_post_update_cleanup_relaunch_args(
@@ -192,6 +453,13 @@ pub fn run_with_paths(paths: AppPaths) {
     let enable_tun_flag = has_cli_flag("--enable-tun");
     let enable_global_preaccel_flag = has_cli_flag("--enable-global-preaccel");
 
+    // Must run strictly BEFORE `SingleInstanceGuard::acquire_for_paths` so `--shutdown-existing`
+    // triggers cross-IL graceful shutdown without waking/raising an existing window first.
+    if has_cli_flag("--shutdown-existing") {
+        let _ = handle_shutdown_existing_flag(&paths);
+        return;
+    }
+
     if post_update_cleanup {
         let _ = catcloud_core::updater::run_post_update_cleanup(&paths.backup_dir);
     }
@@ -200,9 +468,17 @@ pub fn run_with_paths(paths: AppPaths) {
         match SingleInstanceGuard::acquire_for_paths(&paths, restarting) {
             Ok(AcquireOutcome::Primary(guard)) => Some(guard),
             Ok(AcquireOutcome::SecondaryWokePrimary) => {
-                tracing::info!(
-                    "another CatCloud instance owns this data_dir; signaled primary and exiting"
-                );
+                if restarting {
+                    tracing::warn!(
+                        timeout_secs = catcloud_core::process_guard::RESTART_WAIT_TIMEOUT.as_secs(),
+                        data_dir = %paths.root_data_dir.display(),
+                        "RESTART_WAIT_TIMEOUT elapsed while waiting for previous CatCloud instance to release single-instance lock; signaled primary and exiting"
+                    );
+                } else {
+                    tracing::info!(
+                        "another CatCloud instance owns this data_dir; signaled primary and exiting"
+                    );
+                }
                 return;
             }
             Err(err) => {
@@ -232,6 +508,7 @@ pub fn run_with_paths(paths: AppPaths) {
     cfg.preaccel.reconcile_unified_enabled();
     let mut storage = Storage::open(&paths.db_path).expect("failed to open CatCloud SQLite store");
     let _ = storage.seed_builtin_probes();
+    let _ = reconcile_startup_config_with_storage(&paths, &mut cfg, &storage);
 
     let destroy_on_close = cfg.behavior.minimize_to_tray_on_close;
     let silent_start = silent_flag || cfg.behavior.silent_start;
@@ -268,6 +545,8 @@ pub fn run_with_paths(paths: AppPaths) {
 
     let instance_guard_slot = Arc::new(Mutex::new(instance_guard));
     let wake_guard_ref = Arc::clone(&instance_guard_slot);
+    let end_session_guard_ref = Arc::clone(&instance_guard_slot);
+    let end_session_job_ref = Arc::clone(&job_guard);
     let exit_guard_ref = Arc::clone(&instance_guard_slot);
     let exit_job_ref = Arc::clone(&job_guard);
 
@@ -302,6 +581,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::get_full_config,
             commands::save_full_config,
             commands::save_extended_settings,
+            commands::mark_onboarding_completed,
             commands::get_runtime_info,
             commands::start_core,
             commands::stop_core,
@@ -394,6 +674,7 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::scan_migration_path,
             commands::preview_migration_from_text,
             commands::apply_migration_nodes,
+            commands::apply_migration_nodes_with_meta,
             commands::list_running_processes,
             commands::inspect_process_source,
             commands::list_desktop_app_candidates,
@@ -456,15 +737,61 @@ pub fn run_with_paths(paths: AppPaths) {
                 });
             }
 
-            // Wakeup listener: when a secondary launch targets the same data_dir,
-            // rebuild or focus the primary main window.
+            // Unified single-instance listener:
+            // - secondary launch -> rebuild or focus the primary main window
+            // - cross-IL graceful-exit event -> mark shutting down and run full graceful exit
             if let Ok(guard_lock) = wake_guard_ref.lock() {
                 if let Some(ref si) = *guard_lock {
                     let wake_handle = handle.clone();
-                    let _ = si.start_wakeup_listener(move || {
-                        lifecycle::show_or_rebuild_main_window(&wake_handle);
-                    });
+                    let exit_handle = handle.clone();
+                    if let Err(err) = si.start_instance_listeners(
+                        move || {
+                            lifecycle::show_or_rebuild_main_window(&wake_handle);
+                        },
+                        move || {
+                            tracing::info!(
+                                "received cross-IL graceful-exit event; triggering clean shutdown"
+                            );
+                            if let Some(st) = exit_handle.try_state::<AppState>() {
+                                st.shutting_down.store(true, Ordering::SeqCst);
+                            }
+                            lifecycle::request_graceful_exit(&exit_handle);
+                        },
+                    ) {
+                        tracing::warn!("failed to start single-instance listeners: {err}");
+                    }
                 }
+            }
+
+            // Windows WM_QUERYENDSESSION / WM_ENDSESSION subclass guard on tao's resident hidden
+            // event window: synchronously executes <=3000ms bounded cleanup before tao calls exit(0).
+            {
+                let end_session_app = handle.clone();
+                let end_session_job = Arc::clone(&end_session_job_ref);
+                let end_session_guard = Arc::clone(&end_session_guard_ref);
+                lifecycle::install_tao_end_session_guard(move || {
+                    if let Some(st) = end_session_app.try_state::<AppState>() {
+                        commands::emergency_cleanup_on_exit_bounded(
+                            &st,
+                            Duration::from_millis(3000),
+                        );
+                    }
+                    let _ = end_session_job.terminate_all();
+                    match end_session_guard.try_lock() {
+                        Ok(mut guard_lock) => {
+                            if let Some(mut si) = guard_lock.take() {
+                                si.release();
+                            }
+                        }
+                        Err(std::sync::TryLockError::Poisoned(e)) => {
+                            let mut guard_lock = e.into_inner();
+                            if let Some(mut si) = guard_lock.take() {
+                                si.release();
+                            }
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => {}
+                    }
+                });
             }
 
             // Spawn background telemetry event forwarders feeding frontend sparklines, logs, and tray tooltip.
@@ -2891,9 +3218,10 @@ fn spawn_auto_update_loop(app: &tauri::AppHandle) {
                             let staged_ver = res.get("staged_version").and_then(|v| v.as_str());
                             if auto_staged && !auto_stage_reused {
                                 if !st.shutting_down.load(Ordering::SeqCst) {
-                                    if let Ok(Some(prompt_dto)) =
+                                    if let Ok(Some(mut prompt_dto)) =
                                         commands::get_pending_staged_update_internal(&st).await
                                     {
+                                        apply_next_launch_silent_badge_policy(&st, &mut prompt_dto);
                                         let _ = app_h.emit(
                                             commands::EVENT_UPDATE_READY,
                                             &prompt_dto,
@@ -3573,5 +3901,217 @@ mod tests {
             bypass_cooldown_on_disconnect: true,
         }];
         assert_eq!(commands::group_watchdog_failure_threshold(&group), 3);
+    }
+
+    #[test]
+    fn shutdown_existing_signals_without_waking_and_startup_reconciles_dangling_relay() {
+        use std::sync::atomic::AtomicBool;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_lib_s22_test_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("create temp AppPaths");
+
+        // 1. `--shutdown-existing` flag triggers graceful exit listener WITHOUT triggering wakeup.
+        let guard = match SingleInstanceGuard::acquire_for_paths(&paths, false)
+            .expect("acquire primary guard")
+        {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary ownership"),
+        };
+        let woke = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let woke_cb = Arc::clone(&woke);
+        let exited_cb = Arc::clone(&exited);
+        guard
+            .start_instance_listeners(
+                move || woke_cb.store(true, Ordering::SeqCst),
+                move || exited_cb.store(true, Ordering::SeqCst),
+            )
+            .expect("start instance listeners");
+
+        assert!(handle_shutdown_existing_flag(&paths));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !exited.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(exited.load(Ordering::SeqCst), "graceful exit callback must fire");
+        assert!(!woke.load(Ordering::SeqCst), "wakeup callback must NOT fire");
+        drop(guard);
+
+        // 2. Startup config reconciliation clears dangling `active_relay_id` and persists it.
+        let storage = Storage::open(&paths.db_path).expect("open sqlite");
+        let mut cfg = catcloud_core::models::AppConfig::default();
+        cfg.preaccel.active_relay_id = Some("deleted-relay-id".to_string());
+        config::save(&paths, &cfg).expect("save initial config");
+        assert!(reconcile_startup_config_with_storage(&paths, &mut cfg, &storage));
+        assert_eq!(cfg.preaccel.active_relay_id, None);
+        let persisted = config::load_or_init(&paths).expect("reload config");
+        assert_eq!(persisted.preaccel.active_relay_id, None);
+
+        // 3. `UpdateApplyMode::NextLaunch` marks silent_badge_only=true and records session dismissal.
+        cfg.update.mode = UpdateApplyMode::NextLaunch;
+        let state = AppState::new(
+            paths.clone(),
+            cfg,
+            storage,
+            Arc::new(JobGuard::new().expect("job guard")),
+        );
+        let mut dto = commands::PendingUpdatePromptDto {
+            current_version: "0.1.1".to_string(),
+            target_version: "0.1.2".to_string(),
+            kind: "portable_zip".to_string(),
+            apply_action: "portable_restart".to_string(),
+            archive_sha256: "a".repeat(64),
+            package_size_bytes: 1024,
+            staged_at: "2026-11-27T00:00:00Z".to_string(),
+            release_notes: String::new(),
+            release_url: None,
+            platform_key: None,
+            installer_filename: None,
+            dismissed_in_session: false,
+            silent_badge_only: false,
+            is_elevated: false,
+        };
+        assert!(apply_next_launch_silent_badge_policy(&state, &mut dto));
+        assert!(dto.silent_badge_only);
+        assert!(dto.dismissed_in_session);
+        assert_eq!(
+            state
+                .dismissed_update_prompt_version
+                .read()
+                .unwrap()
+                .as_deref(),
+            Some("0.1.2")
+        );
+        assert!(is_one_shot_launch_flag("--shutdown-existing"));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage22_r25_shutdown_existing_readonly_creates_zero_directories_and_targets_accurately() {
+        use std::sync::atomic::AtomicBool;
+
+        let root = std::env::temp_dir().join(format!(
+            "catcloud_lib_r25_shutdown_ro_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let installed_exe_dir = root.join("ProgramFiles").join("CatCloud");
+        let portable_exe_dir = root.join("PortableApp");
+        let std_appdata_dir = root.join("Roaming").join("CatCloud");
+        let nonexistent_sandbox = root.join("NonexistentSandbox");
+        std::fs::create_dir_all(&installed_exe_dir).unwrap();
+        std::fs::create_dir_all(&portable_exe_dir).unwrap();
+        std::fs::write(portable_exe_dir.join("portable.flag"), b"1").unwrap();
+
+        // 1. Nonexistent `--data-dir` MUST remain completely absent after readonly resolution & signal.
+        let (resolved_nonexistent, is_port_nonexistent) = resolve_data_dir_readonly_for(
+            Some(nonexistent_sandbox.clone()),
+            None,
+            &installed_exe_dir,
+            &std_appdata_dir,
+        );
+        assert_eq!(resolved_nonexistent, nonexistent_sandbox);
+        assert!(is_port_nonexistent);
+        let is_std_nonexistent = is_standard_installed_readonly_for(
+            &resolved_nonexistent,
+            is_port_nonexistent,
+            &installed_exe_dir,
+            &std_appdata_dir,
+        );
+        assert!(!is_std_nonexistent);
+        let _ = handle_shutdown_existing_for_target(&resolved_nonexistent, is_std_nonexistent);
+        assert!(
+            !nonexistent_sandbox.exists(),
+            "--shutdown-existing readonly path must NOT create nonexistent data directories"
+        );
+
+        // 2. Standard installed (default & UAC-elevated `--data-dir %APPDATA%\CatCloud`) vs portable.
+        let (resolved_std, is_port_std) =
+            resolve_data_dir_readonly_for(None, None, &installed_exe_dir, &std_appdata_dir);
+        assert_eq!(resolved_std, std_appdata_dir);
+        assert!(!is_port_std);
+        assert!(is_standard_installed_readonly_for(
+            &resolved_std,
+            is_port_std,
+            &installed_exe_dir,
+            &std_appdata_dir
+        ));
+        assert!(
+            !std_appdata_dir.exists(),
+            "readonly standard installed detection must not create APPDATA dir"
+        );
+
+        let (resolved_uac_std, is_port_uac_std) = resolve_data_dir_readonly_for(
+            Some(std_appdata_dir.clone()),
+            None,
+            &installed_exe_dir,
+            &std_appdata_dir,
+        );
+        assert!(is_port_uac_std);
+        assert!(is_standard_installed_readonly_for(
+            &resolved_uac_std,
+            is_port_uac_std,
+            &installed_exe_dir,
+            &std_appdata_dir
+        ));
+
+        let (resolved_portable, is_port_portable) =
+            resolve_data_dir_readonly_for(None, None, &portable_exe_dir, &std_appdata_dir);
+        assert_eq!(resolved_portable, portable_exe_dir.join("data"));
+        assert!(is_port_portable);
+        assert!(!is_standard_installed_readonly_for(
+            &resolved_portable,
+            is_port_portable,
+            &portable_exe_dir,
+            &std_appdata_dir
+        ));
+        assert!(!portable_exe_dir.join("data").exists());
+
+        // 3. Existing running isolated `--data-dir` is hit accurately via readonly path without wakeup.
+        let live_sandbox = root.join("LiveSandbox");
+        let live_paths = AppPaths::from_data_dir(live_sandbox.clone(), true).unwrap();
+        let guard = match SingleInstanceGuard::acquire_for_paths(&live_paths, false).unwrap() {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary ownership"),
+        };
+        let woke = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(AtomicBool::new(false));
+        let woke_cb = Arc::clone(&woke);
+        let exited_cb = Arc::clone(&exited);
+        guard
+            .start_instance_listeners(
+                move || woke_cb.store(true, Ordering::SeqCst),
+                move || exited_cb.store(true, Ordering::SeqCst),
+            )
+            .unwrap();
+
+        let (resolved_live, is_port_live) = resolve_data_dir_readonly_for(
+            Some(live_sandbox.clone()),
+            None,
+            &installed_exe_dir,
+            &std_appdata_dir,
+        );
+        let is_std_live = is_standard_installed_readonly_for(
+            &resolved_live,
+            is_port_live,
+            &installed_exe_dir,
+            &std_appdata_dir,
+        );
+        assert!(!is_std_live);
+        assert!(handle_shutdown_existing_for_target(&resolved_live, is_std_live));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !exited.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(exited.load(Ordering::SeqCst));
+        assert!(!woke.load(Ordering::SeqCst));
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

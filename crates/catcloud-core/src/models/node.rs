@@ -1,5 +1,7 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 
 /// Source type of a subscription or node feed.
@@ -728,16 +730,81 @@ pub struct ProbeSnapshot {
     pub per_probe_down_mbps: HashMap<String, f64>,
     pub per_probe_ping_ms: HashMap<String, f64>,
     pub per_probe_detail: HashMap<String, String>,
+    #[serde(default)]
+    pub per_probe_tested_at: HashMap<String, String>,
+}
+
+/// Infer the canonical [`ProbeKind`] for well-known built-in probe IDs.
+pub fn infer_builtin_probe_kind(probe_id: &str) -> Option<ProbeKind> {
+    let trimmed = probe_id.trim();
+    match trimmed {
+        "builtin_latency" => Some(ProbeKind::Latency),
+        "builtin_google_cn" => Some(ProbeKind::GoogleCn),
+        "builtin_upload" => Some(ProbeKind::Upload),
+        "builtin_download" => Some(ProbeKind::Download),
+        "builtin_keepalive_60s" => Some(ProbeKind::Keepalive),
+        "builtin_unlock_windsurf"
+        | "builtin_unlock_claude"
+        | "builtin_unlock_chatgpt"
+        | "builtin_unlock_gemini" => Some(ProbeKind::UnlockRegex),
+        _ if trimmed.starts_with("builtin_unlock_") => Some(ProbeKind::UnlockRegex),
+        _ => None,
+    }
+}
+
+fn parse_tested_at_utc(ts: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(ts.trim())
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn compare_tested_at_desc(a: &str, b: &str) -> Ordering {
+    match (parse_tested_at_utc(a), parse_tested_at_utc(b)) {
+        (Some(da), Some(db)) => db.cmp(&da).then_with(|| b.cmp(a)),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => b.cmp(a),
+    }
 }
 
 impl ProbeSnapshot {
-    /// Merge latest per-probe result rows for a node into one formula-ready snapshot.
-    /// When `primary_probe_id` is given, its scalar metrics take priority for top-level
-    /// `latency_ms`/`up_mbps`/`down_mbps` fields.
+    /// Merge latest per-probe result rows for a node into one formula-ready snapshot using the
+    /// built-in probe ID -> [`ProbeKind`] mapping (compatibility wrapper around
+    /// [`ProbeSnapshot::from_results_with_kinds`]).
     pub fn from_results(
         node_id: &str,
         results: &[ProbeResultRecord],
         primary_probe_id: Option<&str>,
+    ) -> Self {
+        let builtin_kinds: HashMap<String, ProbeKind> = ProbeDefinition::builtin_defaults()
+            .into_iter()
+            .map(|d| (d.id, d.kind))
+            .collect();
+        Self::from_results_with_kinds(node_id, results, primary_probe_id, &builtin_kinds)
+    }
+
+    /// Merge per-probe result rows for a node into one formula-ready snapshot with explicit
+    /// `probe_id -> ProbeKind` semantics:
+    /// - Records are sorted newest-first using RFC3339 UTC timestamp ordering (falling back to
+    ///   lexicographic string comparison for non-RFC3339 timestamps).
+    /// - Top-level `latency_ms` / `jitter_ms` / `loss_pct` are populated strictly from
+    ///   [`ProbeKind::Latency`] records (priority: valid Latency `primary_probe_id` ->
+    ///   `builtin_latency` -> latest Latency probe), never polluted by Unlock/Upload/Download/
+    ///   Keepalive/GoogleCn/ExternalCmd probes.
+    /// - Top-level `up_mbps` / `down_mbps` accept strictly `rec.ok == true` positive finite values
+    ///   from `Upload`/`Download`/`ExternalCmd` probes.
+    /// - `cf_loc` / `yt_gl` / `google_clean` / `keepalive_60s_ok` take the newest non-empty value.
+    /// - In `unlocked_sites`, `builtin_unlock_gemini` strictly owns the `"gemini"` key whenever
+    ///   present (never overwritten by `builtin_google_cn`, which independently maintains
+    ///   `"gemini_aistudio"`).
+    /// - When any `Latency` record exists, `snap.ok` strictly reflects the selected latest Latency
+    ///   probe (`ok == false` clears `latency_ms = None`); only when no Latency record exists does
+    ///   `snap.ok` fall back to `any_ok`.
+    pub fn from_results_with_kinds(
+        node_id: &str,
+        results: &[ProbeResultRecord],
+        primary_probe_id: Option<&str>,
+        probe_kinds: &HashMap<String, ProbeKind>,
     ) -> Self {
         let mut snap = Self {
             node_id: node_id.to_string(),
@@ -747,89 +814,221 @@ impl ProbeSnapshot {
             return snap;
         }
 
-        let mut any_ok = false;
-        let mut primary_matched = false;
+        let primary_id = primary_probe_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
 
-        for rec in results {
-            if rec.tested_at > snap.tested_at {
-                snap.tested_at = rec.tested_at.clone();
+        // Sort newest-first by parsed RFC3339 UTC timestamp (tie-break: probe_id ASC, later index first).
+        let mut order: Vec<usize> = (0..results.len()).collect();
+        order.sort_by(|&a, &b| {
+            compare_tested_at_desc(&results[a].tested_at, &results[b].tested_at)
+                .then_with(|| results[a].probe_id.cmp(&results[b].probe_id))
+                .then_with(|| b.cmp(&a))
+        });
+
+        // Deduplicate to the latest record per `probe_id` while preserving newest-first order.
+        let mut seen_probe_ids: HashSet<&str> = HashSet::with_capacity(results.len());
+        let mut latest_records: Vec<(&ProbeResultRecord, Option<ProbeKind>)> =
+            Vec::with_capacity(results.len());
+        for idx in order {
+            let rec = &results[idx];
+            if !seen_probe_ids.insert(rec.probe_id.as_str()) {
+                continue;
+            }
+            let kind = probe_kinds
+                .get(&rec.probe_id)
+                .cloned()
+                .or_else(|| infer_builtin_probe_kind(&rec.probe_id));
+            latest_records.push((rec, kind));
+        }
+
+        let mut any_ok = false;
+
+        // First pass: populate per-probe maps, top-level `tested_at`, and newest-non-null metadata.
+        for (rec, _) in &latest_records {
+            if !rec.tested_at.trim().is_empty() {
+                if snap.tested_at.trim().is_empty()
+                    || compare_tested_at_desc(&rec.tested_at, &snap.tested_at) == Ordering::Less
+                {
+                    snap.tested_at = rec.tested_at.clone();
+                }
+                snap.per_probe_tested_at
+                    .insert(rec.probe_id.clone(), rec.tested_at.clone());
             }
             if rec.ok {
                 any_ok = true;
             }
 
             snap.per_probe_ok.insert(rec.probe_id.clone(), rec.ok);
-            if let Some(up) = rec.up_mbps {
-                snap.per_probe_up_mbps.insert(rec.probe_id.clone(), up);
-            }
-            if let Some(down) = rec.down_mbps {
-                snap.per_probe_down_mbps.insert(rec.probe_id.clone(), down);
-            }
-            if let Some(ping) = rec.latency_ms {
-                snap.per_probe_ping_ms.insert(rec.probe_id.clone(), ping);
+            if rec.ok {
+                if let Some(up) = rec.up_mbps.filter(|v| v.is_finite() && *v > 0.0) {
+                    snap.per_probe_up_mbps.insert(rec.probe_id.clone(), up);
+                }
+                if let Some(down) = rec.down_mbps.filter(|v| v.is_finite() && *v > 0.0) {
+                    snap.per_probe_down_mbps.insert(rec.probe_id.clone(), down);
+                }
+                if let Some(ping) = rec.latency_ms.filter(|v| v.is_finite() && *v > 0.0) {
+                    snap.per_probe_ping_ms.insert(rec.probe_id.clone(), ping);
+                }
             }
             if let Some(ref detail) = rec.detail {
                 snap.per_probe_detail
                     .insert(rec.probe_id.clone(), detail.clone());
             }
 
-            let is_primary = primary_probe_id.is_some_and(|pid| pid == rec.probe_id);
-            if is_primary {
-                primary_matched = true;
-                snap.ok = rec.ok;
-                if rec.latency_ms.is_some() {
-                    snap.latency_ms = rec.latency_ms;
-                }
-                if rec.jitter_ms.is_some() {
-                    snap.jitter_ms = rec.jitter_ms;
-                }
-                if rec.loss_pct.is_some() {
-                    snap.loss_pct = rec.loss_pct;
-                }
-                if rec.up_mbps.is_some() {
-                    snap.up_mbps = rec.up_mbps;
-                }
-                if rec.down_mbps.is_some() {
-                    snap.down_mbps = rec.down_mbps;
-                }
-            } else {
-                if snap.latency_ms.is_none() && rec.latency_ms.is_some() {
-                    snap.latency_ms = rec.latency_ms;
-                }
-                if snap.jitter_ms.is_none() && rec.jitter_ms.is_some() {
-                    snap.jitter_ms = rec.jitter_ms;
-                }
-                if snap.loss_pct.is_none() && rec.loss_pct.is_some() {
-                    snap.loss_pct = rec.loss_pct;
-                }
-                if snap.up_mbps.is_none() && rec.up_mbps.is_some() {
-                    snap.up_mbps = rec.up_mbps;
-                }
-                if snap.down_mbps.is_none() && rec.down_mbps.is_some() {
-                    snap.down_mbps = rec.down_mbps;
+            // Newest-non-empty wins (protected by `is_none()` because `latest_records` is DESC).
+            if snap.cf_loc.is_none() {
+                if let Some(ref loc) = rec.cf_loc {
+                    if !loc.trim().is_empty() {
+                        snap.cf_loc = Some(loc.clone());
+                    }
                 }
             }
-
-            if rec.cf_loc.is_some() {
-                snap.cf_loc = rec.cf_loc.clone();
+            if snap.yt_gl.is_none() {
+                if let Some(ref gl) = rec.yt_gl {
+                    if !gl.trim().is_empty() {
+                        snap.yt_gl = Some(gl.clone());
+                    }
+                }
             }
-            if rec.yt_gl.is_some() {
-                snap.yt_gl = rec.yt_gl.clone();
-            }
-            if rec.google_clean.is_some() {
+            if snap.google_clean.is_none() && rec.google_clean.is_some() {
                 snap.google_clean = rec.google_clean;
             }
-            if rec.keepalive_60s_ok.is_some() {
+            if snap.keepalive_60s_ok.is_none() && rec.keepalive_60s_ok.is_some() {
                 snap.keepalive_60s_ok = rec.keepalive_60s_ok;
-            }
-            for (site, unlocked) in &rec.unlocked_map {
-                snap.unlocked_sites.insert(site.clone(), *unlocked);
             }
         }
 
-        if !primary_matched {
+        // `unlocked_sites`: `builtin_unlock_gemini` strictly owns `"gemini"` whenever present;
+        // `builtin_google_cn` independently maintains `"gemini_aistudio"` and never overrides `"gemini"`.
+        let dedicated_gemini = latest_records
+            .iter()
+            .find(|(rec, _)| rec.probe_id == "builtin_unlock_gemini");
+        let gemini_owned_by_dedicated = if let Some((grec, _)) = dedicated_gemini {
+            let val = grec.unlocked_map.get("gemini").copied().unwrap_or(grec.ok);
+            snap.unlocked_sites.insert("gemini".to_string(), val);
+            true
+        } else {
+            false
+        };
+
+        for (rec, _) in &latest_records {
+            for (site, unlocked) in &rec.unlocked_map {
+                if site == "gemini" {
+                    if gemini_owned_by_dedicated {
+                        continue;
+                    }
+                    if rec.probe_id == "builtin_google_cn" {
+                        // When no dedicated `builtin_unlock_gemini` record exists yet, keep
+                        // `gemini_aistudio` independent and only populate `"gemini"` if unset.
+                        snap.unlocked_sites.entry(site.clone()).or_insert(*unlocked);
+                        continue;
+                    }
+                }
+                snap.unlocked_sites.entry(site.clone()).or_insert(*unlocked);
+            }
+        }
+
+        // Top-level latency / jitter / loss & `ok`: strictly from `ProbeKind::Latency`.
+        let latency_recs: Vec<&ProbeResultRecord> = latest_records
+            .iter()
+            .filter_map(|(rec, kind)| matches!(kind, Some(ProbeKind::Latency)).then_some(*rec))
+            .collect();
+
+        let chosen_latency = primary_id
+            .and_then(|pid| latency_recs.iter().copied().find(|r| r.probe_id == pid))
+            .or_else(|| {
+                latency_recs
+                    .iter()
+                    .copied()
+                    .find(|r| r.probe_id == "builtin_latency")
+            })
+            .or_else(|| latency_recs.first().copied());
+
+        if let Some(lrec) = chosen_latency {
+            snap.ok = lrec.ok;
+            if lrec.ok {
+                snap.latency_ms = lrec.latency_ms.filter(|v| v.is_finite() && *v > 0.0);
+            } else {
+                snap.latency_ms = None;
+            }
+            snap.jitter_ms = lrec.jitter_ms.filter(|v| v.is_finite() && *v >= 0.0);
+            snap.loss_pct = lrec.loss_pct.filter(|v| v.is_finite() && *v >= 0.0);
+        } else {
             snap.ok = any_ok;
         }
+
+        // Top-level `up_mbps`: strictly `ok == true` positive values from Upload / ExternalCmd.
+        let pick_up = |rec: &ProbeResultRecord, kind: &Option<ProbeKind>| -> Option<f64> {
+            if !rec.ok {
+                return None;
+            }
+            if !matches!(kind, Some(ProbeKind::Upload | ProbeKind::ExternalCmd)) {
+                return None;
+            }
+            rec.up_mbps.filter(|v| v.is_finite() && *v > 0.0)
+        };
+        snap.up_mbps = primary_id
+            .and_then(|pid| {
+                latest_records
+                    .iter()
+                    .find(|(rec, _)| rec.probe_id == pid)
+                    .and_then(|(rec, kind)| pick_up(rec, kind))
+            })
+            .or_else(|| {
+                latest_records
+                    .iter()
+                    .find_map(|(rec, kind)| {
+                        matches!(kind, Some(ProbeKind::Upload))
+                            .then(|| pick_up(rec, kind))
+                            .flatten()
+                    })
+            })
+            .or_else(|| {
+                latest_records
+                    .iter()
+                    .find_map(|(rec, kind)| {
+                        matches!(kind, Some(ProbeKind::ExternalCmd))
+                            .then(|| pick_up(rec, kind))
+                            .flatten()
+                    })
+            });
+
+        // Top-level `down_mbps`: strictly `ok == true` positive values from Download / ExternalCmd.
+        let pick_down = |rec: &ProbeResultRecord, kind: &Option<ProbeKind>| -> Option<f64> {
+            if !rec.ok {
+                return None;
+            }
+            if !matches!(kind, Some(ProbeKind::Download | ProbeKind::ExternalCmd)) {
+                return None;
+            }
+            rec.down_mbps.filter(|v| v.is_finite() && *v > 0.0)
+        };
+        snap.down_mbps = primary_id
+            .and_then(|pid| {
+                latest_records
+                    .iter()
+                    .find(|(rec, _)| rec.probe_id == pid)
+                    .and_then(|(rec, kind)| pick_down(rec, kind))
+            })
+            .or_else(|| {
+                latest_records
+                    .iter()
+                    .find_map(|(rec, kind)| {
+                        matches!(kind, Some(ProbeKind::Download))
+                            .then(|| pick_down(rec, kind))
+                            .flatten()
+                    })
+            })
+            .or_else(|| {
+                latest_records
+                    .iter()
+                    .find_map(|(rec, kind)| {
+                        matches!(kind, Some(ProbeKind::ExternalCmd))
+                            .then(|| pick_down(rec, kind))
+                            .flatten()
+                    })
+            });
 
         if let (Some(cf), Some(yt)) = (&snap.cf_loc, &snap.yt_gl) {
             snap.google_risk_mismatch = !cf.eq_ignore_ascii_case(yt);
@@ -1132,5 +1331,221 @@ mod tests {
             1.0,
             "jp01.example.test"
         )));
+    }
+
+    #[test]
+    fn probe_snapshot_from_results_with_kinds_isolates_latency_speeds_gemini_and_rfc3339_order() {
+        let mut kinds = HashMap::new();
+        for def in ProbeDefinition::builtin_defaults() {
+            kinds.insert(def.id, def.kind);
+        }
+        kinds.insert("custom_ext".to_string(), ProbeKind::ExternalCmd);
+        kinds.insert("custom_unlock".to_string(), ProbeKind::UnlockRegex);
+
+        // Simulate SQLite DESC order where Windsurf (1423ms), Upload (3500ms), Download (2800ms),
+        // Keepalive (1900ms), ExternalCmd (2200ms) finished AFTER builtin_latency (38.5ms).
+        let mut windsurf_map = HashMap::new();
+        windsurf_map.insert("windsurf".to_string(), true);
+
+        let mut gemini_map = HashMap::new();
+        gemini_map.insert("gemini".to_string(), false);
+
+        let mut google_cn_map = HashMap::new();
+        google_cn_map.insert("google_clean".to_string(), true);
+        google_cn_map.insert("gemini_aistudio".to_string(), true);
+        google_cn_map.insert("gemini".to_string(), true);
+
+        let mut custom_unlock_map = HashMap::new();
+        custom_unlock_map.insert("custom_site".to_string(), true);
+
+        let results = vec![
+            // Newest: Upload failed with leaked stage1 speed (must NOT populate top-level or per-probe speed)
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "builtin_upload".into(),
+                tested_at: "2026-11-27T13:00:10.500Z".into(),
+                ok: false,
+                latency_ms: Some(3500.0),
+                up_mbps: Some(0.14),
+                ..Default::default()
+            },
+            // Download ok (2800ms transfer duration must NOT pollute top-level latency_ms)
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "builtin_download".into(),
+                tested_at: "2026-11-27T21:00:09+08:00".into(), // 13:00:09Z
+                ok: true,
+                latency_ms: Some(2800.0),
+                down_mbps: Some(185.5),
+                ..Default::default()
+            },
+            // ExternalCmd ok (with positive upload speed fallback)
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "custom_ext".into(),
+                tested_at: "2026-11-27T13:00:08Z".into(),
+                ok: true,
+                latency_ms: Some(2200.0),
+                up_mbps: Some(42.0),
+                ..Default::default()
+            },
+            // Keepalive newer = true
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "builtin_keepalive_60s".into(),
+                tested_at: "2026-11-27T13:00:07Z".into(),
+                ok: true,
+                latency_ms: Some(1900.0),
+                keepalive_60s_ok: Some(true),
+                ..Default::default()
+            },
+            // Windsurf unlock (1423ms full page load must NEVER override 38.5ms hot latency!)
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "builtin_unlock_windsurf".into(),
+                tested_at: "2026-11-27T13:00:06Z".into(),
+                ok: true,
+                latency_ms: Some(1423.0),
+                unlocked_map: windsurf_map,
+                ..Default::default()
+            },
+            // Google CN ran AFTER builtin_unlock_gemini with AI Studio = true, MUST NOT overwrite gemini=false!
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "builtin_google_cn".into(),
+                tested_at: "2026-11-27T13:00:05.9Z".into(),
+                ok: true,
+                latency_ms: Some(610.0),
+                cf_loc: Some("JP".into()),
+                yt_gl: Some("JP".into()),
+                google_clean: Some(true),
+                unlocked_map: google_cn_map,
+                ..Default::default()
+            },
+            // Dedicated Gemini probe ran earlier and found API geo-blocked (gemini = false)
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "builtin_unlock_gemini".into(),
+                tested_at: "2026-11-27T13:00:05.123456Z".into(),
+                ok: false,
+                latency_ms: Some(890.0),
+                unlocked_map: gemini_map,
+                ..Default::default()
+            },
+            // Custom unlock probe
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "custom_unlock".into(),
+                tested_at: "2026-11-27T13:00:04Z".into(),
+                ok: true,
+                latency_ms: Some(777.0),
+                unlocked_map: custom_unlock_map,
+                ..Default::default()
+            },
+            // Standard L0 latency ran FIRST (earliest timestamp)
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "builtin_latency".into(),
+                tested_at: "2026-11-27T13:00:01Z".into(),
+                ok: true,
+                latency_ms: Some(38.5),
+                jitter_ms: Some(2.1),
+                loss_pct: Some(0.0),
+                ..Default::default()
+            },
+            // Older stale google_cn record (must NEVER reverse-override newer clean JP values)
+            ProbeResultRecord {
+                node_id: "n1".into(),
+                probe_id: "legacy_google_probe".into(),
+                tested_at: "2026-11-26T00:00:00Z".into(),
+                ok: false,
+                cf_loc: Some("CN".into()),
+                yt_gl: Some("HK".into()),
+                google_clean: Some(false),
+                keepalive_60s_ok: Some(false),
+                ..Default::default()
+            },
+        ];
+
+        let snap = ProbeSnapshot::from_results_with_kinds("n1", &results, None, &kinds);
+        assert!(snap.ok);
+        assert_eq!(snap.latency_ms, Some(38.5));
+        assert_eq!(snap.jitter_ms, Some(2.1));
+        assert_eq!(snap.loss_pct, Some(0.0));
+        // Failed builtin_upload (0.14) ignored; ExternalCmd (42.0) provides valid ok up_mbps
+        assert_eq!(snap.up_mbps, Some(42.0));
+        assert_eq!(snap.probe_up("builtin_upload"), None);
+        // Failed probe durations must NEVER pollute `per_probe_ping_ms` / `probe_ping(...)`.
+        assert_eq!(snap.probe_ping("builtin_upload"), None);
+        assert_eq!(snap.probe_ping("builtin_unlock_gemini"), None);
+        assert_eq!(snap.probe_ping("builtin_latency"), Some(38.5));
+        assert_eq!(snap.down_mbps, Some(185.5));
+        assert_eq!(snap.cf_loc.as_deref(), Some("JP"));
+        assert_eq!(snap.yt_gl.as_deref(), Some("JP"));
+        assert_eq!(snap.google_clean, Some(true));
+        assert!(!snap.google_risk_mismatch);
+        assert_eq!(snap.keepalive_60s_ok, Some(true));
+        // Dedicated builtin_unlock_gemini strictly owns "gemini"; google_cn independently keeps "gemini_aistudio"
+        assert_eq!(snap.unlocked_sites.get("gemini"), Some(&false));
+        assert_eq!(snap.unlocked_sites.get("gemini_aistudio"), Some(&true));
+        assert_eq!(snap.unlocked_sites.get("windsurf"), Some(&true));
+        assert_eq!(snap.tested_at, "2026-11-27T13:00:10.500Z");
+        assert_eq!(
+            snap.per_probe_tested_at.get("builtin_latency").map(String::as_str),
+            Some("2026-11-27T13:00:01Z")
+        );
+        assert_eq!(
+            snap.per_probe_tested_at.get("builtin_download").map(String::as_str),
+            Some("2026-11-27T21:00:09+08:00")
+        );
+
+        // When Latency fails, snap.ok MUST be false and latency_ms MUST be None even if Unlock succeeded!
+        let failed_lat_results = vec![
+            ProbeResultRecord {
+                node_id: "n2".into(),
+                probe_id: "builtin_unlock_windsurf".into(),
+                tested_at: "2026-11-27T13:01:00Z".into(),
+                ok: true,
+                latency_ms: Some(1200.0),
+                ..Default::default()
+            },
+            ProbeResultRecord {
+                node_id: "n2".into(),
+                probe_id: "builtin_latency".into(),
+                tested_at: "2026-11-27T13:02:00Z".into(),
+                ok: false,
+                latency_ms: None,
+                loss_pct: Some(100.0),
+                ..Default::default()
+            },
+        ];
+        let snap_fail = ProbeSnapshot::from_results_with_kinds("n2", &failed_lat_results, None, &kinds);
+        assert!(!snap_fail.ok);
+        assert_eq!(snap_fail.latency_ms, None);
+        assert_eq!(snap_fail.loss_pct, Some(100.0));
+        assert_eq!(snap_fail.probe_ping("builtin_latency"), None);
+
+        // Non-positive latency (0.0ms) or failed probe with elapsed latency must not enter per_probe_ping_ms.
+        let edge_results = vec![
+            ProbeResultRecord {
+                node_id: "n3".into(),
+                probe_id: "custom_lat_fail".into(),
+                tested_at: "2026-11-27T13:03:00Z".into(),
+                ok: false,
+                latency_ms: Some(4500.0),
+                ..Default::default()
+            },
+            ProbeResultRecord {
+                node_id: "n3".into(),
+                probe_id: "custom_lat_zero".into(),
+                tested_at: "2026-11-27T13:03:01Z".into(),
+                ok: true,
+                latency_ms: Some(0.0),
+                ..Default::default()
+            },
+        ];
+        let snap_edge = ProbeSnapshot::from_results_with_kinds("n3", &edge_results, None, &kinds);
+        assert_eq!(snap_edge.probe_ping("custom_lat_fail"), None);
+        assert_eq!(snap_edge.probe_ping("custom_lat_zero"), None);
     }
 }

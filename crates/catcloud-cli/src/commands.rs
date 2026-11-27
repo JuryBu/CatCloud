@@ -37,9 +37,7 @@ use catcloud_core::preaccel::global_tunnel::{
     GlobalPreAccelRuntimeMeta, detect_host_security_products, locate_windivert_files,
     read_global_preaccel_runtime_meta,
 };
-use catcloud_core::preaccel::schema::{
-    evaluate_expiry, parse_mmrelay_clipboard, validate_relay_strict,
-};
+use catcloud_core::preaccel::schema::{evaluate_expiry, parse_mmrelay_clipboard};
 use catcloud_core::probe::registry::{FunnelTier, ProbeRegistry, validate_definition};
 use catcloud_core::probe::{
     DEFAULT_READY_TIMEOUT, FunnelOptions, FunnelRunReport, IsolatedProbeCore,
@@ -1724,19 +1722,21 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 };
                 let bundle = parse_mmrelay_clipboard(&raw)?;
                 let db = open_storage(paths)?;
-                for relay in &bundle.relays {
-                    validate_relay_strict(relay)?;
-                    db.upsert_preaccel_relay(relay)?;
+                let (imported_count, warnings) =
+                    catcloud_core::preaccel::import_relays_dedup_into_storage(&db, bundle.relays)?;
+                if imported_count == 0 && !warnings.is_empty() {
+                    anyhow::bail!("{}", warnings.join("; "));
                 }
-                let redacted_relays: Vec<PreAccelRelay> = bundle
-                    .relays
+                let persisted_relays = db.list_preaccel_relays(false)?;
+                let redacted_relays: Vec<PreAccelRelay> = persisted_relays
                     .iter()
                     .map(redact_relay_for_readonly)
                     .collect();
                 let out = json!({
                     "ok": true,
                     "sanitized": true,
-                    "imported_relays": redacted_relays.len(),
+                    "imported_relays": imported_count,
+                    "warnings": warnings,
                     "relays": redacted_relays,
                 });
                 emit_output(
@@ -1744,7 +1744,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     &out,
                     &format!(
                         "Imported {} verified domestic :443 relay(s).",
-                        bundle.relays.len()
+                        imported_count
                     ),
                 )
             }
@@ -1817,6 +1817,19 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 }
                 if let Some(ds) = dispatch_strategy {
                     cfg.preaccel.dispatch_strategy = parse_preaccel_dispatch_strategy(&ds)?;
+                    if matches!(
+                        cfg.preaccel.dispatch_strategy,
+                        PreAccelDispatchStrategy::Auto | PreAccelDispatchStrategy::LoadBalance
+                    ) {
+                        cfg.preaccel.active_relay_id = None;
+                    }
+                }
+                if let Ok(db) = open_storage(paths) {
+                    if let Ok(enabled_relays) = db.list_preaccel_relays(true) {
+                        let enabled_ids: HashSet<String> =
+                            enabled_relays.into_iter().map(|r| r.id).collect();
+                        let _ = config::reconcile_dangling_active_relay(&mut cfg, &enabled_ids);
+                    }
                 }
                 if let Some(lb) = lb_strategy {
                     cfg.preaccel.lb_strategy = parse_preaccel_lb_strategy(&lb)?;
@@ -6935,15 +6948,15 @@ async fn run_config_reload_inner(
     } else {
         None
     };
-    let classified_level = match &live_baseline_cfg {
+    let mut classified_level = match &live_baseline_cfg {
         Some(old) => classify_config_diff(old, &effective_cfg),
         None => ReloadLevel::L2HotReload,
     };
-    let diff_reasons = match &live_baseline_cfg {
+    let mut diff_reasons = match &live_baseline_cfg {
         Some(old) => summarize_l3_diff_reasons(old, &effective_cfg),
         None => Vec::new(),
     };
-    let requires_l3_restart = classified_level == ReloadLevel::L3CoreRestart;
+    let mut requires_l3_restart = classified_level == ReloadLevel::L3CoreRestart;
 
     if dry_run {
         let db = open_storage(paths)?;
@@ -6969,7 +6982,7 @@ async fn run_config_reload_inner(
             .clone()
             .unwrap_or_else(generate_controller_secret);
         let empty_filter = HashMap::new();
-        let compiled = compile_mihomo_config_with_runtime_dir(
+        let mut compiled = compile_mihomo_config_with_runtime_dir(
             &CompileInput {
                 config: &effective_cfg,
                 nodes: &nodes,
@@ -6983,6 +6996,31 @@ async fn run_config_reload_inner(
             },
             Some(&paths.runtime_dir),
         )?;
+        if !allow_tun {
+            catcloud_core::core_adapter::enforce_tun_disabled_on_compiled(&mut compiled)?;
+        }
+        let compiled_tun_enabled = compiled
+            .value
+            .get("tun")
+            .and_then(|t| t.get("enable"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
+        if core_running && compiled_tun_enabled {
+            let live_mtu =
+                catcloud_core::core_adapter::read_live_tun_mtu_from_path(&runtime_yaml_path)
+                    .or_else(|| live_tun_enabled.then_some(1500));
+            if let Some(live_mtu) = live_mtu {
+                let next_mtu = compiled.stats.effective_tun_mtu;
+                if live_mtu != next_mtu {
+                    classified_level = ReloadLevel::L3CoreRestart;
+                    requires_l3_restart = true;
+                    let reason = format!("tun.effective_mtu ({live_mtu} -> {next_mtu})");
+                    if !diff_reasons.iter().any(|r| r.contains("tun.effective_mtu")) {
+                        diff_reasons.push(reason);
+                    }
+                }
+            }
+        }
         if !compiled.validation.ok {
             let summary = sanitize_log_line(
                 &compiled
@@ -12101,7 +12139,7 @@ mod tests {
         assert_eq!(eval_out["evaluation_mode"], json!("offline_dry_run"));
         assert_eq!(
             eval_out["evaluation"]["gate_passed"][0]["tested_at"],
-            json!("2026-11-26T12:00:00Z")
+            json!("2026-11-26T12:00:00.000000Z")
         );
         assert_eq!(
             eval_out["watchdog_snapshot"]["recent_events"][0]["group_id"],
@@ -13059,6 +13097,208 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 
+    #[tokio::test]
+    async fn stage22_cli_preaccel_add_dedup_bind_clears_active_relay_and_reload_dry_run_checks_mtu() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud_cli_s22_test_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).unwrap();
+
+        // 1. `PreaccelCommand::Add` deduplicates by `(protocol, server, port)` and strips speed cache.
+        let r1 = PreAccelRelay {
+            id: "relay-dup-1".to_string(),
+            name: "Aliyun-SH-A".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN-SH".to_string(),
+            server: "198.51.100.40".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-password-a".to_string(),
+            skip_cert_verify: true,
+            enabled: true,
+            last_probe_ms: Some(15.0),
+            last_up_mbps: Some(99.0),
+            ..Default::default()
+        };
+        let mut r2 = r1.clone();
+        r2.id = "relay-dup-2".to_string();
+        r2.name = "Aliyun-SH-Updated".to_string();
+        let bundle_json = catcloud_core::preaccel::serialize_mmrelay_json(
+            &catcloud_core::preaccel::bundle_from_relays(vec![r1, r2]),
+        )
+        .unwrap();
+
+        dispatch(
+            &paths,
+            true,
+            Commands::Preaccel {
+                action: PreaccelCommand::Add {
+                    file: None,
+                    uri: Some(bundle_json),
+                },
+            },
+        )
+        .await
+        .expect("preaccel add dedup succeeds");
+
+        let db = open_storage(&paths).unwrap();
+        let stored_relays = db.list_preaccel_relays(false).unwrap();
+        assert_eq!(
+            stored_relays.len(),
+            1,
+            "duplicate (protocol, server, port) relays must deduplicate to 1 row"
+        );
+        assert_eq!(stored_relays[0].name, "Aliyun-SH-Updated");
+        assert_eq!(stored_relays[0].last_probe_ms, None);
+        assert_eq!(stored_relays[0].last_up_mbps, None);
+        drop(db);
+
+        // 2. `PreaccelCommand::Bind --dispatch-strategy auto` clears pinned/dangling `active_relay_id`.
+        let mut cfg = config::load_or_init(&paths).unwrap();
+        cfg.preaccel.active_relay_id = Some("relay-dup-1".to_string());
+        cfg.preaccel.dispatch_strategy = PreAccelDispatchStrategy::Fallback;
+        config::save(&paths, &cfg).unwrap();
+
+        dispatch(
+            &paths,
+            true,
+            Commands::Preaccel {
+                action: PreaccelCommand::Bind {
+                    enabled: Some(true),
+                    skip_443_native: None,
+                    probe_url: None,
+                    dispatch_strategy: Some("auto".to_string()),
+                    lb_strategy: None,
+                },
+            },
+        )
+        .await
+        .expect("preaccel bind auto succeeds");
+        let after_bind = config::load_or_init(&paths).unwrap();
+        assert_eq!(after_bind.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Auto);
+        assert_eq!(after_bind.preaccel.active_relay_id, None);
+
+        // 3. `run_config_reload_inner(..., dry_run=true)` escalates to L3 restart when live
+        //    `runtime.yaml` TUN MTU (1500) differs from compiled effective TUN MTU (1400).
+        let db = open_storage(&paths).unwrap();
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-mtu".to_string(),
+            name: "MTU Sub".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_node(&ProxyNode {
+            id: "node-mtu-1".to_string(),
+            sub_id: "sub-mtu".to_string(),
+            name: "SG-Non443".to_string(),
+            protocol: "vless".to_string(),
+            server: "203.0.113.55".to_string(),
+            port: 8443,
+            is_443_native: false,
+            preaccel_eligible: true,
+            enabled: true,
+            raw_config: serde_json::json!({
+                "name": "SG-Non443",
+                "type": "vless",
+                "server": "203.0.113.55",
+                "port": 8443,
+                "uuid": "00000000-0000-4000-8000-000000000055",
+                "tls": true,
+                "network": "tcp"
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        drop(db);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = listener.local_addr().unwrap().port();
+        let secret = "cli-s22-mtu-secret".to_string();
+        let mixed_port = 27890u16;
+        let dns_port = 21053u16;
+        let server_secret = secret.clone();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let expected_auth = format!("Bearer {server_secret}");
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let authorized = req
+                        .lines()
+                        .any(|l| l.eq_ignore_ascii_case(&format!("Authorization: {expected_auth}")));
+                    let (status, body) = if !authorized {
+                        ("401 Unauthorized", r#"{"message":"unauthorized"}"#.to_string())
+                    } else if first_line.starts_with("GET /version") {
+                        ("200 OK", r#"{"version":"v1.19.10"}"#.to_string())
+                    } else if first_line.starts_with("GET /configs") {
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"mixed-port":{mixed_port},"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"info","ipv6":false,"tun":{{"enable":true,"stack":"mixed"}}}}"#
+                            ),
+                        )
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut reload_cfg = config::load_or_init(&paths).unwrap();
+        reload_cfg.mixed_port = mixed_port;
+        reload_cfg.controller_port = ctrl_port;
+        reload_cfg.dns_listen_port = dns_port;
+        reload_cfg.controller_secret = Some(secret.clone());
+        reload_cfg.tun.enabled = true;
+        reload_cfg.tun.mtu = 1500;
+        reload_cfg.preaccel.enabled = true;
+        reload_cfg.preaccel.global_bypass_enabled = true;
+        config::save(&paths, &reload_cfg).unwrap();
+
+        let runtime_yaml_path = paths.runtime_dir.join("runtime.yaml");
+        let live_yaml = format!(
+            "mixed-port: {mixed_port}\nallow-lan: false\nbind-address: 127.0.0.1\nmode: rule\nexternal-controller: 127.0.0.1:{ctrl_port}\nsecret: \"{secret}\"\ndns:\n  enable: true\n  listen: 127.0.0.1:{dns_port}\ntun:\n  enable: true\n  stack: mixed\n  mtu: 1500\n"
+        );
+        std::fs::write(&runtime_yaml_path, live_yaml).unwrap();
+
+        let mut priv_caps = default_platform().capabilities();
+        priv_caps.is_elevated = true;
+
+        let (dry_ok, dry_out, _) =
+            run_config_reload_inner(&paths, true, Some(priv_caps), false)
+                .await
+                .expect("dry run with live MTU 1500 vs compiled 1400");
+        assert!(dry_ok, "dry run failed: {dry_out}");
+        assert_eq!(dry_out["level"], json!("l3_core_restart"));
+        assert_eq!(dry_out["requires_l3_restart"], json!(true));
+        assert!(
+            dry_out["diff_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap_or("").contains("tun.effective_mtu")),
+            "diff_reasons must mention tun.effective_mtu: {}",
+            dry_out["diff_reasons"]
+        );
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
     #[test]
     fn read_tun_mtu_from_runtime_yaml_checks_tun_enable_and_supports_flow_yaml() {
         let temp_root = std::env::temp_dir().join(format!(
@@ -13088,6 +13328,218 @@ mod tests {
         std::fs::write(&p_missing_enable, "tun:\n  mtu: 1400\n").unwrap();
         assert_eq!(read_tun_mtu_from_runtime_yaml(&p_missing_enable), None);
 
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn stage22_r25_cli_reload_dry_run_enforces_tun_disabled_and_detects_override_mtu_baseline() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud_cli_r25_dry_run_tun_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).unwrap();
+
+        let db = open_storage(&paths).unwrap();
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-r25".to_string(),
+            name: "R25 Sub".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_node(&ProxyNode {
+            id: "node-r25-1".to_string(),
+            sub_id: "sub-r25".to_string(),
+            name: "SG-Non443-R25".to_string(),
+            protocol: "vless".to_string(),
+            server: "203.0.113.88".to_string(),
+            port: 8443,
+            is_443_native: false,
+            preaccel_eligible: true,
+            enabled: true,
+            raw_config: serde_json::json!({
+                "name": "SG-Non443-R25",
+                "type": "vless",
+                "server": "203.0.113.88",
+                "port": 8443,
+                "uuid": "00000000-0000-4000-8000-000000000088",
+                "tls": true,
+                "network": "tcp"
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_preaccel_relay(&PreAccelRelay {
+            id: "relay-r25".to_string(),
+            name: "Relay-R25".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN-SH".to_string(),
+            server: "198.51.100.88".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-password-r25".to_string(),
+            skip_cert_verify: true,
+            enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        drop(db);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = listener.local_addr().unwrap().port();
+        let secret = "cli-r25-dry-tun-secret".to_string();
+        let mixed_port = 27990u16;
+        let dns_port = 21153u16;
+        let server_secret = secret.clone();
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let expected_auth = format!("Bearer {server_secret}");
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let Ok(n) = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await else {
+                        return;
+                    };
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let authorized = req
+                        .lines()
+                        .any(|l| l.eq_ignore_ascii_case(&format!("Authorization: {expected_auth}")));
+                    let (status, body) = if !authorized {
+                        ("401 Unauthorized", r#"{"message":"unauthorized"}"#.to_string())
+                    } else if first_line.starts_with("GET /version") {
+                        ("200 OK", r#"{"version":"v1.19.10"}"#.to_string())
+                    } else if first_line.starts_with("GET /configs") {
+                        (
+                            "200 OK",
+                            format!(
+                                r#"{{"mixed-port":{mixed_port},"allow-lan":false,"bind-address":"127.0.0.1","mode":"rule","log-level":"info","ipv6":false,"tun":{{"enable":true,"stack":"mixed"}}}}"#
+                            ),
+                        )
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await;
+                });
+            }
+        });
+
+        // Case 1: `config.json` has `tun.enabled = false`, while `inline_override_yaml` enables
+        // `tun.enable: true`. Under `!allow_tun` (unprivileged), `dry_run` MUST invoke
+        // `enforce_tun_disabled_on_compiled` so its `sha256` matches actual non-dry-run reload
+        // and does NOT claim a TUN MTU change.
+        let mut cfg = config::load_or_init(&paths).unwrap();
+        cfg.mixed_port = mixed_port;
+        cfg.controller_port = ctrl_port;
+        cfg.dns_listen_port = dns_port;
+        cfg.controller_secret = Some(secret.clone());
+        cfg.tun.enabled = false;
+        cfg.tun.mtu = 1500;
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.global_bypass_enabled = true;
+        cfg.rules_override.inline_override_yaml =
+            Some("tun:\n  enable: true\n  stack: mixed\n".to_string());
+        config::save(&paths, &cfg).unwrap();
+
+        // Live runtime.yaml enables TUN but intentionally OMITS the `mtu` key so
+        // `read_live_tun_mtu_from_path` returns `None`.
+        let runtime_yaml_path = paths.runtime_dir.join("runtime.yaml");
+        let live_yaml_no_mtu = format!(
+            "mixed-port: {mixed_port}\nallow-lan: false\nbind-address: 127.0.0.1\nmode: rule\nexternal-controller: 127.0.0.1:{ctrl_port}\nsecret: \"{secret}\"\ndns:\n  enable: true\n  listen: 127.0.0.1:{dns_port}\ntun:\n  enable: true\n  stack: mixed\n"
+        );
+        std::fs::write(&runtime_yaml_path, &live_yaml_no_mtu).unwrap();
+        assert_eq!(
+            catcloud_core::core_adapter::read_live_tun_mtu_from_path(&runtime_yaml_path),
+            None
+        );
+
+        let mut unpriv_caps = default_platform().capabilities();
+        unpriv_caps.is_elevated = false;
+
+        let (dry_unpriv_ok, dry_unpriv_out, _) =
+            run_config_reload_inner(&paths, true, Some(unpriv_caps.clone()), false)
+                .await
+                .expect("unprivileged dry_run");
+        assert!(dry_unpriv_ok, "unprivileged dry_run failed: {dry_unpriv_out}");
+        assert_eq!(dry_unpriv_out["allow_tun"], json!(false));
+
+        // Verify dry_run SHA-256 matches an offline real compile with `enforce_tun_disabled_on_compiled`.
+        let mut expected_compiled = {
+            let db = open_storage(&paths).unwrap();
+            let nodes = db.list_nodes().unwrap();
+            let groups = db.list_multi_groups().unwrap();
+            let relays = db.list_preaccel_relays(false).unwrap();
+            let ports = AllocatedPorts {
+                bind_host: "127.0.0.1".to_string(),
+                mixed_port,
+                controller_port: ctrl_port,
+                dns_port,
+                shifted: Vec::new(),
+            };
+            let empty_filter = HashMap::new();
+            compile_mihomo_config_with_runtime_dir(
+                &CompileInput {
+                    config: &cfg,
+                    nodes: &nodes,
+                    groups: &groups,
+                    relays: &relays,
+                    controller_secret: &secret,
+                    allocated_ports: &ports,
+                    extra_prepend_rules: &[],
+                    extra_fake_ip_filters: &[],
+                    group_filtered_members: &empty_filter,
+                },
+                Some(&paths.runtime_dir),
+            )
+            .unwrap()
+        };
+        catcloud_core::core_adapter::enforce_tun_disabled_on_compiled(&mut expected_compiled)
+            .unwrap();
+        assert_eq!(
+            dry_unpriv_out["sha256"].as_str(),
+            Some(expected_compiled.sha256.as_str()),
+            "dry_run under !allow_tun must enforce tun.enable=false before computing sha256"
+        );
+        assert!(
+            !dry_unpriv_out["diff_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap_or("").contains("tun.effective_mtu")),
+            "when TUN is forced off under !allow_tun, dry_run must not report tun.effective_mtu diff"
+        );
+
+        // Case 2: Under elevated privileges (`allow_tun == true`), `config.json` still has
+        // `tun.enabled = false` but `inline_override_yaml` enables TUN (`compiled.value.tun.enable == true`)
+        // while live `runtime.yaml` omits `mtu` (`live_tun_enabled == true`, `read_live_tun_mtu_from_path == None`).
+        // Must fall back to 1500 baseline and detect `1500 -> 1400` L3 restart requirement!
+        let mut priv_caps = default_platform().capabilities();
+        priv_caps.is_elevated = true;
+
+        let (dry_priv_ok, dry_priv_out, _) =
+            run_config_reload_inner(&paths, true, Some(priv_caps), false)
+                .await
+                .expect("privileged dry_run with override TUN and omitted live mtu");
+        assert!(dry_priv_ok, "privileged dry_run failed: {dry_priv_out}");
+        assert_eq!(dry_priv_out["level"], json!("l3_core_restart"));
+        assert_eq!(dry_priv_out["requires_l3_restart"], json!(true));
+        assert!(
+            dry_priv_out["diff_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r.as_str().unwrap_or("").contains("tun.effective_mtu (1500 -> 1400)")),
+            "expected tun.effective_mtu (1500 -> 1400) in diff_reasons: {}",
+            dry_priv_out["diff_reasons"]
+        );
+
+        server_task.abort();
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

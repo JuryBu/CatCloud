@@ -354,6 +354,8 @@ export const en: DeepStringDict<TranslationDict> = {
     downloadReadyMsg: "v{version} downloaded and verified — update now or confirm on next launch",
     downloadManualHint: "Please download the package for your platform from the official Releases page",
     downloadFailedMsg: "Failed to download update: {error}",
+    exitTimeoutFallback: "Exit timed out; please retry or open the official Releases page",
+    unknownErrorFallback: "Unknown error",
     closeAria: "Remind me later and close dialog",
   },
   tunPrompt: {
@@ -498,5 +500,51 @@ export const en: DeepStringDict<TranslationDict> = {
     clipboardUnavailableToast: "Clipboard unavailable — please select and copy the YAML manually",
     savedToast: "Router config exported: {path}",
     saveFailedToast: "Failed to save config file: {error}",
+  },
+  latency: {
+    probeHotTooltip:
+      "Standard 204 warm-connection latency (excludes TLS handshake and unlock checks)",
+    healthColdTooltip:
+      "Background dual-source health probe latency (includes connection setup, may be slightly higher than warm tests)",
+    failedTooltip: "Latest standard latency probe failed",
+    untestedTooltip: "Not tested yet",
+    sourceProbeShort: "Warm",
+    sourceHealthShort: "Health",
+    probationBadge: "Probation",
+    degradedBadge: "Degraded",
+    testedAtLatency: "Latency tested",
+    testedAtSpeed: "Speed tested",
+    cooldownSec: "Cooldown {sec}s",
+    cooldownActive: "Cooldown",
+    cooldownRetryHint: "Node is in cooldown, retrying in ~{sec}s",
+    cooldownHint: "Node is temporarily in cooldown",
+    reasonPrefix: "Reason: ",
+    stagePrefix: "Stage: ",
+    timeoutShort: "Err",
+    untestedShort: "N/A",
+  },
+  speedTest: {
+    goldenHiddenHint:
+      "{count} node(s) meet the core Golden criteria but have not been bandwidth-tested yet, so they are hidden from the Golden list",
+    goldenSwitchAllBtn: "Show All Nodes",
+    goldenRunSpeedBtn: "Test Bandwidth for Candidates",
+    latencyDisabledHint:
+      "\"Standard Latency\" is unchecked — primary node latency will not be updated in this run",
+  },
+  groups: {
+    clearActiveProtectedConfirm:
+      "This group contains the currently active node. Clearing it will switch or stop the active route. Continue?",
+    removeActiveProtectedHint:
+      "Removing the active node will automatically switch to another available node",
+    confirmClear: "Confirm Clear",
+    confirmBelowHint: "Confirm Below",
+    activeRemoveConfirmTip: "Active node · Unchecking requires confirmation",
+  },
+  shareBundle: {
+    cancelUpdateExisting: "Cancel",
+  },
+  update: {
+    nextLaunchBadgeTip:
+      "A verified update is ready in the background and will prompt on next launch",
   },
 };

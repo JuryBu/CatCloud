@@ -94,6 +94,7 @@ export function App() {
   const onboardingCompleted = useAppSelector(
     (s) => s.config.personalization.onboarding_completed === true
   );
+  const onboardingHydratedOk = useAppSelector((s) => s.onboardingHydratedOk);
   const onboardingModalOpen = useAppSelector((s) => s.onboardingModalOpen);
   const onboardingAutoSkipped = useAppSelector((s) => s.onboardingAutoSkipped);
   const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
@@ -102,7 +103,8 @@ export function App() {
   const showOnboardingModal =
     windowMode === "main" &&
     initialized &&
-    (onboardingModalOpen || (!onboardingCompleted && !onboardingAutoSkipped));
+    (onboardingModalOpen ||
+      (onboardingHydratedOk && !onboardingCompleted && !onboardingAutoSkipped));
   const showUpdateReadyModal =
     windowMode === "main" &&
     initialized &&

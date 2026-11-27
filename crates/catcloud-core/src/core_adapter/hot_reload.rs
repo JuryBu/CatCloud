@@ -258,6 +258,28 @@ struct CoordinatorState {
     last_active_selections: BTreeMap<String, String>,
 }
 
+/// Default TUN MTU assumed by Mihomo when `tun.enable: true` is active without an explicit `mtu` key.
+const DEFAULT_LIVE_TUN_MTU: u16 = 1500;
+
+fn compiled_tun_enabled(doc: &serde_yaml_ng::Value) -> bool {
+    doc.get("tun")
+        .and_then(|t| t.get("enable"))
+        .and_then(|v| v.as_bool())
+        == Some(true)
+}
+
+fn read_runtime_yaml_tun_enabled(runtime_yaml_path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(runtime_yaml_path) else {
+        return false;
+    };
+    let text = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    let Ok(mut doc) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) else {
+        return false;
+    };
+    let _ = doc.apply_merge();
+    compiled_tun_enabled(&doc)
+}
+
 /// Inspect on-disk `runtime.yaml` to recover the active effective `tun.mtu` when TUN is enabled.
 pub fn read_runtime_yaml_tun_mtu(runtime_yaml_path: &Path) -> Option<u16> {
     let raw = std::fs::read_to_string(runtime_yaml_path).ok()?;
@@ -273,10 +295,15 @@ pub fn read_runtime_yaml_tun_mtu(runtime_yaml_path: &Path) -> Option<u16> {
         .and_then(|v| u16::try_from(v).ok())
 }
 
+/// Public alias for inspecting the live `tun.mtu` value directly from an on-disk `runtime.yaml` path.
+pub fn read_live_tun_mtu_from_path(path: &Path) -> Option<u16> {
+    read_runtime_yaml_tun_mtu(path)
+}
+
 /// Enforce `tun.enable = false` on a final compiled configuration when the current process lacks
 /// TUN privileges (`!options.allow_tun`), preventing `inline_override_yaml` or merge patches from
 /// silently re-enabling TUN.
-fn enforce_tun_disabled_on_compiled(compiled: &mut CompiledCoreConfig) -> CatResult<()> {
+pub fn enforce_tun_disabled_on_compiled(compiled: &mut CompiledCoreConfig) -> CatResult<()> {
     let Some(root_map) = compiled.value.as_mapping_mut() else {
         return Ok(());
     };
@@ -368,10 +395,16 @@ impl HotReloadCoordinator {
         let _op_guard = self.op_lock.lock().await;
         let status = self.adapter.runtime_status().await;
         let active_selections = self.adapter.active_selections_snapshot().await;
-        let seeded_tun_mtu = cfg
-            .tun
-            .enabled
-            .then(|| read_runtime_yaml_tun_mtu(&self.runtime_yaml_path()).unwrap_or(cfg.tun.mtu));
+        let runtime_yaml_path = self.runtime_yaml_path();
+        let seeded_tun_mtu = cfg.tun.enabled.then(|| {
+            read_runtime_yaml_tun_mtu(&runtime_yaml_path).unwrap_or_else(|| {
+                if read_runtime_yaml_tun_enabled(&runtime_yaml_path) {
+                    DEFAULT_LIVE_TUN_MTU
+                } else {
+                    cfg.tun.mtu
+                }
+            })
+        });
         let mut guard = self.state.lock().await;
         guard.last_applied_config = Some(cfg);
         guard.last_compiled_hash = Some(compiled_hash);
@@ -636,11 +669,24 @@ impl HotReloadCoordinator {
             );
         }
 
-        // 6b. When TUN is enabled and the compiled effective TUN MTU crosses (e.g. 1500 <-> 1400
-        //     when dialer-proxy wrapping activates or deactivates), escalate to L3CoreRestart so
-        //     Wintun / virtual NIC MTU changes cleanly, strictly honoring `allow_l3_restart`.
-        let effective_tun_mtu_changed = effective_cfg.tun.enabled
-            && prev_effective_tun_mtu
+        // 6b. When compiled TUN is enabled (including via `inline_override_yaml`) and the compiled
+        //     effective TUN MTU crosses (e.g. 1500 <-> 1400 when dialer-proxy wrapping activates or
+        //     deactivates), escalate to L3CoreRestart so Wintun / virtual NIC MTU changes cleanly,
+        //     strictly honoring `allow_l3_restart`.
+        let mut compiled_tun_is_enabled = compiled_tun_enabled(&compiled.value);
+        let live_runtime_yaml_path = self.runtime_yaml_path();
+        let live_prev_tun_mtu = prev_effective_tun_mtu.or_else(|| {
+            if current_status.running || prev_cfg.is_some() {
+                read_live_tun_mtu_from_path(&live_runtime_yaml_path).or_else(|| {
+                    read_runtime_yaml_tun_enabled(&live_runtime_yaml_path)
+                        .then_some(DEFAULT_LIVE_TUN_MTU)
+                })
+            } else {
+                None
+            }
+        });
+        let effective_tun_mtu_changed = compiled_tun_is_enabled
+            && live_prev_tun_mtu
                 .is_some_and(|prev_mtu| prev_mtu != compiled.stats.effective_tun_mtu);
         if effective_tun_mtu_changed && level != ReloadLevel::L3CoreRestart {
             if !options.allow_l3_restart {
@@ -648,7 +694,7 @@ impl HotReloadCoordinator {
                     ReloadLevel::L3CoreRestart,
                     format!(
                         "L3 core restart is required because effective TUN MTU changed ({} -> {}), but allow_l3_restart is disabled; active core and runtime.yaml were left untouched",
-                        prev_effective_tun_mtu.unwrap_or(effective_cfg.tun.mtu),
+                        live_prev_tun_mtu.unwrap_or(DEFAULT_LIVE_TUN_MTU),
                         compiled.stats.effective_tun_mtu
                     ),
                 );
@@ -724,6 +770,7 @@ impl HotReloadCoordinator {
                         ),
                     );
                 }
+                compiled_tun_is_enabled = compiled_tun_enabled(&compiled.value);
             }
         }
 
@@ -740,9 +787,7 @@ impl HotReloadCoordinator {
             && prev_hash.as_deref() == Some(compiled.sha256.as_str())
         {
             let mut guard = self.state.lock().await;
-            guard.last_effective_tun_mtu = effective_cfg
-                .tun
-                .enabled
+            guard.last_effective_tun_mtu = compiled_tun_is_enabled
                 .then_some(compiled.stats.effective_tun_mtu);
             guard.last_applied_config = Some(effective_cfg);
             return ReloadOutcome {
@@ -887,22 +932,12 @@ impl HotReloadCoordinator {
                 None
             };
 
-            let prev_tun_enabled = prev_cfg
-                .as_ref()
-                .map(|c| c.tun.enabled)
-                .unwrap_or_else(|| {
-                    previous_runtime_yaml
-                        .as_deref()
-                        .and_then(|bytes| {
-                            serde_yaml_ng::from_slice::<serde_yaml_ng::Value>(bytes).ok()
-                        })
-                        .and_then(|doc| {
-                            doc.get("tun")
-                                .and_then(|t| t.get("enable"))
-                                .and_then(|v| v.as_bool())
-                        })
-                        .unwrap_or(false)
-                });
+            let prev_yaml_tun_enabled = previous_runtime_yaml
+                .as_deref()
+                .and_then(|bytes| serde_yaml_ng::from_slice::<serde_yaml_ng::Value>(bytes).ok())
+                .is_some_and(|doc| compiled_tun_enabled(&doc));
+            let prev_tun_enabled =
+                prev_cfg.as_ref().is_some_and(|c| c.tun.enabled) || prev_yaml_tun_enabled;
 
             let proxy_host = if effective_cfg.allow_lan {
                 effective_cfg.bind_address.as_str()
@@ -1003,9 +1038,7 @@ impl HotReloadCoordinator {
         let shifted = std::mem::take(&mut allocated_ports.shifted);
         {
             let mut guard = self.state.lock().await;
-            guard.last_effective_tun_mtu = effective_cfg
-                .tun
-                .enabled
+            guard.last_effective_tun_mtu = compiled_tun_is_enabled
                 .then_some(compiled.stats.effective_tun_mtu);
             guard.last_applied_config = Some(effective_cfg);
             guard.last_compiled_hash = Some(compiled.sha256.clone());
@@ -2691,6 +2724,140 @@ mod tests {
             "seed_active_state must not seed stale runtime.yaml MTU when cfg.tun.enabled is false"
         );
         drop(guard);
+
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[tokio::test]
+    async fn apply_disk_reload_detects_mtu_change_when_override_enables_tun_and_live_yaml_omits_mtu()
+    {
+        let paths = temp_paths("override-tun-and-omit-mtu");
+        let adapter = Arc::new(MihomoAdapter::new(Arc::new(JobGuard::new().unwrap())).unwrap());
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        let relay = PreAccelRelay {
+            id: "relay-ov".to_string(),
+            name: "Relay-OV".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN".to_string(),
+            server: "203.0.113.21".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-password".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+            supports_ipv6: false,
+        };
+        let non443_node = ProxyNode {
+            id: "node-non443-ov".to_string(),
+            sub_id: "sub-ov".to_string(),
+            name: "Node-8443-OV".to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.88".to_string(),
+            port: 8443,
+            is_443_native: false,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            enabled: true,
+            raw_config: serde_json::json!({
+                "name": "Node-8443-OV",
+                "type": "trojan",
+                "server": "198.51.100.88",
+                "port": 8443,
+                "password": "demo-trojan-password"
+            }),
+            ..Default::default()
+        };
+        let snapshot = DiskReloadSnapshot {
+            nodes: vec![non443_node],
+            groups: Vec::new(),
+            relays: vec![relay],
+        };
+
+        // Case 1: cfg.tun.enabled == false, but inline_override_yaml enables TUN under allow_tun=true.
+        // Baseline reload compiles tun.enable=true & effective_tun_mtu=1500.
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = false;
+        cfg.tun.mtu = 1500;
+        cfg.preaccel.enabled = false;
+        cfg.rules_override.inline_override_yaml = Some("tun:\n  enable: true\n".to_string());
+        save(&paths, &cfg).unwrap();
+
+        let out1 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: true,
+                snapshot_override: Some(snapshot.clone()),
+                ..Default::default()
+            })
+            .await;
+        assert!(out1.applied, "override-enabled TUN baseline failed: {:?}", out1.error);
+
+        // Now enable preaccel -> dialer-proxy clamps effective TUN MTU 1500 -> 1400.
+        // Even though cfg.tun.enabled is still false, compiled tun.enable==true must trigger L3!
+        cfg.preaccel.enabled = true;
+        save(&paths, &cfg).unwrap();
+        let out_l3 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: true,
+                snapshot_override: Some(snapshot.clone()),
+                ..Default::default()
+            })
+            .await;
+        assert!(out_l3.rejected);
+        assert_eq!(out_l3.level, ReloadLevel::L3CoreRestart);
+        assert!(
+            out_l3
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("effective TUN MTU changed (1500 -> 1400)"),
+            "unexpected error: {:?}",
+            out_l3.error
+        );
+
+        // Case 2: Live runtime.yaml enables TUN (`tun.enable: true`) but OMITS the `mtu` key so
+        // `read_live_tun_mtu_from_path` returns None -> must fall back to 1500 baseline and detect
+        // transition to 1400!
+        std::fs::write(coordinator.runtime_yaml_path(), "tun:\n  enable: true\n").unwrap();
+        assert_eq!(
+            read_live_tun_mtu_from_path(&coordinator.runtime_yaml_path()),
+            None
+        );
+        {
+            let mut guard = coordinator.state.lock().await;
+            guard.last_effective_tun_mtu = None;
+        }
+        let out_omitted_mtu = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: true,
+                snapshot_override: Some(snapshot),
+                ..Default::default()
+            })
+            .await;
+        assert!(out_omitted_mtu.rejected);
+        assert_eq!(out_omitted_mtu.level, ReloadLevel::L3CoreRestart);
+        assert!(
+            out_omitted_mtu
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("effective TUN MTU changed (1500 -> 1400)"),
+            "expected omitted-mtu 1500 -> 1400 escalation, got: {:?}",
+            out_omitted_mtu.error
+        );
 
         let _ = std::fs::remove_dir_all(&paths.root_data_dir);
     }

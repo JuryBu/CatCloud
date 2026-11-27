@@ -24,6 +24,7 @@ export function OnboardingModal() {
   const onboardingCompleted = useAppSelector(
     (s) => s.config.personalization.onboarding_completed === true
   );
+  const onboardingHydratedOk = useAppSelector((s) => s.onboardingHydratedOk);
   const onboardingModalOpen = useAppSelector((s) => s.onboardingModalOpen);
   const onboardingAutoSkipped = useAppSelector((s) => s.onboardingAutoSkipped);
   const uiLang = normalizeUiLanguage(
@@ -37,7 +38,8 @@ export function OnboardingModal() {
   const shouldRender =
     windowMode === "main" &&
     initialized &&
-    (onboardingModalOpen || (!onboardingCompleted && !onboardingAutoSkipped));
+    (onboardingModalOpen ||
+      (onboardingHydratedOk && !onboardingCompleted && !onboardingAutoSkipped));
 
   useEffect(() => {
     if (!shouldRender) {
@@ -64,7 +66,7 @@ export function OnboardingModal() {
       const ok = await appActions.copyAgentBootstrapPrompt("onboarding", "autopilot", uiLang);
       if (ok) {
         setCopiedMode("local");
-        void appActions.markOnboardingCompleted();
+        await appActions.markOnboardingCompleted();
       }
     } finally {
       setBusyAction(null);
@@ -78,7 +80,7 @@ export function OnboardingModal() {
       const ok = await appActions.copyAiOnboardingForUser(uiLang, "onboarding");
       if (ok) {
         setCopiedMode("web");
-        void appActions.markOnboardingCompleted();
+        await appActions.markOnboardingCompleted();
       }
     } finally {
       setBusyAction(null);

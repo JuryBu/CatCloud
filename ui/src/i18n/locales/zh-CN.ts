@@ -351,6 +351,8 @@ export const zhCN = {
     downloadReadyMsg: "v{version} 已下载并校验完成，可立即更新或下次打开确认",
     downloadManualHint: "请前往官方下载页获取对应系统安装包",
     downloadFailedMsg: "下载更新失败：{error}",
+    exitTimeoutFallback: "退出等待超时，请重试或前往官方下载页",
+    unknownErrorFallback: "未知错误",
     closeAria: "稍后提醒并关闭窗口",
   },
   tunPrompt: {
@@ -495,6 +497,47 @@ export const zhCN = {
     clipboardUnavailableToast: "剪贴板不可用，请手动选中上方代码复制",
     savedToast: "已导出软路由配置文件：{path}",
     saveFailedToast: "保存配置文件失败：{error}",
+  },
+  latency: {
+    probeHotTooltip: "标准 204 热连接延迟，不含 TLS 握手与解锁耗时",
+    healthColdTooltip: "后台双源轻探活延迟，含连接建立可能略高于热测速",
+    failedTooltip: "最近一次标准延迟探测失败",
+    untestedTooltip: "尚未测速",
+    sourceProbeShort: "热测",
+    sourceHealthShort: "探活",
+    probationBadge: "观察中",
+    degradedBadge: "已降权",
+    testedAtLatency: "延迟测于",
+    testedAtSpeed: "带宽测于",
+    cooldownSec: "冷却 {sec}s",
+    cooldownActive: "冷却中",
+    cooldownRetryHint: "节点暂时冷却中，约 {sec} 秒后重试",
+    cooldownHint: "节点暂时冷却中",
+    reasonPrefix: "原因: ",
+    stagePrefix: "阶段: ",
+    timeoutShort: "超时",
+    untestedShort: "未测",
+  },
+  speedTest: {
+    goldenHiddenHint:
+      "当前有 {count} 个节点核心指标已达标，但尚未测上下行带宽，所以未出现在黄金节点列表中",
+    goldenSwitchAllBtn: "显示全部节点",
+    goldenRunSpeedBtn: "为候选补测上下行",
+    latencyDisabledHint: "当前未勾选「标准延迟」，本轮不会更新节点主延迟",
+  },
+  groups: {
+    clearActiveProtectedConfirm:
+      "当前分组包含正在使用的节点，清空后将自动切换或停止当前选中路线，确定清空吗？",
+    removeActiveProtectedHint: "正在使用的节点移出后将自动切换至其他可用节点",
+    confirmClear: "确认清空",
+    confirmBelowHint: "请确认下方提示",
+    activeRemoveConfirmTip: "当前在用节点 · 取消勾选将二次确认",
+  },
+  shareBundle: {
+    cancelUpdateExisting: "取消",
+  },
+  update: {
+    nextLaunchBadgeTip: "新版本已在后台就绪，下次启动软件时将提示一键更新",
   },
 } as const;
 

@@ -1,6 +1,7 @@
 ﻿!include LogicLib.nsh
 !include x64.nsh
 !include FileFunc.nsh
+!include "${__FILEDIR__}\graceful-shutdown.nsh"
 
 !define MUI_CUSTOMFUNCTION_GUIINIT CatCloudCheckArm64GuiInit
 
@@ -66,4 +67,9 @@ FunctionEnd
     RMDir "$INSTDIR"
     Abort "Incompatible architecture: ARM64 installer requires Windows on ARM64."
   ${EndIf}
+  !insertmacro CatCloudGracefulShutdownRunning "INSTALL"
+!macroend
+
+!macro NSIS_HOOK_PREUNINSTALL
+  !insertmacro CatCloudGracefulShutdownRunning "UNINSTALL"
 !macroend

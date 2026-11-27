@@ -66,7 +66,8 @@ use catcloud_core::share_bundle::{
     preview_share_bundle_zip_bytes, preview_share_bundle_zip_file,
 };
 use catcloud_core::storage::{
-    MergeSubscriptionsResult, Storage, SubscriptionNodesUpdateResult, SubscriptionUpdateMode,
+    BackupDbSnapshot, MergeSubscriptionsResult, Storage, SubscriptionNodesUpdateResult,
+    SubscriptionUpdateMode,
 };
 use catcloud_core::strategy::evaluator::evaluate_group_candidates_with_runtime;
 use catcloud_core::strategy::health_pool::{NodeHealthHintDto, NodeHealthPool, RuntimeDualHealth};
@@ -107,6 +108,8 @@ pub const EVENT_TUN_NEEDS_ADMIN: &str = "catcloud://tun-needs-admin";
 pub const EVENT_STRATEGY_SWITCH: &str = "catcloud://strategy-switch";
 pub const EVENT_CONFIG_UPDATED: &str = "catcloud://config-updated";
 pub const EVENT_UPDATE_READY: &str = "catcloud://update-ready";
+pub const EVENT_GROUPS_UPDATED: &str = "catcloud://groups-updated";
+pub const EVENT_RELAYS_UPDATED: &str = "catcloud://relays-updated";
 
 /// Physical-pixel anchor tracked during custom Win32 floating capsule dragging (zero HTCAPTION / Aero Snap).
 #[derive(Debug, Clone, Copy)]
@@ -2439,17 +2442,26 @@ fn resolve_preaccel_effective_carrier(
     ("off", false)
 }
 
+fn has_existing_enabled_active_relay(
+    active_relay_id: Option<&str>,
+    enabled_relays: &[PreAccelRelay],
+) -> bool {
+    active_relay_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|aid| enabled_relays.iter().any(|r| r.enabled && r.id == aid))
+}
+
 /// Align multi-cloud load-balance activation with `preaccel::generator::build_preaccel_proxy_groups`:
-/// requires `distinct_host_count >= 2` and either explicit `LoadBalance` or `Auto` with no pinned
-/// `active_relay_id`.
+/// requires `distinct_host_count >= 2` and either explicit `LoadBalance` or `Auto` with no existing
+/// enabled pinned `active_relay_id` (a dangling/deleted/disabled `active_relay_id` does not block LB).
 fn is_preaccel_pool_lb_effective(
     strategy: PreAccelDispatchStrategy,
     active_relay_id: Option<&str>,
+    enabled_relays: &[PreAccelRelay],
     distinct_host_count: usize,
 ) -> bool {
-    let has_active_relay = active_relay_id
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty());
+    let has_active_relay = has_existing_enabled_active_relay(active_relay_id, enabled_relays);
     distinct_host_count >= 2
         && (strategy == PreAccelDispatchStrategy::LoadBalance
             || (strategy == PreAccelDispatchStrategy::Auto && !has_active_relay))
@@ -2788,6 +2800,14 @@ pub fn emit_runtime_snapshot(app: &AppHandle, state: &AppState) {
 
 pub fn emit_config_updated(app: &AppHandle, cfg: &AppConfig) {
     let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(cfg));
+}
+
+pub fn emit_groups_updated(app: &AppHandle) {
+    let _ = app.emit(EVENT_GROUPS_UPDATED, ());
+}
+
+pub fn emit_relays_updated(app: &AppHandle) {
+    let _ = app.emit(EVENT_RELAYS_UPDATED, ());
 }
 
 pub fn refresh_tray(app: &AppHandle, state: &AppState) {
@@ -3178,6 +3198,12 @@ fn is_system_proxy_owned_by_us(
     if !observed.enabled {
         return false;
     }
+    // If this instance neither has system proxy enabled nor has a live running core listener,
+    // never guess ownership by default port (CoreRuntimeStatus::default() carries mixed_port=7890
+    // with running=false, which must never clear a concurrent host portable CatCloud proxy).
+    if !cfg.system_proxy.enabled && (!rt.running || rt.mixed_port == 0) {
+        return false;
+    }
     if let Some(pac) = observed
         .pac_url
         .as_deref()
@@ -3185,7 +3211,7 @@ fn is_system_proxy_owned_by_us(
         .filter(|s| !s.is_empty())
     {
         let expected_pac = format!("http://127.0.0.1:{}/proxy.pac", cfg.system_proxy.pac.port);
-        return pac.eq_ignore_ascii_case(&expected_pac);
+        return cfg.system_proxy.pac.enabled && pac.eq_ignore_ascii_case(&expected_pac);
     }
     if !is_loopback_host(&observed.host) {
         return false;
@@ -3206,14 +3232,39 @@ fn disable_system_proxy_os_only(cfg: &AppConfig) -> Result<(), String> {
 /// Clear OS system proxy under `state.system_proxy_lock` ONLY when CatCloud owns it
 /// (`previously_enabled || cfg.system_proxy.enabled`, or current OS `ProxyServer` points to
 /// `127.0.0.1:<runtime_or_config_port>` / our local PAC).
-fn clear_system_proxy_if_owned_with_hint(
+///
+/// When `lock_wait_budget` is `Some(dur)` (shutdown / `WM_ENDSESSION` path), uses non-blocking
+/// `try_lock` with bounded polling so a stalled background thread can never block teardown or skip
+/// `JobGuard::terminate_all()`.
+fn clear_system_proxy_if_owned_with_hint_bounded(
     state: &AppState,
     previously_enabled: bool,
+    lock_wait_budget: Option<Duration>,
 ) -> Result<bool, String> {
-    let _proxy_guard = state
-        .system_proxy_lock
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _proxy_guard = match lock_wait_budget {
+        None => state
+            .system_proxy_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+        Some(budget) => {
+            let deadline = Instant::now() + budget;
+            loop {
+                match state.system_proxy_lock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::Poisoned(err)) => break err.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        if Instant::now() >= deadline {
+                            return Err(
+                                "退出时等待系统代理锁超时，已跳过代理清理以保障有界关机"
+                                    .to_string(),
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+    };
     let cfg = state.snapshot_config();
     let rt = state.snapshot_runtime();
     let owned = previously_enabled || cfg.system_proxy.enabled || {
@@ -3232,9 +3283,24 @@ fn clear_system_proxy_if_owned_with_hint(
     Ok(true)
 }
 
+fn clear_system_proxy_if_owned_with_hint(
+    state: &AppState,
+    previously_enabled: bool,
+) -> Result<bool, String> {
+    clear_system_proxy_if_owned_with_hint_bounded(state, previously_enabled, None)
+}
+
 /// Clear OS system proxy under `state.system_proxy_lock` if owned by CatCloud.
 pub fn clear_system_proxy_if_owned(state: &AppState) -> Result<bool, String> {
-    clear_system_proxy_if_owned_with_hint(state, false)
+    clear_system_proxy_if_owned_with_hint_bounded(state, false, None)
+}
+
+/// Bounded-wait variant of `clear_system_proxy_if_owned` used during shutdown / `WM_ENDSESSION`.
+pub fn clear_system_proxy_if_owned_bounded(
+    state: &AppState,
+    lock_wait_budget: Duration,
+) -> Result<bool, String> {
+    clear_system_proxy_if_owned_with_hint_bounded(state, false, Some(lock_wait_budget))
 }
 
 /// Apply OS system proxy (`ProxyEnable=1`) under `state.system_proxy_lock`, re-checking
@@ -3264,7 +3330,7 @@ fn apply_system_proxy_if_still_enabled(state: &AppState, port: u16) -> Result<bo
 ///
 /// Intentionally NEVER calls `DeleteService` to prevent Win32 `1072` races on rapid relaunch.
 #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
-fn emergency_stop_windivert_service_fallback() -> bool {
+fn emergency_stop_windivert_service_fallback_bounded(max_wait: Duration) -> bool {
     use windows_sys::Win32::Foundation::GetLastError;
     use windows_sys::Win32::System::Services::{
         CloseServiceHandle, ControlService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
@@ -3333,7 +3399,7 @@ fn emergency_stop_windivert_service_fallback() -> bool {
         return true;
     }
 
-    let deadline = Instant::now() + Duration::from_millis(500);
+    let deadline = Instant::now() + max_wait.min(Duration::from_millis(500));
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
         let mut cur: SERVICE_STATUS = unsafe { std::mem::zeroed() };
@@ -3348,18 +3414,22 @@ fn emergency_stop_windivert_service_fallback() -> bool {
 }
 
 /// Deterministic, idempotent exit safety hook invoked before `JobGuard::terminate_all()` on `RunEvent::Exit`.
+pub fn emergency_cleanup_on_exit(state: &AppState) {
+    emergency_cleanup_on_exit_bounded(state, Duration::from_millis(5300));
+}
+
+/// Bounded-deadline variant of `emergency_cleanup_on_exit` (e.g. `<= 3000ms` for synchronous
+/// Windows `WM_ENDSESSION` cleanup before `tao` calls `std::process::exit(0)`).
 ///
 /// 1. Atomically guards against duplicate execution via `exit_cleanup_done`.
 /// 2. Stops background `ProxyGuard` ticks and cancels any in-flight update download immediately.
-/// 3. Gracefully stops domestic global acceleration (2.0s bounded timeout) whenever enabled,
-///    running, or mid-probing, with a Windows SCM fallback stopping the `WinDivert` service if
-///    exit occurs during the 4s self-test window.
-/// 4. Gracefully disables TUN (1.5s bounded timeout) when active, and ALWAYS gracefully stops a
-///    live Mihomo core (1.5s bounded timeout) regardless of TUN so `mihomo.exe` releases all
-///    ports and file handles before portable swap or installer execution.
-/// 5. Clears Windows WinINet system proxy under `system_proxy_lock` (only if owned by CatCloud)
-///    WITHOUT mutating `config.json` remembered preferences.
-pub fn emergency_cleanup_on_exit(state: &AppState) {
+/// 3. Gracefully stops domestic global acceleration whenever enabled, running, or mid-probing,
+///    with a bounded Windows SCM fallback stopping the `WinDivert` service if needed.
+/// 4. Idempotently calls `disable_tun_gracefully()` on any live Mihomo controller, and ALWAYS
+///    stops the live Mihomo core within the shared deadline budget via a hard-bounded helper thread.
+/// 5. Always clears Windows WinINet system proxy under bounded `system_proxy_lock` acquisition
+///    (only if owned by CatCloud) WITHOUT mutating `config.json` remembered preferences.
+pub fn emergency_cleanup_on_exit_bounded(state: &AppState, max_budget: Duration) {
     if state.exit_cleanup_done.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -3368,8 +3438,34 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
     state.stop_streams();
     state.lan_sync.shutdown_all();
 
+    let overall_deadline = Instant::now() + max_budget.max(Duration::from_millis(600));
+    // Reserve tail budget for `clear_system_proxy_if_owned_bounded` + metadata removal + caller's JobGuard.
+    let proxy_reserve = if max_budget <= Duration::from_millis(3000) {
+        Duration::from_millis(450)
+    } else {
+        Duration::from_millis(300)
+    };
+    let teardown_budget = max_budget
+        .saturating_sub(proxy_reserve)
+        .max(Duration::from_millis(400));
+    let tight_budget = max_budget <= Duration::from_millis(3000);
+    let step_global_cap = if tight_budget {
+        Duration::from_millis(900)
+    } else {
+        Duration::from_millis(2000)
+    };
+    let step_tun_cap = if tight_budget {
+        Duration::from_millis(800)
+    } else {
+        Duration::from_millis(1500)
+    };
+    let step_stop_cap = if tight_budget {
+        Duration::from_millis(900)
+    } else {
+        Duration::from_millis(1500)
+    };
+
     let cfg = state.snapshot_config();
-    let may_have_tun = config_may_have_tun(state, &cfg);
     let global_status = state.global_preaccel.status();
     let may_have_global_preaccel = cfg.preaccel.enabled
         || global_status.running
@@ -3378,74 +3474,109 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
     {
         let adapter = Arc::clone(&state.adapter);
         let global_preaccel = Arc::clone(&state.global_preaccel);
-        let global_stop_needs_fallback = Arc::new(AtomicBool::new(false));
-        let fallback_flag = Arc::clone(&global_stop_needs_fallback);
+        let global_stop_succeeded = Arc::new(AtomicBool::new(false));
+        let global_stop_ok_flag = Arc::clone(&global_stop_succeeded);
         let run_teardown = move || {
+            let teardown_deadline = Instant::now() + teardown_budget;
             tauri::async_runtime::block_on(async move {
-                if may_have_global_preaccel {
-                    match tokio::time::timeout(Duration::from_millis(2000), global_preaccel.stop())
-                        .await
-                    {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => {
-                            fallback_flag.store(true, Ordering::SeqCst);
-                            tracing::warn!(
-                                "退出时停止国内提速失败，准备触发 WinDivert 兜底清理：{err}"
-                            );
-                        }
-                        Err(_) => {
-                            fallback_flag.store(true, Ordering::SeqCst);
-                            tracing::warn!(
-                                "退出时等待国内提速停止超时（2000ms，可能处于自检窗口），准备触发 WinDivert 兜底清理"
-                            );
+                let _ = tokio::time::timeout(teardown_budget, async move {
+                    if may_have_global_preaccel {
+                        let rem = teardown_deadline.saturating_duration_since(Instant::now());
+                        if !rem.is_zero() {
+                            let step = rem.min(step_global_cap);
+                            match tokio::time::timeout(step, global_preaccel.stop()).await {
+                                Ok(Ok(_)) => {
+                                    global_stop_ok_flag.store(true, Ordering::SeqCst);
+                                }
+                                Ok(Err(err)) => {
+                                    tracing::warn!(
+                                        "退出时停止国内提速失败，准备触发 WinDivert 兜底清理：{err}"
+                                    );
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "退出时等待国内提速停止超时（{}ms，可能处于自检窗口），准备触发 WinDivert 兜底清理",
+                                        step.as_millis()
+                                    );
+                                }
+                            }
                         }
                     }
-                }
-                let core_alive = adapter.has_live_controller().await;
-                if core_alive && may_have_tun {
-                    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
-                        let _ = adapter.disable_tun_gracefully().await;
-                    })
-                    .await;
-                }
-                if core_alive {
-                    let _ = tokio::time::timeout(Duration::from_millis(1500), async {
-                        let _ = adapter.stop().await;
-                    })
-                    .await;
-                }
+                    let core_alive = adapter.has_live_controller().await;
+                    if core_alive {
+                        // Always call `disable_tun_gracefully()` idempotently on any live controller
+                        // so TUN adapters and routes are never left behind even under overrides.
+                        let rem = teardown_deadline.saturating_duration_since(Instant::now());
+                        if !rem.is_zero() {
+                            let _ = tokio::time::timeout(rem.min(step_tun_cap), async {
+                                let _ = adapter.disable_tun_gracefully().await;
+                            })
+                            .await;
+                        }
+                        let rem = teardown_deadline.saturating_duration_since(Instant::now());
+                        if !rem.is_zero() {
+                            let _ = tokio::time::timeout(rem.min(step_stop_cap), async {
+                                let _ = adapter.stop().await;
+                            })
+                            .await;
+                        }
+                    }
+                })
+                .await;
             });
-        };
-        let teardown_timed_out = if tokio::runtime::Handle::try_current().is_ok() {
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                run_teardown();
-                let _ = tx.send(());
-            });
-            rx.recv_timeout(Duration::from_millis(5300)).is_err()
-        } else {
-            run_teardown();
-            false
         };
 
+        // Always offload async teardown onto a dedicated thread with a hard channel timeout on
+        // BOTH the main UI thread (`WM_ENDSESSION`) and Tokio worker threads so a stalled runtime
+        // or blocked call can never overrun the shutdown budget.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            run_teardown();
+            let _ = tx.send(());
+        });
+        let teardown_timed_out = rx
+            .recv_timeout(teardown_budget + Duration::from_millis(50))
+            .is_err();
+        if teardown_timed_out {
+            tracing::warn!(
+                budget_ms = teardown_budget.as_millis(),
+                "退出有界清理超过预算上限，已强硬截断并继续执行代理清理与子进程终止"
+            );
+        }
+
+        // Only trigger Windows SCM `ControlService` fallback when domestic preaccel might be active
+        // AND `global_preaccel.stop()` did NOT confirm success (avoiding wasted 500ms SCM calls
+        // when `global_preaccel.stop()` already succeeded before `adapter.stop()` timed out).
         let need_fallback =
-            may_have_global_preaccel && (teardown_timed_out || global_stop_needs_fallback.load(Ordering::SeqCst));
+            may_have_global_preaccel && !global_stop_succeeded.load(Ordering::SeqCst);
         #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
         if need_fallback {
-            let stopped = emergency_stop_windivert_service_fallback();
-            if stopped {
-                tracing::info!("退出兜底：已通过 Windows SCM 安全停止 WinDivert 内核服务");
-            } else {
-                tracing::warn!(
-                    "退出兜底：尝试通过 Windows SCM 停止 WinDivert 内核服务未确认完成（可能未加载或无权限）"
-                );
+            let rem_for_scm = overall_deadline
+                .saturating_duration_since(Instant::now())
+                .saturating_sub(Duration::from_millis(150));
+            if !rem_for_scm.is_zero() {
+                let stopped = emergency_stop_windivert_service_fallback_bounded(rem_for_scm);
+                if stopped {
+                    tracing::info!("退出兜底：已通过 Windows SCM 安全停止 WinDivert 内核服务");
+                } else {
+                    tracing::warn!(
+                        "退出兜底：尝试通过 Windows SCM 停止 WinDivert 内核服务未确认完成（可能未加载或无权限）"
+                    );
+                }
             }
         }
         #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
         let _ = need_fallback;
     }
 
-    if let Err(err) = clear_system_proxy_if_owned(state) {
+    let proxy_lock_wait = overall_deadline
+        .saturating_duration_since(Instant::now())
+        .min(if tight_budget {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(200)
+        });
+    if let Err(err) = clear_system_proxy_if_owned_bounded(state, proxy_lock_wait) {
         tracing::warn!("退出时清除系统代理失败：{err}");
     }
     catcloud_core::core_adapter::remove_runtime_controller_meta(&state.paths.runtime_dir);
@@ -3662,12 +3793,21 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
         extra_fake_ip_filters: &extra_filters,
         group_filtered_members: &empty_filter,
     };
-    let compiled = compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir))
+    let mut compiled = compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir))
         .map_err(|e| {
             let msg = format_mihomo_error_for_user(&format!("生成代理配置失败：{e}"));
             state.log_app_event("error", "核心", &msg);
             msg
         })?;
+    if !tun_ready {
+        catcloud_core::core_adapter::enforce_tun_disabled_on_compiled(&mut compiled).map_err(
+            |e| {
+                let msg = format_mihomo_error_for_user(&format!("非提权模式强制关闭覆写 TUN 失败：{e}"));
+                state.log_app_event("error", "核心", &msg);
+                msg
+            },
+        )?;
+    }
     if !compiled.validation.ok {
         let summary = compiled
             .validation
@@ -4844,12 +4984,13 @@ async fn select_group_node_core(
 ) -> Result<SwitchResultDto, String> {
     let _switching_guard = SwitchingActiveGuard::enter(app, state);
     let _cfg_guard = state.config_transition_lock.lock().await;
-    let (mut group, target_node, prev_id, prev_node_name, snap) = {
+    let (mut group, prev_group, target_node, prev_id, prev_node_name, snap) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let group = db
             .get_multi_group(&group_id)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("未找到指定路线分组（{group_id}）"))?;
+        let prev_group = group.clone();
         let target_node = db
             .get_node(&node_id)
             .map_err(|e| e.to_string())?
@@ -4864,7 +5005,7 @@ async fn select_group_node_core(
         let snap = db
             .get_probe_snapshot(&target_node.id, group.primary_probe_id.as_deref())
             .map_err(|e| e.to_string())?;
-        (group, target_node, prev_id, prev_node_name, snap)
+        (group, prev_group, target_node, prev_id, prev_node_name, snap)
     };
 
     let mut members_changed = false;
@@ -4880,7 +5021,8 @@ async fn select_group_node_core(
         db.upsert_multi_group(&group).map_err(|e| e.to_string())?;
     }
 
-    let mut cfg = state.snapshot_config();
+    let prev_cfg = state.snapshot_config();
+    let mut cfg = prev_cfg.clone();
     let was_single = cfg.route_mode == RouteTargetMode::Single;
     let active_group_changed = cfg.active_group_id.as_deref() != Some(group.id.as_str());
     let route_cfg_changed = activate_group && (was_single || active_group_changed);
@@ -4901,6 +5043,16 @@ async fn select_group_node_core(
                     .await
             {
                 if outcome.rejected {
+                    if let Ok(db) = state.storage.lock() {
+                        let _ = db.upsert_multi_group(&prev_group);
+                    }
+                    if route_cfg_changed {
+                        let _ = config::save(&state.paths, &prev_cfg);
+                        if let Ok(mut guard) = state.config.write() {
+                            *guard = prev_cfg.clone();
+                        }
+                    }
+                    sync_app_side_effects(app, state, &prev_cfg);
                     let detail = outcome
                         .error
                         .as_deref()
@@ -4960,6 +5112,7 @@ async fn select_group_node_core(
         );
     }
     sync_app_side_effects(app, state, &cfg);
+    emit_groups_updated(app);
 
     let resolved_latency_ms = state.resolve_node_latency_ms(&target_node.id, snap.as_ref());
     Ok(SwitchResultDto {
@@ -5166,6 +5319,7 @@ pub async fn reconcile_group_best_node_internal(
             }),
         );
     }
+    emit_groups_updated(app);
 
     let resolved_latency_ms =
         state.resolve_node_latency_ms(&decision.to_node_id, target_snap.as_ref());
@@ -5919,21 +6073,28 @@ fn format_inline_override_validation_error(raw: &str) -> String {
     }
 }
 
+fn has_active_yaml_override(cfg: &AppConfig) -> bool {
+    matches!(
+        cfg.rules_override.override_mode,
+        OverrideMode::MergePatch | OverrideMode::Both
+    ) || has_non_empty_inline_override_yaml(cfg)
+}
+
 fn validate_inline_override_yaml_compile(
     state: &AppState,
     candidate_cfg: &AppConfig,
 ) -> Result<(), String> {
-    let Some(full_raw) = candidate_cfg.rules_override.inline_override_yaml.as_deref() else {
-        return Ok(());
-    };
-    if full_raw.trim().is_empty() {
+    if !has_active_yaml_override(candidate_cfg) {
         return Ok(());
     }
-    if full_raw.len() > MAX_INLINE_OVERRIDE_YAML_BYTES {
-        return Err(format!(
-            "内联 YAML 覆写体积超过 1 MiB 上限（当前 {} 字节），已拒绝保存",
-            full_raw.len()
-        ));
+    let has_inline = has_non_empty_inline_override_yaml(candidate_cfg);
+    if let Some(full_raw) = candidate_cfg.rules_override.inline_override_yaml.as_deref() {
+        if !full_raw.trim().is_empty() && full_raw.len() > MAX_INLINE_OVERRIDE_YAML_BYTES {
+            return Err(format!(
+                "内联 YAML 覆写体积超过 1 MiB 上限（当前 {} 字节），已拒绝保存",
+                full_raw.len()
+            ));
+        }
     }
 
     let (nodes, groups, relays) = {
@@ -5972,8 +6133,18 @@ fn validate_inline_override_yaml_compile(
     };
 
     let compiled =
-        compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir))
-            .map_err(|e| format_inline_override_validation_error(&e.to_string()))?;
+        compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir)).map_err(
+            |e| {
+                if has_inline {
+                    format_inline_override_validation_error(&e.to_string())
+                } else {
+                    format!(
+                        "YAML 覆写合并编译校验失败，未保存修改：{}",
+                        format_mihomo_error_for_user(&e.to_string())
+                    )
+                }
+            },
+        )?;
 
     let errors = compiled.validation.errors();
     if !errors.is_empty() {
@@ -5983,9 +6154,11 @@ fn validate_inline_override_yaml_compile(
             .map(|issue| issue.message.as_str())
             .collect::<Vec<_>>()
             .join("；");
-        return Err(format!(
-            "内联 YAML 覆写合并后静态校验未通过，未保存修改：{summary}"
-        ));
+        return Err(if has_inline {
+            format!("内联 YAML 覆写合并后静态校验未通过，未保存修改：{summary}")
+        } else {
+            format!("YAML 覆写合并后静态校验未通过，未保存修改：{summary}")
+        });
     }
 
     Ok(())
@@ -6000,9 +6173,9 @@ fn should_validate_inline_override_yaml(
     next: &AppConfig,
     inline_override_touched: bool,
 ) -> bool {
-    next.rules_override.inline_override_yaml.is_some()
+    has_active_yaml_override(next)
         && (inline_override_touched
-            || old.rules_override.inline_override_yaml != next.rules_override.inline_override_yaml
+            || old.rules_override != next.rules_override
             || has_core_config_changes(old, next))
 }
 
@@ -6082,15 +6255,41 @@ fn prepare_extended_settings_next(
     normalize_inline_override_yaml(&mut next);
     reconcile_saved_preaccel_switch(old, &mut next);
 
-    let inline_override_touched = patch
-        .get("rules_override")
-        .and_then(|v| v.get("inline_override_yaml"))
-        .is_some();
-    if should_validate_inline_override_yaml(old, &next, inline_override_touched) {
+    let override_touched = patch.get("rules_override").is_some_and(|ro| {
+        ro.get("inline_override_yaml").is_some()
+            || ro.get("override_mode").is_some()
+            || ro.get("override_merge_path").is_some()
+    });
+    if should_validate_inline_override_yaml(old, &next, override_touched) {
         validate_inline_override_yaml_compile(state, &next)?;
     }
 
     Ok(next)
+}
+
+async fn mark_onboarding_completed_core(state: &AppState) -> Result<AppConfig, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let mut cfg = state.snapshot_config();
+    if cfg.personalization.onboarding_completed {
+        return Ok(cfg);
+    }
+    cfg.personalization.onboarding_completed = true;
+    config::save(&state.paths, &cfg).map_err(|e| format!("保存首次引导完成状态失败：{e}"))?;
+    if let Ok(mut guard) = state.config.write() {
+        *guard = cfg.clone();
+    }
+    state.bump_config_generation();
+    Ok(cfg)
+}
+
+#[tauri::command]
+pub async fn mark_onboarding_completed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let cfg = mark_onboarding_completed_core(&state).await?;
+    emit_config_updated(&app, &cfg);
+    Ok(())
 }
 
 #[tauri::command]
@@ -6813,6 +7012,9 @@ pub async fn set_active_group(
         );
     }
     sync_app_side_effects(&app, &state, &cfg);
+    if changed || reconciled.is_some() {
+        emit_groups_updated(&app);
+    }
     build_runtime_info_dto(&state)
 }
 
@@ -7147,6 +7349,7 @@ pub async fn upsert_multi_group(
     }
     let cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &cfg);
+    emit_groups_updated(&app);
     Ok(group)
 }
 
@@ -7156,8 +7359,11 @@ pub async fn delete_multi_group(
     state: State<'_, AppState>,
     group_id: String,
 ) -> Result<bool, String> {
-    let (deleted, next_fallback_group_id) = {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let prev_cfg = state.snapshot_config();
+    let (prev_group, deleted, next_fallback_group_id) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let prev_group = db.get_multi_group(&group_id).map_err(|e| e.to_string())?;
         let deleted = db.delete_multi_group(&group_id).map_err(|e| e.to_string())?;
         let next_id = if deleted {
             db.list_multi_groups()
@@ -7167,23 +7373,46 @@ pub async fn delete_multi_group(
         } else {
             None
         };
-        (deleted, next_id)
+        (prev_group, deleted, next_id)
     };
     if deleted {
-        if let Ok(mut pool) = state.node_health_pool.write() {
-            pool.remove_group_cursor(&group_id);
-        }
-        let mut cfg = state.snapshot_config();
-        if cfg.active_group_id.as_deref() == Some(group_id.as_str()) {
+        let mut cfg = prev_cfg.clone();
+        let active_changed = cfg.active_group_id.as_deref() == Some(group_id.as_str());
+        if active_changed {
             cfg.active_group_id = next_fallback_group_id;
             config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
             if let Ok(mut guard) = state.config.write() {
                 *guard = cfg.clone();
             }
         }
-        let _ = trigger_reload_if_running(&app, &state, false).await;
+        if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+            if outcome.rejected {
+                if let Some(ref old_group) = prev_group {
+                    if let Ok(db) = state.storage.lock() {
+                        let _ = db.upsert_multi_group(old_group);
+                    }
+                }
+                if active_changed {
+                    let _ = config::save(&state.paths, &prev_cfg);
+                    if let Ok(mut guard) = state.config.write() {
+                        *guard = prev_cfg.clone();
+                    }
+                }
+                sync_app_side_effects(&app, &state, &prev_cfg);
+                let detail = outcome
+                    .error
+                    .as_deref()
+                    .map(format_mihomo_error_for_user)
+                    .unwrap_or_else(|| "未知原因".to_string());
+                return Err(format!("删除路线分组失败，核心配置重载未通过：{detail}"));
+            }
+        }
+        if let Ok(mut pool) = state.node_health_pool.write() {
+            pool.remove_group_cursor(&group_id);
+        }
         let latest_cfg = state.snapshot_config();
         emit_config_updated(&app, &latest_cfg);
+        emit_groups_updated(&app);
         sync_app_side_effects(&app, &state, &latest_cfg);
     }
     Ok(deleted)
@@ -7282,6 +7511,7 @@ pub async fn update_multi_group_members(
     }
     let cfg = state.snapshot_config();
     sync_app_side_effects(&app, &state, &cfg);
+    emit_groups_updated(&app);
     Ok(updated)
 }
 
@@ -7504,20 +7734,20 @@ pub async fn run_isolated_probes(
 
     let used_preaccel = !preaccel_relays.is_empty();
     let preaccel_host_selection = catcloud_core::preaccel::select_physical_host_relays(&preaccel_relays);
+    let has_valid_active_relay = has_existing_enabled_active_relay(
+        cfg.preaccel.active_relay_id.as_deref(),
+        &preaccel_relays,
+    );
     let preaccel_lb_active = is_preaccel_pool_lb_effective(
         cfg.preaccel.dispatch_strategy,
         cfg.preaccel.active_relay_id.as_deref(),
+        &preaccel_relays,
         preaccel_host_selection.distinct_host_count,
     );
     let effective_probe_dispatch_strategy = if preaccel_lb_active {
         cfg.preaccel.dispatch_strategy
     } else if cfg.preaccel.dispatch_strategy == PreAccelDispatchStrategy::Auto
-        && cfg
-            .preaccel
-            .active_relay_id
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty())
+        && has_valid_active_relay
     {
         PreAccelDispatchStrategy::Fallback
     } else {
@@ -7716,18 +7946,13 @@ pub async fn run_isolated_probes(
                     } else {
                         report.snapshot
                     };
-                    if snap.ok {
-                        if let Some(ms) = snap.latency_ms.filter(|v| v.is_finite() && *v > 0.0) {
-                            state.reset_node_health(&nid);
-                            state.record_node_health_probe(
-                                &nid,
-                                RuntimeDualHealth::FullHealthy,
-                                Some(ms),
-                            );
-                        }
-                    } else {
-                        state.reset_node_health(&nid);
-                    }
+                    update_node_health_pool_after_isolated_probe(
+                        &state,
+                        &nid,
+                        &report.records,
+                        &latency_probe_ids,
+                        &snap,
+                    );
                     snapshots.insert(nid.clone(), snap.clone());
                     let _ = app.emit(
                         EVENT_PROBE_PROGRESS,
@@ -7909,6 +8134,46 @@ struct IsolatedProbeBatchSummary {
     untested_count: usize,
 }
 
+/// Update the runtime `node_health_pool` after an isolated probe run ONLY when this run actually
+/// executed at least one `ProbeKind::Latency` probe:
+/// - Latency ran and passed (matching `ProbeSnapshot::from_results_with_kinds` priority:
+///   `builtin_latency` first, then last latency record) -> clear stale failure/cooldown penalties
+///   via `reset_node_health` WITHOUT fabricating a background watchdog `FullHealthy` entry.
+/// - Latency ran and failed -> reset stale healthy state and mark node `Failed` into cooldown.
+/// - No Latency probe ran (e.g. unlock-only or bandwidth-only run) -> leave existing health pool
+///   untouched so healthy nodes are never wiped.
+fn update_node_health_pool_after_isolated_probe(
+    state: &AppState,
+    node_id: &str,
+    records: &[catcloud_core::models::ProbeResultRecord],
+    latency_probe_ids: &HashSet<String>,
+    merged_snap: &ProbeSnapshot,
+) {
+    if latency_probe_ids.is_empty() {
+        return;
+    }
+    let latency_records: Vec<&catcloud_core::models::ProbeResultRecord> = records
+        .iter()
+        .filter(|r| latency_probe_ids.contains(&r.probe_id))
+        .collect();
+    if latency_records.is_empty() {
+        return;
+    }
+    let chosen_latency = latency_records
+        .iter()
+        .rev()
+        .copied()
+        .find(|r| r.probe_id == "builtin_latency")
+        .or_else(|| latency_records.last().copied());
+    let latency_passed = chosen_latency.is_some_and(|r| r.ok) && merged_snap.ok;
+    if latency_passed {
+        state.reset_node_health(node_id);
+    } else {
+        state.reset_node_health(node_id);
+        state.record_node_health_probe(node_id, RuntimeDualHealth::Failed, None);
+    }
+}
+
 /// Split isolated batch probe results into distinct, non-conflated metrics:
 /// latency reachability, bidirectional bandwidth pass, 60s keepalive pass, failed probes,
 /// execution errors, and untested nodes.
@@ -7926,22 +8191,41 @@ fn summarize_isolated_probe_run(
     let mut failed_count = 0usize;
 
     for (node_id, snap) in run_snapshots {
+        let node_recs = run_records_by_node.get(node_id);
         let latency_ok = if !latency_probe_ids.is_empty() {
-            run_records_by_node
-                .get(node_id)
-                .is_some_and(|recs| {
-                    recs.iter()
-                        .any(|r| latency_probe_ids.contains(&r.probe_id) && r.ok)
-                })
+            node_recs.is_some_and(|recs| {
+                recs.iter()
+                    .any(|r| latency_probe_ids.contains(&r.probe_id) && r.ok)
+            })
         } else {
             snap.ok && snap.latency_ms.is_some_and(|v| v.is_finite() && v > 0.0)
         };
         if latency_ok {
             latency_ok_count += 1;
         }
-        let bw_ok = snap.up_mbps.is_some_and(|v| v.is_finite() && v > 0.0)
-            && snap.down_mbps.is_some_and(|v| v.is_finite() && v > 0.0);
-        if bw_ok {
+        let up_ok = match node_recs {
+            Some(recs)
+                if recs
+                    .iter()
+                    .any(|r| r.up_mbps.is_some() || r.probe_id == "builtin_upload") =>
+            {
+                recs.iter()
+                    .any(|r| r.ok && r.up_mbps.is_some_and(|v| v.is_finite() && v > 0.0))
+            }
+            _ => snap.up_mbps.is_some_and(|v| v.is_finite() && v > 0.0),
+        };
+        let down_ok = match node_recs {
+            Some(recs)
+                if recs
+                    .iter()
+                    .any(|r| r.down_mbps.is_some() || r.probe_id == "builtin_download") =>
+            {
+                recs.iter()
+                    .any(|r| r.ok && r.down_mbps.is_some_and(|v| v.is_finite() && v > 0.0))
+            }
+            _ => snap.down_mbps.is_some_and(|v| v.is_finite() && v > 0.0),
+        };
+        if up_ok && down_ok {
             bandwidth_ok_count += 1;
         }
         if snap.keepalive_60s_ok == Some(true) {
@@ -8876,12 +9160,22 @@ pub async fn import_share_bundle(
         warnings.extend(relay_warnings);
     }
 
+    let mut created_default_group = false;
     if imported_nodes > 0 {
         let _ = remap_active_single_node_id_if_needed(&state, &id_remap)?;
         prune_node_health_pool_from_db(&state);
-        let _ = ensure_default_group_if_empty(&state);
+        created_default_group = ensure_default_group_if_empty(&state);
     }
-    let _ = trigger_reload_if_running(&app, &state, false).await;
+    if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+        if outcome.rejected {
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            warnings.push(format!("已导入数据，但热重载核心配置未通过：{detail}"));
+        }
+    }
     let latest_cfg = state.snapshot_config();
     if imported_relays > 0 {
         sync_running_global_preaccel_if_active(&state, &latest_cfg).await;
@@ -8895,6 +9189,12 @@ pub async fn import_share_bundle(
         ),
     );
     emit_config_updated(&app, &latest_cfg);
+    if created_default_group {
+        emit_groups_updated(&app);
+    }
+    if imported_relays > 0 {
+        emit_relays_updated(&app);
+    }
     sync_app_side_effects(&app, &state, &latest_cfg);
 
     Ok(ShareBundleImportOutcome {
@@ -9713,14 +10013,24 @@ pub async fn apply_sync_import(
         }
     }
 
+    let mut created_default_group = false;
     if imported_nodes > 0 {
         let _ = remap_active_single_node_id_if_needed(&state, &id_remap)?;
         prune_node_health_pool_from_db(&state);
-        let _ = ensure_default_group_if_empty(&state);
+        created_default_group = ensure_default_group_if_empty(&state);
     } else if imported_groups > 0 {
-        let _ = ensure_default_group_if_empty(&state);
+        created_default_group = ensure_default_group_if_empty(&state);
     }
-    let _ = trigger_reload_if_running(&app, &state, false).await;
+    if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+        if outcome.rejected {
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            warnings.push(format!("已导入同步包，但热重载核心配置未通过：{detail}"));
+        }
+    }
     let latest_cfg = state.snapshot_config();
     if imported_relays > 0 {
         sync_running_global_preaccel_if_active(&state, &latest_cfg).await;
@@ -9734,6 +10044,12 @@ pub async fn apply_sync_import(
         ),
     );
     emit_config_updated(&app, &latest_cfg);
+    if imported_groups > 0 || created_default_group {
+        emit_groups_updated(&app);
+    }
+    if imported_relays > 0 {
+        emit_relays_updated(&app);
+    }
     sync_app_side_effects(&app, &state, &latest_cfg);
 
     Ok(ShareBundleImportOutcome {
@@ -10775,15 +11091,65 @@ pub async fn upsert_preaccel_relay(
         relay.id = format!("relay-{}", uuid::Uuid::new_v4().simple());
     }
     catcloud_core::preaccel::schema::validate_relay_strict(&relay).map_err(|e| e.to_string())?;
-    {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let prev_cfg = state.snapshot_config();
+    let (prev_relay, enabled_relay_ids) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
+        let prev = db
+            .get_preaccel_relay(&relay.id)
+            .map_err(|e| e.to_string())?;
         db.upsert_preaccel_relay(&relay).map_err(|e| e.to_string())?;
+        let enabled_ids: HashSet<String> = db
+            .list_preaccel_relays(true)
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        (prev, enabled_ids)
+    };
+    let mut cfg = prev_cfg.clone();
+    let active_relay_cleared = config::reconcile_dangling_active_relay(&mut cfg, &enabled_relay_ids);
+    if active_relay_cleared {
+        config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = cfg.clone();
+        }
     }
-    let _ = trigger_reload_if_running(&app, &state, false).await;
+    if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+        if outcome.rejected {
+            if let Ok(db) = state.storage.lock() {
+                match prev_relay {
+                    Some(ref old_relay) => {
+                        let _ = db.upsert_preaccel_relay(old_relay);
+                    }
+                    None => {
+                        let _ = db.delete_preaccel_relay(&relay.id);
+                    }
+                }
+            }
+            if active_relay_cleared {
+                let _ = config::save(&state.paths, &prev_cfg);
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = prev_cfg.clone();
+                }
+            }
+            sync_app_side_effects(&app, &state, &prev_cfg);
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            return Err(format!(
+                "保存国内中转「{}」失败，核心配置重载未通过：{detail}",
+                relay.name
+            ));
+        }
+    }
     let cfg = state.snapshot_config();
     sync_running_global_preaccel_if_active(&state, &cfg).await;
     sync_app_side_effects(&app, &state, &cfg);
-    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+    emit_config_updated(&app, &cfg);
+    emit_relays_updated(&app);
     Ok(relay)
 }
 
@@ -10793,17 +11159,61 @@ pub async fn delete_preaccel_relay(
     state: State<'_, AppState>,
     relay_id: String,
 ) -> Result<bool, String> {
-    let deleted = {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let prev_cfg = state.snapshot_config();
+    let (prev_relay, deleted, enabled_relay_ids) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        db.delete_preaccel_relay(&relay_id)
+        let prev = db
+            .get_preaccel_relay(&relay_id)
+            .map_err(|e| e.to_string())?;
+        let deleted = db
+            .delete_preaccel_relay(&relay_id)
+            .map_err(|e| e.to_string())?;
+        let enabled_ids: HashSet<String> = db
+            .list_preaccel_relays(true)
             .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        (prev, deleted, enabled_ids)
     };
     if deleted {
-        let _ = trigger_reload_if_running(&app, &state, false).await;
+        let mut cfg = prev_cfg.clone();
+        let active_relay_cleared =
+            config::reconcile_dangling_active_relay(&mut cfg, &enabled_relay_ids);
+        if active_relay_cleared {
+            config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
+            if let Ok(mut guard) = state.config.write() {
+                *guard = cfg.clone();
+            }
+        }
+        if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+            if outcome.rejected {
+                if let Some(ref old_relay) = prev_relay {
+                    if let Ok(db) = state.storage.lock() {
+                        let _ = db.upsert_preaccel_relay(old_relay);
+                    }
+                }
+                if active_relay_cleared {
+                    let _ = config::save(&state.paths, &prev_cfg);
+                    if let Ok(mut guard) = state.config.write() {
+                        *guard = prev_cfg.clone();
+                    }
+                }
+                sync_app_side_effects(&app, &state, &prev_cfg);
+                let detail = outcome
+                    .error
+                    .as_deref()
+                    .map(format_mihomo_error_for_user)
+                    .unwrap_or_else(|| "未知原因".to_string());
+                return Err(format!("删除国内中转失败，核心配置重载未通过：{detail}"));
+            }
+        }
         let cfg = state.snapshot_config();
         sync_running_global_preaccel_if_active(&state, &cfg).await;
         sync_app_side_effects(&app, &state, &cfg);
-        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+        emit_config_updated(&app, &cfg);
+        emit_relays_updated(&app);
     }
     Ok(deleted)
 }
@@ -11628,14 +12038,31 @@ async fn select_preaccel_relay_locked(
         } else {
             PreAccelDispatchStrategy::Auto
         };
-        let mut cfg = state.snapshot_config();
+        let prev_cfg = state.snapshot_config();
+        let mut cfg = prev_cfg.clone();
         apply_preaccel_relay_selection_to_config(&mut cfg, None, Some(target_strategy));
         config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
         }
         if state.adapter.has_live_controller().await {
-            let _ = trigger_reload_if_running(app, state, true).await;
+            if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
+                if outcome.rejected {
+                    let _ = config::save(&state.paths, &prev_cfg);
+                    if let Ok(mut guard) = state.config.write() {
+                        *guard = prev_cfg.clone();
+                    }
+                    sync_app_side_effects(app, state, &prev_cfg);
+                    let detail = outcome
+                        .error
+                        .as_deref()
+                        .map(format_mihomo_error_for_user)
+                        .unwrap_or_else(|| "未知原因".to_string());
+                    return Err(format!(
+                        "切换国内提速自动调度模式失败，核心配置重载未通过：{detail}"
+                    ));
+                }
+            }
             let _ = state
                 .adapter
                 .select_group_proxy(
@@ -11654,7 +12081,8 @@ async fn select_preaccel_relay_locked(
             ),
         );
         sync_app_side_effects(app, state, &cfg);
-        let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+        emit_config_updated(app, &cfg);
+        emit_relays_updated(app);
         return Ok(target_strategy.as_str().to_string());
     }
 
@@ -11664,7 +12092,8 @@ async fn select_preaccel_relay_locked(
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("未找到指定国内中转（{trimmed_id}）"))?
     };
-    let mut cfg = state.snapshot_config();
+    let prev_cfg = state.snapshot_config();
+    let mut cfg = prev_cfg.clone();
     let switched_from_lb = apply_preaccel_relay_selection_to_config(&mut cfg, Some(&relay), None);
     config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
     if let Ok(mut guard) = state.config.write() {
@@ -11674,7 +12103,24 @@ async fn select_preaccel_relay_locked(
         // Trigger L2 hot reload so `PREACCEL_FALLBACK_GROUP` promotes this relay to index 0
         // while `PREACCEL_SELECT_GROUP` continues pointing to `PREACCEL_FALLBACK_GROUP` for
         // automatic failover + DIRECT safety net (never locking a single relay bare).
-        let _ = trigger_reload_if_running(app, state, true).await;
+        if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
+            if outcome.rejected {
+                let _ = config::save(&state.paths, &prev_cfg);
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = prev_cfg.clone();
+                }
+                sync_app_side_effects(app, state, &prev_cfg);
+                let detail = outcome
+                    .error
+                    .as_deref()
+                    .map(format_mihomo_error_for_user)
+                    .unwrap_or_else(|| "未知原因".to_string());
+                return Err(format!(
+                    "切换国内中转「{}」失败，核心配置重载未通过：{detail}",
+                    relay.name
+                ));
+            }
+        }
         let _ = state
             .adapter
             .select_group_proxy(
@@ -11695,7 +12141,8 @@ async fn select_preaccel_relay_locked(
         &format!("已切换国内提速优先中转至「{}」{mode_note}", relay.name),
     );
     sync_app_side_effects(app, state, &cfg);
-    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
+    emit_config_updated(app, &cfg);
+    emit_relays_updated(app);
     Ok(relay.id)
 }
 
@@ -12086,6 +12533,7 @@ async fn measure_relay_real_rtt_ms(relay: &PreAccelRelay) -> Result<f64, String>
 
 #[tauri::command]
 pub async fn test_preaccel_relays(
+    app: AppHandle,
     state: State<'_, AppState>,
     relay_ids: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
@@ -12173,6 +12621,7 @@ pub async fn test_preaccel_relays(
                 );
             }
         }
+        emit_relays_updated(&app);
     }
     state.log_app_event(
         if ok_count == total_count { "info" } else { "warning" },
@@ -12484,6 +12933,17 @@ fn format_side_log_summary(side: &PreAccelSideSpeedDto) -> String {
     }
 }
 
+fn extract_verified_throughput_mbps(
+    rec: &catcloud_core::models::ProbeResultRecord,
+    is_upload: bool,
+) -> Option<f64> {
+    if !rec.ok {
+        return None;
+    }
+    let val = if is_upload { rec.up_mbps } else { rec.down_mbps };
+    val.filter(|&v| v.is_finite() && v > 0.0)
+}
+
 async fn run_preaccel_comparison_side(
     proxy_port: u16,
     node_id: &str,
@@ -12600,7 +13060,7 @@ async fn run_preaccel_comparison_side(
         .await
         {
             Ok(rec) => {
-                let speed = rec.up_mbps.filter(|&v| v.is_finite() && v > 0.0);
+                let speed = extract_verified_throughput_mbps(&rec, true);
                 if speed.is_some() {
                     (speed, None)
                 } else {
@@ -12640,7 +13100,7 @@ async fn run_preaccel_comparison_side(
         .await
         {
             Ok(rec) => {
-                let speed = rec.down_mbps.filter(|&v| v.is_finite() && v > 0.0);
+                let speed = extract_verified_throughput_mbps(&rec, false);
                 if speed.is_some() {
                     (speed, None)
                 } else {
@@ -12833,6 +13293,7 @@ pub async fn benchmark_preaccel_comparison(
                 recorded_down_mbps,
             );
         }
+        emit_relays_updated(&app);
     }
 
     let up_boost_ratio = calc_boost_ratio(accelerated.up_mbps, direct.up_mbps);
@@ -13099,6 +13560,7 @@ pub async fn test_preaccel_relay_speeds(
 
     let total_count = target_relays.len();
     let mut ok_count = 0usize;
+    let mut any_metrics_updated = false;
     let mut results: Vec<PreAccelRelaySpeedResultDto> = Vec::with_capacity(total_count);
 
     // Run strictly sequentially per relay to prevent local uplink bandwidth contention.
@@ -13164,6 +13626,7 @@ pub async fn test_preaccel_relay_speeds(
                     recorded_up,
                     recorded_down,
                 );
+                any_metrics_updated = true;
             }
         }
 
@@ -13182,6 +13645,9 @@ pub async fn test_preaccel_relay_speeds(
     }
 
     let _ = probe_core.shutdown().await;
+    if any_metrics_updated {
+        emit_relays_updated(&app);
+    }
 
     state.log_app_event(
         if ok_count == total_count {
@@ -14828,20 +15294,64 @@ pub async fn import_mmrelay_input(
 ) -> Result<Vec<PreAccelRelay>, String> {
     let bundle =
         catcloud_core::preaccel::schema::parse_mmrelay_clipboard(&raw).map_err(|e| e.to_string())?;
-    {
+    let expected_fps: HashSet<(String, String, u16)> = bundle
+        .relays
+        .iter()
+        .map(|r| {
+            let proto = catcloud_core::preaccel::schema::RelayProtocol::parse(&r.protocol)
+                .map(|p| p.mihomo_type().to_string())
+                .unwrap_or_else(|| r.protocol.trim().to_ascii_lowercase());
+            (proto, r.server.trim().to_ascii_lowercase(), r.port)
+        })
+        .collect();
+    let (imported_count, warnings, persisted) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
-        for relay in &bundle.relays {
-            catcloud_core::preaccel::schema::validate_relay_strict(relay)
+        let (count, warnings) =
+            catcloud_core::preaccel::import_relays_dedup_into_storage(&db, bundle.relays)
                 .map_err(|e| e.to_string())?;
-            db.upsert_preaccel_relay(relay).map_err(|e| e.to_string())?;
+        if count == 0 && !warnings.is_empty() {
+            return Err(warnings.join("；"));
+        }
+        let all = db.list_preaccel_relays(false).map_err(|e| e.to_string())?;
+        let matched: Vec<PreAccelRelay> = all
+            .into_iter()
+            .filter(|r| {
+                let proto = catcloud_core::preaccel::schema::RelayProtocol::parse(&r.protocol)
+                    .map(|p| p.mihomo_type().to_string())
+                    .unwrap_or_else(|| r.protocol.trim().to_ascii_lowercase());
+                expected_fps.contains(&(proto, r.server.trim().to_ascii_lowercase(), r.port))
+            })
+            .collect();
+        (count, warnings, matched)
+    };
+    if !warnings.is_empty() {
+        state.log_app_event(
+            "warning",
+            "国内提速",
+            &format!("导入国内中转存在跳过项：{}", warnings.join("；")),
+        );
+    }
+    if let Some(outcome) = trigger_reload_if_running(&app, &state, false).await {
+        if outcome.rejected {
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            let cfg = state.snapshot_config();
+            sync_app_side_effects(&app, &state, &cfg);
+            emit_relays_updated(&app);
+            return Err(format!(
+                "已去重导入 {imported_count} 条国内中转，但核心配置热重载未通过：{detail}"
+            ));
         }
     }
-    let _ = trigger_reload_if_running(&app, &state, false).await;
     let latest_cfg = state.snapshot_config();
     sync_running_global_preaccel_if_active(&state, &latest_cfg).await;
     sync_app_side_effects(&app, &state, &latest_cfg);
-    let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
-    Ok(bundle.relays)
+    emit_config_updated(&app, &latest_cfg);
+    emit_relays_updated(&app);
+    Ok(persisted)
 }
 
 #[tauri::command]
@@ -14915,6 +15425,60 @@ fn persist_migration_nodes(
     Ok((sub_id, count))
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MigrationApplyOutcome {
+    pub imported_count: usize,
+    pub sub_id: String,
+}
+
+async fn apply_migration_nodes_with_meta_internal(
+    app: &AppHandle,
+    state: &AppState,
+    source_name: String,
+    nodes: Vec<ProxyNode>,
+) -> Result<MigrationApplyOutcome, String> {
+    let (sub_id, count) = {
+        let mut db = state.storage.lock().map_err(|e| e.to_string())?;
+        persist_migration_nodes(&mut db, source_name, nodes)?
+    };
+    prune_node_health_pool_from_db(state);
+    let created_default_group = ensure_default_group_if_empty(state);
+    if let Some(outcome) = trigger_reload_if_running(app, state, false).await {
+        if outcome.rejected {
+            let detail = outcome
+                .error
+                .as_deref()
+                .map(format_mihomo_error_for_user)
+                .unwrap_or_else(|| "未知原因".to_string());
+            state.log_app_event(
+                "warning",
+                "迁移导入",
+                &format!("已导入 {count} 个节点，但热重载核心配置未通过：{detail}"),
+            );
+        }
+    }
+    let cfg = state.snapshot_config();
+    emit_config_updated(app, &cfg);
+    if created_default_group {
+        emit_groups_updated(app);
+    }
+    sync_app_side_effects(app, state, &cfg);
+    Ok(MigrationApplyOutcome {
+        imported_count: count,
+        sub_id,
+    })
+}
+
+#[tauri::command]
+pub async fn apply_migration_nodes_with_meta(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    source_name: String,
+    nodes: Vec<ProxyNode>,
+) -> Result<MigrationApplyOutcome, String> {
+    apply_migration_nodes_with_meta_internal(&app, &state, source_name, nodes).await
+}
+
 #[tauri::command]
 pub async fn apply_migration_nodes(
     app: AppHandle,
@@ -14922,17 +15486,9 @@ pub async fn apply_migration_nodes(
     source_name: String,
     nodes: Vec<ProxyNode>,
 ) -> Result<usize, String> {
-    let (_sub_id, count) = {
-        let mut db = state.storage.lock().map_err(|e| e.to_string())?;
-        persist_migration_nodes(&mut db, source_name, nodes)?
-    };
-    prune_node_health_pool_from_db(&state);
-    let _ = ensure_default_group_if_empty(&state);
-    let _ = trigger_reload_if_running(&app, &state, false).await;
-    let cfg = state.snapshot_config();
-    emit_config_updated(&app, &cfg);
-    sync_app_side_effects(&app, &state, &cfg);
-    Ok(count)
+    apply_migration_nodes_with_meta_internal(&app, &state, source_name, nodes)
+        .await
+        .map(|o| o.imported_count)
 }
 
 #[tauri::command]
@@ -16794,6 +17350,8 @@ pub struct PendingUpdatePromptDto {
     pub platform_key: Option<String>,
     pub installer_filename: Option<String>,
     pub dismissed_in_session: bool,
+    #[serde(default)]
+    pub silent_badge_only: bool,
     pub is_elevated: bool,
 }
 
@@ -16918,11 +17476,33 @@ fn resolve_staged_update_version_checked(
     if !staging_dir.exists() {
         return None;
     }
-    let pending = catcloud_core::updater::verify_staged_payload_integrity(staging_dir).ok()?;
+    let pending = match catcloud_core::updater::verify_staged_payload_integrity(staging_dir) {
+        Ok(meta) => meta,
+        Err(err) => {
+            tracing::warn!(
+                staging_dir = %staging_dir.display(),
+                "staged update failed integrity check during background probe; auto-purging: {err}"
+            );
+            let _ = catcloud_core::updater::purge_staged_update(staging_dir);
+            return None;
+        }
+    };
     if pending.kind != expected_kind {
+        tracing::info!(
+            staged_kind = ?pending.kind,
+            expected_kind = ?expected_kind,
+            "staged update kind mismatch during background probe; auto-purging"
+        );
+        let _ = catcloud_core::updater::purge_staged_update(staging_dir);
         return None;
     }
     if catcloud_core::updater::is_version_skipped(&pending.target_version, skipped_version) {
+        tracing::info!(
+            staged = %pending.target_version,
+            skipped = ?skipped_version,
+            "staged update matches skipped version during background probe; auto-purging"
+        );
+        let _ = catcloud_core::updater::purge_staged_update(staging_dir);
         return None;
     }
     if catcloud_core::updater::is_update_available_for_channel(
@@ -16934,6 +17514,12 @@ fn resolve_staged_update_version_checked(
     {
         Some(pending.target_version)
     } else {
+        tracing::info!(
+            current = %current_version,
+            staged = %pending.target_version,
+            "staged update is expired/not newer than current build; auto-purging"
+        );
+        let _ = catcloud_core::updater::purge_staged_update(staging_dir);
         None
     }
 }
@@ -17033,6 +17619,7 @@ fn inspect_and_reconcile_staged_update(
         platform_key: pending.platform_key,
         installer_filename,
         dismissed_in_session,
+        silent_badge_only: false,
         is_elevated,
     })
 }
@@ -18121,6 +18708,13 @@ fn dismiss_update_prompt_for_session_state(
     Ok(true)
 }
 
+pub(crate) fn dismiss_update_prompt_for_session_internal(
+    state: &AppState,
+    version: &str,
+) -> Result<bool, String> {
+    dismiss_update_prompt_for_session_state(state, version)
+}
+
 #[tauri::command]
 pub fn dismiss_update_prompt_for_session(
     state: State<'_, AppState>,
@@ -18250,6 +18844,7 @@ fn collect_portable_update_relaunch_args(raw_args: &[std::ffi::OsString]) -> Vec
                 | "--apply-staged-update"
                 | "--enable-tun"
                 | "--enable-global-preaccel"
+                | "--shutdown-existing"
         ) {
             continue;
         }
@@ -18370,9 +18965,21 @@ pub async fn apply_staged_update_and_restart(
                 .ok_or_else(|| "无法定位当前程序所在目录".to_string())?;
             let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
             let args = collect_portable_update_relaunch_args(&raw_args);
+
+            // Track A (PortableZip, no UAC): synchronously stop core/TUN/WinDivert, clear owned
+            // OS proxy, and release child process file locks BEFORE spawning the swapper binary.
+            let app_cleanup = app.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Some(st) = app_cleanup.try_state::<AppState>() {
+                    emergency_cleanup_on_exit(&st);
+                    let _ = st.job_guard.terminate_all();
+                }
+            })
+            .await;
+
             let exe_clone = exe.clone();
             let app_root_clone = app_root.clone();
-            tokio::task::spawn_blocking(move || {
+            let spawn_res = tokio::task::spawn_blocking(move || {
                 catcloud_core::process_guard::spawn_detached_self(
                     &exe_clone,
                     &args,
@@ -18380,8 +18987,19 @@ pub async fn apply_staged_update_and_restart(
                 )
             })
             .await
-            .map_err(|e| format!("拉起重启更新进程任务异常中止：{e}"))?
-            .map_err(|e| format!("拉起重启更新进程失败：{e}"))?;
+            .map_err(|e| format!("拉起重启更新进程任务异常中止：{e}"))
+            .and_then(|r| r.map_err(|e| format!("拉起重启更新进程失败：{e}")));
+            if let Err(err) = spawn_res {
+                // Restore exit flags so user can retry or exit normally without getting stuck.
+                state.shutting_down.store(false, Ordering::SeqCst);
+                state.exit_cleanup_done.store(false, Ordering::SeqCst);
+                let latest_status = state.adapter.status().await;
+                state.update_cached_runtime(latest_status);
+                let latest_cfg = state.snapshot_config();
+                emit_runtime_snapshot(&app, &state);
+                sync_app_side_effects(&app, &state, &latest_cfg);
+                return Err(format!("{err}；核心已停止，请重试更新或手动重连"));
+            }
 
             let msg = format!("已拉起 v{target_version} 便携更新换轨进程，应用即将优雅退出并重启");
             state.log_app_event("info", "软件更新", &msg);
@@ -18389,7 +19007,7 @@ pub async fn apply_staged_update_and_restart(
             apply_guard.keep_locked();
             let app_exit = app.clone();
             tauri::async_runtime::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(120)).await;
+                tokio::time::sleep(Duration::from_millis(80)).await;
                 lifecycle::request_graceful_exit(&app_exit);
             });
 
@@ -18424,6 +19042,9 @@ pub async fn apply_staged_update_and_restart(
             #[cfg(target_os = "windows")]
             {
                 if apply_action == "installer_launch" {
+                    // Track B (Windows InstallerPackage): launch installer FIRST so UAC
+                    // cancellation causes 0 network disruption and immediately releases
+                    // `update_apply_in_progress`.
                     let path_for_launch = installer_path.clone();
                     let launched = tokio::task::spawn_blocking(move || {
                         catcloud_core::process_guard::launch_windows_installer(&path_for_launch)
@@ -18446,6 +19067,17 @@ pub async fn apply_staged_update_and_restart(
                         });
                     }
 
+                    // UAC approved and installer is running: synchronously stop core/TUN/proxy and
+                    // release child locks immediately before exiting cleanly.
+                    let app_cleanup = app.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        if let Some(st) = app_cleanup.try_state::<AppState>() {
+                            emergency_cleanup_on_exit(&st);
+                            let _ = st.job_guard.terminate_all();
+                        }
+                    })
+                    .await;
+
                     let msg = format!(
                         "已启动 v{target_version} 安装向导，应用即将优雅退出以释放程序文件"
                     );
@@ -18454,7 +19086,7 @@ pub async fn apply_staged_update_and_restart(
                     apply_guard.keep_locked();
                     let app_exit = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(120)).await;
+                        tokio::time::sleep(Duration::from_millis(80)).await;
                         lifecycle::request_graceful_exit(&app_exit);
                     });
 
@@ -18717,85 +19349,372 @@ fn merge_redacted_backup_relay(
     true
 }
 
+struct BackupRestoreApplied {
+    old_cfg: AppConfig,
+    db_snapshot: BackupDbSnapshot,
+    config_written: bool,
+    has_db_mutations: bool,
+    restored_config: bool,
+    restored_groups: usize,
+    restored_relays: usize,
+    restored_probes: usize,
+    skipped_redacted_relays: usize,
+}
+
+/// Phase 1 + Phase 2 of backup restore:
+/// Fully parses and strictly validates ALL entities (groups + formulas, probes + `validate_definition`,
+/// relays + `validate_relay_strict`, config + Mihomo compile preflight) BEFORE mutating SQLite or
+/// disk. Commits SQLite atomically in a single transaction first, then writes `config.json`, rolling
+/// back SQLite in one transaction if `config::save` fails. Caller MUST hold `state.config_transition_lock`.
+fn prepare_and_apply_backup_bundle_core(
+    state: &AppState,
+    bundle_json: &str,
+) -> Result<BackupRestoreApplied, String> {
+    let parsed: serde_json::Value = serde_json::from_str(bundle_json)
+        .map_err(|e| format!("备份文件 JSON 格式无效：{e}"))?;
+    if !parsed.is_object() {
+        return Err("备份文件顶层格式无效：应为 JSON 对象".to_string());
+    }
+
+    let old_cfg = state.snapshot_config();
+
+    // 1. Strictly parse & validate groups, probes, and relays in memory first (zero DB/disk mutation yet).
+    let mut parsed_groups: Vec<MultiGroup> = Vec::new();
+    if let Some(val) = parsed.get("multi_groups").filter(|v| !v.is_null()) {
+        let arr = val
+            .as_array()
+            .ok_or_else(|| "备份中的 multi_groups 格式无效：应为数组".to_string())?;
+        for (idx, item) in arr.iter().enumerate() {
+            let g: MultiGroup = serde_json::from_value(item.clone())
+                .map_err(|e| format!("备份中的第 {} 条多选分组数据损坏：{e}", idx + 1))?;
+            if g.id.trim().is_empty() {
+                return Err(format!("备份中的第 {} 条多选分组缺少有效 ID", idx + 1));
+            }
+            catcloud_core::strategy::formula::validate_formula(&g.formula_expr)
+                .map_err(|e| format!("备份中的分组「{}」排序公式无效：{e}", g.name))?;
+            parsed_groups.push(g);
+        }
+    }
+
+    let mut parsed_probes: Vec<ProbeDefinition> = Vec::new();
+    if let Some(val) = parsed.get("probe_definitions").filter(|v| !v.is_null()) {
+        let arr = val
+            .as_array()
+            .ok_or_else(|| "备份中的 probe_definitions 格式无效：应为数组".to_string())?;
+        for (idx, item) in arr.iter().enumerate() {
+            let p: ProbeDefinition = serde_json::from_value(item.clone())
+                .map_err(|e| format!("备份中的第 {} 条测速探针数据损坏：{e}", idx + 1))?;
+            catcloud_core::probe::validate_definition(&p)
+                .map_err(|e| format!("备份中的测速探针「{}」校验未通过：{e}", p.name))?;
+            parsed_probes.push(p);
+        }
+    }
+
+    let (existing_nodes, db_snapshot) = {
+        let db = state.storage.lock().map_err(|e| e.to_string())?;
+        (
+            db.list_nodes().map_err(|e| e.to_string())?,
+            db.capture_backup_db_snapshot()
+                .map_err(|e| format!("读取恢复前数据库快照失败：{e}"))?,
+        )
+    };
+    let existing_groups = db_snapshot.groups.clone();
+    let existing_relays = db_snapshot.relays.clone();
+
+    let existing_relay_map: HashMap<&str, &PreAccelRelay> = existing_relays
+        .iter()
+        .map(|r| (r.id.as_str(), r))
+        .collect();
+    let mut validated_relays: Vec<PreAccelRelay> = Vec::new();
+    let mut skipped_redacted_relays = 0usize;
+    if let Some(val) = parsed.get("preaccel_relays").filter(|v| !v.is_null()) {
+        let arr = val
+            .as_array()
+            .ok_or_else(|| "备份中的 preaccel_relays 格式无效：应为数组".to_string())?;
+        for (idx, item) in arr.iter().enumerate() {
+            let mut r: PreAccelRelay = serde_json::from_value(item.clone())
+                .map_err(|e| format!("备份中的第 {} 条国内中转数据损坏：{e}", idx + 1))?;
+            let existing = existing_relay_map.get(r.id.as_str()).copied();
+            if !merge_redacted_backup_relay(existing, &mut r) {
+                skipped_redacted_relays += 1;
+                continue;
+            }
+            catcloud_core::preaccel::schema::validate_relay_strict(&r)
+                .map_err(|e| format!("备份中的国内中转校验未通过：{e}"))?;
+            validated_relays.push(r);
+        }
+    }
+
+    // Build projected post-restore groups & relays to run dangling relay reconciliation and compile preflight.
+    let mut projected_relays_map: HashMap<String, PreAccelRelay> = existing_relays
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect();
+    for r in &validated_relays {
+        projected_relays_map.insert(r.id.clone(), r.clone());
+    }
+    let projected_relays: Vec<PreAccelRelay> = projected_relays_map.into_values().collect();
+    let projected_enabled_relay_ids: HashSet<String> = projected_relays
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.id.clone())
+        .collect();
+
+    let mut projected_groups_map: HashMap<String, MultiGroup> = existing_groups
+        .into_iter()
+        .map(|g| (g.id.clone(), g))
+        .collect();
+    for g in &parsed_groups {
+        projected_groups_map.insert(g.id.clone(), g.clone());
+    }
+    let projected_groups: Vec<MultiGroup> = projected_groups_map.into_values().collect();
+
+    let mut next_cfg_opt: Option<AppConfig> = None;
+    let mut restored_config = false;
+    if let Some(cfg_val) = parsed.get("config").filter(|v| !v.is_null()) {
+        let mut next: AppConfig = serde_json::from_value(cfg_val.clone())
+            .map_err(|e| format!("备份中的配置格式无效：{e}"))?;
+        preserve_local_secrets_in_config(&old_cfg, &mut next);
+        normalize_inline_override_yaml(&mut next);
+        let _ = config::migrate_config_in_memory(&mut next);
+        // One-way latch: never regress `onboarding_completed` from `true` back to `false`.
+        next.personalization.onboarding_completed |= old_cfg.personalization.onboarding_completed;
+        let _ = config::reconcile_dangling_active_relay(&mut next, &projected_enabled_relay_ids);
+        config::validate_config(&next)
+            .map_err(|e| format!("备份中的配置参数校验未通过：{e}"))?;
+        next_cfg_opt = Some(next);
+        restored_config = true;
+    } else {
+        let mut reconciled_existing = old_cfg.clone();
+        if config::reconcile_dangling_active_relay(
+            &mut reconciled_existing,
+            &projected_enabled_relay_ids,
+        ) {
+            next_cfg_opt = Some(reconciled_existing);
+        }
+    }
+
+    // Compile preflight with projected config + groups + relays before touching disk or SQLite.
+    let candidate_cfg = next_cfg_opt.as_ref().unwrap_or(&old_cfg);
+    let eff_candidate = effective_config_for_runtime(state, candidate_cfg);
+    let allocated = AllocatedPorts {
+        bind_host: eff_candidate.bind_address.clone(),
+        mixed_port: eff_candidate.mixed_port,
+        controller_port: eff_candidate.controller_port,
+        dns_port: eff_candidate.dns_listen_port,
+        shifted: Vec::new(),
+    };
+    let empty_filter = HashMap::new();
+    let compile_input = CompileInput {
+        config: &eff_candidate,
+        nodes: &existing_nodes,
+        groups: &projected_groups,
+        relays: &projected_relays,
+        controller_secret: "backup-preflight-secret",
+        allocated_ports: &allocated,
+        extra_prepend_rules: &[],
+        extra_fake_ip_filters: &[],
+        group_filtered_members: &empty_filter,
+    };
+    let mut compiled =
+        compile_mihomo_config_with_runtime_dir(&compile_input, Some(&state.paths.runtime_dir))
+            .map_err(|e| {
+                format!(
+                    "备份配置编译预检失败，已拒绝恢复：{}",
+                    format_mihomo_error_for_user(&e.to_string())
+                )
+            })?;
+    if !is_tun_privilege_ready(state) {
+        catcloud_core::core_adapter::enforce_tun_disabled_on_compiled(&mut compiled).map_err(
+            |e| format!("备份配置非提权 TUN 预检失败，已拒绝恢复：{e}"),
+        )?;
+    }
+    if !compiled.validation.ok {
+        let summary = compiled
+            .validation
+            .errors()
+            .iter()
+            .take(3)
+            .map(|i| i.message.as_str())
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!("备份配置静态防环预检未通过，已拒绝恢复：{summary}"));
+    }
+
+    // 2. All preflight checks passed:
+    //    Step 2a: Atomically commit SQLite entities in a single transaction FIRST.
+    let restored_groups = parsed_groups.len();
+    let restored_relays = validated_relays.len();
+    let restored_probes = parsed_probes.len();
+    let has_db_mutations = restored_groups > 0 || restored_relays > 0 || restored_probes > 0;
+    if has_db_mutations {
+        let mut db = state.storage.lock().map_err(|e| e.to_string())?;
+        db.apply_backup_entities_atomic(
+            &parsed_groups,
+            &validated_relays,
+            &parsed_probes,
+            false,
+        )
+        .map_err(|e| format!("原子写入备份数据库实体失败，已回滚：{e}"))?;
+    }
+
+    //    Step 2b: Persist `config.json` & update in-memory `state.config`. If `config::save` fails,
+    //    atomically restore all three SQLite tables back to `db_snapshot` (removing newly inserted IDs).
+    let mut config_written = false;
+    if let Some(next_cfg) = next_cfg_opt {
+        if let Err(save_err) = config::save(&state.paths, &next_cfg) {
+            if has_db_mutations {
+                if let Ok(mut db) = state.storage.lock() {
+                    if let Err(rb_err) = db.apply_backup_entities_atomic(
+                        &db_snapshot.groups,
+                        &db_snapshot.relays,
+                        &db_snapshot.probes,
+                        true,
+                    ) {
+                        tracing::error!("写入恢复配置失败后回滚数据库快照异常：{rb_err}");
+                    }
+                }
+            }
+            return Err(format!("写入恢复配置失败，已原子回滚数据库变更：{save_err}"));
+        }
+        if let Ok(mut guard) = state.config.write() {
+            *guard = next_cfg;
+        }
+        config_written = true;
+    }
+
+    Ok(BackupRestoreApplied {
+        old_cfg,
+        db_snapshot,
+        config_written,
+        has_db_mutations,
+        restored_config,
+        restored_groups,
+        restored_relays,
+        restored_probes,
+        skipped_redacted_relays,
+    })
+}
+
+/// Atomically restore SQLite (`multi_groups`, `preaccel_relays`, `probe_definitions` via
+/// `replace_all = true`) AND `config.json` / `state.config` back to the pre-restore snapshot.
+fn rollback_backup_restore_core(
+    state: &AppState,
+    applied: &BackupRestoreApplied,
+) -> Result<(), String> {
+    let mut errs: Vec<String> = Vec::new();
+    if applied.has_db_mutations {
+        match state.storage.lock() {
+            Ok(mut db) => {
+                if let Err(err) = db.apply_backup_entities_atomic(
+                    &applied.db_snapshot.groups,
+                    &applied.db_snapshot.relays,
+                    &applied.db_snapshot.probes,
+                    true,
+                ) {
+                    errs.push(format!("数据库回滚失败：{err}"));
+                }
+            }
+            Err(err) => {
+                errs.push(format!("获取数据库锁执行回滚失败：{err}"));
+            }
+        }
+    }
+    if applied.config_written {
+        if let Err(err) = config::save(&state.paths, &applied.old_cfg) {
+            errs.push(format!("配置文件回滚失败：{err}"));
+        } else if let Ok(mut guard) = state.config.write() {
+            *guard = applied.old_cfg.clone();
+        }
+    }
+    prune_node_health_pool_from_db(state);
+    if errs.is_empty() {
+        Ok(())
+    } else {
+        Err(errs.join("；"))
+    }
+}
+
+/// Enforce atomic rollback whenever a live core hot-reload rejects the restored backup bundle.
+fn finalize_backup_restore_reload_outcome(
+    state: &AppState,
+    applied: &BackupRestoreApplied,
+    outcome: Option<&ReloadOutcome>,
+) -> Result<(), String> {
+    let Some(outcome) = outcome else {
+        return Ok(());
+    };
+    if !outcome.rejected {
+        return Ok(());
+    }
+    let rollback_res = rollback_backup_restore_core(state, applied);
+    let detail = outcome
+        .error
+        .as_deref()
+        .map(format_mihomo_error_for_user)
+        .unwrap_or_else(|| "未知原因".to_string());
+    if let Err(rb_err) = rollback_res {
+        tracing::error!("备份恢复热重载失败后的原子回滚出现异常：{rb_err}");
+        return Err(format!(
+            "恢复备份后热重载代理核心未通过：{detail}（自动回滚异常：{rb_err}）"
+        ));
+    }
+    Err(format!(
+        "恢复备份后热重载代理核心未通过，已完整回滚配置与数据库：{detail}"
+    ))
+}
+
 #[tauri::command]
 pub async fn import_backup_bundle(
     app: AppHandle,
     state: State<'_, AppState>,
     bundle_json: String,
 ) -> Result<serde_json::Value, String> {
-    let parsed: serde_json::Value = serde_json::from_str(&bundle_json)
-        .map_err(|e| format!("备份文件 JSON 格式无效：{e}"))?;
-    let mut restored_config = false;
-    let mut restored_groups = 0usize;
-    let mut restored_relays = 0usize;
-    let mut skipped_redacted_relays = 0usize;
-
-    let old_cfg = state.snapshot_config();
-    if let Some(cfg_val) = parsed.get("config") {
-        let mut next: AppConfig = serde_json::from_value(cfg_val.clone())
-            .map_err(|e| format!("备份中的配置格式无效：{e}"))?;
-        preserve_local_secrets_in_config(&old_cfg, &mut next);
-        next.preaccel.reconcile_unified_enabled();
-        config::save(&state.paths, &next).map_err(|e| format!("写入恢复配置失败：{e}"))?;
-        if let Ok(mut guard) = state.config.write() {
-            *guard = next;
-        }
-        restored_config = true;
-    }
-
-    {
-        let db = state.storage.lock().map_err(|e| e.to_string())?;
-        if let Some(arr) = parsed.get("multi_groups").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Ok(g) = serde_json::from_value::<MultiGroup>(item.clone()) {
-                    db.upsert_multi_group(&g).map_err(|e| e.to_string())?;
-                    restored_groups += 1;
-                }
-            }
-        }
-        if let Some(arr) = parsed.get("preaccel_relays").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Ok(mut r) = serde_json::from_value::<PreAccelRelay>(item.clone()) {
-                    let existing = db.get_preaccel_relay(&r.id).ok().flatten();
-                    if !merge_redacted_backup_relay(existing.as_ref(), &mut r) {
-                        skipped_redacted_relays += 1;
-                        continue;
-                    }
-                    catcloud_core::preaccel::schema::validate_relay_strict(&r)
-                        .map_err(|e| format!("备份中的国内中转校验未通过：{e}"))?;
-                    db.upsert_preaccel_relay(&r).map_err(|e| e.to_string())?;
-                    restored_relays += 1;
-                }
-            }
-        }
-        if let Some(arr) = parsed.get("probe_definitions").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Ok(p) = serde_json::from_value::<ProbeDefinition>(item.clone()) {
-                    let _ = db.upsert_probe_definition(&p);
-                }
-            }
-        }
-    }
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    let applied = prepare_and_apply_backup_bundle_core(&state, &bundle_json)?;
 
     prune_node_health_pool_from_db(&state);
-    let _ = trigger_reload_if_running(&app, &state, true).await;
+    let reload_outcome = trigger_reload_if_running(&app, &state, true).await;
+    if let Err(err) =
+        finalize_backup_restore_reload_outcome(&state, &applied, reload_outcome.as_ref())
+    {
+        let latest_cfg = state.snapshot_config();
+        emit_config_updated(&app, &latest_cfg);
+        if applied.restored_groups > 0 {
+            emit_groups_updated(&app);
+        }
+        if applied.restored_relays > 0 {
+            emit_relays_updated(&app);
+        }
+        sync_app_side_effects(&app, &state, &latest_cfg);
+        return Err(err);
+    }
     let cfg = state.snapshot_config();
+    sync_running_global_preaccel_if_active(&state, &cfg).await;
     emit_config_updated(&app, &cfg);
+    if applied.restored_groups > 0 {
+        emit_groups_updated(&app);
+    }
+    if applied.restored_relays > 0 {
+        emit_relays_updated(&app);
+    }
     sync_app_side_effects(&app, &state, &cfg);
 
-    let message = if skipped_redacted_relays > 0 {
+    let message = if applied.skipped_redacted_relays > 0 {
         format!(
-            "备份已成功恢复（已跳过 {skipped_redacted_relays} 条脱敏中转占位项，保留本地密钥未受损）"
+            "备份已成功恢复（已跳过 {} 条脱敏中转占位项，保留本地密钥未受损）",
+            applied.skipped_redacted_relays
         )
     } else {
         "备份已成功恢复".to_string()
     };
 
     Ok(serde_json::json!({
-        "restored_config": restored_config,
-        "restored_groups": restored_groups,
-        "restored_relays": restored_relays,
-        "skipped_redacted_relays": skipped_redacted_relays,
+        "restored_config": applied.restored_config,
+        "restored_groups": applied.restored_groups,
+        "restored_relays": applied.restored_relays,
+        "restored_probes": applied.restored_probes,
+        "skipped_redacted_relays": applied.skipped_redacted_relays,
         "message": message
     }))
 }
@@ -19608,6 +20527,11 @@ mod tests {
             bypass: vec![],
             pac_url: Some(format!("http://127.0.0.1:{}/proxy.pac", cfg.system_proxy.pac.port)),
         };
+        // With local PAC disabled (`cfg.system_proxy.pac.enabled == false`), never claim a
+        // same-port host PAC URL even while our core is running.
+        assert!(!is_system_proxy_owned_by_us(&cfg, &rt, &own_pac));
+
+        cfg.system_proxy.pac.enabled = true;
         assert!(is_system_proxy_owned_by_us(&cfg, &rt, &own_pac));
     }
 
@@ -23399,7 +24323,9 @@ mod tests {
         );
 
         // 3. Even if legacy stored config has `Auto + Some(id)`, `apply_ui_dto(Auto, None)` clears
-        //    `active_relay_id` so multi-cloud LB activates cleanly.
+        //    `active_relay_id` so multi-cloud LB activates cleanly; a dangling `active_relay_id`
+        //    that does not exist in `enabled_relays` also never blocks multi-cloud LB.
+        let enabled_pool = vec![relay_a.clone(), relay_b.clone()];
         let mut legacy_auto_pinned = AppConfig::default();
         legacy_auto_pinned.preaccel.enabled = true;
         legacy_auto_pinned.preaccel.dispatch_strategy = PreAccelDispatchStrategy::Auto;
@@ -23409,9 +24335,19 @@ mod tests {
             !is_preaccel_pool_lb_effective(
                 legacy_auto_pinned.preaccel.dispatch_strategy,
                 legacy_auto_pinned.preaccel.active_relay_id.as_deref(),
+                &enabled_pool,
                 2
             ),
-            "Auto + pinned active_relay_id must NOT report multi-cloud LB"
+            "Auto + existing pinned active_relay_id must NOT report multi-cloud LB"
+        );
+        assert!(
+            is_preaccel_pool_lb_effective(
+                PreAccelDispatchStrategy::Auto,
+                Some("r-deleted-dangling"),
+                &enabled_pool,
+                2
+            ),
+            "Auto + dangling active_relay_id MUST still activate multi-cloud LB"
         );
 
         let mut dto_restore_auto = UiAppConfigDto::from(&legacy_auto_pinned);
@@ -23423,6 +24359,7 @@ mod tests {
         assert!(is_preaccel_pool_lb_effective(
             legacy_auto_pinned.preaccel.dispatch_strategy,
             legacy_auto_pinned.preaccel.active_relay_id.as_deref(),
+            &enabled_pool,
             2
         ));
 
@@ -23444,6 +24381,7 @@ mod tests {
         assert!(!is_preaccel_pool_lb_effective(
             legacy_auto_pinned.preaccel.dispatch_strategy,
             legacy_auto_pinned.preaccel.active_relay_id.as_deref(),
+            &enabled_pool,
             2
         ));
 
@@ -23459,11 +24397,13 @@ mod tests {
         assert!(is_preaccel_pool_lb_effective(
             PreAccelDispatchStrategy::LoadBalance,
             Some("r-tx"),
+            &enabled_pool,
             2
         ));
         assert!(!is_preaccel_pool_lb_effective(
             PreAccelDispatchStrategy::LoadBalance,
             None,
+            &enabled_pool,
             1
         ));
     }
@@ -25207,5 +26147,836 @@ mod tests {
             ..base
         })
         .is_ok());
+    }
+
+    #[test]
+    fn stage22_system_proxy_ownership_protects_host_proxy_when_disabled_and_core_never_started() {
+        let mut cfg = AppConfig::default();
+        cfg.mixed_port = 7890;
+        cfg.system_proxy.enabled = false;
+        let rt = CoreRuntimeStatus::default(); // mixed_port == 0, never started core
+
+        let host_portable_proxy = SystemProxySpec {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 7890,
+            bypass: vec![],
+            pac_url: None,
+        };
+        assert!(
+            !is_system_proxy_owned_by_us(&cfg, &rt, &host_portable_proxy),
+            "sandbox/idle instance with system_proxy disabled and rt.mixed_port==0 must NEVER claim host port 7890"
+        );
+
+        let host_pac = SystemProxySpec {
+            enabled: true,
+            host: "127.0.0.1".to_string(),
+            port: 7890,
+            bypass: vec![],
+            pac_url: Some(format!(
+                "http://127.0.0.1:{}/proxy.pac",
+                cfg.system_proxy.pac.port
+            )),
+        };
+        assert!(
+            !is_system_proxy_owned_by_us(&cfg, &rt, &host_pac),
+            "sandbox/idle instance must NEVER claim host PAC when system_proxy disabled and rt.mixed_port==0"
+        );
+
+        // Once system_proxy is enabled in config, loopback proxy ownership returns true,
+        // while PAC URL ownership strictly requires `cfg.system_proxy.pac.enabled == true`.
+        cfg.system_proxy.enabled = true;
+        assert!(is_system_proxy_owned_by_us(&cfg, &rt, &host_portable_proxy));
+        assert!(
+            !is_system_proxy_owned_by_us(&cfg, &rt, &host_pac),
+            "PAC ownership must stay false when cfg.system_proxy.pac.enabled is false"
+        );
+        cfg.system_proxy.pac.enabled = true;
+        assert!(is_system_proxy_owned_by_us(&cfg, &rt, &host_pac));
+    }
+
+    #[test]
+    fn stage22_resolve_staged_update_version_checked_purges_stale_skipped_mismatched_and_corrupt() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s22_stage_purge_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&tmp).expect("create temp root");
+
+        // 1. Corrupted staging dir is auto-purged.
+        let corrupt_dir = tmp.join("corrupt").join(".update_staging");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(corrupt_dir.join("pending_apply.json"), b"{corrupt").unwrap();
+        assert_eq!(
+            resolve_staged_update_version_checked(
+                &corrupt_dir,
+                "0.1.1",
+                false,
+                None,
+                catcloud_core::updater::StagedUpdateKind::PortableZip
+            ),
+            None
+        );
+        assert!(
+            !corrupt_dir.exists(),
+            "corrupt staging_dir must be purged automatically"
+        );
+
+        // Helper to build a valid staged portable zip payload.
+        let write_valid_staged = |dir: &std::path::Path, target_ver: &str| {
+            let payload_dir = dir.join("payload");
+            std::fs::create_dir_all(&payload_dir).unwrap();
+            let payload_rel = "payload.bin";
+            let payload_bytes = b"catcloud-s22-test-payload";
+            let payload_file = payload_dir.join(payload_rel);
+            std::fs::write(&payload_file, payload_bytes).unwrap();
+            let sha = compute_file_sha256(&payload_file).unwrap();
+            let meta = catcloud_core::updater::PendingUpdateMetadata {
+                from_version: "0.1.0".to_string(),
+                target_version: target_ver.to_string(),
+                kind: catcloud_core::updater::StagedUpdateKind::PortableZip,
+                archive_sha256: sha.clone(),
+                staged_at: "2026-11-27T00:00:00Z".to_string(),
+                package_size_bytes: payload_bytes.len() as u64,
+                release_notes: String::new(),
+                release_url: None,
+                platform_key: None,
+                installer_rel_path: None,
+                files: vec![catcloud_core::updater::StagedFileEntry {
+                    rel_path: payload_rel.to_string(),
+                    sha256: sha,
+                    size_bytes: payload_bytes.len() as u64,
+                }],
+            };
+            let meta_bytes = serde_json::to_vec_pretty(&meta).unwrap();
+            std::fs::write(dir.join("pending_apply.json"), meta_bytes).unwrap();
+        };
+
+        // 2. Kind mismatch -> purged.
+        let mismatch_dir = tmp.join("mismatch").join(".update_staging");
+        write_valid_staged(&mismatch_dir, "0.2.0");
+        assert_eq!(
+            resolve_staged_update_version_checked(
+                &mismatch_dir,
+                "0.1.1",
+                false,
+                None,
+                catcloud_core::updater::StagedUpdateKind::InstallerPackage
+            ),
+            None
+        );
+        assert!(!mismatch_dir.exists(), "kind-mismatched staging must be purged");
+
+        // 3. Skipped version -> purged.
+        let skipped_dir = tmp.join("skipped").join(".update_staging");
+        write_valid_staged(&skipped_dir, "0.2.0");
+        assert_eq!(
+            resolve_staged_update_version_checked(
+                &skipped_dir,
+                "0.1.1",
+                false,
+                Some("0.2.0"),
+                catcloud_core::updater::StagedUpdateKind::PortableZip
+            ),
+            None
+        );
+        assert!(!skipped_dir.exists(), "skipped staging must be purged");
+
+        // 4. Expired (<= current_version) -> purged.
+        let expired_dir = tmp.join("expired").join(".update_staging");
+        write_valid_staged(&expired_dir, "0.1.1");
+        assert_eq!(
+            resolve_staged_update_version_checked(
+                &expired_dir,
+                "0.1.1",
+                false,
+                None,
+                catcloud_core::updater::StagedUpdateKind::PortableZip
+            ),
+            None
+        );
+        assert!(!expired_dir.exists(), "expired staging must be purged");
+
+        // 5. Valid newer non-skipped matching kind -> preserved and returned.
+        let valid_dir = tmp.join("valid").join(".update_staging");
+        write_valid_staged(&valid_dir, "0.2.0");
+        assert_eq!(
+            resolve_staged_update_version_checked(
+                &valid_dir,
+                "0.1.1",
+                false,
+                None,
+                catcloud_core::updater::StagedUpdateKind::PortableZip
+            )
+            .as_deref(),
+            Some("0.2.0")
+        );
+        assert!(valid_dir.exists(), "valid newer staging must remain intact");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn stage22_mark_onboarding_completed_and_backup_restore_preflight_invariants() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s22_backup_onboard_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let mut storage = Storage::open(&paths.db_path).unwrap();
+        storage.seed_builtin_probes().unwrap();
+        let initial_cfg = AppConfig::default();
+        config::save(&paths, &initial_cfg).unwrap();
+        let state = AppState::new(
+            paths.clone(),
+            initial_cfg,
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+
+        // 1. Lightweight `mark_onboarding_completed_core` sets and persists `onboarding_completed = true`.
+        assert!(!state.snapshot_config().personalization.onboarding_completed);
+        let updated = mark_onboarding_completed_core(&state)
+            .await
+            .expect("mark onboarding completed");
+        assert!(updated.personalization.onboarding_completed);
+        let reloaded = config::load_or_init(&paths).unwrap();
+        assert!(reloaded.personalization.onboarding_completed);
+
+        // 2. Backup bundle containing an invalid relay MUST fail BEFORE touching `config.json`.
+        let mut bad_cfg = AppConfig::default();
+        bad_cfg.mixed_port = 19999;
+        let bad_relay = PreAccelRelay {
+            id: "r-bad".to_string(),
+            name: "Bad-SNI".to_string(),
+            provider: "tencent".to_string(),
+            region: "CN".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            protocol: "trojan".to_string(),
+            password: "demo-password".to_string(),
+            sni: Some("forbidden.example.invalid".to_string()),
+            skip_cert_verify: true,
+            enabled: true,
+            ..Default::default()
+        };
+        let bad_bundle = serde_json::json!({
+            "config": bad_cfg,
+            "preaccel_relays": [bad_relay]
+        })
+        .to_string();
+        let err = prepare_and_apply_backup_bundle_core(&state, &bad_bundle)
+            .err()
+            .expect("invalid relay backup must reject before writing config");
+        assert!(err.contains("国内中转校验未通过"), "unexpected err: {err}");
+        assert_ne!(
+            state.snapshot_config().mixed_port,
+            19999,
+            "failed backup must NOT leave half-restored config in memory"
+        );
+        assert_ne!(
+            config::load_or_init(&paths).unwrap().mixed_port,
+            19999,
+            "failed backup must NOT leave half-restored config on disk"
+        );
+
+        // 3. Valid backup with `onboarding_completed=false`, overseas `probe_url`, dangling
+        //    `active_relay_id`, and stale Windsurf probe (`expected_status=None`):
+        //    must latch `onboarding_completed |= true`, heal `probe_url`, clear dangling relay,
+        //    and re-seed built-in Windsurf `expected_status = Some(200)`.
+        let mut legacy_cfg = AppConfig::default();
+        legacy_cfg.personalization.onboarding_completed = false;
+        legacy_cfg.preaccel.probe_url = "https://www.gstatic.com/generate_204".to_string();
+        legacy_cfg.preaccel.active_relay_id = Some("nonexistent-relay-id".to_string());
+        let stale_windsurf = ProbeDefinition {
+            id: "builtin_unlock_windsurf".to_string(),
+            name: "Windsurf".to_string(),
+            kind: catcloud_core::models::ProbeKind::UnlockRegex,
+            target_url: "https://example.invalid/old".to_string(),
+            method: "GET".to_string(),
+            expected_status: None,
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 4000,
+            builtin: true,
+        };
+        let good_bundle = serde_json::json!({
+            "config": legacy_cfg,
+            "probe_definitions": [stale_windsurf]
+        })
+        .to_string();
+        let applied = prepare_and_apply_backup_bundle_core(&state, &good_bundle)
+            .expect("valid backup restore must succeed");
+        assert!(applied.restored_config);
+        let after_cfg = state.snapshot_config();
+        assert!(
+            after_cfg.personalization.onboarding_completed,
+            "backup restore must one-way latch onboarding_completed |= old"
+        );
+        assert_eq!(after_cfg.preaccel.active_relay_id, None);
+        assert!(
+            !after_cfg.preaccel.probe_url.contains("gstatic"),
+            "backup restore must run migrate_config_in_memory to heal overseas probe_url"
+        );
+        let probes = state.storage.lock().unwrap().list_probe_definitions().unwrap();
+        let ws = probes
+            .iter()
+            .find(|p| p.id == "builtin_unlock_windsurf")
+            .expect("windsurf builtin probe exists");
+        assert_eq!(
+            ws.expected_status,
+            Some(200),
+            "seed_builtin_probes after restore must keep windsurf expected_status = Some(200)"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage22_isolated_probe_health_pool_and_throughput_ok_guards() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s22_health_bw_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let state = AppState::new(
+            paths,
+            AppConfig::default(),
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+
+        // Seed healthy node in runtime health pool.
+        state.record_node_health_probe("n1", RuntimeDualHealth::FullHealthy, Some(42.0));
+        let latency_ids: HashSet<String> = ["builtin_latency".to_string()].into_iter().collect();
+
+        // 1. Running only Unlock/Upload probes (NO Latency record) MUST NOT wipe existing health pool!
+        let unlock_rec = catcloud_core::models::ProbeResultRecord {
+            node_id: "n1".to_string(),
+            probe_id: "builtin_unlock_claude".to_string(),
+            ok: false,
+            ..Default::default()
+        };
+        let unlock_snap = ProbeSnapshot {
+            node_id: "n1".to_string(),
+            ok: false,
+            ..Default::default()
+        };
+        update_node_health_pool_after_isolated_probe(
+            &state,
+            "n1",
+            &[unlock_rec],
+            &latency_ids,
+            &unlock_snap,
+        );
+        assert_eq!(
+            state.snapshot_node_health_pool().live_latency_ms("n1"),
+            Some(42.0),
+            "non-Latency probe run must preserve existing node_health_pool latency"
+        );
+
+        // 2. Running a Latency probe that FAILS MUST reset stale latency and mark node Failed.
+        let fail_lat_rec = catcloud_core::models::ProbeResultRecord {
+            node_id: "n1".to_string(),
+            probe_id: "builtin_latency".to_string(),
+            ok: false,
+            ..Default::default()
+        };
+        let fail_snap = ProbeSnapshot {
+            node_id: "n1".to_string(),
+            ok: false,
+            latency_ms: None,
+            ..Default::default()
+        };
+        update_node_health_pool_after_isolated_probe(
+            &state,
+            "n1",
+            &[fail_lat_rec],
+            &latency_ids,
+            &fail_snap,
+        );
+        let pool_after_fail = state.snapshot_node_health_pool();
+        assert_eq!(pool_after_fail.live_latency_ms("n1"), None);
+        assert_eq!(
+            pool_after_fail.get("n1").and_then(|e| e.last_health),
+            Some(RuntimeDualHealth::Failed)
+        );
+
+        // 3. Running a Latency probe that SUCCEEDS clears stale Failed/cooldown state via
+        //    `reset_node_health` WITHOUT fabricating a background watchdog `FullHealthy` hint.
+        let ok_lat_rec = catcloud_core::models::ProbeResultRecord {
+            node_id: "n1".to_string(),
+            probe_id: "builtin_latency".to_string(),
+            ok: true,
+            latency_ms: Some(36.0),
+            ..Default::default()
+        };
+        let ok_snap = ProbeSnapshot {
+            node_id: "n1".to_string(),
+            ok: true,
+            latency_ms: Some(36.0),
+            ..Default::default()
+        };
+        update_node_health_pool_after_isolated_probe(
+            &state,
+            "n1",
+            &[ok_lat_rec.clone()],
+            &latency_ids,
+            &ok_snap,
+        );
+        let pool_after_ok = state.snapshot_node_health_pool();
+        assert!(
+            pool_after_ok.get("n1").is_none(),
+            "manual latency pass must clear cooldown via reset_node_health without faking watchdog entry"
+        );
+        assert!(
+            state.snapshot_node_health_hints().get("n1").is_none(),
+            "manual latency pass must NEVER fabricate a health_hint claiming background probe"
+        );
+
+        // 3b. Multiple Latency probes in one run: `builtin_latency` passes (40ms) while a
+        //     secondary custom Latency probe fails; `merged_snap.ok == true` (matching
+        //     `from_results_with_kinds` priority). Must clear old cooldown and NOT mark Failed!
+        state.record_node_health_probe("n1", RuntimeDualHealth::Failed, None);
+        let multi_latency_ids: HashSet<String> = [
+            "builtin_latency".to_string(),
+            "custom_latency_alt".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let builtin_ok_rec = catcloud_core::models::ProbeResultRecord {
+            node_id: "n1".to_string(),
+            probe_id: "builtin_latency".to_string(),
+            ok: true,
+            latency_ms: Some(40.0),
+            ..Default::default()
+        };
+        let custom_fail_rec = catcloud_core::models::ProbeResultRecord {
+            node_id: "n1".to_string(),
+            probe_id: "custom_latency_alt".to_string(),
+            ok: false,
+            latency_ms: None,
+            ..Default::default()
+        };
+        let merged_multi_snap = ProbeSnapshot {
+            node_id: "n1".to_string(),
+            ok: true,
+            latency_ms: Some(40.0),
+            ..Default::default()
+        };
+        update_node_health_pool_after_isolated_probe(
+            &state,
+            "n1",
+            &[builtin_ok_rec, custom_fail_rec],
+            &multi_latency_ids,
+            &merged_multi_snap,
+        );
+        assert!(
+            state.snapshot_node_health_pool().get("n1").is_none(),
+            "passing builtin_latency must not be overridden by a trailing failed custom latency probe"
+        );
+        assert!(state.snapshot_node_health_hints().get("n1").is_none());
+
+        // 4. `extract_verified_throughput_mbps` & `summarize_isolated_probe_run` strictly require `rec.ok == true`.
+        let failed_up_rec = catcloud_core::models::ProbeResultRecord {
+            node_id: "n1".to_string(),
+            probe_id: "builtin_upload".to_string(),
+            ok: false,
+            up_mbps: Some(0.15),
+            ..Default::default()
+        };
+        let ok_down_rec = catcloud_core::models::ProbeResultRecord {
+            node_id: "n1".to_string(),
+            probe_id: "builtin_download".to_string(),
+            ok: true,
+            down_mbps: Some(85.0),
+            ..Default::default()
+        };
+        assert_eq!(extract_verified_throughput_mbps(&failed_up_rec, true), None);
+        assert_eq!(
+            extract_verified_throughput_mbps(&ok_down_rec, false),
+            Some(85.0)
+        );
+
+        let mut run_snaps = HashMap::new();
+        run_snaps.insert(
+            "n1".to_string(),
+            ProbeSnapshot {
+                node_id: "n1".to_string(),
+                ok: true,
+                latency_ms: Some(36.0),
+                up_mbps: Some(0.15),
+                down_mbps: Some(85.0),
+                ..Default::default()
+            },
+        );
+        let mut run_recs = HashMap::new();
+        run_recs.insert("n1".to_string(), vec![failed_up_rec, ok_down_rec]);
+        let summary = summarize_isolated_probe_run(1, 1, &run_snaps, &run_recs, &HashSet::new(), 0);
+        assert_eq!(
+            summary.bandwidth_ok_count, 0,
+            "failed upload record (ok=false) must NEVER count toward bandwidth_ok_count"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage22_override_precheck_triggers_for_merge_patch_mode_even_without_inline_yaml() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s22_merge_patch_precheck_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let broken_patch = tmp.join("broken_patch.yaml");
+        std::fs::write(
+            &broken_patch,
+            "rules:\n  - DOMAIN-SUFFIX,example.invalid,NonExistentTarget\n  - MATCH,DIRECT\n",
+        )
+        .unwrap();
+
+        let old = AppConfig::default();
+        let state = AppState::new(
+            paths,
+            old.clone(),
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+
+        let mut next = old.clone();
+        next.rules_override.override_mode = OverrideMode::MergePatch;
+        next.rules_override.override_merge_path = Some(broken_patch.display().to_string());
+        next.rules_override.inline_override_yaml = None;
+
+        assert!(should_validate_inline_override_yaml(&old, &next, false));
+        let err = prepare_full_config_next(&state, &old, next)
+            .expect_err("MergePatch mode with broken patch file must reject even without inline YAML");
+        assert!(
+            err.contains("NonExistentTarget"),
+            "unexpected error: {err}"
+        );
+
+        let patch_json = serde_json::json!({
+            "rules_override": {
+                "override_mode": "merge_patch",
+                "override_merge_path": broken_patch.display().to_string()
+            }
+        });
+        let ext_err = prepare_extended_settings_next(&state, &old, &patch_json)
+            .expect_err("prepare_extended_settings_next must also reject broken MergePatch");
+        assert!(
+            ext_err.contains("NonExistentTarget"),
+            "unexpected extended settings error: {ext_err}"
+        );
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage22_r25_backup_bundle_strict_validation_and_atomic_rollback_on_reload_rejected() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s22_r25_backup_atomic_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let mut storage = Storage::open(&paths.db_path).unwrap();
+        storage.seed_builtin_probes().unwrap();
+
+        // Seed existing group, relay, node + probe_result so rollback must preserve them intact.
+        let mut orig_group = MultiGroup::default();
+        orig_group.id = "grp-orig".to_string();
+        orig_group.name = "OriginalGroup".to_string();
+        storage.upsert_multi_group(&orig_group).unwrap();
+
+        let orig_relay = PreAccelRelay {
+            id: "relay-orig".to_string(),
+            name: "Orig-Relay".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN-SH".to_string(),
+            server: "198.51.100.11".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-orig-password".to_string(),
+            skip_cert_verify: true,
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_preaccel_relay(&orig_relay).unwrap();
+
+        storage
+            .upsert_subscription(&SubscriptionRecord {
+                id: "sub-orig".to_string(),
+                name: "Orig Sub".to_string(),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .upsert_node(&ProxyNode {
+                id: "node-orig".to_string(),
+                sub_id: "sub-orig".to_string(),
+                name: "Orig-Node".to_string(),
+                protocol: "vless".to_string(),
+                server: "203.0.113.22".to_string(),
+                port: 443,
+                enabled: true,
+                raw_config: serde_json::json!({
+                    "name": "Orig-Node",
+                    "type": "vless",
+                    "server": "203.0.113.22",
+                    "port": 443,
+                    "uuid": "00000000-0000-4000-8000-000000000022",
+                    "tls": true,
+                    "network": "tcp"
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .insert_probe_results_batch(&[catcloud_core::models::ProbeResultRecord {
+                node_id: "node-orig".to_string(),
+                probe_id: "builtin_latency".to_string(),
+                tested_at: "2026-11-27T12:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(45.0),
+                ..Default::default()
+            }])
+            .unwrap();
+
+        let snap_before = storage.capture_backup_db_snapshot().unwrap();
+        let mut orig_cfg = AppConfig::default();
+        orig_cfg.mixed_port = 17890;
+        config::save(&paths, &orig_cfg).unwrap();
+
+        let state = AppState::new(
+            paths.clone(),
+            orig_cfg.clone(),
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+
+        // 1. Corrupt item inside `multi_groups` (both schema type mismatch & missing ID) MUST
+        //    reject with clear Chinese error (never silently skip).
+        let corrupt_group_bundle = serde_json::json!({
+            "config": { "mixed_port": 18888 },
+            "multi_groups": [{ "id": 12345, "mode": "invalid_mode" }]
+        })
+        .to_string();
+        let err_group = prepare_and_apply_backup_bundle_core(&state, &corrupt_group_bundle)
+            .err()
+            .expect("corrupt multi_groups entry must be rejected");
+        assert!(err_group.contains("多选分组数据损坏"), "unexpected err: {err_group}");
+        assert_eq!(state.snapshot_config().mixed_port, 17890);
+        assert_eq!(
+            state.storage.lock().unwrap().capture_backup_db_snapshot().unwrap(),
+            snap_before
+        );
+
+        let missing_id_group_bundle = serde_json::json!({
+            "multi_groups": [{ "name": "NoIdGroup" }]
+        })
+        .to_string();
+        let err_missing_id = prepare_and_apply_backup_bundle_core(&state, &missing_id_group_bundle)
+            .err()
+            .expect("multi_groups entry with empty ID must be rejected");
+        assert!(
+            err_missing_id.contains("缺少有效 ID"),
+            "unexpected err: {err_missing_id}"
+        );
+
+        // 2. Corrupt item inside `preaccel_relays` MUST reject strictly.
+        let corrupt_relay_bundle = serde_json::json!({
+            "preaccel_relays": [{ "port": "not-a-port" }]
+        })
+        .to_string();
+        let err_relay = prepare_and_apply_backup_bundle_core(&state, &corrupt_relay_bundle)
+            .err()
+            .expect("corrupt preaccel_relays entry must be rejected");
+        assert!(err_relay.contains("国内中转数据损坏"), "unexpected err: {err_relay}");
+        assert_eq!(
+            state.storage.lock().unwrap().capture_backup_db_snapshot().unwrap(),
+            snap_before
+        );
+
+        // 3. Invalid probe failing `validate_definition` (bad scheme `ftp://`) MUST reject cleanly.
+        let bad_probe = ProbeDefinition {
+            id: "custom_bad_scheme".to_string(),
+            name: "BadSchemeProbe".to_string(),
+            kind: catcloud_core::models::ProbeKind::Latency,
+            target_url: "ftp://example.invalid/test".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(204),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 4000,
+            builtin: false,
+        };
+        let bad_probe_bundle = serde_json::json!({
+            "probe_definitions": [bad_probe]
+        })
+        .to_string();
+        let err_probe = prepare_and_apply_backup_bundle_core(&state, &bad_probe_bundle)
+            .err()
+            .expect("invalid probe definition must be rejected");
+        assert!(err_probe.contains("测速探针"), "unexpected err: {err_probe}");
+        assert_eq!(
+            state.storage.lock().unwrap().capture_backup_db_snapshot().unwrap(),
+            snap_before
+        );
+
+        // 4. Valid bundle mutating config + adding new group, new relay, new probe, and modifying
+        //    existing group -> apply succeeds -> simulated live hot-reload `outcome.rejected == true`
+        //    MUST atomically roll back ALL three SQLite tables (deleting newly added IDs and
+        //    restoring modified rows without cascading `probe_results`) AND restore `config.json`
+        //    & in-memory `state.config`.
+        let mut next_cfg = orig_cfg.clone();
+        next_cfg.mixed_port = 18899;
+        let mut modified_orig_group = orig_group.clone();
+        modified_orig_group.name = "ModifiedDuringRestore".to_string();
+        let mut added_group = MultiGroup::default();
+        added_group.id = "grp-added-in-backup".to_string();
+        added_group.name = "AddedBackupGroup".to_string();
+        let added_relay = PreAccelRelay {
+            id: "relay-added-in-backup".to_string(),
+            name: "Added-Relay".to_string(),
+            provider: "tencent".to_string(),
+            region: "CN-GZ".to_string(),
+            server: "198.51.100.99".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-added-password".to_string(),
+            skip_cert_verify: true,
+            enabled: true,
+            ..Default::default()
+        };
+        let added_probe = ProbeDefinition {
+            id: "custom_probe_added_in_backup".to_string(),
+            name: "AddedProbe".to_string(),
+            kind: catcloud_core::models::ProbeKind::Latency,
+            target_url: "https://example.invalid/generate_204".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(204),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 4000,
+            builtin: false,
+        };
+        let valid_bundle = serde_json::json!({
+            "config": next_cfg,
+            "multi_groups": [modified_orig_group, added_group],
+            "preaccel_relays": [added_relay],
+            "probe_definitions": [added_probe]
+        })
+        .to_string();
+
+        let applied = prepare_and_apply_backup_bundle_core(&state, &valid_bundle)
+            .expect("valid backup restore must apply before reload check");
+        assert_eq!(state.snapshot_config().mixed_port, 18899);
+        assert_eq!(config::load_or_init(&paths).unwrap().mixed_port, 18899);
+        assert!(
+            state
+                .storage
+                .lock()
+                .unwrap()
+                .list_multi_groups()
+                .unwrap()
+                .iter()
+                .any(|g| g.id == "grp-added-in-backup")
+        );
+
+        let rejected = ReloadOutcome {
+            applied: false,
+            level: ReloadLevel::L2HotReload,
+            skipped_unchanged: false,
+            rejected: true,
+            config_hash: None,
+            replayed_groups: 0,
+            shifted_ports: Vec::new(),
+            warnings: Vec::new(),
+            error: Some("simulated mihomo -t rejection".to_string()),
+            applied_at: "2026-11-27T12:05:00Z".to_string(),
+        };
+        let rb_err = finalize_backup_restore_reload_outcome(&state, &applied, Some(&rejected))
+            .expect_err("rejected reload must return error after atomic rollback");
+        assert!(
+            rb_err.contains("已完整回滚配置与数据库"),
+            "unexpected rollback err: {rb_err}"
+        );
+
+        // Verify 100% atomic restoration of config (memory + disk) and all 3 SQLite tables + probe_results.
+        assert_eq!(state.snapshot_config().mixed_port, 17890);
+        assert_eq!(config::load_or_init(&paths).unwrap().mixed_port, 17890);
+        let snap_after = state
+            .storage
+            .lock()
+            .unwrap()
+            .capture_backup_db_snapshot()
+            .unwrap();
+        assert_eq!(
+            snap_after, snap_before,
+            "DB snapshot after rejected-reload rollback must equal pre-restore snapshot byte-for-byte"
+        );
+        let preserved_snap = state
+            .storage
+            .lock()
+            .unwrap()
+            .get_probe_snapshot("node-orig", None)
+            .unwrap()
+            .expect("probe_results must remain intact after rollback");
+        assert_eq!(preserved_snap.latency_ms, Some(45.0));
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage22_r25_emergency_cleanup_bounded_and_proxy_lock_contended_never_stall() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s22_r25_bounded_exit_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.system_proxy.enabled = false;
+        cfg.preaccel.enabled = false;
+        let state = AppState::new(
+            paths,
+            cfg,
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+
+        // Hold `system_proxy_lock` on the current thread to simulate a stalled background thread.
+        let held_guard = state.system_proxy_lock.lock().unwrap();
+        let start = Instant::now();
+        let lock_err = clear_system_proxy_if_owned_bounded(&state, Duration::from_millis(40))
+            .expect_err("contended system_proxy_lock must time out cleanly");
+        assert!(lock_err.contains("超时"), "unexpected err: {lock_err}");
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "bounded proxy lock wait took too long: {:?}",
+            start.elapsed()
+        );
+
+        // `emergency_cleanup_on_exit_bounded` must also finish promptly even while `system_proxy_lock`
+        // is contended, never hanging the caller before `JobGuard::terminate_all()`.
+        let exit_start = Instant::now();
+        emergency_cleanup_on_exit_bounded(&state, Duration::from_millis(700));
+        assert!(
+            exit_start.elapsed() < Duration::from_millis(1200),
+            "emergency_cleanup_on_exit_bounded must remain strictly bounded: {:?}",
+            exit_start.elapsed()
+        );
+        assert!(state.exit_cleanup_done.load(Ordering::SeqCst));
+        assert!(state.shutting_down.load(Ordering::SeqCst));
+
+        drop(held_guard);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

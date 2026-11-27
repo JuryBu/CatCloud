@@ -354,6 +354,8 @@ export const ru: DeepStringDict<TranslationDict> = {
     downloadReadyMsg: "Версия v{version} загружена и проверена — обновите сейчас или при следующем запуске",
     downloadManualHint: "Скачайте установочный пакет для вашей системы на официальной странице релизов",
     downloadFailedMsg: "Не удалось скачать обновление: {error}",
+    exitTimeoutFallback: "Превышено время ожидания выхода; повторите или откройте страницу релизов",
+    unknownErrorFallback: "Неизвестная ошибка",
     closeAria: "Напомнить позже и закрыть окно",
   },
   tunPrompt: {
@@ -498,5 +500,51 @@ export const ru: DeepStringDict<TranslationDict> = {
     clipboardUnavailableToast: "Буфер обмена недоступен — выделите и скопируйте код вручную",
     savedToast: "Конфигурация роутера сохранена: {path}",
     saveFailedToast: "Не удалось сохранить файл: {error}",
+  },
+  latency: {
+    probeHotTooltip:
+      "Задержка стандартного 204-теста по прогретому соединению (без TLS-рукопожатия и проверок разблокировки)",
+    healthColdTooltip:
+      "Фоновая двухканальная проверка доступности (включает установку соединения и может быть чуть выше прогретого теста)",
+    failedTooltip: "Последняя стандартная проверка задержки завершилась ошибкой",
+    untestedTooltip: "Ещё не проверено",
+    sourceProbeShort: "Тест",
+    sourceHealthShort: "Фон",
+    probationBadge: "Наблюдение",
+    degradedBadge: "Понижен",
+    testedAtLatency: "Пинг проверен",
+    testedAtSpeed: "Скорость проверена",
+    cooldownSec: "Пауза {sec}с",
+    cooldownActive: "Пауза",
+    cooldownRetryHint: "Узел на паузе, повтор через ~{sec}с",
+    cooldownHint: "Узел временно на паузе",
+    reasonPrefix: "Причина: ",
+    stagePrefix: "Этап: ",
+    timeoutShort: "Сбой",
+    untestedShort: "—",
+  },
+  speedTest: {
+    goldenHiddenHint:
+      "Узлов с пройденными базовыми критериями: {count}, но их скорость ещё не измерена, поэтому они скрыты из списка золотых узлов",
+    goldenSwitchAllBtn: "Показать все узлы",
+    goldenRunSpeedBtn: "Измерить скорость кандидатов",
+    latencyDisabledHint:
+      "«Стандартная задержка» не выбрана — основная задержка узлов в этом запуске не обновится",
+  },
+  groups: {
+    clearActiveProtectedConfirm:
+      "В этой группе находится активный узел. Очистка приведёт к автопереключению или остановке текущего маршрута. Очистить?",
+    removeActiveProtectedHint:
+      "После удаления активного узла маршрут автоматически переключится на другой доступный узел",
+    confirmClear: "Очистить",
+    confirmBelowHint: "Подтвердите ниже",
+    activeRemoveConfirmTip: "Активный узел · Снятие потребует подтверждения",
+  },
+  shareBundle: {
+    cancelUpdateExisting: "Отмена",
+  },
+  update: {
+    nextLaunchBadgeTip:
+      "Новая версия готова в фоне — предложение об обновлении появится при следующем запуске",
   },
 };

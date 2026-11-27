@@ -50,6 +50,15 @@ pub struct MergeSubscriptionsResult {
     pub id_remap: HashMap<String, String>,
 }
 
+/// Consistent snapshot of backup-managed SQLite entities (`multi_groups`, `preaccel_relays`,
+/// `probe_definitions`) used for atomic backup restore and deterministic rollback.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BackupDbSnapshot {
+    pub groups: Vec<MultiGroup>,
+    pub relays: Vec<PreAccelRelay>,
+    pub probes: Vec<ProbeDefinition>,
+}
+
 /// SQLite persistence layer backed by bundled `rusqlite` in WAL mode.
 pub struct Storage {
     conn: Connection,
@@ -1018,96 +1027,14 @@ impl Storage {
     // -------------------------------------------------------------------------
 
     pub fn upsert_probe_definition(&self, def: &ProbeDefinition) -> CatResult<()> {
-        if def.id.trim().is_empty() {
-            return Err(CatError::Validation("probe definition id cannot be empty".into()));
-        }
-        self.conn.execute(
-            "
-            INSERT INTO probe_definitions (
-                id, name, kind, target_url, method, expected_status,
-                body_regex, payload_bytes, timeout_ms, builtin
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                kind = excluded.kind,
-                target_url = excluded.target_url,
-                method = excluded.method,
-                expected_status = excluded.expected_status,
-                body_regex = excluded.body_regex,
-                payload_bytes = excluded.payload_bytes,
-                timeout_ms = excluded.timeout_ms,
-                builtin = excluded.builtin
-            ",
-            params![
-                def.id,
-                def.name,
-                def.kind.as_str(),
-                def.target_url,
-                def.method,
-                def.expected_status.map(i64::from),
-                def.body_regex,
-                def.payload_bytes.map(|v| v as i64),
-                def.timeout_ms as i64,
-                bool_to_int(def.builtin),
-            ],
-        )?;
-        Ok(())
+        upsert_probe_definition_with_conn(&self.conn, def)
     }
 
-    /// Seed built-in probe definitions without overwriting user-modified rows, and migrate
-    /// legacy built-in AI unlock probes (when `builtin = 1` and `body_regex IS NULL`) to
-    /// credential-free semantic probing (`expected_status = NULL` + latest `target_url`/`method`).
+    /// Seed missing built-in probe definitions and perform narrowly scoped legacy migrations
+    /// without overwriting user-customized built-in rows (such as custom `builtin_latency` /
+    /// `builtin_upload` / `builtin_download` URLs, methods, or expected statuses).
     pub fn seed_builtin_probes(&mut self) -> CatResult<usize> {
-        let builtins = ProbeDefinition::builtin_defaults();
-        self.in_transaction(|tx| {
-            let mut inserted = 0usize;
-            for def in &builtins {
-                let changed = tx.execute(
-                    "
-                    INSERT OR IGNORE INTO probe_definitions (
-                        id, name, kind, target_url, method, expected_status,
-                        body_regex, payload_bytes, timeout_ms, builtin
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                    ",
-                    params![
-                        def.id,
-                        def.name,
-                        def.kind.as_str(),
-                        def.target_url,
-                        def.method,
-                        def.expected_status.map(i64::from),
-                        def.body_regex,
-                        def.payload_bytes.map(|v| v as i64),
-                        def.timeout_ms as i64,
-                        bool_to_int(def.builtin),
-                    ],
-                )?;
-                if changed == 0
-                    && matches!(
-                        def.id.as_str(),
-                        "builtin_unlock_claude"
-                            | "builtin_unlock_chatgpt"
-                            | "builtin_unlock_gemini"
-                    )
-                {
-                    tx.execute(
-                        "
-                        UPDATE probe_definitions
-                        SET expected_status = NULL,
-                            target_url = ?2,
-                            method = ?3
-                        WHERE id = ?1
-                          AND builtin = 1
-                          AND (body_regex IS NULL OR TRIM(body_regex) = '')
-                          AND (expected_status IS NOT NULL OR target_url != ?2 OR method != ?3)
-                        ",
-                        params![def.id, def.target_url, def.method],
-                    )?;
-                }
-                inserted += changed;
-            }
-            Ok(inserted)
-        })
+        self.in_transaction(seed_builtin_probes_in_tx)
     }
 
     pub fn get_probe_definition(&self, id: &str) -> CatResult<Option<ProbeDefinition>> {
@@ -1195,6 +1122,23 @@ impl Storage {
         Ok(list)
     }
 
+    fn load_probe_kind_map(&self) -> CatResult<HashMap<String, ProbeKind>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, kind FROM probe_definitions")?;
+        let rows = stmt.query_map([], |row| {
+            let id: String = row.get(0)?;
+            let kind_str: String = row.get(1)?;
+            Ok((id, ProbeKind::from_db_str(&kind_str)))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (id, kind) = row?;
+            map.insert(id, kind);
+        }
+        Ok(map)
+    }
+
     /// Build an aggregated formula-ready `ProbeSnapshot` from the latest per-probe results.
     pub fn get_probe_snapshot(
         &self,
@@ -1205,10 +1149,12 @@ impl Storage {
         if latest.is_empty() {
             return Ok(None);
         }
-        Ok(Some(ProbeSnapshot::from_results(
+        let probe_kinds = self.load_probe_kind_map()?;
+        Ok(Some(ProbeSnapshot::from_results_with_kinds(
             node_id,
             &latest,
             primary_probe_id,
+            &probe_kinds,
         )))
     }
 
@@ -1222,6 +1168,7 @@ impl Storage {
         if node_ids.is_empty() {
             return Ok(out);
         }
+        let probe_kinds = self.load_probe_kind_map()?;
         let placeholders = make_placeholders(node_ids.len());
         let sql = format!(
             "
@@ -1253,7 +1200,7 @@ impl Storage {
         for (nid, recs) in grouped {
             out.insert(
                 nid.clone(),
-                ProbeSnapshot::from_results(&nid, &recs, primary_probe_id),
+                ProbeSnapshot::from_results_with_kinds(&nid, &recs, primary_probe_id, &probe_kinds),
             );
         }
         Ok(out)
@@ -1292,77 +1239,7 @@ impl Storage {
     // -------------------------------------------------------------------------
 
     pub fn upsert_multi_group(&self, group: &MultiGroup) -> CatResult<()> {
-        if group.id.trim().is_empty() {
-            return Err(CatError::Validation("multi_group id cannot be empty".into()));
-        }
-        let match_rules_json = serde_json::to_string(&group.match_rules)?;
-        let member_node_ids_json = serde_json::to_string(&group.member_node_ids)?;
-        let dynamic_filter_json = group
-            .dynamic_filter
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
-        let hard_gates_json = serde_json::to_string(&group.hard_gates)?;
-        let trigger_rules_json = serde_json::to_string(&group.trigger_rules)?;
-
-        self.conn.execute(
-            "
-            INSERT INTO multi_groups (
-                id, name, mode, match_rules_json, member_node_ids_json,
-                dynamic_filter_json, primary_probe_id, hard_gates_json,
-                trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
-                escalated_since, recover_probe_interval_sec, switch_mode,
-                cooldown_sec, hysteresis_pct, active_node_id, state,
-                independent_routing
-            ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-                ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
-            )
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                mode = excluded.mode,
-                match_rules_json = excluded.match_rules_json,
-                member_node_ids_json = excluded.member_node_ids_json,
-                dynamic_filter_json = excluded.dynamic_filter_json,
-                primary_probe_id = excluded.primary_probe_id,
-                hard_gates_json = excluded.hard_gates_json,
-                trigger_rules_json = excluded.trigger_rules_json,
-                formula_expr = excluded.formula_expr,
-                fallback_policy = excluded.fallback_policy,
-                fallback_pool_id = excluded.fallback_pool_id,
-                escalated_since = excluded.escalated_since,
-                recover_probe_interval_sec = excluded.recover_probe_interval_sec,
-                switch_mode = excluded.switch_mode,
-                cooldown_sec = excluded.cooldown_sec,
-                hysteresis_pct = excluded.hysteresis_pct,
-                active_node_id = excluded.active_node_id,
-                state = excluded.state,
-                independent_routing = excluded.independent_routing
-            ",
-            params![
-                group.id,
-                group.name,
-                group.mode.as_str(),
-                match_rules_json,
-                member_node_ids_json,
-                dynamic_filter_json,
-                group.primary_probe_id,
-                hard_gates_json,
-                trigger_rules_json,
-                group.formula_expr,
-                group.fallback_policy.as_str(),
-                group.fallback_pool_id,
-                group.escalated_since,
-                group.recover_probe_interval_sec as i64,
-                group.switch_mode.as_str(),
-                group.cooldown_sec as i64,
-                group.hysteresis_pct,
-                group.active_node_id,
-                group.state.as_str(),
-                bool_to_int(group.independent_routing),
-            ],
-        )?;
-        Ok(())
+        upsert_multi_group_with_conn(&self.conn, group)
     }
 
     pub fn get_multi_group(&self, id: &str) -> CatResult<Option<MultiGroup>> {
@@ -1439,59 +1316,7 @@ impl Storage {
     // -------------------------------------------------------------------------
 
     pub fn upsert_preaccel_relay(&self, relay: &PreAccelRelay) -> CatResult<()> {
-        if relay.id.trim().is_empty() {
-            return Err(CatError::Validation(
-                "preaccel_relay id cannot be empty".into(),
-            ));
-        }
-        self.conn.execute(
-            "
-            INSERT INTO preaccel_relays (
-                id, name, provider, region, server, port, protocol,
-                password, sni, skip_cert_verify, priority, expires_at,
-                enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps, supports_ipv6
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
-            ON CONFLICT(id) DO UPDATE SET
-                name = excluded.name,
-                provider = excluded.provider,
-                region = excluded.region,
-                server = excluded.server,
-                port = excluded.port,
-                protocol = excluded.protocol,
-                password = excluded.password,
-                sni = excluded.sni,
-                skip_cert_verify = excluded.skip_cert_verify,
-                priority = excluded.priority,
-                expires_at = excluded.expires_at,
-                enabled = excluded.enabled,
-                last_probe_ms = excluded.last_probe_ms,
-                last_mbps = excluded.last_mbps,
-                last_up_mbps = excluded.last_up_mbps,
-                last_down_mbps = excluded.last_down_mbps,
-                supports_ipv6 = excluded.supports_ipv6
-            ",
-            params![
-                relay.id,
-                relay.name,
-                relay.provider,
-                relay.region,
-                relay.server,
-                i64::from(relay.port),
-                relay.protocol,
-                relay.password,
-                relay.sni,
-                bool_to_int(relay.skip_cert_verify),
-                relay.priority,
-                relay.expires_at,
-                bool_to_int(relay.enabled),
-                relay.last_probe_ms,
-                relay.last_mbps,
-                relay.last_up_mbps,
-                relay.last_down_mbps,
-                bool_to_int(relay.supports_ipv6),
-            ],
-        )?;
-        Ok(())
+        upsert_preaccel_relay_with_conn(&self.conn, relay)
     }
 
     pub fn get_preaccel_relay(&self, id: &str) -> CatResult<Option<PreAccelRelay>> {
@@ -1586,6 +1411,63 @@ impl Storage {
             params![id, last_probe_ms, last_up_mbps, last_down_mbps],
         )?;
         Ok(changed > 0)
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Atomic Backup Snapshot & Transactional Restore / Rollback
+    // -------------------------------------------------------------------------
+
+    /// Capture a consistent snapshot of `multi_groups`, `preaccel_relays`, and
+    /// `probe_definitions` before mutating SQLite during backup restore.
+    pub fn capture_backup_db_snapshot(&self) -> CatResult<BackupDbSnapshot> {
+        Ok(BackupDbSnapshot {
+            groups: self.list_multi_groups()?,
+            relays: self.list_preaccel_relays(false)?,
+            probes: self.list_probe_definitions()?,
+        })
+    }
+
+    /// Atomically apply `groups`, `relays`, and `probes` inside a single SQLite transaction.
+    ///
+    /// - Any validation or SQL failure rolls back the entire transaction cleanly.
+    /// - When `replace_all == true` (e.g. rolling back to a prior [`BackupDbSnapshot`]), all
+    ///   target rows are upserted in place and only extra rows whose IDs are absent from the
+    ///   snapshot are deleted, preserving `probe_results` foreign-key references for surviving
+    ///   `probe_definitions` (never cascading a full wipe).
+    /// - When `replace_all == false` and `!probes.is_empty()`, legacy built-in probe migrations
+    ///   run inside the same transaction so old backups never leave broken built-in rows.
+    pub fn apply_backup_entities_atomic(
+        &mut self,
+        groups: &[MultiGroup],
+        relays: &[PreAccelRelay],
+        probes: &[ProbeDefinition],
+        replace_all: bool,
+    ) -> CatResult<()> {
+        self.in_transaction(|tx| {
+            for group in groups {
+                upsert_multi_group_with_conn(tx, group)?;
+            }
+            for relay in relays {
+                upsert_preaccel_relay_with_conn(tx, relay)?;
+            }
+            for probe in probes {
+                upsert_probe_definition_with_conn(tx, probe)?;
+            }
+
+            if replace_all {
+                let keep_groups: HashSet<&str> = groups.iter().map(|g| g.id.as_str()).collect();
+                let keep_relays: HashSet<&str> = relays.iter().map(|r| r.id.as_str()).collect();
+                let keep_probes: HashSet<&str> = probes.iter().map(|p| p.id.as_str()).collect();
+
+                delete_ids_not_in_tx(tx, "multi_groups", &keep_groups)?;
+                delete_ids_not_in_tx(tx, "preaccel_relays", &keep_relays)?;
+                delete_ids_not_in_tx(tx, "probe_definitions", &keep_probes)?;
+            } else if !probes.is_empty() {
+                seed_builtin_probes_in_tx(tx)?;
+            }
+
+            Ok(())
+        })
     }
 }
 
@@ -1779,8 +1661,362 @@ fn upsert_node_with_conn(conn: &Connection, node: &ProxyNode) -> CatResult<()> {
     Ok(())
 }
 
+fn upsert_probe_definition_with_conn(conn: &Connection, def: &ProbeDefinition) -> CatResult<()> {
+    if def.id.trim().is_empty() {
+        return Err(CatError::Validation(
+            "probe definition id cannot be empty".into(),
+        ));
+    }
+    conn.execute(
+        "
+        INSERT INTO probe_definitions (
+            id, name, kind, target_url, method, expected_status,
+            body_regex, payload_bytes, timeout_ms, builtin
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            kind = excluded.kind,
+            target_url = excluded.target_url,
+            method = excluded.method,
+            expected_status = excluded.expected_status,
+            body_regex = excluded.body_regex,
+            payload_bytes = excluded.payload_bytes,
+            timeout_ms = excluded.timeout_ms,
+            builtin = excluded.builtin
+        ",
+        params![
+            def.id,
+            def.name,
+            def.kind.as_str(),
+            def.target_url,
+            def.method,
+            def.expected_status.map(i64::from),
+            def.body_regex,
+            def.payload_bytes.map(|v| v as i64),
+            def.timeout_ms as i64,
+            bool_to_int(def.builtin),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_multi_group_with_conn(conn: &Connection, group: &MultiGroup) -> CatResult<()> {
+    if group.id.trim().is_empty() {
+        return Err(CatError::Validation("multi_group id cannot be empty".into()));
+    }
+    let match_rules_json = serde_json::to_string(&group.match_rules)?;
+    let member_node_ids_json = serde_json::to_string(&group.member_node_ids)?;
+    let dynamic_filter_json = group
+        .dynamic_filter
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let hard_gates_json = serde_json::to_string(&group.hard_gates)?;
+    let trigger_rules_json = serde_json::to_string(&group.trigger_rules)?;
+
+    conn.execute(
+        "
+        INSERT INTO multi_groups (
+            id, name, mode, match_rules_json, member_node_ids_json,
+            dynamic_filter_json, primary_probe_id, hard_gates_json,
+            trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
+            escalated_since, recover_probe_interval_sec, switch_mode,
+            cooldown_sec, hysteresis_pct, active_node_id, state,
+            independent_routing
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+            ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            mode = excluded.mode,
+            match_rules_json = excluded.match_rules_json,
+            member_node_ids_json = excluded.member_node_ids_json,
+            dynamic_filter_json = excluded.dynamic_filter_json,
+            primary_probe_id = excluded.primary_probe_id,
+            hard_gates_json = excluded.hard_gates_json,
+            trigger_rules_json = excluded.trigger_rules_json,
+            formula_expr = excluded.formula_expr,
+            fallback_policy = excluded.fallback_policy,
+            fallback_pool_id = excluded.fallback_pool_id,
+            escalated_since = excluded.escalated_since,
+            recover_probe_interval_sec = excluded.recover_probe_interval_sec,
+            switch_mode = excluded.switch_mode,
+            cooldown_sec = excluded.cooldown_sec,
+            hysteresis_pct = excluded.hysteresis_pct,
+            active_node_id = excluded.active_node_id,
+            state = excluded.state,
+            independent_routing = excluded.independent_routing
+        ",
+        params![
+            group.id,
+            group.name,
+            group.mode.as_str(),
+            match_rules_json,
+            member_node_ids_json,
+            dynamic_filter_json,
+            group.primary_probe_id,
+            hard_gates_json,
+            trigger_rules_json,
+            group.formula_expr,
+            group.fallback_policy.as_str(),
+            group.fallback_pool_id,
+            group.escalated_since,
+            group.recover_probe_interval_sec as i64,
+            group.switch_mode.as_str(),
+            group.cooldown_sec as i64,
+            group.hysteresis_pct,
+            group.active_node_id,
+            group.state.as_str(),
+            bool_to_int(group.independent_routing),
+        ],
+    )?;
+    Ok(())
+}
+
+fn upsert_preaccel_relay_with_conn(conn: &Connection, relay: &PreAccelRelay) -> CatResult<()> {
+    if relay.id.trim().is_empty() {
+        return Err(CatError::Validation(
+            "preaccel_relay id cannot be empty".into(),
+        ));
+    }
+    conn.execute(
+        "
+        INSERT INTO preaccel_relays (
+            id, name, provider, region, server, port, protocol,
+            password, sni, skip_cert_verify, priority, expires_at,
+            enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps, supports_ipv6
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+        ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            provider = excluded.provider,
+            region = excluded.region,
+            server = excluded.server,
+            port = excluded.port,
+            protocol = excluded.protocol,
+            password = excluded.password,
+            sni = excluded.sni,
+            skip_cert_verify = excluded.skip_cert_verify,
+            priority = excluded.priority,
+            expires_at = excluded.expires_at,
+            enabled = excluded.enabled,
+            last_probe_ms = excluded.last_probe_ms,
+            last_mbps = excluded.last_mbps,
+            last_up_mbps = excluded.last_up_mbps,
+            last_down_mbps = excluded.last_down_mbps,
+            supports_ipv6 = excluded.supports_ipv6
+        ",
+        params![
+            relay.id,
+            relay.name,
+            relay.provider,
+            relay.region,
+            relay.server,
+            i64::from(relay.port),
+            relay.protocol,
+            relay.password,
+            relay.sni,
+            bool_to_int(relay.skip_cert_verify),
+            relay.priority,
+            relay.expires_at,
+            bool_to_int(relay.enabled),
+            relay.last_probe_ms,
+            relay.last_mbps,
+            relay.last_up_mbps,
+            relay.last_down_mbps,
+            bool_to_int(relay.supports_ipv6),
+        ],
+    )?;
+    Ok(())
+}
+
+fn delete_ids_not_in_tx(
+    tx: &Transaction<'_>,
+    table: &str,
+    keep_ids: &HashSet<&str>,
+) -> CatResult<()> {
+    let mut existing_ids: Vec<String> = Vec::new();
+    {
+        let mut stmt = tx.prepare(&format!("SELECT id FROM {table}"))?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            existing_ids.push(row?);
+        }
+    }
+    for id in existing_ids {
+        if !keep_ids.contains(id.as_str()) {
+            tx.execute(&format!("DELETE FROM {table} WHERE id = ?1"), params![id])?;
+        }
+    }
+    Ok(())
+}
+
+fn seed_builtin_probes_in_tx(tx: &Transaction<'_>) -> CatResult<usize> {
+    let builtins = ProbeDefinition::builtin_defaults();
+    let mut inserted = 0usize;
+    for def in &builtins {
+        let changed = tx.execute(
+            "
+            INSERT OR IGNORE INTO probe_definitions (
+                id, name, kind, target_url, method, expected_status,
+                body_regex, payload_bytes, timeout_ms, builtin
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            ",
+            params![
+                def.id,
+                def.name,
+                def.kind.as_str(),
+                def.target_url,
+                def.method,
+                def.expected_status.map(i64::from),
+                def.body_regex,
+                def.payload_bytes.map(|v| v as i64),
+                def.timeout_ms as i64,
+                bool_to_int(def.builtin),
+            ],
+        )?;
+        if changed == 0 {
+            match def.id.as_str() {
+                // Narrowly migrate known historical default URLs/methods/statuses for built-in AI
+                // unlock probes, never overwriting user-customized endpoints.
+                "builtin_unlock_claude" => {
+                    tx.execute(
+                        "
+                        UPDATE probe_definitions
+                        SET kind = ?2,
+                            expected_status = NULL,
+                            target_url = ?3,
+                            method = ?4
+                        WHERE id = ?1
+                          AND builtin = 1
+                          AND (body_regex IS NULL OR TRIM(body_regex) = '')
+                          AND (
+                              target_url IN ('https://claude.ai/', 'https://claude.ai')
+                              OR (
+                                  target_url = ?3
+                                  AND (kind != ?2 OR expected_status IS NOT NULL OR method != ?4)
+                              )
+                          )
+                        ",
+                        params![def.id, def.kind.as_str(), def.target_url, def.method],
+                    )?;
+                }
+                "builtin_unlock_chatgpt" => {
+                    tx.execute(
+                        "
+                        UPDATE probe_definitions
+                        SET kind = ?2,
+                            expected_status = NULL,
+                            target_url = ?3,
+                            method = ?4
+                        WHERE id = ?1
+                          AND builtin = 1
+                          AND (body_regex IS NULL OR TRIM(body_regex) = '')
+                          AND (
+                              target_url IN (
+                                  'https://chatgpt.com/',
+                                  'https://chatgpt.com',
+                                  'https://chat.openai.com/',
+                                  'https://chat.openai.com'
+                              )
+                              OR (
+                                  target_url = ?3
+                                  AND (kind != ?2 OR expected_status IS NOT NULL OR method != ?4)
+                              )
+                          )
+                        ",
+                        params![def.id, def.kind.as_str(), def.target_url, def.method],
+                    )?;
+                }
+                "builtin_unlock_gemini" => {
+                    tx.execute(
+                        "
+                        UPDATE probe_definitions
+                        SET kind = ?2,
+                            expected_status = NULL,
+                            target_url = ?3,
+                            method = ?4
+                        WHERE id = ?1
+                          AND builtin = 1
+                          AND (body_regex IS NULL OR TRIM(body_regex) = '')
+                          AND (
+                              target_url IN ('https://gemini.google.com/', 'https://gemini.google.com')
+                              OR (
+                                  target_url = ?3
+                                  AND (kind != ?2 OR expected_status IS NOT NULL OR method != ?4)
+                              )
+                          )
+                        ",
+                        params![def.id, def.kind.as_str(), def.target_url, def.method],
+                    )?;
+                }
+                // Precisely heal `builtin_unlock_windsurf` rows whose `expected_status` was
+                // cleared to NULL by an older bug/backup without clobbering user customizations.
+                "builtin_unlock_windsurf" => {
+                    let healed_official = tx.execute(
+                        "
+                        UPDATE probe_definitions
+                        SET kind = ?2,
+                            expected_status = ?3,
+                            target_url = ?4,
+                            method = ?5
+                        WHERE id = ?1
+                          AND builtin = 1
+                          AND (body_regex IS NULL OR TRIM(body_regex) = '')
+                          AND expected_status IS NULL
+                          AND target_url IN (
+                              'https://windsurf.com',
+                              'https://windsurf.com/',
+                              'https://codeium.com',
+                              'https://codeium.com/'
+                          )
+                        ",
+                        params![
+                            def.id,
+                            def.kind.as_str(),
+                            def.expected_status.map(i64::from),
+                            def.target_url,
+                            def.method,
+                        ],
+                    )?;
+                    if healed_official == 0 {
+                        tx.execute(
+                            "
+                            UPDATE probe_definitions
+                            SET expected_status = ?2
+                            WHERE id = ?1
+                              AND builtin = 1
+                              AND (body_regex IS NULL OR TRIM(body_regex) = '')
+                              AND expected_status IS NULL
+                            ",
+                            params![def.id, def.expected_status.map(i64::from)],
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        inserted += changed;
+    }
+    Ok(inserted)
+}
+
+/// Normalize parseable RFC 3339 timestamps into fixed-width UTC microsecond strings
+/// (`YYYY-MM-DDTHH:MM:SS.ffffffZ`) so SQLite `ORDER BY tested_at DESC` lexicographical
+/// ordering is 100% isomorphic to UTC instant ordering across mixed timezones/precisions.
+fn normalize_tested_at_for_storage(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
+        dt.with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+    } else {
+        raw.to_string()
+    }
+}
+
 fn insert_probe_result_with_conn(conn: &Connection, rec: &ProbeResultRecord) -> CatResult<i64> {
     let unlocked_map_json = serde_json::to_string(&rec.unlocked_map)?;
+    let normalized_tested_at = normalize_tested_at_for_storage(&rec.tested_at);
     conn.execute(
         "
         INSERT INTO probe_results (
@@ -1792,7 +2028,7 @@ fn insert_probe_result_with_conn(conn: &Connection, rec: &ProbeResultRecord) -> 
         params![
             rec.node_id,
             rec.probe_id,
-            rec.tested_at,
+            normalized_tested_at,
             bool_to_int(rec.ok),
             rec.latency_ms,
             rec.jitter_ms,
@@ -2139,7 +2375,10 @@ fn migrate_newer_probe_results_in_tx(
 
         let should_replace = match to_latest_tested_at.as_deref() {
             None => true,
-            Some(existing_ts) => from_tested_at.as_str() > existing_ts,
+            Some(existing_ts) => {
+                normalize_tested_at_for_storage(&from_tested_at)
+                    > normalize_tested_at_for_storage(existing_ts)
+            }
         };
         if should_replace {
             tx.execute(
@@ -2924,6 +3163,232 @@ mod tests {
             storage.get_probe_definition("builtin_unlock_chatgpt").unwrap(),
             Some(custom_non_builtin_chatgpt)
         );
+
+        // `builtin_unlock_windsurf` MUST keep `expected_status: Some(200)` and accurately heal
+        // when `expected_status` was cleared to NULL on the official URL, while user customizations
+        // to `builtin_latency` / `builtin_upload` / `builtin_download` / custom URLs MUST persist!
+        let ws = storage
+            .get_probe_definition("builtin_unlock_windsurf")
+            .unwrap()
+            .expect("windsurf builtin exists");
+        assert_eq!(ws.expected_status, Some(200));
+
+        let stale_ws = ProbeDefinition {
+            id: "builtin_unlock_windsurf".to_string(),
+            name: ws.name.clone(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://windsurf.com".to_string(),
+            method: "HEAD".to_string(),
+            expected_status: None,
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 8000,
+            builtin: true,
+        };
+        storage.upsert_probe_definition(&stale_ws).unwrap();
+        storage.seed_builtin_probes().unwrap();
+        let realigned_ws = storage
+            .get_probe_definition("builtin_unlock_windsurf")
+            .unwrap()
+            .unwrap();
+        assert_eq!(realigned_ws.expected_status, Some(200));
+        assert_eq!(realigned_ws.target_url, "https://windsurf.com");
+        assert_eq!(realigned_ws.method, "GET");
+
+        // User-edited built-in latency/upload/download endpoints MUST survive restart seeding!
+        let custom_lat = ProbeDefinition {
+            id: "builtin_latency".to_string(),
+            name: "Self-hosted 204".to_string(),
+            kind: ProbeKind::Latency,
+            target_url: "https://my-204.example.invalid/generate_204".to_string(),
+            method: "HEAD".to_string(),
+            expected_status: Some(200),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 3500,
+            builtin: true,
+        };
+        let custom_up = ProbeDefinition {
+            id: "builtin_upload".to_string(),
+            name: "Custom Upload".to_string(),
+            kind: ProbeKind::Upload,
+            target_url: "https://my-speed.example.invalid/up".to_string(),
+            method: "PUT".to_string(),
+            expected_status: Some(201),
+            body_regex: None,
+            payload_bytes: Some(256 * 1024),
+            timeout_ms: 10000,
+            builtin: true,
+        };
+        let custom_claude_proxy = ProbeDefinition {
+            id: "builtin_unlock_claude".to_string(),
+            name: "Custom Claude Proxy".to_string(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://my-claude-mirror.example.invalid/check".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(204),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 7000,
+            builtin: true,
+        };
+        storage.upsert_probe_definition(&custom_lat).unwrap();
+        storage.upsert_probe_definition(&custom_up).unwrap();
+        storage.upsert_probe_definition(&custom_claude_proxy).unwrap();
+        assert_eq!(storage.seed_builtin_probes().unwrap(), 0);
+        assert_eq!(
+            storage.get_probe_definition("builtin_latency").unwrap(),
+            Some(custom_lat)
+        );
+        assert_eq!(
+            storage.get_probe_definition("builtin_upload").unwrap(),
+            Some(custom_up)
+        );
+        assert_eq!(
+            storage.get_probe_definition("builtin_unlock_claude").unwrap(),
+            Some(custom_claude_proxy)
+        );
+    }
+
+    #[test]
+    fn query_nodes_and_cold_read_probe_snapshot_agree_under_desc_multi_probe_rows() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.seed_builtin_probes().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-s22", "Stage22 Sub"))
+            .unwrap();
+        let node = sample_node("n-s22", "sub-s22", "JP", 1.0, "anytls", true, &["ai"]);
+        storage.upsert_node(&node).unwrap();
+
+        let mut google_map_old = HashMap::new();
+        google_map_old.insert("gemini".to_string(), true);
+        google_map_old.insert("gemini_aistudio".to_string(), true);
+
+        let mut google_map_new = HashMap::new();
+        google_map_new.insert("gemini".to_string(), true);
+        google_map_new.insert("gemini_aistudio".to_string(), true);
+
+        let mut gemini_dedicated = HashMap::new();
+        gemini_dedicated.insert("gemini".to_string(), false);
+
+        let mut ws_map = HashMap::new();
+        ws_map.insert("windsurf".to_string(), true);
+
+        storage
+            .insert_probe_results_batch(&[
+                // Earlier stale negative google_clean & keepalive
+                ProbeResultRecord {
+                    node_id: "n-s22".into(),
+                    probe_id: "builtin_google_cn".into(),
+                    tested_at: "2026-11-26T10:00:00Z".into(),
+                    ok: false,
+                    google_clean: Some(false),
+                    cf_loc: Some("CN".into()),
+                    yt_gl: Some("HK".into()),
+                    unlocked_map: google_map_old,
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-s22".into(),
+                    probe_id: "builtin_keepalive_60s".into(),
+                    tested_at: "2026-11-26T10:01:00Z".into(),
+                    ok: false,
+                    keepalive_60s_ok: Some(false),
+                    ..Default::default()
+                },
+                // Current run: L0 latency first, then L1 gemini (blocked), google_cn (clean), windsurf (1423ms), L2 keepalive (ok)
+                ProbeResultRecord {
+                    node_id: "n-s22".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-27T12:00:01Z".into(),
+                    ok: true,
+                    latency_ms: Some(41.2),
+                    jitter_ms: Some(1.5),
+                    loss_pct: Some(0.0),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-s22".into(),
+                    probe_id: "builtin_unlock_gemini".into(),
+                    tested_at: "2026-11-27T12:00:02Z".into(),
+                    ok: false,
+                    latency_ms: Some(810.0),
+                    unlocked_map: gemini_dedicated,
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-s22".into(),
+                    probe_id: "builtin_google_cn".into(),
+                    tested_at: "2026-11-27T12:00:03Z".into(),
+                    ok: true,
+                    latency_ms: Some(530.0),
+                    cf_loc: Some("JP".into()),
+                    yt_gl: Some("JP".into()),
+                    google_clean: Some(true),
+                    unlocked_map: google_map_new,
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-s22".into(),
+                    probe_id: "builtin_unlock_windsurf".into(),
+                    tested_at: "2026-11-27T12:00:04Z".into(),
+                    ok: true,
+                    latency_ms: Some(1423.0),
+                    unlocked_map: ws_map,
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-s22".into(),
+                    probe_id: "builtin_keepalive_60s".into(),
+                    tested_at: "2026-11-27T12:00:05Z".into(),
+                    ok: true,
+                    latency_ms: Some(1800.0),
+                    keepalive_60s_ok: Some(true),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+
+        let snap = storage
+            .get_probe_snapshot("n-s22", None)
+            .unwrap()
+            .expect("cold snapshot");
+        let batch = storage
+            .get_probe_snapshots_batch(&["n-s22".to_string()], None)
+            .unwrap();
+        assert_eq!(batch.get("n-s22"), Some(&snap));
+
+        // Top-level latency MUST stay 41.2ms (never 1423ms Windsurf or 1800ms Keepalive!)
+        assert!(snap.ok);
+        assert_eq!(snap.latency_ms, Some(41.2));
+        assert_eq!(snap.google_clean, Some(true));
+        assert_eq!(snap.keepalive_60s_ok, Some(true));
+        assert_eq!(snap.unlocked_sites.get("gemini"), Some(&false));
+        assert_eq!(snap.unlocked_sites.get("gemini_aistudio"), Some(&true));
+        assert_eq!(snap.unlocked_sites.get("windsurf"), Some(&true));
+
+        // query_nodes SQL filters MUST match snapshot truth 100%
+        let clean_ka_ws = storage
+            .query_nodes(&NodeFilter {
+                google_clean_only: true,
+                keepalive_60s_ok_only: true,
+                unlocked_site: Some("windsurf".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(clean_ka_ws.len(), 1);
+        assert_eq!(clean_ka_ws[0].id, "n-s22");
+
+        let gemini_unlocked = storage
+            .query_nodes(&NodeFilter {
+                unlocked_site: Some("gemini".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            gemini_unlocked.is_empty(),
+            "builtin_unlock_gemini=false must not be overridden by newer builtin_google_cn"
+        );
     }
 
     #[test]
@@ -3691,5 +4156,224 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backup_db_snapshot_and_apply_atomic_commits_rolls_back_and_preserves_probe_results() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.seed_builtin_probes().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-bak", "Backup Sub"))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-bak", "sub-bak", "JP", 1.0, "anytls", true, &[]))
+            .unwrap();
+        storage
+            .insert_probe_result(&ProbeResultRecord {
+                node_id: "n-bak".into(),
+                probe_id: "builtin_latency".into(),
+                tested_at: "2026-11-27T10:00:00Z".into(),
+                ok: true,
+                latency_ms: Some(36.0),
+                ..Default::default()
+            })
+            .unwrap();
+
+        let orig_group = MultiGroup {
+            id: "grp-orig".into(),
+            name: "Original Group".into(),
+            member_node_ids: vec!["n-bak".into()],
+            ..Default::default()
+        };
+        let orig_relay = PreAccelRelay {
+            id: "relay-orig".into(),
+            name: "Original Relay".into(),
+            server: "203.0.113.10".into(),
+            port: 443,
+            protocol: "anytls".into(),
+            password: "pw-orig".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_multi_group(&orig_group).unwrap();
+        storage.upsert_preaccel_relay(&orig_relay).unwrap();
+
+        let snap_before = storage.capture_backup_db_snapshot().unwrap();
+        assert_eq!(snap_before.groups.len(), 1);
+        assert_eq!(snap_before.relays.len(), 1);
+        assert!(snap_before.probes.len() >= 9);
+
+        // 1. Mid-batch error (empty relay ID) MUST roll back all writes including the new group.
+        let new_group = MultiGroup {
+            id: "grp-new".into(),
+            name: "New Group".into(),
+            ..Default::default()
+        };
+        let bad_relay = PreAccelRelay {
+            id: "   ".into(),
+            name: "Broken Relay".into(),
+            ..Default::default()
+        };
+        assert!(
+            storage
+                .apply_backup_entities_atomic(&[new_group.clone()], &[bad_relay], &[], false)
+                .is_err()
+        );
+        assert_eq!(storage.capture_backup_db_snapshot().unwrap(), snap_before);
+
+        // 2. Valid atomic restore adds new group/relay/probe and heals stale built-in Windsurf.
+        let new_relay = PreAccelRelay {
+            id: "relay-new".into(),
+            name: "New Relay".into(),
+            server: "198.51.100.20".into(),
+            port: 443,
+            protocol: "anytls".into(),
+            password: "pw-new".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let stale_ws = ProbeDefinition {
+            id: "builtin_unlock_windsurf".into(),
+            name: "Windsurf".into(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://windsurf.com".into(),
+            method: "GET".into(),
+            expected_status: None,
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 8000,
+            builtin: true,
+        };
+        let extra_probe = ProbeDefinition {
+            id: "custom_backup_probe".into(),
+            name: "Backup Custom".into(),
+            kind: ProbeKind::Latency,
+            target_url: "https://example.invalid/204".into(),
+            method: "GET".into(),
+            expected_status: Some(204),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 5000,
+            builtin: false,
+        };
+        storage
+            .apply_backup_entities_atomic(
+                &[new_group],
+                &[new_relay],
+                &[stale_ws, extra_probe],
+                false,
+            )
+            .unwrap();
+        assert!(storage.get_multi_group("grp-new").unwrap().is_some());
+        assert!(storage.get_preaccel_relay("relay-new").unwrap().is_some());
+        assert!(storage.get_probe_definition("custom_backup_probe").unwrap().is_some());
+        assert_eq!(
+            storage
+                .get_probe_definition("builtin_unlock_windsurf")
+                .unwrap()
+                .unwrap()
+                .expected_status,
+            Some(200)
+        );
+
+        // 3. Rollback with `replace_all = true` restores exact prior snapshot, removes added IDs,
+        //    and MUST NOT cascade-delete existing `probe_results` for surviving probes!
+        storage
+            .apply_backup_entities_atomic(
+                &snap_before.groups,
+                &snap_before.relays,
+                &snap_before.probes,
+                true,
+            )
+            .unwrap();
+        assert_eq!(storage.capture_backup_db_snapshot().unwrap(), snap_before);
+        assert!(storage.get_multi_group("grp-new").unwrap().is_none());
+        assert!(storage.get_preaccel_relay("relay-new").unwrap().is_none());
+        assert!(storage.get_probe_definition("custom_backup_probe").unwrap().is_none());
+        let surviving_results = storage.latest_probe_results_for_node("n-bak").unwrap();
+        assert_eq!(surviving_results.len(), 1);
+        assert_eq!(surviving_results[0].latency_ms, Some(36.0));
+    }
+
+    #[test]
+    fn probe_results_mixed_timezone_rfc3339_normalized_for_sqlite_cold_read_order() {
+        let mut storage = Storage::open_in_memory().unwrap();
+        storage.seed_builtin_probes().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-tz", "TZ Sub"))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-tz", "sub-tz", "JP", 1.0, "anytls", true, &[]))
+            .unwrap();
+
+        // Older instant written with +08:00 (lexicographically greater: "21:00:01+08:00" > "13:00:05Z"!)
+        // Newer instant written with Z (13:00:05Z is 4 seconds AFTER 21:00:01+08:00 == 13:00:01Z).
+        storage
+            .insert_probe_results_batch(&[
+                ProbeResultRecord {
+                    node_id: "n-tz".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-27T21:00:01+08:00".into(),
+                    ok: false,
+                    latency_ms: None,
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-tz".into(),
+                    probe_id: "builtin_latency".into(),
+                    tested_at: "2026-11-27T13:00:05Z".into(),
+                    ok: true,
+                    latency_ms: Some(27.5),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-tz".into(),
+                    probe_id: "builtin_google_cn".into(),
+                    tested_at: "2026-11-27T21:00:01.9+08:00".into(),
+                    ok: false,
+                    google_clean: Some(false),
+                    ..Default::default()
+                },
+                ProbeResultRecord {
+                    node_id: "n-tz".into(),
+                    probe_id: "builtin_google_cn".into(),
+                    tested_at: "2026-11-27T13:00:05.12Z".into(),
+                    ok: true,
+                    google_clean: Some(true),
+                    ..Default::default()
+                },
+            ])
+            .unwrap();
+
+        let latest = storage.latest_probe_results_for_node("n-tz").unwrap();
+        let lat_row = latest
+            .iter()
+            .find(|r| r.probe_id == "builtin_latency")
+            .expect("latest latency row");
+        assert!(lat_row.ok);
+        assert_eq!(lat_row.latency_ms, Some(27.5));
+        assert_eq!(lat_row.tested_at, "2026-11-27T13:00:05.000000Z");
+
+        let snap = storage
+            .get_probe_snapshot("n-tz", None)
+            .unwrap()
+            .expect("cold snapshot");
+        assert!(snap.ok);
+        assert_eq!(snap.latency_ms, Some(27.5));
+        assert_eq!(snap.google_clean, Some(true));
+
+        let batch = storage
+            .get_probe_snapshots_batch(&["n-tz".to_string()], None)
+            .unwrap();
+        assert_eq!(batch.get("n-tz"), Some(&snap));
+
+        let filtered = storage
+            .query_nodes(&NodeFilter {
+                google_clean_only: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "n-tz");
     }
 }

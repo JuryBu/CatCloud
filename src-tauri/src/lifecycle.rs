@@ -1,6 +1,6 @@
 use std::path::{Component, Path};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use catcloud_core::AppPaths;
@@ -1004,6 +1004,7 @@ pub fn handle_run_event<R: Runtime, F: FnOnce()>(
             }
         }
         RunEvent::Exit => {
+            uninstall_tao_end_session_guard();
             crate::tray::cleanup_tray(app);
             crate::shortcuts::unregister_all_shortcuts(app);
             if let Some(cleanup_fn) = cleanup.take() {
@@ -1011,6 +1012,242 @@ pub fn handle_run_event<R: Runtime, F: FnOnce()>(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(target_os = "windows")]
+const TAO_END_SESSION_SUBCLASS_UID: usize = 0xCA7C_1002;
+#[cfg(target_os = "windows")]
+const TAO_EVENT_TARGET_CLASS: &str = "Tao Thread Event Target";
+
+#[cfg(target_os = "windows")]
+struct InstalledEndSessionHook {
+    hwnd: usize,
+    executed: Arc<AtomicBool>,
+    on_end_session: Arc<dyn Fn() + Send + Sync + 'static>,
+}
+
+#[cfg(target_os = "windows")]
+static END_SESSION_HOOK: Mutex<Option<InstalledEndSessionHook>> = Mutex::new(None);
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn tao_end_session_subclass_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    msg: u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+    _uid: usize,
+    _ref_data: usize,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_ENDSESSION, WM_NCDESTROY, WM_QUERYENDSESSION,
+    };
+
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
+        WM_QUERYENDSESSION => {
+            // Zero-latency approval: never tear down network/core here because Windows or the user
+            // may still cancel logoff/shutdown.
+            1
+        }
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                let hook_cb = END_SESSION_HOOK
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|h| (Arc::clone(&h.executed), Arc::clone(&h.on_end_session)));
+                if let Some((executed, on_end_session)) = hook_cb {
+                    if !executed.swap(true, Ordering::SeqCst) {
+                        on_end_session();
+                    }
+                }
+            }
+            // Forward to tao's original proc (which completes teardown / exits cleanly).
+            unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+        }
+        WM_NCDESTROY => {
+            if let Ok(mut guard) = END_SESSION_HOOK.lock() {
+                if guard.as_ref().is_some_and(|h| h.hwnd == hwnd as usize) {
+                    *guard = None;
+                }
+            }
+            unsafe {
+                let _ = RemoveWindowSubclass(
+                    hwnd,
+                    Some(tao_end_session_subclass_proc),
+                    TAO_END_SESSION_SUBCLASS_UID,
+                );
+                DefSubclassProc(hwnd, msg, wparam, lparam)
+            }
+        }
+        _ => unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) },
+    }))
+    .unwrap_or_else(|_| unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) })
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn enum_tao_event_target_proc(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::BOOL {
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
+
+    let mut buf = [0u16; 128];
+    let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if len > 0 {
+        let class_name = String::from_utf16_lossy(&buf[..len as usize]);
+        if class_name == TAO_EVENT_TARGET_CLASS {
+            let out_ptr = lparam as *mut usize;
+            if !out_ptr.is_null() {
+                unsafe {
+                    *out_ptr = hwnd as usize;
+                }
+            }
+            return 0; // Found: stop enumeration.
+        }
+    }
+    1 // Continue enumeration.
+}
+
+#[cfg(target_os = "windows")]
+fn find_tao_thread_event_target_hwnd() -> Option<windows_sys::Win32::Foundation::HWND> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
+
+    let mut found_hwnd: usize = 0;
+    let tid = unsafe { GetCurrentThreadId() };
+    unsafe {
+        let _ = EnumThreadWindows(
+            tid,
+            Some(enum_tao_event_target_proc),
+            (&mut found_hwnd as *mut usize) as LPARAM,
+        );
+    }
+    if found_hwnd == 0 {
+        None
+    } else {
+        Some(found_hwnd as HWND)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn install_end_session_subclass_for_hwnd(
+    hwnd: windows_sys::Win32::Foundation::HWND,
+    on_end_session: Arc<dyn Fn() + Send + Sync + 'static>,
+) -> bool {
+    use windows_sys::Win32::UI::Shell::{RemoveWindowSubclass, SetWindowSubclass};
+    use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+
+    if hwnd.is_null() || unsafe { IsWindow(hwnd) == 0 } {
+        return false;
+    }
+
+    let prev_hwnd = {
+        let mut guard = END_SESSION_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = guard.as_ref().map(|h| h.hwnd);
+        *guard = Some(InstalledEndSessionHook {
+            hwnd: hwnd as usize,
+            executed: Arc::new(AtomicBool::new(false)),
+            on_end_session,
+        });
+        prev
+    };
+    if let Some(old_addr) = prev_hwnd {
+        if old_addr != 0 && old_addr != hwnd as usize {
+            let old_hwnd = old_addr as windows_sys::Win32::Foundation::HWND;
+            if unsafe { IsWindow(old_hwnd) != 0 } {
+                unsafe {
+                    let _ = RemoveWindowSubclass(
+                        old_hwnd,
+                        Some(tao_end_session_subclass_proc),
+                        TAO_END_SESSION_SUBCLASS_UID,
+                    );
+                }
+            }
+        }
+    }
+
+    let installed = unsafe {
+        SetWindowSubclass(
+            hwnd,
+            Some(tao_end_session_subclass_proc),
+            TAO_END_SESSION_SUBCLASS_UID,
+            0,
+        ) != 0
+    };
+    if !installed {
+        if let Ok(mut guard) = END_SESSION_HOOK.lock() {
+            if guard.as_ref().is_some_and(|h| h.hwnd == hwnd as usize) {
+                *guard = None;
+            }
+        }
+    }
+    installed
+}
+
+/// Install a Windows `SetWindowSubclass` guard onto tao's resident `"Tao Thread Event Target"`
+/// hidden top-level window on the current UI thread so `WM_QUERYENDSESSION` approves immediately
+/// and `WM_ENDSESSION (wParam != 0)` synchronously executes bounded proxy/TUN/core cleanup BEFORE
+/// tao's default handler calls `std::process::exit(0)`.
+///
+/// Must be called on the main event-loop thread during Tauri `setup`. No-op on non-Windows.
+pub fn install_tao_end_session_guard<F>(on_end_session: F) -> bool
+where
+    F: Fn() + Send + Sync + 'static,
+{
+    #[cfg(target_os = "windows")]
+    {
+        let Some(hwnd) = find_tao_thread_event_target_hwnd() else {
+            tracing::debug!(
+                "tao thread event target window not found on current thread; WM_ENDSESSION guard skipped"
+            );
+            return false;
+        };
+        let ok = install_end_session_subclass_for_hwnd(hwnd, Arc::new(on_end_session));
+        if !ok {
+            tracing::warn!("failed to install WM_ENDSESSION subclass on Tao Thread Event Target");
+        }
+        ok
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = on_end_session;
+        false
+    }
+}
+
+/// Symmetrically remove the `WM_ENDSESSION` subclass guard from tao's hidden event window on
+/// normal exit so no subclass callback or closure state remains resident.
+pub fn uninstall_tao_end_session_guard() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::Shell::RemoveWindowSubclass;
+        use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
+
+        let removed = END_SESSION_HOOK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(hook) = removed {
+            let hwnd = hook.hwnd as HWND;
+            if !hwnd.is_null() && unsafe { IsWindow(hwnd) != 0 } {
+                return unsafe {
+                    RemoveWindowSubclass(
+                        hwnd,
+                        Some(tao_end_session_subclass_proc),
+                        TAO_END_SESSION_SUBCLASS_UID,
+                    ) != 0
+                };
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
     }
 }
 
@@ -1252,5 +1489,100 @@ mod tests {
         assert!(trimmed);
         #[cfg(not(target_os = "windows"))]
         assert!(!trimmed);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn tao_end_session_subclass_handles_query_cancel_and_idempotent_sync_cleanup() {
+        use std::sync::atomic::AtomicUsize;
+        use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SendMessageW,
+            UnregisterClassW, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
+        };
+
+        unsafe extern "system" fn test_wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        let class_name: Vec<u16> = format!(
+            "CatCloudEndSessionTest_{}",
+            uuid::Uuid::new_v4().simple()
+        )
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+        let hinstance = unsafe { GetModuleHandleW(std::ptr::null()) };
+        let wc = WNDCLASSW {
+            style: 0,
+            lpfnWndProc: Some(test_wnd_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinstance,
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+        };
+        let atom = unsafe { RegisterClassW(&wc) };
+        assert_ne!(atom, 0, "RegisterClassW must succeed");
+
+        let hwnd = unsafe {
+            CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                class_name.as_ptr(),
+                WS_OVERLAPPED,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                hinstance,
+                std::ptr::null(),
+            )
+        };
+        assert!(!hwnd.is_null(), "CreateWindowExW must succeed");
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_cb = Arc::clone(&call_count);
+        assert!(install_end_session_subclass_for_hwnd(
+            hwnd,
+            Arc::new(move || {
+                call_count_cb.fetch_add(1, Ordering::SeqCst);
+            })
+        ));
+
+        // 1. WM_QUERYENDSESSION returns LRESULT(1) immediately without invoking cleanup.
+        let query_res = unsafe { SendMessageW(hwnd, WM_QUERYENDSESSION, 0, 0) };
+        assert_eq!(query_res, 1);
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+        // 2. WM_ENDSESSION with wParam == 0 (shutdown cancelled) must NOT run cleanup.
+        let _ = unsafe { SendMessageW(hwnd, WM_ENDSESSION, 0, 0) };
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+        // 3. WM_ENDSESSION with wParam != 0 runs cleanup synchronously once, and repeats are idempotent.
+        let _ = unsafe { SendMessageW(hwnd, WM_ENDSESSION, 1, 0) };
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        let _ = unsafe { SendMessageW(hwnd, WM_ENDSESSION, 1, 0) };
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+
+        // 4. Symmetric uninstall removes subclass cleanly before destroying test HWND.
+        assert!(uninstall_tao_end_session_guard());
+        assert!(!uninstall_tao_end_session_guard());
+
+        unsafe {
+            let _ = DestroyWindow(hwnd);
+            let _ = UnregisterClassW(class_name.as_ptr(), hinstance);
+        }
     }
 }

@@ -27,7 +27,7 @@ pub use config_compiler::{
     PREACCEL_SELECT_GROUP_NAME, SINGLE_NODE_GROUP_NAME, StaticCheckIssue, StaticCheckSeverity,
     StaticValidationReport, apply_yaml_merge_patch, build_default_ai_routing_rules,
     compile_mihomo_config, compile_mihomo_config_with_runtime_dir, expand_group_match_rule,
-    redact_compiled_yaml_for_preview, validate_compiled_yaml,
+    redact_compiled_yaml_for_preview, sanitize_business_node_transport, validate_compiled_yaml,
 };
 pub use dns_diag::{
     DNS_TLS_CATEGORY, DNS_TLS_STATUS_CERT_FAILED, DNS_TLS_STATUS_DEGRADED_RECOVERED,
@@ -37,7 +37,8 @@ pub use dns_diag::{
 pub use hot_reload::{
     ConfigWatcherHandle, DEFAULT_DEBOUNCE_WINDOW, DebounceDecision, DiskReloadOptions,
     DiskReloadSnapshot, HotReloadCoordinator, HotReloadDebouncer, classify_config_diff,
-    has_core_config_changes,
+    enforce_tun_disabled_on_compiled, has_core_config_changes, read_live_tun_mtu_from_path,
+    read_runtime_yaml_tun_mtu,
 };
 pub use mihomo::{
     ControllerEndpointSource, LiveCoreConfigSnapshot, MihomoAdapter,

@@ -1259,7 +1259,13 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "gtimg.cn",
         "gtimg.com",
         "weixin.qq.com",
+        "wechat.com",
         "tencent.com",
+        "qcloud.com",
+        "myqcloud.com",
+        "qcloudimg.com",
+        "tencentcs.com",
+        "tencent-cloud.net",
         "bilibili.com",
         "bilivideo.com",
         "bilivideo.cn",
@@ -1547,6 +1553,13 @@ pub fn compile_mihomo_config_with_runtime_dir(
         enforce_mandatory_safety_rules_at_top(&mut final_value, &mandatory_safety_rules);
     }
 
+    // Re-scan final `proxies[].dialer-proxy` and `proxy-providers.*.override.dialer-proxy` after
+    // merge patches/inline overrides and re-clamp `tun.mtu <= 1400` whenever TUN is enabled and
+    // any dialer-proxy exists (including when an override deleted `tun.mtu` via `mtu: null`).
+    let (final_dialer_wrapped_proxies, final_effective_tun_mtu) =
+        reconcile_post_override_dialer_and_tun_mtu(&mut final_value, effective_tun_mtu);
+    dialer_wrapped_proxies = final_dialer_wrapped_proxies;
+
     let yaml = serde_yaml_ng::to_string(&final_value)?;
     let validation = validate_compiled_yaml(&yaml, &relay_servers_for_validation)?;
 
@@ -1562,13 +1575,6 @@ pub fn compile_mihomo_config_with_runtime_dir(
         .get("rules")
         .and_then(Value::as_sequence)
         .map_or(0, Vec::len);
-
-    let final_effective_tun_mtu = final_value
-        .get("tun")
-        .and_then(|t| t.get("mtu"))
-        .and_then(Value::as_u64)
-        .and_then(|v| u16::try_from(v).ok())
-        .unwrap_or(effective_tun_mtu);
 
     let stats = CompileStats {
         total_proxies,
@@ -1609,6 +1615,79 @@ pub fn redact_compiled_yaml_for_preview(
         compiled.yaml.clone()
     };
     Ok(crate::sanitize::redact_compiled_yaml(&source_yaml))
+}
+
+fn reconcile_post_override_dialer_and_tun_mtu(
+    final_value: &mut Value,
+    fallback_tun_mtu: u16,
+) -> (usize, u16) {
+    let Some(root_map) = final_value.as_mapping_mut() else {
+        return (0, fallback_tun_mtu);
+    };
+
+    let proxy_dialers = root_map
+        .get("proxies")
+        .and_then(Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter(|item| {
+                    item.as_mapping()
+                        .and_then(|m| m.get("dialer-proxy"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    let provider_dialers = root_map
+        .get("proxy-providers")
+        .and_then(Value::as_mapping)
+        .map(|providers| {
+            providers
+                .values()
+                .filter(|prov| {
+                    prov.as_mapping()
+                        .and_then(|m| m.get("override"))
+                        .and_then(Value::as_mapping)
+                        .and_then(|ov| ov.get("dialer-proxy"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.trim().is_empty())
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    let total_dialers = proxy_dialers.saturating_add(provider_dialers);
+
+    let mut effective_mtu = fallback_tun_mtu;
+    if let Some(tun_map) = root_map.get_mut("tun").and_then(Value::as_mapping_mut) {
+        let tun_enabled = tun_map
+            .get("enable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let parsed_mtu = tun_map
+            .get("mtu")
+            .and_then(Value::as_u64)
+            .filter(|&v| v > 0)
+            .and_then(|v| u16::try_from(v).ok());
+
+        if total_dialers > 0 && tun_enabled {
+            match parsed_mtu {
+                Some(mtu) if mtu <= 1400 => {
+                    effective_mtu = mtu;
+                }
+                _ => {
+                    insert_u64(tun_map, "mtu", 1400);
+                    effective_mtu = 1400;
+                }
+            }
+        } else if let Some(mtu) = parsed_mtu {
+            effective_mtu = mtu;
+        }
+    }
+
+    (total_dialers, effective_mtu)
 }
 
 /// Apply a declarative RFC 7396 style YAML Merge Patch onto a cloned copy of `base`.
@@ -2074,6 +2153,12 @@ fn export_gateway_relay_fragment(
 
     let plan = build_preaccel_compile_plan(&relay_cfg, relays, &[])?;
     let mut warnings = plan.warnings.clone();
+    if !cfg.preaccel.enabled && plan.active && !plan.relay_proxies.is_empty() {
+        warnings.push(
+            "当前桌面国内提速总开关关闭，已按已启用中转池配置一并导出中转片段（合并后即可使用）。"
+                .to_string(),
+        );
+    }
     let mut doc = Mapping::new();
 
     if !plan.active || plan.relay_proxies.is_empty() {
@@ -2108,6 +2193,31 @@ fn export_gateway_relay_fragment(
 
     let doc_value = Value::Mapping(doc);
     let body_yaml = serde_yaml_ng::to_string(&doc_value)?;
+    if plan.active && !plan.relay_proxies.is_empty() {
+        let relay_servers_for_validation: Vec<String> = relays
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.server.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let validation = validate_compiled_yaml(&body_yaml, &relay_servers_for_validation)?;
+        let hard_errors = validation.errors();
+        if !hard_errors.is_empty() {
+            let summary = hard_errors
+                .iter()
+                .map(|i| format!("[{}] {}", i.code, i.message))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(CatError::Validation(format!(
+                "国内提速片段静态防环校验未通过，已阻止导出坏配置：{summary}"
+            )));
+        }
+        for issue in validation.warnings() {
+            if issue.code != "missing_match_rule" {
+                warnings.push(issue.message.clone());
+            }
+        }
+    }
     let header = format!(
         concat!(
             "# ============================================================================\n",
@@ -2152,7 +2262,7 @@ fn export_gateway_transparent_full(
     nodes: &[ProxyNode],
     groups: &[MultiGroup],
     relays: &[PreAccelRelay],
-    runtime_dir: Option<&Path>,
+    _runtime_dir: Option<&Path>,
     opts: &GatewayExportOptions,
 ) -> CatResult<GatewayExportOutput> {
     if opts.tproxy_port == 0 || opts.redir_port == 0 || opts.dns_listen_port == 0 {
@@ -2173,6 +2283,12 @@ fn export_gateway_transparent_full(
 
     let mut gw_cfg = cfg.clone();
     let mut warnings: Vec<String> = Vec::new();
+    if !gw_cfg.preaccel.enabled && relays.iter().any(|r| r.enabled) {
+        warnings.push(
+            "当前桌面国内提速总开关未开启，本次导出的完整透明网关配置未附带国内 443 中转；如需在软路由启用，请先开启国内提速开关后重新导出。"
+                .to_string(),
+        );
+    }
     let mut reserved_ports: HashSet<u16> =
         [opts.tproxy_port, opts.redir_port, opts.dns_listen_port]
             .into_iter()
@@ -2185,6 +2301,10 @@ fn export_gateway_transparent_full(
     gw_cfg.tun.enabled = false;
     gw_cfg.dns_listen_host = "0.0.0.0".to_string();
     gw_cfg.dns_listen_port = opts.dns_listen_port;
+    // Decouple exported transparent-gateway configs from desktop GeoData files & auto-update so
+    // offline or low-flash soft-routers never fail attempting to load or download `.dat` assets.
+    gw_cfg.geodata.geodata_mode = false;
+    gw_cfg.geodata.auto_update = false;
     // Always export all enabled nodes & groups for soft-router/gateway deployments so >32 node
     // pruning in desktop Single mode never strips router proxy pools.
     gw_cfg.core_runtime.compile_all_nodes = true;
@@ -2275,7 +2395,10 @@ fn export_gateway_transparent_full(
         group_filtered_members: &empty_filtered,
     };
 
-    let mut compiled = compile_mihomo_config_with_runtime_dir(&compile_input, runtime_dir)?;
+    // Decouple exported router config from the desktop's local GeoData files (`runtime_dir = None`)
+    // so OpenWrt/soft-router instances without `geosite.dat`/`Country.mmdb` never fail to load
+    // `GEOSITE,cn`/`GEOIP,CN` and always retain conservative domestic direct fallback rules.
+    let mut compiled = compile_mihomo_config_with_runtime_dir(&compile_input, None)?;
 
     // Post-merge gateway contract lock: prevent `override_merge_path` / `inline_override_yaml`
     // from silently turning desktop TUN back on or hijacking TPROXY/REDIR/DNS/LAN bindings.
@@ -2556,6 +2679,33 @@ fn export_gateway_preferred_nodes(
 
     let doc_value = Value::Mapping(doc);
     let body_yaml = serde_yaml_ng::to_string(&doc_value)?;
+    let relay_servers_for_validation: Vec<String> = if preaccel_plan.active {
+        relays
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.server.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let validation = validate_compiled_yaml(&body_yaml, &relay_servers_for_validation)?;
+    let hard_errors = validation.errors();
+    if !hard_errors.is_empty() {
+        let summary = hard_errors
+            .iter()
+            .map(|i| format!("[{}] {}", i.code, i.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(CatError::Validation(format!(
+            "优选节点片段静态防环校验未通过，已阻止导出坏配置：{summary}"
+        )));
+    }
+    for issue in validation.warnings() {
+        if issue.code != "missing_match_rule" {
+            warnings.push(issue.message.clone());
+        }
+    }
     let header = concat!(
         "# ============================================================================\n",
         "# CatCloud 优选节点与国内 443 中转片段（Preferred Nodes）\n",
@@ -2886,6 +3036,7 @@ fn is_gateway_yaml_host_key(key: &str) -> bool {
             | "host"
             | "obfs-host"
             | "obfs_host"
+            | "endpoint"
             | "external-controller"
     )
 }
@@ -3177,8 +3328,12 @@ fn redact_gateway_fake_ip_entry(entry: &str, sensitive_domains: &HashSet<String>
 
 fn redact_gateway_rule_line(rule: &str, sensitive_domains: &HashSet<String>) -> String {
     let trimmed = rule.trim();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
+    if trimmed.is_empty() {
         return rule.to_string();
+    }
+    if trimmed.starts_with('#') {
+        let dom_clean = redact_sensitive_domains_in_text(rule, sensitive_domains);
+        return crate::sanitize::sanitize_log_line(&dom_clean);
     }
     if let Some((raw_type, _)) = trimmed.split_once(',') {
         let rt_upper = raw_type.trim().to_ascii_uppercase();
@@ -3280,7 +3435,188 @@ fn redact_gateway_yaml_host_value(val: &mut Value, sensitive_domains: &HashSet<S
     }
 }
 
-fn redact_gateway_rule_providers_section(
+fn is_public_dns_allowlisted_host(host: &str) -> bool {
+    let norm = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    matches!(
+        norm.as_str(),
+        "dns.alidns.com"
+            | "doh.pub"
+            | "dot.pub"
+            | "dns.pub"
+            | "dns.google"
+            | "dns.google.com"
+            | "cloudflare-dns.com"
+            | "one.one.one.one"
+            | "mozilla.cloudflare-dns.com"
+            | "dns.quad9.net"
+            | "dns9.quad9.net"
+            | "doh.opendns.com"
+            | "dns.adguard-dns.com"
+            | "dns.adguard.com"
+            | "doh.360.cn"
+            | "dot.360.cn"
+            | "dns.sb"
+            | "doh.dns.sb"
+            | "dns.tuna.tsinghua.edu.cn"
+    )
+}
+
+fn format_url_host_redacted(host: &str) -> String {
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
+    let masked = crate::sanitize::redact_ip_or_host(bare);
+    if masked.contains(':') && !masked.starts_with('[') {
+        format!("[{masked}]")
+    } else {
+        masked
+    }
+}
+
+/// Redact `proxy-providers.*.url` and `rule-providers.*.url`: masks host/IP and replaces any
+/// non-root path, query string, or fragment (e.g. `/subscribe/<secret-token>?flag=clash`) with
+/// `/<REDACTED>` while preserving valid URL syntax.
+fn redact_gateway_provider_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "<REDACTED>" {
+        return trimmed.to_string();
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return "<REDACTED>".to_string();
+    };
+    let scheme = parsed.scheme();
+    let Some(host) = parsed.host_str() else {
+        return "<REDACTED>".to_string();
+    };
+    let masked_host = format_url_host_redacted(host);
+    let port_part = parsed
+        .port()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    let has_sensitive_tail = (!parsed.path().is_empty() && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some();
+    if has_sensitive_tail {
+        format!("{scheme}://{masked_host}{port_part}/<REDACTED>")
+    } else if parsed.path() == "/" {
+        format!("{scheme}://{masked_host}{port_part}/")
+    } else {
+        format!("{scheme}://{masked_host}{port_part}")
+    }
+}
+
+/// Redact a single Mihomo DNS server entry while preserving allowlisted public DoH/DoT domains
+/// and Mihomo `#DIRECT` / `#PROXY` routing suffixes.
+fn redact_gateway_dns_entry(entry: &str, sensitive_domains: &HashSet<String>) -> String {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() || trimmed == "<REDACTED>" {
+        return trimmed.to_string();
+    }
+
+    // Preserve Mihomo DNS routing suffixes like `#DIRECT`, `#PROXY`, `#h3=true` intact.
+    let (base, suffix) = match trimmed.split_once('#') {
+        Some((b, s)) => (b.trim(), Some(s)),
+        None => (trimmed, None),
+    };
+    let clean_suffix = suffix.map(|s| {
+        if matches!(
+            s.trim().to_ascii_uppercase().as_str(),
+            "DIRECT" | "PROXY" | "REJECT"
+        ) {
+            s.to_string()
+        } else {
+            let d = redact_sensitive_domains_in_text(s, sensitive_domains);
+            crate::sanitize::sanitize_log_line(&d)
+        }
+    });
+
+    let base_lower = base.to_ascii_lowercase();
+    let clean_base = if base_lower.starts_with("dhcp://") || base_lower.starts_with("rcode://") {
+        let d = redact_sensitive_domains_in_text(base, sensitive_domains);
+        crate::sanitize::sanitize_log_line(&d)
+    } else if base.contains("://") {
+        if let Ok(parsed) = Url::parse(base) {
+            let scheme = parsed.scheme();
+            if let Some(host) = parsed.host_str() {
+                let is_standard_dns_path =
+                    matches!(parsed.path(), "" | "/" | "/dns-query" | "/resolve");
+                let has_credentials = !parsed.username().is_empty() || parsed.password().is_some();
+                if is_public_dns_allowlisted_host(host)
+                    && !has_credentials
+                    && is_standard_dns_path
+                    && parsed.query().is_none()
+                {
+                    base.to_string()
+                } else {
+                    let masked_host = format_url_host_redacted(host);
+                    let port_part = parsed
+                        .port()
+                        .map(|p| format!(":{p}"))
+                        .unwrap_or_default();
+                    if is_standard_dns_path && !has_credentials && parsed.query().is_none() {
+                        format!("{scheme}://{masked_host}{port_part}{}", parsed.path())
+                    } else {
+                        format!("{scheme}://{masked_host}{port_part}/<REDACTED>")
+                    }
+                }
+            } else {
+                let d = redact_sensitive_domains_in_text(base, sensitive_domains);
+                crate::sanitize::sanitize_log_line(&d)
+            }
+        } else {
+            let d = redact_sensitive_domains_in_text(base, sensitive_domains);
+            crate::sanitize::sanitize_log_line(&d)
+        }
+    } else if base.eq_ignore_ascii_case("system") {
+        base.to_string()
+    } else {
+        // Strip optional `:port` on bare non-IPv6 hostnames to check against the public DNS allowlist.
+        let bare_host_candidate = if !base.starts_with('[')
+            && base.bytes().filter(|&b| b == b':').count() == 1
+        {
+            match base.rsplit_once(':') {
+                Some((h, p))
+                    if !p.is_empty()
+                        && p.bytes().all(|b| b.is_ascii_digit())
+                        && p.parse::<u16>().is_ok() =>
+                {
+                    h
+                }
+                _ => base,
+            }
+        } else {
+            base
+        };
+        if is_public_dns_allowlisted_host(bare_host_candidate) {
+            base.to_string()
+        } else if !base.chars().any(char::is_whitespace) {
+            crate::sanitize::redact_ip_or_host(base)
+        } else {
+            let d = redact_sensitive_domains_in_text(base, sensitive_domains);
+            crate::sanitize::sanitize_log_line(&d)
+        }
+    };
+
+    if let Some(suf) = clean_suffix {
+        format!("{clean_base}#{suf}")
+    } else {
+        clean_base
+    }
+}
+
+fn redact_gateway_dns_value(val: &mut Value, sensitive_domains: &HashSet<String>) {
+    match val {
+        Value::String(s) => {
+            *s = redact_gateway_dns_entry(s, sensitive_domains);
+        }
+        Value::Sequence(seq) => {
+            for item in seq.iter_mut() {
+                redact_gateway_dns_value(item, sensitive_domains);
+            }
+        }
+        _ => redact_gateway_yaml_ast(val, sensitive_domains, false),
+    }
+}
+
+fn redact_gateway_providers_section(
     val: &mut Value,
     sensitive_domains: &HashSet<String>,
 ) {
@@ -3300,6 +3636,12 @@ fn redact_gateway_rule_providers_section(
                 .unwrap_or_default();
             if key_lower == "header" || key_lower == "headers" {
                 redact_all_scalar_values_deep(v);
+            } else if key_lower == "url" {
+                if let Value::String(s) = v {
+                    *s = redact_gateway_provider_url(s);
+                } else {
+                    redact_gateway_yaml_ast(v, sensitive_domains, false);
+                }
             } else if key_lower == "path" {
                 if let Value::String(s) = v {
                     let p = crate::sanitize::redact_path_for_display(s);
@@ -3346,6 +3688,13 @@ fn redact_gateway_dns_section(val: &mut Value, sensitive_domains: &HashSet<Strin
                     }
                 }
             }
+            "default-nameserver"
+            | "direct-nameserver"
+            | "nameserver"
+            | "proxy-server-nameserver"
+            | "fallback" => {
+                redact_gateway_dns_value(v, sensitive_domains);
+            }
             "nameserver-policy" => {
                 if let Value::Mapping(old_policy) = v {
                     let mut new_policy = Mapping::new();
@@ -3355,7 +3704,7 @@ fn redact_gateway_dns_section(val: &mut Value, sensitive_domains: &HashSet<Strin
                         } else {
                             pk
                         };
-                        redact_gateway_yaml_ast(&mut pv, sensitive_domains, false);
+                        redact_gateway_dns_value(&mut pv, sensitive_domains);
                         new_policy.insert(new_pk, pv);
                     }
                     *old_policy = new_policy;
@@ -3397,8 +3746,8 @@ fn redact_gateway_yaml_ast(
 
                 if is_root {
                     match key_lower.as_str() {
-                        "rule-providers" => {
-                            redact_gateway_rule_providers_section(v, sensitive_domains);
+                        "rule-providers" | "proxy-providers" => {
+                            redact_gateway_providers_section(v, sensitive_domains);
                             continue;
                         }
                         "dns" => {
@@ -4434,6 +4783,48 @@ fn build_relay_proxy_mapping(relay: &PreAccelRelay, unique_name: &str) -> CatRes
     }
 }
 
+/// Normalize transport parameters on TCP-based business proxy mappings to prevent TFO stalls and
+/// idle zombie-session drops (`anytls`, `trojan`, `vless`, `vmess`, `ss`, `shadowsocks`, `ssr`).
+///
+/// Strictly whitelisted to TCP protocols so UDP-based transports (`hysteria2`, `hy2`, `tuic`,
+/// `wireguard`, etc.) are never mutated.
+pub fn sanitize_business_node_transport(map: &mut Mapping, fallback_protocol: &str) {
+    let proto = map
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(fallback_protocol.trim())
+        .to_ascii_lowercase();
+
+    if !matches!(
+        proto.as_str(),
+        "anytls" | "trojan" | "vless" | "vmess" | "ss" | "shadowsocks" | "ssr"
+    ) {
+        return;
+    }
+
+    insert_bool(map, "tfo", false);
+
+    if proto == "anytls" {
+        insert_u64(map, "min-idle-session", 0);
+        let has_valid_check = map
+            .get("idle-session-check-interval")
+            .and_then(Value::as_u64)
+            .is_some_and(|v| v > 0);
+        if !has_valid_check {
+            insert_u64(map, "idle-session-check-interval", 30);
+        }
+        let has_valid_timeout = map
+            .get("idle-session-timeout")
+            .and_then(Value::as_u64)
+            .is_some_and(|v| v > 0);
+        if !has_valid_timeout {
+            insert_u64(map, "idle-session-timeout", 30);
+        }
+    }
+}
+
 pub fn build_node_proxy_mapping(node: &ProxyNode, unique_name: &str) -> CatResult<Mapping> {
     let mut map = match serde_yaml_ng::to_value(&node.raw_config)? {
         Value::Mapping(m) => m,
@@ -4450,6 +4841,8 @@ pub fn build_node_proxy_mapping(node: &ProxyNode, unique_name: &str) -> CatResul
     if !map.contains_key("port") && node.port > 0 {
         insert_u64(&mut map, "port", u64::from(node.port));
     }
+
+    sanitize_business_node_transport(&mut map, &node.protocol);
 
     Ok(map)
 }
@@ -8921,5 +9314,328 @@ rules:
         )
         .expect("transparent gateway must export all nodes");
         assert_eq!(gw.node_count, 40);
+    }
+
+    #[test]
+    fn post_override_mtu_reclamps_null_and_high_mtu_for_proxy_and_provider_dialers_and_sanitizes_tcp() {
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = true;
+        cfg.tun.mtu = 1500;
+        cfg.preaccel.enabled = true;
+        // 1. Override deletes `tun.mtu` via `null` and adds a proxy-provider with override.dialer-proxy.
+        cfg.rules_override.inline_override_yaml = Some(
+            r#"
+tun:
+  mtu: null
+proxy-providers:
+  corp_pool:
+    type: http
+    url: https://sub.private-corp.example/subscribe/AbcSecret999?flag=clash
+    path: ./providers/corp.yaml
+    override:
+      dialer-proxy: "⚡ 国内预加速入口"
+"#
+            .to_string(),
+        );
+
+        let relays = vec![sample_relay("r1", "Relay-A", "203.0.113.10", 10)];
+
+        let mut anytls_node = sample_node("n-any", "Node-AnyTLS #1", 8443, false);
+        anytls_node.protocol = "anytls".to_string();
+        anytls_node.raw_config = serde_json::json!({
+            "name": "Node-AnyTLS #1",
+            "type": "anytls",
+            "server": "anytls.vendor.example",
+            "port": 8443,
+            "password": "pw",
+            "tfo": true,
+            "min-idle-session": 4
+        });
+
+        let mut hy2_node = sample_node("n-hy2", "Node-Hy2", 443, true);
+        hy2_node.protocol = "hysteria2".to_string();
+        hy2_node.raw_config = serde_json::json!({
+            "name": "Node-Hy2",
+            "type": "hysteria2",
+            "server": "hy2.vendor.example",
+            "port": 443,
+            "password": "pw2",
+            "tfo": true
+        });
+
+        let nodes = vec![anytls_node, hy2_node];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &relays,
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with null mtu override");
+
+        assert_eq!(compiled.value["tun"]["mtu"].as_u64(), Some(1400));
+        assert_eq!(compiled.stats.effective_tun_mtu, 1400);
+        // 1 wrapped proxy (anytls) + 1 proxy-provider with override.dialer-proxy = 2
+        assert_eq!(compiled.stats.dialer_wrapped_proxies, 2);
+
+        // Business node transport sanitizer: anytls normalized, hysteria2 untouched
+        let proxies = compiled.value["proxies"].as_sequence().unwrap();
+        let any_p = proxies
+            .iter()
+            .find(|p| p["name"] == "Node-AnyTLS #1")
+            .unwrap();
+        assert_eq!(any_p["tfo"].as_bool(), Some(false));
+        assert_eq!(any_p["min-idle-session"].as_u64(), Some(0));
+        assert_eq!(any_p["idle-session-check-interval"].as_u64(), Some(30));
+        assert_eq!(any_p["idle-session-timeout"].as_u64(), Some(30));
+
+        let hy2_p = proxies.iter().find(|p| p["name"] == "Node-Hy2").unwrap();
+        assert_eq!(hy2_p["tfo"].as_bool(), Some(true));
+
+        // 2. All 6 added Tencent/WeChat/QCloud domains exist in QUIC direct bypass rules
+        let rules: Vec<&str> = compiled.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for dom in [
+            "qcloud.com",
+            "myqcloud.com",
+            "wechat.com",
+            "qcloudimg.com",
+            "tencentcs.com",
+            "tencent-cloud.net",
+        ] {
+            let expected = format!(
+                "AND,((NETWORK,UDP),(DST-PORT,443),(DOMAIN-SUFFIX,{dom})),DIRECT"
+            );
+            assert!(
+                rules.contains(&expected.as_str()),
+                "missing domestic QUIC direct rule for {dom}"
+            );
+        }
+
+        // 3. Overriding tun.mtu to 9000 with proxy-provider-only dialer still re-clamps to 1400.
+        cfg.preaccel.enabled = false;
+        cfg.rules_override.inline_override_yaml = Some(
+            r#"
+tun:
+  mtu: 9000
+proxy-providers:
+  ext_pool:
+    type: http
+    url: https://sub.private-corp.example/subscribe/SecretPath
+    override:
+      dialer-proxy: "Node-Hy2"
+"#
+            .to_string(),
+        );
+        let compiled_provider_only = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile provider-only dialer with mtu 9000");
+        assert_eq!(compiled_provider_only.value["tun"]["mtu"].as_u64(), Some(1400));
+        assert_eq!(compiled_provider_only.stats.effective_tun_mtu, 1400);
+        assert_eq!(compiled_provider_only.stats.dialer_wrapped_proxies, 1);
+    }
+
+    #[test]
+    fn transparent_gateway_decouples_desktop_geodata_and_redacts_scoped_urls_and_wg_endpoints_only() {
+        // Create a temporary fake desktop runtime_dir containing geosite.dat & Country.mmdb.
+        let fake_runtime = std::env::temp_dir().join(format!(
+            "catcloud-gw-geodata-decouple-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&fake_runtime).unwrap();
+        std::fs::write(fake_runtime.join("geosite.dat"), b"fake").unwrap();
+        std::fs::write(fake_runtime.join("Country.mmdb"), b"fake").unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.geodata.geodata_mode = true;
+        cfg.geodata.auto_update = true;
+        cfg.preaccel.enabled = true;
+        cfg.dns.nameserver = vec![
+            "https://dns.alidns.com/dns-query#DIRECT".to_string(),
+            "https://doh.pub/dns-query".to_string(),
+            "https://doh.my-private-corp.example/secret-profile-7788/dns-query#DIRECT".to_string(),
+            "dns.corp.internal:53".to_string(),
+            "dns.alidns.com:53".to_string(),
+            "system".to_string(),
+            "dhcp://system".to_string(),
+            "rcode://success".to_string(),
+        ];
+        cfg.rules_override.inline_override_yaml = Some(
+            r#"
+proxy-providers:
+  corp_sub:
+    type: http
+    url: https://sub.private-airport.example/api/v1/client/subscribe/SuperSecretPath99?token=xyz
+    path: ./providers/corp_sub.yaml
+rule-providers:
+  corp_rules:
+    type: http
+    behavior: domain
+    url: https://rules.private-corp.example/internal/ListSecretPath.yaml
+    path: ./rules/corp.yaml
+geox-url:
+  geoip: https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat
+"#
+            .to_string(),
+        );
+
+        let relays = vec![sample_relay("r1", "Relay #1", "203.0.113.10", 10)];
+        let mut wg_node = sample_node("n-wg", "WG Node #1", 51820, false);
+        wg_node.protocol = "wireguard".to_string();
+        wg_node.server = "wg-entry.private-wg.example".to_string();
+        wg_node.raw_config = serde_json::json!({
+            "name": "WG Node #1",
+            "type": "wireguard",
+            "server": "wg-entry.private-wg.example",
+            "port": 51820,
+            "private-key": "wg-priv-key-secret",
+            "peers": [
+                {
+                    "server": "peer-a.private-wg.example",
+                    "port": 51820,
+                    "endpoint": "wg-peer.private-wg.example:51820",
+                    "public-key": "wg-pub-key-secret"
+                }
+            ]
+        });
+
+        // Pass Some(&fake_runtime): TransparentGateway MUST still decouple from desktop GeoData.
+        let gw_redacted = export_gateway_yaml(
+            &cfg,
+            &[wg_node],
+            &[],
+            &relays,
+            Some(&fake_runtime),
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::TransparentGateway,
+                tproxy_port: 17893,
+                redir_port: 17892,
+                dns_listen_port: 11053,
+                redact_secrets: true,
+            },
+        )
+        .expect("export redacted transparent gateway");
+
+        let _ = std::fs::remove_dir_all(&fake_runtime);
+
+        // Must NOT emit GEOSITE,cn or GEOIP,CN despite desktop runtime_dir having GeoData files!
+        assert!(!gw_redacted.yaml.contains("GEOSITE,cn,DIRECT"));
+        assert!(!gw_redacted.yaml.contains("GEOIP,CN,DIRECT"));
+        // Must still contain conservative domestic direct fallback rules.
+        assert!(gw_redacted.yaml.contains("DOMAIN-SUFFIX,qq.com,DIRECT"));
+
+        // Scoped secrets MUST be redacted:
+        for leaked in [
+            "private-airport",
+            "SuperSecretPath99",
+            "rules.private-corp.example",
+            "ListSecretPath",
+            "my-private-corp",
+            "secret-profile-7788",
+            "dns.corp.internal",
+            "wg-peer.private-wg.example",
+            "wg-priv-key-secret",
+            "wg-pub-key-secret",
+        ] {
+            assert!(
+                !gw_redacted.yaml.contains(leaked),
+                "leaked `{leaked}` in redacted gateway YAML:\n{}",
+                gw_redacted.yaml
+            );
+        }
+
+        // Non-sensitive public endpoints, suffixes, and node `#1` names MUST remain intact!
+        let parsed: Value = serde_yaml_ng::from_str(&gw_redacted.yaml).expect("valid YAML");
+        assert_eq!(
+            parsed["geodata-mode"],
+            Value::Bool(false),
+            "transparent gateway export must disable geodata-mode"
+        );
+        assert_eq!(
+            parsed["geo-auto-update"],
+            Value::Bool(false),
+            "transparent gateway export must disable geo-auto-update"
+        );
+        let ns_list: Vec<&str> = parsed["dns"]["nameserver"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            ns_list.contains(&"https://dns.alidns.com/dns-query#DIRECT"),
+            "public DoH with #DIRECT suffix must stay intact: {ns_list:?}"
+        );
+        assert!(
+            ns_list.contains(&"https://doh.pub/dns-query#DIRECT")
+                || ns_list.contains(&"https://doh.pub/dns-query"),
+            "public DoH must stay intact: {ns_list:?}"
+        );
+        assert!(
+            ns_list.contains(&"https://***.example/<REDACTED>#DIRECT"),
+            "private DoH must redact host & path while keeping #DIRECT suffix: {ns_list:?}"
+        );
+        assert!(
+            ns_list.contains(&"***.internal:53"),
+            "bare private DNS domain with port must be redacted via redact_ip_or_host: {ns_list:?}"
+        );
+        assert!(
+            ns_list.contains(&"dns.alidns.com:53#DIRECT")
+                || ns_list.contains(&"dns.alidns.com:53"),
+            "allowlisted public bare DNS domain with port must stay intact: {ns_list:?}"
+        );
+        assert!(
+            ns_list.contains(&"system"),
+            "system DNS entry must stay intact: {ns_list:?}"
+        );
+        assert!(
+            ns_list.contains(&"dhcp://system"),
+            "dhcp:// DNS entry must stay intact: {ns_list:?}"
+        );
+        assert!(
+            ns_list.contains(&"rcode://success"),
+            "rcode:// DNS entry must stay intact: {ns_list:?}"
+        );
+        assert_eq!(
+            parsed["geox-url"]["geoip"].as_str(),
+            Some("https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geoip.dat"),
+            "geox-url must NOT be clobbered"
+        );
+        let group_urls: Vec<&str> = parsed["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|g| g.get("url").and_then(Value::as_str))
+            .collect();
+        assert!(
+            group_urls
+                .iter()
+                .any(|u| u.contains("connectivitycheck.platform.hicloud.com")),
+            "proxy-groups[].url must NOT be clobbered: {group_urls:?}"
+        );
+        assert!(
+            gw_redacted.yaml.contains("WG Node #1"),
+            "node name containing `#1` must NOT be corrupted"
+        );
     }
 }

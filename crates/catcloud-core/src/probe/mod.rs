@@ -40,6 +40,7 @@ use crate::models::{ProbeDefinition, ProbeKind, ProbeResultRecord, ProbeSnapshot
 use crate::process_guard::JobGuard;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use url::Url;
 
@@ -102,6 +103,19 @@ pub async fn run_single_probe(
     options: &FunnelOptions,
     job_guard: Option<&JobGuard>,
 ) -> CatResult<ProbeResultRecord> {
+    run_single_probe_with_client(def, node_id, proxy_port, options, job_guard, None).await
+}
+
+/// Internal probe runner allowing L2 throughput probes (`Upload`/`Download`) to share a warmed
+/// Keep-Alive `reqwest::Client` so Stage-1 avoids cold TCP/TLS handshake inflation.
+async fn run_single_probe_with_client(
+    def: &ProbeDefinition,
+    node_id: &str,
+    proxy_port: u16,
+    options: &FunnelOptions,
+    job_guard: Option<&JobGuard>,
+    shared_client: Option<&reqwest::Client>,
+) -> CatResult<ProbeResultRecord> {
     validate_definition(def)?;
 
     if def.kind == ProbeKind::ExternalCmd {
@@ -146,12 +160,20 @@ pub async fn run_single_probe(
             Ok(run_unlock_regex_probe(&client, node_id, def).await)
         }
         ProbeKind::Upload => {
-            let client = build_client_for_mode(proxy_port, timeout, options, true, None)?;
-            Ok(run_upload_probe_with_config(&client, node_id, def, &options.throughput).await)
+            if let Some(client) = shared_client {
+                Ok(run_upload_probe_with_config(client, node_id, def, &options.throughput).await)
+            } else {
+                let client = build_client_for_mode(proxy_port, timeout, options, true, None)?;
+                Ok(run_upload_probe_with_config(&client, node_id, def, &options.throughput).await)
+            }
         }
         ProbeKind::Download => {
-            let client = build_client_for_mode(proxy_port, timeout, options, true, None)?;
-            Ok(run_download_probe_with_config(&client, node_id, def, &options.throughput).await)
+            if let Some(client) = shared_client {
+                Ok(run_download_probe_with_config(client, node_id, def, &options.throughput).await)
+            } else {
+                let client = build_client_for_mode(proxy_port, timeout, options, true, None)?;
+                Ok(run_download_probe_with_config(&client, node_id, def, &options.throughput).await)
+            }
         }
         ProbeKind::Keepalive => {
             let max_interval = options
@@ -166,6 +188,80 @@ pub async fn run_single_probe(
             Ok(run_keepalive_probe(&client, node_id, def, &options.keepalive_intervals).await)
         }
         ProbeKind::ExternalCmd => unreachable!("handled above"),
+    }
+}
+
+fn build_probe_kind_map(registry: &ProbeRegistry) -> HashMap<String, ProbeKind> {
+    registry
+        .list()
+        .into_iter()
+        .map(|def| (def.id.clone(), def.kind.clone()))
+        .collect()
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1")
+}
+
+/// Build a lightweight same-origin warmup request `(method, url)` for non-loopback L2 throughput
+/// probes. For `speed.cloudflare.com`, uses `GET /__down?bytes=1`; for other non-loopback hosts,
+/// uses `HEAD` against the origin root so TCP/TLS sockets enter the shared Keep-Alive pool.
+pub(crate) fn build_l2_warmup_request(target_url: &str) -> Option<(reqwest::Method, String, String)> {
+    let parsed = Url::parse(target_url.trim()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if is_loopback_host(host) {
+        return None;
+    }
+    let port_part = parsed
+        .port()
+        .map(|p| format!(":{p}"))
+        .unwrap_or_default();
+    let origin = format!("{}://{}{}", parsed.scheme(), host, port_part);
+    if host.eq_ignore_ascii_case("speed.cloudflare.com") {
+        Some((
+            reqwest::Method::GET,
+            format!("{origin}/__down?bytes=1"),
+            origin,
+        ))
+    } else {
+        Some((reqwest::Method::HEAD, format!("{origin}/"), origin))
+    }
+}
+
+/// Best-effort 3-second Keep-Alive connection warmup for L2 throughput probes using the same
+/// shared `reqwest::Client`. Never blocks or aborts subsequent probes on failure/timeout.
+async fn warm_l2_throughput_client(client: &reqwest::Client, l2_defs: &[&ProbeDefinition]) {
+    let mut warmed_origins: HashSet<String> = HashSet::new();
+    for def in l2_defs {
+        if !matches!(def.kind, ProbeKind::Upload | ProbeKind::Download) {
+            continue;
+        }
+        let Some((method, warmup_url, origin_key)) = build_l2_warmup_request(&def.target_url) else {
+            continue;
+        };
+        if !warmed_origins.insert(origin_key) {
+            continue;
+        }
+        let warmup_fut = async {
+            if let Ok(mut resp) = client
+                .request(method, &warmup_url)
+                .timeout(Duration::from_secs(3))
+                .send()
+                .await
+            {
+                let mut drained = 0usize;
+                while drained < 4096 {
+                    match resp.chunk().await {
+                        Ok(Some(chunk)) if !chunk.is_empty() => drained += chunk.len(),
+                        _ => break,
+                    }
+                }
+            }
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(3), warmup_fut).await;
     }
 }
 
@@ -188,6 +284,7 @@ pub async fn run_funnel_for_node(
         ));
     }
 
+    let probe_kinds = build_probe_kind_map(registry);
     let mut records: Vec<ProbeResultRecord> = Vec::new();
     let mut reached_tier = FunnelTier::L0Connectivity;
 
@@ -197,7 +294,8 @@ pub async fn run_funnel_for_node(
     let l0_defs = registry.select_funnel_tier(FunnelTier::L0Connectivity);
     let mut l0_any_ok = false;
     for def in &l0_defs {
-        let rec = execute_or_capture_error(def, node_id, proxy_port, options, job_guard).await?;
+        let rec =
+            execute_or_capture_error(def, node_id, proxy_port, options, job_guard, None).await?;
         if rec.ok {
             l0_any_ok = true;
         }
@@ -205,7 +303,8 @@ pub async fn run_funnel_for_node(
     }
 
     if !l0_defs.is_empty() && !l0_any_ok && options.short_circuit_on_l0_failure {
-        let snapshot = ProbeSnapshot::from_results(node_id, &records, primary_probe_id);
+        let snapshot =
+            ProbeSnapshot::from_results_with_kinds(node_id, &records, primary_probe_id, &probe_kinds);
         return Ok(FunnelRunReport {
             node_id: node_id.to_string(),
             reached_tier,
@@ -217,7 +316,8 @@ pub async fn run_funnel_for_node(
     }
 
     if options.max_tier == FunnelTier::L0Connectivity {
-        let snapshot = ProbeSnapshot::from_results(node_id, &records, primary_probe_id);
+        let snapshot =
+            ProbeSnapshot::from_results_with_kinds(node_id, &records, primary_probe_id, &probe_kinds);
         return Ok(FunnelRunReport {
             node_id: node_id.to_string(),
             reached_tier,
@@ -235,7 +335,8 @@ pub async fn run_funnel_for_node(
     let l1_defs = registry.select_funnel_tier(FunnelTier::L1CleanAndUnlock);
     let mut google_dirty = false;
     for def in &l1_defs {
-        let rec = execute_or_capture_error(def, node_id, proxy_port, options, job_guard).await?;
+        let rec =
+            execute_or_capture_error(def, node_id, proxy_port, options, job_guard, None).await?;
         if rec.google_clean == Some(false) {
             google_dirty = true;
         }
@@ -243,7 +344,8 @@ pub async fn run_funnel_for_node(
     }
 
     if google_dirty && options.short_circuit_on_google_dirty {
-        let snapshot = ProbeSnapshot::from_results(node_id, &records, primary_probe_id);
+        let snapshot =
+            ProbeSnapshot::from_results_with_kinds(node_id, &records, primary_probe_id, &probe_kinds);
         return Ok(FunnelRunReport {
             node_id: node_id.to_string(),
             reached_tier,
@@ -255,7 +357,8 @@ pub async fn run_funnel_for_node(
     }
 
     if options.max_tier == FunnelTier::L1CleanAndUnlock {
-        let snapshot = ProbeSnapshot::from_results(node_id, &records, primary_probe_id);
+        let snapshot =
+            ProbeSnapshot::from_results_with_kinds(node_id, &records, primary_probe_id, &probe_kinds);
         return Ok(FunnelRunReport {
             node_id: node_id.to_string(),
             reached_tier,
@@ -267,16 +370,46 @@ pub async fn run_funnel_for_node(
     }
 
     // -------------------------------------------------------------------------
-    // Tier L2: Upload/Download throughput (512 KiB fast fuse), Keep-Alive, ExternalCmd
+    // Tier L2: Upload/Download throughput (512 KiB fast fuse + shared Keep-Alive client),
+    // Keep-Alive, ExternalCmd
     // -------------------------------------------------------------------------
     reached_tier = FunnelTier::L2ThroughputAndKeepalive;
     let l2_defs = registry.select_funnel_tier(FunnelTier::L2ThroughputAndKeepalive);
+    let max_tp_timeout_ms = l2_defs
+        .iter()
+        .filter(|d| matches!(d.kind, ProbeKind::Upload | ProbeKind::Download))
+        .map(|d| d.timeout_ms.max(MIN_TIMEOUT_MS))
+        .max();
+    let shared_l2_client = if let Some(tp_timeout_ms) = max_tp_timeout_ms {
+        let client = build_client_for_mode(
+            proxy_port,
+            Duration::from_millis(tp_timeout_ms),
+            options,
+            true,
+            Some(Duration::from_secs(30)),
+        )?;
+        if !options.bypass_proxy_for_loopback_test {
+            warm_l2_throughput_client(&client, &l2_defs).await;
+        }
+        Some(client)
+    } else {
+        None
+    };
+
     for def in &l2_defs {
-        let rec = execute_or_capture_error(def, node_id, proxy_port, options, job_guard).await?;
+        let tp_client = if matches!(def.kind, ProbeKind::Upload | ProbeKind::Download) {
+            shared_l2_client.as_ref()
+        } else {
+            None
+        };
+        let rec =
+            execute_or_capture_error(def, node_id, proxy_port, options, job_guard, tp_client)
+                .await?;
         records.push(rec);
     }
 
-    let snapshot = ProbeSnapshot::from_results(node_id, &records, primary_probe_id);
+    let snapshot =
+        ProbeSnapshot::from_results_with_kinds(node_id, &records, primary_probe_id, &probe_kinds);
     Ok(FunnelRunReport {
         node_id: node_id.to_string(),
         reached_tier,
@@ -293,8 +426,11 @@ async fn execute_or_capture_error(
     proxy_port: u16,
     options: &FunnelOptions,
     job_guard: Option<&JobGuard>,
+    shared_client: Option<&reqwest::Client>,
 ) -> CatResult<ProbeResultRecord> {
-    match run_single_probe(def, node_id, proxy_port, options, job_guard).await {
+    match run_single_probe_with_client(def, node_id, proxy_port, options, job_guard, shared_client)
+        .await
+    {
         Ok(rec) => Ok(rec),
         Err(CatError::Security(msg)) => Err(CatError::Security(msg)),
         Err(err) => Ok(ProbeResultRecord {
@@ -965,6 +1101,11 @@ mod tests {
         let fused_up = run_upload_probe_with_config(&client, "n1", &slow_up, &strict_cfg).await;
         assert!(!fused_up.ok);
         assert!(
+            fused_up.up_mbps.is_none(),
+            "fast_fuse upload must clear up_mbps to None, got {:?}",
+            fused_up.up_mbps
+        );
+        assert!(
             fused_up
                 .detail
                 .as_deref()
@@ -981,6 +1122,11 @@ mod tests {
         let fused_down =
             run_download_probe_with_config(&client, "n1", &slow_down, &strict_cfg).await;
         assert!(!fused_down.ok);
+        assert!(
+            fused_down.down_mbps.is_none(),
+            "fast_fuse download must clear down_mbps to None, got {:?}",
+            fused_down.down_mbps
+        );
         assert!(
             fused_down
                 .detail
@@ -1186,6 +1332,75 @@ mod tests {
             counters.l1_hits.load(Ordering::SeqCst),
             l1_before,
             "L1 must not be invoked when L0 short-circuits"
+        );
+    }
+
+    #[tokio::test]
+    async fn l2_throughput_shares_keepalive_client_and_warmup_skips_loopback() {
+        // 1. Warmup URL helper maps speed.cloudflare.com -> /__down?bytes=1, custom host -> HEAD /,
+        //    and strictly skips loopback addresses.
+        let (cf_method, cf_url, _) =
+            build_l2_warmup_request("https://speed.cloudflare.com/__up").expect("cf warmup");
+        assert_eq!(cf_method, reqwest::Method::GET);
+        assert_eq!(cf_url, "https://speed.cloudflare.com/__down?bytes=1");
+
+        let (custom_method, custom_url, _) =
+            build_l2_warmup_request("https://speed.example.invalid/upload").expect("custom warmup");
+        assert_eq!(custom_method, reqwest::Method::HEAD);
+        assert_eq!(custom_url, "https://speed.example.invalid/");
+
+        assert!(build_l2_warmup_request("http://127.0.0.1:8080/__up").is_none());
+        assert!(build_l2_warmup_request("http://localhost:8080/__down").is_none());
+
+        // 2. Funnel L2 Upload + Download share a single Keep-Alive TCP connection on local mock.
+        let (port, counters) = spawn_local_probe_mock_server().await;
+        let mut reg = ProbeRegistry::new();
+        reg.register(ProbeDefinition {
+            id: "l2_up".to_string(),
+            name: "Shared Upload".to_string(),
+            kind: ProbeKind::Upload,
+            target_url: format!("http://127.0.0.1:{port}/__up"),
+            method: "POST".to_string(),
+            expected_status: Some(200),
+            payload_bytes: Some(512 * 1024),
+            timeout_ms: 4000,
+            ..Default::default()
+        })
+        .unwrap();
+        reg.register(ProbeDefinition {
+            id: "l2_down".to_string(),
+            name: "Shared Download".to_string(),
+            kind: ProbeKind::Download,
+            target_url: format!("http://127.0.0.1:{port}/__down?bytes=524288"),
+            method: "GET".to_string(),
+            expected_status: Some(200),
+            payload_bytes: Some(512 * 1024),
+            timeout_ms: 4000,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let opts = FunnelOptions {
+            max_tier: FunnelTier::L2ThroughputAndKeepalive,
+            bypass_proxy_for_loopback_test: true,
+            ..Default::default()
+        };
+
+        let conns_before = counters.accepted_conns.load(Ordering::SeqCst);
+        let report = run_funnel_for_node(&reg, "node-shared-l2", 0, &opts, None, None)
+            .await
+            .expect("shared L2 funnel run");
+        assert_eq!(report.records.len(), 2);
+        assert!(report.snapshot.up_mbps.unwrap_or(0.0) > 0.2);
+        assert!(report.snapshot.down_mbps.unwrap_or(0.0) > 0.2);
+        assert!(
+            report.snapshot.latency_ms.is_none(),
+            "L2 throughput probes must NOT populate top-level latency_ms"
+        );
+        assert_eq!(
+            counters.accepted_conns.load(Ordering::SeqCst) - conns_before,
+            1,
+            "L2 upload and download must reuse a single shared Keep-Alive connection"
         );
     }
 }

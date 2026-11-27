@@ -101,6 +101,14 @@ fn standard_fallback_root() -> PathBuf {
 }
 
 fn main() {
+    // 0. Fast-path `--shutdown-existing` strictly BEFORE any path creation (`AppPaths::resolve`,
+    //    write probes, or WebView2 user-data directory creation) so invoking shutdown against an
+    //    uninitialized or nonexistent data directory leaves zero empty directories behind.
+    if catcloud_desktop_lib::has_shutdown_existing_cli_flag() {
+        let _ = catcloud_desktop_lib::handle_shutdown_existing_readonly();
+        return;
+    }
+
     // 1. Install Rustls ring CryptoProvider before any thread or network stack initializes.
     catcloud_core::init_crypto_provider();
 

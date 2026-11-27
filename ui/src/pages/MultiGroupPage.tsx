@@ -33,6 +33,7 @@ import {
   type GroupEvaluationReport,
   type MultiGroup,
   type MultiGroupMode,
+  type NodeHealthHint,
   type ProbeSnapshot,
   type ProxyNode,
   type TriggerRule,
@@ -42,12 +43,21 @@ import {
 } from "../api/tauri";
 import { AppSelect } from "../components/AppSelect";
 import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
+import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import {
   appActions,
   appStore,
   selectIsProbeEngineBusy,
   useAppSelector,
 } from "../store/appStore";
+import {
+  MISSING_LATENCY_PENALTY_MS,
+  type ResolvedNodeLatency,
+  getLatencyTooltipKey,
+  hasValidDownMbps,
+  hasValidUpMbps,
+  resolveNodeDisplayLatency,
+} from "../utils/latencyDisplay";
 import {
   type ContinentId,
   buildContinentRegionStats,
@@ -67,7 +77,7 @@ const FORMULA_COST_EFFECTIVE =
 const FORMULA_MAX_PERF =
   "up_mbps * 45 + min(down_mbps, 200) * 0.35 - ping_ms * 0.1";
 
-const DEFAULT_MISSING_PING_MS = 9999;
+const DEFAULT_MISSING_PING_MS = MISSING_LATENCY_PENALTY_MS;
 const EPSILON_ZERO = 1e-12;
 const EPSILON_EQ = 1e-9;
 const NODE_PAGE_SIZE_OPTIONS = [24, 48, 96] as const;
@@ -1027,13 +1037,20 @@ function buildEvalContextForNode(node: ProxyNode, snap: ProbeSnapshot | undefine
   const unlockedEntries = snap ? Object.values(snap.unlocked_sites) : [];
   const allUnlocked = unlockedEntries.length > 0 && unlockedEntries.every(Boolean);
   const ok = snap?.ok ?? false;
+  const validLatencyMs =
+    typeof snap?.latency_ms === "number" &&
+    Number.isFinite(snap.latency_ms) &&
+    snap.latency_ms > 0
+      ? snap.latency_ms
+      : null;
+  const effectivePingMs = validLatencyMs ?? MISSING_LATENCY_PENALTY_MS;
 
   return {
     vars: {
       up_mbps: snap?.up_mbps ?? 0,
       down_mbps: snap?.down_mbps ?? 0,
-      ping_ms: snap?.latency_ms ?? (ok ? 0 : DEFAULT_MISSING_PING_MS),
-      latency_ms: snap?.latency_ms ?? (ok ? 0 : DEFAULT_MISSING_PING_MS),
+      ping_ms: effectivePingMs,
+      latency_ms: effectivePingMs,
       jitter_ms: snap?.jitter_ms ?? 0,
       loss_pct: snap?.loss_pct ?? (ok ? 0 : 100),
       multiplier: Number.isFinite(node.multiplier) && node.multiplier >= 0 ? node.multiplier : 1,
@@ -1185,8 +1202,55 @@ let multiGroupDraftCache: MultiGroupDraftCache = {
   triggerMetas: {},
 };
 
+function formatGroupLatencyTooltip(
+  resolved: ResolvedNodeLatency,
+  dict: ReturnType<typeof useUiDict>,
+  hint?: NodeHealthHint | null
+): string {
+  const tipKey = getLatencyTooltipKey(resolved);
+  const base =
+    tipKey === "probeHot"
+      ? dict.latency.probeHotTooltip
+      : tipKey === "healthCold"
+        ? dict.latency.healthColdTooltip
+        : tipKey === "failed"
+          ? dict.latency.failedTooltip
+          : dict.latency.untestedTooltip;
+  const tags: string[] = [];
+  if (resolved.isProbation) tags.push(dict.latency.probationBadge);
+  if (resolved.isDegraded) tags.push(dict.latency.degradedBadge);
+  if (hint?.status === "cooldown" && hint.cooldown_remaining_sec > 0) {
+    tags.push(
+      formatI18nTemplate(dict.latency.cooldownSec, {
+        sec: Math.ceil(hint.cooldown_remaining_sec),
+      })
+    );
+  }
+  return tags.length > 0 ? `${base} · ${tags.join(" · ")}` : base;
+}
+
+const isStringPref = (raw: unknown): string | undefined =>
+  typeof raw === "string" ? raw : undefined;
+
+const MULTIGROUP_CONTINENT_VALIDATOR = oneOfPref([
+  "all",
+  "common",
+  "asia",
+  "middle_east",
+  "europe",
+  "north_america",
+  "south_america",
+  "oceania",
+  "africa",
+  "other",
+] as const);
+
 export function MultiGroupPage() {
   const storeGroups = useAppSelector((s) => s.groups);
+  const uiLang = useAppSelector((s) =>
+    normalizeUiLanguage(s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
   const subscriptions = useAppSelector((s) => s.subscriptions);
@@ -1232,13 +1296,29 @@ export function MultiGroupPage() {
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deletingGroupId, setDeletingGroupId] = useState<string | null>(null);
 
-  // Center pane: inline rename, filters, pagination, batch clear confirm, single-node actions
+  // Center pane: inline rename, filters (persisted across tab switches & reloads), pagination, batch clear confirm, single-node actions
   const [editingName, setEditingName] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
-  const [selectedSubId, setSelectedSubId] = useState<string>("all");
-  const [filterContinent, setFilterContinent] = useState<ContinentId>("all");
-  const [filterRegion, setFilterRegion] = useState<string>("all");
-  const [searchQuery, setSearchQuery] = useState("");
+  const [selectedSubId, setSelectedSubId] = usePersistedState<string>(
+    "multigroup.selectedSubId",
+    "all",
+    isStringPref
+  );
+  const [filterContinent, setFilterContinent] = usePersistedState<ContinentId>(
+    "multigroup.filterContinent",
+    "all",
+    MULTIGROUP_CONTINENT_VALIDATOR
+  );
+  const [filterRegion, setFilterRegion] = usePersistedState<string>(
+    "multigroup.filterRegion",
+    "all",
+    isStringPref
+  );
+  const [searchQuery, setSearchQuery] = usePersistedState<string>(
+    "multigroup.searchQuery",
+    "",
+    isStringPref
+  );
   const [viewMode, setViewMode] = usePersistedState<NodeViewMode>(
     "multigroup.viewMode",
     "all",
@@ -1249,8 +1329,16 @@ export function MultiGroupPage() {
     "default",
     oneOfPref(["default", "up_desc", "down_desc", "latency_asc"] as const)
   );
-  const [filterGoogleClean, setFilterGoogleClean] = useState(false);
-  const [filterAiReady, setFilterAiReady] = useState(false);
+  const [filterGoogleClean, setFilterGoogleClean] = usePersistedState<boolean>(
+    "multigroup.filterGoogleClean",
+    false,
+    isBoolPref
+  );
+  const [filterAiReady, setFilterAiReady] = usePersistedState<boolean>(
+    "multigroup.filterAiReady",
+    false,
+    isBoolPref
+  );
   const [nodePage, setNodePage] = useState(1);
   const [nodePageSize, setNodePageSize] = usePersistedState<number>(
     "multigroup.pageSize",
@@ -1344,6 +1432,7 @@ export function MultiGroupPage() {
         if (local && dirtyGroupIdsRef.current[sg.id]) {
           return {
             ...local,
+            name: sg.name,
             member_node_ids: latestMembersRef.current[sg.id] ?? sg.member_node_ids,
             active_node_id: sg.active_node_id,
           };
@@ -1600,41 +1689,45 @@ export function MultiGroupPage() {
     const pinnedActive = usePinned ? pinnedOrder.activeId : null;
     const pinnedMembers = usePinned ? pinnedOrder.memberIds : null;
 
+    const healthHints = runtime.node_health_hints;
     const getMetricRank = (
+      nodeId: string,
       snap: ProbeSnapshot | undefined
     ): { tier: number; primary: number; secondary: number } => {
-      if (!snap) return { tier: 2, primary: 0, secondary: 99999 };
-      if (!snap.ok) return { tier: 3, primary: 0, secondary: 99999 };
-      const lat =
-        typeof snap.latency_ms === "number" && Number.isFinite(snap.latency_ms)
-          ? snap.latency_ms
-          : 99999;
+      const resolved = resolveNodeDisplayLatency(snap, healthHints?.[nodeId]);
+      if (resolved.state === "untested" && !snap) {
+        return { tier: 2, primary: 0, secondary: MISSING_LATENCY_PENALTY_MS };
+      }
+      if (resolved.state === "failed") {
+        return { tier: 3, primary: 0, secondary: MISSING_LATENCY_PENALTY_MS };
+      }
+      const lat = resolved.latencyMs ?? MISSING_LATENCY_PENALTY_MS;
+      const validUp = hasValidUpMbps(snap) ? snap!.up_mbps! : null;
+      const validDown = hasValidDownMbps(snap) ? snap!.down_mbps! : null;
       if (sortMode === "up_desc") {
-        if (typeof snap.up_mbps === "number" && Number.isFinite(snap.up_mbps)) {
-          return { tier: 0, primary: -snap.up_mbps, secondary: lat };
+        if (validUp !== null) {
+          return { tier: 0, primary: -validUp, secondary: lat };
         }
         return { tier: 1, primary: lat, secondary: 0 };
       }
       if (sortMode === "down_desc") {
-        if (typeof snap.down_mbps === "number" && Number.isFinite(snap.down_mbps)) {
-          return { tier: 0, primary: -snap.down_mbps, secondary: lat };
+        if (validDown !== null) {
+          return { tier: 0, primary: -validDown, secondary: lat };
         }
         return { tier: 1, primary: lat, secondary: 0 };
       }
       // latency_asc
-      if (typeof snap.latency_ms === "number" && Number.isFinite(snap.latency_ms)) {
-        const up =
-          typeof snap.up_mbps === "number" && Number.isFinite(snap.up_mbps) ? snap.up_mbps : -1;
-        return { tier: 0, primary: snap.latency_ms, secondary: -up };
+      if (resolved.latencyMs !== null) {
+        return { tier: 0, primary: resolved.latencyMs, secondary: -(validUp ?? -1) };
       }
-      return { tier: 1, primary: 99999, secondary: 0 };
+      return { tier: 1, primary: MISSING_LATENCY_PENALTY_MS, secondary: 0 };
     };
 
     const sorted = [...list];
     sorted.sort((a, b) => {
       if (sortMode !== "default") {
-        const ra = getMetricRank(activeFilterProbes?.[a.id]);
-        const rb = getMetricRank(activeFilterProbes?.[b.id]);
+        const ra = getMetricRank(a.id, activeFilterProbes?.[a.id]);
+        const rb = getMetricRank(b.id, activeFilterProbes?.[b.id]);
         if (ra.tier !== rb.tier) return ra.tier - rb.tier;
         if (ra.primary !== rb.primary) return ra.primary - rb.primary;
         if (ra.secondary !== rb.secondary) return ra.secondary - rb.secondary;
@@ -1644,10 +1737,16 @@ export function MultiGroupPage() {
         const aAct = memberActiveId === a.id ? 1 : 0;
         const bAct = memberActiveId === b.id ? 1 : 0;
         if (aAct !== bAct) return bAct - aAct;
-        const aSnap = activeFilterProbes?.[a.id];
-        const bSnap = activeFilterProbes?.[b.id];
-        const aLat = aSnap?.ok ? (aSnap.latency_ms ?? 99999) : 99999;
-        const bLat = bSnap?.ok ? (bSnap.latency_ms ?? 99999) : 99999;
+        const aRes = resolveNodeDisplayLatency(
+          activeFilterProbes?.[a.id],
+          healthHints?.[a.id]
+        );
+        const bRes = resolveNodeDisplayLatency(
+          activeFilterProbes?.[b.id],
+          healthHints?.[b.id]
+        );
+        const aLat = aRes.ok && aRes.latencyMs !== null ? aRes.latencyMs : MISSING_LATENCY_PENALTY_MS;
+        const bLat = bRes.ok && bRes.latencyMs !== null ? bRes.latencyMs : MISSING_LATENCY_PENALTY_MS;
         if (aLat !== bLat) return aLat - bLat;
         return a.name.localeCompare(b.name);
       }
@@ -1676,6 +1775,7 @@ export function MultiGroupPage() {
     selectedGroupId,
     memberActiveId,
     activeFilterProbes,
+    runtime.node_health_hints,
   ]);
 
   const totalNodePages = Math.max(1, Math.ceil(filteredNodes.length / nodePageSize));
@@ -1944,6 +2044,40 @@ export function MultiGroupPage() {
     );
   };
 
+  const hasProtectedActiveMember = Boolean(
+    selectedGroup &&
+      ((selectedGroup.active_node_id &&
+        selectedGroup.member_node_ids.includes(selectedGroup.active_node_id)) ||
+        (runtime.active_node_id &&
+          selectedGroup.member_node_ids.includes(runtime.active_node_id)))
+  );
+
+  useEffect(() => {
+    setConfirmClearMembers(false);
+    if (clearConfirmTimerRef.current !== null) {
+      window.clearTimeout(clearConfirmTimerRef.current);
+      clearConfirmTimerRef.current = null;
+    }
+  }, [selectedGroupId]);
+
+  const handleCancelClearGroupMembers = () => {
+    setConfirmClearMembers(false);
+    if (clearConfirmTimerRef.current !== null) {
+      window.clearTimeout(clearConfirmTimerRef.current);
+      clearConfirmTimerRef.current = null;
+    }
+  };
+
+  const handleConfirmClearGroupMembers = () => {
+    if (!selectedGroup || selectedGroup.member_node_ids.length === 0) return;
+    handleCancelClearGroupMembers();
+    void persistGroupMembers(
+      selectedGroup.id,
+      [],
+      `已清空「${formatGroupDisplayName(selectedGroup.name)}」中的节点`
+    );
+  };
+
   const handleClearGroupMembers = () => {
     if (!selectedGroup || selectedGroup.member_node_ids.length === 0) return;
     if (!confirmClearMembers) {
@@ -1951,18 +2085,15 @@ export function MultiGroupPage() {
       if (clearConfirmTimerRef.current !== null) {
         window.clearTimeout(clearConfirmTimerRef.current);
       }
-      clearConfirmTimerRef.current = window.setTimeout(() => {
-        setConfirmClearMembers(false);
-        clearConfirmTimerRef.current = null;
-      }, 3500);
+      if (!hasProtectedActiveMember) {
+        clearConfirmTimerRef.current = window.setTimeout(() => {
+          setConfirmClearMembers(false);
+          clearConfirmTimerRef.current = null;
+        }, 3500);
+      }
       return;
     }
-    setConfirmClearMembers(false);
-    void persistGroupMembers(
-      selectedGroup.id,
-      [],
-      `已清空「${formatGroupDisplayName(selectedGroup.name)}」中的节点`
-    );
+    handleConfirmClearGroupMembers();
   };
 
   const handleSwitchNextBestInGroup = async () => {
@@ -2096,16 +2227,37 @@ export function MultiGroupPage() {
       return;
     }
 
-    const updated: MultiGroup = { ...selectedGroup, name: trimmed };
+    const wasDirty = Boolean(dirtyGroupIds[selectedGroup.id]);
+    const persistedBase =
+      storeGroups.find((g) => g.id === selectedGroup.id) ?? selectedGroup;
+    const latestMembers =
+      latestMembersRef.current[selectedGroup.id] ?? persistedBase.member_node_ids;
+    const renamePayloadSource: MultiGroup = {
+      ...persistedBase,
+      member_node_ids: latestMembers,
+      name: trimmed,
+    };
+
     try {
-      const payload = normalizeGroupForBackend(updated, currentTriggerMeta);
+      const payload = wasDirty
+        ? renamePayloadSource
+        : normalizeGroupForBackend(renamePayloadSource, currentTriggerMeta);
       const saved = await catcloudApi.upsertMultiGroup(payload);
-      setGroups((prev) => {
-        const next = prev.map((g) => (g.id === saved.id ? saved : g));
-        appActions.syncGroups(next);
-        return next;
-      });
-      setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
+      appActions.syncGroups(
+        appStore
+          .getState()
+          .groups.map((g) => (g.id === saved.id ? saved : g))
+      );
+      setGroups((prev) =>
+        prev.map((g) => {
+          if (g.id !== saved.id) return g;
+          // Preserve unsaved strategy form drafts and dirty flag when only renaming
+          return wasDirty ? { ...g, name: saved.name } : saved;
+        })
+      );
+      if (!wasDirty) {
+        setDirtyGroupIds((prev) => ({ ...prev, [saved.id]: false }));
+      }
       appActions.showToast(`已重命名为：${formatGroupDisplayName(saved.name)}`, "ok");
     } catch (err) {
       appActions.showToast(`重命名失败：${formatErrorMessage(err)}`, "warn");
@@ -2332,7 +2484,7 @@ export function MultiGroupPage() {
    * ============================================================================ */
 
   return (
-    <div className="flex min-h-[calc(100vh-2rem)] flex-col gap-3.5 lg:flex-row lg:items-stretch">
+    <div className="flex min-h-[calc(100vh-4.25rem)] flex-col gap-3.5 lg:flex-row lg:items-stretch">
       {/* =====================================================================
           COLUMN 1: LEFT SIDEBAR (216px/232px) — Create Group & Existing Groups List
          ===================================================================== */}
@@ -2956,11 +3108,45 @@ export function MultiGroupPage() {
                         : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--red)]/50 hover:text-[var(--red)]"
                     }`}
                   >
-                    {confirmClearMembers ? "再点一次确认清空" : "清空本组"}
+                    {confirmClearMembers
+                      ? hasProtectedActiveMember
+                        ? dict.groups.confirmBelowHint
+                        : "再点一次确认清空"
+                      : "清空本组"}
                   </button>
                 )}
               </div>
             </div>
+
+            {confirmClearMembers && hasProtectedActiveMember && (
+              <div
+                role="alert"
+                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/55 bg-[var(--amber-soft)]/75 px-3 py-2 text-xs"
+              >
+                <div className="flex min-w-0 flex-1 items-start gap-2 text-[var(--amber)]">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                  <span className="leading-relaxed">
+                    {dict.groups.clearActiveProtectedConfirm}
+                  </span>
+                </div>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={handleCancelClearGroupMembers}
+                    className="rounded-lg border border-[var(--line)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text)]"
+                  >
+                    {dict.common.cancel}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleConfirmClearGroupMembers}
+                    className="rounded-lg bg-[var(--red)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                  >
+                    {dict.groups.confirmClear}
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Compact Legend & Match Count Row */}
             <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
@@ -3044,32 +3230,37 @@ export function MultiGroupPage() {
                 const isMember = memberIdSet.has(node.id);
                 const snap = probes[node.id];
                 const healthHint = runtime.node_health_hints?.[node.id];
-                const liveHintLatencyMs =
-                  healthHint &&
-                  typeof healthHint.latency_ms === "number" &&
-                  Number.isFinite(healthHint.latency_ms) &&
-                  healthHint.latency_ms > 0
-                    ? healthHint.latency_ms
+                const resolvedLat = resolveNodeDisplayLatency(snap, healthHint);
+                const latTooltip = formatGroupLatencyTooltip(resolvedLat, dict, healthHint);
+                const latSourceShort =
+                  resolvedLat.latencyMs !== null
+                    ? resolvedLat.source === "health"
+                      ? dict.latency.sourceHealthShort
+                      : resolvedLat.source === "probe"
+                        ? dict.latency.sourceProbeShort
+                        : null
                     : null;
                 const healthBadge =
-                  healthHint?.status === "cooldown"
+                  healthHint?.status === "cooldown" && resolvedLat.state === "failed"
                     ? {
                         label:
                           healthHint.cooldown_remaining_sec > 0
-                            ? `冷却 ${Math.ceil(healthHint.cooldown_remaining_sec)}s`
-                            : "临时冷却",
+                            ? formatI18nTemplate(dict.latency.cooldownSec, {
+                                sec: Math.ceil(healthHint.cooldown_remaining_sec),
+                              })
+                            : dict.latency.cooldownActive,
                         cls: "bg-[var(--red-soft)]/80 text-[var(--red)]",
-                        title: "近期连续探活失败，暂时降权冷却，到期将自动低频复检恢复",
+                        title: dict.latency.cooldownHint,
                       }
-                    : healthHint?.status === "probation"
+                    : resolvedLat.isProbation
                       ? {
-                          label: "恢复确认中",
+                          label: dict.latency.probationBadge,
                           cls: "bg-[var(--sky-soft)] text-[var(--sky)]",
                           title: "刚从冷却恢复，正处于观察期，持续稳定后自动恢复正常权重",
                         }
-                      : healthHint?.status === "degraded"
+                      : resolvedLat.isDegraded
                         ? {
-                            label: "轻微波动",
+                            label: dict.latency.degradedBadge,
                             cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
                             title: "最近探活出现轻微抖动或单源波动，后台正持续观察",
                           }
@@ -3205,93 +3396,64 @@ export function MultiGroupPage() {
                       })()}
                     </div>
 
-                    {/* Bottom row: gentle probe status + live health pool hint + 2 quick actions ("测" & "用它") */}
+                    {/* Bottom row: unified latency resolver + throughput + gate status + live health pool hint + 2 quick actions ("测" & "用它") */}
                     <div className="flex items-center justify-between gap-2 pt-0.5">
                       <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px]">
-                        {liveHintLatencyMs !== null ? (
-                          <>
-                            <span
-                              title="后台轻探活最新延迟"
-                              className="cc-mono cc-tabular font-semibold"
-                              style={{ color: formatLatencyTone(liveHintLatencyMs) }}
-                            >
-                              {Math.round(liveHintLatencyMs)} ms
-                            </span>
-                            {snap?.up_mbps !== null && snap?.up_mbps !== undefined && (
-                              <span
-                                title="实测上传速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
-                                className="cc-mono cc-tabular text-[10px] text-[var(--coral)]"
-                              >
-                                ↑{snap.up_mbps.toFixed(1)} Mbps
-                              </span>
-                            )}
-                            {snap?.down_mbps !== null && snap?.down_mbps !== undefined && (
-                              <span
-                                title="实测下载速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
-                                className="cc-mono cc-tabular text-[10px] text-[var(--sky)]"
-                              >
-                                ↓
-                                {snap.down_mbps >= 100
-                                  ? Math.round(snap.down_mbps)
-                                  : snap.down_mbps.toFixed(1)}{" "}
-                                Mbps
-                              </span>
-                            )}
-                            {gateEval.hasMeasuredFailure && (
-                              <span
-                                title={`实测未达标：${gateEval.failedReasons.join("、")}`}
-                                className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                              >
-                                实测未达标
-                              </span>
-                            )}
-                          </>
-                        ) : !snap ? (
-                          <span className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                            待测
-                          </span>
-                        ) : !snap.ok ? (
+                        {resolvedLat.latencyMs !== null ? (
                           <span
-                            title="最近一次测速未连通，可点右侧「测」重测"
-                            className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
+                            title={latTooltip}
+                            className="inline-flex items-center gap-1 cc-mono cc-tabular font-semibold"
+                            style={{ color: formatLatencyTone(resolvedLat.latencyMs) }}
+                          >
+                            <span>{Math.round(resolvedLat.latencyMs)} ms</span>
+                            {latSourceShort && (
+                              <span className="rounded bg-[var(--bg-elevated)] px-1 py-[1px] font-sans text-[9px] font-normal text-[var(--muted)]">
+                                {latSourceShort}
+                              </span>
+                            )}
+                          </span>
+                        ) : resolvedLat.state === "failed" ? (
+                          <span
+                            title={latTooltip}
+                            className="rounded-md bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
                           >
                             暂不可达
                           </span>
                         ) : (
-                          <>
-                            {snap.latency_ms !== null && (
-                              <span
-                                className="cc-mono cc-tabular font-semibold"
-                                style={{ color: formatLatencyTone(snap.latency_ms) }}
-                              >
-                                {Math.round(snap.latency_ms)} ms
-                              </span>
-                            )}
-                            {snap.up_mbps !== null && (
-                              <span
-                                title="实测上传速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
-                                className="cc-mono cc-tabular text-[10px] text-[var(--coral)]"
-                              >
-                                ↑{snap.up_mbps.toFixed(1)} Mbps
-                              </span>
-                            )}
-                            {snap.down_mbps !== null && (
-                              <span
-                                title="实测下载速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
-                                className="cc-mono cc-tabular text-[10px] text-[var(--sky)]"
-                              >
-                                ↓{snap.down_mbps >= 100 ? Math.round(snap.down_mbps) : snap.down_mbps.toFixed(1)} Mbps
-                              </span>
-                            )}
-                            {gateEval.hasMeasuredFailure && (
-                              <span
-                                title={`实测未达标：${gateEval.failedReasons.join("、")}`}
-                                className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                              >
-                                实测未达标
-                              </span>
-                            )}
-                          </>
+                          <span
+                            title={latTooltip}
+                            className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
+                          >
+                            待测
+                          </span>
+                        )}
+                        {hasValidUpMbps(snap) && (
+                          <span
+                            title="实测上传速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                            className="cc-mono cc-tabular text-[10px] text-[var(--coral)]"
+                          >
+                            ↑{snap!.up_mbps!.toFixed(1)} Mbps
+                          </span>
+                        )}
+                        {hasValidDownMbps(snap) && (
+                          <span
+                            title="实测下载速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
+                            className="cc-mono cc-tabular text-[10px] text-[var(--sky)]"
+                          >
+                            ↓
+                            {snap!.down_mbps! >= 100
+                              ? Math.round(snap!.down_mbps!)
+                              : snap!.down_mbps!.toFixed(1)}{" "}
+                            Mbps
+                          </span>
+                        )}
+                        {gateEval.hasMeasuredFailure && (
+                          <span
+                            title={`实测未达标：${gateEval.failedReasons.join("、")}`}
+                            className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                          >
+                            实测未达标
+                          </span>
                         )}
                         {healthBadge && (
                           <span
