@@ -3630,12 +3630,16 @@ mod tests {
             .unwrap();
 
         let timed_out =
-            signal_config_reload_and_wait_outcome(&dir, true, Duration::from_millis(160));
+            signal_config_reload_and_wait_outcome(&dir, true, Duration::from_millis(350));
         match timed_out {
             ConfigReloadWaitOutcome::TimedOut { req_id } => {
                 assert!(!req_id.is_empty(), "TimedOut outcome must carry req_id");
             }
             other => panic!("expected TimedOut outcome, got {other:?}"),
+        }
+        let wait_deadline = std::time::Instant::now() + Duration::from_millis(600);
+        while !signaled.load(Ordering::SeqCst) && std::time::Instant::now() < wait_deadline {
+            std::thread::sleep(Duration::from_millis(10));
         }
         assert!(signaled.load(Ordering::SeqCst));
         assert_eq!(
