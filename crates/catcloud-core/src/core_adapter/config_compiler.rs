@@ -5,9 +5,11 @@ use crate::error::{CatError, CatResult};
 use crate::models::{
     AppConfig, DEFAULT_AI_ROUTING_DOMAINS, FallbackPolicy, MultiGroup, MultiGroupMode,
     MultiGroupState, OverrideMode, PreAccelRelay, ProxyMode, ProxyNode, RouteTargetMode,
-    is_ipv6_only_node, pick_smart_default_node_id,
+    is_info_proxy_node, is_ipv6_only_node, pick_smart_default_node_id,
 };
-use crate::preaccel::generator::build_preaccel_proxy_groups;
+use crate::preaccel::generator::{
+    build_preaccel_compile_plan, build_preaccel_proxy_groups, host_to_fake_ip_filter,
+};
 use serde::{Deserialize, Serialize};
 use serde_yaml_ng::{Mapping, Number, Value};
 use sha2::{Digest, Sha256};
@@ -76,6 +78,46 @@ pub struct CompileStats {
     pub proxy_groups: usize,
     pub total_rules: usize,
     pub preaccel_active: bool,
+    #[serde(default)]
+    pub effective_tun_mtu: u16,
+}
+
+/// Structured transport-layer diagnostics for domestic pre-acceleration stability inspection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreAccelTransportDiagnostics {
+    pub effective_mode: String,
+    pub effective_tun_mtu: u16,
+    pub anytls_tfo: bool,
+    pub anytls_min_idle_session: u16,
+    pub keep_alive_idle_sec: u16,
+    pub keep_alive_interval_sec: u16,
+    pub expected_probe_status: String,
+    pub lb_strategy: String,
+    pub probe_interval_sec: u16,
+}
+
+/// Build a structured [`PreAccelTransportDiagnostics`] snapshot from the active [`AppConfig`],
+/// compiled effective TUN MTU, and resolved effective pre-acceleration mode.
+pub fn build_preaccel_transport_diagnostics(
+    cfg: &AppConfig,
+    effective_tun_mtu: u16,
+    effective_mode: &str,
+) -> PreAccelTransportDiagnostics {
+    let probe_interval_sec = cfg.preaccel.probe_interval_sec.clamp(20, 300) as u16;
+    PreAccelTransportDiagnostics {
+        effective_mode: effective_mode.trim().to_string(),
+        effective_tun_mtu,
+        anytls_tfo: false,
+        anytls_min_idle_session: 0,
+        keep_alive_idle_sec: 45,
+        keep_alive_interval_sec: 15,
+        expected_probe_status: crate::preaccel::generator::expected_probe_status_for_url(
+            &cfg.preaccel.probe_url,
+        )
+        .to_string(),
+        lb_strategy: cfg.preaccel.lb_strategy.as_str().to_string(),
+        probe_interval_sec,
+    }
 }
 
 /// Severity of a static pre-flight check finding.
@@ -252,6 +294,36 @@ fn is_logical_rule_type(rule_type: &str) -> bool {
     matches!(upper.as_str(), "AND" | "OR" | "NOT")
 }
 
+/// Parse a Mihomo catch-all `MATCH,<target>` rule tolerating ASCII whitespace around the comma
+/// (e.g. `"MATCH , DIRECT"`), returning the trimmed non-empty target when valid.
+fn parse_match_rule_target(rule: &str) -> Option<&str> {
+    let (raw_type, rest) = rule.trim().split_once(',')?;
+    if !raw_type.trim().eq_ignore_ascii_case("MATCH") {
+        return None;
+    }
+    let target = rest.trim();
+    if target.is_empty() || target.contains(',') {
+        return None;
+    }
+    Some(target)
+}
+
+/// Return `true` when `rule` is a valid Mihomo `MATCH,<target>` rule (tolerating spaces around
+/// the comma such as `"MATCH , DIRECT"`).
+pub(crate) fn is_match_rule(rule: &str) -> bool {
+    parse_match_rule_target(rule).is_some()
+}
+
+/// Normalize a global rule string before emitting into compiled `rules`, converting
+/// whitespace-padded `MATCH , <target>` variants into canonical `MATCH,<target>`.
+fn normalize_global_rule_for_emit(rule: &str) -> String {
+    if let Some(target) = parse_match_rule_target(rule) {
+        format!("MATCH,{target}")
+    } else {
+        rule.trim().to_string()
+    }
+}
+
 fn is_plausible_global_rule(rule: &str) -> bool {
     let trimmed = rule.trim();
     if trimmed.is_empty() {
@@ -265,19 +337,39 @@ fn is_plausible_global_rule(rule: &str) -> bool {
         return false;
     }
     if rule_type.eq_ignore_ascii_case("MATCH") {
-        let target = rest.trim();
-        return !target.is_empty() && !target.contains(',');
+        return is_match_rule(trimmed);
     }
     if is_logical_rule_type(rule_type) {
         // Logical composite rules look like: `AND,((NETWORK,UDP),(DST-PORT,443)),REJECT`
-        let Some((expr, action)) = rest.rsplit_once(',') else {
-            return false;
-        };
-        let action = action.trim();
-        return !action.is_empty()
-            && !action.contains('(')
-            && !action.contains(')')
-            && has_balanced_parens(expr);
+        // and may optionally carry trailing flags such as `no-resolve` / `src`.
+        let mut remainder = rest.trim();
+        while let Some((head, tail)) = remainder.rsplit_once(',') {
+            let candidate = tail.trim();
+            if candidate.is_empty() {
+                return false;
+            }
+            if is_mihomo_rule_flag(candidate) {
+                remainder = head.trim();
+                continue;
+            }
+            return !candidate.contains('(')
+                && !candidate.contains(')')
+                && has_balanced_parens(head);
+        }
+        return false;
+    }
+    if rule_type.eq_ignore_ascii_case("SUB-RULE") {
+        let rest_trimmed = rest.trim();
+        if rest_trimmed.starts_with('(') {
+            let Some((expr, target)) = rest_trimmed.rsplit_once(',') else {
+                return false;
+            };
+            let target = target.trim();
+            return !target.is_empty()
+                && !target.contains('(')
+                && !target.contains(')')
+                && has_balanced_parens(expr);
+        }
     }
     let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
     parts.len() >= 3 && parts.iter().all(|p| !p.is_empty())
@@ -474,6 +566,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
 ) -> CatResult<CompiledCoreConfig> {
     let cfg = input.config;
     validate_config(cfg)?;
+    cfg.rules_override
+        .validate_inline_override_yaml()
+        .map_err(CatError::Validation)?;
 
     let secret = input.controller_secret.trim();
     if secret.is_empty() {
@@ -543,7 +638,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
     insert_bool(&mut root, "ipv6", cfg.core_ipv6);
     insert_bool(&mut root, "unified-delay", cfg.unified_delay);
     insert_bool(&mut root, "tcp-concurrent", cfg.tcp_concurrent);
-    insert_u64(&mut root, "keep-alive-idle", 15);
+    insert_u64(&mut root, "keep-alive-idle", 45);
     insert_u64(&mut root, "keep-alive-interval", 15);
     insert_str(
         &mut root,
@@ -599,11 +694,12 @@ pub fn compile_mihomo_config_with_runtime_dir(
         root.insert(str_val("geox-url"), Value::Mapping(geox_url));
     }
 
+    let custom_rules_only = cfg.rules_override.custom_rules_only;
     root.insert(
         str_val("sniffer"),
         Value::Mapping(build_sniffer_section(
-            cfg.rules_override.block_quic_udp_443,
-            cfg.rules_override.domestic_direct_enabled,
+            !custom_rules_only && cfg.rules_override.block_quic_udp_443,
+            !custom_rules_only && cfg.rules_override.domestic_direct_enabled,
             has_geoip,
         )),
     );
@@ -701,11 +797,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
     );
     root.insert(str_val("dns"), Value::Mapping(dns_map));
 
-    // 5. Full TUN section.
-    let tun_map = build_tun_section(cfg);
-    root.insert(str_val("tun"), Value::Mapping(tun_map));
-
-    // 6. Compile proxies (domestic relays + business nodes with optional dialer-proxy).
+    // 5. Compile proxies (domestic relays + business nodes with optional dialer-proxy).
+    //    (TUN section is emitted immediately after dangling `dialer-proxy` stripping so
+    //    `effective_tun_mtu` accurately reflects whether any proxy remains dialer-wrapped.)
     // Pre-seed Mihomo built-in target names and pre-acceleration group names so user-provided
     // relay/node names (e.g. a relay literally named `DIRECT`) never collide with reserved names
     // or get filtered out of load-balance groups.
@@ -1052,56 +1146,18 @@ pub fn compile_mihomo_config_with_runtime_dir(
 
     // Strip dangling/invalid/self-referencing `dialer-proxy` entries inherited from raw
     // subscriptions unless their target exists in the compiled proxies or proxy-groups.
-    let mut valid_dialer_targets: HashSet<String> =
-        HashSet::with_capacity(compiled_proxies.len() + proxy_groups.len());
-    for proxy_val in &compiled_proxies {
-        if let Some(name) = proxy_val
-            .as_mapping()
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-        {
-            let trimmed = name.trim();
-            if !trimmed.is_empty() {
-                valid_dialer_targets.insert(trimmed.to_string());
-            }
-        }
-    }
-    for group_val in &proxy_groups {
-        if let Some(name) = group_val
-            .as_mapping()
-            .and_then(|m| m.get("name"))
-            .and_then(Value::as_str)
-        {
-            let trimmed = name.trim();
-            if !trimmed.is_empty() {
-                valid_dialer_targets.insert(trimmed.to_string());
-            }
-        }
-    }
-    for proxy_val in &mut compiled_proxies {
-        if let Some(map) = proxy_val.as_mapping_mut() {
-            if !map.contains_key("dialer-proxy") {
-                continue;
-            }
-            let self_name = map
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .map(ToString::to_string);
-            let keep = map
-                .get("dialer-proxy")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .is_some_and(|target| {
-                    !target.is_empty()
-                        && self_name.as_deref() != Some(target)
-                        && valid_dialer_targets.contains(target)
-                });
-            if !keep {
-                map.shift_remove("dialer-proxy");
-            }
-        }
-    }
+    let removed_preaccel_dialers =
+        strip_dangling_dialer_proxies(&mut compiled_proxies, &proxy_groups);
+    dialer_wrapped_proxies = dialer_wrapped_proxies.saturating_sub(removed_preaccel_dialers);
+
+    // Emit TUN section after final `dialer_wrapped_proxies` is known (never mutating `cfg.tun.mtu`).
+    let effective_tun_mtu = if dialer_wrapped_proxies > 0 {
+        cfg.tun.mtu.min(1400)
+    } else {
+        cfg.tun.mtu
+    };
+    let tun_map = build_tun_section(cfg, effective_tun_mtu);
+    root.insert(str_val("tun"), Value::Mapping(tun_map));
 
     root.insert(str_val("proxies"), Value::Sequence(compiled_proxies));
     root.insert(str_val("proxy-groups"), Value::Sequence(proxy_groups));
@@ -1113,16 +1169,17 @@ pub fn compile_mihomo_config_with_runtime_dir(
     //    (7) group match_rules (skipped in single mode) ->
     //    (8) global_append_rules -> (9) domestic direct rules -> (10) MATCH
     let mut rules: Vec<String> = Vec::new();
+    let mut mandatory_safety_rules: Vec<String> = Vec::new();
     for r in anti_loop_rules {
+        push_unique(&mut mandatory_safety_rules, r.clone());
         push_unique(&mut rules, r);
     }
-    push_unique(
-        &mut rules,
-        format!(
-            "PROCESS-NAME,{},DIRECT",
-            crate::probe::isolated_runner::PROBE_CORE_PROCESS_NAME
-        ),
+    let probe_bypass_rule = format!(
+        "PROCESS-NAME,{},DIRECT",
+        crate::probe::isolated_runner::PROBE_CORE_PROCESS_NAME
     );
+    push_unique(&mut mandatory_safety_rules, probe_bypass_rule.clone());
+    push_unique(&mut rules, probe_bypass_rule);
 
     const PRIVATE_LAN_DIRECT_RULES: &[&str] = &[
         "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
@@ -1138,6 +1195,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
     ];
     for r in PRIVATE_LAN_DIRECT_RULES {
+        push_unique(&mut mandatory_safety_rules, (*r).to_string());
         push_unique(&mut rules, (*r).to_string());
     }
     const PRIVATE_LOCAL_DOMAIN_DIRECT_RULES: &[&str] = &[
@@ -1149,6 +1207,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "DOMAIN-SUFFIX,internal,DIRECT",
     ];
     for r in PRIVATE_LOCAL_DOMAIN_DIRECT_RULES {
+        push_unique(&mut mandatory_safety_rules, (*r).to_string());
         push_unique(&mut rules, (*r).to_string());
     }
     if has_geosite {
@@ -1175,19 +1234,20 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "DOMAIN,dns.pub,DIRECT",
     ];
     for r in DOMESTIC_PUBLIC_DNS_DIRECT_RULES {
+        push_unique(&mut mandatory_safety_rules, (*r).to_string());
         push_unique(&mut rules, (*r).to_string());
     }
 
     for r in input.extra_prepend_rules {
         let trimmed = r.trim();
         if is_plausible_global_rule(trimmed) {
-            push_unique(&mut rules, trimmed.to_string());
+            push_unique(&mut rules, normalize_global_rule_for_emit(trimmed));
         }
     }
     for r in &cfg.rules_override.global_prepend_rules {
         let trimmed = r.trim();
         if is_plausible_global_rule(trimmed) {
-            push_unique(&mut rules, trimmed.to_string());
+            push_unique(&mut rules, normalize_global_rule_for_emit(trimmed));
         }
     }
 
@@ -1204,7 +1264,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "bilivideo.com",
         "bilivideo.cn",
     ];
-    if cfg.rules_override.block_quic_udp_443 {
+    if !custom_rules_only && cfg.rules_override.block_quic_udp_443 {
         if cfg.rules_override.domestic_direct_enabled {
             for domain in DOMESTIC_QUIC_DIRECT_DOMAINS {
                 push_unique(
@@ -1232,7 +1292,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
             "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT".to_string(),
         );
     }
-    if !single_mode_active {
+    if !custom_rules_only && !single_mode_active {
         let active_group_id_ref = effective_active_group_id.as_deref();
         // Emit the active home group's match_rules FIRST for highest priority, followed ONLY by
         // other groups with `independent_routing == true`. Unselected groups with
@@ -1266,7 +1326,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
     for r in &cfg.rules_override.global_append_rules {
         let trimmed = r.trim();
         if is_plausible_global_rule(trimmed) {
-            push_unique(&mut rules, trimmed.to_string());
+            push_unique(&mut rules, normalize_global_rule_for_emit(trimmed));
         }
     }
 
@@ -1410,7 +1470,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "cainiao.com",
         "edu.cn",
     ];
-    if cfg.rules_override.domestic_direct_enabled {
+    if !custom_rules_only && cfg.rules_override.domestic_direct_enabled {
         push_unique(&mut rules, "DOMAIN-SUFFIX,cn,DIRECT".to_string());
         for domain in ALWAYS_DOMESTIC_AND_SYSTEM_CDN_DOMAINS {
             push_unique(&mut rules, format!("DOMAIN-SUFFIX,{domain},DIRECT"));
@@ -1427,9 +1487,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         }
     }
 
-    let has_match_rule = rules
-        .iter()
-        .any(|r| r.to_ascii_uppercase().starts_with("MATCH,"));
+    let has_match_rule = rules.iter().any(|r| is_match_rule(r));
     if !has_match_rule {
         rules.push(format!("MATCH,{match_target}"));
     }
@@ -1439,8 +1497,10 @@ pub fn compile_mihomo_config_with_runtime_dir(
         string_seq(rules.iter().map(String::as_str)),
     );
 
-    // 9. Apply optional declarative YAML Merge Patch override without mutating original on error.
+    // 9. Apply optional declarative YAML Merge Patch override (file and/or inline) without
+    //    mutating the base configuration on error.
     let mut final_value = Value::Mapping(root);
+    let mut applied_override_patch = false;
     if matches!(
         cfg.rules_override.override_mode,
         OverrideMode::MergePatch | OverrideMode::Both
@@ -1460,7 +1520,31 @@ pub fn compile_mihomo_config_with_runtime_dir(
                 ))
             })?;
             final_value = apply_yaml_merge_patch(&final_value, &patch_yaml)?;
+            applied_override_patch = true;
         }
+    }
+    if let Some(inline_yaml) = cfg
+        .rules_override
+        .inline_override_yaml
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        cfg.rules_override
+            .validate_inline_override_yaml()
+            .map_err(CatError::Validation)?;
+        final_value = apply_yaml_merge_patch(&final_value, inline_yaml).map_err(|e| {
+            CatError::Validation(format!(
+                "内联 YAML 覆写片段应用失败（基础配置未被破坏）：{e}"
+            ))
+        })?;
+        applied_override_patch = true;
+    }
+
+    // Re-prepend mandatory anti-loop, isolated probe core bypass, and private LAN/DNS safety rules
+    // at the top of final `rules` so RFC 7396 sequence replacement can never wipe the safety base.
+    if applied_override_patch {
+        enforce_mandatory_safety_rules_at_top(&mut final_value, &mandatory_safety_rules);
     }
 
     let yaml = serde_yaml_ng::to_string(&final_value)?;
@@ -1479,6 +1563,13 @@ pub fn compile_mihomo_config_with_runtime_dir(
         .and_then(Value::as_sequence)
         .map_or(0, Vec::len);
 
+    let final_effective_tun_mtu = final_value
+        .get("tun")
+        .and_then(|t| t.get("mtu"))
+        .and_then(Value::as_u64)
+        .and_then(|v| u16::try_from(v).ok())
+        .unwrap_or(effective_tun_mtu);
+
     let stats = CompileStats {
         total_proxies,
         relay_proxies: relay_names_ordered.len(),
@@ -1488,6 +1579,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         proxy_groups: total_groups,
         total_rules,
         preaccel_active,
+        effective_tun_mtu: final_effective_tun_mtu,
     };
 
     let sha256 = sha256_hex(yaml.as_bytes());
@@ -1757,8 +1849,37 @@ pub fn validate_compiled_yaml(
         }
     }
 
-    // Verify every rule target resolves to a built-in action or an existing proxy / proxy-group.
+    // Collect top-level `rule-providers` names so `RULE-SET` rules referencing undefined
+    // providers emit a clear warning instead of crashing or silently failing at runtime.
+    let declared_rule_providers: HashSet<String> = root
+        .get("rule-providers")
+        .and_then(Value::as_mapping)
+        .map(|map| {
+            map.keys()
+                .filter_map(Value::as_str)
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut warned_missing_providers: HashSet<String> = HashSet::new();
+
+    // Verify every rule target resolves to a built-in action or an existing proxy / proxy-group,
+    // and warn when `RULE-SET,<name>,...` references an undeclared `rule-providers` entry.
     for rule in &rules {
+        for provider_name in extract_rule_set_provider_names(rule) {
+            if !declared_rule_providers.contains(&provider_name)
+                && warned_missing_providers.insert(provider_name.clone())
+            {
+                issues.push(StaticCheckIssue {
+                    code: "missing_rule_provider".to_string(),
+                    severity: StaticCheckSeverity::Warning,
+                    message: format!(
+                        "规则 `{rule}` 引用了规则集 `{provider_name}`，但最终配置根节点 `rule-providers` 中未定义该名称（请在内联 YAML 覆写或合并补丁中补充 `rule-providers.{provider_name}`）"
+                    ),
+                });
+            }
+        }
         if let Some(target) = extract_mihomo_rule_target(rule) {
             if !valid_rule_targets.contains(target) {
                 issues.push(StaticCheckIssue {
@@ -1772,10 +1893,7 @@ pub fn validate_compiled_yaml(
         }
     }
 
-    if !rules
-        .iter()
-        .any(|r| r.to_ascii_uppercase().starts_with("MATCH,"))
-    {
+    if !rules.iter().any(|r| is_match_rule(r)) {
         issues.push(StaticCheckIssue {
             code: "missing_match_rule".to_string(),
             severity: StaticCheckSeverity::Warning,
@@ -1802,6 +1920,1678 @@ pub fn validate_compiled_yaml(
         .all(|issue| issue.severity != StaticCheckSeverity::Error);
 
     Ok(StaticValidationReport { ok, issues })
+}
+
+// ============================================================================
+// Stage 21.5: Bulk raw rules parser & transparent gateway / soft-router YAML exporter
+// ============================================================================
+
+/// Target profile for transparent gateway / soft-router Mihomo YAML export.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayExportProfile {
+    RelayFragment,
+    TransparentGateway,
+    PreferredNodes,
+}
+
+fn default_gateway_tproxy_port() -> u16 {
+    7893
+}
+
+fn default_gateway_redir_port() -> u16 {
+    7892
+}
+
+fn default_gateway_dns_port() -> u16 {
+    1053
+}
+
+fn default_true_bool() -> bool {
+    true
+}
+
+/// Options controlling transparent gateway / soft-router YAML export.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayExportOptions {
+    pub profile: GatewayExportProfile,
+    #[serde(default = "default_gateway_tproxy_port")]
+    pub tproxy_port: u16,
+    #[serde(default = "default_gateway_redir_port")]
+    pub redir_port: u16,
+    #[serde(default = "default_gateway_dns_port")]
+    pub dns_listen_port: u16,
+    #[serde(default = "default_true_bool")]
+    pub redact_secrets: bool,
+}
+
+impl Default for GatewayExportOptions {
+    fn default() -> Self {
+        Self {
+            profile: GatewayExportProfile::RelayFragment,
+            tproxy_port: default_gateway_tproxy_port(),
+            redir_port: default_gateway_redir_port(),
+            dns_listen_port: default_gateway_dns_port(),
+            redact_secrets: true,
+        }
+    }
+}
+
+/// Structured output returned by [`export_gateway_yaml`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayExportOutput {
+    pub profile: GatewayExportProfile,
+    pub yaml: String,
+    pub redacted: bool,
+    pub relay_count: usize,
+    pub node_count: usize,
+    pub rule_count: usize,
+    pub warnings: Vec<String>,
+    pub integration_hint: String,
+}
+
+/// Result of parsing pasted raw Mihomo/Clash rule text via [`parse_bulk_rules_text`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BulkRulesParseResult {
+    pub valid_rules: Vec<String>,
+    pub skipped_lines: Vec<String>,
+}
+
+/// Parse pasted raw Mihomo rule text line-by-line:
+/// - Ignores blank lines, `#` comment lines, and `rules:` section header lines.
+/// - Strips leading YAML sequence markers (`- ` / `-\t`), paired single/double quotes,
+///   and trailing unquoted `# comments`.
+/// - Validates all `VALID_MIHOMO_RULE_TYPES` (including `RULE-SET`, `GEOSITE`, `GEOIP`,
+///   `AND`/`OR`/`NOT`, `MATCH`, and `SUB-RULE`), deduplicating valid rules in order.
+pub fn parse_bulk_rules_text(raw: &str) -> BulkRulesParseResult {
+    let mut valid_rules: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut skipped_lines: Vec<String> = Vec::new();
+
+    for raw_line in raw.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(after_rules) = trimmed
+            .get(..6)
+            .filter(|prefix| prefix.eq_ignore_ascii_case("rules:"))
+            .map(|_| trimmed[6..].trim())
+        {
+            if after_rules.is_empty() || after_rules.starts_with('#') {
+                continue;
+            }
+        }
+        let Some(candidate) = strip_yaml_list_rule_line(trimmed) else {
+            continue;
+        };
+        if is_plausible_global_rule(&candidate) {
+            let normalized = normalize_global_rule_for_emit(&candidate);
+            if seen.insert(normalized.clone()) {
+                valid_rules.push(normalized);
+            }
+        } else {
+            skipped_lines.push(trimmed.to_string());
+        }
+    }
+
+    BulkRulesParseResult {
+        valid_rules,
+        skipped_lines,
+    }
+}
+
+/// Export standardized Mihomo YAML for OpenWrt / Linux transparent gateways, soft-routers,
+/// or custom-rule Mihomo deployments.
+pub fn export_gateway_yaml(
+    cfg: &AppConfig,
+    nodes: &[ProxyNode],
+    groups: &[MultiGroup],
+    relays: &[PreAccelRelay],
+    runtime_dir: Option<&Path>,
+    opts: &GatewayExportOptions,
+) -> CatResult<GatewayExportOutput> {
+    match opts.profile {
+        GatewayExportProfile::RelayFragment => {
+            export_gateway_relay_fragment(cfg, relays, opts)
+        }
+        GatewayExportProfile::TransparentGateway => {
+            export_gateway_transparent_full(cfg, nodes, groups, relays, runtime_dir, opts)
+        }
+        GatewayExportProfile::PreferredNodes => {
+            export_gateway_preferred_nodes(cfg, nodes, groups, relays, opts)
+        }
+    }
+}
+
+fn export_gateway_relay_fragment(
+    cfg: &AppConfig,
+    relays: &[PreAccelRelay],
+    opts: &GatewayExportOptions,
+) -> CatResult<GatewayExportOutput> {
+    let mut relay_cfg = cfg.preaccel.clone();
+    relay_cfg.enabled = true;
+
+    let plan = build_preaccel_compile_plan(&relay_cfg, relays, &[])?;
+    let mut warnings = plan.warnings.clone();
+    let mut doc = Mapping::new();
+
+    if !plan.active || plan.relay_proxies.is_empty() {
+        warnings.clear();
+        warnings.push(
+            "当前尚未启用任何国内 443 提速中转，已导出标准空框架模板；请先在「国内提速」添加并启用至少一条中转后重新导出。"
+                .to_string(),
+        );
+        doc.insert(str_val("proxies"), Value::Sequence(Vec::new()));
+        doc.insert(str_val("proxy-groups"), Value::Sequence(Vec::new()));
+        doc.insert(str_val("rules"), Value::Sequence(Vec::new()));
+        let mut dns_map = Mapping::new();
+        dns_map.insert(str_val("fake-ip-filter"), Value::Sequence(Vec::new()));
+        doc.insert(str_val("dns"), Value::Mapping(dns_map));
+    } else {
+        doc.insert(str_val("proxies"), Value::Sequence(plan.relay_proxies.clone()));
+        doc.insert(
+            str_val("proxy-groups"),
+            Value::Sequence(plan.proxy_groups.clone()),
+        );
+        doc.insert(
+            str_val("rules"),
+            string_seq(plan.anti_loop_rules.iter().map(String::as_str)),
+        );
+        let mut dns_map = Mapping::new();
+        dns_map.insert(
+            str_val("fake-ip-filter"),
+            string_seq(plan.fake_ip_filter.iter().map(String::as_str)),
+        );
+        doc.insert(str_val("dns"), Value::Mapping(dns_map));
+    }
+
+    let doc_value = Value::Mapping(doc);
+    let body_yaml = serde_yaml_ng::to_string(&doc_value)?;
+    let header = format!(
+        concat!(
+            "# ============================================================================\n",
+            "# CatCloud 国内 443 提速标准 Mihomo 片段（Relay Fragment）\n",
+            "# 适用场景：OpenWrt / OpenClash / ShellCrash / Linux 透明网关 / 自写规则配置合并\n",
+            "# 已内置抗断流调优：tfo: false、min-idle-session: 0、国内 204 探针与多云 consistent-hashing 双活\n",
+            "#\n",
+            "# 接入方法：\n",
+            "# 1. 将下方 proxies 与 proxy-groups 合并进你现有的 Mihomo 配置；\n",
+            "# 2. 将下方 rules 置顶插入规则链最前面（防回环），并将 dns.fake-ip-filter 合并进 dns 节；\n",
+            "# 3. 在需要走国内 443 提速的非 443 海外节点下新增一行即可生效：\n",
+            "#    dialer-proxy: {entry}\n",
+            "# ============================================================================\n"
+        ),
+        entry = PREACCEL_SELECT_GROUP_NAME
+    );
+    let raw_yaml = format!("{header}{body_yaml}");
+    let yaml = if opts.redact_secrets {
+        redact_gateway_yaml(&header, doc_value, &[], relays)?
+    } else {
+        raw_yaml
+    };
+
+    let integration_hint = format!(
+        "将 proxies / proxy-groups 合并至旁路由 Mihomo 配置，置顶防环 rules 与 dns.fake-ip-filter，并在目标非 443 节点下添加 `dialer-proxy: {PREACCEL_SELECT_GROUP_NAME}`。"
+    );
+
+    Ok(GatewayExportOutput {
+        profile: GatewayExportProfile::RelayFragment,
+        yaml,
+        redacted: opts.redact_secrets,
+        relay_count: plan.relay_proxies.len(),
+        node_count: 0,
+        rule_count: plan.anti_loop_rules.len(),
+        warnings,
+        integration_hint,
+    })
+}
+
+fn export_gateway_transparent_full(
+    cfg: &AppConfig,
+    nodes: &[ProxyNode],
+    groups: &[MultiGroup],
+    relays: &[PreAccelRelay],
+    runtime_dir: Option<&Path>,
+    opts: &GatewayExportOptions,
+) -> CatResult<GatewayExportOutput> {
+    if opts.tproxy_port == 0 || opts.redir_port == 0 || opts.dns_listen_port == 0 {
+        return Err(CatError::Validation(
+            "透明网关导出端口配置无效：tproxy_port、redir_port 与 dns_listen_port 均必须在 1..=65535 之间"
+                .to_string(),
+        ));
+    }
+    if opts.tproxy_port == opts.redir_port
+        || opts.tproxy_port == opts.dns_listen_port
+        || opts.redir_port == opts.dns_listen_port
+    {
+        return Err(CatError::Validation(format!(
+            "透明网关导出端口冲突：tproxy_port({})、redir_port({}) 与 dns_listen_port({}) 必须互不相同",
+            opts.tproxy_port, opts.redir_port, opts.dns_listen_port
+        )));
+    }
+
+    let mut gw_cfg = cfg.clone();
+    let mut warnings: Vec<String> = Vec::new();
+    let mut reserved_ports: HashSet<u16> =
+        [opts.tproxy_port, opts.redir_port, opts.dns_listen_port]
+            .into_iter()
+            .collect();
+
+    gw_cfg.allow_lan = true;
+    gw_cfg.bind_address = "*".to_string();
+    gw_cfg.tproxy_port = Some(opts.tproxy_port);
+    gw_cfg.redir_port = Some(opts.redir_port);
+    gw_cfg.tun.enabled = false;
+    gw_cfg.dns_listen_host = "0.0.0.0".to_string();
+    gw_cfg.dns_listen_port = opts.dns_listen_port;
+    // Always export all enabled nodes & groups for soft-router/gateway deployments so >32 node
+    // pruning in desktop Single mode never strips router proxy pools.
+    gw_cfg.core_runtime.compile_all_nodes = true;
+    if gw_cfg.controller_host.trim().is_empty() {
+        gw_cfg.controller_host = "127.0.0.1".to_string();
+    }
+
+    if gw_cfg.mixed_port == 0 || reserved_ports.contains(&gw_cfg.mixed_port) {
+        let old = gw_cfg.mixed_port;
+        let shifted = pick_non_colliding_gateway_port(&reserved_ports, 7890);
+        gw_cfg.mixed_port = shifted;
+        warnings.push(format!(
+            "导出透明网关配置时，原 mixed-port ({old}) 与透明代理/DNS 端口冲突，已自动顺延至 {shifted}。"
+        ));
+    }
+    reserved_ports.insert(gw_cfg.mixed_port);
+
+    if gw_cfg.controller_port == 0 || reserved_ports.contains(&gw_cfg.controller_port) {
+        let old = gw_cfg.controller_port;
+        let shifted = pick_non_colliding_gateway_port(&reserved_ports, 9090);
+        gw_cfg.controller_port = shifted;
+        warnings.push(format!(
+            "导出透明网关配置时，原控制口端口 ({old}) 与透明代理/DNS 端口冲突，已自动顺延至 {shifted}。"
+        ));
+    }
+    reserved_ports.insert(gw_cfg.controller_port);
+
+    if let Some(sp) = gw_cfg.socks_port {
+        if sp == 0 || reserved_ports.contains(&sp) {
+            gw_cfg.socks_port = None;
+            warnings.push(format!(
+                "导出透明网关配置时，原 socks-port ({sp}) 与透明代理端口冲突，已自动省略。"
+            ));
+        } else {
+            reserved_ports.insert(sp);
+        }
+    }
+    if let Some(hp) = gw_cfg.http_port {
+        if hp == 0 || reserved_ports.contains(&hp) {
+            gw_cfg.http_port = None;
+            warnings.push(format!(
+                "导出透明网关配置时，原 http-port ({hp}) 与透明代理端口冲突，已自动省略。"
+            ));
+        } else {
+            reserved_ports.insert(hp);
+        }
+    }
+    if gw_cfg.system_proxy.pac.enabled
+        && (gw_cfg.system_proxy.pac.port == 0
+            || reserved_ports.contains(&gw_cfg.system_proxy.pac.port))
+    {
+        gw_cfg.system_proxy.pac.enabled = false;
+    }
+
+    let controller_secret = match gw_cfg
+        .controller_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(s) => s.to_string(),
+        None => {
+            warnings.push(
+                "当前未设置控制口密钥，导出配置已填入占位值，部署到路由器前请修改 `secret` 字段。"
+                    .to_string(),
+            );
+            "catcloud-gateway-change-me".to_string()
+        }
+    };
+
+    let allocated_ports = AllocatedPorts {
+        bind_host: "*".to_string(),
+        mixed_port: gw_cfg.mixed_port,
+        controller_port: gw_cfg.controller_port,
+        dns_port: gw_cfg.dns_listen_port,
+        shifted: Vec::new(),
+    };
+    let empty_filtered: HashMap<String, Vec<String>> = HashMap::new();
+    let compile_input = CompileInput {
+        config: &gw_cfg,
+        nodes,
+        groups,
+        relays,
+        controller_secret: &controller_secret,
+        allocated_ports: &allocated_ports,
+        extra_prepend_rules: &[],
+        extra_fake_ip_filters: &[],
+        group_filtered_members: &empty_filtered,
+    };
+
+    let mut compiled = compile_mihomo_config_with_runtime_dir(&compile_input, runtime_dir)?;
+
+    // Post-merge gateway contract lock: prevent `override_merge_path` / `inline_override_yaml`
+    // from silently turning desktop TUN back on or hijacking TPROXY/REDIR/DNS/LAN bindings.
+    if let Some(root_map) = compiled.value.as_mapping_mut() {
+        insert_bool(root_map, "allow-lan", true);
+        insert_str(root_map, "bind-address", "*");
+        insert_u64(root_map, "tproxy-port", u64::from(opts.tproxy_port));
+        insert_u64(root_map, "redir-port", u64::from(opts.redir_port));
+
+        let locked_ports = [opts.tproxy_port, opts.redir_port, opts.dns_listen_port];
+        if let Some(mixed_p) = root_map
+            .get("mixed-port")
+            .and_then(Value::as_u64)
+            .and_then(|v| u16::try_from(v).ok())
+        {
+            if locked_ports.contains(&mixed_p) {
+                insert_u64(root_map, "mixed-port", u64::from(gw_cfg.mixed_port));
+            }
+        }
+
+        let tun_entry = root_map
+            .entry(str_val("tun"))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if !tun_entry.is_mapping() {
+            *tun_entry = Value::Mapping(Mapping::new());
+        }
+        if let Some(tun_map) = tun_entry.as_mapping_mut() {
+            insert_bool(tun_map, "enable", false);
+        }
+
+        let dns_entry = root_map
+            .entry(str_val("dns"))
+            .or_insert_with(|| Value::Mapping(Mapping::new()));
+        if !dns_entry.is_mapping() {
+            *dns_entry = Value::Mapping(Mapping::new());
+        }
+        if let Some(dns_map) = dns_entry.as_mapping_mut() {
+            insert_str(
+                dns_map,
+                "listen",
+                &format_host_port("0.0.0.0", opts.dns_listen_port),
+            );
+        }
+    }
+
+    let locked_yaml = serde_yaml_ng::to_string(&compiled.value)?;
+    let relay_servers_for_validation: Vec<String> = if gw_cfg.preaccel.enabled {
+        relays
+            .iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.server.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let final_validation = validate_compiled_yaml(&locked_yaml, &relay_servers_for_validation)?;
+    let hard_errors = final_validation.errors();
+    if !hard_errors.is_empty() {
+        let summary = hard_errors
+            .iter()
+            .map(|i| format!("[{}] {}", i.code, i.message))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(CatError::Validation(format!(
+            "透明网关配置静态校验未通过，已阻止导出坏配置：{summary}"
+        )));
+    }
+    for issue in final_validation.warnings() {
+        warnings.push(issue.message.clone());
+    }
+
+    let header = format!(
+        concat!(
+            "# ============================================================================\n",
+            "# CatCloud 透明网关 / 软路由完整 Mihomo 配置（Transparent Gateway）\n",
+            "# 监听端口：tproxy-port={tproxy} | redir-port={redir} | dns.listen=0.0.0.0:{dns}\n",
+            "# 局域网模式：allow-lan=true | bind-address=\"*\" | 桌面虚拟网卡 tun.enable=false\n",
+            "# 已保留国内 443 提速、防环规则、用户自写规则与内联 YAML / rule-providers 覆写\n",
+            "# 部署示例：mihomo -d /etc/mihomo -f config.yaml\n",
+            "# ============================================================================\n"
+        ),
+        tproxy = opts.tproxy_port,
+        redir = opts.redir_port,
+        dns = opts.dns_listen_port,
+    );
+    let total_proxies = compiled
+        .value
+        .get("proxies")
+        .and_then(Value::as_sequence)
+        .map_or(compiled.stats.total_proxies, Vec::len);
+    let relay_count = compiled.stats.relay_proxies;
+    let node_count = total_proxies.saturating_sub(relay_count);
+    let rule_count = compiled
+        .value
+        .get("rules")
+        .and_then(Value::as_sequence)
+        .map_or(compiled.stats.total_rules, Vec::len);
+
+    let yaml = if opts.redact_secrets {
+        redact_gateway_yaml(&header, compiled.value, nodes, relays)?
+    } else {
+        format!("{header}{locked_yaml}")
+    };
+    let integration_hint = format!(
+        "可直接保存为 OpenWrt / Linux 旁路由 Mihomo 配置运行（tproxy-port={}、redir-port={}、dns=0.0.0.0:{}，已关闭桌面 TUN 避免与 nftables/iptables TPROXY 冲突）。",
+        opts.tproxy_port, opts.redir_port, opts.dns_listen_port
+    );
+
+    Ok(GatewayExportOutput {
+        profile: GatewayExportProfile::TransparentGateway,
+        yaml,
+        redacted: opts.redact_secrets,
+        relay_count,
+        node_count,
+        rule_count,
+        warnings,
+        integration_hint,
+    })
+}
+
+fn export_gateway_preferred_nodes(
+    cfg: &AppConfig,
+    nodes: &[ProxyNode],
+    groups: &[MultiGroup],
+    relays: &[PreAccelRelay],
+    opts: &GatewayExportOptions,
+) -> CatResult<GatewayExportOutput> {
+    let preferred_nodes = rank_preferred_nodes_for_gateway(cfg, nodes, groups);
+    let mut warnings: Vec<String> = Vec::new();
+    let mut used_names: HashSet<String> = [
+        "DIRECT",
+        "REJECT",
+        "PASS",
+        PREACCEL_SELECT_GROUP_NAME,
+        PREACCEL_FALLBACK_GROUP_NAME,
+        PREACCEL_LB_GROUP_NAME,
+        "🌟 优选节点",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect();
+
+    let enabled_relays: Vec<&PreAccelRelay> = relays.iter().filter(|r| r.enabled).collect();
+    let has_enabled_relays = !enabled_relays.is_empty();
+    let relays_support_ipv6 =
+        has_enabled_relays && enabled_relays.iter().all(|r| r.supports_ipv6);
+    let mut effective_preaccel_cfg = cfg.preaccel.clone();
+    if !effective_preaccel_cfg.enabled && has_enabled_relays {
+        effective_preaccel_cfg.enabled = true;
+        warnings.push(
+            "当前桌面国内提速总开关关闭，已按中转池配置一并导出（如需直连可删 `dialer-proxy`）。"
+                .to_string(),
+        );
+    }
+
+    // Pass `&[]` for nodes so `anti_loop_rules` strictly contains relay servers, domestic 204
+    // probe endpoints, and campus direct guards — never forcing `DIRECT` rules onto business
+    // proxy nodes (business node domains belong strictly in `dns.fake-ip-filter`).
+    let preaccel_plan = build_preaccel_compile_plan(&effective_preaccel_cfg, relays, &[])?;
+    warnings.extend(preaccel_plan.warnings.iter().cloned());
+
+    let mut compiled_proxies: Vec<Value> = Vec::new();
+    let mut proxy_groups: Vec<Value> = Vec::new();
+    let mut anti_loop_rules: Vec<String> = Vec::new();
+    let mut fake_ip_filter: Vec<String> = Vec::new();
+    let mut relay_count = 0usize;
+
+    if preaccel_plan.active && !preaccel_plan.relay_proxies.is_empty() {
+        for relay_val in &preaccel_plan.relay_proxies {
+            if let Some(name) = relay_val
+                .as_mapping()
+                .and_then(|m| m.get("name"))
+                .and_then(Value::as_str)
+            {
+                used_names.insert(name.to_string());
+            }
+            compiled_proxies.push(relay_val.clone());
+        }
+        relay_count = preaccel_plan.relay_proxies.len();
+        proxy_groups.extend(preaccel_plan.proxy_groups.clone());
+        anti_loop_rules.extend(preaccel_plan.anti_loop_rules.clone());
+        fake_ip_filter.extend(preaccel_plan.fake_ip_filter.clone());
+    } else if !cfg.preaccel.enabled {
+        warnings.push(
+            "当前国内提速开关未开启且尚未启用国内 443 中转，本次仅导出优选业务节点（未附带国内 443 中转与 dialer-proxy）。"
+                .to_string(),
+        );
+    }
+
+    let mut preferred_proxy_names: Vec<String> = Vec::with_capacity(preferred_nodes.len());
+    for node in &preferred_nodes {
+        let base_name = if node.name.trim().is_empty() {
+            format!("Node-{}", node.id)
+        } else {
+            node.name.trim().to_string()
+        };
+        let unique_name = make_unique_name(&base_name, &mut used_names);
+        let mut proxy_map = build_node_proxy_mapping(node, &unique_name)?;
+
+        let server_candidate = {
+            let s = node.server.trim();
+            if !s.is_empty() {
+                Some(s)
+            } else {
+                node.raw_config
+                    .get("server")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+            }
+        };
+        if let Some(raw_server) = server_candidate {
+            if let Some(filter) = host_to_fake_ip_filter(raw_server) {
+                push_unique(&mut fake_ip_filter, filter);
+            }
+        }
+
+        if preaccel_plan.active {
+            let wants_preaccel = node.should_apply_preaccel(effective_preaccel_cfg.skip_443_native);
+            let skip_for_ipv6 = wants_preaccel
+                && !relays_support_ipv6
+                && is_ipv6_only_node(node)
+                && node.preaccel_override != Some(true);
+            if wants_preaccel && !skip_for_ipv6 {
+                insert_str(&mut proxy_map, "dialer-proxy", PREACCEL_SELECT_GROUP_NAME);
+            } else if proxy_map.get("dialer-proxy").and_then(Value::as_str)
+                == Some(PREACCEL_SELECT_GROUP_NAME)
+            {
+                proxy_map.shift_remove("dialer-proxy");
+            }
+        } else if proxy_map.get("dialer-proxy").and_then(Value::as_str)
+            == Some(PREACCEL_SELECT_GROUP_NAME)
+        {
+            proxy_map.shift_remove("dialer-proxy");
+        }
+
+        compiled_proxies.push(Value::Mapping(proxy_map));
+        preferred_proxy_names.push(unique_name);
+    }
+
+    if preferred_proxy_names.is_empty() {
+        warnings.push("当前没有已启用的业务节点可供导出，已在优选组写入 DIRECT 占位。".to_string());
+    }
+
+    let mut select_group = Mapping::new();
+    insert_str(&mut select_group, "name", "🌟 优选节点");
+    insert_str(&mut select_group, "type", "select");
+    let group_members: Vec<&str> = if preferred_proxy_names.is_empty() {
+        vec!["DIRECT"]
+    } else {
+        preferred_proxy_names.iter().map(String::as_str).collect()
+    };
+    select_group.insert(str_val("proxies"), string_seq(group_members));
+    proxy_groups.push(Value::Mapping(select_group));
+
+    // Strip any dangling or self-referencing `dialer-proxy` inherited from raw subscription nodes
+    // so the exported YAML never fails Mihomo config loading with an unresolved dialer target.
+    let _ = strip_dangling_dialer_proxies(&mut compiled_proxies, &proxy_groups);
+
+    let mut doc = Mapping::new();
+    doc.insert(str_val("proxies"), Value::Sequence(compiled_proxies));
+    doc.insert(str_val("proxy-groups"), Value::Sequence(proxy_groups));
+    if !anti_loop_rules.is_empty() {
+        doc.insert(
+            str_val("rules"),
+            string_seq(anti_loop_rules.iter().map(String::as_str)),
+        );
+    }
+    if !fake_ip_filter.is_empty() {
+        let mut dns_map = Mapping::new();
+        dns_map.insert(
+            str_val("fake-ip-filter"),
+            string_seq(fake_ip_filter.iter().map(String::as_str)),
+        );
+        doc.insert(str_val("dns"), Value::Mapping(dns_map));
+    }
+
+    let doc_value = Value::Mapping(doc);
+    let body_yaml = serde_yaml_ng::to_string(&doc_value)?;
+    let header = concat!(
+        "# ============================================================================\n",
+        "# CatCloud 优选节点与国内 443 中转片段（Preferred Nodes）\n",
+        "# 说明：优先排布当前活跃与智能多选组内优选节点；若已开启国内提速，则自动保留 dialer-proxy 与防环规则\n",
+        "# 适用场景：按需摘取健康业务节点合并进 OpenWrt / Linux 旁路由自维护配置\n",
+        "# ============================================================================\n"
+    );
+    let raw_yaml = format!("{header}{body_yaml}");
+    let yaml = if opts.redact_secrets {
+        redact_gateway_yaml(header, doc_value, &preferred_nodes, relays)?
+    } else {
+        raw_yaml
+    };
+
+    let integration_hint = if relay_count > 0 {
+        format!(
+            "已导出 {} 个优选业务节点与 {} 条国内 443 中转（非 443 节点已保留 `dialer-proxy: {PREACCEL_SELECT_GROUP_NAME}`），合并进旁路由配置时请一并置顶防环 rules。",
+            preferred_proxy_names.len(),
+            relay_count
+        )
+    } else {
+        format!(
+            "已导出 {} 个优选业务节点，可直接复制所需节点段落合并进旁路由 Mihomo 配置。",
+            preferred_proxy_names.len()
+        )
+    };
+
+    Ok(GatewayExportOutput {
+        profile: GatewayExportProfile::PreferredNodes,
+        yaml,
+        redacted: opts.redact_secrets,
+        relay_count,
+        node_count: preferred_proxy_names.len(),
+        rule_count: anti_loop_rules.len(),
+        warnings,
+        integration_hint,
+    })
+}
+
+fn rank_preferred_nodes_for_gateway(
+    cfg: &AppConfig,
+    nodes: &[ProxyNode],
+    groups: &[MultiGroup],
+) -> Vec<ProxyNode> {
+    let enabled: Vec<&ProxyNode> = nodes.iter().filter(|n| n.enabled).collect();
+    let non_info: Vec<&ProxyNode> = enabled
+        .iter()
+        .copied()
+        .filter(|n| !is_info_proxy_node(n))
+        .collect();
+    let candidates = if non_info.is_empty() { enabled } else { non_info };
+
+    let mut active_ids: HashSet<&str> = HashSet::new();
+    if let Some(single_id) = cfg
+        .active_single_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        active_ids.insert(single_id);
+    }
+    let mut member_rank: HashMap<&str, usize> = HashMap::new();
+    for (g_idx, g) in groups.iter().enumerate() {
+        if g.state != MultiGroupState::CircuitOpen {
+            if let Some(aid) = g
+                .active_node_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                active_ids.insert(aid);
+            }
+        }
+        for (m_idx, mid) in g.member_node_ids.iter().enumerate() {
+            let trimmed = mid.trim();
+            if !trimmed.is_empty() {
+                let rank = g_idx * 10_000 + m_idx;
+                member_rank
+                    .entry(trimmed)
+                    .and_modify(|prev| *prev = (*prev).min(rank))
+                    .or_insert(rank);
+            }
+        }
+    }
+
+    let mut ranked: Vec<ProxyNode> = candidates.into_iter().cloned().collect();
+    ranked.sort_by(|a, b| {
+        let key = |n: &ProxyNode| {
+            let has_fail_tag = n.tags.iter().any(|t| {
+                let l = t.trim().to_ascii_lowercase();
+                matches!(l.as_str(), "failed" | "offline" | "dead" | "broken" | "timeout")
+            });
+            let has_healthy_tag = n.tags.iter().any(|t| {
+                let l = t.trim().to_ascii_lowercase();
+                matches!(
+                    l.as_str(),
+                    "golden" | "healthy" | "verified" | "ok" | "ai_ok" | "google_clean"
+                )
+            });
+            let tier: u8 = if has_fail_tag {
+                3
+            } else if active_ids.contains(n.id.as_str()) {
+                0
+            } else if has_healthy_tag || member_rank.contains_key(n.id.as_str()) {
+                1
+            } else {
+                2
+            };
+            let m_rank = member_rank.get(n.id.as_str()).copied().unwrap_or(usize::MAX);
+            let region_pref: u8 = match n.region_code.trim().to_ascii_uppercase().as_str() {
+                "TW" => 0,
+                "HK" => 1,
+                "SG" => 2,
+                "JP" => 3,
+                "US" => 4,
+                "KR" => 5,
+                _ => 6,
+            };
+            let mult_milli = if n.multiplier.is_finite() && n.multiplier >= 0.0 {
+                (n.multiplier * 1000.0).round() as u64
+            } else {
+                u64::MAX
+            };
+            (tier, m_rank, region_pref, mult_milli, n.name.clone(), n.id.clone())
+        };
+        key(a).cmp(&key(b))
+    });
+    ranked
+}
+
+fn pick_non_colliding_gateway_port(used: &HashSet<u16>, preferred: u16) -> u16 {
+    if preferred > 0 && !used.contains(&preferred) {
+        return preferred;
+    }
+    for candidate in 17890u16..=60000u16 {
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    preferred
+}
+
+/// Strip dangling, empty, or self-referencing `dialer-proxy` entries from `compiled_proxies`
+/// unless their target exists in `compiled_proxies` or `proxy_groups`. Returns the count of
+/// removed `PREACCEL_SELECT_GROUP_NAME` references so callers can keep stats accurate.
+fn strip_dangling_dialer_proxies(
+    compiled_proxies: &mut [Value],
+    proxy_groups: &[Value],
+) -> usize {
+    let mut valid_dialer_targets: HashSet<String> =
+        HashSet::with_capacity(compiled_proxies.len() + proxy_groups.len());
+    for proxy_val in compiled_proxies.iter() {
+        if let Some(name) = proxy_val
+            .as_mapping()
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+        {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                valid_dialer_targets.insert(trimmed.to_string());
+            }
+        }
+    }
+    for group_val in proxy_groups {
+        if let Some(name) = group_val
+            .as_mapping()
+            .and_then(|m| m.get("name"))
+            .and_then(Value::as_str)
+        {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                valid_dialer_targets.insert(trimmed.to_string());
+            }
+        }
+    }
+
+    let mut removed_preaccel = 0usize;
+    for proxy_val in compiled_proxies.iter_mut() {
+        if let Some(map) = proxy_val.as_mapping_mut() {
+            if !map.contains_key("dialer-proxy") {
+                continue;
+            }
+            let self_name = map
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .map(ToString::to_string);
+            let keep = map
+                .get("dialer-proxy")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|target| {
+                    !target.is_empty()
+                        && self_name.as_deref() != Some(target)
+                        && valid_dialer_targets.contains(target)
+                });
+            if !keep {
+                let is_preaccel = map
+                    .get("dialer-proxy")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    == Some(PREACCEL_SELECT_GROUP_NAME);
+                map.shift_remove("dialer-proxy");
+                if is_preaccel {
+                    removed_preaccel += 1;
+                }
+            }
+        }
+    }
+    removed_preaccel
+}
+
+/// Ensure mandatory anti-loop, isolated probe core bypass, and private LAN/DNS safety rules
+/// always remain deduplicated at the top of `doc["rules"]`, even when a YAML Merge Patch or
+/// `inline_override_yaml` replaces `rules:` via RFC 7396 semantics.
+fn enforce_mandatory_safety_rules_at_top(doc: &mut Value, mandatory_safety_rules: &[String]) {
+    let Some(root_map) = doc.as_mapping_mut() else {
+        return;
+    };
+    let existing_rules: Vec<Value> = root_map
+        .get("rules")
+        .and_then(Value::as_sequence)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut merged: Vec<Value> =
+        Vec::with_capacity(mandatory_safety_rules.len() + existing_rules.len());
+    let mut seen_ci: HashSet<String> = HashSet::new();
+
+    for rule in mandatory_safety_rules {
+        let normalized = normalize_global_rule_for_emit(rule);
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen_ci.insert(normalized.to_ascii_lowercase()) {
+            merged.push(Value::String(normalized));
+        }
+    }
+    for item in existing_rules {
+        if let Some(raw) = item.as_str() {
+            let normalized = normalize_global_rule_for_emit(raw);
+            if normalized.is_empty() {
+                continue;
+            }
+            if seen_ci.insert(normalized.to_ascii_lowercase()) {
+                merged.push(Value::String(normalized));
+            }
+        } else {
+            merged.push(item);
+        }
+    }
+    root_map.insert(str_val("rules"), Value::Sequence(merged));
+}
+
+fn is_gateway_yaml_credential_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "password"
+            | "passwd"
+            | "pwd"
+            | "uuid"
+            | "token"
+            | "secret"
+            | "controller_secret"
+            | "controller-secret"
+            | "obfs_password"
+            | "obfs-password"
+            | "client_secret"
+            | "client-secret"
+            | "access_token"
+            | "access-token"
+            | "refresh_token"
+            | "refresh-token"
+            | "api_key"
+            | "api-key"
+            | "apikey"
+            | "x-api-key"
+            | "private_key"
+            | "private-key"
+            | "public_key"
+            | "public-key"
+            | "peer-public-key"
+            | "peer_public_key"
+            | "pre-shared-key"
+            | "pre_shared_key"
+            | "short_id"
+            | "short-id"
+            | "auth"
+            | "auth_str"
+            | "auth-str"
+            | "psk"
+            | "pbk"
+            | "sid"
+            | "cookie"
+            | "set-cookie"
+            | "username"
+            | "user"
+            | "passphrase"
+            | "authorization"
+            | "hmac-key"
+            | "hmac_key"
+            | "encryption-key"
+            | "encryption_key"
+    ) || lower.ends_with("_password")
+        || lower.ends_with("-password")
+        || lower.ends_with("_secret")
+        || lower.ends_with("-secret")
+        || lower.ends_with("_token")
+        || lower.ends_with("-token")
+        || lower.ends_with("_private_key")
+        || lower.ends_with("-private-key")
+        || lower.ends_with("_public_key")
+        || lower.ends_with("-public-key")
+        || lower.ends_with("_api_key")
+        || lower.ends_with("-api-key")
+}
+
+fn is_gateway_yaml_host_key(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "server"
+            | "sni"
+            | "servername"
+            | "server-name"
+            | "server_name"
+            | "host"
+            | "obfs-host"
+            | "obfs_host"
+            | "external-controller"
+    )
+}
+
+fn normalize_sensitive_domain_candidate(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    if trimmed.is_empty() {
+        return None;
+    }
+    let host_part = if let Some((h, p)) = trimmed.rsplit_once(':') {
+        if !h.contains(':') && p.parse::<u16>().is_ok() {
+            h
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    let bare = host_part
+        .trim_start_matches("*.")
+        .trim_start_matches("+.")
+        .trim_start_matches('.')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if bare.is_empty()
+        || !bare.contains('.')
+        || bare == "localhost"
+        || bare.starts_with("***.")
+        || bare == "<redacted>"
+        || bare.contains(char::is_whitespace)
+        || bare.contains('/')
+        || bare.contains(',')
+        || bare.parse::<IpAddr>().is_ok()
+    {
+        return None;
+    }
+    Some(bare)
+}
+
+fn collect_sensitive_domains_from_yaml_value(val: &Value, out: &mut HashSet<String>) {
+    match val {
+        Value::Mapping(map) => {
+            for (k, v) in map {
+                if let Some(key_str) = k.as_str() {
+                    if is_gateway_yaml_host_key(key_str)
+                        && !key_str.eq_ignore_ascii_case("external-controller")
+                    {
+                        match v {
+                            Value::String(s) => {
+                                if let Some(dom) = normalize_sensitive_domain_candidate(s) {
+                                    out.insert(dom);
+                                }
+                            }
+                            Value::Sequence(seq) => {
+                                for item in seq {
+                                    if let Some(s) = item.as_str() {
+                                        if let Some(dom) = normalize_sensitive_domain_candidate(s) {
+                                            out.insert(dom);
+                                        }
+                                    } else {
+                                        collect_sensitive_domains_from_yaml_value(item, out);
+                                    }
+                                }
+                            }
+                            _ => collect_sensitive_domains_from_yaml_value(v, out),
+                        }
+                        continue;
+                    }
+                }
+                collect_sensitive_domains_from_yaml_value(v, out);
+            }
+        }
+        Value::Sequence(seq) => {
+            for item in seq {
+                collect_sensitive_domains_from_yaml_value(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_sensitive_domains_from_json_value(
+    val: &serde_json::Value,
+    out: &mut HashSet<String>,
+) {
+    match val {
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if is_gateway_yaml_host_key(k) && !k.eq_ignore_ascii_case("external-controller") {
+                    match v {
+                        serde_json::Value::String(s) => {
+                            if let Some(dom) = normalize_sensitive_domain_candidate(s) {
+                                out.insert(dom);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for item in arr {
+                                if let Some(s) = item.as_str() {
+                                    if let Some(dom) = normalize_sensitive_domain_candidate(s) {
+                                        out.insert(dom);
+                                    }
+                                } else {
+                                    collect_sensitive_domains_from_json_value(item, out);
+                                }
+                            }
+                        }
+                        _ => collect_sensitive_domains_from_json_value(v, out),
+                    }
+                    continue;
+                }
+                collect_sensitive_domains_from_json_value(v, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_sensitive_domains_from_json_value(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_gateway_sensitive_domains(
+    doc: &Value,
+    nodes: &[ProxyNode],
+    relays: &[PreAccelRelay],
+) -> HashSet<String> {
+    let mut domains = HashSet::new();
+    for relay in relays {
+        if let Some(dom) = normalize_sensitive_domain_candidate(&relay.server) {
+            domains.insert(dom);
+        }
+        if let Some(sni) = relay.sni.as_deref() {
+            if let Some(dom) = normalize_sensitive_domain_candidate(sni) {
+                domains.insert(dom);
+            }
+        }
+    }
+    for node in nodes {
+        if let Some(dom) = normalize_sensitive_domain_candidate(&node.server) {
+            domains.insert(dom);
+        }
+        collect_sensitive_domains_from_json_value(&node.raw_config, &mut domains);
+    }
+    if let Some(proxies) = doc.get("proxies") {
+        collect_sensitive_domains_from_yaml_value(proxies, &mut domains);
+    }
+    domains
+}
+
+fn is_broad_non_sensitive_suffix(norm: &str) -> bool {
+    matches!(
+        norm,
+        "com.cn"
+            | "net.cn"
+            | "org.cn"
+            | "gov.cn"
+            | "edu.cn"
+            | "co.jp"
+            | "co.uk"
+            | "com.hk"
+            | "com.tw"
+            | "hicloud.com"
+            | "miui.com"
+            | "qq.com"
+            | "home.arpa"
+    )
+}
+
+fn matches_sensitive_domain(candidate: &str, sensitive_domains: &HashSet<String>) -> bool {
+    let Some(norm) = normalize_sensitive_domain_candidate(candidate) else {
+        return false;
+    };
+    sensitive_domains.iter().any(|sens| {
+        norm == *sens
+            || norm.ends_with(&format!(".{sens}"))
+            || (!is_broad_non_sensitive_suffix(&norm) && sens.ends_with(&format!(".{norm}")))
+    })
+}
+
+fn is_domain_boundary_byte(b: u8) -> bool {
+    !(b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+}
+
+fn redact_sensitive_domains_in_text(text: &str, sensitive_domains: &HashSet<String>) -> String {
+    if text.is_empty() || sensitive_domains.is_empty() {
+        return text.to_string();
+    }
+    let mut sorted_domains: Vec<&String> = sensitive_domains.iter().collect();
+    sorted_domains.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+
+    let mut current = text.to_string();
+    for domain in sorted_domains {
+        let needle_bytes = domain.as_bytes();
+        if needle_bytes.is_empty() {
+            continue;
+        }
+        let replacement = crate::sanitize::redact_ip_or_host(domain);
+        let bytes = current.as_bytes();
+        let mut out = String::with_capacity(current.len());
+        let mut i = 0usize;
+        let mut replaced_any = false;
+        while i < bytes.len() {
+            if i + needle_bytes.len() <= bytes.len()
+                && bytes[i..i + needle_bytes.len()].eq_ignore_ascii_case(needle_bytes)
+            {
+                let before_ok = i == 0
+                    || is_domain_boundary_byte(bytes[i - 1])
+                    || (i >= 2
+                        && matches!(bytes[i - 2], b'+' | b'*')
+                        && bytes[i - 1] == b'.');
+                let after_ok = i + needle_bytes.len() == bytes.len()
+                    || is_domain_boundary_byte(bytes[i + needle_bytes.len()]);
+                if before_ok && after_ok {
+                    out.push_str(&replacement);
+                    i += needle_bytes.len();
+                    replaced_any = true;
+                    continue;
+                }
+            }
+            if let Some(ch) = current[i..].chars().next() {
+                out.push(ch);
+                i += ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if replaced_any {
+            current = out;
+        }
+    }
+    current
+}
+
+fn is_reserved_standard_cidr(payload: &str) -> bool {
+    let norm = payload.trim().to_ascii_lowercase();
+    matches!(
+        norm.as_str(),
+        "127.0.0.0/8"
+            | "10.0.0.0/8"
+            | "100.64.0.0/10"
+            | "172.16.0.0/12"
+            | "192.168.0.0/16"
+            | "169.254.0.0/16"
+            | "224.0.0.0/4"
+            | "255.255.255.255/32"
+            | "0.0.0.0/32"
+            | "240.0.0.0/4"
+            | "::1/128"
+            | "fc00::/7"
+            | "fe80::/10"
+    )
+}
+
+fn redact_cidr_payload(payload: &str) -> String {
+    let trimmed = payload.trim();
+    if is_reserved_standard_cidr(trimmed) {
+        return trimmed.to_string();
+    }
+    if let Some((ip_part, prefix)) = trimmed.split_once('/') {
+        let masked_ip = crate::sanitize::redact_ip_or_host(ip_part);
+        format!("{masked_ip}/{prefix}")
+    } else {
+        crate::sanitize::redact_ip_or_host(trimmed)
+    }
+}
+
+fn redact_gateway_fake_ip_entry(entry: &str, sensitive_domains: &HashSet<String>) -> String {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let (prefix, bare) = if let Some(rest) = trimmed.strip_prefix("+.") {
+        ("+.", rest)
+    } else if let Some(rest) = trimmed.strip_prefix("*.") {
+        ("*.", rest)
+    } else {
+        ("", trimmed)
+    };
+    if matches_sensitive_domain(bare, sensitive_domains) {
+        return format!("{prefix}{}", crate::sanitize::redact_ip_or_host(bare));
+    }
+    if bare.parse::<IpAddr>().is_ok() {
+        return format!("{prefix}{}", crate::sanitize::redact_ip_or_host(bare));
+    }
+    let dom_clean = redact_sensitive_domains_in_text(trimmed, sensitive_domains);
+    crate::sanitize::sanitize_log_line(&dom_clean)
+}
+
+fn redact_gateway_rule_line(rule: &str, sensitive_domains: &HashSet<String>) -> String {
+    let trimmed = rule.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return rule.to_string();
+    }
+    if let Some((raw_type, _)) = trimmed.split_once(',') {
+        let rt_upper = raw_type.trim().to_ascii_uppercase();
+        if matches!(rt_upper.as_str(), "IP-CIDR" | "IP-CIDR6" | "SRC-IP-CIDR") {
+            let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+            if parts.len() >= 3 {
+                let mut rebuilt: Vec<String> = Vec::with_capacity(parts.len());
+                rebuilt.push(parts[0].to_string());
+                rebuilt.push(redact_cidr_payload(parts[1]));
+                for seg in &parts[2..] {
+                    let s1 = redact_sensitive_domains_in_text(seg, sensitive_domains);
+                    rebuilt.push(crate::sanitize::sanitize_log_line(&s1));
+                }
+                return rebuilt.join(",");
+            }
+        }
+        if matches!(
+            rt_upper.as_str(),
+            "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-WILDCARD" | "DOMAIN-KEYWORD" | "DOMAIN-REGEX"
+        ) {
+            let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+            if parts.len() >= 3 {
+                let payload = parts[1];
+                let payload_matches = matches_sensitive_domain(payload, sensitive_domains)
+                    || (matches!(rt_upper.as_str(), "DOMAIN-KEYWORD" | "DOMAIN-REGEX")
+                        && sensitive_domains.iter().any(|sens| {
+                            let p_lower = payload.to_ascii_lowercase();
+                            p_lower.contains(sens)
+                                || (p_lower.len() >= 4 && sens.contains(&p_lower))
+                        }));
+                let clean_payload = if payload_matches {
+                    let (prefix, bare) = if let Some(rest) = payload.strip_prefix("+.") {
+                        ("+.", rest)
+                    } else if let Some(rest) = payload.strip_prefix("*.") {
+                        ("*.", rest)
+                    } else {
+                        ("", payload)
+                    };
+                    format!("{prefix}{}", crate::sanitize::redact_ip_or_host(bare))
+                } else {
+                    let s1 = redact_sensitive_domains_in_text(payload, sensitive_domains);
+                    crate::sanitize::sanitize_log_line(&s1)
+                };
+                let mut rebuilt: Vec<String> = Vec::with_capacity(parts.len());
+                rebuilt.push(parts[0].to_string());
+                rebuilt.push(clean_payload);
+                for seg in &parts[2..] {
+                    let s1 = redact_sensitive_domains_in_text(seg, sensitive_domains);
+                    rebuilt.push(crate::sanitize::sanitize_log_line(&s1));
+                }
+                return rebuilt.join(",");
+            }
+        }
+    }
+    let step1 = redact_sensitive_domains_in_text(trimmed, sensitive_domains);
+    crate::sanitize::sanitize_log_line(&step1)
+}
+
+fn redact_all_scalar_values_deep(val: &mut Value) {
+    match val {
+        Value::String(s) => {
+            if !s.is_empty() && s != "<REDACTED>" {
+                *s = "<REDACTED>".to_string();
+            }
+        }
+        Value::Number(_) => {
+            *val = Value::String("<REDACTED>".to_string());
+        }
+        Value::Sequence(seq) => {
+            for item in seq {
+                redact_all_scalar_values_deep(item);
+            }
+        }
+        Value::Mapping(map) => {
+            for (_, v) in map.iter_mut() {
+                redact_all_scalar_values_deep(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redact_gateway_yaml_host_value(val: &mut Value, sensitive_domains: &HashSet<String>) {
+    match val {
+        Value::String(s) => {
+            if !s.trim().is_empty() {
+                *s = crate::sanitize::redact_ip_or_host(s);
+            }
+        }
+        Value::Sequence(seq) => {
+            for item in seq {
+                redact_gateway_yaml_host_value(item, sensitive_domains);
+            }
+        }
+        Value::Mapping(_) => {
+            redact_gateway_yaml_ast(val, sensitive_domains, false);
+        }
+        _ => {}
+    }
+}
+
+fn redact_gateway_rule_providers_section(
+    val: &mut Value,
+    sensitive_domains: &HashSet<String>,
+) {
+    let Some(providers_map) = val.as_mapping_mut() else {
+        redact_gateway_yaml_ast(val, sensitive_domains, false);
+        return;
+    };
+    for (_, provider_val) in providers_map.iter_mut() {
+        let Some(pmap) = provider_val.as_mapping_mut() else {
+            redact_gateway_yaml_ast(provider_val, sensitive_domains, false);
+            continue;
+        };
+        for (k, v) in pmap.iter_mut() {
+            let key_lower = k
+                .as_str()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_default();
+            if key_lower == "header" || key_lower == "headers" {
+                redact_all_scalar_values_deep(v);
+            } else if key_lower == "path" {
+                if let Value::String(s) = v {
+                    let p = crate::sanitize::redact_path_for_display(s);
+                    let d = redact_sensitive_domains_in_text(&p, sensitive_domains);
+                    *s = crate::sanitize::sanitize_log_line(&d);
+                } else {
+                    redact_gateway_yaml_ast(v, sensitive_domains, false);
+                }
+            } else if is_gateway_yaml_credential_key(&key_lower) {
+                redact_all_scalar_values_deep(v);
+            } else {
+                redact_gateway_yaml_ast(v, sensitive_domains, false);
+            }
+        }
+    }
+}
+
+fn redact_gateway_dns_section(val: &mut Value, sensitive_domains: &HashSet<String>) {
+    let Some(dns_map) = val.as_mapping_mut() else {
+        redact_gateway_yaml_ast(val, sensitive_domains, false);
+        return;
+    };
+    for (k, v) in dns_map.iter_mut() {
+        let key_lower = k
+            .as_str()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        match key_lower.as_str() {
+            "fake-ip-filter" => {
+                if let Value::Sequence(seq) = v {
+                    for item in seq.iter_mut() {
+                        if let Value::String(s) = item {
+                            *s = redact_gateway_fake_ip_entry(s, sensitive_domains);
+                        }
+                    }
+                } else {
+                    redact_gateway_yaml_ast(v, sensitive_domains, false);
+                }
+            }
+            "listen" => {
+                if let Value::String(s) = v {
+                    if !s.trim().is_empty() {
+                        *s = crate::sanitize::redact_ip_or_host(s);
+                    }
+                }
+            }
+            "nameserver-policy" => {
+                if let Value::Mapping(old_policy) = v {
+                    let mut new_policy = Mapping::new();
+                    for (pk, mut pv) in std::mem::take(old_policy) {
+                        let new_pk = if let Value::String(ks) = pk {
+                            Value::String(redact_gateway_fake_ip_entry(&ks, sensitive_domains))
+                        } else {
+                            pk
+                        };
+                        redact_gateway_yaml_ast(&mut pv, sensitive_domains, false);
+                        new_policy.insert(new_pk, pv);
+                    }
+                    *old_policy = new_policy;
+                }
+            }
+            _ => redact_gateway_yaml_ast(v, sensitive_domains, false),
+        }
+    }
+}
+
+fn redact_gateway_hosts_section(val: &mut Value, sensitive_domains: &HashSet<String>) {
+    let Some(old_hosts) = val.as_mapping_mut() else {
+        redact_gateway_yaml_ast(val, sensitive_domains, false);
+        return;
+    };
+    let mut new_hosts = Mapping::new();
+    for (hk, mut hv) in std::mem::take(old_hosts) {
+        let new_hk = if let Value::String(ks) = hk {
+            Value::String(redact_gateway_fake_ip_entry(&ks, sensitive_domains))
+        } else {
+            hk
+        };
+        redact_gateway_yaml_host_value(&mut hv, sensitive_domains);
+        new_hosts.insert(new_hk, hv);
+    }
+    *old_hosts = new_hosts;
+}
+
+fn redact_gateway_yaml_ast(
+    val: &mut Value,
+    sensitive_domains: &HashSet<String>,
+    is_root: bool,
+) {
+    match val {
+        Value::Mapping(map) => {
+            for (k, v) in map.iter_mut() {
+                let key_str = k.as_str().unwrap_or("");
+                let key_lower = key_str.trim().to_ascii_lowercase();
+
+                if is_root {
+                    match key_lower.as_str() {
+                        "rule-providers" => {
+                            redact_gateway_rule_providers_section(v, sensitive_domains);
+                            continue;
+                        }
+                        "dns" => {
+                            redact_gateway_dns_section(v, sensitive_domains);
+                            continue;
+                        }
+                        "hosts" => {
+                            redact_gateway_hosts_section(v, sensitive_domains);
+                            continue;
+                        }
+                        "rules" => {
+                            if let Value::Sequence(seq) = v {
+                                for item in seq.iter_mut() {
+                                    if let Value::String(s) = item {
+                                        *s = redact_gateway_rule_line(s, sensitive_domains);
+                                    } else {
+                                        redact_gateway_yaml_ast(item, sensitive_domains, false);
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                if is_gateway_yaml_credential_key(&key_lower) {
+                    redact_all_scalar_values_deep(v);
+                    continue;
+                }
+                if is_gateway_yaml_host_key(&key_lower) {
+                    redact_gateway_yaml_host_value(v, sensitive_domains);
+                    continue;
+                }
+                if key_lower == "path" || key_lower.ends_with("-path") || key_lower.ends_with("_path")
+                {
+                    if let Value::String(s) = v {
+                        let p = crate::sanitize::redact_path_for_display(s);
+                        let d = redact_sensitive_domains_in_text(&p, sensitive_domains);
+                        *s = crate::sanitize::sanitize_log_line(&d);
+                        continue;
+                    }
+                }
+
+                redact_gateway_yaml_ast(v, sensitive_domains, false);
+            }
+        }
+        Value::Sequence(seq) => {
+            for item in seq.iter_mut() {
+                redact_gateway_yaml_ast(item, sensitive_domains, false);
+            }
+        }
+        Value::String(s) => {
+            if !s.is_empty() && s != "*" && s != "<REDACTED>" {
+                let dom_clean = redact_sensitive_domains_in_text(s, sensitive_domains);
+                *s = crate::sanitize::sanitize_log_line(&dom_clean);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// AST-level redaction for gateway YAML exports: recursively sanitizes credentials, upstream
+/// servers/SNIs/hosts, `rule-providers.*.header`, and sensitive domains/non-reserved IPs inside
+/// `dns.fake-ip-filter` and `rules`, then serializes via `serde_yaml_ng::to_string` and re-attaches
+/// the comment header so the output is guaranteed 100% syntactically valid YAML with zero leaks.
+fn redact_gateway_yaml(
+    header: &str,
+    mut value: Value,
+    nodes: &[ProxyNode],
+    relays: &[PreAccelRelay],
+) -> CatResult<String> {
+    let sensitive_domains = collect_gateway_sensitive_domains(&value, nodes, relays);
+    redact_gateway_yaml_ast(&mut value, &sensitive_domains, true);
+    let body_yaml = serde_yaml_ng::to_string(&value)?;
+    Ok(format!("{header}{body_yaml}"))
+}
+
+fn strip_unquoted_inline_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'#' && (i == 0 || matches!(bytes[i - 1], b' ' | b'\t')) {
+            return s[..i].trim_end();
+        }
+    }
+    s.trim_end()
+}
+
+fn strip_yaml_list_rule_line(trimmed_line: &str) -> Option<String> {
+    let mut s = trimmed_line.trim();
+    if s.is_empty() || s.starts_with('#') || s == "-" {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix("- ").or_else(|| s.strip_prefix("-\t")) {
+        s = rest.trim_start();
+    }
+    if s.is_empty() || s.starts_with('#') {
+        return None;
+    }
+
+    let cleaned = if let Some(inner_rest) = s.strip_prefix('"') {
+        let mut out = String::with_capacity(inner_rest.len());
+        let mut chars = inner_rest.chars();
+        let mut closed = false;
+        let mut remainder = "";
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                if let Some(esc) = chars.next() {
+                    out.push(esc);
+                } else {
+                    out.push('\\');
+                }
+            } else if ch == '"' {
+                closed = true;
+                remainder = chars.as_str().trim();
+                break;
+            } else {
+                out.push(ch);
+            }
+        }
+        if closed && (remainder.is_empty() || remainder.starts_with('#')) {
+            out
+        } else {
+            strip_unquoted_inline_comment(s).to_string()
+        }
+    } else if let Some(inner_rest) = s.strip_prefix('\'') {
+        let mut out = String::with_capacity(inner_rest.len());
+        let mut chars = inner_rest.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    let _ = chars.next();
+                    out.push('\'');
+                } else {
+                    let tail: String = chars.collect();
+                    let tail_trimmed = tail.trim();
+                    if tail_trimmed.is_empty() || tail_trimmed.starts_with('#') {
+                        let res = out.trim();
+                        return if res.is_empty() || res.starts_with('#') {
+                            None
+                        } else {
+                            Some(res.to_string())
+                        };
+                    }
+                    break;
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        strip_unquoted_inline_comment(s).to_string()
+    } else {
+        strip_unquoted_inline_comment(s).to_string()
+    };
+
+    let final_str = cleaned.trim();
+    if final_str.is_empty() || final_str.starts_with('#') {
+        None
+    } else {
+        Some(final_str.to_string())
+    }
+}
+
+/// Extract all `RULE-SET,<provider>` provider names referenced by a top-level or logical rule line.
+fn extract_rule_set_provider_names(rule: &str) -> Vec<String> {
+    let mut providers: Vec<String> = Vec::new();
+    let trimmed = rule.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return providers;
+    }
+
+    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("RULE-SET") && !parts[1].is_empty() {
+        push_unique(&mut providers, parts[1].to_string());
+        return providers;
+    }
+
+    // Also inspect nested logical expressions such as `AND,((RULE-SET,foo),(DST-PORT,443)),DIRECT`.
+    let upper = trimmed.to_ascii_uppercase();
+    let needle = "(RULE-SET,";
+    let mut search_from = 0usize;
+    while let Some(rel) = upper[search_from..].find(needle) {
+        let name_start = search_from + rel + needle.len();
+        let tail = &trimmed[name_start..];
+        let name_end = tail.find([',', ')']).unwrap_or(tail.len());
+        let name = tail[..name_end].trim();
+        if !name.is_empty() {
+            push_unique(&mut providers, name.to_string());
+        }
+        search_from = name_start + name_end;
+    }
+
+    providers
 }
 
 // ============================================================================
@@ -1936,6 +3726,42 @@ fn select_nodes_and_groups_for_compile<'a>(
         }
     }
 
+    // Also preserve any proxy groups or nodes referenced by `rules:` inside `inline_override_yaml`
+    // so >32 node pruning never strips targets referenced by inline overrides.
+    if let Some(inline_yaml) = cfg
+        .rules_override
+        .inline_override_yaml
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(mut parsed) = serde_yaml_ng::from_str::<Value>(inline_yaml) {
+            let _ = parsed.apply_merge();
+            if let Some(rules_seq) = parsed
+                .as_mapping()
+                .and_then(|m| m.get("rules"))
+                .and_then(Value::as_sequence)
+            {
+                for item in rules_seq {
+                    if let Some(raw_rule) = item.as_str() {
+                        if let Some(target) = extract_mihomo_rule_target(raw_rule) {
+                            if let Some(gids) = group_ids_by_name.get(target) {
+                                for &gid in gids {
+                                    queue.push(gid);
+                                }
+                            }
+                            if let Some(nids) = enabled_nodes_by_name.get(target) {
+                                for &nid in nids {
+                                    active_node_ids.insert(nid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 3. Transitively expand active groups via `fallback_pool_id` and emitted `match_rules`.
     while let Some(gid) = queue.pop() {
         if !active_group_ids.insert(gid.to_string()) {
@@ -1953,6 +3779,7 @@ fn select_nodes_and_groups_for_compile<'a>(
                 }
             }
             if single_mode_node_id.is_none()
+                && !cfg.rules_override.custom_rules_only
                 && (effective_active_group_id == Some(gid) || group.independent_routing)
             {
                 let g_name = if group.name.trim().is_empty() {
@@ -2360,14 +4187,16 @@ fn build_dns_section(
         "+.twimg.com",
         "+.t.co",
     ];
-    for &domain in AI_DNS_POLICY_DOMAINS {
-        let key_lower = domain.to_ascii_lowercase();
-        if !configured_policy_keys.contains(&key_lower) {
-            policy_map.insert(
-                str_val(domain),
-                string_seq(effective_fallback.iter().map(String::as_str)),
-            );
-            configured_policy_keys.insert(key_lower);
+    if !cfg.rules_override.custom_rules_only {
+        for &domain in AI_DNS_POLICY_DOMAINS {
+            let key_lower = domain.to_ascii_lowercase();
+            if !configured_policy_keys.contains(&key_lower) {
+                policy_map.insert(
+                    str_val(domain),
+                    string_seq(effective_fallback.iter().map(String::as_str)),
+                );
+                configured_policy_keys.insert(key_lower);
+            }
         }
     }
 
@@ -2575,7 +4404,7 @@ pub fn should_emit_tun_device_name(target_os: &str, device_name: &str) -> bool {
     }
 }
 
-fn build_tun_section(cfg: &AppConfig) -> Mapping {
+fn build_tun_section(cfg: &AppConfig, effective_mtu: u16) -> Mapping {
     let tun = &cfg.tun;
     let mut map = Mapping::new();
     insert_bool(&mut map, "enable", tun.enabled);
@@ -2587,7 +4416,7 @@ fn build_tun_section(cfg: &AppConfig) -> Mapping {
     insert_bool(&mut map, "auto-detect-interface", tun.auto_detect_interface);
     insert_bool(&mut map, "strict-route", tun.strict_route);
     insert_bool(&mut map, "endpoint-independent-nat", false);
-    insert_u64(&mut map, "mtu", u64::from(tun.mtu));
+    insert_u64(&mut map, "mtu", u64::from(effective_mtu));
     map.insert(
         str_val("dns-hijack"),
         string_seq(tun.dns_hijack.iter().map(String::as_str)),
@@ -2747,12 +4576,12 @@ fn has_direct_anti_loop_rule(relay_server: &str, rules: &[String]) -> bool {
     let target_ip = target.parse::<IpAddr>().ok();
 
     for rule in rules {
-        let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
         // Stop before a catch-all MATCH rule routes the relay into a proxy loop.
         // Note: `MATCH,<target>` has only 2 segments, so this check MUST precede `parts.len() < 3`.
-        if parts.len() >= 2 && parts[0].eq_ignore_ascii_case("MATCH") {
+        if is_match_rule(rule) {
             return false;
         }
+        let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
         if parts.len() < 3 {
             continue;
         }
@@ -3168,13 +4997,16 @@ mod tests {
         assert!(compiled.value["geox-url"].get("mmdb").is_some());
         assert!(compiled.value["geox-url"].get("asn").is_some());
 
-        // Full TUN fields
+        // Full TUN fields (effective MTU clamps to <=1400 when dialer-proxy wraps >=1 proxy,
+        // without mutating `AppConfig.tun.mtu`).
         let tun = &compiled.value["tun"];
         assert_eq!(tun["enable"], Value::Bool(true));
         assert_eq!(tun["stack"], "gvisor");
         assert_eq!(tun["strict-route"], Value::Bool(true));
         assert_eq!(tun["endpoint-independent-nat"], Value::Bool(false));
-        assert_eq!(tun["mtu"], 1500);
+        assert_eq!(tun["mtu"], 1400);
+        assert_eq!(compiled.stats.effective_tun_mtu, 1400);
+        assert_eq!(cfg.tun.mtu, 1500);
 
         // Pre-accel chain: pure-IP relay omits SNI; non-443 gets dialer-proxy; 443-native skipped
         let proxies = compiled.value["proxies"].as_sequence().unwrap();
@@ -3217,6 +5049,59 @@ mod tests {
         assert!(rules.contains(&"IP-CIDR,203.0.113.10/32,DIRECT,no-resolve"));
         assert!(rules.contains(&"DOMAIN,relay-b.example.test,DIRECT"));
         assert!(rules.contains(&"DOMAIN,connectivitycheck.platform.hicloud.com,DIRECT"));
+
+        // Reverse check: without any dialer-wrapped proxy (preaccel disabled), TUN MTU stays 1500.
+        let mut cfg_no_preaccel = cfg.clone();
+        cfg_no_preaccel.preaccel.enabled = false;
+        let compiled_no_preaccel = compile_mihomo_config(&CompileInput {
+            config: &cfg_no_preaccel,
+            nodes: &nodes,
+            groups: &[],
+            relays: &relays,
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty_filtered,
+        })
+        .expect("compile without preaccel");
+        assert_eq!(compiled_no_preaccel.stats.dialer_wrapped_proxies, 0);
+        assert_eq!(compiled_no_preaccel.value["tun"]["mtu"], 1500);
+        assert_eq!(compiled_no_preaccel.stats.effective_tun_mtu, 1500);
+
+        // User-configured MTU below 1400 (e.g. 1280) must never be raised when preaccel is active.
+        let mut cfg_low_mtu = cfg.clone();
+        cfg_low_mtu.tun.mtu = 1280;
+        let compiled_low_mtu = compile_mihomo_config(&CompileInput {
+            config: &cfg_low_mtu,
+            nodes: &nodes,
+            groups: &[],
+            relays: &relays,
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty_filtered,
+        })
+        .expect("compile low mtu");
+        assert_eq!(compiled_low_mtu.value["tun"]["mtu"], 1280);
+        assert_eq!(compiled_low_mtu.stats.effective_tun_mtu, 1280);
+
+        // Verify locked transport diagnostics snapshot helper.
+        let diag = build_preaccel_transport_diagnostics(
+            &cfg,
+            compiled.stats.effective_tun_mtu,
+            "main-tun-core",
+        );
+        assert_eq!(diag.effective_mode, "main-tun-core");
+        assert_eq!(diag.effective_tun_mtu, 1400);
+        assert!(!diag.anytls_tfo);
+        assert_eq!(diag.anytls_min_idle_session, 0);
+        assert_eq!(diag.keep_alive_idle_sec, 45);
+        assert_eq!(diag.keep_alive_interval_sec, 15);
+        assert_eq!(diag.expected_probe_status, "204");
+        assert_eq!(diag.lb_strategy, "consistent-hashing");
+        assert_eq!(diag.probe_interval_sec, 30);
     }
 
     #[test]
@@ -4780,11 +6665,11 @@ rules:
         assert_eq!(compiled_4.value["proxies"].as_sequence().unwrap().len(), 4);
 
         // Unconditional memory tunings: geodata-loader=memconservative even when geodata_mode=false,
-        // keep-alive-idle=15, keep-alive-interval=15; when GeoIP is absent while domestic_direct_enabled=true,
+        // keep-alive-idle=45, keep-alive-interval=15; when GeoIP is absent while domestic_direct_enabled=true,
         // QUIC sniffer stays enabled so domestic IM UDP/443 can match DOMAIN-SUFFIX DIRECT before REJECT.
         assert_eq!(compiled_4.value["geodata-mode"], Value::Bool(false));
         assert_eq!(compiled_4.value["geodata-loader"], "memconservative");
-        assert_eq!(compiled_4.value["keep-alive-idle"], 15);
+        assert_eq!(compiled_4.value["keep-alive-idle"], 45);
         assert_eq!(compiled_4.value["keep-alive-interval"], 15);
         assert!(compiled_4.value["sniffer"]["sniff"].get("QUIC").is_some());
         assert!(compiled_4.value["sniffer"]["sniff"].get("TLS").is_some());
@@ -5300,7 +7185,7 @@ rules:
         let mut cfg = AppConfig::default();
         cfg.tun.enabled = true;
         cfg.tun.device_name = "CatCloud".to_string();
-        let tun_map = build_tun_section(&cfg);
+        let tun_map = build_tun_section(&cfg, cfg.tun.mtu);
         if cfg!(target_os = "macos") {
             assert!(tun_map.get("device").is_none());
         } else {
@@ -5308,7 +7193,7 @@ rules:
         }
 
         cfg.tun.device_name = "utun9".to_string();
-        let tun_utun = build_tun_section(&cfg);
+        let tun_utun = build_tun_section(&cfg, cfg.tun.mtu);
         assert_eq!(tun_utun.get("device").and_then(Value::as_str), Some("utun9"));
     }
 
@@ -6114,5 +7999,927 @@ rules:
         assert!(!redacted.contains("super-secret-controller-token-9999"));
         assert!(!redacted.contains("203.0.113.55"));
         assert_eq!(redacted, crate::sanitize::redact_compiled_yaml(&compiled.yaml));
+    }
+
+    #[test]
+    fn custom_rules_only_skips_builtin_rules_and_ai_dns_while_respecting_user_match() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.rules_override.custom_rules_only = true;
+        cfg.rules_override.block_quic_udp_443 = true;
+        cfg.rules_override.domestic_direct_enabled = true;
+        cfg.rules_override.global_prepend_rules = vec![
+            "DOMAIN-SUFFIX,custom-direct.test,DIRECT".to_string(),
+        ];
+        cfg.rules_override.global_append_rules = vec![
+            "DOMAIN-SUFFIX,custom-proxy.test,AI-Sticky".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+        cfg.dns
+            .nameserver_policy
+            .insert("+.mycorp.internal".to_string(), vec!["10.0.0.53".to_string()]);
+
+        let nodes = vec![sample_node("n1", "Node-JP-01", 8443, false)];
+        let groups = vec![MultiGroup {
+            id: "g-ai".to_string(),
+            name: "AI-Sticky".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            match_rules: vec!["@ai_domains".to_string()],
+            member_node_ids: vec!["n1".to_string()],
+            active_node_id: Some("n1".to_string()),
+            independent_routing: true,
+            ..Default::default()
+        }];
+        let relays = vec![sample_relay("r1", "Relay-East", "203.0.113.10", 10)];
+        let extra = vec!["DOMAIN,extra-prepend.test,DIRECT".to_string()];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &relays,
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &extra,
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile custom_rules_only with explicit MATCH");
+        assert!(compiled.validation.ok, "issues: {:?}", compiled.validation.issues);
+
+        let rules: Vec<&str> = compiled.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+
+        // Mandatory anti-loop, probe process bypass, private LAN direct, and user rules are preserved.
+        assert!(rules.contains(&"IP-CIDR,203.0.113.10/32,DIRECT,no-resolve"));
+        assert!(rules.iter().any(|r| r.starts_with("PROCESS-NAME,") && r.ends_with(",DIRECT")));
+        assert!(rules.contains(&"IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"));
+        assert!(rules.contains(&"DOMAIN,extra-prepend.test,DIRECT"));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,custom-direct.test,DIRECT"));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,custom-proxy.test,AI-Sticky"));
+
+        // Built-in QUIC block, group auto match_rules, and built-in domestic direct lists are skipped.
+        assert!(!rules.contains(&"AND,((NETWORK,UDP),(DST-PORT,443)),REJECT"));
+        assert!(!rules.iter().any(|r| r.contains("openai.com")));
+        assert!(!rules.contains(&"DOMAIN-SUFFIX,cn,DIRECT"));
+        assert!(!rules.contains(&"DOMAIN-SUFFIX,baidu.com,DIRECT"));
+        assert!(!rules.contains(&"GEOSITE,cn,DIRECT"));
+        assert!(!rules.contains(&"GEOIP,CN,DIRECT,no-resolve"));
+
+        // User's own `MATCH,DIRECT` is respected 100% (no duplicate `MATCH,AI-Sticky` appended).
+        let match_rules: Vec<&&str> = rules
+            .iter()
+            .filter(|r| r.to_ascii_uppercase().starts_with("MATCH,"))
+            .collect();
+        assert_eq!(match_rules, vec![&"MATCH,DIRECT"]);
+
+        // Built-in `AI_DNS_POLICY_DOMAINS` are NOT injected when `custom_rules_only == true`,
+        // while user `nameserver_policy` and intranet anti-loop remain intact.
+        let policy = compiled.value["dns"]["nameserver-policy"].as_mapping().unwrap();
+        assert!(policy.get("+.mycorp.internal").is_some());
+        assert!(policy.get("+.edu.cn").is_some());
+        assert!(policy.get("+.openai.com").is_none());
+        assert!(policy.get("+.anthropic.com").is_none());
+
+        // When user omits `MATCH,...`, compiler appends fallback `MATCH,{match_target}` automatically.
+        cfg.rules_override.global_append_rules =
+            vec!["DOMAIN-SUFFIX,custom-proxy.test,AI-Sticky".to_string()];
+        let compiled_fallback = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &relays,
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile custom_rules_only without explicit MATCH");
+        let rules_fb: Vec<&str> = compiled_fallback.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(rules_fb.last().copied(), Some("MATCH,AI-Sticky"));
+    }
+
+    #[test]
+    fn inline_override_yaml_injects_rule_providers_validates_rule_set_and_rejects_invalid_yaml() {
+        let mut cfg = AppConfig::default();
+        // Verify inline YAML merge patch runs even when `override_mode == OverrideMode::Disabled`.
+        cfg.rules_override.override_mode = OverrideMode::Disabled;
+        cfg.rules_override.global_prepend_rules = vec![
+            "RULE-SET,custom_direct,DIRECT".to_string(),
+            "RULE-SET,missing_set,DIRECT".to_string(),
+        ];
+        cfg.rules_override.inline_override_yaml = Some(
+            r#"
+rule-providers:
+  custom_direct:
+    type: http
+    behavior: domain
+    url: https://example.invalid/direct.yaml
+    path: ./ruleset/custom_direct.yaml
+    interval: 86400
+"#
+            .to_string(),
+        );
+
+        let nodes = vec![sample_node("n1", "Node-SG-01", 8443, false)];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with inline rule-providers override");
+        assert!(compiled.validation.ok, "RULE-SET warnings must not fail validation");
+        assert!(compiled.value["rule-providers"]["custom_direct"].is_mapping());
+
+        let warnings = compiled.validation.warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.code == "missing_rule_provider" && w.message.contains("missing_set")),
+            "expected missing_rule_provider warning for `missing_set`, got: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "missing_rule_provider" && w.message.contains("custom_direct")),
+            "defined provider `custom_direct` must not trigger warning"
+        );
+
+        // Invalid YAML must be rejected cleanly with a Chinese diagnostic without panicking.
+        cfg.rules_override.inline_override_yaml = Some("rule-providers: [\n  unclosed".to_string());
+        let err = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect_err("malformed inline YAML must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("内联 YAML"), "unexpected error: {msg}");
+
+        // Oversized (> 1 MiB) inline YAML must be rejected cleanly.
+        cfg.rules_override.inline_override_yaml = Some(format!(
+            "rules:\n  - {}\n",
+            "x".repeat(crate::models::MAX_INLINE_OVERRIDE_YAML_BYTES + 32)
+        ));
+        let err_oversized = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect_err("oversized inline YAML must fail");
+        assert!(err_oversized.to_string().contains("1 MiB"));
+    }
+
+    #[test]
+    fn parse_bulk_rules_text_handles_yaml_bullets_quotes_comments_and_complex_rules() {
+        let raw = r#"
+# Top comment should be skipped
+rules: # header comment
+
+  - 'DOMAIN-SUFFIX,openai.com,AI-Group' # inline comment
+  - "RULE-SET,private_cn,DIRECT" # provider rule
+  - GEOSITE,cn,DIRECT
+  - GEOIP,CN,DIRECT,no-resolve # geoip comment
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT # quic block
+  - OR,((DOMAIN-SUFFIX,a.test),(DOMAIN-SUFFIX,b.test)),PROXY,no-resolve
+  - NOT,((DST-PORT,80)),DIRECT
+  - SUB-RULE,(NETWORK,TCP),sub-tcp-rules
+  - DOMAIN-SUFFIX,openai.com,AI-Group
+  - MATCH,DIRECT
+  - INVALID-TYPE,foo,DIRECT
+  - broken-line-without-comma
+"#;
+
+        let parsed = parse_bulk_rules_text(raw);
+        assert_eq!(
+            parsed.valid_rules,
+            vec![
+                "DOMAIN-SUFFIX,openai.com,AI-Group",
+                "RULE-SET,private_cn,DIRECT",
+                "GEOSITE,cn,DIRECT",
+                "GEOIP,CN,DIRECT,no-resolve",
+                "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT",
+                "OR,((DOMAIN-SUFFIX,a.test),(DOMAIN-SUFFIX,b.test)),PROXY,no-resolve",
+                "NOT,((DST-PORT,80)),DIRECT",
+                "SUB-RULE,(NETWORK,TCP),sub-tcp-rules",
+                "MATCH,DIRECT",
+            ]
+        );
+        assert_eq!(
+            parsed.skipped_lines,
+            vec![
+                "- INVALID-TYPE,foo,DIRECT",
+                "- broken-line-without-comma",
+            ]
+        );
+    }
+
+    #[test]
+    fn export_gateway_yaml_covers_all_three_profiles_redaction_ports_and_disables_tun() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.tun.enabled = true;
+        cfg.controller_secret = Some("gw-test-controller-secret-12345".to_string());
+        cfg.rules_override.custom_rules_only = true;
+        cfg.rules_override.global_prepend_rules = vec![
+            "RULE-SET,lan_direct,DIRECT".to_string(),
+            "DOMAIN-SUFFIX,corp.example.test,DIRECT".to_string(),
+        ];
+        cfg.rules_override.inline_override_yaml = Some(
+            "rule-providers:\n  lan_direct:\n    type: http\n    behavior: domain\n    url: https://example.invalid/lan.yaml\n    path: ./ruleset/lan.yaml\n"
+                .to_string(),
+        );
+
+        let relays = vec![
+            sample_relay("r1", "CloudA-443", "203.0.113.10", 10),
+            sample_relay("r2", "CloudB-443", "198.51.100.20", 20),
+        ];
+        let nodes = vec![
+            sample_node("n1", "Node-JP-8443", 8443, false),
+            sample_node("n2", "Node-SG-443", 443, true),
+        ];
+        let groups = vec![MultiGroup {
+            id: "g1".to_string(),
+            name: "Main-Group".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n2".to_string(), "n1".to_string()],
+            active_node_id: Some("n1".to_string()),
+            ..Default::default()
+        }];
+
+        // 1. RelayFragment: redacted vs plaintext + empty relays friendly fallback
+        let frag_redacted = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::RelayFragment,
+                redact_secrets: true,
+                ..GatewayExportOptions::default()
+            },
+        )
+        .expect("export relay fragment redacted");
+        assert!(frag_redacted.redacted);
+        assert_eq!(frag_redacted.relay_count, 2);
+        assert_eq!(frag_redacted.node_count, 0);
+        assert!(frag_redacted.rule_count >= 2);
+        assert!(frag_redacted.yaml.contains(&format!("dialer-proxy: {PREACCEL_SELECT_GROUP_NAME}")));
+        assert!(!frag_redacted.yaml.contains("relay-password"));
+        assert!(!frag_redacted.yaml.contains("203.0.113.10"));
+        let frag_val: Value =
+            serde_yaml_ng::from_str(&frag_redacted.yaml).expect("redacted relay fragment valid YAML");
+        let first_relay = &frag_val["proxies"][0];
+        assert_eq!(first_relay["tfo"], Value::Bool(false));
+        assert_eq!(first_relay["min-idle-session"], Value::Number(Number::from(0u64)));
+        assert!(frag_val["dns"]["fake-ip-filter"].is_sequence());
+
+        let frag_plain = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::RelayFragment,
+                redact_secrets: false,
+                ..GatewayExportOptions::default()
+            },
+        )
+        .expect("export relay fragment plaintext");
+        assert!(!frag_plain.redacted);
+        assert!(frag_plain.yaml.contains("relay-password"));
+        assert!(frag_plain.yaml.contains("203.0.113.10"));
+
+        let frag_empty = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &[],
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::RelayFragment,
+                redact_secrets: true,
+                ..GatewayExportOptions::default()
+            },
+        )
+        .expect("empty relays must not fail");
+        assert_eq!(frag_empty.relay_count, 0);
+        assert!(!frag_empty.warnings.is_empty());
+        let _: Value = serde_yaml_ng::from_str(&frag_empty.yaml).expect("empty fragment valid YAML");
+
+        // 2. TransparentGateway: allow-lan, bind-address="*", custom ports, tun disabled, inline rule-providers preserved
+        let gw_plain = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::TransparentGateway,
+                tproxy_port: 17893,
+                redir_port: 17892,
+                dns_listen_port: 11053,
+                redact_secrets: false,
+            },
+        )
+        .expect("export transparent gateway plaintext");
+        assert!(!gw_plain.redacted);
+        assert_eq!(gw_plain.relay_count, 2);
+        assert_eq!(gw_plain.node_count, 2);
+        let gw_val: Value =
+            serde_yaml_ng::from_str(&gw_plain.yaml).expect("transparent gateway valid YAML");
+        assert_eq!(gw_val["allow-lan"], Value::Bool(true));
+        assert_eq!(gw_val["bind-address"], "*");
+        assert_eq!(gw_val["tproxy-port"], Value::Number(Number::from(17893u64)));
+        assert_eq!(gw_val["redir-port"], Value::Number(Number::from(17892u64)));
+        assert_eq!(gw_val["tun"]["enable"], Value::Bool(false));
+        assert_eq!(gw_val["dns"]["listen"], "0.0.0.0:11053");
+        assert!(gw_val["rule-providers"]["lan_direct"].is_mapping());
+        assert!(gw_plain.yaml.contains("gw-test-controller-secret-12345"));
+
+        let gw_redacted = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::TransparentGateway,
+                tproxy_port: 17893,
+                redir_port: 17892,
+                dns_listen_port: 11053,
+                redact_secrets: true,
+            },
+        )
+        .expect("export transparent gateway redacted");
+        assert!(gw_redacted.redacted);
+        assert!(!gw_redacted.yaml.contains("gw-test-controller-secret-12345"));
+        assert!(!gw_redacted.yaml.contains("relay-password"));
+        assert!(!gw_redacted.yaml.contains("203.0.113.10"));
+        let _: Value =
+            serde_yaml_ng::from_str(&gw_redacted.yaml).expect("redacted gateway valid YAML");
+
+        // 3. PreferredNodes: ranks active healthy node first and keeps dialer-proxy on non-443 node
+        let pref_plain = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::PreferredNodes,
+                redact_secrets: false,
+                ..GatewayExportOptions::default()
+            },
+        )
+        .expect("export preferred nodes plaintext");
+        assert_eq!(pref_plain.relay_count, 2);
+        assert_eq!(pref_plain.node_count, 2);
+        let pref_val: Value =
+            serde_yaml_ng::from_str(&pref_plain.yaml).expect("preferred nodes valid YAML");
+        let proxies = pref_val["proxies"].as_sequence().unwrap();
+        let jp_node = proxies
+            .iter()
+            .find(|p| p["name"] == "Node-JP-8443")
+            .expect("JP non-443 node present");
+        assert_eq!(jp_node["dialer-proxy"], PREACCEL_SELECT_GROUP_NAME);
+        let sg_node = proxies
+            .iter()
+            .find(|p| p["name"] == "Node-SG-443")
+            .expect("SG 443-native node present");
+        assert!(sg_node.get("dialer-proxy").is_none());
+
+        let pref_redacted = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::PreferredNodes,
+                redact_secrets: true,
+                ..GatewayExportOptions::default()
+            },
+        )
+        .expect("export preferred nodes redacted");
+        assert!(!pref_redacted.yaml.contains("demo-password"));
+        assert!(!pref_redacted.yaml.contains("relay-password"));
+        let _: Value =
+            serde_yaml_ng::from_str(&pref_redacted.yaml).expect("redacted preferred nodes valid YAML");
+    }
+
+    #[test]
+    fn redact_gateway_yaml_ast_redacts_special_passwords_headers_fake_ip_and_rules_as_valid_yaml() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.controller_secret = Some("ctrl'sec;ret&val > )".to_string());
+        cfg.rules_override.global_prepend_rules = vec![
+            "DOMAIN,edge.demo-vendor.example,DIRECT".to_string(),
+            "IP-CIDR,10.23.45.67/32,DIRECT,no-resolve".to_string(),
+            "IP-CIDR,198.51.100.99/32,DIRECT,no-resolve".to_string(),
+        ];
+        let provider_url = format!(
+            "{}?{}={}",
+            "https://example.invalid/corp.yaml", "token", "url_tok_secret_99"
+        );
+        cfg.rules_override.inline_override_yaml = Some(format!(
+            "rule-providers:\n  private_corp:\n    type: http\n    behavior: domain\n    url: {provider_url}\n    path: ./ruleset/corp.yaml\n    header:\n      Authorization:\n        - \"Bearer top-secret-provider-hdr\"\n      X-Custom-Auth: \"hdr-secret-value-42\"\n"
+        ));
+
+        let mut domain_relay =
+            sample_relay("r-dom", "Relay-Domain", "relay.vendor-hop.example", 10);
+        domain_relay.password = "pass'word;semi&amp>paren )\\".to_string();
+        let relays = vec![domain_relay];
+
+        let mut tricky_node = sample_node("n-tricky", "Node-Tricky", 8443, false);
+        tricky_node.server = "edge.demo-vendor.example".to_string();
+        tricky_node.raw_config = serde_json::json!({
+            "name": "Node-Tricky",
+            "type": "trojan",
+            "server": "edge.demo-vendor.example",
+            "port": 8443,
+            "sni": "sni.demo-vendor.example",
+            "password": "line1'secret\nline2;secret&tail > )\\",
+            "uuid": "11111111-2222-3333-4444-555555555555",
+            "reality-opts": {
+                "public-key": "pub_key_real_secret_xyz",
+                "short-id": "abcdef012345"
+            },
+            "ws-opts": {
+                "headers": {
+                    "Host": "ws.demo-vendor.example"
+                }
+            }
+        });
+        let nodes = vec![tricky_node];
+
+        for profile in [
+            GatewayExportProfile::RelayFragment,
+            GatewayExportProfile::TransparentGateway,
+            GatewayExportProfile::PreferredNodes,
+        ] {
+            let exported = export_gateway_yaml(
+                &cfg,
+                &nodes,
+                &[],
+                &relays,
+                None,
+                &GatewayExportOptions {
+                    profile,
+                    tproxy_port: 17893,
+                    redir_port: 17892,
+                    dns_listen_port: 11053,
+                    redact_secrets: true,
+                },
+            )
+            .expect("AST redacted gateway export must succeed");
+
+            let parsed: Value = serde_yaml_ng::from_str(&exported.yaml)
+                .expect("AST redacted gateway YAML must be 100% valid YAML");
+
+            for leaked in [
+                "relay.vendor-hop.example",
+                "vendor-hop",
+                "edge.demo-vendor.example",
+                "demo-vendor",
+                "sni.demo-vendor.example",
+                "ws.demo-vendor.example",
+                "pass'word",
+                "semi&amp",
+                "line1'secret",
+                "line2;secret",
+                "ctrl'sec",
+                "11111111-2222-3333-4444-555555555555",
+                "pub_key_real_secret_xyz",
+                "abcdef012345",
+                "top-secret-provider-hdr",
+                "hdr-secret-value-42",
+                "url_tok_secret_99",
+                "10.23.45.67",
+                "198.51.100.99",
+            ] {
+                assert!(
+                    !exported.yaml.contains(leaked),
+                    "profile {profile:?} leaked `{leaked}` in:\n{}",
+                    exported.yaml
+                );
+            }
+
+            if profile == GatewayExportProfile::TransparentGateway {
+                let hdr = &parsed["rule-providers"]["private_corp"]["header"];
+                assert_eq!(hdr["Authorization"][0].as_str(), Some("<REDACTED>"));
+                assert_eq!(hdr["X-Custom-Auth"].as_str(), Some("<REDACTED>"));
+            }
+        }
+    }
+
+    #[test]
+    fn inline_override_yaml_cannot_wipe_safety_rules_or_bypass_transparent_gateway_locks() {
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.enabled = true;
+        cfg.tun.enabled = true;
+        cfg.rules_override.custom_rules_only = true;
+        cfg.rules_override.inline_override_yaml = Some(
+            r#"
+tun:
+  enable: true
+allow-lan: false
+bind-address: "127.0.0.1"
+tproxy-port: 9999
+redir-port: 9998
+dns:
+  listen: "127.0.0.1:5353"
+rules:
+  - DOMAIN-SUFFIX,custom-only.test,DIRECT
+  - MATCH , DIRECT
+"#
+            .to_string(),
+        );
+
+        let relays = vec![sample_relay("r1", "Relay-A", "203.0.113.10", 10)];
+        let nodes = vec![sample_node("n1", "Node-JP-8443", 8443, false)];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        // 1. Direct compilation must keep anti-loop, probe bypass, and private LAN safety rules on top.
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &relays,
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with rules override");
+        assert!(compiled.validation.ok, "unexpected errors: {:?}", compiled.validation.issues);
+        let rules: Vec<&str> = compiled.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let probe_rule = format!(
+            "PROCESS-NAME,{},DIRECT",
+            crate::probe::isolated_runner::PROBE_CORE_PROCESS_NAME
+        );
+        assert!(rules.contains(&"IP-CIDR,203.0.113.10/32,DIRECT,no-resolve"));
+        assert!(rules.contains(&probe_rule.as_str()));
+        assert!(rules.contains(&"IP-CIDR,10.0.0.0/8,DIRECT,no-resolve"));
+        assert!(rules.contains(&"IP-CIDR,192.168.0.0/16,DIRECT,no-resolve"));
+        assert!(rules.contains(&"DOMAIN-SUFFIX,custom-only.test,DIRECT"));
+        assert_eq!(rules.last().copied(), Some("MATCH,DIRECT"));
+        let lan_pos = rules
+            .iter()
+            .position(|r| *r == "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve")
+            .unwrap();
+        let custom_pos = rules
+            .iter()
+            .position(|r| *r == "DOMAIN-SUFFIX,custom-only.test,DIRECT")
+            .unwrap();
+        assert!(lan_pos < custom_pos, "safety base must precede overridden user rules");
+
+        // 2. TransparentGateway locks allow-lan, bind-address="*", ports, dns.listen, and tun.enable=false.
+        let gw = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &[],
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::TransparentGateway,
+                tproxy_port: 17893,
+                redir_port: 17892,
+                dns_listen_port: 11053,
+                redact_secrets: false,
+            },
+        )
+        .expect("transparent gateway export with locked overrides");
+        let gw_doc: Value = serde_yaml_ng::from_str(&gw.yaml).unwrap();
+        assert_eq!(gw_doc["allow-lan"], Value::Bool(true));
+        assert_eq!(gw_doc["bind-address"], "*");
+        assert_eq!(gw_doc["tproxy-port"], Value::Number(Number::from(17893u64)));
+        assert_eq!(gw_doc["redir-port"], Value::Number(Number::from(17892u64)));
+        assert_eq!(gw_doc["tun"]["enable"], Value::Bool(false));
+        assert_eq!(gw_doc["dns"]["listen"], "0.0.0.0:11053");
+
+        // 3. StaticCheckSeverity::Error from invalid rule target in inline_override_yaml must return Err.
+        cfg.rules_override.inline_override_yaml = Some(
+            "rules:\n  - DOMAIN-SUFFIX,broken.test,NonExistentGroup\n  - MATCH,DIRECT\n".to_string(),
+        );
+        let err = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &[],
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::TransparentGateway,
+                tproxy_port: 17893,
+                redir_port: 17892,
+                dns_listen_port: 11053,
+                redact_secrets: false,
+            },
+        )
+        .expect_err("transparent gateway must return Err when static validation has Error");
+        assert!(err.to_string().contains("unknown_rule_target"));
+    }
+
+    #[test]
+    fn match_rule_whitespace_is_normalized_without_duplicate_match() {
+        assert!(is_match_rule("MATCH,DIRECT"));
+        assert!(is_match_rule("MATCH , DIRECT"));
+        assert!(is_match_rule("  match , AI-Group  "));
+        assert!(!is_match_rule("MATCH,"));
+        assert!(!is_match_rule("MATCH,A,B"));
+        assert!(!is_match_rule("DOMAIN-SUFFIX,example.com,DIRECT"));
+
+        let bulk = parse_bulk_rules_text("  - 'MATCH , DIRECT'\n  - MATCH,DIRECT\n");
+        assert_eq!(bulk.valid_rules, vec!["MATCH,DIRECT".to_string()]);
+        assert!(bulk.skipped_lines.is_empty());
+
+        let mut cfg = AppConfig::default();
+        cfg.rules_override.custom_rules_only = true;
+        cfg.rules_override.global_append_rules = vec!["MATCH , DIRECT".to_string()];
+        let nodes = vec![sample_node("n1", "Node-JP-01", 8443, false)];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile with spaced MATCH");
+        let rules: Vec<&str> = compiled.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let match_rules: Vec<&str> = rules.iter().copied().filter(|r| is_match_rule(r)).collect();
+        assert_eq!(match_rules, vec!["MATCH,DIRECT"]);
+        assert!(
+            !compiled
+                .validation
+                .warnings()
+                .iter()
+                .any(|w| w.code == "missing_match_rule")
+        );
+    }
+
+    #[test]
+    fn export_gateway_preferred_nodes_strips_dangling_dialer_keeps_clean_rules_and_handles_disabled_preaccel()
+    {
+        let mut cfg = AppConfig::default();
+        // Desktop switch off while enabled relays exist -> symmetric export with explanatory warning.
+        cfg.preaccel.enabled = false;
+        cfg.preaccel.skip_443_native = true;
+
+        let relays = vec![sample_relay("r1", "Relay-A", "203.0.113.10", 10)];
+
+        let mut node_dangling = sample_node("n-dangling", "Node-443-Dangling", 443, true);
+        node_dangling.server = "biz-node.vendor-exit.example".to_string();
+        node_dangling.raw_config = serde_json::json!({
+            "name": "Node-443-Dangling",
+            "type": "trojan",
+            "server": "biz-node.vendor-exit.example",
+            "port": 443,
+            "password": "pw1",
+            "dialer-proxy": "Other-Missing-Relay"
+        });
+
+        let mut node_self = sample_node("n-self", "Node-443-Self", 443, true);
+        node_self.server = "self-node.vendor-exit.example".to_string();
+        node_self.raw_config = serde_json::json!({
+            "name": "Node-443-Self",
+            "type": "trojan",
+            "server": "self-node.vendor-exit.example",
+            "port": 443,
+            "password": "pw2",
+            "dialer-proxy": "Node-443-Self"
+        });
+
+        let mut node_wrapped = sample_node("n-wrap", "Node-8443-Wrap", 8443, false);
+        node_wrapped.server = "wrap-node.vendor-exit.example".to_string();
+        node_wrapped.raw_config = serde_json::json!({
+            "name": "Node-8443-Wrap",
+            "type": "ss",
+            "server": "wrap-node.vendor-exit.example",
+            "port": 8443,
+            "cipher": "aes-128-gcm",
+            "password": "pw3"
+        });
+
+        let nodes = vec![node_dangling, node_self, node_wrapped];
+        let exported = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &[],
+            &relays,
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::PreferredNodes,
+                redact_secrets: false,
+                ..GatewayExportOptions::default()
+            },
+        )
+        .expect("preferred nodes export");
+
+        assert_eq!(exported.relay_count, 1);
+        assert!(
+            exported
+                .warnings
+                .iter()
+                .any(|w| w.contains("当前桌面国内提速总开关关闭")),
+            "expected disabled-switch symmetric export warning, got: {:?}",
+            exported.warnings
+        );
+
+        let doc: Value = serde_yaml_ng::from_str(&exported.yaml).unwrap();
+        let proxies = doc["proxies"].as_sequence().unwrap();
+        let dangling_p = proxies
+            .iter()
+            .find(|p| p["name"] == "Node-443-Dangling")
+            .unwrap();
+        assert!(
+            dangling_p.get("dialer-proxy").is_none(),
+            "dangling dialer-proxy must be stripped"
+        );
+        let self_p = proxies
+            .iter()
+            .find(|p| p["name"] == "Node-443-Self")
+            .unwrap();
+        assert!(
+            self_p.get("dialer-proxy").is_none(),
+            "self-referencing dialer-proxy must be stripped"
+        );
+        let wrap_p = proxies
+            .iter()
+            .find(|p| p["name"] == "Node-8443-Wrap")
+            .unwrap();
+        assert_eq!(wrap_p["dialer-proxy"], PREACCEL_SELECT_GROUP_NAME);
+
+        // Business node domains MUST enter dns.fake-ip-filter and MUST NOT enter rules: DIRECT.
+        let rules: Vec<&str> = doc["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(rules.contains(&"IP-CIDR,203.0.113.10/32,DIRECT,no-resolve"));
+        for biz_dom in [
+            "biz-node.vendor-exit.example",
+            "self-node.vendor-exit.example",
+            "wrap-node.vendor-exit.example",
+        ] {
+            assert!(
+                !rules.iter().any(|r| r.contains(biz_dom)),
+                "business node domain `{biz_dom}` must NOT appear in PreferredNodes rules: {rules:?}"
+            );
+        }
+        let fake_ip_filter: Vec<&str> = doc["dns"]["fake-ip-filter"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for biz_dom in [
+            "biz-node.vendor-exit.example",
+            "self-node.vendor-exit.example",
+            "wrap-node.vendor-exit.example",
+        ] {
+            assert!(
+                fake_ip_filter.contains(&biz_dom),
+                "business node domain `{biz_dom}` must appear in dns.fake-ip-filter: {fake_ip_filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn prune_over_32_nodes_preserves_inline_override_targets_and_transparent_gateway_exports_all_nodes()
+    {
+        let mut cfg = AppConfig::default();
+        cfg.core_runtime.compile_all_nodes = false;
+        cfg.proxy_mode = ProxyMode::Rule;
+        cfg.route_mode = RouteTargetMode::Single;
+        cfg.active_single_node_id = Some("n-01".to_string());
+        cfg.rules_override.inline_override_yaml = Some(
+            r#"
+rules:
+  - DOMAIN-SUFFIX,ai-inline.test,Inline-AI-Group
+  - DOMAIN-SUFFIX,direct-node.test,Node-35
+  - MATCH,DIRECT
+"#
+            .to_string(),
+        );
+
+        let nodes: Vec<ProxyNode> = (1..=40)
+            .map(|i| sample_node(&format!("n-{i:02}"), &format!("Node-{i:02}"), 8443, false))
+            .collect();
+        let groups = vec![MultiGroup {
+            id: "g-inline".to_string(),
+            name: "Inline-AI-Group".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["n-20".to_string(), "n-21".to_string()],
+            active_node_id: Some("n-20".to_string()),
+            ..Default::default()
+        }];
+        let ports = sample_ports();
+        let empty = HashMap::new();
+
+        // 1. >32 node pruning preserves groups & nodes referenced by inline_override_yaml rules.
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &groups,
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile pruned config with inline_override_yaml targets");
+        assert!(
+            compiled.validation.ok,
+            "inline_override_yaml targets must survive pruning without unknown_rule_target: {:?}",
+            compiled.validation.issues
+        );
+        let compiled_names: Vec<&str> = compiled.value["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(compiled_names.contains(&"Node-01"));
+        assert!(compiled_names.contains(&"Node-20"));
+        assert!(compiled_names.contains(&"Node-21"));
+        assert!(compiled_names.contains(&"Node-35"));
+        assert!(
+            compiled_names.len() < 40,
+            "unreferenced nodes should still be pruned in desktop single mode"
+        );
+
+        // 2. TransparentGateway forces compile_all_nodes=true and exports all 40 enabled nodes.
+        let gw = export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &[],
+            None,
+            &GatewayExportOptions {
+                profile: GatewayExportProfile::TransparentGateway,
+                tproxy_port: 17893,
+                redir_port: 17892,
+                dns_listen_port: 11053,
+                redact_secrets: false,
+            },
+        )
+        .expect("transparent gateway must export all nodes");
+        assert_eq!(gw.node_count, 40);
     }
 }

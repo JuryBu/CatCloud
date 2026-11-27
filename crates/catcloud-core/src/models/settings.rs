@@ -496,6 +496,9 @@ pub enum OverrideMode {
     Both,
 }
 
+/// Hard upper bound (1 MiB) for inline YAML merge-patch overrides stored in `config.json`.
+pub const MAX_INLINE_OVERRIDE_YAML_BYTES: usize = 1024 * 1024;
+
 /// Global user rules and external merge/script override settings.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -510,6 +513,15 @@ pub struct RulesAndOverrideConfig {
     pub block_quic_udp_443: bool,
     #[serde(default = "default_true_bool")]
     pub domestic_direct_enabled: bool,
+    /// Pure custom-rules mode: keeps anti-loop / probe bypass / private LAN safety guards
+    /// and user-authored rules while skipping built-in QUIC blocking, group auto match rules,
+    /// built-in domestic direct lists, and built-in AI DNS policy overrides.
+    #[serde(default)]
+    pub custom_rules_only: bool,
+    /// Optional inline Mihomo YAML Merge Patch (e.g. `rule-providers:` / `rules:` / `dns:`)
+    /// applied directly during compilation without requiring an external file (<= 1 MiB).
+    #[serde(default)]
+    pub inline_override_yaml: Option<String>,
 }
 
 /// Compatibility alias for `RulesAndOverrideConfig`.
@@ -526,8 +538,47 @@ impl Default for RulesAndOverrideConfig {
             override_script_timeout_ms: 5000,
             block_quic_udp_443: true,
             domestic_direct_enabled: true,
+            custom_rules_only: false,
+            inline_override_yaml: None,
         }
     }
+}
+
+impl RulesAndOverrideConfig {
+    /// Validate optional `inline_override_yaml` payload size (<= 1 MiB) and YAML mapping syntax.
+    pub fn validate_inline_override_yaml(&self) -> Result<(), String> {
+        let Some(raw) = self.inline_override_yaml.as_deref() else {
+            return Ok(());
+        };
+        validate_inline_override_yaml_text(raw)
+    }
+}
+
+/// Validate a raw inline YAML merge-patch snippet (<= 1 MiB, valid YAML syntax, top-level mapping).
+pub fn validate_inline_override_yaml_text(raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    if raw.len() > MAX_INLINE_OVERRIDE_YAML_BYTES {
+        return Err(format!(
+            "内联 YAML 覆写片段超出 1 MiB 大小限制（当前 {} 字节，最大 {} 字节）",
+            raw.len(),
+            MAX_INLINE_OVERRIDE_YAML_BYTES
+        ));
+    }
+    let mut parsed: serde_yaml_ng::Value = serde_yaml_ng::from_str(raw).map_err(|e| {
+        format!("内联 YAML 覆写片段存在语法错误，无法解析：{e}")
+    })?;
+    parsed.apply_merge().map_err(|e| {
+        format!("内联 YAML 覆写片段的锚点合并（<<）解析失败：{e}")
+    })?;
+    if !parsed.is_mapping() {
+        return Err(
+            "内联 YAML 覆写片段的根节点必须是 YAML 键值对映射（例如 rule-providers: / rules: / dns:）"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// GeoIP / GeoSite / MMDB / ASN database URLs and memory-conscious loader settings.
@@ -754,9 +805,9 @@ impl PreAccelDispatchStrategy {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PreAccelLbStrategy {
-    #[default]
     #[serde(alias = "round-robin")]
     RoundRobin,
+    #[default]
     #[serde(alias = "consistent-hashing")]
     ConsistentHashing,
 }
@@ -821,11 +872,11 @@ impl Default for PreAccelConfig {
             skip_443_native: true,
             probe_url: DEFAULT_PREACCEL_PROBE_URL.to_string(),
             fallback_probe_url: DEFAULT_PREACCEL_FALLBACK_PROBE_URL.to_string(),
-            probe_interval_sec: 15,
+            probe_interval_sec: 30,
             active_relay_id: None,
             auto_failover: true,
             dispatch_strategy: PreAccelDispatchStrategy::Auto,
-            lb_strategy: PreAccelLbStrategy::RoundRobin,
+            lb_strategy: PreAccelLbStrategy::ConsistentHashing,
             campus_portal_guard: true,
             campus_direct_domains: Vec::new(),
             global_bypass_enabled: false,
@@ -1254,12 +1305,26 @@ mod tests {
         assert!(!cfg.preaccel.enabled);
         assert!(!cfg.preaccel.global_bypass_enabled);
         assert!(!cfg.preaccel.is_unified_enabled());
-        assert_eq!(cfg.preaccel.probe_interval_sec, 15);
+        assert_eq!(cfg.preaccel.probe_interval_sec, 30);
         assert_eq!(cfg.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Auto);
-        assert_eq!(cfg.preaccel.lb_strategy, PreAccelLbStrategy::RoundRobin);
-        assert_eq!(legacy.preaccel.probe_interval_sec, 15);
+        assert_eq!(
+            cfg.preaccel.lb_strategy,
+            PreAccelLbStrategy::ConsistentHashing
+        );
+        assert_eq!(legacy.preaccel.probe_interval_sec, 30);
         assert_eq!(legacy.preaccel.dispatch_strategy, PreAccelDispatchStrategy::Auto);
-        assert_eq!(legacy.preaccel.lb_strategy, PreAccelLbStrategy::RoundRobin);
+        assert_eq!(
+            legacy.preaccel.lb_strategy,
+            PreAccelLbStrategy::ConsistentHashing
+        );
+        assert_eq!(
+            serde_json::from_str::<PreAccelLbStrategy>("\"round_robin\"").unwrap(),
+            PreAccelLbStrategy::RoundRobin
+        );
+        assert_eq!(
+            serde_json::from_str::<PreAccelLbStrategy>("\"round-robin\"").unwrap(),
+            PreAccelLbStrategy::RoundRobin
+        );
         assert_eq!(
             serde_json::to_string(&PreAccelDispatchStrategy::LoadBalance).unwrap(),
             "\"load_balance\""
@@ -1421,5 +1486,62 @@ mod tests {
         let json = serde_json::to_string(&with_skip).expect("serialize UpdateConfig");
         let parsed: UpdateConfig = serde_json::from_str(&json).expect("deserialize UpdateConfig");
         assert_eq!(parsed.skipped_version.as_deref(), Some("0.1.1"));
+    }
+
+    #[test]
+    fn rules_override_custom_rules_and_inline_yaml_legacy_json_backcompat() {
+        let cfg = AppConfig::default();
+        assert!(!cfg.rules_override.custom_rules_only);
+        assert!(cfg.rules_override.inline_override_yaml.is_none());
+        assert!(cfg.rules_override.validate_inline_override_yaml().is_ok());
+
+        // Legacy JSON missing `custom_rules_only` and `inline_override_yaml` must deserialize cleanly.
+        let legacy_json = r#"{
+            "rules_override": {
+                "global_prepend_rules": ["DOMAIN-SUFFIX,example.com,DIRECT"],
+                "global_append_rules": [],
+                "override_mode": "disabled",
+                "block_quic_udp_443": true,
+                "domestic_direct_enabled": true
+            }
+        }"#;
+        let legacy: AppConfig =
+            serde_json::from_str(legacy_json).expect("deserialize legacy RulesAndOverrideConfig");
+        assert!(!legacy.rules_override.custom_rules_only);
+        assert!(legacy.rules_override.inline_override_yaml.is_none());
+        assert_eq!(
+            legacy.rules_override.global_prepend_rules,
+            vec!["DOMAIN-SUFFIX,example.com,DIRECT"]
+        );
+
+        // New fields round-trip accurately through JSON.
+        let mut custom = RulesAndOverrideConfig::default();
+        custom.custom_rules_only = true;
+        custom.inline_override_yaml = Some(
+            "rule-providers:\n  direct_list:\n    type: http\n    behavior: domain\n".to_string(),
+        );
+        assert!(custom.validate_inline_override_yaml().is_ok());
+        let serialized = serde_json::to_string(&custom).expect("serialize RulesAndOverrideConfig");
+        let parsed: RulesAndOverrideConfig =
+            serde_json::from_str(&serialized).expect("deserialize RulesAndOverrideConfig");
+        assert!(parsed.custom_rules_only);
+        assert_eq!(parsed.inline_override_yaml, custom.inline_override_yaml);
+
+        // Reject oversized (> 1 MiB), malformed, or non-mapping inline YAML with Chinese diagnostics.
+        let oversized = format!("rules:\n  - {}\n", "a".repeat(MAX_INLINE_OVERRIDE_YAML_BYTES + 16));
+        let err_size = validate_inline_override_yaml_text(&oversized).unwrap_err();
+        assert!(err_size.contains("1 MiB"), "unexpected size error: {err_size}");
+
+        let err_syntax = validate_inline_override_yaml_text("rule-providers: [\n  broken").unwrap_err();
+        assert!(
+            err_syntax.contains("语法错误"),
+            "unexpected syntax error: {err_syntax}"
+        );
+
+        let err_non_map = validate_inline_override_yaml_text("- just-a-list-item").unwrap_err();
+        assert!(
+            err_non_map.contains("键值对映射"),
+            "unexpected non-mapping error: {err_non_map}"
+        );
     }
 }

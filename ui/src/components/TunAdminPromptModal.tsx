@@ -83,41 +83,43 @@ export function TunAdminPromptModal() {
         aria-modal="true"
         aria-label={tunElevationCopy.ariaLabel}
         onClick={(e) => e.stopPropagation()}
-        className="cc-surface w-full max-w-[468px] rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+        className="cc-surface flex max-h-[calc(100vh-2rem)] w-full max-w-[468px] flex-col overflow-hidden rounded-2xl border border-[var(--line-strong)] shadow-2xl"
       >
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex items-start gap-3">
-            <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
-              <ShieldCheck className="h-5 w-5" />
-            </span>
-            <div>
-              <h3 className="text-sm font-semibold text-[var(--text)]">
-                {tunElevationCopy.title}
-              </h3>
-              <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-                {tunElevationCopy.desc}
-              </p>
+        <div className="min-h-0 flex-1 overflow-y-auto p-5 pb-4">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-3">
+              <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
+                <ShieldCheck className="h-5 w-5" />
+              </span>
+              <div className="min-w-0 flex-1">
+                <h3 className="break-words text-sm font-semibold text-[var(--text)]">
+                  {tunElevationCopy.title}
+                </h3>
+                <p className="mt-1 break-words text-xs leading-relaxed text-[var(--text-secondary)]">
+                  {tunElevationCopy.desc}
+                </p>
+              </div>
             </div>
+            <button
+              type="button"
+              disabled={tunAdminPromptBusy || disablingTunIntent}
+              onClick={() => appActions.closeTunAdminPrompt()}
+              className="shrink-0 rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
+              aria-label={dict.tunPrompt.closeModalAria}
+            >
+              <X className="h-4 w-4" />
+            </button>
           </div>
-          <button
-            type="button"
-            disabled={tunAdminPromptBusy || disablingTunIntent}
-            onClick={() => appActions.closeTunAdminPrompt()}
-            className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)] disabled:opacity-50"
-            aria-label={dict.tunPrompt.closeModalAria}
-          >
-            <X className="h-4 w-4" />
-          </button>
+
+          {tunAdminPromptReason && (
+            <div className="mt-3 whitespace-pre-wrap break-words rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
+              {tunAdminPromptReason}
+            </div>
+          )}
         </div>
 
-        {tunAdminPromptReason && (
-          <div className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
-            {tunAdminPromptReason}
-          </div>
-        )}
-
         <div
-          className={`mt-5 flex flex-wrap items-center gap-2 ${
+          className={`flex shrink-0 flex-wrap items-center gap-2 border-t border-[var(--line)]/75 bg-[var(--bg-elevated)]/45 px-5 py-3.5 ${
             runtime.tun_needs_elevation ? "justify-between" : "justify-end"
           }`}
         >
@@ -133,7 +135,7 @@ export function TunAdminPromptModal() {
                 : dict.tunPrompt.disableTunIntentBtn}
             </button>
           )}
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2">
             <button
               type="button"
               disabled={tunAdminPromptBusy || disablingTunIntent}
@@ -149,9 +151,9 @@ export function TunAdminPromptModal() {
               className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-65"
             >
               {tunAdminPromptBusy ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
               ) : (
-                <ShieldCheck className="h-3.5 w-3.5" />
+                <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
               )}
               <span>
                 {tunAdminPromptBusy

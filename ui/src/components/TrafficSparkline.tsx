@@ -352,6 +352,7 @@ export function TrafficSparkline({
     oneOfPref(["linear", "sqrt"] as const)
   );
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [plotWidthPx, setPlotWidthPx] = useState<number>(0);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const scratchRef = useRef<SparklineScratch | null>(null);
   const lastRenderedVersionRef = useRef<number>(liveVersion);
@@ -529,6 +530,9 @@ export function TrafficSparkline({
     if (!isFull || computed.count === 0) return;
     const rect = svgRef.current?.getBoundingClientRect();
     if (!rect || rect.width <= 0) return;
+    if (Math.abs(rect.width - plotWidthPx) > 1) {
+      setPlotWidthPx(rect.width);
+    }
     const svgX = ((ev.clientX - rect.left) / rect.width) * vbWidth;
 
     // Binary search nearest point by timestamp-aligned X coordinate
@@ -704,26 +708,39 @@ export function TrafficSparkline({
   const hoverDownY = validHover !== null ? computed.downGeom.ys[validHover] : 0;
   const hoverUpY = validHover !== null ? computed.upGeom.ys[validHover] : 0;
   const hoverLeftPct = validHover !== null ? (hoverX / vbWidth) * 100 : 0;
-  const alignRight = hoverLeftPct > 68;
+  const tooltipEstWidth = 164;
+  const tooltipSafePad = 8;
+  const effectivePlotWidth = plotWidthPx > 0 ? plotWidthPx : vbWidth;
+  const hoverAnchorPx = (hoverX / vbWidth) * effectivePlotWidth;
+  const rawTooltipLeftPx =
+    hoverAnchorPx + 10 + tooltipEstWidth <= effectivePlotWidth - tooltipSafePad
+      ? hoverAnchorPx + 10
+      : hoverAnchorPx - 10 - tooltipEstWidth;
+  const clampedTooltipLeftPx = Math.max(
+    tooltipSafePad,
+    Math.min(rawTooltipLeftPx, Math.max(tooltipSafePad, effectivePlotWidth - tooltipEstWidth - tooltipSafePad))
+  );
 
   const titleLabel = activeWindowSec === 600 ? "近 10 分钟流量走势" : "近 2 分钟流量走势";
 
   return (
     <div className={`cc-card rounded-2xl p-4 ${className}`}>
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <h2 className="text-sm font-semibold tracking-tight text-[var(--text)]">{titleLabel}</h2>
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <div className="flex min-w-0 flex-wrap items-center gap-2">
+          <h2 className="whitespace-nowrap text-sm font-semibold tracking-tight text-[var(--text)]">
+            {titleLabel}
+          </h2>
 
           {/* Time window selector: 2 min (zoomed) vs 10 min (full) */}
           <div
-            className="inline-flex items-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[10.5px]"
+            className="inline-flex shrink-0 items-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[10.5px]"
             role="group"
             aria-label="切换流量时间跨度"
           >
             <button
               type="button"
               onClick={() => setWindowSec(120)}
-              className={`rounded-md px-2 py-0.5 font-medium transition-colors ${
+              className={`whitespace-nowrap rounded-md px-2 py-0.5 font-medium transition-colors ${
                 windowSec === 120
                   ? "bg-[var(--card)] text-[var(--text)] shadow-xs"
                   : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -734,7 +751,7 @@ export function TrafficSparkline({
             <button
               type="button"
               onClick={() => setWindowSec(600)}
-              className={`rounded-md px-2 py-0.5 font-medium transition-colors ${
+              className={`whitespace-nowrap rounded-md px-2 py-0.5 font-medium transition-colors ${
                 windowSec === 600
                   ? "bg-[var(--card)] text-[var(--text)] shadow-xs"
                   : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -748,7 +765,7 @@ export function TrafficSparkline({
           <button
             type="button"
             onClick={() => setScaleMode((m) => (m === "linear" ? "sqrt" : "linear"))}
-            className={`rounded-lg border px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
+            className={`shrink-0 whitespace-nowrap rounded-lg border px-2 py-0.5 text-[10.5px] font-medium transition-colors ${
               scaleMode === "sqrt"
                 ? "border-[var(--accent)]/45 bg-[var(--accent-soft)] text-[var(--accent)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
@@ -762,30 +779,30 @@ export function TrafficSparkline({
             {scaleMode === "sqrt" ? "柔和刻度" : "标准刻度"}
           </button>
 
-          <span className="rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10.5px] cc-mono text-[var(--text-secondary)]">
+          <span className="shrink-0 whitespace-nowrap rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10.5px] cc-mono text-[var(--text-secondary)]">
             {computed.rawPeak > 0
               ? `实测峰值 ${formatRate(computed.rawPeak)}`
               : `量程 ${formatRate(computed.scaleMax)}`}
           </span>
 
           {!sparklineEnabled && (
-            <span className="inline-flex items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber)]">
-              <Pause className="h-3 w-3" />
+            <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber)]">
+              <Pause className="h-3 w-3 shrink-0" />
               曲线已暂停
             </span>
           )}
         </div>
 
-        <div className="flex items-center gap-4 text-xs">
-          <div className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-[var(--coral)]" />
+        <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+          <div className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-[var(--coral)]" />
             <span className="text-[var(--muted)]">上传</span>
             <span className="cc-mono font-semibold text-[var(--text)]">
               {formatRate(latest.up_bps)}
             </span>
           </div>
-          <div className="flex items-center gap-1.5">
-            <span className="h-2 w-2 rounded-full bg-[var(--sky)]" />
+          <div className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap">
+            <span className="h-2 w-2 shrink-0 rounded-full bg-[var(--sky)]" />
             <span className="text-[var(--muted)]">下载</span>
             <span className="cc-mono font-semibold text-[var(--text)]">
               {formatRate(latest.down_bps)}
@@ -797,7 +814,7 @@ export function TrafficSparkline({
       <div className="flex h-[156px] w-full items-stretch gap-2">
         {/* Left Y-axis column precisely aligned to topY, midY, and baseY gridlines */}
         <div
-          className="relative w-[68px] shrink-0 select-none text-right text-[10.5px] font-medium leading-none cc-mono text-[var(--text-secondary)]"
+          className="relative w-[74px] shrink-0 select-none text-right text-[10.5px] font-medium leading-none cc-mono text-[var(--text-secondary)]"
           aria-hidden="true"
         >
           <span
@@ -966,11 +983,10 @@ export function TrafficSparkline({
                 }}
               />
               <div
-                className="pointer-events-none absolute top-2 z-20 min-w-[152px] rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3 py-2 text-xs"
+                className="pointer-events-none absolute top-2 z-20 w-[164px] max-w-[calc(100%-16px)] rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3 py-2 text-xs"
                 style={{
                   boxShadow: "var(--shadow-popover)",
-                  left: alignRight ? undefined : `calc(${Math.min(hoverLeftPct, 82)}% + 10px)`,
-                  right: alignRight ? `calc(${100 - hoverLeftPct}% + 10px)` : undefined,
+                  left: `${Math.round(clampedTooltipLeftPx)}px`,
                 }}
               >
                 <div className="mb-1.5 flex items-center justify-between border-b border-[var(--line)] pb-1 text-[11px]">
@@ -1005,7 +1021,7 @@ export function TrafficSparkline({
 
       {/* Bottom X-axis time labels aligned with plot area */}
       <div className="mt-1 flex items-center gap-2">
-        <div className="w-[68px] shrink-0" aria-hidden="true" />
+        <div className="w-[74px] shrink-0" aria-hidden="true" />
         <div className="flex min-w-0 flex-1 items-center justify-between text-[10px] cc-mono text-[var(--muted)]">
           {xTicks.map((label, idx) => (
             <span key={`${idx}-${label}`}>{label}</span>

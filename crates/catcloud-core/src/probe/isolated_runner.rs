@@ -3,8 +3,8 @@ use crate::models::{
     PreAccelDispatchStrategy, PreAccelLbStrategy, PreAccelRelay, ProxyNode, is_ipv6_only_node,
 };
 use crate::preaccel::{
-    DEFAULT_DOMESTIC_204_PRIMARY, compile_relay_to_mihomo_yaml, host_to_direct_rule,
-    relays_support_ipv6, select_physical_host_relays,
+    DEFAULT_DOMESTIC_204_PRIMARY, compile_relay_to_mihomo_yaml, expected_probe_status_for_url,
+    host_to_direct_rule, relays_support_ipv6, select_physical_host_relays,
 };
 use crate::process_guard::JobGuard;
 use serde::{Deserialize, Serialize};
@@ -794,6 +794,10 @@ pub fn build_isolated_probe_yaml_with_preaccel_pool(
             YamlValue::from("url"),
             YamlValue::from(DEFAULT_DOMESTIC_204_PRIMARY),
         );
+        fb_group.insert(
+            YamlValue::from("expected-status"),
+            YamlValue::from(expected_probe_status_for_url(DEFAULT_DOMESTIC_204_PRIMARY)),
+        );
         fb_group.insert(YamlValue::from("interval"), YamlValue::from(10u64));
         fb_group.insert(YamlValue::from("lazy"), YamlValue::from(false));
 
@@ -811,6 +815,10 @@ pub fn build_isolated_probe_yaml_with_preaccel_pool(
         lb_group.insert(
             YamlValue::from("url"),
             YamlValue::from(DEFAULT_DOMESTIC_204_PRIMARY),
+        );
+        lb_group.insert(
+            YamlValue::from("expected-status"),
+            YamlValue::from(expected_probe_status_for_url(DEFAULT_DOMESTIC_204_PRIMARY)),
         );
         lb_group.insert(YamlValue::from("interval"), YamlValue::from(10u64));
         lb_group.insert(YamlValue::from("lazy"), YamlValue::from(false));
@@ -834,6 +842,10 @@ pub fn build_isolated_probe_yaml_with_preaccel_pool(
         fb_group.insert(
             YamlValue::from("url"),
             YamlValue::from(DEFAULT_DOMESTIC_204_PRIMARY),
+        );
+        fb_group.insert(
+            YamlValue::from("expected-status"),
+            YamlValue::from(expected_probe_status_for_url(DEFAULT_DOMESTIC_204_PRIMARY)),
         );
         fb_group.insert(YamlValue::from("interval"), YamlValue::from(10u64));
         fb_group.insert(YamlValue::from("lazy"), YamlValue::from(false));
@@ -3171,8 +3183,10 @@ mod tests {
             .iter()
             .find(|g| g["name"].as_str() == Some(PROBE_RELAY_LB_GROUP_NAME))
             .expect("pool lb group");
+        assert_eq!(fb["expected-status"].as_str(), Some("204"));
         assert_eq!(lb["type"].as_str(), Some("load-balance"));
         assert_eq!(lb["strategy"].as_str(), Some("round-robin"));
+        assert_eq!(lb["expected-status"].as_str(), Some("204"));
         let lb_members: Vec<&str> = lb["proxies"]
             .as_sequence()
             .unwrap()
@@ -3258,6 +3272,7 @@ mod tests {
             single_groups[0]["name"].as_str(),
             Some(PROBE_RELAY_POOL_GROUP_NAME)
         );
+        assert_eq!(single_groups[0]["expected-status"].as_str(), Some("204"));
         let single_members: Vec<&str> = single_groups[0]["proxies"]
             .as_sequence()
             .unwrap()

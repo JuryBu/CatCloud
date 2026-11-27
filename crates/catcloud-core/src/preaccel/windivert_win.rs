@@ -12,7 +12,7 @@ use crate::preaccel::global_tunnel::{
     forward_redirected_stream, is_domestic_ipv4, is_non_proxy_communication_process,
     is_open_source_proxy_core_name, is_physical_nic_descriptor, is_system_or_self_excluded_process,
     normalize_process_basename, parse_ipv4_tcp_packet, rewrite_ipv4_tcp_from_loopback,
-    rewrite_ipv4_tcp_to_loopback, should_intercept_port_443,
+    rewrite_ipv4_tcp_to_loopback, should_intercept_port_443, validate_self_test_http_status,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CString, OsStr, c_void};
@@ -453,6 +453,154 @@ impl Drop for SelfTestPortGuard {
     }
 }
 
+struct SingleProbeAttempt {
+    host: String,
+    target_desc: String,
+    nic_name: String,
+    probe_io: Result<Result<Option<u16>, std::io::Error>, tokio::time::error::Elapsed>,
+    intercepted_delta: u64,
+    accepted_delta: u64,
+    send_err_delta: u64,
+    latency_ms: u64,
+}
+
+enum ProbeAttemptStep {
+    Attempt(SingleProbeAttempt),
+    RecordFailure(WinDivertSelfTestOutcome),
+    SkipUrl,
+}
+
+/// Evaluate an ordered list of domestic HTTP non-443 204 probe URLs, enforcing strict HTTP 204
+/// inside the loop so non-204 responses (e.g. 502/302/200) record `last_failure` and fall back
+/// to the next probe URL instead of short-circuiting into a premature circuit break.
+async fn evaluate_self_test_urls<F, Fut>(
+    probe_urls: &[&str],
+    timeout: Duration,
+    mut probe_one: F,
+) -> WinDivertSelfTestOutcome
+where
+    F: FnMut(String, u16, String) -> Fut,
+    Fut: std::future::Future<Output = ProbeAttemptStep>,
+{
+    let mut last_failure: Option<WinDivertSelfTestOutcome> = None;
+
+    for &raw_url in probe_urls {
+        let Ok(parsed) = Url::parse(raw_url.trim()) else {
+            continue;
+        };
+        let Some(host) = parsed.host_str().map(ToString::to_string) else {
+            continue;
+        };
+        let port = parsed.port_or_known_default().unwrap_or(80);
+        if port == 443 || port == 53 {
+            continue;
+        }
+        let path = if parsed.path().is_empty() {
+            "/".to_string()
+        } else {
+            match parsed.query() {
+                Some(q) => format!("{}?{q}", parsed.path()),
+                None => parsed.path().to_string(),
+            }
+        };
+
+        let attempt = match probe_one(host, port, path).await {
+            ProbeAttemptStep::Attempt(a) => a,
+            ProbeAttemptStep::RecordFailure(failure) => {
+                last_failure = Some(failure);
+                continue;
+            }
+            ProbeAttemptStep::SkipUrl => continue,
+        };
+
+        let SingleProbeAttempt {
+            host,
+            target_desc,
+            nic_name,
+            probe_io,
+            intercepted_delta,
+            accepted_delta,
+            send_err_delta,
+            latency_ms,
+        } = attempt;
+
+        match probe_io {
+            Ok(Ok(Some(status_code))) => {
+                if intercepted_delta > 0 && accepted_delta > 0 {
+                    match validate_self_test_http_status(Some(status_code)) {
+                        Ok(valid_code) => {
+                            tracing::info!(
+                                "WinDivert dataplane self-test PASSED via {target_desc} ({host}, HTTP {valid_code}, {latency_ms}ms, nic={nic_name}, intercepted={intercepted_delta}, accepted={accepted_delta})"
+                            );
+                            return WinDivertSelfTestOutcome::Passed {
+                                latency_ms,
+                                probe_host: host,
+                                status_code: valid_code,
+                            };
+                        }
+                        Err(reason) => {
+                            tracing::warn!(
+                                "WinDivert self-test received non-204 HTTP {status_code} from {host} ({target_desc}); continuing to next fallback 204 URL: {reason}"
+                            );
+                            last_failure = Some(WinDivertSelfTestOutcome::TunnelUnreachable {
+                                detail: format!("{host} {reason}"),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                last_failure = Some(WinDivertSelfTestOutcome::NoPacketIntercepted {
+                    detail: format!(
+                        "测试连接虽连通 {host}，但未命中底层抓包路径（nic={nic_name}，intercepted={intercepted_delta}，accepted={accepted_delta}）"
+                    ),
+                });
+            }
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
+                let err_note = match probe_io {
+                    Err(_) => format!("连接或读取 {host} 超时（{} ms）", timeout.as_millis()),
+                    Ok(Err(e)) => format!("连接 {host} 失败：{e}"),
+                    Ok(Ok(None)) => format!("{host} 返回了非标准 HTTP 响应"),
+                    Ok(Ok(Some(code))) => format!("{host} 返回 HTTP {code}"),
+                };
+                if intercepted_delta > 0 && accepted_delta == 0 {
+                    // Definitive dataplane/firewall block: do not retry other URLs needlessly.
+                    tracing::warn!(
+                        "WinDivert dataplane self-test BLOCKED: {err_note} (intercepted={intercepted_delta}, accepted=0, send_errors={send_err_delta})"
+                    );
+                    return WinDivertSelfTestOutcome::BlockedAtDataplane {
+                        intercepted: intercepted_delta,
+                        accepted: accepted_delta,
+                        send_errors: send_err_delta,
+                        detail: format!(
+                            "数据包已拦截但未到达本机 127.0.0.1 转发口（{err_note}）"
+                        ),
+                    };
+                } else if intercepted_delta > 0 && accepted_delta > 0 {
+                    tracing::warn!(
+                        "WinDivert self-test reached local listener but upstream 443 tunnel failed for {host}: {err_note}"
+                    );
+                    last_failure = Some(WinDivertSelfTestOutcome::TunnelUnreachable {
+                        detail: err_note,
+                    });
+                } else {
+                    tracing::warn!(
+                        "WinDivert self-test saw zero intercepted packets on nic `{nic_name}`: {err_note}"
+                    );
+                    last_failure = Some(WinDivertSelfTestOutcome::NoPacketIntercepted {
+                        detail: format!(
+                            "物理网卡「{nic_name}」未捕获到出站探测包（{err_note}）"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    last_failure.unwrap_or_else(|| WinDivertSelfTestOutcome::NoPacketIntercepted {
+        detail: "未找到可用的国内非 443 HTTP 探测地址".to_string(),
+    })
+}
+
 /// Active Windows WinDivert kernel transparent TCP interceptor + local loopback SOCKS5 forwarder.
 pub struct WinDivertEngine {
     lib: Arc<WinDivertLib>,
@@ -788,8 +936,9 @@ impl WinDivertEngine {
     /// Execute an active end-to-end dataplane self-test verifying that a real outbound non-443
     /// TCP connection bound to the primary physical NIC is (1) intercepted by WinDivert,
     /// (2) reflected cleanly across loopback into our local `127.0.0.1:<redirect_port>` listener,
-    /// (3) forwarded through the standalone `:443` SOCKS5 tunnel, and (4) returns a valid HTTP
-    /// response back to the originating client socket.
+    /// (3) forwarded through the standalone `:443` SOCKS5 tunnel, and (4) returns a strict HTTP
+    /// 204 response back to the originating client socket (falling back across remaining probe
+    /// URLs whenever an endpoint returns a non-204 status code).
     pub(super) async fn run_self_test(
         &self,
         probe_urls: &[&str],
@@ -818,39 +967,21 @@ impl WinDivertEngine {
             guard.insert(physical.if_idx);
         }
 
-        let mut last_failure: Option<WinDivertSelfTestOutcome> = None;
-
-        for &raw_url in probe_urls {
-            let Ok(parsed) = Url::parse(raw_url.trim()) else {
-                continue;
-            };
-            let Some(host) = parsed.host_str().map(ToString::to_string) else {
-                continue;
-            };
-            let port = parsed.port_or_known_default().unwrap_or(80);
-            if port == 443 || port == 53 {
-                continue;
-            }
-            let path = if parsed.path().is_empty() {
-                "/"
-            } else {
-                parsed.path()
-            };
-
+        let physical_ref = &physical;
+        evaluate_self_test_urls(probe_urls, timeout, move |host, port, path| async move {
             // Resolve a real public IPv4 (bypassing third-party TUN Fake-IP 198.18.0.0/15 DNS
             // hijacking by querying domestic public DNS directly over the physical NIC if needed).
             let Some(target_ip) = resolve_public_ipv4_for_self_test(
                 &host,
                 port,
-                physical.local_ipv4,
-                physical.if_idx,
+                physical_ref.local_ipv4,
+                physical_ref.if_idx,
             )
             .await
             else {
-                last_failure = Some(WinDivertSelfTestOutcome::TunnelUnreachable {
+                return ProbeAttemptStep::RecordFailure(WinDivertSelfTestOutcome::TunnelUnreachable {
                     detail: format!("无法解析国内探测域名 {host} 的真实公网 IPv4"),
                 });
-                continue;
             };
 
             let before_intercepted = self.self_test_intercepted.load(Ordering::SeqCst);
@@ -860,32 +991,40 @@ impl WinDivertEngine {
             let sock = match TcpSocket::new_v4() {
                 Ok(s) => s,
                 Err(e) => {
-                    last_failure = Some(WinDivertSelfTestOutcome::NoPacketIntercepted {
-                        detail: format!("创建探测套接字失败: {e}"),
-                    });
-                    continue;
+                    return ProbeAttemptStep::RecordFailure(
+                        WinDivertSelfTestOutcome::NoPacketIntercepted {
+                            detail: format!("创建探测套接字失败: {e}"),
+                        },
+                    );
                 }
             };
-            if let Err(e) = sock.bind(SocketAddr::V4(SocketAddrV4::new(physical.local_ipv4, 0))) {
-                last_failure = Some(WinDivertSelfTestOutcome::NoPacketIntercepted {
-                    detail: format!("绑定物理网卡本机地址 {} 失败: {e}", physical.local_ipv4),
-                });
-                continue;
+            if let Err(e) =
+                sock.bind(SocketAddr::V4(SocketAddrV4::new(physical_ref.local_ipv4, 0)))
+            {
+                return ProbeAttemptStep::RecordFailure(
+                    WinDivertSelfTestOutcome::NoPacketIntercepted {
+                        detail: format!(
+                            "绑定物理网卡本机地址 {} 失败: {e}",
+                            physical_ref.local_ipv4
+                        ),
+                    },
+                );
             }
             if let Err(e) =
-                set_ipv4_unicast_interface(sock.as_raw_socket() as usize, physical.if_idx)
+                set_ipv4_unicast_interface(sock.as_raw_socket() as usize, physical_ref.if_idx)
             {
-                last_failure = Some(WinDivertSelfTestOutcome::NoPacketIntercepted {
-                    detail: format!(
-                        "绑定物理网卡出站接口 IP_UNICAST_IF (if_idx={}) 失败: {e}",
-                        physical.if_idx
-                    ),
-                });
-                continue;
+                return ProbeAttemptStep::RecordFailure(
+                    WinDivertSelfTestOutcome::NoPacketIntercepted {
+                        detail: format!(
+                            "绑定物理网卡出站接口 IP_UNICAST_IF (if_idx={}) 失败: {e}",
+                            physical_ref.if_idx
+                        ),
+                    },
+                );
             }
             let local_port = match sock.local_addr() {
                 Ok(SocketAddr::V4(v4)) => v4.port(),
-                _ => continue,
+                _ => return ProbeAttemptStep::SkipUrl,
             };
 
             self.self_test_src_port.store(local_port, Ordering::SeqCst);
@@ -923,71 +1062,18 @@ impl WinDivertEngine {
                 .saturating_sub(before_send_err);
             let latency_ms = started.elapsed().as_millis().max(1) as u64;
 
-            match probe_io {
-                Ok(Ok(Some(status_code))) => {
-                    if intercepted_delta > 0 && accepted_delta > 0 {
-                        tracing::info!(
-                            "WinDivert dataplane self-test PASSED via {}:{} ({host}, HTTP {status_code}, {latency_ms}ms, nic={}, intercepted={intercepted_delta}, accepted={accepted_delta})",
-                            target_ip,
-                            port,
-                            physical.friendly_name
-                        );
-                        return WinDivertSelfTestOutcome::Passed {
-                            latency_ms,
-                            probe_host: host,
-                            status_code,
-                        };
-                    }
-                    last_failure = Some(WinDivertSelfTestOutcome::NoPacketIntercepted {
-                        detail: format!(
-                            "测试连接虽连通 {host}，但未命中底层抓包路径（nic={}，intercepted={intercepted_delta}，accepted={accepted_delta}）",
-                            physical.friendly_name
-                        ),
-                    });
-                }
-                Ok(Ok(None)) | Ok(Err(_)) | Err(_) => {
-                    let err_note = match probe_io {
-                        Err(_) => format!("连接或读取 {host} 超时（{} ms）", timeout.as_millis()),
-                        Ok(Err(e)) => format!("连接 {host} 失败：{e}"),
-                        Ok(Ok(None)) => format!("{host} 返回了非标准 HTTP 响应"),
-                        Ok(Ok(Some(code))) => format!("{host} 返回 HTTP {code}"),
-                    };
-                    if intercepted_delta > 0 && accepted_delta == 0 {
-                        // Definitive dataplane/firewall block: do not retry other URLs needlessly.
-                        tracing::warn!(
-                            "WinDivert dataplane self-test BLOCKED: {err_note} (intercepted={intercepted_delta}, accepted=0, send_errors={send_err_delta})"
-                        );
-                        return WinDivertSelfTestOutcome::BlockedAtDataplane {
-                            intercepted: intercepted_delta,
-                            accepted: accepted_delta,
-                            send_errors: send_err_delta,
-                            detail: format!(
-                                "数据包已拦截但未到达本机 127.0.0.1 转发口（{err_note}）"
-                            ),
-                        };
-                    } else if intercepted_delta > 0 && accepted_delta > 0 {
-                        tracing::warn!(
-                            "WinDivert self-test reached local listener but upstream 443 tunnel failed for {host}: {err_note}"
-                        );
-                        last_failure = Some(WinDivertSelfTestOutcome::TunnelUnreachable {
-                            detail: err_note,
-                        });
-                    } else {
-                        tracing::warn!(
-                            "WinDivert self-test saw zero intercepted packets on nic `{}`: {err_note}",
-                            physical.friendly_name
-                        );
-                        last_failure = Some(WinDivertSelfTestOutcome::NoPacketIntercepted {
-                            detail: format!("物理网卡「{}」未捕获到出站探测包（{err_note}）", physical.friendly_name),
-                        });
-                    }
-                }
-            }
-        }
-
-        last_failure.unwrap_or_else(|| WinDivertSelfTestOutcome::NoPacketIntercepted {
-            detail: "未找到可用的国内非 443 HTTP 探测地址".to_string(),
+            ProbeAttemptStep::Attempt(SingleProbeAttempt {
+                host,
+                target_desc: format!("{target_ip}:{port}"),
+                nic_name: physical_ref.friendly_name.clone(),
+                probe_io,
+                intercepted_delta,
+                accepted_delta,
+                send_err_delta,
+                latency_ms,
+            })
         })
+        .await
     }
 
     /// Dynamically update or clear the external main Mihomo core PID excluded from
@@ -3473,5 +3559,152 @@ mod tests {
         assert!(!should_intercept_port_443("open_core_name", false, cn_ip));
         assert!(!should_intercept_port_443("manual", false, overseas_ip));
         assert!(!should_intercept_port_443("scope_all", false, overseas_ip));
+    }
+
+    #[tokio::test]
+    async fn self_test_probe_loop_falls_back_on_non_204_and_fails_only_when_all_non_204() {
+        let urls = [
+            "http://connectivitycheck.platform.hicloud.com/generate_204",
+            "http://connect.rom.miui.com/generate_204",
+            "http://backup-check.example.cn/generate_204",
+        ];
+
+        // 1. Primary returns 502 -> falls back to secondary returning 204 -> Passed.
+        let visited_1 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let statuses_1 = Arc::new(std::sync::Mutex::new(VecDeque::from([Some(502u16), Some(204u16)])));
+        let v1 = Arc::clone(&visited_1);
+        let s1 = Arc::clone(&statuses_1);
+        let out1 = evaluate_self_test_urls(&urls[..2], Duration::from_secs(2), move |host, port, _path| {
+            let v = Arc::clone(&v1);
+            let s = Arc::clone(&s1);
+            async move {
+                v.lock().unwrap().push(host.clone());
+                let code = s.lock().unwrap().pop_front().flatten();
+                ProbeAttemptStep::Attempt(SingleProbeAttempt {
+                    host,
+                    target_desc: format!("203.0.113.10:{port}"),
+                    nic_name: "WLAN".to_string(),
+                    probe_io: Ok(Ok(code)),
+                    intercepted_delta: 2,
+                    accepted_delta: 1,
+                    send_err_delta: 0,
+                    latency_ms: 19,
+                })
+            }
+        })
+        .await;
+        assert_eq!(
+            *visited_1.lock().unwrap(),
+            vec![
+                "connectivitycheck.platform.hicloud.com",
+                "connect.rom.miui.com"
+            ]
+        );
+        assert!(matches!(
+            out1,
+            WinDivertSelfTestOutcome::Passed {
+                status_code: 204,
+                ref probe_host,
+                ..
+            } if probe_host == "connect.rom.miui.com"
+        ));
+
+        // 2. First two return 302 and 200 -> falls back to third returning 204 -> Passed.
+        let visited_2 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let statuses_2 = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            Some(302u16),
+            Some(200u16),
+            Some(204u16),
+        ])));
+        let v2 = Arc::clone(&visited_2);
+        let s2 = Arc::clone(&statuses_2);
+        let out2 = evaluate_self_test_urls(&urls, Duration::from_secs(2), move |host, port, _path| {
+            let v = Arc::clone(&v2);
+            let s = Arc::clone(&s2);
+            async move {
+                v.lock().unwrap().push(host.clone());
+                let code = s.lock().unwrap().pop_front().flatten();
+                ProbeAttemptStep::Attempt(SingleProbeAttempt {
+                    host,
+                    target_desc: format!("203.0.113.20:{port}"),
+                    nic_name: "WLAN".to_string(),
+                    probe_io: Ok(Ok(code)),
+                    intercepted_delta: 3,
+                    accepted_delta: 1,
+                    send_err_delta: 0,
+                    latency_ms: 24,
+                })
+            }
+        })
+        .await;
+        assert_eq!(visited_2.lock().unwrap().len(), 3);
+        assert!(matches!(
+            out2,
+            WinDivertSelfTestOutcome::Passed {
+                status_code: 204,
+                ref probe_host,
+                ..
+            } if probe_host == "backup-check.example.cn"
+        ));
+
+        // 3. All endpoints return non-204 (502, 302, 200) -> fails with TunnelUnreachable after exhausting all URLs.
+        let visited_3 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let statuses_3 = Arc::new(std::sync::Mutex::new(VecDeque::from([
+            Some(502u16),
+            Some(302u16),
+            Some(200u16),
+        ])));
+        let v3 = Arc::clone(&visited_3);
+        let s3 = Arc::clone(&statuses_3);
+        let out3 = evaluate_self_test_urls(&urls, Duration::from_secs(2), move |host, port, _path| {
+            let v = Arc::clone(&v3);
+            let s = Arc::clone(&s3);
+            async move {
+                v.lock().unwrap().push(host.clone());
+                let code = s.lock().unwrap().pop_front().flatten();
+                ProbeAttemptStep::Attempt(SingleProbeAttempt {
+                    host,
+                    target_desc: format!("203.0.113.30:{port}"),
+                    nic_name: "WLAN".to_string(),
+                    probe_io: Ok(Ok(code)),
+                    intercepted_delta: 2,
+                    accepted_delta: 1,
+                    send_err_delta: 0,
+                    latency_ms: 31,
+                })
+            }
+        })
+        .await;
+        assert_eq!(visited_3.lock().unwrap().len(), 3);
+        assert!(matches!(
+            out3,
+            WinDivertSelfTestOutcome::TunnelUnreachable { ref detail } if detail.contains("HTTP 200")
+        ));
+
+        // 4. Dataplane firewall block (intercepted > 0, accepted == 0) still aborts immediately.
+        let visited_4 = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let v4 = Arc::clone(&visited_4);
+        let out4 = evaluate_self_test_urls(&urls, Duration::from_secs(2), move |host, port, _path| {
+            let v = Arc::clone(&v4);
+            async move {
+                v.lock().unwrap().push(host.clone());
+                ProbeAttemptStep::Attempt(SingleProbeAttempt {
+                    host,
+                    target_desc: format!("203.0.113.40:{port}"),
+                    nic_name: "WLAN".to_string(),
+                    probe_io: Ok(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "blocked",
+                    ))),
+                    intercepted_delta: 4,
+                    accepted_delta: 0,
+                    send_err_delta: 1,
+                    latency_ms: 2000,
+                })
+            }
+        })
+        .await;
+        assert_eq!(visited_4.lock().unwrap().len(), 1);
+        assert!(matches!(out4, WinDivertSelfTestOutcome::BlockedAtDataplane { .. }));
     }
 }

@@ -306,12 +306,12 @@ export function App() {
         </Suspense>
 
         {visibleToast && (
-          <div className="pointer-events-none fixed inset-x-1.5 bottom-1 z-50 flex justify-center">
+          <div className="pointer-events-none fixed inset-x-1.5 bottom-1 z-[80] flex justify-center">
             <div
               role="status"
               title={visibleToast.text}
               onClick={() => setDismissedToastId(visibleToast.id)}
-              className="pointer-events-auto flex max-w-[288px] cursor-pointer items-center gap-1.5 rounded-full border border-[var(--line-strong)] bg-[var(--surface)]/95 px-2.5 py-0.5 text-[10px] leading-tight text-[var(--text)]"
+              className="pointer-events-auto flex max-w-[min(288px,calc(100%-8px))] cursor-pointer items-center gap-1.5 rounded-full border border-[var(--line-strong)] bg-[var(--surface)]/95 px-2.5 py-0.5 text-[10px] leading-tight text-[var(--text)]"
             >
               <span
                 className="inline-block h-1.5 w-1.5 shrink-0 rounded-full"
@@ -373,10 +373,10 @@ export function App() {
       )}
 
       {visibleToast && (
-        <div className="pointer-events-none fixed inset-x-4 top-12 z-50 flex justify-center">
+        <div className="pointer-events-none fixed inset-x-4 bottom-4 z-[80] flex justify-center">
           <div
             role="status"
-            className="pointer-events-auto flex max-w-lg items-start gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2.5 text-xs leading-relaxed text-[var(--text)] shadow-lg"
+            className="pointer-events-auto flex max-w-md items-start gap-2 rounded-xl border border-[var(--line-strong)] bg-[var(--surface)] px-3.5 py-2.5 text-xs leading-relaxed text-[var(--text)] shadow-lg"
           >
             <span
               className="mt-1.5 inline-block h-2 w-2 shrink-0 rounded-full"

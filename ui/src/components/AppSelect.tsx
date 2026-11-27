@@ -2,6 +2,7 @@ import { Check, ChevronDown } from "lucide-react";
 import {
   type JSX,
   type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useId,
@@ -11,6 +12,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
+import { isAnchorVisibleInScrollHierarchy } from "../utils/viewportVisibility";
 
 export interface AppSelectOption {
   value: string;
@@ -28,6 +30,7 @@ export interface AppSelectProps {
   className?: string;
   buttonClassName?: string;
   menuClassName?: string;
+  leadingIcon?: ReactNode;
   "aria-label"?: string;
   title?: string;
   size?: "xs" | "sm" | "md";
@@ -87,6 +90,7 @@ export function AppSelect({
   className = "",
   buttonClassName = "",
   menuClassName = "",
+  leadingIcon,
   "aria-label": ariaLabel,
   title,
   size = "sm",
@@ -179,8 +183,8 @@ export function AppSelect({
     const vw = window.innerWidth;
     const vh = window.innerHeight;
 
-    // Close if trigger scrolled completely outside the viewport
-    if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
+    // Close if trigger scrolled outside viewport, under TitleBar, or clipped by an ancestor scroll container
+    if (!isAnchorVisibleInScrollHierarchy(trigger)) {
       return null;
     }
 
@@ -513,7 +517,9 @@ export function AppSelect({
           }
         }}
         onKeyDown={handleTriggerKeyDown}
-        className={`inline-flex w-full min-w-0 cursor-pointer items-center justify-between gap-2 border bg-[var(--bg-elevated)] font-medium text-[var(--text)] outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
+        className={`inline-flex w-full min-w-0 cursor-pointer items-center justify-between border bg-[var(--bg-elevated)] font-medium text-[var(--text)] outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
+          leadingIcon ? "gap-1.5" : "gap-2"
+        } ${
           SIZE_CLASSES[size]
         } ${
           open
@@ -521,6 +527,14 @@ export function AppSelect({
             : "border-[var(--line)] hover:border-[var(--line-strong)] focus-visible:border-[var(--accent)]"
         } ${buttonClassName}`}
       >
+        {leadingIcon && (
+          <span
+            className="inline-flex shrink-0 items-center text-[var(--muted)]"
+            aria-hidden="true"
+          >
+            {leadingIcon}
+          </span>
+        )}
         <span
           className={`min-w-0 flex-1 truncate text-left ${
             isPlaceholder ? "text-[var(--muted)]" : ""
@@ -569,7 +583,8 @@ export function AppSelect({
                 >
                   {section.group && (
                     <div
-                      className={`select-none px-2.5 pb-1 pt-1.5 text-[10px] font-semibold tracking-wide text-[var(--muted)] ${
+                      title={section.group}
+                      className={`select-none truncate px-2.5 pb-1 pt-1.5 text-[10px] font-semibold tracking-wide text-[var(--muted)] ${
                         sectionIdx > 0 ? "mt-1 border-t border-[var(--line)]/70 pt-2" : ""
                       }`}
                     >

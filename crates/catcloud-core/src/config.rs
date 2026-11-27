@@ -526,6 +526,9 @@ pub fn validate_config_detailed(cfg: &AppConfig) -> Vec<ConfigValidationIssue> {
         }
         OverrideMode::Disabled => {}
     }
+    if let Err(err) = cfg.rules_override.validate_inline_override_yaml() {
+        push_err(&mut issues, "rules_override.inline_override_yaml", &err);
+    }
 
     // 6. Geodata & Core Runtime
     if cfg.geodata.auto_update && cfg.geodata.update_interval_hours == 0 {
@@ -1341,6 +1344,64 @@ mod tests {
         )
         .unwrap();
         assert!(mgr.import_backup(&tampered_path).is_err());
+
+        cleanup_dir(&paths);
+    }
+
+    #[test]
+    fn validate_config_and_backup_restore_reject_invalid_or_oversized_inline_override_yaml() {
+        let paths = temp_paths("inline-override-validation");
+        let mgr = ConfigManager::new(paths.clone());
+
+        // Valid inline YAML mapping passes config validation.
+        let mut valid_cfg = AppConfig::default();
+        valid_cfg.rules_override.inline_override_yaml =
+            Some("rules:\n  - DOMAIN-SUFFIX,example.com,DIRECT\n  - MATCH,DIRECT\n".to_string());
+        assert!(validate_config(&valid_cfg).is_ok());
+
+        // Malformed inline YAML syntax is rejected by validate_config and save().
+        let mut bad_syntax = AppConfig::default();
+        bad_syntax.rules_override.inline_override_yaml =
+            Some("rule-providers: [\n  unclosed".to_string());
+        let err = validate_config(&bad_syntax).expect_err("malformed inline YAML must fail");
+        assert!(err.to_string().contains("rules_override.inline_override_yaml"));
+        assert!(mgr.save(&bad_syntax).is_err());
+
+        // Non-mapping root (top-level sequence) is rejected.
+        let mut non_map = AppConfig::default();
+        non_map.rules_override.inline_override_yaml =
+            Some("- DOMAIN,example.com,DIRECT\n".to_string());
+        let non_map_err =
+            validate_config(&non_map).expect_err("non-mapping inline YAML must fail");
+        assert!(non_map_err.to_string().contains("rules_override.inline_override_yaml"));
+
+        // Oversized (> 1 MiB) inline YAML is rejected both directly and through backup import.
+        let mut oversized = AppConfig::default();
+        oversized.rules_override.inline_override_yaml = Some(format!(
+            "rules:\n  - {}\n",
+            "a".repeat(crate::models::MAX_INLINE_OVERRIDE_YAML_BYTES + 64)
+        ));
+        let oversized_err =
+            validate_config(&oversized).expect_err("oversized inline YAML must fail");
+        assert!(oversized_err.to_string().contains("rules_override.inline_override_yaml"));
+        assert!(oversized_err.to_string().contains("1 MiB"));
+
+        let canonical = serde_json::to_vec(&oversized).unwrap();
+        let digest = sha256_hex(&canonical);
+        let backup = ConfigBackupBundle {
+            schema: BACKUP_SCHEMA.to_string(),
+            exported_at: "2026-01-01T00:00:00Z".to_string(),
+            app_version: "0.1.0".to_string(),
+            config_sha256: digest,
+            config: oversized,
+        };
+        std::fs::create_dir_all(&paths.backup_dir).unwrap();
+        let backup_path = paths.backup_dir.join("oversized-inline-override.json");
+        std::fs::write(&backup_path, serde_json::to_vec_pretty(&backup).unwrap()).unwrap();
+        let restore_err = mgr
+            .import_backup(&backup_path)
+            .expect_err("backup restore must reject oversized inline_override_yaml");
+        assert!(restore_err.to_string().contains("rules_override.inline_override_yaml"));
 
         cleanup_dir(&paths);
     }

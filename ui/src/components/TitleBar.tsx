@@ -225,13 +225,16 @@ export function TitleBar() {
           )}
         </span>
 
-        <span className="pointer-events-none inline-flex shrink-0 items-center gap-1 rounded-full border border-[var(--line)]/80 bg-[var(--card)]/85 px-2 py-0.5 text-[10px] font-medium leading-none text-[var(--text-secondary)]">
+        <span
+          title={badge.label}
+          className="pointer-events-none inline-flex max-w-[180px] shrink-0 items-center gap-1 rounded-full border border-[var(--line)]/80 bg-[var(--card)]/85 px-2 py-0.5 text-[10px] font-medium leading-none text-[var(--text-secondary)]"
+        >
           <span
             className="h-1.5 w-1.5 shrink-0 rounded-full"
             style={{ backgroundColor: badge.dotColor }}
             aria-hidden="true"
           />
-          <span>{badge.label}</span>
+          <span className="min-w-0 truncate">{badge.label}</span>
         </span>
       </div>
 

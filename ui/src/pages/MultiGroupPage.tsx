@@ -26,6 +26,7 @@ import {
   Zap,
 } from "lucide-react";
 import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   type DynamicFilterSpec,
   type FallbackPolicy,
@@ -1266,6 +1267,9 @@ export function MultiGroupPage() {
     false,
     isBoolPref
   );
+  const [isWideDesktop, setIsWideDesktop] = useState<boolean>(() =>
+    typeof window !== "undefined" ? window.innerWidth >= 1280 : true
+  );
   const [advancedOpen, setAdvancedOpen] = usePersistedState<boolean>(
     "multigroup.advancedOpen",
     false,
@@ -1306,6 +1310,29 @@ export function MultiGroupPage() {
       if (clearConfirmTimerRef.current !== null) window.clearTimeout(clearConfirmTimerRef.current);
     };
   }, []);
+
+  // Track xl (>=1280px) viewport breakpoint: 3-column inline docked drawer on >=1280px,
+  // slide-over Portal drawer below 1280px so the center node grid never collapses.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const mq = window.matchMedia("(min-width: 1280px)");
+    const sync = () => setIsWideDesktop(mq.matches);
+    sync();
+    mq.addEventListener("change", sync);
+    return () => mq.removeEventListener("change", sync);
+  }, []);
+
+  useEffect(() => {
+    if (isWideDesktop || !drawerOpen) return;
+    const onKeyDown = (ev: globalThis.KeyboardEvent) => {
+      if (ev.key === "Escape") {
+        ev.preventDefault();
+        setDrawerOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [drawerOpen, isWideDesktop, setDrawerOpen]);
 
   // Sync store groups smoothly without wiping unsaved strategy drafts
   useEffect(() => {
@@ -2307,9 +2334,9 @@ export function MultiGroupPage() {
   return (
     <div className="flex min-h-[calc(100vh-2rem)] flex-col gap-3.5 lg:flex-row lg:items-stretch">
       {/* =====================================================================
-          COLUMN 1: LEFT SIDEBAR (232px) — Create Group & Existing Groups List
+          COLUMN 1: LEFT SIDEBAR (216px/232px) — Create Group & Existing Groups List
          ===================================================================== */}
-      <aside className="flex w-full shrink-0 flex-col lg:w-[232px]">
+      <aside className="flex w-full shrink-0 flex-col lg:w-[216px] xl:w-[232px]">
         <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl p-3">
           {/* Prominent "+ 新建多选组" primary button */}
           <button
@@ -2622,7 +2649,7 @@ export function MultiGroupPage() {
                         ev.preventDefault();
                         void handleCommitRename();
                       }}
-                      className="flex items-center gap-1.5"
+                      className="flex min-w-0 max-w-full items-center gap-1.5"
                     >
                       <input
                         type="text"
@@ -2635,7 +2662,7 @@ export function MultiGroupPage() {
                             setEditingName(false);
                           }
                         }}
-                        className="rounded-lg border border-[var(--accent)] bg-[var(--bg-elevated)] px-2.5 py-1 text-sm font-semibold text-[var(--text)] outline-none"
+                        className="min-w-0 w-full max-w-[260px] rounded-lg border border-[var(--accent)] bg-[var(--bg-elevated)] px-2.5 py-1 text-sm font-semibold text-[var(--text)] outline-none"
                       />
                     </form>
                   ) : (
@@ -2715,12 +2742,12 @@ export function MultiGroupPage() {
                   type="button"
                   disabled={switchingNext}
                   onClick={() => void handleSwitchNextBestInGroup()}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:opacity-60"
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:opacity-60"
                 >
                   {switchingNext ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
                   ) : (
-                    <Zap className="h-3.5 w-3.5" />
+                    <Zap className="h-3.5 w-3.5 shrink-0" />
                   )}
                   <span>{switchingNext ? "切换中..." : "换下一个最快"}</span>
                 </button>
@@ -2728,13 +2755,13 @@ export function MultiGroupPage() {
                 <button
                   type="button"
                   onClick={() => setDrawerOpen((v) => !v)}
-                  className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+                  className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
                     drawerOpen
                       ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                       : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
                   }`}
                 >
-                  <Settings2 className="h-3.5 w-3.5" />
+                  <Settings2 className="h-3.5 w-3.5 shrink-0" />
                   <span>{drawerOpen ? "收起策略与标准" : "策略与标准"}</span>
                   {activeRuleCount > 0 && (
                     <span className="cc-mono rounded-full bg-[var(--card)] px-1.5 py-0.2 text-[10px] font-semibold text-[var(--accent)]">
@@ -2743,7 +2770,7 @@ export function MultiGroupPage() {
                   )}
                   {isSelectedDirty && (
                     <span
-                      className="h-1.5 w-1.5 rounded-full bg-[var(--amber)]"
+                      className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]"
                       title="有未应用的策略改动"
                     />
                   )}
@@ -3005,8 +3032,10 @@ export function MultiGroupPage() {
 
           {pagedFilteredNodes.length > 0 ? (
             <div
-              className={`grid grid-cols-1 gap-2.5 sm:grid-cols-2 ${
-                drawerOpen ? "2xl:grid-cols-3" : "xl:grid-cols-3 2xl:grid-cols-4"
+              className={`grid grid-cols-1 gap-2.5 ${
+                drawerOpen && isWideDesktop
+                  ? "2xl:grid-cols-2"
+                  : "sm:grid-cols-2 min-[1400px]:grid-cols-3 2xl:grid-cols-4"
               }`}
             >
               {pagedFilteredNodes.map((node) => {
@@ -3106,7 +3135,7 @@ export function MultiGroupPage() {
                           <span>在组内</span>
                         </span>
                       ) : (
-                        <span className="pointer-events-none absolute right-2.5 top-2.5 rounded-full border border-[var(--accent)]/40 bg-[var(--card)]/95 px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)] opacity-0 shadow-xs transition-opacity group-hover:opacity-100">
+                        <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border border-transparent px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)] transition-colors group-hover:border-[var(--accent)]/45 group-hover:bg-[var(--accent-soft)] group-hover:text-[var(--accent)]">
                           + 加入本组
                         </span>
                       )}
@@ -3406,17 +3435,19 @@ export function MultiGroupPage() {
       )}
 
       {/* =====================================================================
-          COLUMN 3: RIGHT COLLAPSIBLE STRATEGY DRAWER (Collapsed strip / 332px)
+          COLUMN 3: RIGHT COLLAPSIBLE STRATEGY DRAWER
+          - >=1280px (xl): Docked inline strip (44px) / 332px third column
+          - <1280px: Slide-over Portal drawer below 36px TitleBar (top-9 z-40)
          ===================================================================== */}
       {selectedGroup && !drawerOpen && (
-        <aside className="hidden lg:flex lg:shrink-0 lg:flex-col">
+        <aside className="hidden xl:flex xl:shrink-0 xl:flex-col">
           <button
             type="button"
             onClick={() => setDrawerOpen(true)}
             title="点击展开右侧策略与标准设置"
             className="cc-card cc-glass flex w-[44px] flex-1 flex-col items-center justify-start gap-3 rounded-2xl py-4 text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
           >
-            <span className="flex flex-col items-center gap-3 lg:sticky lg:top-4">
+            <span className="flex flex-col items-center gap-3 xl:sticky xl:top-4">
               <Settings2 className="h-4 w-4 text-[var(--accent)]" />
               <span
                 className="text-xs font-medium tracking-widest"
@@ -3434,16 +3465,16 @@ export function MultiGroupPage() {
         </aside>
       )}
 
-      {selectedGroup && drawerOpen && (
-        <aside className="flex w-full shrink-0 flex-col lg:w-[332px]">
-          <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl">
+      {selectedGroup && drawerOpen && (() => {
+        const strategyDrawerBody = (
+          <>
             {/* Drawer Header */}
-            <div className="flex items-center justify-between gap-2 border-b border-[var(--line)] px-4 py-3">
-              <div className="flex items-center gap-2">
-                <Settings2 className="h-4 w-4 text-[var(--accent)]" />
-                <div>
-                  <h2 className="text-xs font-semibold text-[var(--text)]">策略与标准</h2>
-                  <p className="text-[10px] text-[var(--muted)]">
+            <div className="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--line)] px-4 py-3">
+              <div className="flex min-w-0 flex-1 items-center gap-2">
+                <Settings2 className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+                <div className="min-w-0 flex-1">
+                  <h2 className="truncate text-xs font-semibold text-[var(--text)]">策略与标准</h2>
+                  <p className="truncate text-[10px] text-[var(--muted)]" title={selectedGroupDisplayName}>
                     针对「{selectedGroupDisplayName}」的选点规则
                   </p>
                 </div>
@@ -3451,7 +3482,7 @@ export function MultiGroupPage() {
               <button
                 type="button"
                 onClick={() => setDrawerOpen(false)}
-                className="rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
+                className="shrink-0 rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
                 title="收起策略面板"
                 aria-label="收起策略面板"
               >
@@ -3459,7 +3490,7 @@ export function MultiGroupPage() {
               </button>
             </div>
 
-            <div className="flex-1 space-y-5 p-4">
+            <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain p-4">
               {/* 1. 选点模式 */}
               <div className="space-y-2">
                 <div className="text-xs font-semibold text-[var(--text)]">1. 选点模式</div>
@@ -3545,7 +3576,7 @@ export function MultiGroupPage() {
                         key={preset.expr}
                         type="button"
                         onClick={() => handleToggleGate(preset.expr)}
-                        className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+                        className={`inline-flex max-w-full min-w-0 items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
                           enabled
                             ? "border-[var(--green)]/60 bg-[var(--green-soft)] text-[var(--green)]"
                             : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
@@ -3556,7 +3587,7 @@ export function MultiGroupPage() {
                         ) : (
                           <Plus className="h-3 w-3 shrink-0 opacity-60" />
                         )}
-                        <span>{preset.label}</span>
+                        <span className="min-w-0 truncate">{preset.label}</span>
                       </button>
                     );
                   })}
@@ -3567,14 +3598,15 @@ export function MultiGroupPage() {
                     {customHardGates.map((expr) => (
                       <span
                         key={expr}
-                        className="cc-mono inline-flex items-center gap-1 rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                        title={expr}
+                        className="cc-mono inline-flex min-w-0 max-w-full items-center gap-1 rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]"
                       >
-                        {expr}
+                        <span className="min-w-0 break-all">{expr}</span>
                         <button
                           type="button"
                           onClick={() => handleToggleGate(expr)}
                           aria-label={`移除条件 ${expr}`}
-                          className="text-[var(--muted)] hover:text-[var(--red)]"
+                          className="shrink-0 text-[var(--muted)] hover:text-[var(--red)]"
                         >
                           <X className="h-3 w-3" />
                         </button>
@@ -3877,14 +3909,14 @@ export function MultiGroupPage() {
                         <span
                           key={rule}
                           title={rule}
-                          className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text-secondary)]"
+                          className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text-secondary)]"
                         >
                           {chip.tag && (
-                            <span className="rounded bg-[var(--card)] px-1 text-[9px] text-[var(--muted)]">
+                            <span className="shrink-0 whitespace-nowrap rounded bg-[var(--card)] px-1 text-[9px] text-[var(--muted)]">
                               {chip.tag}
                             </span>
                           )}
-                          <span className="cc-mono">{chip.display}</span>
+                          <span className="cc-mono min-w-0 break-all">{chip.display}</span>
                           <button
                             type="button"
                             onClick={() =>
@@ -3894,7 +3926,7 @@ export function MultiGroupPage() {
                               }))
                             }
                             aria-label={`移除网站 ${chip.display}`}
-                            className="text-[var(--muted)] hover:text-[var(--red)]"
+                            className="shrink-0 text-[var(--muted)] hover:text-[var(--red)]"
                           >
                             <X className="h-3 w-3" />
                           </button>
@@ -4182,8 +4214,8 @@ export function MultiGroupPage() {
               </div>
             </div>
 
-            {/* Sticky Bottom Apply Strategy Bar */}
-            <div className="sticky bottom-0 border-t border-[var(--line)] bg-[var(--card)]/95 px-4 py-3 backdrop-blur-xs rounded-b-2xl">
+            {/* Solid Bottom Apply Strategy Bar (zero bleed-through) */}
+            <div className="sticky bottom-0 shrink-0 rounded-b-2xl border-t border-[var(--line)] bg-[var(--card)] px-4 py-3">
               <button
                 type="button"
                 disabled={savingGroup || !formulaSyntaxCheck.ok}
@@ -4194,7 +4226,7 @@ export function MultiGroupPage() {
                     : "border border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
                 }`}
               >
-                <Save className="h-3.5 w-3.5" />
+                <Save className="h-3.5 w-3.5 shrink-0" />
                 <span>
                   {savingGroup
                     ? "正在应用..."
@@ -4204,9 +4236,42 @@ export function MultiGroupPage() {
                 </span>
               </button>
             </div>
-          </div>
-        </aside>
-      )}
+          </>
+        );
+
+        if (isWideDesktop) {
+          return (
+            <aside className="flex w-full shrink-0 flex-col xl:w-[332px]">
+              <div className="cc-card cc-glass flex flex-1 flex-col overflow-hidden rounded-2xl">
+                {strategyDrawerBody}
+              </div>
+            </aside>
+          );
+        }
+
+        if (typeof document === "undefined") {
+          return null;
+        }
+
+        return createPortal(
+          <>
+            <div
+              className="fixed inset-x-0 top-9 bottom-0 z-[39] bg-black/35"
+              onClick={() => setDrawerOpen(false)}
+              aria-hidden="true"
+            />
+            <aside
+              role="dialog"
+              aria-modal="true"
+              aria-label={`策略与标准 - ${selectedGroupDisplayName}`}
+              className="cc-surface fixed top-9 bottom-0 right-0 z-40 flex w-[min(360px,calc(100vw-48px))] flex-col overflow-hidden border-l border-[var(--line-strong)] shadow-2xl"
+            >
+              {strategyDrawerBody}
+            </aside>
+          </>,
+          document.body
+        );
+      })()}
     </div>
   );
 }

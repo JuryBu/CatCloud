@@ -10,7 +10,10 @@ use catcloud_core::core_adapter::binary_resolver::{
     compute_file_sha256, mihomo_binary_name, resolve_mihomo_binary,
 };
 use catcloud_core::core_adapter::config_compiler::{
-    CompileInput, CompileStats, StaticValidationReport, compile_mihomo_config_with_runtime_dir,
+    BulkRulesParseResult, CompileInput, CompileStats, GatewayExportOptions, GatewayExportOutput,
+    GatewayExportProfile, PreAccelTransportDiagnostics, StaticValidationReport,
+    build_preaccel_transport_diagnostics, compile_mihomo_config_with_runtime_dir,
+    export_gateway_yaml as core_export_gateway_yaml, parse_bulk_rules_text,
     redact_compiled_yaml_for_preview,
 };
 use catcloud_core::core_adapter::hot_reload::{
@@ -160,6 +163,7 @@ pub struct AppState {
     pub system_proxy_lock: Arc<std::sync::Mutex<()>>,
     pub node_proxy_name_map: RwLock<HashMap<String, String>>,
     pub compiled_group_ids: RwLock<Option<HashSet<String>>>,
+    pub last_effective_tun_mtu: RwLock<Option<u16>>,
     pub last_log_level: RwLock<CoreLogLevel>,
     pub app_logger: Arc<RotatingAppLogger>,
     pub last_app_error: RwLock<Option<String>>,
@@ -305,6 +309,7 @@ impl AppState {
             system_proxy_lock: Arc::new(std::sync::Mutex::new(())),
             node_proxy_name_map: RwLock::new(HashMap::new()),
             compiled_group_ids: RwLock::new(None),
+            last_effective_tun_mtu: RwLock::new(None),
             last_log_level: RwLock::new(initial_log_level),
             app_logger,
             last_app_error: RwLock::new(None),
@@ -480,6 +485,20 @@ impl AppState {
             .read()
             .ok()
             .and_then(|g| g.clone())
+    }
+
+    pub fn set_last_effective_tun_mtu(&self, mtu: Option<u16>) {
+        if let Ok(mut guard) = self.last_effective_tun_mtu.write() {
+            *guard = mtu.filter(|&v| v > 0);
+        }
+    }
+
+    pub fn snapshot_last_effective_tun_mtu(&self) -> Option<u16> {
+        self.last_effective_tun_mtu
+            .read()
+            .ok()
+            .and_then(|g| *g)
+            .filter(|&v| v > 0)
     }
 
     pub fn attach_streams(
@@ -1071,6 +1090,10 @@ pub struct CoreRuntimeInfoDto {
     pub tun_configured: bool,
     pub tun_needs_elevation: bool,
     pub tun_admin_ready: bool,
+    #[serde(default)]
+    pub effective_tun_mtu: Option<u16>,
+    #[serde(default)]
+    pub preaccel_transport: Option<PreAccelTransportDiagnostics>,
     pub app_version: String,
     pub os_label: String,
     pub autostart_enabled: bool,
@@ -1841,6 +1864,23 @@ pub fn effective_tun_enabled(state: &AppState, cfg: &AppConfig) -> bool {
     cfg.tun.enabled && is_tun_privilege_ready(state)
 }
 
+fn has_non_empty_inline_override_yaml(cfg: &AppConfig) -> bool {
+    cfg.rules_override
+        .inline_override_yaml
+        .as_deref()
+        .is_some_and(|raw| !raw.trim().is_empty())
+}
+
+fn may_have_tun_for_teardown(effective_tun: bool, cfg: &AppConfig) -> bool {
+    effective_tun
+        || cfg.rules_override.override_mode != OverrideMode::Disabled
+        || has_non_empty_inline_override_yaml(cfg)
+}
+
+fn config_may_have_tun(state: &AppState, cfg: &AppConfig) -> bool {
+    may_have_tun_for_teardown(effective_tun_enabled(state, cfg), cfg)
+}
+
 /// Return `true` when the user configured TUN ON (`cfg.tun.enabled == true`) but current privileges
 /// are insufficient so TUN cannot genuinely take effect.
 pub fn tun_needs_elevation(state: &AppState, cfg: &AppConfig) -> bool {
@@ -2415,6 +2455,48 @@ fn is_preaccel_pool_lb_effective(
             || (strategy == PreAccelDispatchStrategy::Auto && !has_active_relay))
 }
 
+/// Determine whether any enabled business proxy node will actually be wrapped with domestic
+/// pre-acceleration `dialer-proxy`, mirroring `config_compiler.rs` and `catcloud-cli`
+/// (`should_apply_preaccel` + `relays_support_ipv6` IPv6-only exclusion).
+fn has_preaccel_wrappable_nodes(
+    cfg: &AppConfig,
+    relays: &[PreAccelRelay],
+    nodes: &[ProxyNode],
+) -> bool {
+    let enabled_relays: Vec<&PreAccelRelay> = relays.iter().filter(|r| r.enabled).collect();
+    if enabled_relays.is_empty() {
+        return false;
+    }
+    let relays_support_ipv6 = enabled_relays.iter().all(|r| r.supports_ipv6);
+    nodes.iter().any(|n| {
+        if !n.enabled
+            || is_info_proxy_node(n)
+            || !n.should_apply_preaccel(cfg.preaccel.skip_443_native)
+        {
+            return false;
+        }
+        let skip_for_ipv6 =
+            !relays_support_ipv6 && is_ipv6_only_node(n) && n.preaccel_override != Some(true);
+        !skip_for_ipv6
+    })
+}
+
+/// Infer the effective compiled TUN MTU when no cached `CompileStats.effective_tun_mtu` is
+/// available yet (e.g. core stopped), mirroring `config_compiler::build_tun_section`:
+/// clamp to `<= 1400` whenever domestic pre-acceleration will wrap business nodes via
+/// `dialer-proxy`, otherwise preserve `cfg.tun.mtu`.
+fn infer_effective_tun_mtu(
+    cfg: &AppConfig,
+    has_enabled_relays: bool,
+    has_wrappable_nodes: bool,
+) -> u16 {
+    if cfg.preaccel.enabled && has_enabled_relays && has_wrappable_nodes {
+        cfg.tun.mtu.min(1400)
+    } else {
+        cfg.tun.mtu
+    }
+}
+
 pub fn build_runtime_info_dto(state: &AppState) -> Result<CoreRuntimeInfoDto, String> {
     build_runtime_info_dto_with_verify_override(state, None)
 }
@@ -2445,12 +2527,14 @@ fn build_runtime_info_dto_with_verify_override(
         active_node_name,
         active_node_region,
         relays,
+        has_wrappable_nodes,
         active_snap,
     ) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let groups = db.list_multi_groups().unwrap_or_default();
         let nodes = db.list_nodes().unwrap_or_default();
         let relays = db.list_preaccel_relays(true).unwrap_or_default();
+        let has_wrappable_nodes = has_preaccel_wrappable_nodes(&cfg, &relays, &nodes);
         let primary_group = cfg
             .active_group_id
             .as_deref()
@@ -2522,6 +2606,7 @@ fn build_runtime_info_dto_with_verify_override(
                 .map(|n| n.region_code.clone())
                 .unwrap_or_else(|| "--".to_string()),
             relays,
+            has_wrappable_nodes,
             snap,
         )
     };
@@ -2602,6 +2687,20 @@ fn build_runtime_info_dto_with_verify_override(
             is_direct_mode,
             &global_status,
         );
+    let effective_tun_mtu_val = if rt.running {
+        state
+            .snapshot_last_effective_tun_mtu()
+            .unwrap_or_else(|| {
+                infer_effective_tun_mtu(&cfg, has_enabled_relays, has_wrappable_nodes)
+            })
+    } else {
+        infer_effective_tun_mtu(&cfg, has_enabled_relays, has_wrappable_nodes)
+    };
+    let preaccel_transport = Some(build_preaccel_transport_diagnostics(
+        &cfg,
+        effective_tun_mtu_val,
+        preaccel_effective_carrier,
+    ));
     let dns_diag_raw = analyze_dns_tls_diagnostics_from_log_file(
         &state.app_logger.active_log_path(),
         64 * 1024,
@@ -2671,6 +2770,8 @@ fn build_runtime_info_dto_with_verify_override(
         tun_configured: cfg.tun.enabled,
         tun_needs_elevation: tun_need_elev,
         tun_admin_ready,
+        effective_tun_mtu: Some(effective_tun_mtu_val),
+        preaccel_transport,
         app_version: env!("CARGO_PKG_VERSION").to_string(),
         os_label: format!("{} {}", caps.os, caps.arch),
         autostart_enabled: cfg.behavior.autostart,
@@ -3268,8 +3369,7 @@ pub fn emergency_cleanup_on_exit(state: &AppState) {
     state.lan_sync.shutdown_all();
 
     let cfg = state.snapshot_config();
-    let may_have_tun = effective_tun_enabled(state, &cfg)
-        || cfg.rules_override.override_mode != OverrideMode::Disabled;
+    let may_have_tun = config_may_have_tun(state, &cfg);
     let global_status = state.global_preaccel.status();
     let may_have_global_preaccel = cfg.preaccel.enabled
         || global_status.running
@@ -3407,6 +3507,7 @@ fn refresh_node_proxy_name_map(state: &AppState) {
     if let Ok(compiled) =
         compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir))
     {
+        state.set_last_effective_tun_mtu(Some(compiled.stats.effective_tun_mtu));
         state.set_node_proxy_name_map(compiled.node_id_to_proxy_name);
         state.set_compiled_group_ids(Some(
             compiled
@@ -3630,7 +3731,9 @@ async fn start_core_locked(app: &AppHandle, state: &AppState) -> Result<CoreRunt
 
     let loaded_nodes_count = compiled.stats.total_proxies;
     let loaded_relays_count = compiled.stats.relay_proxies;
+    let effective_tun_mtu = compiled.stats.effective_tun_mtu;
     let total_library_nodes = nodes.len();
+    state.set_last_effective_tun_mtu(Some(effective_tun_mtu));
     state.set_node_proxy_name_map(compiled.node_id_to_proxy_name);
     state.set_compiled_group_ids(Some(
         compiled
@@ -3756,8 +3859,7 @@ pub async fn start_core_internal(
 /// Caller must hold `state.core_lifecycle_lock`.
 async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
     let cfg = state.snapshot_config();
-    let may_have_tun = effective_tun_enabled(state, &cfg)
-        || cfg.rules_override.override_mode != OverrideMode::Disabled;
+    let may_have_tun = config_may_have_tun(state, &cfg);
     if may_have_tun && state.adapter.has_live_controller().await {
         let _ = state.adapter.disable_tun_gracefully().await;
     }
@@ -3774,6 +3876,7 @@ async fn stop_core_for_restart_locked(state: &AppState) -> Result<(), String> {
     state.telemetry.clear_traffic();
     state.set_node_proxy_name_map(HashMap::new());
     state.set_compiled_group_ids(None);
+    state.set_last_effective_tun_mtu(None);
     let status = state.adapter.status().await;
     state.update_cached_runtime(status);
     if let Ok(mut m) = state.cached_metrics.write() {
@@ -3795,8 +3898,7 @@ async fn stop_core_locked(
 ) -> Result<CoreRuntimeInfoDto, String> {
     let old_cfg = state.snapshot_config();
     let was_sys_proxy_enabled = old_cfg.system_proxy.enabled;
-    let may_have_tun = effective_tun_enabled(state, &old_cfg)
-        || old_cfg.rules_override.override_mode != OverrideMode::Disabled;
+    let may_have_tun = config_may_have_tun(state, &old_cfg);
     let mut cfg = old_cfg;
     let flags_changed = cfg.system_proxy.enabled || (clear_tun_intent && cfg.tun.enabled);
 
@@ -3851,6 +3953,7 @@ async fn stop_core_locked(
     state.telemetry.clear_traffic();
     state.set_node_proxy_name_map(HashMap::new());
     state.set_compiled_group_ids(None);
+    state.set_last_effective_tun_mtu(None);
     let mut status = state.adapter.status().await;
     if let Some(ref proxy_err) = clear_proxy_err {
         if !state.shutting_down.load(Ordering::SeqCst) {
@@ -5291,35 +5394,77 @@ fn reconcile_saved_preaccel_switch(old: &AppConfig, next: &mut AppConfig) {
     }
 }
 
-/// Delay before inspecting Go heap after switching `Global -> Rule` so idle memory settles.
-const HEAP_RECLAIM_DELAY_SECS: u64 = 8;
-/// Skip heap-reclaim restart when active application connections exceed this count.
-const HEAP_RECLAIM_MAX_ACTIVE_CONNS: usize = 8;
-/// Sliding window (10 s) for heap-reclaim high-throughput guard.
+/// Bounded stepped retry delays (seconds) before inspecting Go heap after switching `Global -> Rule`.
+/// At most 3 attempts (`8s`, `30s`, `90s`), ensuring active proxy flows defer reclaim safely
+/// without looping indefinitely or leaking background tasks.
+const HEAP_RECLAIM_RETRY_DELAYS_SECS: [u64; 3] = [8, 30, 90];
+/// Strictly skip L3 heap-reclaim restart whenever any active proxied stream exists (excluding
+/// `Inner` tunnels, `DIRECT` apps such as QQ, and `REJECT` flows), protecting low-connection
+/// long-lived AI/Codex SSE sessions from forced disconnects.
+const HEAP_RECLAIM_MAX_PROXIED_CONNS: usize = 0;
+/// Sliding window (10 s) for heap-reclaim idle throughput guard.
 const HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS: i64 = 10_000;
-/// Throughput threshold (128 KiB/s) protecting ongoing transfers from heap-reclaim restart.
-const HEAP_RECLAIM_HIGH_THROUGHPUT_THRESHOLD_BPS: u64 = 128 * 1024;
+/// Combined upload + download throughput ceiling (`8 KiB/s`) below which core is considered idle.
+const HEAP_RECLAIM_MAX_TOTAL_BPS: u64 = 8 * 1024;
 /// Minimum cooldown between consecutive automatic heap-reclaim restarts (10 minutes).
 const HEAP_RECLAIM_COOLDOWN_SECS: u64 = 10 * 60;
 /// Floor memory threshold in MiB below which Go heap reclaim is skipped.
 const HEAP_RECLAIM_MIN_MEMORY_MB: f64 = 90.0;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct HeapReclaimCheckInput {
     gen_matches: bool,
     is_rule_mode: bool,
     core_running: bool,
     tun_enabled: bool,
-    active_connections: usize,
-    high_throughput: bool,
+    proxied_connections: usize,
+    direct_connections: usize,
+    traffic_telemetry_fresh: bool,
+    total_bytes_per_sec: u64,
     probing_active: bool,
     memory_mb: f64,
     budget_mb: f64,
     cooldown_elapsed: bool,
 }
 
+/// Compute peak combined (`up + down`) throughput in B/s across the cached real-time rate and
+/// recent `/traffic` ticks inside `window_ms` of `now_ms`, together with whether at least one
+/// fresh `/traffic` sample was observed in that window.
+fn resolve_recent_peak_total_bps_with_freshness(
+    cached: &CachedRealtimeMetrics,
+    recent_ticks: &[TrafficTick],
+    now_ms: i64,
+    window_ms: i64,
+) -> (u64, bool) {
+    let mut peak = cached.up_bps.saturating_add(cached.down_bps);
+    let mut has_fresh_tick = false;
+    let cutoff_ms = now_ms.saturating_sub(window_ms.max(0));
+    let upper_ms = now_ms.saturating_add(5_000);
+    for tick in recent_ticks {
+        if tick.timestamp_ms >= cutoff_ms && tick.timestamp_ms <= upper_ms {
+            has_fresh_tick = true;
+            peak = peak.max(tick.up.saturating_add(tick.down));
+        }
+    }
+    (peak, has_fresh_tick)
+}
+
+/// Compute peak combined (`up + down`) throughput in B/s across the cached real-time rate and
+/// recent `/traffic` ticks inside `window_ms` of `now_ms`.
+#[cfg_attr(not(test), allow(dead_code))]
+fn resolve_recent_peak_total_bps(
+    cached: &CachedRealtimeMetrics,
+    recent_ticks: &[TrafficTick],
+    now_ms: i64,
+    window_ms: i64,
+) -> u64 {
+    resolve_recent_peak_total_bps_with_freshness(cached, recent_ticks, now_ms, window_ms).0
+}
+
 /// Pure guardrail evaluator for `Global -> Rule` delayed Go heap reclaim.
-/// Returns `Ok(threshold_mb)` only when every safety invariant passes.
+/// Returns `Ok(threshold_mb)` only when every safety invariant passes, including zero active
+/// proxied connections (`proxied_connections == 0`), idle total throughput (`< 8 KiB/s`), and
+/// fresh `/traffic` telemetry whenever `DIRECT` connections are present.
 fn evaluate_heap_reclaim_guard(input: &HeapReclaimCheckInput) -> Result<f64, &'static str> {
     if !input.gen_matches {
         return Err("config_generation_changed");
@@ -5330,15 +5475,6 @@ fn evaluate_heap_reclaim_guard(input: &HeapReclaimCheckInput) -> Result<f64, &'s
     if input.tun_enabled {
         return Err("tun_active");
     }
-    if input.active_connections > HEAP_RECLAIM_MAX_ACTIVE_CONNS {
-        return Err("too_many_active_connections");
-    }
-    if input.high_throughput {
-        return Err("high_throughput_active");
-    }
-    if input.probing_active {
-        return Err("probing_active");
-    }
     let threshold_mb = (input.budget_mb * 1.5).max(HEAP_RECLAIM_MIN_MEMORY_MB);
     if !input.memory_mb.is_finite() || input.memory_mb <= threshold_mb {
         return Err("memory_within_budget");
@@ -5346,132 +5482,211 @@ fn evaluate_heap_reclaim_guard(input: &HeapReclaimCheckInput) -> Result<f64, &'s
     if !input.cooldown_elapsed {
         return Err("cooldown_active");
     }
+    if input.proxied_connections > HEAP_RECLAIM_MAX_PROXIED_CONNS {
+        return Err("active_proxied_connections");
+    }
+    if input.total_bytes_per_sec >= HEAP_RECLAIM_MAX_TOTAL_BPS {
+        return Err("throughput_above_idle_threshold");
+    }
+    if input.direct_connections > 0 && !input.traffic_telemetry_fresh {
+        return Err("traffic_telemetry_stale_with_direct_connections");
+    }
+    if input.probing_active {
+        return Err("probing_active");
+    }
     Ok(threshold_mb)
+}
+
+/// Return `true` if a heap-reclaim skip reason is transient and worth retrying on the next
+/// bounded backoff step (`[8s, 30s, 90s]`).
+fn is_heap_reclaim_reason_deferrable(reason: &str) -> bool {
+    matches!(
+        reason,
+        "active_proxied_connections"
+            | "throughput_above_idle_threshold"
+            | "traffic_telemetry_stale_with_direct_connections"
+            | "probing_active"
+    )
+}
+
+/// Sleep for `delay_secs` while aborting promptly if the app shuts down or `config_generation`
+/// advances past `expected_gen`.
+async fn wait_heap_reclaim_delay(app: &AppHandle, expected_gen: u64, delay_secs: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(delay_secs);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return true;
+        }
+        tokio::time::sleep(remaining.min(Duration::from_secs(2))).await;
+        let Some(st) = app.try_state::<AppState>() else {
+            return false;
+        };
+        if st.shutting_down.load(Ordering::SeqCst) || st.config_generation() != expected_gen {
+            return false;
+        }
+    }
 }
 
 fn schedule_global_to_rule_heap_reclaim(app: &AppHandle, expected_gen: u64) {
     let app_h = app.clone();
     tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_secs(HEAP_RECLAIM_DELAY_SECS)).await;
+        let total_attempts = HEAP_RECLAIM_RETRY_DELAYS_SECS.len();
+        for (attempt_idx, &delay_secs) in HEAP_RECLAIM_RETRY_DELAYS_SECS.iter().enumerate() {
+            if !wait_heap_reclaim_delay(&app_h, expected_gen, delay_secs).await {
+                return;
+            }
 
-        let Some(st) = app_h.try_state::<AppState>() else {
-            return;
-        };
-        if st.shutting_down.load(Ordering::SeqCst) {
-            return;
-        }
-        // Never block or contend with active user config transitions.
-        let Ok(_cfg_guard) = st.config_transition_lock.try_lock() else {
-            return;
-        };
-        if st.shutting_down.load(Ordering::SeqCst) || st.config_generation() != expected_gen {
-            return;
-        }
+            let Some(st) = app_h.try_state::<AppState>() else {
+                return;
+            };
+            if st.shutting_down.load(Ordering::SeqCst) || st.config_generation() != expected_gen {
+                return;
+            }
 
-        let cfg = st.snapshot_config();
-        let core_running =
-            st.snapshot_runtime().running && st.adapter.has_live_controller().await;
-        if cfg.proxy_mode != ProxyMode::Rule || !core_running {
-            return;
-        }
+            // Never block or contend with active user config transitions; guard is dropped before
+            // sleeping for any subsequent retry tier.
+            let Ok(_cfg_guard) = st.config_transition_lock.try_lock() else {
+                tracing::debug!(
+                    attempt = attempt_idx + 1,
+                    total_attempts,
+                    "Global -> Rule delayed Go heap reclaim deferred: config transition busy"
+                );
+                continue;
+            };
+            if st.shutting_down.load(Ordering::SeqCst) || st.config_generation() != expected_gen {
+                return;
+            }
 
-        let live_snap =
-            tokio::time::timeout(Duration::from_millis(800), st.adapter.list_connections())
-                .await
-                .ok()
-                .and_then(|res| res.ok());
-        let cached = st
-            .cached_metrics
-            .read()
-            .map(|m| *m)
-            .unwrap_or_default();
-        let (active_connections, mem_bytes) = if let Some(ref snap) = live_snap {
+            let cfg = st.snapshot_config();
+            let core_running =
+                st.snapshot_runtime().running && st.adapter.has_live_controller().await;
+            if cfg.proxy_mode != ProxyMode::Rule || !core_running {
+                return;
+            }
+
+            let live_snap = tokio::time::timeout(
+                Duration::from_millis(1000),
+                st.adapter.list_connections(),
+            )
+            .await
+            .ok()
+            .and_then(|res| res.ok());
+            // Never assume zero proxied streams when `/connections` snapshot is unavailable
+            // (cached metrics may be stale when the GUI window is minimized).
+            let Some(snap) = live_snap else {
+                tracing::debug!(
+                    attempt = attempt_idx + 1,
+                    total_attempts,
+                    "Global -> Rule delayed Go heap reclaim deferred: live /connections unavailable"
+                );
+                continue;
+            };
+
+            let cached = st
+                .cached_metrics
+                .read()
+                .map(|m| *m)
+                .unwrap_or_default();
             let summary = summarize_connections(&snap.connections);
-            let mem = if snap.memory > 0 {
+            let mem_bytes = if snap.memory > 0 {
                 snap.memory
             } else {
                 cached.core_mem_bytes
             };
-            (summary.app_connections, mem)
-        } else {
-            (cached.app_connections, cached.core_mem_bytes)
-        };
 
-        let recent_ticks = st.telemetry.traffic_snapshot();
-        let now_ms = Utc::now().timestamp_millis();
-        let high_throughput = is_high_throughput_active(
-            &cached,
-            &recent_ticks,
-            now_ms,
-            HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS,
-            HEAP_RECLAIM_HIGH_THROUGHPUT_THRESHOLD_BPS,
-        );
-        let rt = st.snapshot_runtime();
-        let budget_mb = cfg
-            .core_runtime
-            .memory_tier
-            .resolve_mib(rt.node_count, rt.rule_count) as f64;
-        let memory_mb = (mem_bytes as f64) / (1024.0 * 1024.0);
-        let cooldown_elapsed = st
-            .last_heap_reclaim_at
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(HEAP_RECLAIM_COOLDOWN_SECS));
-
-        let check = HeapReclaimCheckInput {
-            gen_matches: st.config_generation() == expected_gen,
-            is_rule_mode: cfg.proxy_mode == ProxyMode::Rule,
-            core_running,
-            tun_enabled: effective_tun_enabled(&st, &cfg),
-            active_connections,
-            high_throughput,
-            probing_active: st.probe_running.load(Ordering::SeqCst),
-            memory_mb,
-            budget_mb,
-            cooldown_elapsed,
-        };
-
-        let threshold_mb = match evaluate_heap_reclaim_guard(&check) {
-            Ok(threshold) => threshold,
-            Err(reason) => {
-                tracing::debug!(
-                    reason,
-                    memory_mb,
-                    budget_mb,
-                    active_connections,
-                    "Global -> Rule delayed Go heap reclaim skipped"
+            let recent_ticks = st.telemetry.traffic_snapshot();
+            let now_ms = Utc::now().timestamp_millis();
+            let (total_bytes_per_sec, traffic_telemetry_fresh) =
+                resolve_recent_peak_total_bps_with_freshness(
+                    &cached,
+                    &recent_ticks,
+                    now_ms,
+                    HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS,
                 );
-                return;
-            }
-        };
+            let rt = st.snapshot_runtime();
+            let budget_mb = cfg
+                .core_runtime
+                .memory_tier
+                .resolve_mib(rt.node_count, rt.rule_count) as f64;
+            let memory_mb = (mem_bytes as f64) / (1024.0 * 1024.0);
+            let cooldown_elapsed = st
+                .last_heap_reclaim_at
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(HEAP_RECLAIM_COOLDOWN_SECS));
 
-        if let Ok(mut guard) = st.last_heap_reclaim_at.lock() {
-            *guard = Some(Instant::now());
-        }
-        st.log_app_event(
-            "info",
-            "内存",
-            &format!(
-                "从全局模式切回规则分流后核心内存偏高（{memory_mb:.1} MiB > 阈值 {threshold_mb:.1} MiB，活跃连接 {active_connections} 条），正在执行核心轻量重启以回收 Go 堆内存"
-            ),
-        );
+            let check = HeapReclaimCheckInput {
+                gen_matches: st.config_generation() == expected_gen,
+                is_rule_mode: cfg.proxy_mode == ProxyMode::Rule,
+                core_running,
+                tun_enabled: effective_tun_enabled(&st, &cfg),
+                proxied_connections: summary.proxied_connections,
+                direct_connections: summary.direct_connections,
+                traffic_telemetry_fresh,
+                total_bytes_per_sec,
+                probing_active: st.probe_running.load(Ordering::SeqCst),
+                memory_mb,
+                budget_mb,
+                cooldown_elapsed,
+            };
 
-        match restart_core_locked(&app_h, &st).await {
-            Ok(_) => {
-                st.log_app_event(
-                    "info",
-                    "内存",
-                    "已完成核心轻量重启并回收 Go 堆内存（代理与规则分流状态保持正常）",
-                );
+            let threshold_mb = match evaluate_heap_reclaim_guard(&check) {
+                Ok(threshold) => threshold,
+                Err(reason) => {
+                    let deferrable = is_heap_reclaim_reason_deferrable(reason);
+                    let has_next = attempt_idx + 1 < total_attempts;
+                    tracing::debug!(
+                        reason,
+                        attempt = attempt_idx + 1,
+                        total_attempts,
+                        deferred = deferrable && has_next,
+                        memory_mb,
+                        budget_mb,
+                        proxied_connections = summary.proxied_connections,
+                        direct_connections = summary.direct_connections,
+                        app_connections = summary.app_connections,
+                        traffic_telemetry_fresh,
+                        total_bytes_per_sec,
+                        "Global -> Rule delayed Go heap reclaim skipped"
+                    );
+                    if deferrable && has_next {
+                        continue;
+                    }
+                    return;
+                }
+            };
+
+            if let Ok(mut guard) = st.last_heap_reclaim_at.lock() {
+                *guard = Some(Instant::now());
             }
-            Err(err) => {
-                st.log_app_event(
-                    "warning",
-                    "内存",
-                    &format!("延迟内存回收触发核心轻量重启未成功，已自动回滚保护：{err}"),
-                );
+            st.log_app_event(
+                "info",
+                "内存",
+                &format!(
+                    "从全局模式切回规则分流后核心内存偏高（{memory_mb:.1} MiB > 阈值 {threshold_mb:.1} MiB，当前无活跃代理流，直连 {} 条，总速率 {} B/s），正在执行核心轻量重启以回收 Go 堆内存",
+                    summary.direct_connections, total_bytes_per_sec
+                ),
+            );
+
+            match restart_core_locked(&app_h, &st).await {
+                Ok(_) => {
+                    st.log_app_event(
+                        "info",
+                        "内存",
+                        "已完成核心轻量重启并回收 Go 堆内存（代理与规则分流状态保持正常）",
+                    );
+                }
+                Err(err) => {
+                    st.log_app_event(
+                        "warning",
+                        "内存",
+                        &format!("延迟内存回收触发核心轻量重启未成功，已自动回滚保护：{err}"),
+                    );
+                }
             }
+            return;
         }
     });
 }
@@ -5620,14 +5835,7 @@ where
     let now_core_running =
         state.snapshot_runtime().running || state.adapter.has_live_controller().await;
     let now_tun_active = now_core_running && effective_tun_enabled(state, &next);
-    let relay_selection_changed = old.preaccel.active_relay_id != next.preaccel.active_relay_id
-        || old.preaccel.dispatch_strategy != next.preaccel.dispatch_strategy
-        || old.preaccel.lb_strategy != next.preaccel.lb_strategy;
-    let windivert_policy_changed = old.preaccel.skip_443_native != next.preaccel.skip_443_native
-        || old.preaccel.probe_url != next.preaccel.probe_url
-        || old.preaccel.global_scope != next.preaccel.global_scope
-        || old.preaccel.global_target_processes != next.preaccel.global_target_processes
-        || old.preaccel.windivert_dir != next.preaccel.windivert_dir;
+    let preaccel_changed = should_sync_standalone_preaccel_on_config_change(&old, &next);
 
     if !next.preaccel.enabled
         && (state.global_preaccel.status().running
@@ -5644,36 +5852,12 @@ where
             "代理配置",
         )
         .await;
-    } else if !now_tun_active && next.preaccel.enabled && state.global_preaccel.status().running {
-        if relay_selection_changed {
-            sync_running_global_preaccel_if_active(state, &next).await;
-        } else if windivert_policy_changed {
-            if let Ok(relays) = load_enabled_preaccel_relays(state) {
-                if !relays.is_empty() {
-                    let excluded_pids = collect_excluded_pids_for_global_preaccel(state);
-                    match state
-                        .global_preaccel
-                        .restart_windivert_if_running(&next, &relays, &excluded_pids)
-                        .await
-                    {
-                        Ok(rebuilt_st) => {
-                            log_global_preaccel_verify_status(
-                                state,
-                                "提速参数变更热重建 WinDivert",
-                                &rebuilt_st,
-                            );
-                        }
-                        Err(err) => {
-                            state.log_app_event(
-                                "warning",
-                                "国内提速",
-                                &format!("提速策略变更后热重建 WinDivert 失败：{err}"),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    } else if !now_tun_active
+        && next.preaccel.enabled
+        && state.global_preaccel.status().running
+        && preaccel_changed
+    {
+        sync_running_global_preaccel_if_active(state, &next).await;
     }
 
     let next_gen = state.bump_config_generation();
@@ -5709,15 +5893,141 @@ pub fn get_full_config(state: State<'_, AppState>) -> Result<AppConfig, String> 
     Ok(state.snapshot_config())
 }
 
+const MAX_INLINE_OVERRIDE_YAML_BYTES: usize = 1024 * 1024;
+
+fn normalize_inline_override_yaml(cfg: &mut AppConfig) {
+    if let Some(raw) = cfg.rules_override.inline_override_yaml.as_deref() {
+        if raw.trim().is_empty() {
+            cfg.rules_override.inline_override_yaml = None;
+        }
+    }
+}
+
+fn format_inline_override_validation_error(raw: &str) -> String {
+    let detail = format_mihomo_error_for_user(raw);
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("root document must be a mapping") {
+        return "内联 YAML 覆写根节点必须是键值对映射（例如 rule-providers: / rules: / dns:），不能是纯列表或纯文本，已拒绝保存".to_string();
+    }
+    if lower.contains("exceeds maximum allowed size") {
+        return "内联 YAML 覆写体积超过 1 MiB 上限，已拒绝保存".to_string();
+    }
+    if detail.contains("内联 YAML") {
+        detail
+    } else {
+        format!("内联 YAML 覆写编译校验失败，未保存修改：{detail}")
+    }
+}
+
+fn validate_inline_override_yaml_compile(
+    state: &AppState,
+    candidate_cfg: &AppConfig,
+) -> Result<(), String> {
+    let Some(full_raw) = candidate_cfg.rules_override.inline_override_yaml.as_deref() else {
+        return Ok(());
+    };
+    if full_raw.trim().is_empty() {
+        return Ok(());
+    }
+    if full_raw.len() > MAX_INLINE_OVERRIDE_YAML_BYTES {
+        return Err(format!(
+            "内联 YAML 覆写体积超过 1 MiB 上限（当前 {} 字节），已拒绝保存",
+            full_raw.len()
+        ));
+    }
+
+    let (nodes, groups, relays) = {
+        let db = state
+            .storage
+            .lock()
+            .map_err(|e| format!("读取本地配置数据库失败：{e}"))?;
+        (
+            db.list_nodes()
+                .map_err(|e| format!("读取代理节点列表失败：{e}"))?,
+            db.list_multi_groups()
+                .map_err(|e| format!("读取智能多选组列表失败：{e}"))?,
+            db.list_preaccel_relays(false)
+                .map_err(|e| format!("读取国内中转线路失败：{e}"))?,
+        )
+    };
+
+    let allocated = AllocatedPorts {
+        bind_host: candidate_cfg.bind_address.clone(),
+        mixed_port: candidate_cfg.mixed_port,
+        controller_port: candidate_cfg.controller_port,
+        dns_port: candidate_cfg.dns_listen_port,
+        shifted: Vec::new(),
+    };
+    let empty_filter = HashMap::new();
+    let input = CompileInput {
+        config: candidate_cfg,
+        nodes: &nodes,
+        groups: &groups,
+        relays: &relays,
+        controller_secret: "inline-override-validation-secret",
+        allocated_ports: &allocated,
+        extra_prepend_rules: &[],
+        extra_fake_ip_filters: &[],
+        group_filtered_members: &empty_filter,
+    };
+
+    let compiled =
+        compile_mihomo_config_with_runtime_dir(&input, Some(&state.paths.runtime_dir))
+            .map_err(|e| format_inline_override_validation_error(&e.to_string()))?;
+
+    let errors = compiled.validation.errors();
+    if !errors.is_empty() {
+        let summary = errors
+            .iter()
+            .take(3)
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!(
+            "内联 YAML 覆写合并后静态校验未通过，未保存修改：{summary}"
+        ));
+    }
+
+    Ok(())
+}
+
+fn should_sync_standalone_preaccel_on_config_change(old: &AppConfig, next: &AppConfig) -> bool {
+    old.preaccel != next.preaccel
+}
+
+fn should_validate_inline_override_yaml(
+    old: &AppConfig,
+    next: &AppConfig,
+    inline_override_touched: bool,
+) -> bool {
+    next.rules_override.inline_override_yaml.is_some()
+        && (inline_override_touched
+            || old.rules_override.inline_override_yaml != next.rules_override.inline_override_yaml
+            || has_core_config_changes(old, next))
+}
+
+fn prepare_full_config_next(
+    state: &AppState,
+    old: &AppConfig,
+    mut next: AppConfig,
+) -> Result<AppConfig, String> {
+    normalize_inline_override_yaml(&mut next);
+    reconcile_saved_preaccel_switch(old, &mut next);
+    if should_validate_inline_override_yaml(old, &next, false) {
+        validate_inline_override_yaml_compile(state, &next)?;
+    }
+    Ok(next)
+}
+
 #[tauri::command]
 pub async fn save_full_config(
     app: AppHandle,
     state: State<'_, AppState>,
-    mut next: AppConfig,
+    next: AppConfig,
 ) -> Result<AppConfig, String> {
-    apply_and_save_config_transition(&app, &state, move |old| {
-        reconcile_saved_preaccel_switch(old, &mut next);
-        Ok(next)
+    let state_ref: &AppState = &state;
+    apply_and_save_config_transition(&app, state_ref, move |old| {
+        prepare_full_config_next(state_ref, old, next)
     })
     .await
 }
@@ -5760,19 +6070,38 @@ fn json_deep_merge(target: &mut serde_json::Value, patch: &serde_json::Value) {
     json_deep_merge_inner(target, patch, "");
 }
 
+fn prepare_extended_settings_next(
+    state: &AppState,
+    old: &AppConfig,
+    patch: &serde_json::Value,
+) -> Result<AppConfig, String> {
+    let mut base_val = serde_json::to_value(old).map_err(|e| e.to_string())?;
+    json_deep_merge(&mut base_val, patch);
+    let mut next: AppConfig = serde_json::from_value(base_val)
+        .map_err(|e| format!("配置字段格式无效：{e}"))?;
+    normalize_inline_override_yaml(&mut next);
+    reconcile_saved_preaccel_switch(old, &mut next);
+
+    let inline_override_touched = patch
+        .get("rules_override")
+        .and_then(|v| v.get("inline_override_yaml"))
+        .is_some();
+    if should_validate_inline_override_yaml(old, &next, inline_override_touched) {
+        validate_inline_override_yaml_compile(state, &next)?;
+    }
+
+    Ok(next)
+}
+
 #[tauri::command]
 pub async fn save_extended_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     patch: serde_json::Value,
 ) -> Result<AppConfig, String> {
-    apply_and_save_config_transition(&app, &state, |old| {
-        let mut base_val = serde_json::to_value(old).map_err(|e| e.to_string())?;
-        json_deep_merge(&mut base_val, &patch);
-        let mut next: AppConfig = serde_json::from_value(base_val)
-            .map_err(|e| format!("配置字段格式无效：{e}"))?;
-        reconcile_saved_preaccel_switch(old, &mut next);
-        Ok(next)
+    let state_ref: &AppState = &state;
+    apply_and_save_config_transition(&app, state_ref, |old| {
+        prepare_extended_settings_next(state_ref, old, &patch)
     })
     .await
 }
@@ -6374,8 +6703,7 @@ async fn relaunch_self_with_elevation_flags(
                 .await;
             }
             let cfg = st.snapshot_config();
-            let may_have_tun = effective_tun_enabled(&st, &cfg)
-                || cfg.rules_override.override_mode != OverrideMode::Disabled;
+            let may_have_tun = config_may_have_tun(&st, &cfg);
             if may_have_tun && st.adapter.has_live_controller().await {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(1200),
@@ -14333,6 +14661,165 @@ pub fn compile_preview_yaml(state: State<'_, AppState>) -> Result<CompiledYamlPr
     })
 }
 
+const MAX_BULK_RULES_TEXT_BYTES: usize = 2 * 1024 * 1024;
+
+fn default_gateway_yaml_filename(profile: GatewayExportProfile) -> &'static str {
+    match profile {
+        GatewayExportProfile::RelayFragment => "catcloud-relay-fragment.yaml",
+        GatewayExportProfile::TransparentGateway => "catcloud-transparent-gateway.yaml",
+        GatewayExportProfile::PreferredNodes => "catcloud-preferred-nodes.yaml",
+    }
+}
+
+fn load_gateway_export_snapshot(
+    state: &AppState,
+) -> Result<
+    (
+        AppConfig,
+        Vec<ProxyNode>,
+        Vec<MultiGroup>,
+        Vec<PreAccelRelay>,
+        PathBuf,
+    ),
+    String,
+> {
+    let cfg = state.snapshot_config();
+    let (nodes, groups, relays) = {
+        let db = state
+            .storage
+            .lock()
+            .map_err(|e| format!("读取本地配置数据库失败：{e}"))?;
+        (
+            db.list_nodes()
+                .map_err(|e| format!("读取代理节点列表失败：{e}"))?,
+            db.list_multi_groups()
+                .map_err(|e| format!("读取智能多选组列表失败：{e}"))?,
+            db.list_preaccel_relays(false)
+                .map_err(|e| format!("读取国内中转线路失败：{e}"))?,
+        )
+    };
+    Ok((cfg, nodes, groups, relays, state.paths.runtime_dir.clone()))
+}
+
+fn format_gateway_export_error(raw: &str) -> String {
+    let detail = format_mihomo_error_for_user(raw);
+    if detail.contains("导出软路由") || detail.contains("透明网关") {
+        detail
+    } else {
+        format!("导出软路由 / 透明网关配置失败：{detail}")
+    }
+}
+
+async fn export_gateway_yaml_async(
+    state: &AppState,
+    options: GatewayExportOptions,
+) -> Result<GatewayExportOutput, String> {
+    let (cfg, nodes, groups, relays, runtime_dir) = load_gateway_export_snapshot(state)?;
+    tokio::task::spawn_blocking(move || {
+        core_export_gateway_yaml(
+            &cfg,
+            &nodes,
+            &groups,
+            &relays,
+            Some(&runtime_dir),
+            &options,
+        )
+    })
+    .await
+    .map_err(|e| format!("导出软路由 / 透明网关配置任务异常中止：{e}"))?
+    .map_err(|e| format_gateway_export_error(&e.to_string()))
+}
+
+#[tauri::command]
+pub async fn export_gateway_yaml(
+    state: State<'_, AppState>,
+    options: GatewayExportOptions,
+) -> Result<GatewayExportOutput, String> {
+    export_gateway_yaml_async(&state, options).await
+}
+
+#[tauri::command]
+pub async fn save_gateway_yaml_dialog(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    options: GatewayExportOptions,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let output = export_gateway_yaml_async(&state, options).await?;
+    let default_filename = default_gateway_yaml_filename(output.profile);
+    let dialog_title = match output.profile {
+        GatewayExportProfile::RelayFragment => "导出国内中转与防环片段 (.yaml)",
+        GatewayExportProfile::TransparentGateway => "导出透明网关 / 软路由完整配置 (.yaml)",
+        GatewayExportProfile::PreferredNodes => "导出优选节点与中转片段 (.yaml)",
+    };
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title(dialog_title)
+        .set_file_name(default_filename)
+        .add_filter("Mihomo YAML 配置", &["yaml", "yml"])
+        .save_file(move |file_path| {
+            let _ = tx.send(file_path);
+        });
+
+    let picked = match rx.await {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    let Some(file_path) = picked else {
+        return Ok(None);
+    };
+
+    let mut target_path = file_path
+        .into_path()
+        .map_err(|e| format!("无法解析所选保存路径：{e}"))?;
+    if target_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_none_or(|ext| {
+            !ext.eq_ignore_ascii_case("yaml") && !ext.eq_ignore_ascii_case("yml")
+        })
+    {
+        target_path.set_extension("yaml");
+    }
+
+    let yaml_bytes = output.yaml.into_bytes();
+    let write_path = target_path.clone();
+    tokio::task::spawn_blocking(move || AppPaths::atomic_write(&write_path, &yaml_bytes))
+        .await
+        .map_err(|e| format!("后台写入网关 YAML 文件任务异常中止：{e}"))?
+        .map_err(|e| format!("写入网关 YAML 文件失败：{e}"))?;
+
+    let saved_path = catcloud_core::paths::normalize_os_path(&target_path)
+        .display()
+        .to_string();
+    state.log_app_event(
+        "info",
+        "网关导出",
+        &format!(
+            "已导出软路由 / 透明网关配置（模式：{:?}，脱敏：{}，中转 {} 条，节点 {} 个）",
+            output.profile,
+            if output.redacted { "是" } else { "否" },
+            output.relay_count,
+            output.node_count
+        ),
+    );
+    Ok(Some(saved_path))
+}
+
+#[tauri::command]
+pub async fn parse_bulk_rules_preview(raw_text: String) -> Result<BulkRulesParseResult, String> {
+    if raw_text.len() > MAX_BULK_RULES_TEXT_BYTES {
+        return Err(format!(
+            "批量规则文本超过 2 MiB 上限（当前 {} 字节），请分批导入或改用 rule-providers",
+            raw_text.len()
+        ));
+    }
+    Ok(parse_bulk_rules_text(&raw_text))
+}
+
 #[tauri::command]
 pub async fn import_mmrelay_input(
     app: AppHandle,
@@ -15010,6 +15497,29 @@ fn build_ai_diagnostics_markdown(
     let tun_active = rt.running && eff_tun;
     let global_preaccel_brief =
         format_global_preaccel_brief(global_status, cfg.preaccel.enabled, tun_active);
+    let transport_diag = runtime_dto
+        .and_then(|d| d.preaccel_transport.clone())
+        .unwrap_or_else(|| {
+            let fallback_mtu = runtime_dto
+                .and_then(|d| d.effective_tun_mtu)
+                .unwrap_or(cfg.tun.mtu);
+            let fallback_mode = runtime_dto
+                .map(|d| d.preaccel_effective_carrier.as_str())
+                .unwrap_or("off");
+            build_preaccel_transport_diagnostics(cfg, fallback_mtu, fallback_mode)
+        });
+    let preaccel_transport_summary = format!(
+        "effective_mode=`{}`, effective_tun_mtu=`{}`, anytls_tfo={}, min_idle_session={}, keep_alive_idle={}s, keep_alive_interval={}s, expected_probe_status=`{}`, lb_strategy=`{}`, probe_interval={}s",
+        app_log::sanitize_log_line(&transport_diag.effective_mode),
+        transport_diag.effective_tun_mtu,
+        transport_diag.anytls_tfo,
+        transport_diag.anytls_min_idle_session,
+        transport_diag.keep_alive_idle_sec,
+        transport_diag.keep_alive_interval_sec,
+        app_log::sanitize_log_line(&transport_diag.expected_probe_status),
+        app_log::sanitize_log_line(&transport_diag.lb_strategy),
+        transport_diag.probe_interval_sec,
+    );
     let ipv6_core_label = if cfg.core_ipv6 { "开启" } else { "关闭" };
     let ipv6_dns_label = if cfg.dns.ipv6 { "开启" } else { "关闭" };
     let geodata_brief = format_geodata_brief(geodata_status);
@@ -15044,6 +15554,7 @@ fn build_ai_diagnostics_markdown(
 - 国内直连规则：{domestic_direct_label} ｜ 阻断 QUIC（UDP/443）：{block_quic_label}\n\
 - 国内 443 提速：{preaccel_label}（当前中转：{preaccel_relay_name}，跳过 443 原生节点：{skip_443_label}）\n\
 - 底层提速诊断：{global_preaccel_brief}\n\
+- 国内提速传输参数摘要：{preaccel_transport_summary}\n\
 - IPv6 开关：核心数据面 {ipv6_core_label} ｜ DNS 解析 {ipv6_dns_label}\n\
 - GeoData 状态：{geodata_brief}\n\
 - 本地资产统计：订阅 {sub_count} 个 · 节点 {node_count} 个 · 智能多选组 {group_count} 个 · 国内中转 {relay_count} 个\n\
@@ -15841,8 +16352,10 @@ fn build_sanitized_diagnostics_report_with_disk_logs(
         "tun_configured": cfg.tun.enabled,
         "tun_needs_elevation": tun_need_elev,
         "tun_stack": cfg.tun.stack_mode,
+        "effective_tun_mtu": runtime_dto.as_ref().and_then(|d| d.effective_tun_mtu),
         "preaccel_enabled": cfg.preaccel.enabled,
         "skip_443_native": cfg.preaccel.skip_443_native,
+        "preaccel_transport": runtime_dto.as_ref().and_then(|d| d.preaccel_transport.as_ref()),
         "counts": {
             "subscriptions": sub_count,
             "nodes": node_count,
@@ -21770,8 +22283,10 @@ mod tests {
             is_rule_mode: true,
             core_running: true,
             tun_enabled: false,
-            active_connections: 4,
-            high_throughput: false,
+            proxied_connections: 0,
+            direct_connections: 0,
+            traffic_telemetry_fresh: true,
+            total_bytes_per_sec: 1024,
             probing_active: false,
             memory_mb: 112.0,
             budget_mb: 64.0,
@@ -21780,49 +22295,329 @@ mod tests {
         let threshold = evaluate_heap_reclaim_guard(&base).expect("base case should trigger");
         assert!((threshold - 96.0).abs() < 0.01);
 
-        // Generation changed
-        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+        // Stepped retry schedule must stay strictly bounded (`[8s, 30s, 90s]`).
+        assert_eq!(HEAP_RECLAIM_RETRY_DELAYS_SECS, [8, 30, 90]);
+
+        // Generation changed (terminal skip)
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
             gen_matches: false,
             ..base
         })
-        .is_err());
-        // TUN active must skip
-        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+        .unwrap_err();
+        assert_eq!(err, "config_generation_changed");
+        assert!(!is_heap_reclaim_reason_deferrable(err));
+
+        // TUN active must skip (terminal)
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
             tun_enabled: true,
             ..base
         })
-        .is_err());
-        // Active connections > 8 must skip
-        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
-            active_connections: 9,
+        .unwrap_err();
+        assert_eq!(err, "tun_active");
+        assert!(!is_heap_reclaim_reason_deferrable(err));
+
+        // Even a single active proxied stream (e.g. Codex/AI SSE) MUST block and defer.
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+            proxied_connections: 1,
+            total_bytes_per_sec: 0,
             ..base
         })
-        .is_err());
-        // High throughput must skip
-        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
-            high_throughput: true,
+        .unwrap_err();
+        assert_eq!(err, "active_proxied_connections");
+        assert!(is_heap_reclaim_reason_deferrable(err));
+
+        // Throughput >= 8 KiB/s (8192 B/s) MUST block and defer; 8191 B/s is idle enough.
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+            total_bytes_per_sec: HEAP_RECLAIM_MAX_TOTAL_BPS,
             ..base
         })
-        .is_err());
-        // Probing active must skip
+        .unwrap_err();
+        assert_eq!(err, "throughput_above_idle_threshold");
+        assert!(is_heap_reclaim_reason_deferrable(err));
         assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+            total_bytes_per_sec: HEAP_RECLAIM_MAX_TOTAL_BPS - 1,
+            ..base
+        })
+        .is_ok());
+
+        // Probing active must skip and defer
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
             probing_active: true,
             ..base
         })
-        .is_err());
-        // Below max(budget * 1.5, 90.0) floor must skip
-        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+        .unwrap_err();
+        assert_eq!(err, "probing_active");
+        assert!(is_heap_reclaim_reason_deferrable(err));
+
+        // Below max(budget * 1.5, 90.0) floor must skip (terminal)
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
             budget_mb: 48.0,
             memory_mb: 89.5,
             ..base
         })
-        .is_err());
-        // Cooldown active must skip
-        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+        .unwrap_err();
+        assert_eq!(err, "memory_within_budget");
+        assert!(!is_heap_reclaim_reason_deferrable(err));
+
+        // Cooldown active must skip (terminal)
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
             cooldown_elapsed: false,
             ..base
         })
-        .is_err());
+        .unwrap_err();
+        assert_eq!(err, "cooldown_active");
+        assert!(!is_heap_reclaim_reason_deferrable(err));
+    }
+
+    #[test]
+    fn heap_reclaim_distinguishes_direct_qq_from_single_proxied_ai_stream_and_throughput() {
+        use catcloud_core::core_adapter::ActiveConnection;
+
+        let now_ms: i64 = 1_700_000_100_000;
+        let base = HeapReclaimCheckInput {
+            gen_matches: true,
+            is_rule_mode: true,
+            core_running: true,
+            tun_enabled: false,
+            proxied_connections: 0,
+            direct_connections: 0,
+            traffic_telemetry_fresh: true,
+            total_bytes_per_sec: 0,
+            probing_active: false,
+            memory_mb: 120.0,
+            budget_mb: 64.0,
+            cooldown_elapsed: true,
+        };
+
+        // Case 1: Only DIRECT QQ + Inner tunnel + REJECT connections, 0 proxied streams, low rate
+        // (< 8 KiB/s) -> MUST allow heap reclaim (never becomes dead code due to DIRECT QQ).
+        let direct_only_conns = vec![
+            ActiveConnection {
+                id: "qq-1".to_string(),
+                conn_type: "HTTP".to_string(),
+                chains: vec!["DIRECT".to_string()],
+                rule: "PROCESS-NAME".to_string(),
+                process: "QQ.exe".to_string(),
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "qq-2".to_string(),
+                conn_type: "TUN".to_string(),
+                chains: vec!["国内直连".to_string(), "DIRECT".to_string()],
+                rule: "GEOIP".to_string(),
+                process: "QQ.exe".to_string(),
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "inner-1".to_string(),
+                conn_type: "Inner".to_string(),
+                chains: vec!["PreAccel-Relay".to_string()],
+                ..Default::default()
+            },
+            ActiveConnection {
+                id: "rej-1".to_string(),
+                conn_type: "TUN".to_string(),
+                chains: vec!["REJECT".to_string()],
+                rule: "AND".to_string(),
+                ..Default::default()
+            },
+        ];
+        let direct_summary = summarize_connections(&direct_only_conns);
+        assert_eq!(direct_summary.app_connections, 3);
+        assert_eq!(direct_summary.tunnel_connections, 1);
+        assert_eq!(direct_summary.direct_connections, 2);
+        assert_eq!(direct_summary.proxied_connections, 0);
+
+        let low_rate_cached = CachedRealtimeMetrics {
+            up_bps: 1024,
+            down_bps: 2048,
+            ..Default::default()
+        };
+        let (low_rate_bps, low_rate_fresh) = resolve_recent_peak_total_bps_with_freshness(
+            &low_rate_cached,
+            &[TrafficTick {
+                up: 512,
+                down: 1536,
+                timestamp_ms: now_ms - 2_000,
+            }],
+            now_ms,
+            HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS,
+        );
+        assert_eq!(low_rate_bps, 3072);
+        assert!(low_rate_fresh);
+        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+            proxied_connections: direct_summary.proxied_connections,
+            direct_connections: direct_summary.direct_connections,
+            traffic_telemetry_fresh: low_rate_fresh,
+            total_bytes_per_sec: low_rate_bps,
+            ..base
+        })
+        .is_ok());
+
+        // Case 2: A single active proxied AI/Codex SSE connection even at 0 B/s MUST be blocked.
+        let mut with_codex_sse = direct_only_conns;
+        with_codex_sse.push(ActiveConnection {
+            id: "codex-sse-1".to_string(),
+            conn_type: "HTTP".to_string(),
+            chains: vec!["AI主力组".to_string(), "日本东京 01".to_string()],
+            rule: "DOMAIN-SUFFIX".to_string(),
+            host: "api.openai.com".to_string(),
+            ..Default::default()
+        });
+        let sse_summary = summarize_connections(&with_codex_sse);
+        assert_eq!(sse_summary.app_connections, 4);
+        assert_eq!(sse_summary.direct_connections, 2);
+        assert_eq!(sse_summary.proxied_connections, 1);
+        assert_eq!(
+            evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+                proxied_connections: sse_summary.proxied_connections,
+                total_bytes_per_sec: 0,
+                ..base
+            }),
+            Err("active_proxied_connections")
+        );
+
+        // Case 3: 0 proxied streams but combined (up + down) throughput >= 8 KiB/s in window MUST block.
+        let combined_peak_bps = resolve_recent_peak_total_bps(
+            &CachedRealtimeMetrics::default(),
+            &[TrafficTick {
+                up: 4096,
+                down: 4096,
+                timestamp_ms: now_ms - 3_000,
+            }],
+            now_ms,
+            HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS,
+        );
+        assert_eq!(combined_peak_bps, 8192);
+        assert_eq!(
+            evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+                proxied_connections: 0,
+                total_bytes_per_sec: combined_peak_bps,
+                ..base
+            }),
+            Err("throughput_above_idle_threshold")
+        );
+    }
+
+    #[test]
+    fn runtime_dto_and_ai_diagnostics_expose_sanitized_preaccel_transport_summary() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_stage21_transport_diag_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).expect("resolve test paths");
+        let storage = Storage::open_in_memory().expect("open in-memory storage");
+
+        let sub = SubscriptionRecord {
+            id: "sub-1".to_string(),
+            name: "测试订阅".to_string(),
+            ..Default::default()
+        };
+        storage.upsert_subscription(&sub).expect("upsert subscription");
+
+        let node = ProxyNode {
+            id: "n-sg".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "新加坡 01".to_string(),
+            region_code: "SG".to_string(),
+            protocol: "ss".to_string(),
+            server: "198.51.100.20".to_string(),
+            port: 8388,
+            is_443_native: false,
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_node(&node).expect("upsert node");
+        let relay = PreAccelRelay {
+            id: "r-sh".to_string(),
+            name: "上海中转 10.20.30.40".to_string(),
+            server: "203.0.113.55".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "super_secret_relay_pw".to_string(),
+            enabled: true,
+            ..Default::default()
+        };
+        storage.upsert_preaccel_relay(&relay).expect("upsert relay");
+
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.preaccel.lb_strategy, PreAccelLbStrategy::ConsistentHashing);
+        cfg.preaccel.enabled = false;
+        let state = AppState::new(
+            paths,
+            cfg,
+            storage,
+            Arc::new(JobGuard::new().expect("job guard")),
+        );
+
+        // PreAccel off -> inferred effective TUN MTU stays at default 1500.
+        let dto_off = build_runtime_info_dto(&state).expect("runtime dto with preaccel off");
+        assert_eq!(dto_off.effective_tun_mtu, Some(1500));
+        let tr_off = dto_off
+            .preaccel_transport
+            .expect("preaccel_transport populated");
+        assert_eq!(tr_off.effective_tun_mtu, 1500);
+        assert!(!tr_off.anytls_tfo);
+        assert_eq!(tr_off.anytls_min_idle_session, 0);
+        assert_eq!(tr_off.keep_alive_idle_sec, 45);
+
+        // PreAccel on with enabled relay & wrappable node -> inferred effective TUN MTU clamps to 1400.
+        if let Ok(mut g) = state.config.write() {
+            g.preaccel.enabled = true;
+        }
+        let dto_on = build_runtime_info_dto(&state).expect("runtime dto with preaccel on");
+        assert_eq!(dto_on.effective_tun_mtu, Some(1400));
+        let tr_on = dto_on
+            .preaccel_transport
+            .as_ref()
+            .expect("preaccel_transport populated when enabled");
+        assert_eq!(tr_on.effective_tun_mtu, 1400);
+        assert!(!tr_on.anytls_tfo);
+        assert_eq!(tr_on.anytls_min_idle_session, 0);
+        assert_eq!(tr_on.keep_alive_idle_sec, 45);
+        assert!(
+            tr_on.lb_strategy == "consistent-hashing" || tr_on.lb_strategy == "consistent_hashing"
+        );
+
+        // When core is running and cached `CompileStats.effective_tun_mtu` is present, prefer cached value.
+        state.update_cached_runtime(CoreRuntimeStatus {
+            running: true,
+            ..Default::default()
+        });
+        state.set_last_effective_tun_mtu(Some(1380));
+        let dto_running = build_runtime_info_dto(&state).expect("runtime dto while running");
+        assert_eq!(dto_running.effective_tun_mtu, Some(1380));
+        assert_eq!(
+            dto_running
+                .preaccel_transport
+                .as_ref()
+                .map(|t| t.effective_tun_mtu),
+            Some(1380)
+        );
+
+        // AI diagnostics report + Markdown must include sanitized transport summary with zero IP/secret leaks.
+        let report = build_sanitized_diagnostics_report(&state, None).expect("diagnostics report");
+        assert_eq!(report["effective_tun_mtu"], 1380);
+        assert_eq!(report["preaccel_transport"]["anytls_tfo"], false);
+        assert_eq!(report["preaccel_transport"]["anytls_min_idle_session"], 0);
+        assert_eq!(report["preaccel_transport"]["keep_alive_idle_sec"], 45);
+
+        let md = report["ai_prompt_markdown"]
+            .as_str()
+            .expect("ai_prompt_markdown");
+        assert!(md.contains("国内提速传输参数摘要"));
+        assert!(md.contains("effective_mode=`"));
+        assert!(md.contains("effective_tun_mtu=`1380`"));
+        assert!(md.contains("anytls_tfo=false"));
+        assert!(md.contains("min_idle_session=0"));
+        assert!(md.contains("keep_alive_idle=45s"));
+        assert!(md.contains("expected_probe_status=`"));
+        assert!(md.contains("lb_strategy=`"));
+        assert!(!md.contains("203.0.113.55"));
+        assert!(!md.contains("10.20.30.40"));
+        assert!(!md.contains("super_secret_relay_pw"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -22383,8 +23178,10 @@ mod tests {
         );
         assert!(state_legacy.snapshot_config().personalization.onboarding_completed);
 
-        // 3. UiAppConfigDto roundtrip preserves onboarding_completed, dispatch_strategy, lb_strategy.
+        // 3. UiAppConfigDto roundtrip preserves onboarding_completed, dispatch_strategy, lb_strategy
+        //    (ConsistentHashing default + explicit RoundRobin toggle both preserved).
         let mut cfg = AppConfig::default();
+        assert_eq!(cfg.preaccel.lb_strategy, PreAccelLbStrategy::ConsistentHashing);
         cfg.personalization.onboarding_completed = true;
         cfg.preaccel.dispatch_strategy = PreAccelDispatchStrategy::LoadBalance;
         cfg.preaccel.lb_strategy = PreAccelLbStrategy::ConsistentHashing;
@@ -22414,6 +23211,10 @@ mod tests {
             applied.preaccel.active_relay_id, None,
             "switching strategy to LoadBalance clears pinned relay"
         );
+        let mut rr_dto = dto.clone();
+        rr_dto.preaccel.lb_strategy = Some(PreAccelLbStrategy::RoundRobin);
+        apply_ui_dto(&mut applied, &rr_dto);
+        assert_eq!(applied.preaccel.lb_strategy, PreAccelLbStrategy::RoundRobin);
 
         // 4. Five locked effective_carrier states.
         let mut st_wd = GlobalPreAccelStatus::default();
@@ -23583,5 +24384,828 @@ mod tests {
         .expect_err("non-zero exit code must return Err");
         assert!(err.contains("打开更新包目录失败"));
         assert!(err.contains("7"));
+    }
+
+    #[test]
+    fn stage21_5_export_gateway_yaml_core_paths_cover_redacted_plaintext_and_transparent_gateway() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s21_5_gw_export_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+
+        let sub = SubscriptionRecord {
+            id: "sub-gw-demo".to_string(),
+            name: "Demo Sub".to_string(),
+            ..SubscriptionRecord::default()
+        };
+        storage.upsert_subscription(&sub).expect("upsert sub");
+
+        let node = ProxyNode {
+            id: "node-gw-1".to_string(),
+            sub_id: "sub-gw-demo".to_string(),
+            name: "SG-Edge-01".to_string(),
+            protocol: "vless".to_string(),
+            server: "edge.demo-vendor.example".to_string(),
+            port: 8443,
+            enabled: true,
+            raw_config: serde_json::json!({
+                "name": "SG-Edge-01",
+                "type": "vless",
+                "server": "edge.demo-vendor.example",
+                "port": 8443,
+                "uuid": "00000000-0000-4000-8000-000000000088",
+                "tls": true,
+                "network": "tcp"
+            }),
+            ..ProxyNode::default()
+        };
+        storage.upsert_node(&node).expect("upsert node");
+
+        let relay = PreAccelRelay {
+            id: "relay-gw-1".to_string(),
+            name: "CN-Relay-Demo".to_string(),
+            server: "198.51.100.88".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "relay_secret_token_demo".to_string(),
+            enabled: true,
+            ..PreAccelRelay::default()
+        };
+        storage
+            .upsert_preaccel_relay(&relay)
+            .expect("upsert relay");
+
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = true;
+        cfg.allow_lan = false;
+        cfg.preaccel.enabled = true;
+
+        let state = AppState::new(
+            paths,
+            cfg,
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+
+        assert_eq!(
+            default_gateway_yaml_filename(GatewayExportProfile::RelayFragment),
+            "catcloud-relay-fragment.yaml"
+        );
+        assert_eq!(
+            default_gateway_yaml_filename(GatewayExportProfile::TransparentGateway),
+            "catcloud-transparent-gateway.yaml"
+        );
+        assert_eq!(
+            default_gateway_yaml_filename(GatewayExportProfile::PreferredNodes),
+            "catcloud-preferred-nodes.yaml"
+        );
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async {
+            // 1. RelayFragment (redacted): secrets and relay server must be masked.
+            let redacted = export_gateway_yaml_async(
+                &state,
+                GatewayExportOptions {
+                    profile: GatewayExportProfile::RelayFragment,
+                    tproxy_port: 7893,
+                    redir_port: 7892,
+                    dns_listen_port: 1053,
+                    redact_secrets: true,
+                },
+            )
+            .await
+            .expect("redacted relay fragment export");
+            assert_eq!(redacted.profile, GatewayExportProfile::RelayFragment);
+            assert!(redacted.redacted);
+            assert_eq!(redacted.relay_count, 1);
+            assert!(!redacted.yaml.contains("relay_secret_token_demo"));
+            assert!(!redacted.yaml.contains("198.51.100.88"));
+            assert!(!redacted.yaml.contains("edge.demo-vendor.example"));
+
+            // 2. RelayFragment (plaintext): deploys real relay credentials/endpoints.
+            let plaintext = export_gateway_yaml_async(
+                &state,
+                GatewayExportOptions {
+                    profile: GatewayExportProfile::RelayFragment,
+                    tproxy_port: 7893,
+                    redir_port: 7892,
+                    dns_listen_port: 1053,
+                    redact_secrets: false,
+                },
+            )
+            .await
+            .expect("plaintext relay fragment export");
+            assert_eq!(plaintext.profile, GatewayExportProfile::RelayFragment);
+            assert!(!plaintext.redacted);
+            assert_eq!(plaintext.relay_count, 1);
+            assert!(plaintext.yaml.contains("relay_secret_token_demo"));
+            assert!(plaintext.yaml.contains("198.51.100.88"));
+
+            // 3. TransparentGateway: forces desktop TUN off, sets allow-lan & tproxy/redir ports.
+            let gw = export_gateway_yaml_async(
+                &state,
+                GatewayExportOptions {
+                    profile: GatewayExportProfile::TransparentGateway,
+                    tproxy_port: 7893,
+                    redir_port: 7892,
+                    dns_listen_port: 1053,
+                    redact_secrets: true,
+                },
+            )
+            .await
+            .expect("transparent gateway export");
+            assert_eq!(gw.profile, GatewayExportProfile::TransparentGateway);
+            assert!(gw.yaml.contains("allow-lan: true"));
+            assert!(gw.yaml.contains("tproxy-port: 7893"));
+            assert!(gw.yaml.contains("redir-port: 7892"));
+            assert!(!gw.yaml.contains("relay_secret_token_demo"));
+            assert!(!gw.yaml.contains("198.51.100.88"));
+            assert!(!gw.yaml.contains("edge.demo-vendor.example"));
+            assert!(!gw.yaml.contains("00000000-0000-4000-8000-000000000088"));
+
+            let mut in_tun_section = false;
+            let mut tun_lines: Vec<&str> = Vec::new();
+            for line in gw.yaml.lines() {
+                let trimmed_end = line.trim_end();
+                if trimmed_end == "tun:" {
+                    in_tun_section = true;
+                    continue;
+                }
+                if in_tun_section {
+                    if !trimmed_end.is_empty()
+                        && !trimmed_end.starts_with(' ')
+                        && !trimmed_end.starts_with('#')
+                    {
+                        break;
+                    }
+                    tun_lines.push(trimmed_end.trim());
+                }
+            }
+            assert!(
+                tun_lines.iter().any(|l| *l == "enable: false"),
+                "transparent gateway export must disable desktop TUN, got tun block: {tun_lines:?}"
+            );
+            assert!(
+                !tun_lines.iter().any(|l| *l == "enable: true"),
+                "transparent gateway export must never leave desktop TUN enabled"
+            );
+        });
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage21_5_json_deep_merge_updates_and_clears_custom_rules_and_inline_override_yaml() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s21_5_merge_rules_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        let initial = AppConfig::default();
+        let state = AppState::new(
+            paths,
+            initial.clone(),
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+
+        let valid_inline_yaml = concat!(
+            "rule-providers:\n",
+            "  demo-domain:\n",
+            "    type: http\n",
+            "    behavior: domain\n",
+            "    url: https://example.invalid/demo.yaml\n",
+            "    path: ./ruleset/demo.yaml\n",
+            "    interval: 86400\n"
+        );
+        let enable_patch = serde_json::json!({
+            "rules_override": {
+                "custom_rules_only": true,
+                "inline_override_yaml": valid_inline_yaml
+            }
+        });
+        let updated = prepare_extended_settings_next(&state, &initial, &enable_patch)
+            .expect("valid inline_override_yaml and custom_rules_only update must succeed");
+        assert!(updated.rules_override.custom_rules_only);
+        assert_eq!(
+            updated.rules_override.inline_override_yaml.as_deref(),
+            Some(valid_inline_yaml)
+        );
+        assert_eq!(
+            updated.rules_override.block_quic_udp_443,
+            initial.rules_override.block_quic_udp_443
+        );
+        assert_eq!(
+            updated.rules_override.domestic_direct_enabled,
+            initial.rules_override.domestic_direct_enabled
+        );
+
+        // Clearing via JSON `null` restores `None` while keeping sibling `custom_rules_only`.
+        let clear_null_patch = serde_json::json!({
+            "rules_override": {
+                "inline_override_yaml": null
+            }
+        });
+        let cleared_null = prepare_extended_settings_next(&state, &updated, &clear_null_patch)
+            .expect("clearing inline_override_yaml with null must succeed");
+        assert!(cleared_null.rules_override.custom_rules_only);
+        assert_eq!(cleared_null.rules_override.inline_override_yaml, None);
+
+        // Clearing via empty / whitespace-only string `""` also normalizes to `None`.
+        let clear_empty_patch = serde_json::json!({
+            "rules_override": {
+                "custom_rules_only": false,
+                "inline_override_yaml": "   \n\t  "
+            }
+        });
+        let cleared_empty = prepare_extended_settings_next(&state, &updated, &clear_empty_patch)
+            .expect("clearing inline_override_yaml with empty string must succeed");
+        assert!(!cleared_empty.rules_override.custom_rules_only);
+        assert_eq!(cleared_empty.rules_override.inline_override_yaml, None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage21_5_save_extended_settings_rejects_invalid_or_oversized_inline_override_yaml() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s21_5_inline_guard_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        let initial = AppConfig::default();
+        let state = AppState::new(
+            paths.clone(),
+            initial.clone(),
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+
+        // 1. Broken YAML syntax must be rejected with clear Chinese error.
+        let bad_syntax = serde_json::json!({
+            "rules_override": {
+                "inline_override_yaml": "rule-providers: [\n  unclosed"
+            }
+        });
+        let err_syntax = prepare_extended_settings_next(&state, &initial, &bad_syntax)
+            .expect_err("invalid YAML syntax must fail validation");
+        assert!(err_syntax.contains("内联 YAML"));
+
+        // 2. Non-mapping top-level YAML (sequence) must be rejected.
+        let bad_root = serde_json::json!({
+            "rules_override": {
+                "inline_override_yaml": "- DOMAIN-SUFFIX,example.invalid,DIRECT\n"
+            }
+        });
+        let err_root = prepare_extended_settings_next(&state, &initial, &bad_root)
+            .expect_err("non-mapping top-level YAML must fail validation");
+        assert!(err_root.contains("内联 YAML"));
+
+        // 3. Payload larger than 1 MiB must be rejected before disk save.
+        let oversized_yaml = format!("# {}\ndns:\n  ipv6: false\n", "a".repeat(1024 * 1024));
+        let bad_size = serde_json::json!({
+            "rules_override": {
+                "inline_override_yaml": oversized_yaml
+            }
+        });
+        let err_size = prepare_extended_settings_next(&state, &initial, &bad_size)
+            .expect_err("oversized inline YAML (> 1 MiB) must fail validation");
+        assert!(err_size.contains("1 MiB"));
+
+        // Ensure nothing dirty was written to disk or in-memory config.
+        assert!(!paths.config_path.exists());
+        assert_eq!(state.snapshot_config().rules_override.inline_override_yaml, None);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage21_5_parse_bulk_rules_preview_ipc_wrapper_parses_and_skips_cleanly() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime");
+
+        rt.block_on(async {
+            let raw = concat!(
+                "# Sample Mihomo rules\n",
+                "rules:\n",
+                "  - 'DOMAIN-SUFFIX,example.com,DIRECT'\n",
+                "  - RULE-SET,apple,DIRECT # inline comment\n",
+                "  - DOMAIN-SUFFIX,example.com,DIRECT\n",
+                "  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT\n",
+                "  - INVALID-TYPE,foo,bar\n",
+                "  - MATCH,DIRECT\n"
+            );
+            let parsed = parse_bulk_rules_preview(raw.to_string())
+                .await
+                .expect("bulk rules preview must succeed");
+            assert_eq!(
+                parsed.valid_rules,
+                vec![
+                    "DOMAIN-SUFFIX,example.com,DIRECT".to_string(),
+                    "RULE-SET,apple,DIRECT".to_string(),
+                    "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT".to_string(),
+                    "MATCH,DIRECT".to_string(),
+                ]
+            );
+            assert!(
+                parsed
+                    .skipped_lines
+                    .iter()
+                    .any(|line| line.contains("INVALID-TYPE,foo,bar")),
+                "invalid rule line should be recorded in skipped_lines: {:?}",
+                parsed.skipped_lines
+            );
+
+            // Oversized (> 2 MiB) raw text must return friendly Chinese error.
+            let huge = "DOMAIN,example.invalid,DIRECT\n".repeat(100_000);
+            let err = parse_bulk_rules_preview(huge)
+                .await
+                .expect_err("oversized bulk rules payload should be rejected");
+            assert!(err.contains("2 MiB"));
+        });
+    }
+
+    #[test]
+    fn r23_p0_3_may_have_tun_includes_non_empty_inline_override_yaml() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_r23_may_have_tun_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = false;
+        cfg.rules_override.override_mode = OverrideMode::Disabled;
+        cfg.rules_override.inline_override_yaml = None;
+
+        let state = AppState::new(
+            paths,
+            cfg.clone(),
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+
+        assert!(!may_have_tun_for_teardown(false, &cfg));
+        assert!(!config_may_have_tun(&state, &cfg));
+
+        // Whitespace-only inline_override_yaml does not count as active override.
+        cfg.rules_override.inline_override_yaml = Some("   \n\t  ".to_string());
+        assert!(!may_have_tun_for_teardown(false, &cfg));
+        assert!(!config_may_have_tun(&state, &cfg));
+
+        // Non-empty inline_override_yaml MUST mark `may_have_tun = true` even when
+        // `tun.enabled == false` and `override_mode == Disabled`.
+        cfg.rules_override.inline_override_yaml = Some("tun:\n  enable: true\n".to_string());
+        assert!(may_have_tun_for_teardown(false, &cfg));
+        assert!(config_may_have_tun(&state, &cfg));
+
+        // Legacy override_mode and effective_tun remain covered.
+        cfg.rules_override.inline_override_yaml = None;
+        cfg.rules_override.override_mode = OverrideMode::MergePatch;
+        assert!(may_have_tun_for_teardown(false, &cfg));
+        assert!(config_may_have_tun(&state, &cfg));
+
+        cfg.rules_override.override_mode = OverrideMode::Disabled;
+        assert!(may_have_tun_for_teardown(true, &cfg));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn r23_p1_3_stopped_core_infer_effective_tun_mtu_matches_should_apply_preaccel_and_ipv6() {
+        let mut cfg = AppConfig::default();
+        cfg.tun.mtu = 1500;
+        cfg.preaccel.enabled = true;
+        cfg.preaccel.skip_443_native = true;
+
+        let ipv4_relay = PreAccelRelay {
+            id: "relay-v4".to_string(),
+            name: "CN-V4".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo".to_string(),
+            enabled: true,
+            supports_ipv6: false,
+            ..PreAccelRelay::default()
+        };
+        let ipv6_relay = PreAccelRelay {
+            id: "relay-v6".to_string(),
+            supports_ipv6: true,
+            ..ipv4_relay.clone()
+        };
+
+        let hy2_node = ProxyNode {
+            id: "n-hy2".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "HK-HY2".to_string(),
+            protocol: "hysteria2".to_string(),
+            server: "198.51.100.11".to_string(),
+            port: 8443,
+            enabled: true,
+            ..ProxyNode::default()
+        };
+        let native_443_node = ProxyNode {
+            id: "n-443".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "SG-443".to_string(),
+            protocol: "vless".to_string(),
+            server: "198.51.100.12".to_string(),
+            port: 443,
+            is_443_native: true,
+            enabled: true,
+            ..ProxyNode::default()
+        };
+        let override_off_node = ProxyNode {
+            id: "n-off".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "JP-Off".to_string(),
+            protocol: "ss".to_string(),
+            server: "198.51.100.13".to_string(),
+            port: 8388,
+            preaccel_override: Some(false),
+            enabled: true,
+            ..ProxyNode::default()
+        };
+        let ipv6_only_node = ProxyNode {
+            id: "n-v6".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "US-V6".to_string(),
+            protocol: "vless".to_string(),
+            server: "2001:db8::42".to_string(),
+            port: 8443,
+            enabled: true,
+            ..ProxyNode::default()
+        };
+        let info_banner_node = ProxyNode {
+            id: "n-info".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "剩余流量：100GB".to_string(),
+            protocol: "ss".to_string(),
+            server: "198.51.100.14".to_string(),
+            port: 8388,
+            enabled: true,
+            ..ProxyNode::default()
+        };
+
+        // 1. All UDP-only / 443-native(skipped) / override-off / IPv6-only(without IPv6 relay) /
+        //    info banner nodes -> NOT wrappable -> keep 1500.
+        let unwrappable = vec![
+            hy2_node.clone(),
+            native_443_node.clone(),
+            override_off_node.clone(),
+            ipv6_only_node.clone(),
+            info_banner_node,
+        ];
+        assert!(!has_preaccel_wrappable_nodes(
+            &cfg,
+            std::slice::from_ref(&ipv4_relay),
+            &unwrappable
+        ));
+        assert_eq!(infer_effective_tun_mtu(&cfg, true, false), 1500);
+
+        // 2. When relays support IPv6, IPv6-only node becomes wrappable -> clamp 1400.
+        assert!(has_preaccel_wrappable_nodes(
+            &cfg,
+            std::slice::from_ref(&ipv6_relay),
+            std::slice::from_ref(&ipv6_only_node)
+        ));
+
+        // 3. When mixed relays include one without IPv6, `relays_support_ipv6` is false -> 1500.
+        assert!(!has_preaccel_wrappable_nodes(
+            &cfg,
+            &[ipv4_relay.clone(), ipv6_relay.clone()],
+            std::slice::from_ref(&ipv6_only_node)
+        ));
+
+        // 4. Per-node `preaccel_override = Some(true)` overrides IPv6 exclusion -> wrappable.
+        let mut forced_v6 = ipv6_only_node.clone();
+        forced_v6.preaccel_override = Some(true);
+        assert!(has_preaccel_wrappable_nodes(
+            &cfg,
+            std::slice::from_ref(&ipv4_relay),
+            std::slice::from_ref(&forced_v6)
+        ));
+
+        // 5. Turning `skip_443_native` off wraps 443-native node -> clamp 1400.
+        let mut cfg_no_skip_443 = cfg.clone();
+        cfg_no_skip_443.preaccel.skip_443_native = false;
+        assert!(has_preaccel_wrappable_nodes(
+            &cfg_no_skip_443,
+            std::slice::from_ref(&ipv4_relay),
+            std::slice::from_ref(&native_443_node)
+        ));
+
+        // 6. End-to-end stopped-core `build_runtime_info_dto` reports 1500 instead of 1400 when
+        //    all stored nodes are non-wrappable (HY2 + 443-native + IPv6-only over IPv4 relay).
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_r23_stopped_mtu_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        storage
+            .upsert_subscription(&SubscriptionRecord {
+                id: "sub-1".to_string(),
+                name: "Demo".to_string(),
+                ..SubscriptionRecord::default()
+            })
+            .expect("upsert sub");
+        storage.upsert_node(&hy2_node).expect("upsert hy2");
+        storage.upsert_node(&native_443_node).expect("upsert 443");
+        storage.upsert_node(&ipv6_only_node).expect("upsert v6");
+        storage
+            .upsert_preaccel_relay(&ipv4_relay)
+            .expect("upsert ipv4 relay");
+        let state = AppState::new(
+            paths,
+            cfg,
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+        let dto_unwrappable = build_runtime_info_dto(&state).expect("runtime dto unwrappable");
+        assert_eq!(dto_unwrappable.effective_tun_mtu, Some(1500));
+
+        // Upgrading the relay to IPv6-capable flips stopped-core inferred MTU to 1400.
+        {
+            let db = state.storage.lock().expect("lock storage");
+            db.upsert_preaccel_relay(&PreAccelRelay {
+                id: "relay-v4".to_string(),
+                supports_ipv6: true,
+                ..ipv4_relay
+            })
+            .expect("update relay supports_ipv6");
+        }
+        let dto_wrappable = build_runtime_info_dto(&state).expect("runtime dto wrappable");
+        assert_eq!(dto_wrappable.effective_tun_mtu, Some(1400));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn r23_p1_4_inline_override_yaml_compile_precheck_runs_on_combined_core_config_changes() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_r23_inline_combo_precheck_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), false).expect("create temp AppPaths");
+        let storage = Storage::open_in_memory().expect("open memory storage");
+        storage
+            .upsert_subscription(&SubscriptionRecord {
+                id: "sub-inline".to_string(),
+                name: "Demo".to_string(),
+                ..SubscriptionRecord::default()
+            })
+            .expect("upsert sub");
+        storage
+            .upsert_node(&ProxyNode {
+                id: "node-inline-1".to_string(),
+                sub_id: "sub-inline".to_string(),
+                name: "SG-Inline-01".to_string(),
+                protocol: "vless".to_string(),
+                server: "198.51.100.77".to_string(),
+                port: 8443,
+                enabled: true,
+                raw_config: serde_json::json!({
+                    "name": "SG-Inline-01",
+                    "type": "vless",
+                    "server": "198.51.100.77",
+                    "port": 8443,
+                    "uuid": "00000000-0000-4000-8000-000000000099",
+                    "tls": true,
+                    "network": "tcp"
+                }),
+                ..ProxyNode::default()
+            })
+            .expect("upsert node");
+
+        let mut old = AppConfig::default();
+        old.personalization.onboarding_completed = true;
+        old.rules_override.inline_override_yaml = Some(
+            "rules:\n  - DOMAIN-SUFFIX,example.invalid,Removed-Group\n  - MATCH,DIRECT\n"
+                .to_string(),
+        );
+        let state = AppState::new(
+            paths.clone(),
+            old.clone(),
+            storage,
+            Arc::new(JobGuard::new().expect("create JobGuard")),
+        );
+
+        // 1. Pure UI-only change does NOT trigger inline YAML compile precheck when untouched.
+        let mut ui_only_next = old.clone();
+        ui_only_next.personalization.animations_enabled = !old.personalization.animations_enabled;
+        assert!(!should_validate_inline_override_yaml(
+            &old,
+            &ui_only_next,
+            false
+        ));
+
+        // 2. `save_full_config` path (`prepare_full_config_next`): core field changes
+        //    (`route_mode`) while `inline_override_yaml` stays identical MUST run compile precheck
+        //    and reject dangling target before writing disk.
+        let mut core_changed_next = old.clone();
+        core_changed_next.route_mode = RouteTargetMode::Single;
+        assert!(should_validate_inline_override_yaml(
+            &old,
+            &core_changed_next,
+            false
+        ));
+        let full_err = prepare_full_config_next(&state, &old, core_changed_next)
+            .expect_err("save_full_config combined core change must reject invalid inline YAML");
+        assert!(
+            full_err.contains("内联 YAML") && full_err.contains("Removed-Group"),
+            "unexpected error: {full_err}"
+        );
+
+        // 3. `save_extended_settings` path (`prepare_extended_settings_next`): patching a core
+        //    field without touching `rules_override.inline_override_yaml` MUST also run precheck.
+        let patch_core = serde_json::json!({
+            "route_mode": "single",
+            "core_ipv6": true
+        });
+        let ext_err = prepare_extended_settings_next(&state, &old, &patch_core)
+            .expect_err("save_extended_settings combined core change must reject invalid inline YAML");
+        assert!(
+            ext_err.contains("内联 YAML") && ext_err.contains("Removed-Group"),
+            "unexpected error: {ext_err}"
+        );
+
+        // 4. Positive case: when `inline_override_yaml` is valid, combined core config changes pass.
+        let mut valid_old = old.clone();
+        valid_old.rules_override.inline_override_yaml = Some(
+            "rules:\n  - DOMAIN-SUFFIX,example.invalid,DIRECT\n  - MATCH,DIRECT\n".to_string(),
+        );
+        let mut valid_next = valid_old.clone();
+        valid_next.route_mode = RouteTargetMode::Single;
+        prepare_full_config_next(&state, &valid_old, valid_next)
+            .expect("valid inline YAML with combined core change must pass save_full_config");
+        prepare_extended_settings_next(&state, &valid_old, &patch_core)
+            .expect("valid inline YAML with combined core change must pass save_extended_settings");
+
+        // Nothing dirty written to disk.
+        assert!(!paths.config_path.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn r23_p1_5_preaccel_config_diff_triggers_standalone_tunnel_sync_for_all_fields() {
+        let base = AppConfig::default();
+
+        // Unrelated non-preaccel config changes must NOT trigger standalone tunnel sync.
+        let mut non_preaccel = base.clone();
+        non_preaccel.mixed_port = base.mixed_port + 1;
+        non_preaccel.personalization.language = "en".to_string();
+        assert!(!should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &non_preaccel
+        ));
+
+        // Previously missed 3 fields MUST trigger sync.
+        let mut changed_interval = base.clone();
+        changed_interval.preaccel.probe_interval_sec = base.preaccel.probe_interval_sec + 30;
+        assert!(should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &changed_interval
+        ));
+
+        let mut changed_failover = base.clone();
+        changed_failover.preaccel.auto_failover = !base.preaccel.auto_failover;
+        assert!(should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &changed_failover
+        ));
+
+        let mut changed_fallback_probe = base.clone();
+        changed_fallback_probe.preaccel.fallback_probe_url =
+            "http://connect.rom.miui.com/generate_204?r23=1".to_string();
+        assert!(should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &changed_fallback_probe
+        ));
+
+        // Existing relay selection & WinDivert policy fields remain covered.
+        let mut changed_strategy = base.clone();
+        changed_strategy.preaccel.dispatch_strategy = PreAccelDispatchStrategy::Fallback;
+        assert!(should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &changed_strategy
+        ));
+
+        let mut changed_lb = base.clone();
+        changed_lb.preaccel.lb_strategy = PreAccelLbStrategy::RoundRobin;
+        assert!(should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &changed_lb
+        ));
+
+        let mut changed_scope = base.clone();
+        changed_scope.preaccel.global_scope = GlobalPreAccelScope::AllNon443Tcp;
+        assert!(should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &changed_scope
+        ));
+
+        let mut changed_dir = base.clone();
+        changed_dir.preaccel.windivert_dir = Some("C:\\CustomWinDivert".to_string());
+        assert!(should_sync_standalone_preaccel_on_config_change(
+            &base,
+            &changed_dir
+        ));
+    }
+
+    #[test]
+    fn r23_p2_2_heap_reclaim_defers_when_traffic_telemetry_stale_with_direct_connections() {
+        let now_ms: i64 = 1_700_000_200_000;
+        let base = HeapReclaimCheckInput {
+            gen_matches: true,
+            is_rule_mode: true,
+            core_running: true,
+            tun_enabled: false,
+            proxied_connections: 0,
+            direct_connections: 0,
+            traffic_telemetry_fresh: true,
+            total_bytes_per_sec: 0,
+            probing_active: false,
+            memory_mb: 120.0,
+            budget_mb: 64.0,
+            cooldown_elapsed: true,
+        };
+
+        // 1. Empty `/traffic` ticks (minimized window) -> `fresh == false`.
+        let (peak_empty, fresh_empty) = resolve_recent_peak_total_bps_with_freshness(
+            &CachedRealtimeMetrics::default(),
+            &[],
+            now_ms,
+            HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS,
+        );
+        assert_eq!(peak_empty, 0);
+        assert!(!fresh_empty);
+
+        // 2. Only stale ticks older than 10s -> `fresh == false`.
+        let (peak_stale, fresh_stale) = resolve_recent_peak_total_bps_with_freshness(
+            &CachedRealtimeMetrics::default(),
+            &[TrafficTick {
+                up: 128,
+                down: 256,
+                timestamp_ms: now_ms - HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS - 1_000,
+            }],
+            now_ms,
+            HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS,
+        );
+        assert_eq!(peak_stale, 0);
+        assert!(!fresh_stale);
+
+        // 3. Active DIRECT connections + stale telemetry MUST conservatively defer (never treat as 0 B/s idle).
+        let err = evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+            direct_connections: 2,
+            traffic_telemetry_fresh: fresh_stale,
+            total_bytes_per_sec: peak_stale,
+            ..base
+        })
+        .expect_err("stale telemetry with active DIRECT connections must defer");
+        assert_eq!(err, "traffic_telemetry_stale_with_direct_connections");
+        assert!(is_heap_reclaim_reason_deferrable(err));
+
+        // 4. Zero DIRECT and zero proxied connections -> safe to reclaim even if `/traffic` is paused.
+        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+            direct_connections: 0,
+            traffic_telemetry_fresh: false,
+            total_bytes_per_sec: 0,
+            ..base
+        })
+        .is_ok());
+
+        // 5. Active DIRECT connections + fresh low-throughput tick inside 10s window -> safe to reclaim.
+        let (peak_fresh, fresh_ok) = resolve_recent_peak_total_bps_with_freshness(
+            &CachedRealtimeMetrics::default(),
+            &[TrafficTick {
+                up: 256,
+                down: 512,
+                timestamp_ms: now_ms - 4_000,
+            }],
+            now_ms,
+            HEAP_RECLAIM_HIGH_THROUGHPUT_WINDOW_MS,
+        );
+        assert_eq!(peak_fresh, 768);
+        assert!(fresh_ok);
+        assert!(evaluate_heap_reclaim_guard(&HeapReclaimCheckInput {
+            direct_connections: 2,
+            traffic_telemetry_fresh: fresh_ok,
+            total_bytes_per_sec: peak_fresh,
+            ..base
+        })
+        .is_ok());
     }
 }

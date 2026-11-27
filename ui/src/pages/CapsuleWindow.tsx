@@ -1709,9 +1709,13 @@ export function CapsuleWindow() {
       ? runtime.active_node_latency_ms
       : null;
 
-  // Adaptive breakpoints compatible with 280..560 x 56..140
-  const isCompactWidth = boxSize.w < 320;
-  const showLatencyChip = boxSize.w >= 332;
+  // Adaptive breakpoints compatible with 280..560 x 56..140.
+  // Deduct the 5th PinOff button (~28px) when docked so the center slot never overflows into action buttons.
+  const dockPenaltyPx = dockEdge ? 28 : 0;
+  const effectiveWidth = Math.max(0, boxSize.w - dockPenaltyPx);
+  const isCompactWidth = effectiveWidth < 328;
+  const isUltraNarrowDocked = effectiveWidth < 270;
+  const showLatencyChip = effectiveWidth >= 332;
   const isTallLayout = boxSize.h >= 82;
 
   // Strictly match `src-tauri/src/tray.rs::TrayIconMode::AutoAc`:
@@ -1987,12 +1991,16 @@ export function CapsuleWindow() {
   const isRow1HintActive = hoveredHint?.placement === "row1";
   const isRow2HintActive = hoveredHint?.placement === "row2";
   const showPriorityStatusBadge = Boolean(
-    statusMeta.badge && (statusMeta.pulse !== "none" || runtime.proxy_mode === "direct" || boxSize.w >= 344)
+    statusMeta.badge &&
+      (statusMeta.pulse !== "none" ||
+        runtime.proxy_mode === "direct" ||
+        effectiveWidth >= 344)
   );
   const showLatencyAlongside =
     showLatencyChip &&
+    !isUltraNarrowDocked &&
     liveLatencyMs !== null &&
-    (!showPriorityStatusBadge || boxSize.w >= 400);
+    (!showPriorityStatusBadge || effectiveWidth >= 400);
 
   const capsulePill = (
     <div
@@ -2100,11 +2108,11 @@ export function CapsuleWindow() {
       </div>
 
       {/* Center info column with clean non-overlapping 100% opaque hover hint replacement */}
-      <div className="relative flex min-w-0 flex-1 flex-col justify-center">
+      <div className="relative flex min-w-0 flex-1 flex-col justify-center overflow-hidden">
         {/* Row 1: Mode badge + Active Node Name + Concise Status Badge / Live Latency */}
-        <div className="relative flex min-w-0 items-center gap-1">
+        <div className="relative flex min-w-0 items-center gap-1 overflow-hidden">
           <div
-            className={`flex min-w-0 flex-1 items-center gap-1 ${
+            className={`flex min-w-0 flex-1 items-center gap-1 overflow-hidden ${
               isFullHintActive || isRow1HintActive ? "invisible" : ""
             }`}
           >
@@ -2124,7 +2132,7 @@ export function CapsuleWindow() {
               {isSingleMode ? (isZh ? "单节点" : "1x") : isZh ? "组" : "Grp"}
             </span>
             <span
-              className={`truncate font-semibold leading-tight text-[var(--text)] ${
+              className={`min-w-0 flex-1 truncate font-semibold leading-tight text-[var(--text)] ${
                 isTallLayout ? "text-[12px]" : "text-[11px]"
               }`}
             >
@@ -2153,12 +2161,12 @@ export function CapsuleWindow() {
           {isRow1HintActive && hoveredHint && (
             <div
               aria-live="polite"
-              className="pointer-events-none absolute inset-0 z-10 flex items-center gap-1 rounded bg-[var(--surface)] px-1"
+              className="pointer-events-none absolute inset-0 z-10 flex items-center gap-1 overflow-hidden rounded bg-[var(--surface)] px-1"
             >
-              <span className="shrink-0 text-[10px] font-semibold leading-none text-[var(--text)]">
+              <span className="max-w-[55%] shrink-0 truncate text-[10px] font-semibold leading-none text-[var(--text)]">
                 {hoveredHint.title}
               </span>
-              <span className="truncate text-[9.5px] leading-none text-[var(--text-secondary)]">
+              <span className="min-w-0 flex-1 truncate text-[9.5px] leading-none text-[var(--text-secondary)]">
                 · {hoveredHint.desc}
               </span>
             </div>
@@ -2167,28 +2175,30 @@ export function CapsuleWindow() {
 
         {/* Row 2: Live Up/Down Rates + Concise Proxy / TUN Status Badges */}
         <div
-          className={`relative flex items-center justify-between gap-1 leading-none ${
+          className={`relative flex min-w-0 items-center justify-between gap-1 overflow-hidden leading-none ${
             isTallLayout ? "mt-1.5" : "mt-1"
           }`}
         >
           <div
-            className={`flex min-w-0 flex-1 items-center justify-between gap-1 ${
+            className={`flex min-w-0 flex-1 items-center justify-between gap-1 overflow-hidden ${
               isFullHintActive || isRow2HintActive ? "invisible" : ""
             }`}
           >
             <div
-              className={`cc-mono cc-tabular flex min-w-0 shrink-0 items-center gap-1 whitespace-nowrap tracking-tight ${
+              className={`cc-mono cc-tabular flex min-w-0 shrink items-center gap-1 overflow-hidden whitespace-nowrap tracking-tight ${
                 isTallLayout
                   ? "text-[11px]"
-                  : isCompactWidth
-                    ? "text-[8.5px]"
-                    : "text-[9px]"
+                  : isUltraNarrowDocked
+                    ? "text-[8px]"
+                    : isCompactWidth
+                      ? "text-[8.5px]"
+                      : "text-[9px]"
               }`}
             >
-              <span className="pointer-events-none text-[var(--coral)]">
+              <span className="pointer-events-none truncate text-[var(--coral)]">
                 ↑{formatCompactRate(traffic.up_bps)}
               </span>
-              <span className="pointer-events-none text-[var(--sky)]">
+              <span className="pointer-events-none truncate text-[var(--sky)]">
                 ↓{formatCompactRate(traffic.down_bps)}
               </span>
             </div>
@@ -2240,12 +2250,12 @@ export function CapsuleWindow() {
           {isRow2HintActive && hoveredHint && (
             <div
               aria-live="polite"
-              className="pointer-events-none absolute inset-0 z-10 flex items-center gap-1 rounded bg-[var(--surface)] px-1"
+              className="pointer-events-none absolute inset-0 z-10 flex items-center gap-1 overflow-hidden rounded bg-[var(--surface)] px-1"
             >
-              <span className="shrink-0 text-[9.5px] font-semibold leading-none text-[var(--text)]">
+              <span className="max-w-[55%] shrink-0 truncate text-[9.5px] font-semibold leading-none text-[var(--text)]">
                 {hoveredHint.title}
               </span>
-              <span className="truncate text-[9px] leading-none text-[var(--text-secondary)]">
+              <span className="min-w-0 flex-1 truncate text-[9px] leading-none text-[var(--text-secondary)]">
                 · {hoveredHint.desc}
               </span>
             </div>
@@ -2255,11 +2265,11 @@ export function CapsuleWindow() {
         {/* Row 3 (auto-revealed when dragged taller >= 82px) */}
         {isTallLayout && (
           <div
-            className={`mt-1.5 flex items-center justify-between gap-2 text-[10px] leading-none text-[var(--muted)] ${
+            className={`mt-1.5 flex min-w-0 items-center justify-between gap-2 overflow-hidden text-[10px] leading-none text-[var(--muted)] ${
               isFullHintActive ? "invisible" : ""
             }`}
           >
-            <span className="pointer-events-none truncate">
+            <span className="pointer-events-none min-w-0 flex-1 truncate">
               {isSingleMode ? (isZh ? "单节点模式" : "Single Node") : displayGroupName} ·{" "}
               {traffic.connections} {isZh ? "连接" : "conns"}
             </span>
@@ -2274,7 +2284,7 @@ export function CapsuleWindow() {
         {isFullHintActive && hoveredHint && (
           <div
             aria-live="polite"
-            className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-center rounded-lg border border-[var(--line)]/85 bg-[var(--surface)] px-1.5"
+            className="pointer-events-none absolute inset-0 z-10 flex flex-col justify-center overflow-hidden rounded-lg border border-[var(--line)]/85 bg-[var(--surface)] px-1.5"
           >
             <div className="truncate text-[10.5px] font-semibold leading-tight text-[var(--text)]">
               {hoveredHint.title}
@@ -2287,7 +2297,7 @@ export function CapsuleWindow() {
       </div>
 
       {/* Right circular action cluster: [PinOff?] -> [Zap PreAccel] -> [ArrowRightLeft Switch] -> [Maximize2] -> [X] */}
-      <div className="flex shrink-0 items-center gap-[2.5px]">
+      <div className="relative z-20 flex shrink-0 items-center gap-[2.5px]">
         {dockEdge && (
           <button
             type="button"

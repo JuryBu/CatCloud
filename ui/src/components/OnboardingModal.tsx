@@ -106,7 +106,7 @@ export function OnboardingModal() {
         aria-modal="true"
         aria-labelledby="cc-onboarding-title"
         onClick={(e) => e.stopPropagation()}
-        className="cc-surface relative w-full max-w-[760px] overflow-hidden rounded-3xl border border-[var(--line-strong)] p-5 text-[var(--text)] shadow-2xl sm:p-6"
+        className="cc-surface relative flex max-h-[calc(100vh-2rem)] w-full max-w-[760px] flex-col overflow-hidden rounded-3xl border border-[var(--line-strong)] text-[var(--text)] shadow-2xl"
       >
         {/* Top subtle warm glow accent bar */}
         <div
@@ -114,37 +114,41 @@ export function OnboardingModal() {
           className="pointer-events-none absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-[var(--accent)]/40 via-[var(--accent)] to-[var(--sky)]/60"
         />
 
-        {/* Header */}
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-0.5 text-[11px] font-semibold text-[var(--accent)]">
-              <Sparkles className="h-3 w-3" />
-              <span>{dict.onboarding.welcomeBadge}</span>
-            </span>
-            <h2
-              id="cc-onboarding-title"
-              className="mt-2 text-lg font-bold tracking-tight text-[var(--text)]"
+        {/* Header (always visible & clickable in short viewports) */}
+        <div className="shrink-0 px-5 pt-5 pb-3 sm:px-6 sm:pt-6">
+          <div className="flex items-start justify-between gap-3">
+            <div className="min-w-0">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-0.5 text-[11px] font-semibold text-[var(--accent)]">
+                <Sparkles className="h-3 w-3 shrink-0" />
+                <span>{dict.onboarding.welcomeBadge}</span>
+              </span>
+              <h2
+                id="cc-onboarding-title"
+                className="mt-2 break-words text-lg font-bold tracking-tight text-[var(--text)]"
+              >
+                {dict.onboarding.title}
+              </h2>
+              <p className="mt-1 break-words text-xs leading-relaxed text-[var(--text-secondary)]">
+                {dict.onboarding.subtitle}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleCompleteAndClose}
+              aria-label={dict.common.close}
+              title={dict.common.close}
+              className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
             >
-              {dict.onboarding.title}
-            </h2>
-            <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
-              {dict.onboarding.subtitle}
-            </p>
+              <X className="h-4 w-4" />
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={handleCompleteAndClose}
-            aria-label={dict.common.close}
-            title={dict.common.close}
-            className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
-          >
-            <X className="h-4 w-4" />
-          </button>
         </div>
 
+        {/* Scrollable Body for short 620px viewports */}
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5 sm:px-6 sm:pb-6">
         {/* Centerpiece Hero Card: Hand Everything Over to AI Autopilot */}
         <section
-          className="mt-4 rounded-2xl border border-[var(--accent)]/65 p-4 sm:p-5"
+          className="rounded-2xl border border-[var(--accent)]/65 p-4 sm:p-5"
           style={{
             background:
               "linear-gradient(135deg, var(--accent-soft) 0%, color-mix(in srgb, var(--card) 92%, var(--sky-soft)) 100%)",
@@ -207,7 +211,7 @@ export function OnboardingModal() {
                   className="flex items-start gap-2 rounded-xl border border-[var(--line)]/80 bg-[var(--card)]/85 px-3 py-2 text-xs text-[var(--text-secondary)]"
                 >
                   <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-                  <span className="leading-snug">{item.text}</span>
+                  <span className="min-w-0 flex-1 break-words leading-snug">{item.text}</span>
                 </div>
               );
             })}
@@ -261,7 +265,7 @@ export function OnboardingModal() {
             <div className="mt-3 flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--green)]/45 bg-[var(--green-soft)] px-3.5 py-2 text-xs">
               <div className="flex min-w-0 flex-1 items-center gap-2 text-[var(--text)]">
                 <CheckCircle2 className="h-4 w-4 shrink-0 text-[var(--green)]" />
-                <span className="leading-snug">
+                <span className="break-words leading-snug">
                   {copiedMode === "local"
                     ? dict.onboarding.copiedHintLocal
                     : dict.onboarding.copiedHintWeb}
@@ -303,6 +307,7 @@ export function OnboardingModal() {
             <ArrowRight className="h-3.5 w-3.5" />
           </button>
         </section>
+        </div>
       </div>
     </div>,
     document.body

@@ -986,25 +986,7 @@ fn redact_yaml_block_seq_host_item(line: &str, line_indent: usize) -> Option<Str
     if matches!(first_byte, b'"' | b'\'') {
         let qc = first_byte as char;
         let inner = &val_slice[1..];
-        let close_rel = if first_byte == b'"' {
-            find_unescaped_quote(inner, first_byte)
-        } else {
-            let ib = inner.as_bytes();
-            let mut pos = 0usize;
-            let mut found = None;
-            while pos < ib.len() {
-                if ib[pos] == b'\'' {
-                    if pos + 1 < ib.len() && ib[pos + 1] == b'\'' {
-                        pos += 2;
-                        continue;
-                    }
-                    found = Some(pos);
-                    break;
-                }
-                pos += 1;
-            }
-            found
-        };
+        let close_rel = find_unescaped_quote(inner, first_byte);
         if let Some(close_idx) = close_rel {
             let raw_val = &inner[..close_idx];
             let tail = &inner[close_idx + 1..];
@@ -1402,6 +1384,21 @@ const SENSITIVE_KEYS: &[&str] = &[
 fn find_unescaped_quote(inner: &str, quote: u8) -> Option<usize> {
     let bytes = inner.as_bytes();
     let mut pos = 0usize;
+    if quote == b'\'' {
+        // YAML single-quoted scalars do NOT treat `\` as an escape character;
+        // literal single quotes are represented by doubling (`''`).
+        while pos < bytes.len() {
+            if bytes[pos] == b'\'' {
+                if pos + 1 < bytes.len() && bytes[pos + 1] == b'\'' {
+                    pos += 2;
+                    continue;
+                }
+                return Some(pos);
+            }
+            pos += 1;
+        }
+        return None;
+    }
     while pos < bytes.len() {
         if bytes[pos] == b'\\' {
             pos += 1;
@@ -3107,5 +3104,52 @@ rules:
 
         // Idempotent on second pass.
         assert_eq!(redact_compiled_yaml(&clean), clean);
+    }
+
+    #[test]
+    fn redact_single_quoted_yaml_secrets_handles_doubled_quotes_and_trailing_backslash() {
+        let yaml = concat!(
+            "secret: 'top''secret'\n",
+            "proxies:\n",
+            "  - name: Node-SingleQuote\n",
+            "    type: anytls\n",
+            "    server: edge.vendor-sq.example\n",
+            "    port: 443\n",
+            "    password: 'alpha_sq''beta_sq'\n",
+            "    token: 'abc_sq\\'\n",
+            "    username: 'u_sq''gamma_sq\\'\n",
+            "    auth: ''''\n",
+            "    uuid: \"dbl_sq\\\"quote_sq\\\\\"\n",
+        );
+
+        let clean = redact_compiled_yaml(yaml);
+        for leaked in ["top", "secret'", "alpha_sq", "beta_sq", "abc_sq", "u_sq", "gamma_sq", "dbl_sq", "quote_sq", "vendor-sq"] {
+            assert!(
+                !clean.contains(leaked),
+                "single-quoted YAML secret leaked `{leaked}` in:\n{clean}"
+            );
+        }
+
+        let parsed: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&clean).expect("redacted single-quoted YAML must remain valid");
+        assert_eq!(parsed["secret"].as_str(), Some("<REDACTED>"));
+        let proxy = &parsed["proxies"][0];
+        assert_eq!(proxy["password"].as_str(), Some("<REDACTED>"));
+        assert_eq!(proxy["token"].as_str(), Some("<REDACTED>"));
+        assert_eq!(proxy["username"].as_str(), Some("<REDACTED>"));
+        assert_eq!(proxy["auth"].as_str(), Some("<REDACTED>"));
+        assert_eq!(proxy["uuid"].as_str(), Some("<REDACTED>"));
+        assert_eq!(proxy["server"].as_str(), Some("***.example"));
+        assert_eq!(proxy["port"].as_u64(), Some(443));
+
+        // Direct sanitize_log_line checks for doubled single-quotes and trailing backslash.
+        assert_eq!(
+            sanitize_log_line("password: 'pass''word' next=ok"),
+            "password: '<REDACTED>' next=ok"
+        );
+        assert_eq!(
+            sanitize_log_line("password: 'abc\\' next=ok"),
+            "password: '<REDACTED>' next=ok"
+        );
     }
 }

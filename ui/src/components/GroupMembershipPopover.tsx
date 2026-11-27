@@ -18,6 +18,10 @@ import {
   formatErrorMessage,
 } from "../api/tauri";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
+import {
+  TITLE_BAR_SAFE_TOP_PX,
+  isAnchorVisibleInScrollHierarchy,
+} from "../utils/viewportVisibility";
 
 const FRIENDLY_GROUP_NAME_MAP: Record<string, string> = {
   流媒体与下载受控均衡: "影音下载均衡组",
@@ -227,8 +231,7 @@ export function GroupMembershipPopover({
     const trigger = triggerRef.current;
     if (!trigger || !trigger.isConnected) return true;
     if (trigger.offsetParent === null) return true;
-    const rect = trigger.getBoundingClientRect();
-    return rect.width === 0 || rect.height === 0;
+    return !isAnchorVisibleInScrollHierarchy(trigger, TITLE_BAR_SAFE_TOP_PX);
   }, []);
 
   const computePosition = useCallback((): PopoverPosition | null => {
@@ -236,21 +239,14 @@ export function GroupMembershipPopover({
     if (!trigger || !trigger.isConnected || typeof window === "undefined") return null;
     if (trigger.offsetParent === null) return null;
 
+    // Close automatically when trigger hides or scrolls outside any clipping ancestor / under TitleBar
+    if (!isAnchorVisibleInScrollHierarchy(trigger, TITLE_BAR_SAFE_TOP_PX)) {
+      return null;
+    }
+
     const rect = trigger.getBoundingClientRect();
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-
-    // Close automatically when trigger hides or scrolls outside the viewport / under the TitleBar
-    if (
-      rect.bottom < TOP_PADDING ||
-      rect.top > vh ||
-      rect.right < 0 ||
-      rect.left > vw ||
-      rect.width === 0 ||
-      rect.height === 0
-    ) {
-      return null;
-    }
 
     const width = Math.min(POPOVER_WIDTH, Math.max(196, vw - VIEWPORT_PADDING * 2));
     const estimatedHeight = Math.min(
@@ -505,7 +501,7 @@ export function GroupMembershipPopover({
 
   return (
     <span
-      className={`relative inline-flex shrink-0 ${className}`}
+      className={`relative inline-flex shrink-0 ${variant === "icon" ? "pr-1 pt-1" : ""} ${className}`}
       onMouseDown={stopRowBubble}
       onClick={stopRowBubble}
     >
@@ -562,7 +558,7 @@ export function GroupMembershipPopover({
         ) : (
           joinedCount >= 2 && (
             <span
-              className="pointer-events-none absolute -right-1.5 -top-1.5 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-[var(--green)] px-1 cc-mono text-[9px] font-bold leading-none text-[var(--accent-ink)] shadow-xs"
+              className="pointer-events-none absolute -right-1 -top-1 inline-flex h-3.5 min-w-[14px] items-center justify-center rounded-full bg-[var(--green)] px-1 cc-mono text-[9px] font-bold leading-none text-[var(--accent-ink)] shadow-xs"
               aria-hidden="true"
             >
               {joinedCount}

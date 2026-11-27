@@ -343,9 +343,9 @@ const WEB_UI_IDX_VALIDATOR = (raw: unknown): number | undefined =>
   typeof raw === "number" && Number.isInteger(raw) && raw >= 0 ? raw : undefined;
 
 const INPUT_CLS =
-  "w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]";
+  "w-full min-w-0 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]";
 const BTN_CLS =
-  "inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50";
+  "inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3 py-1.5 text-xs font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50";
 
 function splitCsvOrLines(raw: string): string[] {
   return raw
@@ -489,7 +489,10 @@ function hydrateExtendedFromFullConfig(full: FullAppConfig): ExtendedSettings {
   };
 }
 
-function buildExtendedPatch(ext: ExtendedSettings): Record<string, unknown> {
+function buildExtendedPatch(
+  ext: ExtendedSettings,
+  includeAppendRules = false
+): Record<string, unknown> {
   const [listenHost, listenPortRaw] = ext.dnsListen.split(":");
   const listenPort = Number(listenPortRaw);
   return {
@@ -527,7 +530,7 @@ function buildExtendedPatch(ext: ExtendedSettings): Record<string, unknown> {
       },
     },
     rules_override: {
-      global_append_rules: splitLines(ext.appendRules),
+      ...(includeAppendRules ? { global_append_rules: splitLines(ext.appendRules) } : {}),
       override_script_path: ext.overrideScriptPath.trim() ? ext.overrideScriptPath.trim() : null,
       domestic_direct_enabled: ext.domesticDirectEnabled,
       block_quic_udp_443: ext.blockQuicUdp443,
@@ -577,9 +580,10 @@ function buildReleasesFallbackUrl(repo: string | null | undefined): string {
 
 function buildMergedSettingsPatch(
   draft: AppConfig,
-  ext: ExtendedSettings
+  ext: ExtendedSettings,
+  includeAppendRules = false
 ): Record<string, unknown> {
-  const baseExt = buildExtendedPatch(ext);
+  const baseExt = buildExtendedPatch(ext, includeAppendRules);
   const extSystemProxy = (baseExt.system_proxy as Record<string, unknown>) ?? {};
   const extDns = (baseExt.dns as Record<string, unknown>) ?? {};
   const extCoreRuntime = (baseExt.core_runtime as Record<string, unknown>) ?? {};
@@ -757,9 +761,9 @@ function Card({
   children: ReactNode;
 }) {
   return (
-    <section className="cc-card cc-glass space-y-3 rounded-2xl p-4">
+    <section className="cc-card cc-glass min-w-0 space-y-3 rounded-2xl p-4">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] pb-2">
-        <div>
+        <div className="min-w-0 flex-1">
           <h3 className="text-sm font-semibold text-[var(--text)]">{title}</h3>
           {sub && <p className="text-[11px] text-[var(--muted)]">{sub}</p>}
         </div>
@@ -784,9 +788,9 @@ function SwitchRow({
   badge?: ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2">
-      <div className="min-w-0">
-        <div className="flex items-center gap-2 text-xs font-medium text-[var(--text)]">
+    <div className="flex min-w-0 items-center justify-between gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2">
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-2 text-xs font-medium text-[var(--text)]">
           <span>{title}</span>
           {badge}
         </div>
@@ -850,6 +854,7 @@ interface SettingsSessionDraftCache {
   extLoaded: boolean;
   draftDirty: boolean;
   extDirty: boolean;
+  appendRulesDirty: boolean;
   coreBinaryPath: string;
   yamlPreview: string | null;
   yamlSha: string | null;
@@ -861,6 +866,7 @@ let settingsDraftCache: SettingsSessionDraftCache = {
   extLoaded: false,
   draftDirty: false,
   extDirty: false,
+  appendRulesDirty: false,
   coreBinaryPath: "",
   yamlPreview: null,
   yamlSha: null,
@@ -873,6 +879,7 @@ function clearSettingsDirtyDraftCache(): void {
     ext: null,
     draftDirty: false,
     extDirty: false,
+    appendRulesDirty: false,
   };
 }
 
@@ -980,6 +987,9 @@ export function SettingsPage() {
   );
   const [draftDirty, setDraftDirty] = useState<boolean>(() => settingsDraftCache.draftDirty);
   const [extDirty, setExtDirty] = useState<boolean>(() => settingsDraftCache.extDirty);
+  const [appendRulesDirty, setAppendRulesDirty] = useState<boolean>(
+    () => settingsDraftCache.appendRulesDirty
+  );
   const [saving, setSaving] = useState(false);
   const [pickingWallpaper, setPickingWallpaper] = useState(false);
   const [showUrlInput, setShowUrlInput] = useState(false);
@@ -1007,6 +1017,8 @@ export function SettingsPage() {
   dirtyRef.current = dirty;
   const extDirtyRef = useRef(extDirty);
   extDirtyRef.current = extDirty;
+  const appendRulesDirtyRef = useRef(appendRulesDirty);
+  appendRulesDirtyRef.current = appendRulesDirty;
   const savedExtRef = useRef<ExtendedSettings | null>(null);
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -1023,6 +1035,7 @@ export function SettingsPage() {
       extLoaded,
       draftDirty,
       extDirty,
+      appendRulesDirty,
       coreBinaryPath,
       yamlPreview,
       yamlSha,
@@ -1030,7 +1043,18 @@ export function SettingsPage() {
     if (dirty !== appStore.getState().sessionDrafts.settings.hasDirtyDrafts) {
       appActions.patchSessionDraft("settings", { hasDirtyDrafts: dirty });
     }
-  }, [draft, ext, extLoaded, draftDirty, extDirty, dirty, coreBinaryPath, yamlPreview, yamlSha]);
+  }, [
+    draft,
+    ext,
+    extLoaded,
+    draftDirty,
+    extDirty,
+    appendRulesDirty,
+    dirty,
+    coreBinaryPath,
+    yamlPreview,
+    yamlSha,
+  ]);
 
   const sliderCommitTimerRef = useRef<number | null>(null);
   const pendingSliderPatchRef = useRef<Partial<AppConfig["personalization"]>>({});
@@ -1093,6 +1117,14 @@ export function SettingsPage() {
       savedExtRef.current = structuredClone(hydrated);
       if (!extDirtyRef.current) {
         setExt(hydrated);
+      } else if (!appendRulesDirtyRef.current) {
+        // Keep appendRules synced with latest backend state when user edited other extended fields
+        // so cross-page edits from RulesConnsPage are never overwritten by stale drafts.
+        setExt((prev) =>
+          prev.appendRules === hydrated.appendRules
+            ? prev
+            : { ...prev, appendRules: hydrated.appendRules }
+        );
       }
       setExtLoaded(true);
       setExtLoadError(null);
@@ -1155,6 +1187,10 @@ export function SettingsPage() {
     }
     setExt((prev) => ({ ...prev, [k]: v }));
     setExtDirty(true);
+    if (k === "appendRules") {
+      appendRulesDirtyRef.current = true;
+      setAppendRulesDirty(true);
+    }
   };
 
   const handleDnsPortChange = (nextPort: number) => {
@@ -1239,19 +1275,29 @@ export function SettingsPage() {
           auto_download: draft.update.auto_download ?? true,
         },
       };
+      const shouldSubmitAppendRules =
+        savedExtRef.current !== null &&
+        appendRulesDirtyRef.current &&
+        ext.appendRules !== savedExtRef.current.appendRules;
       let savedBasic: AppConfig;
       if (draftDirty && !extDirty) {
         savedBasic = await catcloudApi.saveConfig(payload);
       } else if (!draftDirty && extDirty) {
-        await catcloudApi.saveExtendedSettings(buildExtendedPatch(ext));
+        await catcloudApi.saveExtendedSettings(
+          buildExtendedPatch(ext, shouldSubmitAppendRules)
+        );
         savedBasic = inTauri ? await catcloudApi.getConfig() : payload;
       } else if (inTauri) {
         // Single merged submission avoids back-to-back saveConfig + saveExtendedSettings double core reloads
-        await catcloudApi.saveExtendedSettings(buildMergedSettingsPatch(payload, ext));
+        await catcloudApi.saveExtendedSettings(
+          buildMergedSettingsPatch(payload, ext, shouldSubmitAppendRules)
+        );
         savedBasic = await catcloudApi.getConfig();
       } else {
         savedBasic = await catcloudApi.saveConfig(payload);
-        await catcloudApi.saveExtendedSettings(buildExtendedPatch(ext));
+        await catcloudApi.saveExtendedSettings(
+          buildExtendedPatch(ext, shouldSubmitAppendRules)
+        );
       }
       const syncedUpdate = {
         ...savedBasic.update,
@@ -1278,9 +1324,11 @@ export function SettingsPage() {
       const nextIncludePrerelease = Boolean(syncedConfig.update.include_prerelease);
       dirtyRef.current = false;
       extDirtyRef.current = false;
+      appendRulesDirtyRef.current = false;
       clearSettingsDirtyDraftCache();
       setDraftDirty(false);
       setExtDirty(false);
+      setAppendRulesDirty(false);
       if (extLoaded) {
         savedExtRef.current = structuredClone(ext);
       }
@@ -1304,9 +1352,11 @@ export function SettingsPage() {
     const latestStoreConfig = appStore.getState().config;
     dirtyRef.current = false;
     extDirtyRef.current = false;
+    appendRulesDirtyRef.current = false;
     clearSettingsDirtyDraftCache();
     setDraftDirty(false);
     setExtDirty(false);
+    setAppendRulesDirty(false);
     appActions.patchSessionDraft("settings", { hasDirtyDrafts: false });
     setDraft(structuredClone(latestStoreConfig));
     if (savedExtRef.current) {
@@ -1536,9 +1586,11 @@ export function SettingsPage() {
             appActions.patchSessionDraft("settings", { hasDirtyDrafts: false });
             dirtyRef.current = false;
             extDirtyRef.current = false;
+            appendRulesDirtyRef.current = false;
             if (mountedRef.current) {
               setDraftDirty(false);
               setExtDirty(false);
+              setAppendRulesDirty(false);
             }
             await appActions.refreshAllData();
             const full = await catcloudApi.getFullConfig();
@@ -1570,6 +1622,10 @@ export function SettingsPage() {
           if (parsed.extended && mountedRef.current) {
             setExt((prev) => ({ ...prev, ...parsed.extended }));
             setExtDirty(true);
+            if (typeof parsed.extended.appendRules === "string") {
+              appendRulesDirtyRef.current = true;
+              setAppendRulesDirty(true);
+            }
           }
           appActions.showToast("已导入备份配置，点击右上角保存后生效", "ok");
         } catch {
@@ -1740,12 +1796,12 @@ export function SettingsPage() {
   return (
     <div className="space-y-4">
       {/* Top Title + 5-Tab Bar + Save Button */}
-      <div className="cc-card cc-glass flex flex-wrap items-center justify-between gap-2 rounded-2xl px-4 py-2.5">
-        <div className="flex flex-wrap items-center gap-2">
-          <h1 className="mr-1 text-sm font-semibold text-[var(--text)]">
+      <div className="cc-card cc-glass flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-2xl px-4 py-2.5">
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1.5">
+          <h1 className="mr-1 shrink-0 whitespace-nowrap text-sm font-semibold text-[var(--text)]">
             {dict.settings.title}
           </h1>
-          <div className="flex flex-wrap items-center gap-1.5">
+          <div className="flex flex-wrap items-center gap-1">
             {tabs.map(({ id, label, icon: Icon }) => {
               const on = tab === id;
               return (
@@ -1753,14 +1809,14 @@ export function SettingsPage() {
                   key={id}
                   type="button"
                   onClick={() => setTab(id)}
-                  className="inline-flex items-center gap-1.5 rounded-xl px-3 py-1.5 text-xs font-medium transition-colors"
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl px-2.5 py-1.5 text-xs font-medium transition-colors"
                   style={{
                     backgroundColor: on ? "var(--accent-soft)" : "transparent",
                     color: on ? "var(--accent)" : "var(--muted)",
                     border: on ? "1px solid var(--accent)" : "1px solid transparent",
                   }}
                 >
-                  <Icon className="h-3.5 w-3.5" />
+                  <Icon className="h-3.5 w-3.5 shrink-0" />
                   <span>{label}</span>
                 </button>
               );
@@ -1771,14 +1827,14 @@ export function SettingsPage() {
           type="button"
           onClick={() => void handleSave()}
           disabled={saving || (extDirty && !extLoaded)}
-          className="inline-flex items-center gap-1.5 rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-60"
+          className="ml-auto inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl px-3.5 py-1.5 text-xs font-semibold disabled:opacity-60"
           style={{
             backgroundColor: dirty ? "var(--accent)" : "var(--surface)",
             color: dirty ? "var(--accent-ink)" : "var(--text)",
             border: "1px solid var(--line-strong)",
           }}
         >
-          {dirty ? <Save className="h-3.5 w-3.5" /> : <Check className="h-3.5 w-3.5" />}
+          {dirty ? <Save className="h-3.5 w-3.5 shrink-0" /> : <Check className="h-3.5 w-3.5 shrink-0" />}
           <span>
             {saving
               ? isZh
@@ -1850,7 +1906,7 @@ export function SettingsPage() {
       {/* Tab 1: 常规与代理 */}
       {tab === "system" && (
         <div className="space-y-4">
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-2">
             <Card title="系统代理与分流接管" sub="控制电脑上网流量如何经过猫猫云梯">
               <SwitchRow
                 title="启用系统代理"
@@ -2000,8 +2056,8 @@ export function SettingsPage() {
                   ]}
                 />
               </div>
-              <div className="grid grid-cols-3 gap-2">
-                <label className="text-[11px] text-[var(--muted)]">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                <label className="min-w-0 text-[11px] text-[var(--muted)]">
                   混合端口
                   <input
                     type="number"
@@ -2012,7 +2068,7 @@ export function SettingsPage() {
                     className={`${INPUT_CLS} mt-1 cc-mono`}
                   />
                 </label>
-                <label className="text-[11px] text-[var(--muted)]">
+                <label className="min-w-0 text-[11px] text-[var(--muted)]">
                   控制端口
                   <input
                     type="number"
@@ -2023,7 +2079,7 @@ export function SettingsPage() {
                     className={`${INPUT_CLS} mt-1 cc-mono`}
                   />
                 </label>
-                <label className="text-[11px] text-[var(--muted)]">
+                <label className="min-w-0 text-[11px] text-[var(--muted)]">
                   DNS 端口
                   <input
                     type="number"
@@ -2096,7 +2152,7 @@ export function SettingsPage() {
             </Card>
           </div>
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-2">
             <Card
               title="启动与托盘行为"
               sub="管理开机启动、默认首页与关闭窗口时的驻留方式"
@@ -2173,11 +2229,16 @@ export function SettingsPage() {
                 {Object.entries(ext.hotkeys).map(([k, val]) => (
                   <label
                     key={k}
-                    className="flex items-center justify-between gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-1.5 text-xs text-[var(--text-secondary)]"
+                    className="flex min-w-0 items-center justify-between gap-3 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-1.5 text-xs text-[var(--text-secondary)]"
                   >
-                    <span className="inline-flex min-w-0 flex-1 items-center gap-2 whitespace-nowrap">
+                    <span
+                      title={HOTKEY_LABELS[k] ?? k}
+                      className="inline-flex min-w-0 flex-1 items-center gap-2 overflow-hidden"
+                    >
                       <Keyboard className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-                      <span className="font-medium text-[var(--text)]">{HOTKEY_LABELS[k] ?? k}</span>
+                      <span className="min-w-0 truncate font-medium text-[var(--text)]">
+                        {HOTKEY_LABELS[k] ?? k}
+                      </span>
                     </span>
                     <input
                       value={val}
@@ -2185,7 +2246,7 @@ export function SettingsPage() {
                       onChange={(e) =>
                         patchExt("hotkeys", { ...ext.hotkeys, [k]: e.target.value })
                       }
-                      className="w-[152px] shrink-0 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-right text-[11px] cc-mono text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                      className="w-[136px] shrink-0 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-right text-[11px] cc-mono text-[var(--text)] outline-none focus:border-[var(--accent)] sm:w-[152px]"
                     />
                   </label>
                 ))}
@@ -2226,7 +2287,7 @@ export function SettingsPage() {
             />
           </section>
 
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-2">
             {/* Theme Palette 4 Visual Cards */}
             <Card
               title="主题配色"
@@ -2335,7 +2396,7 @@ export function SettingsPage() {
                       当前：{currentThemeName}
                     </span>
                   </div>
-                  <div className="grid grid-cols-3 gap-2">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                     {(
                       [
                         ["light_start", "浅色开始"],
@@ -2343,8 +2404,8 @@ export function SettingsPage() {
                         ["midnight_start", "午夜蓝开始"],
                       ] as const
                     ).map(([field, label]) => (
-                      <label key={field} className="text-[11px] text-[var(--muted)]">
-                        {label}
+                      <label key={field} className="min-w-0 text-[11px] text-[var(--muted)]">
+                        <span className="block truncate">{label}</span>
                         <input
                           type="time"
                           value={p.theme_schedule[field]}
@@ -2356,7 +2417,7 @@ export function SettingsPage() {
                               },
                             })
                           }
-                          className={`${INPUT_CLS} mt-1 cc-mono`}
+                          className={`${INPUT_CLS} mt-1 min-w-0 cc-mono`}
                         />
                       </label>
                     ))}
@@ -2716,8 +2777,8 @@ export function SettingsPage() {
             </button>
 
             {showAdvancedDns && (
-              <div className="grid grid-cols-1 gap-4 border-t border-[var(--line)] p-4 lg:grid-cols-2">
-                <div className="space-y-3 rounded-xl border border-[var(--line)] bg-[var(--surface)]/50 p-3.5">
+              <div className="grid grid-cols-1 gap-4 border-t border-[var(--line)] p-4 min-[1160px]:grid-cols-2">
+                <div className="min-w-0 space-y-3 rounded-xl border border-[var(--line)] bg-[var(--surface)]/50 p-3.5">
                   <div className="text-xs font-semibold text-[var(--text)]">
                     解析模式与本地监听
                   </div>
@@ -2740,8 +2801,8 @@ export function SettingsPage() {
                       />
                     </div>
                   </div>
-                  <div className="grid grid-cols-2 gap-2">
-                    <label className="text-[11px] text-[var(--muted)]">
+                  <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <label className="min-w-0 text-[11px] text-[var(--muted)]">
                       DNS 监听地址
                       <input
                         value={ext.dnsListen}
@@ -2749,7 +2810,7 @@ export function SettingsPage() {
                         className={`${INPUT_CLS} mt-1 cc-mono`}
                       />
                     </label>
-                    <label className="text-[11px] text-[var(--muted)]">
+                    <label className="min-w-0 text-[11px] text-[var(--muted)]">
                       虚拟 IP 网段
                       <input
                         value={ext.fakeIpRange}
@@ -2837,7 +2898,7 @@ export function SettingsPage() {
       {/* Tab 4: 内核与工具 */}
       {tab === "core" && (
         <div className="space-y-4">
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+          <div className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-2">
             <Card
               title="全局附加规则与脚本"
               sub="补充自定义分流规则，或预览最终生效配置"
@@ -2862,6 +2923,9 @@ export function SettingsPage() {
                   className={`${INPUT_CLS} mt-1 cc-mono`}
                 />
               </label>
+              <p className="rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-2.5 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
+                {dict.settings.appendRulesAdvancedHint}
+              </p>
               <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 <label className="block text-[11px] text-[var(--muted)]">
                   配置覆写脚本路径（可选）
@@ -2981,7 +3045,7 @@ export function SettingsPage() {
                 </button>
               </div>
 
-              <div className="grid grid-cols-2 gap-2">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                 {GEO_ITEMS.map(([key, dtoKey, fileName, desc]) => {
                   const statusSummary = renderGeoStatusSummary(
                     geoStatus?.[dtoKey],
@@ -2991,11 +3055,14 @@ export function SettingsPage() {
                   return (
                     <div
                       key={key}
-                      className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-3 py-2"
+                      className="flex min-w-0 items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/70 px-2.5 py-2"
                     >
-                      <div className="min-w-0">
+                      <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-1.5">
-                          <span className="truncate cc-mono text-xs font-medium text-[var(--text)]">
+                          <span
+                            title={fileName}
+                            className="min-w-0 truncate cc-mono text-xs font-medium text-[var(--text)]"
+                          >
                             {fileName}
                           </span>
                           <span
@@ -3073,13 +3140,13 @@ export function SettingsPage() {
                         ? "填写本地内核程序路径（如 C:\\path\\to\\mihomo.exe）"
                         : "填写本地内核程序路径（如 /usr/local/bin/mihomo）"
                     }
-                    className={`${INPUT_CLS} flex-1 cc-mono`}
+                    className={`${INPUT_CLS} min-w-[180px] flex-1 cc-mono`}
                   />
                   <button
                     type="button"
                     disabled={coreOpBusy !== null}
                     onClick={() => void handleHotSwapCore()}
-                    className={BTN_CLS}
+                    className={`${BTN_CLS} shrink-0 whitespace-nowrap`}
                   >
                     {coreOpBusy === "hotswap" ? (
                       <RefreshCw className="h-3.5 w-3.5 animate-spin" />
@@ -3181,20 +3248,20 @@ export function SettingsPage() {
                   value={newWebUiName}
                   onChange={(e) => setNewWebUiName(e.target.value)}
                   placeholder="新增面板名称（如 Zashboard）"
-                  className={`${INPUT_CLS} sm:col-span-3`}
+                  className={`${INPUT_CLS} min-w-0 sm:col-span-3`}
                 />
                 <input
                   value={newWebUiTpl}
                   onChange={(e) => setNewWebUiTpl(e.target.value)}
                   placeholder="粘贴外部面板网址，打开时自动填入本机端口与口令"
-                  className={`${INPUT_CLS} sm:col-span-7`}
+                  className={`${INPUT_CLS} min-w-0 sm:col-span-6 min-[1160px]:col-span-7`}
                 />
                 <button
                   type="button"
                   onClick={handleAddWebUiBookmark}
-                  className={`${BTN_CLS} justify-center sm:col-span-2`}
+                  className={`${BTN_CLS} justify-center whitespace-nowrap sm:col-span-3 min-[1160px]:col-span-2`}
                 >
-                  <Plus className="h-3.5 w-3.5" />
+                  <Plus className="h-3.5 w-3.5 shrink-0" />
                   <span>添加书签</span>
                 </button>
               </div>
@@ -3641,18 +3708,18 @@ export function SettingsPage() {
               aria-modal="true"
               aria-label="确认导入备份配置"
               onClick={(e) => e.stopPropagation()}
-              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+              className="cc-surface max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
             >
               <div className="flex items-start justify-between gap-3">
-                <div className="flex items-start gap-3">
+                <div className="flex min-w-0 items-start gap-3">
                   <span className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--amber-soft)] text-[var(--amber)]">
                     <AlertTriangle className="h-4 w-4" />
                   </span>
-                  <div className="min-w-0">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">
+                  <div className="min-w-0 flex-1">
+                    <h3 className="break-words text-sm font-semibold text-[var(--text)]">
                       确认导入配置备份？
                     </h3>
-                    <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+                    <p className="mt-1 break-words text-xs leading-relaxed text-[var(--text-secondary)]">
                       导入备份将会覆盖当前的代理参数、智能多选组和国内中转配置。建议先点「导出备份」保留一份当前配置，再继续导入。
                     </p>
                   </div>
@@ -3660,14 +3727,14 @@ export function SettingsPage() {
                 <button
                   type="button"
                   onClick={() => setConfirmImportBackupOpen(false)}
-                  className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
+                  className="shrink-0 rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
                   aria-label="关闭弹窗"
                 >
                   <X className="h-4 w-4" />
                 </button>
               </div>
 
-              <div className="mt-5 flex justify-end gap-2">
+              <div className="mt-5 flex flex-wrap justify-end gap-2">
                 <button
                   type="button"
                   onClick={() => setConfirmImportBackupOpen(false)}

@@ -1300,11 +1300,11 @@ function MigrationDrawer({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Drawer Header */}
-        <div className="flex items-start justify-between gap-3 border-b border-[var(--line)] px-5 py-4">
-          <div>
+        <div className="flex flex-wrap items-start justify-between gap-2 border-b border-[var(--line)] px-5 py-4">
+          <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <FolderOpen className="h-4 w-4 text-[var(--accent)]" />
-              <h2 className="text-sm font-semibold text-[var(--text)]">
+              <FolderOpen className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+              <h2 className="min-w-0 truncate text-sm font-semibold text-[var(--text)]">
                 从电脑已有梯子导入
               </h2>
             </div>
@@ -1316,7 +1316,7 @@ function MigrationDrawer({
             type="button"
             disabled={importing}
             onClick={safeClose}
-            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
             aria-label="关闭导入窗口"
           >
             <X className="h-4 w-4" />
@@ -1326,37 +1326,37 @@ function MigrationDrawer({
         {/* Read-Only Safety Banner */}
         <div className="mx-5 mt-3 flex items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--green-soft)] px-3 py-2 text-xs text-[var(--green)]">
           <ShieldCheck className="h-4 w-4 shrink-0" />
-          <span>
+          <span className="min-w-0">
             只读安全复制：只会把节点复制一份进猫猫云梯，绝不改动你原来的软件和配置文件。
           </span>
         </div>
 
         {/* Mode Tabs */}
-        <div className="mx-5 mt-3 flex items-center gap-2 border-b border-[var(--line)] pb-2.5">
+        <div className="mx-5 mt-3 flex flex-wrap items-center gap-2 border-b border-[var(--line)] pb-2.5">
           <button
             type="button"
             disabled={importing}
             onClick={() => setTab("scan")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 ${
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 ${
               tab === "scan"
                 ? "bg-[var(--accent)] text-[var(--accent-ink)]"
                 : "border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
             }`}
           >
-            <Search className="h-3.5 w-3.5" />
+            <Search className="h-3.5 w-3.5 shrink-0" />
             自动找电脑里的梯子
           </button>
           <button
             type="button"
             disabled={importing}
             onClick={() => setTab("paste")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 ${
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 text-xs font-medium transition-colors disabled:opacity-50 ${
               tab === "paste"
                 ? "bg-[var(--accent)] text-[var(--accent-ink)]"
                 : "border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
             }`}
           >
-            <FileText className="h-3.5 w-3.5" />
+            <FileText className="h-3.5 w-3.5 shrink-0" />
             粘贴配置文本 / 节点链接
           </button>
         </div>
@@ -2315,11 +2315,11 @@ function ProcessAttachDrawer({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="flex items-start justify-between gap-3 border-b border-[var(--line)] px-5 py-4">
-          <div>
+        <div className="flex flex-wrap items-start justify-between gap-2 border-b border-[var(--line)] px-5 py-4">
+          <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <Cpu className="h-4 w-4 text-[var(--accent)]" />
-              <h2 className="text-sm font-semibold text-[var(--text)]">
+              <Cpu className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+              <h2 className="min-w-0 truncate text-sm font-semibold text-[var(--text)]">
                 实时捕捉向导 · 从正在运行的软件抓节点
               </h2>
             </div>
@@ -2338,7 +2338,7 @@ function ProcessAttachDrawer({
                   ? "收起窗口（已保留本次捕捉快照，可随时回来查看）"
                   : "关闭软件实时捕捉向导"
             }
-            className="inline-flex h-7 w-7 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
+            className="inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-45"
             aria-label="关闭软件实时捕捉向导"
           >
             <X className="h-4 w-4" />
@@ -4816,22 +4816,22 @@ export function NodesSubsPage({
        * ==================================================================== */}
       <section
         aria-label="快速导入节点入口"
-        className="grid grid-cols-1 gap-3.5 lg:grid-cols-3"
+        className="grid grid-cols-1 gap-3.5 min-[1160px]:grid-cols-3"
       >
         {/* Card 1: Paste Subscription URL */}
-        <div className="cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl border-[var(--accent)]/45 p-4">
+        <div className="cc-card cc-glass flex min-w-0 flex-col justify-between gap-3 rounded-2xl border-[var(--accent)]/45 p-4">
           <div className="space-y-2.5">
-            <div className="flex items-start justify-between gap-2">
-              <div className="flex items-center gap-2.5">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-2.5">
                 <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
                   <Link2 className="h-4 w-4" />
                 </div>
-                <div>
+                <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-1.5">
-                    <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--accent)] text-[10px] font-bold text-[var(--accent-ink)]">
+                    <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[10px] font-bold text-[var(--accent-ink)]">
                       1
                     </span>
-                    <h2 className="text-sm font-semibold text-[var(--text)]">
+                    <h2 className="min-w-0 truncate text-sm font-semibold text-[var(--text)]">
                       粘贴订阅链接
                     </h2>
                   </div>
@@ -4843,13 +4843,13 @@ export function NodesSubsPage({
               <button
                 type="button"
                 onClick={() => setShowLocalFileForm((v) => !v)}
-                className={`inline-flex shrink-0 items-center gap-1 rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] font-medium transition-colors ${
                   showLocalFileForm
                     ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                     : "border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
                 }`}
               >
-                <FileText className="h-3 w-3" />
+                <FileText className="h-3 w-3 shrink-0" />
                 {showLocalFileForm ? "收起本地文件" : "本地文件"}
               </button>
             </div>
@@ -4954,17 +4954,17 @@ export function NodesSubsPage({
         </div>
 
         {/* Card 2: Import from Existing VPN Client */}
-        <div className="cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl p-4">
+        <div className="cc-card cc-glass flex min-w-0 flex-col justify-between gap-3 rounded-2xl p-4">
           <div className="space-y-2">
-            <div className="flex items-center gap-2.5">
+            <div className="flex min-w-0 items-center gap-2.5">
               <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--green-soft)] text-[var(--green)]">
                 <FolderOpen className="h-4 w-4" />
               </div>
-              <div className="flex items-center gap-1.5">
-                <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--green)] text-[10px] font-bold text-[var(--accent-ink)]">
+              <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-[var(--green)] text-[10px] font-bold text-[var(--accent-ink)]">
                   2
                 </span>
-                <h2 className="text-sm font-semibold text-[var(--text)]">
+                <h2 className="min-w-0 truncate text-sm font-semibold text-[var(--text)]">
                   从电脑已有梯子导入
                 </h2>
               </div>
@@ -4986,7 +4986,7 @@ export function NodesSubsPage({
 
         {/* Card 3: Capture Nodes from Running Software */}
         <div
-          className={`cc-card cc-glass flex flex-col justify-between gap-3 rounded-2xl p-4 ${
+          className={`cc-card cc-glass flex min-w-0 flex-col justify-between gap-3 rounded-2xl p-4 ${
             bgCapture.active || bgCapture.finishing || bgCapture.outcome
               ? "border-[var(--green)]/60 ring-1 ring-[var(--green)]/25"
               : isCapturePaused
@@ -4995,38 +4995,38 @@ export function NodesSubsPage({
           }`}
         >
           <div className="space-y-2">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2.5">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-1 items-center gap-2.5">
                 <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-[var(--sky-soft)] text-[var(--sky)]">
                   <Cpu className="h-4 w-4" />
                 </div>
-                <div className="flex items-center gap-1.5">
-                  <span className="inline-flex h-4 w-4 items-center justify-center rounded-full bg-[var(--sky)] text-[10px] font-bold text-[var(--accent-ink)]">
+                <div className="flex min-w-0 flex-1 items-center gap-1.5">
+                  <span className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-[var(--sky)] text-[10px] font-bold text-[var(--accent-ink)]">
                     3
                   </span>
-                  <h2 className="text-sm font-semibold text-[var(--text)]">
+                  <h2 className="min-w-0 truncate text-sm font-semibold text-[var(--text)]">
                     从正在运行的软件抓节点
                   </h2>
                 </div>
               </div>
               {bgCapture.finishing ? (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
-                  <RefreshCw className="h-2.5 w-2.5 animate-spin" />
+                <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
+                  <RefreshCw className="h-2.5 w-2.5 shrink-0 animate-spin" />
                   整理中
                 </span>
               ) : bgCapture.outcome ? (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
-                  <CheckCircle2 className="h-2.5 w-2.5" />
+                <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                  <CheckCircle2 className="h-2.5 w-2.5 shrink-0" />
                   待确认导入
                 </span>
               ) : isCapturePaused ? (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
-                  <Clock className="h-2.5 w-2.5" />
+                <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
+                  <Clock className="h-2.5 w-2.5 shrink-0" />
                   已暂停
                 </span>
               ) : bgCapture.active ? (
-                <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
-                  <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                  <span className="cc-pulse-dot h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--green)]" />
                   捕捉中
                 </span>
               ) : null}
@@ -5949,7 +5949,7 @@ export function NodesSubsPage({
           />
         )}
         <div className="overflow-x-auto">
-          <table className="w-full table-fixed border-collapse text-left text-xs">
+          <table className="w-full min-w-[860px] table-fixed border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] font-medium text-[var(--muted)]">
                 <th className="w-8 px-2 py-2.5 text-center">
@@ -5961,22 +5961,22 @@ export function NodesSubsPage({
                     className="accent-[var(--accent)]"
                   />
                 </th>
-                <th className="whitespace-nowrap px-2 py-2.5">
+                <th className="min-w-[240px] whitespace-nowrap px-2 py-2.5">
                   节点名称 / 来源 / 分组
                 </th>
-                <th className="w-[132px] whitespace-nowrap px-2 py-2.5">
+                <th className="w-[122px] whitespace-nowrap px-1.5 py-2.5">
                   地区 · 倍率 · 协议
                 </th>
-                <th className="w-[236px] whitespace-nowrap px-2 py-2.5">
+                <th className="w-[194px] whitespace-nowrap px-1.5 py-2.5">
                   延迟 · 上下行 · 解锁
                 </th>
-                <th className="w-[148px] whitespace-nowrap px-2 py-2.5">
+                <th className="w-[134px] whitespace-nowrap px-1.5 py-2.5">
                   <div className="inline-flex items-center gap-1 whitespace-nowrap">
                     <Zap className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                     国内提速
                   </div>
                 </th>
-                <th className="w-[148px] whitespace-nowrap px-2 py-2.5 text-right">
+                <th className="w-[138px] whitespace-nowrap px-1.5 py-2.5 text-right">
                   使用 / 分组
                 </th>
               </tr>
@@ -6068,7 +6068,7 @@ export function NodesSubsPage({
                       </td>
 
                       {/* Region, Multiplier, Protocol & Direct 443 */}
-                      <td className="w-[132px] px-2 py-2.5 align-middle">
+                      <td className="w-[122px] px-1.5 py-2.5 align-middle">
                         <div className="flex flex-col gap-1 cc-mono text-[10px]">
                           <div className="flex items-center gap-1">
                             <span
@@ -6107,7 +6107,7 @@ export function NodesSubsPage({
                       </td>
 
                       {/* Health Snapshot Badges: Latency, Up/Down Speed, Google Clean/CN & AI Unlocks */}
-                      <td className="w-[236px] px-2 py-2.5 align-middle">
+                      <td className="w-[194px] px-1.5 py-2.5 align-middle">
                         <div className="flex flex-col gap-1 text-[10px]">
                           <div className="flex items-center gap-2 cc-mono">
                             <span
@@ -6218,7 +6218,7 @@ export function NodesSubsPage({
                       </td>
 
                       {/* Single-Node Relay 3-State Override */}
-                      <td className="w-[148px] whitespace-nowrap px-2 py-2.5 align-middle">
+                      <td className="w-[134px] whitespace-nowrap px-1.5 py-2.5 align-middle">
                         <div className="flex flex-col gap-1">
                           <div className="inline-flex w-fit shrink-0 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[10px]">
                             {(
@@ -6242,7 +6242,7 @@ export function NodesSubsPage({
                                   onClick={() =>
                                     void handleSetPreAccelOverride([node.id], opt.value)
                                   }
-                                  className={`shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 transition-colors ${
+                                  className={`shrink-0 whitespace-nowrap rounded-md px-1 py-0.5 transition-colors ${
                                     active
                                       ? activeClass
                                       : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -6268,7 +6268,7 @@ export function NodesSubsPage({
                       </td>
 
                       {/* Single-Node Use & Quick Group Actions */}
-                      <td className="w-[148px] whitespace-nowrap px-2 py-2.5 text-right align-middle">
+                      <td className="w-[138px] whitespace-nowrap px-1.5 py-2.5 text-right align-middle">
                         <div className="inline-flex flex-nowrap items-center justify-end gap-1">
                           <button
                             type="button"

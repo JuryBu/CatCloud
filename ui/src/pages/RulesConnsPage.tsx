@@ -3,26 +3,32 @@ import {
   AlertTriangle,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Code2,
   Copy,
   Eye,
+  FileCode2,
   Filter,
   Layers,
+  Loader2,
   Network,
   Pause,
   Play,
   Plus,
   RefreshCw,
+  Router,
   Search,
   Shield,
+  SlidersHorizontal,
   Sparkles,
   Trash2,
+  Upload,
   X,
   Zap,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   type ActiveConnectionDto,
   type CompiledYamlPreview,
@@ -36,6 +42,8 @@ import { AppSelect, type AppSelectOption } from "../components/AppSelect";
 import { formatBytes, formatRate } from "../components/TrafficSparkline";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
 import { isBoolPref, oneOfPref, usePersistedState } from "../utils/uiPrefs";
+
+const GatewayExportModal = lazy(() => import("../components/GatewayExportModal"));
 
 type ActiveTab = "rules" | "connections";
 type ConnSortKey = "down" | "up" | "rate" | "age" | "process";
@@ -59,6 +67,8 @@ interface ManagedRuleItem {
   target: string;
   noResolve?: boolean;
   groupId?: string;
+  rawLine?: string;
+  isRawFallback?: boolean;
 }
 
 interface AiPresetBundle {
@@ -125,6 +135,116 @@ const RULE_TYPE_LABELS: Record<RuleMatchType, string> = {
   GEOIP: "地区 IP",
 };
 
+const EXTRA_RULE_TYPE_LABELS: Record<string, string> = {
+  "RULE-SET": "规则集合",
+  AND: "复合与",
+  OR: "复合或",
+  NOT: "复合非",
+  "SUB-RULE": "子规则",
+  "DOMAIN-REGEX": "域名正则",
+  "DOMAIN-WILDCARD": "域名通配",
+  "IP-CIDR6": "IPv6 网段",
+  "IP-ASN": "ASN 自治域",
+  "DST-PORT": "目标端口",
+  "SRC-IP-CIDR": "来源网段",
+  "PROCESS-PATH": "进程路径",
+  "PROCESS-PATH-REGEX": "路径正则",
+  "PROCESS-NAME-REGEX": "进程正则",
+  MATCH: "最终兜底",
+  FINAL: "最终兜底",
+  RAW: "原始规则",
+};
+
+const DEMO_BULK_RULES_TEXT = [
+  "# 支持直接粘贴 Mihomo rules 原始段（自动忽略注释与短横线）",
+  "- DOMAIN-SUFFIX,example.com,DIRECT",
+  "- RULE-SET,apple,DIRECT",
+  "- AND,((DOMAIN-SUFFIX,google.com),(DST-PORT,443)),DIRECT",
+].join("\n");
+
+const DEMO_INLINE_OVERRIDE_YAML = [
+  "rule-providers:",
+  "  apple_cn:",
+  "    type: http",
+  "    behavior: domain",
+  "    url: \"https://example.invalid/rules/apple-cn.yaml\"",
+  "    path: ./ruleset/apple-cn.yaml",
+  "    interval: 86400",
+].join("\n");
+
+const LOGICAL_PAREN_RULE_TYPES = new Set(["AND", "OR", "NOT", "SUB-RULE"]);
+
+function splitRuleTopLevel(raw: string): string[] | null {
+  const firstComma = raw.indexOf(",");
+  if (firstComma < 0) return null;
+  const ruleType = raw.slice(0, firstComma).trim().toUpperCase();
+  if (!ruleType) return null;
+
+  if (LOGICAL_PAREN_RULE_TYPES.has(ruleType)) {
+    const parts: string[] = [];
+    let depth = 0;
+    let start = 0;
+    for (let i = 0; i < raw.length; i++) {
+      const ch = raw[i];
+      if (ch === "(") {
+        depth += 1;
+      } else if (ch === ")") {
+        depth -= 1;
+        if (depth < 0) return null;
+      } else if (ch === "," && depth === 0) {
+        parts.push(raw.slice(start, i).trim());
+        start = i + 1;
+      }
+    }
+    if (depth !== 0) return null;
+    parts.push(raw.slice(start).trim());
+    return parts;
+  }
+
+  return raw.split(",").map((s) => s.trim());
+}
+
+function validateInlineOverrideYamlLocal(raw: string): string | null {
+  const trimmedAll = raw.trim();
+  if (!trimmedAll) return null;
+  const lines = raw.split(/\r?\n/);
+  let hasRootMapping = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const lineNo = i + 1;
+    if (/^\t/.test(line)) {
+      return `第 ${lineNo} 行存在 Tab 缩进，请改为空格缩进`;
+    }
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#") || trimmed === "---" || trimmed === "...") {
+      continue;
+    }
+    const indent = line.length - line.trimStart().length;
+    if (indent === 0) {
+      if (trimmed.startsWith("- ") || trimmed === "-") {
+        if (!hasRootMapping) {
+          return `第 ${lineNo} 行顶层不能直接以列表开头，请写为 YAML 键段（如 rule-providers: / rules: / dns:）`;
+        }
+        continue;
+      }
+      if (
+        /^(?:[A-Za-z0-9_.-]+|"[^"\r\n]+"|'[^'\r\n]+')\s*:/.test(trimmed) ||
+        trimmed.startsWith("{")
+      ) {
+        hasRootMapping = true;
+        continue;
+      }
+      if (!hasRootMapping) {
+        return `第 ${lineNo} 行顶层语法有误，请确认键名后带有冒号（例如 rule-providers:）`;
+      }
+    }
+  }
+  if (!hasRootMapping) {
+    return "未检测到有效的 YAML 配置段（如 rule-providers:、rules:、dns:）";
+  }
+  return null;
+}
+
 const AI_PRESETS_TEMPLATE: ReadonlyArray<Omit<AiPresetBundle, "targetGroup" | "enabled">> = [
   {
     id: "ai-openai",
@@ -167,13 +287,21 @@ const AI_PRESETS_TEMPLATE: ReadonlyArray<Omit<AiPresetBundle, "targetGroup" | "e
 ];
 
 function serializeRuleItem(r: ManagedRuleItem): string {
+  if (r.rawLine && r.rawLine.trim()) {
+    return r.rawLine.trim();
+  }
   const typeUpper = r.ruleType.trim().toUpperCase();
   const value = r.value.trim();
   const target = r.target.trim();
-  if (typeUpper === "MATCH") {
-    return `MATCH,${target}`;
+  if (typeUpper === "MATCH" || typeUpper === "FINAL") {
+    return `${typeUpper},${target}`;
   }
   return `${typeUpper},${value},${target}${r.noResolve ? ",no-resolve" : ""}`;
+}
+
+function isRuleFlagToken(token: string): boolean {
+  const lower = token.trim().toLowerCase();
+  return lower === "no-resolve" || lower === "src";
 }
 
 function parseRuleString(
@@ -183,23 +311,33 @@ function parseRuleString(
 ): ManagedRuleItem | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  const parts = trimmed.split(",").map((p) => p.trim());
-  if (parts.length < 2) return null;
+  const parts = splitRuleTopLevel(trimmed);
+  if (!parts || parts.length < 2) return null;
   const ruleType = parts[0].toUpperCase();
-  if (ruleType === "MATCH") {
+  if (ruleType === "MATCH" || ruleType === "FINAL") {
+    if (parts.length !== 2 || !parts[1]) return null;
     return {
       id,
       layer,
       ruleType,
       value: "*",
-      target: parts[1] || "DIRECT",
+      target: parts[1],
+      rawLine: trimmed,
     };
   }
   if (parts.length < 3) return null;
-  const value = parts[1];
-  const target = parts[2];
+
+  // Locate target by skipping known trailing flags (no-resolve, src) while preserving commas in regex values
+  let targetIdx = parts.length - 1;
+  while (targetIdx > 2 && isRuleFlagToken(parts[targetIdx])) {
+    targetIdx -= 1;
+  }
+  const value = parts.slice(1, targetIdx).join(",").trim();
+  const target = parts[targetIdx]?.trim() ?? "";
   if (!value || !target) return null;
-  const noResolve = parts.slice(3).some((p) => p.toLowerCase() === "no-resolve");
+
+  const extraParts = parts.slice(targetIdx + 1);
+  const noResolve = extraParts.some((p) => p.toLowerCase() === "no-resolve");
   return {
     id,
     layer,
@@ -207,6 +345,27 @@ function parseRuleString(
     value,
     target,
     noResolve,
+    rawLine: trimmed,
+  };
+}
+
+function createRawFallbackRuleItem(
+  raw: string,
+  layer: "prepend" | "append",
+  id: string
+): ManagedRuleItem | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const firstComma = trimmed.indexOf(",");
+  const rawType = firstComma > 0 ? trimmed.slice(0, firstComma).trim().toUpperCase() : "RAW";
+  return {
+    id,
+    layer,
+    ruleType: rawType || "RAW",
+    value: trimmed,
+    target: "",
+    rawLine: trimmed,
+    isRawFallback: true,
   };
 }
 
@@ -219,27 +378,30 @@ function hydrateRulesFromConfig(
 
   const presets: AiPresetBundle[] = AI_PRESETS_TEMPLATE.map((tpl) => {
     const domainSet = new Set(tpl.domains.map((d) => d.toLowerCase()));
-    let matchedTarget: string | null = null;
+    const matchedDomains = new Set<string>();
+    const matchedTargets = new Set<string>();
     const matchedIndices: number[] = [];
 
     prependLines.forEach((raw, idx) => {
+      if (consumedPrepend.has(idx)) return;
       const parts = raw.split(",").map((p) => p.trim());
-      if (parts.length < 3) return;
+      if (parts.length !== 3) return;
       if (parts[0].toUpperCase() !== "DOMAIN-SUFFIX") return;
-      if (!domainSet.has(parts[1].toLowerCase())) return;
-      if (matchedTarget === null) {
-        matchedTarget = parts[2];
-      }
-      if (parts[2] === matchedTarget) {
-        matchedIndices.push(idx);
-      }
+      const domain = parts[1].toLowerCase();
+      const target = parts[2];
+      if (!domainSet.has(domain) || !target) return;
+      matchedDomains.add(domain);
+      matchedTargets.add(target);
+      matchedIndices.push(idx);
     });
 
-    if (matchedTarget !== null && matchedIndices.length > 0) {
+    // Only fold into an AI preset switch when ALL preset domains exist and share the exact same target
+    if (matchedDomains.size === domainSet.size && matchedTargets.size === 1) {
+      const [soleTarget] = Array.from(matchedTargets);
       for (const idx of matchedIndices) consumedPrepend.add(idx);
       return {
         ...tpl,
-        targetGroup: matchedTarget,
+        targetGroup: soleTarget,
         enabled: true,
       };
     }
@@ -254,11 +416,15 @@ function hydrateRulesFromConfig(
   const userRules: ManagedRuleItem[] = [];
   prependLines.forEach((raw, idx) => {
     if (consumedPrepend.has(idx)) return;
-    const parsed = parseRuleString(raw, "prepend", `rule-pre-${idx}-${raw}`);
+    const parsed =
+      parseRuleString(raw, "prepend", `rule-pre-${idx}-${raw}`) ??
+      createRawFallbackRuleItem(raw, "prepend", `rule-pre-raw-${idx}-${raw}`);
     if (parsed) userRules.push(parsed);
   });
   appendLines.forEach((raw, idx) => {
-    const parsed = parseRuleString(raw, "append", `rule-app-${idx}-${raw}`);
+    const parsed =
+      parseRuleString(raw, "append", `rule-app-${idx}-${raw}`) ??
+      createRawFallbackRuleItem(raw, "append", `rule-app-raw-${idx}-${raw}`);
     if (parsed) userRules.push(parsed);
   });
 
@@ -668,6 +834,26 @@ export function RulesConnsPage() {
   const [newTarget, setNewTarget] = useState<string>(defaultGroupTarget);
   const [newNoResolve, setNewNoResolve] = useState<boolean>(false);
 
+  // Advanced rules & transparent gateway export state
+  const [gatewayModalOpen, setGatewayModalOpen] = useState<boolean>(false);
+  const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
+  const [customRulesOnly, setCustomRulesOnly] = useState<boolean>(false);
+  const [savingCustomRulesOnly, setSavingCustomRulesOnly] = useState<boolean>(false);
+  const [bulkRawText, setBulkRawText] = useState<string>("");
+  const [bulkTargetLayer, setBulkTargetLayer] = useState<"prepend" | "append">("prepend");
+  const [bulkApplying, setBulkApplying] = useState<boolean>(false);
+  const [bulkFeedback, setBulkFeedback] = useState<{
+    mode: "append" | "replace";
+    layer: "prepend" | "append";
+    validCount: number;
+    skippedLines: string[];
+  } | null>(null);
+  const [inlineOverrideYaml, setInlineOverrideYaml] = useState<string>("");
+  const [savedInlineOverrideYaml, setSavedInlineOverrideYaml] = useState<string>("");
+  const [savingInlineYaml, setSavingInlineYaml] = useState<boolean>(false);
+  const [inlineYamlError, setInlineYamlError] = useState<string | null>(null);
+  const [inlineYamlVerifiedMsg, setInlineYamlVerifiedMsg] = useState<string | null>(null);
+
   // --- Tab B: Connections State ---
   const [connections, setConnections] = useState<LiveConnection[]>(() => {
     if (connPaused && pausedConnectionsSnapshot) {
@@ -759,6 +945,18 @@ export function RulesConnsPage() {
         if (cancelled) return;
         const fallbackTarget = groupsRef.current[0]?.name || "DIRECT";
         const savedOverride = fullCfg.rules_override;
+        const savedCustomOnly = Boolean(savedOverride?.custom_rules_only);
+        const savedInlineYaml =
+          typeof savedOverride?.inline_override_yaml === "string"
+            ? savedOverride.inline_override_yaml
+            : "";
+        setCustomRulesOnly(savedCustomOnly);
+        setInlineOverrideYaml(savedInlineYaml);
+        setSavedInlineOverrideYaml(savedInlineYaml);
+        if (savedCustomOnly || savedInlineYaml.trim().length > 0) {
+          setAdvancedOpen(true);
+        }
+
         const hasSavedOverride =
           savedOverride !== undefined &&
           (Array.isArray(savedOverride.global_prepend_rules) ||
@@ -1046,7 +1244,8 @@ export function RulesConnsPage() {
       return (
         item.value.toLowerCase().includes(kw) ||
         item.ruleType.toLowerCase().includes(kw) ||
-        item.target.toLowerCase().includes(kw)
+        item.target.toLowerCase().includes(kw) ||
+        (item.rawLine?.toLowerCase().includes(kw) ?? false)
       );
     });
   }, [groupBoundRules, ruleLayerFilter, ruleSearch, userRules]);
@@ -1172,6 +1371,209 @@ export function RulesConnsPage() {
       }, 1800);
     } catch {
       appActions.showToast("剪贴板不可用，请手动选中复制", "warn");
+    }
+  };
+
+  const handleBulkImport = async (mode: "append" | "replace") => {
+    if (savingRules || bulkApplying || loadingRules) return;
+    const raw = bulkRawText.trim();
+    if (!raw) {
+      appActions.showToast("请先粘贴要导入的 Mihomo 分流规则文本", "warn");
+      return;
+    }
+    setBulkApplying(true);
+    try {
+      const parsed = await catcloudApi.parseBulkRulesPreview(raw);
+      const validLines = Array.isArray(parsed.valid_rules) ? parsed.valid_rules : [];
+      const skippedLines = Array.isArray(parsed.skipped_lines) ? parsed.skipped_lines : [];
+
+      if (validLines.length === 0) {
+        setBulkFeedback({
+          mode,
+          layer: bulkTargetLayer,
+          validCount: 0,
+          skippedLines,
+        });
+        appActions.showToast(
+          skippedLines.length > 0
+            ? `未识别出有效规则（已跳过 ${skippedLines.length} 行），请检查格式`
+            : "粘贴内容中未包含有效规则",
+          "warn"
+        );
+        return;
+      }
+
+      const stamp = Date.now();
+      const importedItems: ManagedRuleItem[] = [];
+      const unparsedValidLines: string[] = [];
+      for (let i = 0; i < validLines.length; i++) {
+        const line = validLines[i];
+        const item = parseRuleString(line, bulkTargetLayer, `rule-bulk-${stamp}-${i}`);
+        if (item) {
+          importedItems.push(item);
+        } else {
+          unparsedValidLines.push(line);
+        }
+      }
+      const mergedSkippedLines = [...skippedLines, ...unparsedValidLines];
+
+      if (importedItems.length === 0) {
+        setBulkFeedback({
+          mode,
+          layer: bulkTargetLayer,
+          validCount: 0,
+          skippedLines: mergedSkippedLines,
+        });
+        appActions.showToast("未能将解析结果转换为可保存的规则条目", "warn");
+        return;
+      }
+
+      let nextRules: ManagedRuleItem[];
+      if (mode === "replace") {
+        // Only replace user rules in the currently selected layer (preserve the other layer)
+        const preservedOtherLayer = userRules.filter((r) => r.layer !== bulkTargetLayer);
+        nextRules = [...preservedOtherLayer, ...importedItems];
+      } else {
+        const existingSerialized = new Set(
+          userRules.map((r) => `${r.layer}::${serializeRuleItem(r).trim()}`)
+        );
+        const dedupedNew = importedItems.filter(
+          (item) => !existingSerialized.has(`${item.layer}::${serializeRuleItem(item).trim()}`)
+        );
+        nextRules = [...userRules, ...dedupedNew];
+      }
+
+      const layerLabel = bulkTargetLayer === "prepend" ? "优先匹配" : "兜底匹配";
+      const ok = await persistRulesOverride(
+        aiPresets,
+        nextRules,
+        mode === "replace"
+          ? `已替换「${layerLabel}」层自定义规则：写入 ${importedItems.length} 条${mergedSkippedLines.length > 0 ? `，跳过 ${mergedSkippedLines.length} 行` : ""}`
+          : `已解析并追加 ${importedItems.length} 条规则（${layerLabel}）${mergedSkippedLines.length > 0 ? `，跳过 ${mergedSkippedLines.length} 行` : ""}`
+      );
+      if (ok) {
+        setBulkFeedback({
+          mode,
+          layer: bulkTargetLayer,
+          validCount: importedItems.length,
+          skippedLines: mergedSkippedLines,
+        });
+        setBulkRawText("");
+      }
+    } catch (err) {
+      appActions.showToast(`解析批量规则失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setBulkApplying(false);
+    }
+  };
+
+  const handleToggleCustomRulesOnly = async () => {
+    if (savingCustomRulesOnly || loadingRules) return;
+    const prev = customRulesOnly;
+    const next = !prev;
+    setCustomRulesOnly(next);
+    setSavingCustomRulesOnly(true);
+    try {
+      await catcloudApi.saveExtendedSettings({
+        rules_override: { custom_rules_only: next },
+      });
+      appActions.showToast(
+        next
+          ? "已开启「纯自写规则模式」：跳过内置国内/AI 规则，仅保留防环与局域网直连"
+          : "已关闭「纯自写规则模式」，恢复猫云内置分流规则",
+        "ok"
+      );
+      if (showYamlPreviewRef.current) {
+        void loadCompiledPreview();
+      }
+    } catch (err) {
+      setCustomRulesOnly(prev);
+      appActions.showToast(`切换纯自写规则模式失败：${formatErrorMessage(err)}`, "warn");
+    } finally {
+      setSavingCustomRulesOnly(false);
+    }
+  };
+
+  const handleSaveInlineOverrideYaml = async (explicitValue?: string) => {
+    if (savingInlineYaml || loadingRules) return;
+    const candidateRaw = explicitValue !== undefined ? explicitValue : inlineOverrideYaml;
+    const trimmed = candidateRaw.trim();
+    const normalizedPayload: string | null = trimmed.length > 0 ? candidateRaw : null;
+
+    setInlineYamlError(null);
+    setInlineYamlVerifiedMsg(null);
+
+    if (trimmed.length > 0) {
+      const localErr = validateInlineOverrideYamlLocal(candidateRaw);
+      if (localErr) {
+        setInlineYamlError(`YAML 格式校验未通过：${localErr}（未写入配置）`);
+        appActions.showToast(`内联 YAML 校验未通过：${localErr}`, "warn");
+        return;
+      }
+    }
+
+    const prevSaved = savedInlineOverrideYaml;
+    const prevPayload: string | null = prevSaved.trim().length > 0 ? prevSaved : null;
+    setSavingInlineYaml(true);
+    try {
+      await catcloudApi.saveExtendedSettings({
+        rules_override: { inline_override_yaml: normalizedPayload },
+      });
+
+      // Immediately run backend compile & static validation so invalid patches never stay persisted
+      let previewRes: CompiledYamlPreview;
+      try {
+        previewRes = await catcloudApi.compilePreviewYaml();
+      } catch (verifyErr) {
+        await catcloudApi
+          .saveExtendedSettings({
+            rules_override: { inline_override_yaml: prevPayload },
+          })
+          .catch(() => {});
+        const msg = formatErrorMessage(verifyErr);
+        setInlineYamlError(`编译校验失败，已自动回退未写入脏配置：${msg}`);
+        appActions.showToast(`内联 YAML 校验失败：${msg}`, "warn");
+        return;
+      }
+
+      const meta = parseCompiledPreviewMeta(previewRes);
+      if (!meta.validationOk && meta.errors.length > 0 && trimmed.length > 0) {
+        const errSummary = meta.errors
+          .map((item) => (item.code ? `[${item.code}] ${item.message}` : item.message))
+          .join("；");
+        await catcloudApi
+          .saveExtendedSettings({
+            rules_override: { inline_override_yaml: prevPayload },
+          })
+          .catch(() => {});
+        setInlineYamlError(`配置编译校验未通过，已自动回退未写入脏配置：${errSummary}`);
+        appActions.showToast("内联 YAML 校验未通过，已回退原配置", "warn");
+        return;
+      }
+
+      setCompiledPreview(previewRes);
+      setSavedInlineOverrideYaml(trimmed.length > 0 ? candidateRaw : "");
+      if (explicitValue !== undefined) {
+        setInlineOverrideYaml(trimmed.length > 0 ? candidateRaw : "");
+      }
+      if (trimmed.length === 0) {
+        setInlineYamlVerifiedMsg("已清空内联 YAML 覆写并通过编译校验");
+        appActions.showToast("已清空内联 YAML 覆写并生效", "ok");
+      } else if (meta.warnings.length > 0) {
+        setInlineYamlVerifiedMsg(
+          `已保存并通过校验（${meta.warnings.length} 条提醒，可在上方编译预览查看）`
+        );
+        appActions.showToast("内联 YAML 覆写已保存并通过校验", "ok");
+      } else {
+        setInlineYamlVerifiedMsg("已保存并通过 Mihomo 配置编译校验");
+        appActions.showToast("内联 YAML 覆写已保存并通过校验", "ok");
+      }
+    } catch (err) {
+      const msg = formatErrorMessage(err);
+      setInlineYamlError(`保存或校验失败（未写入脏配置）：${msg}`);
+      appActions.showToast(`保存内联 YAML 失败：${msg}`, "warn");
+    } finally {
+      setSavingInlineYaml(false);
     }
   };
 
@@ -1441,11 +1843,11 @@ export function RulesConnsPage() {
     <div className="space-y-4">
       {/* 顶部标题与标签切换 */}
       <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--accent)]">
             <Network className="h-5 w-5" />
           </div>
-          <div>
+          <div className="min-w-0">
             <h1 className="text-sm font-semibold text-[var(--text)]">分流规则与当前连接</h1>
             <p className="mt-0.5 text-xs text-[var(--muted)]">
               决定哪些网站走哪组节点或直接连接，也可以随时查看并断开正在进行的网络连接。
@@ -1453,17 +1855,17 @@ export function RulesConnsPage() {
           </div>
         </div>
 
-        <div className="flex items-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-1 text-xs">
+        <div className="flex shrink-0 flex-wrap items-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-1 text-xs">
           <button
             type="button"
             onClick={() => setActiveTab("rules")}
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium transition-colors ${
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 font-medium transition-colors ${
               activeTab === "rules"
                 ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
                 : "text-[var(--muted)] hover:text-[var(--text)]"
             }`}
           >
-            <Layers className="h-3.5 w-3.5" />
+            <Layers className="h-3.5 w-3.5 shrink-0" />
             分流规则
             <span className="cc-mono rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px]">
               {userRules.length + groupBoundRules.length + enabledAiDomainCount}
@@ -1477,13 +1879,13 @@ export function RulesConnsPage() {
                 ? `真实应用连接 ${connectionBreakdown.appCount} 条（另含 ${connectionBreakdown.innerTunnelCount} 条${innerCountShortLabel} · ${connectionBreakdown.loopbackCount} 条本机回环）`
                 : `真实应用连接 ${connectionBreakdown.appCount} 条`
             }
-            className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 font-medium transition-colors ${
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg px-3 py-1.5 font-medium transition-colors ${
               activeTab === "connections"
                 ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
                 : "text-[var(--muted)] hover:text-[var(--text)]"
             }`}
           >
-            <Activity className="h-3.5 w-3.5" />
+            <Activity className="h-3.5 w-3.5 shrink-0" />
             当前连接
             <span className="cc-mono rounded-full bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px]">
               {connectionBreakdown.appCount}
@@ -1506,16 +1908,25 @@ export function RulesConnsPage() {
                   打开开关即可自动保存，让常用 AI 与开发网站走指定分组
                 </span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 {savingRules && (
-                  <span className="text-[11px] text-[var(--accent)]">保存中...</span>
+                  <span className="whitespace-nowrap text-[11px] text-[var(--accent)]">保存中...</span>
                 )}
                 <button
                   type="button"
-                  onClick={handleToggleYamlPreview}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
+                  onClick={() => setGatewayModalOpen(true)}
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
+                  title="一键导出透明网关 / OpenWrt / Linux 旁路由可用的 Mihomo 配置或中转片段"
                 >
-                  <Code2 className="h-3.5 w-3.5 text-[var(--accent)]" />
+                  <Router className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                  导出给软路由 / 透明网关
+                </button>
+                <button
+                  type="button"
+                  onClick={handleToggleYamlPreview}
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
+                >
+                  <Code2 className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                   {showYamlPreview ? "收起实际规则" : "预览实际规则"}
                 </button>
               </div>
@@ -1529,14 +1940,14 @@ export function RulesConnsPage() {
                 return (
                   <div
                     key={preset.id}
-                    className={`rounded-xl border p-3.5 transition-colors ${
+                    className={`min-w-0 rounded-xl border p-3.5 transition-colors ${
                       preset.enabled
                         ? "border-[var(--line-strong)] bg-[var(--bg-elevated)]"
                         : "border-[var(--line)] bg-[var(--bg-elevated)]/50 opacity-75"
                     }`}
                   >
                     <div className="flex items-start justify-between gap-2">
-                      <div>
+                      <div className="min-w-0 flex-1">
                         <div className="text-xs font-semibold text-[var(--text)]">
                           {preset.name}
                         </div>
@@ -1565,15 +1976,15 @@ export function RulesConnsPage() {
                       {preset.domains.map((d) => (
                         <span
                           key={d}
-                          className="cc-mono rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                          className="cc-mono break-all rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
                         >
                           {d}
                         </span>
                       ))}
                     </div>
 
-                    <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-[var(--line)] pt-2 text-[11px]">
-                      <span className="text-[var(--muted)]">走哪个分组</span>
+                    <div className="mt-2.5 flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] pt-2 text-[11px]">
+                      <span className="shrink-0 whitespace-nowrap text-[var(--muted)]">走哪个分组</span>
                       <AppSelect
                         size="xs"
                         aria-label={`${preset.name} 目标分组`}
@@ -1629,26 +2040,35 @@ export function RulesConnsPage() {
                   )}
                 </div>
 
-                <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => setGatewayModalOpen(true)}
+                    className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--accent)]/45 bg-[var(--accent-soft)]/55 px-2.5 py-1 text-[11px] font-medium text-[var(--accent)] hover:border-[var(--accent)]"
+                    title="导出适配 OpenWrt / Linux 旁路由的透明网关完整配置或中转片段"
+                  >
+                    <Router className="h-3 w-3 shrink-0" />
+                    导出给软路由 / 透明网关
+                  </button>
                   <button
                     type="button"
                     disabled={loadingPreview}
                     onClick={() => void loadCompiledPreview()}
-                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
+                    className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
                   >
-                    <RefreshCw className={`h-3 w-3 ${loadingPreview ? "animate-spin" : ""}`} />
+                    <RefreshCw className={`h-3 w-3 shrink-0 ${loadingPreview ? "animate-spin" : ""}`} />
                     重新编译
                   </button>
                   <button
                     type="button"
                     disabled={loadingPreview || !compiledPreview?.yaml}
                     onClick={() => void handleCopyYaml()}
-                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
+                    className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text)] hover:border-[var(--accent)] disabled:opacity-50"
                   >
                     {copiedYaml ? (
-                      <Check className="h-3 w-3 text-[var(--green)]" />
+                      <Check className="h-3 w-3 shrink-0 text-[var(--green)]" />
                     ) : (
-                      <Copy className="h-3 w-3 text-[var(--accent)]" />
+                      <Copy className="h-3 w-3 shrink-0 text-[var(--accent)]" />
                     )}
                     {copiedYaml ? "已复制" : "复制配置"}
                   </button>
@@ -1703,14 +2123,14 @@ export function RulesConnsPage() {
                 系统已自动保护本机直连与防绕路死循环，添加规则后立即保存生效
               </span>
             </div>
-            <div className="grid grid-cols-1 items-center gap-2 sm:grid-cols-2 lg:grid-cols-12">
+            <div className="grid grid-cols-1 items-center gap-2 sm:grid-cols-2 min-[1160px]:grid-cols-12">
               <AppSelect
                 size="md"
                 aria-label="规则优先级层级"
                 value={newLayer}
                 onChange={(v) => setNewLayer(v as "prepend" | "append")}
                 options={ruleLayerOptions}
-                className="w-full lg:col-span-2"
+                className="w-full min-[1160px]:col-span-2"
                 buttonClassName="w-full rounded-xl"
               />
 
@@ -1720,7 +2140,7 @@ export function RulesConnsPage() {
                 value={newType}
                 onChange={(v) => setNewType(v as RuleMatchType)}
                 options={ruleTypeOptions}
-                className="w-full lg:col-span-2"
+                className="w-full min-[1160px]:col-span-2"
                 buttonClassName="w-full rounded-xl"
               />
 
@@ -1732,7 +2152,7 @@ export function RulesConnsPage() {
                   if (e.key === "Enter") void handleAddRule();
                 }}
                 placeholder="填写网址或内容，例如 github.com、cn 或 chrome.exe"
-                className="cc-mono h-9 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none lg:col-span-4"
+                className="cc-mono h-9 min-w-0 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none sm:col-span-2 min-[1160px]:col-span-4"
               />
 
               <AppSelect
@@ -1744,7 +2164,7 @@ export function RulesConnsPage() {
                   setNewTarget(v);
                 }}
                 options={ruleTargetOptions}
-                className="w-full lg:col-span-2"
+                className="w-full min-[1160px]:col-span-2"
                 buttonClassName="w-full rounded-xl"
               />
 
@@ -1752,9 +2172,9 @@ export function RulesConnsPage() {
                 type="button"
                 disabled={savingRules || loadingRules}
                 onClick={() => void handleAddRule()}
-                className="inline-flex h-9 items-center justify-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50 lg:col-span-2"
+                className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50 min-[1160px]:col-span-2"
               >
-                <Plus className="h-3.5 w-3.5" />
+                <Plus className="h-3.5 w-3.5 shrink-0" />
                 添加并保存
               </button>
             </div>
@@ -1769,6 +2189,324 @@ export function RulesConnsPage() {
                 />
                 跳过域名解析（直连规则推荐勾选，避免多余 DNS 查询）
               </label>
+            )}
+          </section>
+
+          {/* 高阶：批量导入规则与自定义 YAML 覆写（默认折叠，开启纯自写或填写覆写后自动展开并亮徽章） */}
+          <section className="cc-card cc-glass overflow-hidden rounded-2xl">
+            <button
+              type="button"
+              onClick={() => setAdvancedOpen((prev) => !prev)}
+              aria-expanded={advancedOpen}
+              className="flex w-full flex-wrap items-center justify-between gap-2 px-4 py-3 text-left transition-colors hover:bg-[var(--bg-elevated)]/55"
+            >
+              <div className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
+                <SlidersHorizontal className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+                <span className="text-xs font-semibold text-[var(--text)]">
+                  高阶：批量导入规则与自定义 YAML 覆写（兼容手写规则 / rule-providers）
+                </span>
+                {customRulesOnly && (
+                  <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--accent-soft)] px-2 py-0.5 text-[10.5px] font-semibold text-[var(--accent)]">
+                    <Sparkles className="h-3 w-3 shrink-0" />
+                    纯自写规则已开启
+                  </span>
+                )}
+                {savedInlineOverrideYaml.trim().length > 0 && (
+                  <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[10.5px] font-semibold text-[var(--green)]">
+                    <FileCode2 className="h-3 w-3 shrink-0" />
+                    YAML 覆写生效中
+                  </span>
+                )}
+              </div>
+              <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[11px] text-[var(--muted)]">
+                <span>{advancedOpen ? "收起" : "展开"}</span>
+                {advancedOpen ? (
+                  <ChevronDown className="h-4 w-4 shrink-0" />
+                ) : (
+                  <ChevronRight className="h-4 w-4 shrink-0" />
+                )}
+              </span>
+            </button>
+
+            {advancedOpen && (
+              <div className="space-y-4 border-t border-[var(--line)] p-4">
+                {/* 1. 批量粘贴原始 Mihomo 规则区 */}
+                <div className="space-y-2.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/45 p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <h3 className="text-xs font-semibold text-[var(--text)]">
+                        批量粘贴原始 Mihomo 规则
+                      </h3>
+                      <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                        支持直接粘贴整段{" "}
+                        <span className="cc-mono">- DOMAIN-SUFFIX,...</span>、
+                        <span className="cc-mono">RULE-SET,...</span>、
+                        <span className="cc-mono">AND,...</span> 与注释行，自动清理格式并去重写入
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <AppSelect
+                        size="xs"
+                        aria-label="批量导入规则层级"
+                        value={bulkTargetLayer}
+                        disabled={savingRules || bulkApplying || loadingRules}
+                        onChange={(v) => setBulkTargetLayer(v as "prepend" | "append")}
+                        options={ruleLayerOptions}
+                        className="min-w-[144px] max-w-[200px]"
+                      />
+                      <button
+                        type="button"
+                        disabled={bulkApplying}
+                        onClick={() => {
+                          setBulkRawText(DEMO_BULK_RULES_TEXT);
+                          setBulkFeedback(null);
+                        }}
+                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+                      >
+                        填入示例
+                      </button>
+                    </div>
+                  </div>
+
+                  <textarea
+                    rows={5}
+                    value={bulkRawText}
+                    onChange={(e) => {
+                      setBulkRawText(e.target.value);
+                      if (bulkFeedback) setBulkFeedback(null);
+                    }}
+                    spellCheck={false}
+                    placeholder={[
+                      "每行一条 Mihomo 规则，例如：",
+                      "- DOMAIN-SUFFIX,example.com,DIRECT",
+                      "- RULE-SET,apple_cn,DIRECT",
+                      "- AND,((DOMAIN-SUFFIX,google.com),(DST-PORT,443)),PROXY",
+                      "# 以 # 开头的注释行会自动忽略",
+                    ].join("\n")}
+                    className="cc-mono cc-selectable w-full min-w-0 rounded-xl border border-[var(--line)] bg-[var(--card)] p-3 text-[11px] leading-relaxed text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+                  />
+
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[11px] text-[var(--muted)]">
+                      解析前会先经后端格式识别，无法识别的行会自动跳过并单独列出
+                    </span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={savingRules || bulkApplying || loadingRules || !bulkRawText.trim()}
+                        onClick={() => void handleBulkImport("append")}
+                        className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {bulkApplying ? (
+                          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                        ) : (
+                          <Upload className="h-3.5 w-3.5 shrink-0" />
+                        )}
+                        解析并追加
+                      </button>
+                      <button
+                        type="button"
+                        disabled={savingRules || bulkApplying || loadingRules || !bulkRawText.trim()}
+                        onClick={() => void handleBulkImport("replace")}
+                        title="仅替换上方当前所选层级（优先匹配或兜底匹配）的自定义规则，保留另一层规则"
+                        className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--amber)]/55 bg-[var(--amber-soft)]/70 px-3 py-1.5 text-xs font-semibold text-[var(--amber)] transition-colors hover:border-[var(--amber)] disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        替换当前层自定义规则
+                      </button>
+                    </div>
+                  </div>
+
+                  {bulkFeedback && (
+                    <div
+                      className={`space-y-1.5 rounded-xl border px-3 py-2 text-[11px] ${
+                        bulkFeedback.validCount > 0
+                          ? "border-[var(--green)]/40 bg-[var(--green-soft)]/45 text-[var(--text)]"
+                          : "border-[var(--amber)]/45 bg-[var(--amber-soft)]/50 text-[var(--amber)]"
+                      }`}
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-medium">
+                          {bulkFeedback.validCount > 0
+                            ? `${bulkFeedback.mode === "replace" ? "已替换当前层" : "已追加"}（${bulkFeedback.layer === "prepend" ? "优先匹配" : "兜底匹配"}）：成功解析 ${bulkFeedback.validCount} 条有效规则${bulkFeedback.skippedLines.length > 0 ? `，跳过 ${bulkFeedback.skippedLines.length} 行` : ""}`
+                            : `未解析出有效规则（共跳过 ${bulkFeedback.skippedLines.length} 行）`}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setBulkFeedback(null)}
+                          className="shrink-0 rounded p-0.5 text-[var(--muted)] hover:text-[var(--text)]"
+                          aria-label="关闭批量解析结果"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                      {bulkFeedback.skippedLines.length > 0 && (
+                        <div className="space-y-0.5 border-t border-[var(--line)]/60 pt-1.5 text-[10.5px] text-[var(--amber)]">
+                          <div className="font-medium">已跳过的行（格式不完整或暂不支持）：</div>
+                          <ul className="cc-mono max-h-24 list-disc space-y-0.5 overflow-y-auto pl-4">
+                            {bulkFeedback.skippedLines.slice(0, 20).map((line, idx) => (
+                              <li key={`skip-${idx}`} className="break-all">
+                                {line}
+                              </li>
+                            ))}
+                            {bulkFeedback.skippedLines.length > 20 && (
+                              <li>… 其余 {bulkFeedback.skippedLines.length - 20} 行已省略</li>
+                            )}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                {/* 2. 纯自写规则模式开关 */}
+                <div
+                  className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border p-3.5 transition-colors ${
+                    customRulesOnly
+                      ? "border-[var(--accent)]/60 bg-[var(--accent-soft)]/35"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)]/45"
+                  }`}
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="text-xs font-semibold text-[var(--text)]">
+                        纯自写规则模式
+                      </span>
+                      <span className="cc-mono rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                        custom_rules_only
+                      </span>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                      开启后跳过猫云内置国内直连/AI 分流规则，仅保留最底层防环与局域网直连，完全以你的自写规则与下方覆写为准
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={customRulesOnly}
+                    aria-label="切换纯自写规则模式"
+                    disabled={savingCustomRulesOnly || loadingRules}
+                    onClick={() => void handleToggleCustomRulesOnly()}
+                    className={`inline-flex h-6 w-11 shrink-0 items-center rounded-full p-0.5 transition-colors disabled:opacity-50 ${
+                      customRulesOnly ? "bg-[var(--accent)]" : "bg-[var(--line-strong)]"
+                    }`}
+                  >
+                    <span
+                      className={`h-5 w-5 rounded-full bg-[var(--card)] transition-transform ${
+                        customRulesOnly ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+
+                {/* 3. 内联 YAML 覆写代码框 */}
+                <div className="space-y-2.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/45 p-3.5">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-xs font-semibold text-[var(--text)]">
+                          内联 YAML 覆写（Merge Patch）
+                        </h3>
+                        <span className="cc-mono rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                          inline_override_yaml
+                        </span>
+                        {inlineOverrideYaml !== savedInlineOverrideYaml && (
+                          <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10px] font-medium text-[var(--amber)]">
+                            有未保存修改
+                          </span>
+                        )}
+                      </div>
+                      <p className="mt-0.5 text-[11px] text-[var(--muted)]">
+                        直接粘贴 <span className="cc-mono">rule-providers:</span>、
+                        <span className="cc-mono">rules:</span>、
+                        <span className="cc-mono">dns:</span> 等任意 Mihomo YAML Merge Patch 片段；保存时自动执行编译校验，语法有误绝不写入脏配置
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      disabled={savingInlineYaml}
+                      onClick={() => {
+                        setInlineOverrideYaml(DEMO_INLINE_OVERRIDE_YAML);
+                        setInlineYamlError(null);
+                        setInlineYamlVerifiedMsg(null);
+                      }}
+                      className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+                    >
+                      填入 rule-providers 示例
+                    </button>
+                  </div>
+
+                  <textarea
+                    rows={7}
+                    value={inlineOverrideYaml}
+                    onChange={(e) => {
+                      setInlineOverrideYaml(e.target.value);
+                      if (inlineYamlError) setInlineYamlError(null);
+                      if (inlineYamlVerifiedMsg) setInlineYamlVerifiedMsg(null);
+                    }}
+                    spellCheck={false}
+                    placeholder={[
+                      "# 粘贴任意 Mihomo YAML Merge Patch 片段（留空保存即关闭内联覆写）",
+                      "rule-providers:",
+                      "  apple_cn:",
+                      "    type: http",
+                      "    behavior: domain",
+                      "    url: \"https://example.invalid/rules/apple-cn.yaml\"",
+                      "    path: ./ruleset/apple-cn.yaml",
+                      "    interval: 86400",
+                    ].join("\n")}
+                    className="cc-mono cc-selectable w-full min-w-0 rounded-xl border border-[var(--line)] bg-[var(--card)] p-3 text-[11px] leading-relaxed text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none"
+                  />
+
+                  {inlineYamlError && (
+                    <div className="flex items-start gap-2 rounded-xl border border-[var(--red)]/45 bg-[var(--red-soft)] px-3 py-2 text-[11px] leading-relaxed text-[var(--red)]">
+                      <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                      <span className="min-w-0 flex-1 break-words">{inlineYamlError}</span>
+                    </div>
+                  )}
+
+                  {inlineYamlVerifiedMsg && !inlineYamlError && (
+                    <div className="flex items-center gap-2 rounded-xl border border-[var(--green)]/40 bg-[var(--green-soft)]/50 px-3 py-2 text-[11px] text-[var(--green)]">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      <span className="min-w-0 flex-1 break-words">{inlineYamlVerifiedMsg}</span>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="text-[11px] text-[var(--muted)]">
+                      留空并点击保存可清除内联覆写；支持配合上方批量规则引用自定义{" "}
+                      <span className="cc-mono">RULE-SET</span>
+                    </span>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {(inlineOverrideYaml.trim().length > 0 ||
+                        savedInlineOverrideYaml.trim().length > 0) && (
+                        <button
+                          type="button"
+                          disabled={savingInlineYaml || loadingRules}
+                          onClick={() => void handleSaveInlineOverrideYaml("")}
+                          className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--red)] hover:text-[var(--red)] disabled:opacity-50"
+                        >
+                          <Trash2 className="h-3.5 w-3.5 shrink-0" />
+                          清空覆写
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        disabled={savingInlineYaml || loadingRules}
+                        onClick={() => void handleSaveInlineOverrideYaml()}
+                        className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {savingInlineYaml ? (
+                          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
+                        ) : (
+                          <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                        )}
+                        {savingInlineYaml ? "正在保存并校验…" : "保存并立即校验"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
             )}
           </section>
 
@@ -1832,7 +2570,9 @@ export function RulesConnsPage() {
               ) : (
                 allDisplayRules.map((item) => {
                   const typeLabel =
-                    RULE_TYPE_LABELS[item.ruleType as RuleMatchType] ?? item.ruleType;
+                    RULE_TYPE_LABELS[item.ruleType as RuleMatchType] ??
+                    EXTRA_RULE_TYPE_LABELS[item.ruleType] ??
+                    item.ruleType;
                   return (
                     <div
                       key={item.id}
@@ -1870,21 +2610,38 @@ export function RulesConnsPage() {
                           {typeLabel}
                         </span>
 
-                        <span className="cc-mono cc-selectable font-medium text-[var(--text)]">
+                        <span className="cc-mono cc-selectable min-w-0 break-all font-medium text-[var(--text)]">
                           {item.value}
                         </span>
 
                         {item.noResolve && (
-                          <span className="text-[10px] text-[var(--muted)]">
+                          <span className="shrink-0 text-[10px] text-[var(--muted)]">
                             跳过域名解析
+                          </span>
+                        )}
+                        {item.isRawFallback && (
+                          <span
+                            title="已存在的高级/自定义原始规则，保存其它规则时将原样回写保留"
+                            className="shrink-0 rounded bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                          >
+                            原始保留（只读）
                           </span>
                         )}
                       </div>
 
-                      <div className="flex items-center gap-2.5">
-                        <span className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)]">
-                          → {formatRuleTargetLabel(item.target)}
-                        </span>
+                      <div className="flex shrink-0 items-center gap-2.5">
+                        {item.target ? (
+                          <span
+                            title={formatRuleTargetLabel(item.target)}
+                            className="max-w-[220px] truncate rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)]"
+                          >
+                            → {formatRuleTargetLabel(item.target)}
+                          </span>
+                        ) : (
+                          <span className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--muted)]">
+                            原样回写
+                          </span>
+                        )}
                         <button
                           type="button"
                           onClick={() => void handleDeleteRule(item.id)}
@@ -2010,7 +2767,7 @@ export function RulesConnsPage() {
 
           {/* 筛选与排序栏 */}
           <section className="cc-card cc-glass flex flex-wrap items-center gap-2.5 rounded-2xl p-3.5">
-            <div className="relative min-w-[240px] flex-1">
+            <div className="relative min-w-[180px] flex-1">
               <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
               <input
                 type="text"
@@ -2030,9 +2787,9 @@ export function RulesConnsPage() {
               )}
             </div>
 
-            <div className="flex flex-wrap items-center gap-2 text-xs">
+            <div className="flex max-w-full flex-wrap items-center gap-2 text-xs">
               <label
-                className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-xl border px-2.5 text-[11px] font-medium transition-colors ${
+                className={`inline-flex h-8 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 text-[11px] font-medium transition-colors ${
                   showInnerTunnels
                     ? "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)]"
                     : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
@@ -2047,7 +2804,7 @@ export function RulesConnsPage() {
                   type="checkbox"
                   checked={showInnerTunnels}
                   onChange={(e) => setShowInnerTunnels(e.target.checked)}
-                  className="h-3.5 w-3.5 accent-[var(--accent)]"
+                  className="h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
                 />
                 <span>
                   {preAccelEnabled ? "显示底层提速隧道 (Inner)" : "显示内核内部连接 (Inner)"}
@@ -2060,7 +2817,7 @@ export function RulesConnsPage() {
               </label>
 
               <label
-                className={`inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-xl border px-2.5 text-[11px] font-medium transition-colors ${
+                className={`inline-flex h-8 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 text-[11px] font-medium transition-colors ${
                   hideLoopback
                     ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
                     : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
@@ -2071,7 +2828,7 @@ export function RulesConnsPage() {
                   type="checkbox"
                   checked={hideLoopback}
                   onChange={(e) => setHideLoopback(e.target.checked)}
-                  className="h-3.5 w-3.5 accent-[var(--accent)]"
+                  className="h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
                 />
                 <span>隐藏本机回环 (127.0.0.1)</span>
                 {connectionBreakdown.loopbackCount > 0 && (
@@ -2081,7 +2838,7 @@ export function RulesConnsPage() {
                 )}
               </label>
 
-              <div className="flex items-center gap-1.5">
+              <div className="flex max-w-full flex-wrap items-center gap-2">
                 <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
                 <AppSelect
                   size="sm"
@@ -2089,7 +2846,7 @@ export function RulesConnsPage() {
                   value={connGroupFilter}
                   onChange={setConnGroupFilter}
                   options={connGroupFilterOptions}
-                  className="min-w-[128px]"
+                  className="min-w-[128px] max-w-[200px]"
                   buttonClassName="rounded-xl"
                 />
 
@@ -2101,7 +2858,7 @@ export function RulesConnsPage() {
                     setConnSort(v as "down" | "up" | "rate" | "age" | "process")
                   }
                   options={connSortOptions}
-                  className="min-w-[132px]"
+                  className="min-w-[132px] max-w-[200px]"
                   buttonClassName="rounded-xl"
                 />
 
@@ -2109,7 +2866,7 @@ export function RulesConnsPage() {
                   type="button"
                   disabled={refreshingConns}
                   onClick={() => void handleRefreshConns()}
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
+                  className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)] disabled:opacity-50"
                   title="刷新当前连接"
                 >
                   <RefreshCw className={`h-3.5 w-3.5 ${refreshingConns ? "animate-spin" : ""}`} />
@@ -2120,17 +2877,21 @@ export function RulesConnsPage() {
 
           {/* 当前连接表格 */}
           <section className="cc-card cc-glass overflow-hidden rounded-2xl">
+            <div className="flex items-center justify-between border-b border-[var(--line)]/70 bg-[var(--bg-elevated)]/45 px-3 py-1 text-[10.5px] text-[var(--muted)] min-[1160px]:hidden">
+              <span>窄窗模式下可左右滑动查看完整连接列</span>
+              <span className="cc-mono">← →</span>
+            </div>
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[860px] border-collapse text-left text-xs">
+              <table className="w-full min-w-[880px] border-collapse text-left text-xs">
                 <thead>
                   <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)]/70 text-[11px] text-[var(--muted)]">
-                    <th className="whitespace-nowrap px-3 py-2.5 font-medium">软件 / 协议</th>
-                    <th className="whitespace-nowrap px-2.5 py-2.5 font-medium">访问地址与端口</th>
-                    <th className="whitespace-nowrap px-2.5 py-2.5 font-medium">命中规则</th>
-                    <th className="min-w-[136px] whitespace-nowrap px-2.5 py-2.5 font-medium">分组与当前节点</th>
-                    <th className="whitespace-nowrap px-2.5 py-2.5 text-right font-medium">实时速率 / 累计流量</th>
-                    <th className="whitespace-nowrap px-2.5 py-2.5 text-right font-medium">时长</th>
-                    <th className="whitespace-nowrap px-3 py-2.5 text-right font-medium">操作</th>
+                    <th className="min-w-[132px] whitespace-nowrap px-3 py-2.5 font-medium">软件 / 协议</th>
+                    <th className="min-w-[164px] whitespace-nowrap px-2.5 py-2.5 font-medium">访问地址与端口</th>
+                    <th className="min-w-[112px] whitespace-nowrap px-2.5 py-2.5 font-medium">命中规则</th>
+                    <th className="min-w-[144px] whitespace-nowrap px-2.5 py-2.5 font-medium">分组与当前节点</th>
+                    <th className="min-w-[156px] whitespace-nowrap px-2.5 py-2.5 text-right font-medium">实时速率 / 累计流量</th>
+                    <th className="min-w-[58px] whitespace-nowrap px-2.5 py-2.5 text-right font-medium">时长</th>
+                    <th className="min-w-[74px] whitespace-nowrap px-3 py-2.5 text-right font-medium">操作</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[var(--line)]">
@@ -2341,6 +3102,16 @@ export function RulesConnsPage() {
             )}
           </section>
         </div>
+      )}
+
+      {gatewayModalOpen && (
+        <Suspense fallback={null}>
+          <GatewayExportModal
+            open={gatewayModalOpen}
+            defaultProfile="transparent_gateway"
+            onClose={() => setGatewayModalOpen(false)}
+          />
+        </Suspense>
       )}
     </div>
   );

@@ -17,9 +17,9 @@ on:
         default: true
         type: boolean
       mihomo_version:
-        description: "Pinned official MetaCubeX/mihomo release tag"
+        description: "Pinned official MetaCubeX/mihomo release tag (empty = default from scripts/release/fetch_mihomo.mjs)"
         required: false
-        default: "v1.19.16"
+        default: ""
         type: string
 
 permissions:
@@ -63,30 +63,51 @@ jobs:
       - name: Resolve release version and mode
         id: meta
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_DRY_RUN: ${{ inputs.dry_run }}
+          INPUT_MIHOMO_VERSION: ${{ inputs.mihomo_version }}
         run: |
           set -euo pipefail
           CONF_VER="$(node -e 'console.log(JSON.parse(require("fs").readFileSync("src-tauri/tauri.conf.json","utf8")).version)')"
+          DEFAULT_MIHOMO_VER="$(node -e 'import("./scripts/release/fetch_mihomo.mjs").then((m) => { if (!m.DEFAULT_MIHOMO_VERSION) process.exit(1); console.log(m.DEFAULT_MIHOMO_VERSION); })')"
+          if [[ -z "$DEFAULT_MIHOMO_VER" ]]; then
+            echo "ERROR: Failed to resolve DEFAULT_MIHOMO_VERSION from scripts/release/fetch_mihomo.mjs." >&2
+            exit 1
+          fi
           if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
             TAG="${GITHUB_REF_NAME}"
             VER="${TAG#[vV]}"
             DRY_RUN="false"
-            MIHOMO_VER="v1.19.16"
+            MIHOMO_VER="${DEFAULT_MIHOMO_VER}"
             if [[ "$VER" != "$CONF_VER" ]]; then
               echo "ERROR: Git tag version ($VER) does not match src-tauri/tauri.conf.json ($CONF_VER)." >&2
               exit 1
             fi
           else
-            VER="${{ inputs.version }}"
+            VER="${INPUT_VERSION:-}"
             if [[ -z "$VER" ]]; then
               VER="$CONF_VER"
             fi
             VER="${VER#[vV]}"
             TAG="v${VER}"
-            DRY_RUN="${{ inputs.dry_run }}"
-            MIHOMO_VER="${{ inputs.mihomo_version }}"
+            DRY_RUN="${INPUT_DRY_RUN:-true}"
+            MIHOMO_VER="${INPUT_MIHOMO_VERSION:-}"
             if [[ -z "$MIHOMO_VER" ]]; then
-              MIHOMO_VER="v1.19.16"
+              MIHOMO_VER="${DEFAULT_MIHOMO_VER}"
             fi
+          fi
+          if [[ ! "$VER" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+            echo "ERROR: Invalid release version format: ${VER}" >&2
+            exit 1
+          fi
+          if [[ ! "$MIHOMO_VER" =~ ^[0-9A-Za-z._+-]+$ ]]; then
+            echo "ERROR: Invalid mihomo version format: ${MIHOMO_VER}" >&2
+            exit 1
+          fi
+          if [[ "$DRY_RUN" != "true" && "$DRY_RUN" != "false" ]]; then
+            echo "ERROR: Invalid dry_run flag: ${DRY_RUN}" >&2
+            exit 1
           fi
           if [[ "$VER" == "0.0.0" ]]; then
             echo "ERROR: Version 0.0.0 is forbidden." >&2

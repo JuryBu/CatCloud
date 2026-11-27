@@ -556,21 +556,22 @@ export function Sidebar() {
   ];
 
   return (
-    <aside className="cc-surface cc-glass relative z-20 flex h-full w-[236px] shrink-0 flex-col border-r border-[var(--line)] px-3 pb-2.5 pt-2">
+    <aside className="cc-surface cc-glass relative z-20 flex h-full w-[212px] shrink-0 flex-col border-r border-[var(--line)] px-2.5 pb-2.5 pt-2 min-[1160px]:w-[236px] min-[1160px]:px-3">
       {/* Brand header with reactive cream-cat MascotSprite & theme/wallpaper popover */}
-      <div className="mb-2 flex items-center justify-between gap-1.5 px-0.5">
-        <div className="flex min-w-0 items-center gap-1.5">
+      <div className="mb-2 flex shrink-0 items-center justify-between gap-1 px-0.5 min-[1160px]:gap-1.5">
+        <div className="flex min-w-0 items-center gap-1 min-[1160px]:gap-1.5">
           <button
             type="button"
             onClick={handleToggleBrandMascot}
             title={brandMascotTitle}
             aria-label={brandMascotTitle}
-            className="relative flex h-10 w-[62px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)] px-0.5 transition-colors hover:border-[var(--line-strong)]"
+            className="relative flex h-10 w-[50px] shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--card)] px-0.5 transition-colors hover:border-[var(--line-strong)] min-[1160px]:w-[62px]"
           >
             <MascotSprite
               state={effectiveBrandMascotState}
               scale={brandMascotScale}
               animationsEnabled={animationsEnabled && mascotEnabled}
+              className="scale-[0.82] min-[1160px]:scale-100"
               title={brandMascotTitle}
             />
             <span
@@ -580,11 +581,11 @@ export function Sidebar() {
             />
           </button>
           <div className="min-w-0">
-            <div className="truncate text-[14px] font-semibold tracking-tight text-[var(--text)]">
+            <div className="truncate text-[13px] font-semibold tracking-tight text-[var(--text)] min-[1160px]:text-[14px]">
               {dict.common.appName}
             </div>
-            <div className="flex items-center gap-1 whitespace-nowrap text-[10px] text-[var(--muted)]">
-              <span className="cc-mono">v{runtime.app_version}</span>
+            <div className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--muted)]">
+              <span className="cc-mono truncate">v{runtime.app_version}</span>
             </div>
           </div>
         </div>
@@ -596,7 +597,7 @@ export function Sidebar() {
             onClick={() => setThemeMenuOpen((open) => !open)}
             aria-expanded={themeMenuOpen}
             aria-haspopup="dialog"
-            className={`inline-flex h-7 items-center gap-1 whitespace-nowrap rounded-lg border px-1.5 text-[11px] transition-colors ${
+            className={`inline-flex h-7 items-center gap-0.5 whitespace-nowrap rounded-lg border px-1 text-[10.5px] transition-colors min-[1160px]:gap-1 min-[1160px]:px-1.5 min-[1160px]:text-[11px] ${
               themeMenuOpen
                 ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--text)]"
                 : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
@@ -604,11 +605,11 @@ export function Sidebar() {
             title="切换主题配色与背景壁纸"
           >
             {resolvedTheme === "light" ? (
-              <Sun className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <Sun className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
             ) : resolvedTheme === "midnight-blue" ? (
-              <Sparkles className="h-3.5 w-3.5 text-[var(--sky)]" />
+              <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--sky)]" />
             ) : (
-              <Moon className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <Moon className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
             )}
             <span>{THEME_BUTTON_LABELS_I18N[uiLang][themeMode]}</span>
             <ChevronDown
@@ -623,7 +624,7 @@ export function Sidebar() {
             <div
               role="dialog"
               aria-label="主题与壁纸快捷设置"
-              className="absolute right-0 top-[calc(100%+6px)] z-50 max-h-[calc(100vh-100px)] w-[212px] overflow-y-auto rounded-2xl border border-[var(--line-strong)] bg-[var(--surface)] p-2.5 text-[var(--text)]"
+              className="absolute right-0 top-[calc(100%+6px)] z-50 max-h-[calc(100vh-110px)] w-[196px] overflow-y-auto rounded-2xl border border-[var(--line-strong)] bg-[var(--surface)] p-2.5 text-[var(--text)] min-[1160px]:w-[212px]"
               style={{ boxShadow: "var(--shadow-popover)" }}
             >
               <div className="mb-1.5 flex items-center justify-between px-1">
@@ -731,7 +732,7 @@ export function Sidebar() {
       </div>
 
       {/* Grouped 8-item primary navigation: Network (4) + Mid-Focus AI Autopilot Card (1) + Advanced & Config (3) */}
-      <nav className="flex-1 overflow-y-auto pr-0.5" aria-label={dict.nav.sectionNetwork}>
+      <nav className="min-h-0 flex-1 overflow-y-auto pr-0.5" aria-label={dict.nav.sectionNetwork}>
         <div className="mb-1 px-2.5 text-[10px] font-medium tracking-wide text-[var(--muted)]/85">
           {dict.nav.sectionNetwork}
         </div>
@@ -792,7 +793,7 @@ export function Sidebar() {
 
       {/* Bottom compact control console: hidden on overview page to avoid duplicating Hero controls & sparkline */}
       {activeNav === "overview" ? (
-        <div className="mt-1.5 border-t border-[var(--line)] pt-1.5">
+        <div className="mt-1.5 shrink-0 border-t border-[var(--line)] pt-1.5">
           <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)]/80 bg-[var(--card)]/75 px-2.5 py-1.5 text-[11px] text-[var(--text-secondary)]">
             <span className="inline-flex min-w-0 items-center gap-1.5">
               <span
@@ -816,22 +817,22 @@ export function Sidebar() {
           </div>
         </div>
       ) : (
-        <div className="mt-1.5 space-y-1.5 border-t border-[var(--line)] pt-1.5">
+        <div className="mt-1.5 shrink-0 space-y-1.5 border-t border-[var(--line)] pt-1.5">
           <TrafficSparkline variant="mini" />
 
           {/* System Proxy / Virtual Network Card Quick Capsules */}
-          <div className="grid grid-cols-2 gap-1.5">
+          <div className="grid grid-cols-2 gap-1 min-[1160px]:gap-1.5">
             <button
               type="button"
               onClick={() => void appActions.toggleSystemProxy()}
-              className={`flex min-w-0 items-center justify-between gap-1 rounded-xl border px-2 py-1.5 text-[10.5px] font-medium transition-colors ${
+              className={`flex min-w-0 items-center justify-between gap-0.5 rounded-xl border px-1.5 py-1.5 text-[10px] font-medium transition-colors min-[1160px]:gap-1 min-[1160px]:px-2 min-[1160px]:text-[10.5px] ${
                 runtime.system_proxy_enabled
                   ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
                   : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
               title={dict.home.systemProxy}
             >
-              <span className="inline-flex min-w-0 flex-1 items-center gap-1">
+              <span className="inline-flex min-w-0 flex-1 items-center gap-0.5 min-[1160px]:gap-1">
                 <Wifi className="h-3 w-3 shrink-0" />
                 <span className="truncate">{dict.home.systemProxy}</span>
               </span>
@@ -849,7 +850,7 @@ export function Sidebar() {
                   ? appActions.openTunAdminPrompt(null)
                   : void appActions.toggleTun()
               }
-              className={`flex min-w-0 items-center justify-between gap-1 rounded-xl border px-2 py-1.5 text-[10.5px] font-medium transition-colors ${
+              className={`flex min-w-0 items-center justify-between gap-0.5 rounded-xl border px-1.5 py-1.5 text-[10px] font-medium transition-colors min-[1160px]:gap-1 min-[1160px]:px-2 min-[1160px]:text-[10.5px] ${
                 runtime.tun_enabled
                   ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
                   : runtime.tun_needs_elevation
@@ -864,7 +865,7 @@ export function Sidebar() {
                     : tunButtonHint
               }
             >
-              <span className="inline-flex min-w-0 flex-1 items-center gap-1">
+              <span className="inline-flex min-w-0 flex-1 items-center gap-0.5 min-[1160px]:gap-1">
                 <ShieldCheck className="h-3 w-3 shrink-0" />
                 <span className="truncate">
                   {runtime.tun_needs_elevation ? dict.home.tunNeedsAdminShort : dict.home.tunMode}
@@ -885,7 +886,7 @@ export function Sidebar() {
           {/* Compact proxy mode selector + floating mini window button */}
           <div className="flex items-center gap-1.5">
             <div
-              className="grid flex-1 grid-cols-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]"
+              className="grid min-w-0 flex-1 grid-cols-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]"
               role="group"
               aria-label="快捷切换代理模式"
             >
@@ -897,7 +898,7 @@ export function Sidebar() {
                     type="button"
                     onClick={() => void appActions.setProxyMode(m.id)}
                     title={m.hint}
-                    className={`rounded-lg py-1 font-medium transition-colors ${
+                    className={`truncate rounded-lg px-1 py-1 font-medium transition-colors ${
                       selected
                         ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
                         : "text-[var(--muted)] hover:text-[var(--text)]"

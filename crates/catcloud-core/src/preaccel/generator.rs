@@ -68,6 +68,26 @@ pub struct BuiltPreAccelGroups {
 ///     `proxies: [PREACCEL_LB_GROUP_NAME, same-host secondary protocols..., "DIRECT"]`, `lazy: false`.
 /// - Otherwise builds single-layer `PREACCEL_FALLBACK_GROUP` (`fallback`,
 ///   `proxies: [ordered_relays..., "DIRECT"]`, `lazy: false`, promoting `active_relay_id` to index 0).
+/// Determine the Mihomo `expected-status` expression matching a health-check probe URL.
+///
+/// Endpoints whose path or query string (case-insensitive) contains `"204"` (such as
+/// `/generate_204` or `/gen_204`) enforce strict `"204"` matching so captive portals or
+/// error responses cannot pass health checks; custom non-204 endpoints allow `"200/204"`.
+pub fn expected_probe_status_for_url(url: &str) -> &'static str {
+    let trimmed = url.trim();
+    let path_and_query_lower = Url::parse(trimmed)
+        .map(|u| match u.query() {
+            Some(q) => format!("{}?{}", u.path(), q).to_ascii_lowercase(),
+            None => u.path().to_ascii_lowercase(),
+        })
+        .unwrap_or_else(|_| trimmed.to_ascii_lowercase());
+    if path_and_query_lower.contains("204") {
+        "204"
+    } else {
+        "200/204"
+    }
+}
+
 pub fn build_preaccel_proxy_groups(
     cfg: &PreAccelConfig,
     enabled_relays: &[PreAccelRelay],
@@ -76,7 +96,7 @@ pub fn build_preaccel_proxy_groups(
     probe_url: &str,
     interval_sec: u64,
 ) -> BuiltPreAccelGroups {
-    let clamped_interval = interval_sec.clamp(10, 300);
+    let clamped_interval = interval_sec.clamp(20, 300);
     let trimmed_probe_url = probe_url.trim();
     let selection = select_physical_host_relays(enabled_relays);
 
@@ -152,10 +172,11 @@ pub fn build_preaccel_proxy_groups(
         }
         push_unique_exact(&mut fallback_members, &mut fb_seen, "DIRECT".to_string());
 
+        let outer_fallback_interval = clamped_interval.max(30);
         proxy_groups.push(build_fallback_group_yaml(
             &fallback_members,
             trimmed_probe_url,
-            clamped_interval,
+            outer_fallback_interval,
         ));
         proxy_groups.push(build_load_balance_group_yaml(
             PREACCEL_LB_GROUP_NAME,
@@ -213,7 +234,7 @@ pub struct PreAccelCompilePlan {
     pub distinct_host_count: usize,
     /// Validated domestic 204 probe URL used by the `fallback` / `load-balance` groups.
     pub effective_probe_url: String,
-    /// Clamped probe interval in seconds (`10..=300`).
+    /// Clamped probe interval in seconds (`20..=300`).
     pub effective_probe_interval_sec: u64,
     /// Ordered enabled relay IDs sorted by `(priority ASC, id ASC)`.
     pub ordered_relay_ids: Vec<String>,
@@ -387,7 +408,7 @@ pub fn build_preaccel_compile_plan(
     } else {
         Some(validate_domestic_probe_url(&cfg.fallback_probe_url)?)
     };
-    let effective_interval = cfg.probe_interval_sec.clamp(10, 300);
+    let effective_interval = cfg.probe_interval_sec.clamp(20, 300);
 
     let mut plan = PreAccelCompilePlan {
         active: false,
@@ -651,7 +672,7 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
                 Value::String(relay.password.clone()),
             );
             map.insert(Value::String("udp".to_string()), Value::Bool(true));
-            map.insert(Value::String("tfo".to_string()), Value::Bool(true));
+            map.insert(Value::String("tfo".to_string()), Value::Bool(false));
             map.insert(
                 Value::String("idle-session-check-interval".to_string()),
                 Value::Number(Number::from(30u64)),
@@ -662,7 +683,7 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
             );
             map.insert(
                 Value::String("min-idle-session".to_string()),
-                Value::Number(Number::from(2u64)),
+                Value::Number(Number::from(0u64)),
             );
             map.insert(
                 Value::String("skip-cert-verify".to_string()),
@@ -676,7 +697,7 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
                 Value::String(relay.password.clone()),
             );
             map.insert(Value::String("udp".to_string()), Value::Bool(true));
-            map.insert(Value::String("tfo".to_string()), Value::Bool(true));
+            map.insert(Value::String("tfo".to_string()), Value::Bool(false));
             map.insert(
                 Value::String("skip-cert-verify".to_string()),
                 Value::Bool(relay.skip_cert_verify),
@@ -694,7 +715,7 @@ pub fn compile_relay_to_mihomo_yaml(relay: &PreAccelRelay, proxy_name: &str) -> 
             );
             map.insert(Value::String("tls".to_string()), Value::Bool(true));
             map.insert(Value::String("udp".to_string()), Value::Bool(true));
-            map.insert(Value::String("tfo".to_string()), Value::Bool(true));
+            map.insert(Value::String("tfo".to_string()), Value::Bool(false));
             map.insert(
                 Value::String("skip-cert-verify".to_string()),
                 Value::Bool(relay.skip_cert_verify),
@@ -799,6 +820,10 @@ fn build_fallback_group_yaml(
         Value::String(probe_url.to_string()),
     );
     map.insert(
+        Value::String("expected-status".to_string()),
+        Value::String(expected_probe_status_for_url(probe_url).to_string()),
+    );
+    map.insert(
         Value::String("interval".to_string()),
         Value::Number(Number::from(interval_sec)),
     );
@@ -833,6 +858,10 @@ fn build_load_balance_group_yaml(
     map.insert(
         Value::String("url".to_string()),
         Value::String(probe_url.to_string()),
+    );
+    map.insert(
+        Value::String("expected-status".to_string()),
+        Value::String(expected_probe_status_for_url(probe_url).to_string()),
     );
     map.insert(
         Value::String("interval".to_string()),

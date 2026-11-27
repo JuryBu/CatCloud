@@ -1917,18 +1917,18 @@ export function SpeedTestPage({
             <button
               type="button"
               onClick={() => setShowProbeSettings((v) => !v)}
-              className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
+              className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
                 showProbeSettings
                   ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                   : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
               }`}
             >
-              <Settings className="h-3.5 w-3.5" />
+              <Settings className="h-3.5 w-3.5 shrink-0" />
               <span>测速项目设置 ({enabledProbeCount} 项)</span>
               {showProbeSettings ? (
-                <ChevronUp className="h-3.5 w-3.5" />
+                <ChevronUp className="h-3.5 w-3.5 shrink-0" />
               ) : (
-                <ChevronDown className="h-3.5 w-3.5" />
+                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
               )}
             </button>
           </div>
@@ -1945,7 +1945,7 @@ export function SpeedTestPage({
                 ? "国内提速对比测速正在后台进行，完成后可测速"
                 : "主推省流方案：一次测出延迟、谷歌是否送中与 AI 解锁，约 0.2 MB/节点"
             }
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
             <span>{dict.nodes.recommendedProbeBtn}</span>
@@ -1968,7 +1968,7 @@ export function SpeedTestPage({
                 ? "国内提速对比测速正在后台进行，完成后可测速"
                 : "测延迟 + 送中/AI + 真实上传/下载速度，约 3 MB/节点"
             }
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--sky)]/60 bg-[var(--sky-soft)] px-3 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--sky)]/60 bg-[var(--sky-soft)] px-3 py-2 text-xs font-semibold text-[var(--sky)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <Rocket className="h-3.5 w-3.5 shrink-0" />
             <span>含上下行完整测速</span>
@@ -1988,7 +1988,7 @@ export function SpeedTestPage({
                 ? "国内提速对比测速正在后台进行，完成后可测速"
                 : "只测节点连通与基础延迟，速度最快、保留旧的上下行和解锁记录"
             }
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-55"
+            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-55"
           >
             <Zap className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
             <span>仅快测延迟</span>
@@ -2011,7 +2011,7 @@ export function SpeedTestPage({
                 ? "开启后测速将经由已启用的国内 443 中转测出真实提速表现；关闭可裸连对比"
                 : "需先在「国内提速」中添加并启用国内中转机，方可走国内 443 提速测速"
             }
-            className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
               usePreaccelForProbe && hasEnabledPreAccelRelay
                 ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
@@ -2020,7 +2020,7 @@ export function SpeedTestPage({
             <Zap className="h-3.5 w-3.5 shrink-0" />
             <span>{embedded ? "走国内 443 提速" : "同步走国内 443 提速测速"}</span>
             <span
-              className={`h-2 w-2 rounded-full ${
+              className={`h-2 w-2 shrink-0 rounded-full ${
                 usePreaccelForProbe && hasEnabledPreAccelRelay
                   ? "bg-[var(--green)]"
                   : "bg-[var(--muted)]/50"
@@ -2030,7 +2030,7 @@ export function SpeedTestPage({
 
           <label
             title="开启后每节点多耗时约 1 分钟，仅排查断流时建议勾选（与测速项目设置中的 60 秒长连接同步）"
-            className={`inline-flex cursor-pointer items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs transition-colors ${
+            className={`inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-2 text-xs transition-colors ${
               includeKeepalive
                 ? "border-[var(--amber)]/60 bg-[var(--amber-soft)] text-[var(--amber)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
@@ -2041,7 +2041,7 @@ export function SpeedTestPage({
               checked={includeKeepalive}
               disabled={isRunning}
               onChange={(e) => setKeepaliveSynced(e.target.checked)}
-              className="h-3.5 w-3.5 accent-[var(--accent)]"
+              className="h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
             />
             <Clock className="h-3.5 w-3.5 shrink-0" />
             <span className="font-medium">{embedded ? "60秒长连接" : "附带测 60 秒长连接"}</span>
@@ -2051,7 +2051,7 @@ export function SpeedTestPage({
             <button
               type="button"
               onClick={() => setShowProbeSettings((v) => !v)}
-              className={`ml-auto inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors ${
+              className={`ml-auto inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors ${
                 showProbeSettings
                   ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                   : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
@@ -2128,7 +2128,7 @@ export function SpeedTestPage({
         {/* Live Progress Strip (always shown when running; idle guide banner omitted in embedded mode to stay clean) */}
         {(!embedded || isRunning || includeKeepalive) && (
           <div
-            className={`mt-3 flex ${embedded && !isRunning ? "py-2" : "h-[60px]"} items-center justify-between gap-3 overflow-hidden rounded-xl border px-3.5 transition-colors ${
+            className={`mt-3 flex flex-wrap ${embedded && !isRunning ? "py-2" : "min-h-[56px] py-2"} items-center justify-between gap-3 rounded-xl border px-3.5 transition-colors ${
               isRunning
                 ? "border-[var(--accent)]/50 bg-[var(--bg-elevated)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)]/70"
@@ -2138,16 +2138,16 @@ export function SpeedTestPage({
               <>
                 <div className="flex min-w-0 flex-1 flex-col justify-center gap-1.5">
                   <div className="flex min-w-0 items-center gap-2 text-xs">
-                    <span className="cc-mono cc-tabular shrink-0 font-semibold text-[var(--accent)]">
+                    <span className="cc-mono cc-tabular shrink-0 whitespace-nowrap font-semibold text-[var(--accent)]">
                       已完成 {probeProgress.completed} / 总计 {probeProgress.total}
                     </span>
                     <span className="shrink-0 text-[var(--muted)]">·</span>
-                    <span className="truncate font-medium text-[var(--text)]">
+                    <span className="min-w-0 truncate font-medium text-[var(--text)]">
                       {probeProgress.currentNodeName
                         ? `正在测：${probeProgress.currentNodeName}`
                         : "正在准备独立测速通道…"}
                     </span>
-                    <span className="hidden shrink-0 text-[11px] text-[var(--muted)] xl:inline">
+                    <span className="hidden shrink-0 whitespace-nowrap text-[11px] text-[var(--muted)] xl:inline">
                       · 测速中已锁定行顺序，结束后自动按结果排序
                     </span>
                   </div>
@@ -2163,9 +2163,9 @@ export function SpeedTestPage({
                   type="button"
                   disabled={isPausing}
                   onClick={() => void handlePauseTest()}
-                  className="inline-flex shrink-0 items-center gap-1.5 rounded-xl bg-[var(--red)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:cursor-wait disabled:opacity-65"
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--red)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90 disabled:cursor-wait disabled:opacity-65"
                 >
-                  <Square className="h-3.5 w-3.5 fill-current" />
+                  <Square className="h-3.5 w-3.5 shrink-0 fill-current" />
                   <span>{isPausing ? "正在暂停并保存…" : "暂停（保留已测结果）"}</span>
                 </button>
               </>
@@ -2532,7 +2532,7 @@ export function SpeedTestPage({
               setPage(1);
             }}
             title="筛选谷歌未送中、AI 有解锁且高速的优质节点；未测上下行时自动按延迟最低排好候选"
-            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold transition-colors ${
+            className={`shrink-0 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11px] font-semibold transition-colors ${
               onlyGolden
                 ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]"
                 : "border-[var(--accent)]/45 bg-[var(--accent-soft)] text-[var(--accent)] hover:border-[var(--accent)]"
@@ -2547,7 +2547,7 @@ export function SpeedTestPage({
               setOnlyGoogleClean((v) => !v);
               setPage(1);
             }}
-            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+            className={`shrink-0 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
               onlyGoogleClean
                 ? "border-[var(--green)]/50 bg-[var(--green-soft)] text-[var(--green)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
@@ -2562,7 +2562,7 @@ export function SpeedTestPage({
               setOnlyAiUnlocked((v) => !v);
               setPage(1);
             }}
-            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+            className={`shrink-0 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
               onlyAiUnlocked
                 ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
@@ -2577,7 +2577,7 @@ export function SpeedTestPage({
               setOnlyTested((v) => !v);
               setPage(1);
             }}
-            className={`rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+            className={`shrink-0 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
               onlyTested
                 ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
@@ -2588,7 +2588,7 @@ export function SpeedTestPage({
 
           {/* Quick Sort Pills: Upload Fastest / Download Fastest / Lowest Latency */}
           <div
-            className="inline-flex items-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]"
+            className="inline-flex shrink-0 items-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]"
             role="group"
             aria-label="快捷排序"
           >
@@ -2612,7 +2612,7 @@ export function SpeedTestPage({
                     }
                     setPage(1);
                   }}
-                  className={`rounded-md px-2 py-1 font-medium transition-colors ${
+                  className={`shrink-0 whitespace-nowrap rounded-md px-2 py-1 font-medium transition-colors ${
                     active
                       ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
                       : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -2628,9 +2628,9 @@ export function SpeedTestPage({
             <button
               type="button"
               onClick={handleResetFilters}
-              className="inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--text)]"
+              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1.5 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--text)]"
             >
-              <RotateCcw className="h-3 w-3" />
+              <RotateCcw className="h-3 w-3 shrink-0" />
               <span>重置</span>
             </button>
           )}
@@ -2748,7 +2748,7 @@ export function SpeedTestPage({
                 <button
                   type="button"
                   onClick={() => setShareModalOpen(true)}
-                  className="inline-flex items-center gap-1 rounded-lg border border-[var(--accent)]/55 bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
+                  className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--accent)]/55 bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
                 >
                   <Package className="h-3 w-3 shrink-0" />
                   <span>导出已选 (.zip)</span>
@@ -2758,7 +2758,7 @@ export function SpeedTestPage({
                 type="button"
                 disabled={totalFiltered === 0}
                 onClick={handleSelectAllFiltered}
-                className="rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+                className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
               >
                 {allFilteredSelected ? "取消全选当前筛选" : "全选当前筛选"}
               </button>
@@ -2766,7 +2766,7 @@ export function SpeedTestPage({
                 type="button"
                 disabled={totalFiltered === 0}
                 onClick={handleSelectTop20}
-                className="rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+                className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
               >
                 选前 20 个
               </button>
@@ -2774,7 +2774,7 @@ export function SpeedTestPage({
                 type="button"
                 disabled={selectedCount === 0}
                 onClick={handleClearSelection}
-                className="rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--red)]/60 hover:text-[var(--red)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
+                className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--line-strong)]/70 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--red)]/60 hover:text-[var(--red)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:text-[var(--muted)] disabled:opacity-70"
               >
                 清空选择
               </button>
@@ -2807,7 +2807,7 @@ export function SpeedTestPage({
             modifierHeld ? "select-none" : ""
           }`}
         >
-          <table className="w-full table-fixed border-collapse text-left text-xs">
+          <table className="w-full min-w-[884px] table-fixed border-collapse text-left text-xs">
             <thead>
               <tr className="border-b border-[var(--line)] bg-[var(--bg-elevated)] text-[11px] text-[var(--muted)]">
                 <th className="w-8 px-2 py-2.5 text-center">
@@ -2823,27 +2823,52 @@ export function SpeedTestPage({
                 </th>
                 {(
                   [
-                    { key: "name", label: "节点名称", cls: "px-2" },
-                    { key: "source", label: "来源", cls: "w-[96px] px-1.5" },
-                    { key: "latency", label: "延迟", cls: "w-[88px] px-1.5" },
-                    { key: "up", label: "上传 (Mbps)", cls: "w-[82px] px-1.5", title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）" },
-                    { key: "down", label: "下载 (Mbps)", cls: "w-[86px] px-1.5", title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）" },
-                    { key: "google", label: "谷歌地区", cls: "w-[80px] px-1.5" },
-                    { key: "unlocks", label: "AI 解锁", cls: "w-[130px] px-1.5" },
-                  ] as ReadonlyArray<{ key: SortKey; label: string; cls: string; title?: string }>
+                    { key: "name", label: "节点名称", cls: "min-w-[178px] px-2" },
+                    { key: "source", label: "来源", cls: "w-[78px] px-1.5" },
+                    { key: "latency", label: "延迟", cls: "w-[68px] px-1.5" },
+                    {
+                      key: "up",
+                      label: "上传",
+                      sub: "Mbps",
+                      cls: "w-[68px] px-1",
+                      title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）",
+                    },
+                    {
+                      key: "down",
+                      label: "下载",
+                      sub: "Mbps",
+                      cls: "w-[70px] px-1",
+                      title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）",
+                    },
+                    { key: "google", label: "谷歌地区", cls: "w-[68px] px-1" },
+                    { key: "unlocks", label: "AI 解锁", cls: "w-[116px] px-1" },
+                  ] as ReadonlyArray<{
+                    key: SortKey;
+                    label: string;
+                    sub?: string;
+                    cls: string;
+                    title?: string;
+                  }>
                 ).map((col) => (
-                  <th key={col.key} className={`whitespace-nowrap py-2.5 font-medium ${col.cls}`} title={col.title}>
+                  <th
+                    key={col.key}
+                    className={`whitespace-nowrap py-2.5 font-medium ${col.cls}`}
+                    title={col.title}
+                  >
                     <button
                       type="button"
                       onClick={() => handleSort(col.key)}
-                      className="inline-flex items-center gap-0.5 whitespace-nowrap text-left transition-colors hover:text-[var(--text)]"
+                      className="inline-flex max-w-full items-center gap-0.5 whitespace-nowrap text-left transition-colors hover:text-[var(--text)]"
                     >
                       <span>{col.label}</span>
+                      {col.sub && (
+                        <span className="text-[9.5px] font-normal opacity-75">{col.sub}</span>
+                      )}
                       {renderSortIcon(col.key)}
                     </button>
                   </th>
                 ))}
-                <th className="w-[240px] whitespace-nowrap px-2 py-2.5 text-right font-medium">
+                <th className="w-[204px] whitespace-nowrap px-1.5 py-2.5 text-right font-medium">
                   操作
                 </th>
               </tr>
@@ -2974,7 +2999,7 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Source */}
-                      <td className="w-[96px] px-1.5 py-2">
+                      <td className="w-[84px] px-1.5 py-2">
                         <span
                           className="block truncate text-[11px] font-medium text-[var(--text-secondary)]"
                           title={`来源分组：${sourceName}（协议：${node.protocol.toUpperCase()}）`}
@@ -2984,7 +3009,7 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Latency */}
-                      <td className="w-[88px] px-1.5 py-2 cc-mono cc-tabular text-[11.5px]">
+                      <td className="w-[72px] px-1.5 py-2 cc-mono cc-tabular text-[11px]">
                         {isCooldown ? (
                           <div>
                             <span
@@ -3011,7 +3036,7 @@ export function SpeedTestPage({
                             </span>
                             {healthHint?.reason?.trim() && (
                               <div
-                                className="mt-0.5 max-w-[82px] truncate font-sans text-[9.5px] text-[var(--amber)]/90"
+                                className="mt-0.5 max-w-[60px] truncate font-sans text-[9.5px] text-[var(--amber)]/90"
                                 title={healthHint.reason.trim()}
                               >
                                 {healthHint.reason.trim()}
@@ -3080,13 +3105,13 @@ export function SpeedTestPage({
 
                       {/* Upload Speed */}
                       <td
-                        className="w-[82px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]"
+                        className="w-[72px] whitespace-nowrap px-1 py-2 cc-mono cc-tabular text-[11px]"
                         title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
                       >
                         {snap?.up_mbps !== null && snap?.up_mbps !== undefined ? (
                           <span className="font-semibold text-[var(--coral)]">
                             {snap.up_mbps.toFixed(1)}
-                            <span className="ml-0.5 text-[10px] font-normal text-[var(--muted)]">
+                            <span className="ml-0.5 text-[9.5px] font-normal text-[var(--muted)]">
                               Mbps
                             </span>
                           </span>
@@ -3097,7 +3122,7 @@ export function SpeedTestPage({
 
                       {/* Download Speed */}
                       <td
-                        className="w-[86px] whitespace-nowrap px-1.5 py-2 cc-mono cc-tabular text-[11.5px]"
+                        className="w-[74px] whitespace-nowrap px-1 py-2 cc-mono cc-tabular text-[11px]"
                         title="单位 Mbps（8 Mbps ≈ 1 MB/s）"
                       >
                         {snap?.down_mbps !== null && snap?.down_mbps !== undefined ? (
@@ -3105,7 +3130,7 @@ export function SpeedTestPage({
                             {snap.down_mbps >= 100
                               ? Math.round(snap.down_mbps)
                               : snap.down_mbps.toFixed(1)}
-                            <span className="ml-0.5 text-[10px] font-normal text-[var(--muted)]">
+                            <span className="ml-0.5 text-[9.5px] font-normal text-[var(--muted)]">
                               Mbps
                             </span>
                           </span>
@@ -3115,15 +3140,15 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Google Region Status */}
-                      <td className="w-[80px] whitespace-nowrap px-1.5 py-2">
+                      <td className="w-[68px] whitespace-nowrap px-1 py-2">
                         <div className="flex flex-col items-start gap-1">
                           {snap?.google_clean === true ? (
-                            <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10.5px] font-medium text-[var(--green)]">
+                            <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
                               <CheckCircle2 className="h-3 w-3 shrink-0" />
                               正常
                             </span>
                           ) : snap?.google_clean === false ? (
-                            <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10.5px] font-medium text-[var(--red)]">
+                            <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
                               <XCircle className="h-3 w-3 shrink-0" />
                               送中
                             </span>
@@ -3133,20 +3158,20 @@ export function SpeedTestPage({
 
                           {regionMismatch && (
                             <span
-                              className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[9.5px] text-[var(--amber)]"
+                              className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1 py-0.5 text-[9px] text-[var(--amber)]"
                               title="不同网站识别出的地区存在差异，仅供参考"
                             >
                               <AlertTriangle className="h-2.5 w-2.5 shrink-0" />
-                              地区有偏差
+                              地区偏差
                             </span>
                           )}
                         </div>
                       </td>
 
                       {/* AI Unlocks (2x2 compact micro-grid) */}
-                      <td className="w-[134px] px-1.5 py-2">
+                      <td className="w-[116px] px-1 py-2">
                         {hasUnlockData ? (
-                          <div className="grid w-[122px] grid-cols-2 gap-1">
+                          <div className="grid w-full grid-cols-2 gap-0.5">
                             {(
                               [
                                 { id: "gemini", label: "Gemini", ok: unlocks.gemini },
@@ -3157,7 +3182,7 @@ export function SpeedTestPage({
                             ).map((badge) => (
                               <span
                                 key={badge.id}
-                                className={`whitespace-nowrap rounded-md px-1 py-0.5 text-center text-[10px] font-medium leading-tight ${
+                                className={`truncate whitespace-nowrap rounded-md px-0.5 py-0.5 text-center text-[9.5px] font-medium leading-tight ${
                                   badge.ok
                                     ? "bg-[var(--green-soft)] text-[var(--green)]"
                                     : "bg-[var(--bg-elevated)] text-[var(--muted)] opacity-55"
@@ -3173,8 +3198,8 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Row Actions: Primary Single-Node Use + Compact Full Probe + Lightweight Latency / +Group */}
-                      <td className="w-[240px] whitespace-nowrap px-2 py-2 text-right">
-                        <div className="inline-flex flex-nowrap items-center justify-end gap-1">
+                      <td className="w-[204px] whitespace-nowrap px-1 py-2 text-right">
+                        <div className="inline-flex flex-nowrap items-center justify-end gap-0.5">
                           <button
                             type="button"
                             disabled={isSingleActiveNode || isSwitchingThis}
@@ -3192,16 +3217,16 @@ export function SpeedTestPage({
                                 ? `单节点在用中：${node.name}`
                                 : `用它（单节点）：${node.name}`
                             }
-                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap border px-2 py-1 text-[11px] font-semibold transition-colors ${
+                            className={`inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap border px-1.5 py-0.5 text-[10px] font-semibold transition-colors ${
                               isSingleActiveNode
                                 ? "rounded-full border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
                                 : "rounded-lg border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)] hover:bg-[var(--accent)] hover:text-[var(--accent-ink)] disabled:cursor-not-allowed disabled:opacity-65"
                             }`}
                           >
                             {isSingleActiveNode ? (
-                              <Check className="h-3 w-3 shrink-0" />
+                              <Check className="h-2.5 w-2.5 shrink-0" />
                             ) : (
-                              <ArrowRightLeft className="h-3 w-3 shrink-0" />
+                              <ArrowRightLeft className="h-2.5 w-2.5 shrink-0" />
                             )}
                             <span>
                               {isSingleActiveNode
@@ -3225,12 +3250,12 @@ export function SpeedTestPage({
                                 : "单测此节点的延迟、谷歌送中/AI 解锁与真实上下行速度，保留其它旧结果"
                             }
                             aria-label={`测全套：${node.name}`}
-                            className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--sky)]/45 bg-[var(--sky-soft)] px-1.5 py-1 text-[11px] font-medium text-[var(--sky)] transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-55"
+                            className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--sky)]/45 bg-[var(--sky-soft)] px-1 py-0.5 text-[10px] font-medium text-[var(--sky)] transition-opacity hover:opacity-85 disabled:cursor-not-allowed disabled:opacity-55"
                           >
                             {isProbingThis ? (
-                              <Loader2 className="h-3 w-3 shrink-0 animate-spin" />
+                              <Loader2 className="h-2.5 w-2.5 shrink-0 animate-spin" />
                             ) : (
-                              <Rocket className="h-3 w-3 shrink-0" />
+                              <Rocket className="h-2.5 w-2.5 shrink-0" />
                             )}
                             <span>{isProbingThis ? "测速中" : "测全套"}</span>
                           </button>
@@ -3248,7 +3273,7 @@ export function SpeedTestPage({
                                 : "只快速复测此节点延迟，不洗掉之前测好的上下行和解锁结果"
                             }
                             aria-label={`测延迟：${node.name}`}
-                            className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:opacity-65"
+                            className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-1 py-0.5 text-[10px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:opacity-65"
                           >
                             <Play className="h-2.5 w-2.5 shrink-0" />
                             <span>测延迟</span>

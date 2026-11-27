@@ -210,7 +210,7 @@ export function UpdateReadyModal() {
         aria-modal="true"
         aria-labelledby="cc-update-ready-title"
         onClick={(e) => e.stopPropagation()}
-        className="cc-surface relative flex max-h-[calc(100vh-32px)] w-full max-w-[540px] flex-col overflow-hidden rounded-3xl border border-[var(--line-strong)] text-[var(--text)] shadow-2xl"
+        className="cc-surface relative flex max-h-[calc(100vh-2rem)] w-full max-w-[540px] flex-col overflow-hidden rounded-3xl border border-[var(--line-strong)] text-[var(--text)] shadow-2xl"
       >
         {/* Top warm-gold accent rail */}
         <div
@@ -228,11 +228,11 @@ export function UpdateReadyModal() {
               </span>
               <h2
                 id="cc-update-ready-title"
-                className="mt-2 text-base font-bold tracking-tight text-[var(--text)] sm:text-[17px]"
+                className="mt-2 break-words text-base font-bold tracking-tight text-[var(--text)] sm:text-[17px]"
               >
                 {dict.updateModal.title}
               </h2>
-              <p className="mt-1 text-xs leading-relaxed text-[var(--text-secondary)]">
+              <p className="mt-1 break-words text-xs leading-relaxed text-[var(--text-secondary)]">
                 {dict.updateModal.subtitle}
               </p>
             </div>
@@ -312,7 +312,7 @@ export function UpdateReadyModal() {
           {pendingUpdate.kind === "installer_package" && pendingUpdate.is_elevated && (
             <div className="flex items-start gap-2 rounded-2xl border border-[var(--amber)]/40 bg-[var(--amber-soft)]/55 px-3.5 py-2.5 text-[11.5px] leading-relaxed text-[var(--text)]">
               <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0 text-[var(--amber)]" />
-              <span>{dict.updateModal.elevatedInstallerHint}</span>
+              <span className="min-w-0 flex-1 break-words">{dict.updateModal.elevatedInstallerHint}</span>
             </div>
           )}
 

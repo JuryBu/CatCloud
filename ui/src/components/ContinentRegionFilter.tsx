@@ -88,19 +88,17 @@ export function ContinentRegionFilter({
     ];
 
     return (
-      <div className={`flex flex-wrap items-center gap-2 ${className}`}>
+      <div className={`flex max-w-full flex-wrap items-center gap-2 ${className}`}>
         {/* 1. Continent Select */}
-        <div className="relative inline-flex items-center">
-          <Globe className="pointer-events-none absolute left-2.5 top-1/2 z-10 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-          <AppSelect
-            value={continent}
-            onChange={(val) => handleContinentSelect(val as ContinentId)}
-            options={continentOptions}
-            aria-label="按大洲筛选"
-            size="md"
-            buttonClassName="pl-8"
-          />
-        </div>
+        <AppSelect
+          value={continent}
+          onChange={(val) => handleContinentSelect(val as ContinentId)}
+          options={continentOptions}
+          aria-label="按大洲筛选"
+          size="md"
+          leadingIcon={<Globe className="h-3.5 w-3.5" />}
+          className="max-w-full"
+        />
 
         {/* 2. Country / Region Select (linked to selected continent) */}
         <AppSelect
@@ -109,6 +107,7 @@ export function ContinentRegionFilter({
           options={regionOptions}
           aria-label="按国家或地区筛选"
           size="md"
+          className="max-w-full"
         />
       </div>
     );
@@ -118,7 +117,7 @@ export function ContinentRegionFilter({
   const countryPills = continent === "all" ? [] : stats.regionsByContinent[continent] ?? [];
 
   return (
-    <div className={`space-y-2 ${className}`}>
+    <div className={`max-w-full space-y-2 ${className}`}>
       {/* Tier 1: Continents (全部 / 常用 / 亚洲 / 中东 / 欧洲 / 北美洲 / 南美洲 / 大洋洲 / 非洲 / 其他) */}
       <div className="flex flex-wrap items-center gap-1.5">
         <span className="mr-0.5 text-[11px] font-medium text-[var(--muted)]">大洲</span>
@@ -231,7 +230,7 @@ export function PaginationBar({
 
   return (
     <div
-      className={`flex flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--muted)] ${className}`}
+      className={`flex max-w-full flex-wrap items-center justify-between gap-2 text-[11px] text-[var(--muted)] ${className}`}
     >
       <div className="flex flex-wrap items-center gap-2">
         <span className="cc-mono">

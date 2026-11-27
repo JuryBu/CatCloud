@@ -126,10 +126,10 @@ mmrelay://v1/<URL_SAFE_BASE64_NO_PAD(JSON)>
 
 ### 两层嵌套多云负载均衡聚合与 `lazy: false`
 
-为兼顾多台国内云的并发带宽叠加与单台故障时的亚秒级容灾，CatCloud 对主内核、底层独立 443 隧道以及批量隔离测速统一采用**按物理云主机 IP 去重的两层嵌套编排**（调度策略由 `dispatch_strategy` 控制，支持 `auto` 默认 / `load_balance` / `fallback`；负载均衡算法由 `lb_strategy` 控制，支持 `round_robin` 默认 / `consistent_hashing`）：
+为兼顾多台国内云的并发带宽叠加与单台故障时的亚秒级容灾，CatCloud 对主内核、底层独立 443 隧道以及批量隔离测速统一采用**按物理云主机 IP 去重的两层嵌套编排**（调度策略由 `dispatch_strategy` 控制，支持 `auto` 默认 / `load_balance` / `fallback`；负载均衡算法由 `lb_strategy` 控制，支持 `consistent_hashing` 默认 / `round_robin`）：
 
 1. **按物理云主机 IP 去重选代表**：以规范化后的中继 `server` 地址作为物理主机键；同一台物理机若同时部署了多种协议（例如 TCP 443 `AnyTLS` + UDP 443 `Hysteria2`），每台物理机仅推选 1 条最高优先级流式传输代表（`anytls` / `trojan` / `vless` 等 TCP 协议优先于同机 `hysteria2` UDP）进入负载均衡池，避免同一台云服务器的 TCP 与 UDP 入口重复参与轮询、互相抢占同一张物理网卡。
-2. **内层多云负载均衡池（`⚖️ 预加速多云均衡`）**：当去重后的健康物理云主机数 `>= 2` 且 `dispatch_strategy` 为 `auto` 或 `load_balance` 时，编译器生成内层 `type: load-balance` 组（默认 `strategy: round-robin`，强制 `lazy: false` 与国内 204 探针，`interval: 15`，隔离测速 `10`），**仅纳入多台物理云代表，严禁将 `DIRECT` 放进 `load-balance`**（防止正常流量被随机轮询分流至直连）。Mihomo 会按国内 204 探活结果自动踢除失活物理机，在其余健康物理云之间继续聚合。
+2. **内层多云负载均衡池（`⚖️ 预加速多云均衡`）**：当去重后的健康物理云主机数 `>= 2` 且 `dispatch_strategy` 为 `auto` 或 `load_balance` 时，编译器生成内层 `type: load-balance` 组（默认 `strategy: consistent-hashing`，确保同主机长连接稳定锚定同一国内云 TCP 拥塞状态；强制 `lazy: false`、自适应 `expected-status` 与国内 204 探针，默认 `interval: 30`，夹紧区间 `20..=300`，双层外层保底 `>= 30s`，隔离测速 `10`），**仅纳入多台物理云代表，严禁将 `DIRECT` 放进 `load-balance`**（防止正常流量被随机轮询分流至直连）。Mihomo 会按国内 204 探活结果自动踢除失活物理机，在其余健康物理云之间继续聚合。
 3. **外层自动双活与最终兜底（`🔄 预加速自动双活`）**：外层 `type: fallback`（同样强制 `lazy: false`）按顺序编排为 `[⚖️ 预加速多云均衡, 同机其余协议备选..., DIRECT]`。当所有物理云主代表同时不可达时，先依次尝试同机备用协议，极端全挂场景下仍保留 `DIRECT` 兜底不断网。主选入口 `⚡ 国内预加速入口`（`type: select`）默认指向该自动组，同时在下方列出单条中转以便按需临时固定单线。当仅有 1 台物理云主机，或用户显式选择 `fallback` 调度模式时，自动退化为单层 `fallback([relays..., DIRECT])`。
 4. **批量隔离测速同步受惠**：数百节点的批量隔离测速同样使用两层嵌套池（`catcloud-probe-relay-lb` → `catcloud-probe-relay-pool` 含 `DIRECT` 兜底），将并发测速流量均摊到多台物理云，避免单机打满导致大面积误判超时。
 
@@ -221,8 +221,8 @@ catcloud config reload --json
 
 ## 9. 服务端性能调优与实测避坑要点
 
-1. **必须在线实刷主网卡 `fq` 队列调度**：仅在 `/etc/sysctl.d/` 写入 `net.core.default_qdisc = fq` 不会对开机前已初始化的 `eth0` 生效；若 `tc qdisc show dev eth0` 仍为 `pfifo_fast`，BBR 将失去 pacing 整形并显著放大并发丢包。在服务端执行 `tc qdisc replace dev <iface> root fq`（在线零断流）并注册开机 `systemd` 服务持久化，同时配合 `tcp_fastopen = 3`、`tcp_notsent_lowat = 16384` 与 `16 MiB` TCP 缓冲区。
-2. **客户端 `tfo: true` 与 `AnyTLS` 连接池**：CatCloud 编译国内 443 中转时已自动启用 `tfo: true`，并为 `AnyTLS` 自动注入空闲连接池参数（`min-idle-session: 2`），显著降低短并发握手超时；宽带放行国内 UDP 443 时可在同机房 `UDP 443` 并行部署 `Hysteria2` 彻底消除 TCP-over-TCP 拥塞。
+1. **必须在线实刷主网卡 `fq` 队列调度（且不开启 TFO）**：仅在 `/etc/sysctl.d/` 写入 `net.core.default_qdisc = fq` 不会对开机前已初始化的 `eth0` 生效；若 `tc qdisc show dev eth0` 仍为 `pfifo_fast`，BBR 将失去 pacing 整形并显著放大并发丢包。在服务端执行 `tc qdisc replace dev <iface> root fq`（在线零断流）并注册开机 `systemd` 服务持久化，同时配合 `tcp_notsent_lowat = 16384` 与 `16 MiB` TCP 缓冲区；服务端 `sing-box` `AnyTLS` 入站禁止启用 `tcp_fast_open`（AnyTLS 官方明确不兼容 TFO，开启 TFO 会导致国内云首包建连超时卡顿）。
+2. **客户端抗断流默认传输参数与 `AnyTLS` 会话治理**：CatCloud 编译国内 443 中转时已全量关闭 TFO（`AnyTLS`/`Trojan`/`VLESS` 均强制 `tfo: false`），并将 `AnyTLS` 空闲会话池设为 `min-idle-session: 0`（避免中间 NAT 半关闭残留僵尸空闲会话拖死后续重试），同时默认启用 `keep-alive-idle: 45` / `keep-alive-interval: 15`、开启 `dialer-proxy` 时自动将 TUN 有效 MTU 钳降至 `<= 1400`、多云负载均衡默认 `consistent-hashing` 并为国内 204 探针自动写入 `expected-status`；宽带放行国内 UDP 443 时可在同机房 `UDP 443` 并行部署 `Hysteria2` 彻底消除 TCP-over-TCP 拥塞。
 3. **单层 TLS 优先与多云聚合边界把控**：外层 443 中转已有完整 TLS 加密，内层优先搭配 `Shadowsocks` 等轻量非 443 海外节点避免双重 TLS 分片损耗；拥有 2 台及以上健康物理云主机时，默认两层嵌套调度（内层 `load-balance` 按物理机 IP 去重聚合 + 外层 `fallback` 保留同机协议备选与 `DIRECT` 兜底）可将多流并发、批量测速与多人共享总吞吐叠加为多台物理机带宽之和，但**单条 TCP 长连接仍受单台物理机与本地宽带上限约束**；若其中某台备机出现持续丢包或高抖动，可随时一键切回单线主备（`fallback`）防止木桶效应。
 
 ---
@@ -263,3 +263,39 @@ node scripts/relay/rotate_relay_secrets.mjs \
 # 示例时间戳请替换为轮换输出中的真实目录名
 sudo bash /etc/catcloud-relay/backups/rotate-<YYYYMMDDTHHMMSSZ>/rollback.sh
 ```
+
+---
+
+## 11. 透明网关 / 软路由标准导出与纯自写规则模式
+
+对于已在 OpenWrt（OpenClash / Nikki / ShellCrash）或 Linux 旁路由上自维护 Mihomo 透明网关与自定义规则的高级用户，CatCloud 提供无侵入的标准化导出与纯自写规则模式，既可仅摘取国内 `:443` 提速中转片段接入现有配置，也可一键导出可直接部署的透明网关完整配置。
+
+### 11.1 三种导出 Profile 与 CLI 命令
+
+CLI 命令默认**强制脱敏**（所有中转/节点公私网 IP、密码、UUID 与控制口密钥均自动掩码，适合审阅或发给 AI 辅助排错）；准备实际部署到路由器时，显式追加 `--reveal-secrets` 即可输出完整明文 YAML：
+
+```bash
+# 1. 仅导出国内 443 中转标准 Mihomo 片段（含 proxies / proxy-groups / 防环 rules / dns.fake-ip-filter）
+catcloud config export-gateway --profile relay-fragment --json
+catcloud config export-gateway --profile relay-fragment --reveal-secrets --output ./preaccel-fragment.yaml
+
+# 2. 导出 OpenWrt / Linux 旁路由完整透明网关配置（自动开启 allow-lan / TPROXY / REDIR / 0.0.0.0 DNS 并关闭桌面 TUN）
+catcloud config export-gateway --profile transparent-gateway \
+  --tproxy-port 7893 --redir-port 7892 --dns-port 1053 \
+  --reveal-secrets --output ./gateway-config.yaml
+
+# 3. 导出优选业务节点（按健康与当前选中优先排序，提速启用时保留 dialer-proxy）+ 国内中转防环片段
+catcloud config export-gateway --profile preferred-nodes --reveal-secrets --output ./preferred-nodes.yaml
+```
+
+- **`relay-fragment`（最适合已有自维护透明网关配置）**：复用 CatCloud 已调优的抗断流参数（`AnyTLS`/`Trojan`/`VLESS` 强制 `tfo: false`、`AnyTLS` `min-idle-session: 0`、国内 204 探针 `expected-status` 与多云 `consistent-hashing` 双活组）。合并进你现有 Mihomo 配置后，仅需在想走提速的非 443 海外节点下新增一行即可生效：
+  ```yaml
+  dialer-proxy: ⚡ 国内预加速入口
+  ```
+- **`transparent-gateway`（旁路由整包导出）**：自动覆盖 `allow-lan: true`、`bind-address: "*"`、`tproxy-port`（默认 `7893`）、`redir-port`（默认 `7892`）、`dns.listen: 0.0.0.0:<dns-port>`（默认 `1053`）并强制关闭桌面虚拟网卡 `tun.enable: false`，同时完整保留国内 443 提速、防环规则、用户自写规则与 `rule-providers`。
+- **`preferred-nodes`（按需摘取优选节点）**：优先排布当前选中与分组内优选业务节点，在启用国内提速时自动附带中转与防环片段并保留对应非 443 节点的 `dialer-proxy`。
+
+### 11.2 纯自写规则模式与内联 YAML / `rule-providers` 覆写
+
+- **纯自写规则模式（`rules_override.custom_rules_only: true`）**：仅保留必不可少的中转/探针防环规则、探测进程白名单与局域网私有网段直连防环；跳过内置海外 QUIC 拦截、多选组自动生成的 `match_rules`、内置国内直连域名表 / `GEOSITE,cn` / `GEOIP,CN` 以及内置 AI DNS 策略覆写。完整保留用户自写的前置/后置规则；若用户规则中已显式包含 `MATCH,...` 兜底规则则 100% 尊重用户配置，不再追加默认 `MATCH`。
+- **内联 YAML Merge Patch 覆写（`rules_override.inline_override_yaml`）**：支持直接粘贴 `rule-providers:`、`rules:` 或 `dns:` 片段（上限 `1 MiB`），无需额外在磁盘维护外部文件即可在编译与透明网关导出时合并生效；静态校验器自动放行 `RULE-SET,<name>,<target>`，若规则引用了未在 `rule-providers` 中定义的名称会给出清晰中文预警而不中断运行。

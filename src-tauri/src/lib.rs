@@ -386,6 +386,9 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::validate_formula_expr,
             commands::evaluate_multi_group,
             commands::compile_preview_yaml,
+            commands::export_gateway_yaml,
+            commands::save_gateway_yaml_dialog,
+            commands::parse_bulk_rules_preview,
             commands::import_mmrelay_input,
             commands::scan_local_migrations,
             commands::scan_migration_path,
@@ -1177,6 +1180,25 @@ fn format_trigger_reason(trigger: WatchdogFailoverTrigger) -> String {
             format!("当前节点连续 {degraded_rounds} 轮对 {failed_source} 单源超时（持续半残）")
         }
     }
+}
+
+/// Resolve `(close_old_override, keep_existing_connections)` for multi-group watchdog failover:
+/// - `SustainedDegraded` (partial outage) always preserves live streams (`Some(false)`, `true`).
+/// - `TotalOutage` strictly preserves the group's `SwitchMode::{ForceCloseOld, GracefulNewOnly}`
+///   policy without mutating or simplifying user-selected switch semantics.
+fn resolve_watchdog_switch_close_policy(
+    trigger: WatchdogFailoverTrigger,
+    switch_mode: &SwitchMode,
+) -> (Option<bool>, bool) {
+    let close_old_override = match trigger {
+        WatchdogFailoverTrigger::SustainedDegraded { .. } => Some(false),
+        WatchdogFailoverTrigger::TotalOutage { .. } => None,
+    };
+    let keep_existing_connections = match close_old_override {
+        Some(close_old) => !close_old,
+        None => matches!(switch_mode, SwitchMode::GracefulNewOnly),
+    };
+    (close_old_override, keep_existing_connections)
 }
 
 /// Build per-candidate decision traces across every enabled member in `group`, recording why each
@@ -2194,19 +2216,11 @@ fn spawn_group_strategy_watchdog(app: &tauri::AppHandle) {
                                     } else {
                                         // Guard #5: smooth migration on partial degradation never
                                         // force-kills live streams; total outage respects group's switch_mode.
-                                        let close_old_override = match trigger {
-                                            WatchdogFailoverTrigger::SustainedDegraded { .. } => {
-                                                Some(false)
-                                            }
-                                            WatchdogFailoverTrigger::TotalOutage { .. } => None,
-                                        };
-                                        let keep_existing_connections = match close_old_override {
-                                            Some(close_old) => !close_old,
-                                            None => matches!(
-                                                latest_group.switch_mode,
-                                                SwitchMode::GracefulNewOnly
-                                            ),
-                                        };
+                                        let (close_old_override, keep_existing_connections) =
+                                            resolve_watchdog_switch_close_policy(
+                                                trigger,
+                                                &latest_group.switch_mode,
+                                            );
                                         let switch_res = commands::select_group_node_in_place_internal(
                                             &app_h,
                                             &st,
@@ -3502,5 +3516,62 @@ mod tests {
                 "--restarting".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn watchdog_switch_policy_preserves_both_switch_modes_and_failure_threshold_floor() {
+        use catcloud_core::models::TriggerRule;
+
+        let degraded = WatchdogFailoverTrigger::SustainedDegraded {
+            degraded_rounds: 4,
+            failed_source: "Google",
+        };
+        let outage = WatchdogFailoverTrigger::TotalOutage { fail_count: 2 };
+
+        // Partial degradation always keeps existing live connections regardless of switch_mode.
+        assert_eq!(
+            resolve_watchdog_switch_close_policy(degraded, &SwitchMode::ForceCloseOld),
+            (Some(false), true)
+        );
+        assert_eq!(
+            resolve_watchdog_switch_close_policy(degraded, &SwitchMode::GracefulNewOnly),
+            (Some(false), true)
+        );
+
+        // Total outage strictly preserves both SwitchMode options without regression.
+        assert_eq!(
+            resolve_watchdog_switch_close_policy(outage, &SwitchMode::ForceCloseOld),
+            (None, false)
+        );
+        assert_eq!(
+            resolve_watchdog_switch_close_policy(outage, &SwitchMode::GracefulNewOnly),
+            (None, true)
+        );
+
+        // SwitchMode serialization contract remains untouched.
+        assert_eq!(
+            serde_json::to_string(&SwitchMode::ForceCloseOld).unwrap(),
+            "\"force_close_old\""
+        );
+        assert_eq!(
+            serde_json::to_string(&SwitchMode::GracefulNewOnly).unwrap(),
+            "\"graceful_new_only\""
+        );
+
+        // Failure threshold guard stays clamped at >= 2.
+        let mut group = MultiGroup::default();
+        assert!(commands::group_watchdog_failure_threshold(&group) >= 2);
+        group.trigger_rules = vec![TriggerRule {
+            expr: "ok == 0".to_string(),
+            consecutive_failures: 1,
+            bypass_cooldown_on_disconnect: true,
+        }];
+        assert_eq!(commands::group_watchdog_failure_threshold(&group), 2);
+        group.trigger_rules = vec![TriggerRule {
+            expr: "ok == 0".to_string(),
+            consecutive_failures: 3,
+            bypass_cooldown_on_disconnect: true,
+        }];
+        assert_eq!(commands::group_watchdog_failure_threshold(&group), 3);
     }
 }

@@ -2,8 +2,11 @@ use anyhow::{Context, Result};
 use catcloud_core::agent_docs;
 use catcloud_core::config::{self, ConfigValidationIssue, ValidationSeverity};
 use catcloud_core::core_adapter::config_compiler::{
-    CompileInput, StaticCheckIssue, StaticValidationReport,
-    compile_mihomo_config_with_runtime_dir, validate_compiled_yaml,
+    CompileInput, DEFAULT_FALLBACK_GROUP_NAME, GatewayExportOptions, GatewayExportOutput,
+    GatewayExportProfile, PREACCEL_SELECT_GROUP_NAME, PreAccelTransportDiagnostics,
+    SINGLE_NODE_GROUP_NAME, StaticCheckIssue, StaticValidationReport,
+    build_preaccel_transport_diagnostics, compile_mihomo_config_with_runtime_dir,
+    export_gateway_yaml, validate_compiled_yaml,
 };
 use catcloud_core::core_adapter::dns_diag::{
     DNS_TLS_STATUS_CERT_FAILED, DNS_TLS_STATUS_DEGRADED_RECOVERED, DnsTlsDiagnostics,
@@ -664,7 +667,7 @@ pub enum PreaccelCommand {
         /// Multi-cloud dispatch strategy: auto | load_balance | fallback
         #[arg(long)]
         dispatch_strategy: Option<String>,
-        /// Inner load-balance strategy: round_robin | consistent_hashing
+        /// Inner load-balance strategy: consistent_hashing | round_robin
         #[arg(long)]
         lb_strategy: Option<String>,
     },
@@ -698,6 +701,27 @@ pub enum ConfigCommand {
         #[arg(long)]
         output: Option<PathBuf>,
         /// Reveal plaintext proxy credentials and controller secret (default: redacted)
+        #[arg(long)]
+        reveal_secrets: bool,
+    },
+    /// Export Mihomo YAML for transparent gateway / soft-router or domestic :443 relay fragment (redacted by default)
+    ExportGateway {
+        /// Export profile: relay-fragment | transparent-gateway | preferred-nodes
+        #[arg(long, default_value = "relay-fragment")]
+        profile: String,
+        /// TPROXY listening port for transparent-gateway profile
+        #[arg(long, default_value_t = 7893)]
+        tproxy_port: u16,
+        /// REDIR listening port for transparent-gateway profile
+        #[arg(long, default_value_t = 7892)]
+        redir_port: u16,
+        /// DNS listening port for transparent-gateway profile (binds 0.0.0.0)
+        #[arg(long, default_value_t = 1053)]
+        dns_port: u16,
+        /// Optional output path to write the exported YAML atomically
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Reveal plaintext relay/node credentials, IPs, and controller secret (default: redacted)
         #[arg(long)]
         reveal_secrets: bool,
     },
@@ -900,88 +924,7 @@ fn parse_group_match_rules_arg(raw: &str) -> Vec<String> {
 pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Status => {
-            let cfg = config::load_or_init(paths)?;
-            let db = open_storage(paths)?;
-            let plat = default_platform();
-            let caps = plat.capabilities();
-            let mihomo_bin = resolve_mihomo_binary(&cfg, paths, &[], false)
-                .ok()
-                .and_then(|r| r.path);
-            let tun_configured = cfg.tun.enabled;
-            let active_ports = inspect_active_core_ports(paths, &cfg).await;
-            let (tun_enabled, tun_needs_elevation, tun_runtime_source) =
-                resolve_cli_effective_tun_state_with_probe(
-                    &cfg,
-                    &caps,
-                    mihomo_bin.as_deref(),
-                    &active_ports,
-                )
-                .await;
-            let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
-            let sub_count = db.list_subscriptions()?.len();
-            let node_count = db.list_nodes()?.len();
-            let group_count = db.list_multi_groups()?.len();
-            let relay_count = db.list_preaccel_relays(false)?.len();
-            let probe_count = db.list_probe_definitions()?.len();
-            let eff_mixed = active_ports.effective_mixed_port;
-            let eff_ctrl = active_ports.effective_controller_port;
-            let eff_dns = active_ports.effective_dns_port;
-            let out = json!({
-                "ok": true,
-                "sanitized": true,
-                "version": env!("CARGO_PKG_VERSION"),
-                "data_dir": redact_path_for_display(&paths.root_data_dir.to_string_lossy()),
-                "is_portable": paths.is_portable,
-                "instance_hash": paths.instance_hash,
-                "platform": caps,
-                "core_running": active_ports.core_running,
-                "core_version": &active_ports.core_version,
-                "proxy_mode": cfg.proxy_mode,
-                "system_proxy_enabled": cfg.system_proxy.enabled,
-                "tun_enabled": tun_enabled,
-                "tun_configured": tun_configured,
-                "tun_needs_elevation": tun_needs_elevation,
-                "tun_source": tun_runtime_source,
-                "mixed_port": eff_mixed,
-                "controller_addr": format_host_port(&active_ports.endpoint.host, eff_ctrl),
-                "dns_listen_addr": format_host_port(&cfg.dns_listen_host, eff_dns),
-                "ports": active_ports.to_status_json(),
-                "preaccel_enabled": cfg.preaccel.enabled,
-                "global_preaccel": {
-                    "enabled": cfg.preaccel.global_bypass_enabled,
-                    "scope": cfg.preaccel.global_scope,
-                    "windivert_available": wd_files.is_some(),
-                    "windivert_path": wd_files.as_ref().map(|(dll, _)| redact_path_for_display(&dll.to_string_lossy())),
-                    "is_elevated": caps.is_elevated,
-                },
-                "counts": {
-                    "subscriptions": sub_count,
-                    "nodes": node_count,
-                    "multi_groups": group_count,
-                    "preaccel_relays": relay_count,
-                    "probes": probe_count,
-                }
-            });
-            let tun_summary = if tun_needs_elevation {
-                "needs_elevation"
-            } else if tun_enabled {
-                "true"
-            } else {
-                "false"
-            };
-            let human = format!(
-                "CatCloud CLI v{} | core_running={} | portable={} | mode={} | port={} | tun={} | nodes={} | groups={} | global_preaccel={} (windivert={})",
-                env!("CARGO_PKG_VERSION"),
-                active_ports.core_running,
-                paths.is_portable,
-                cfg.proxy_mode.as_str(),
-                eff_mixed,
-                tun_summary,
-                node_count,
-                group_count,
-                cfg.preaccel.global_bypass_enabled,
-                wd_files.is_some()
-            );
+            let (out, human) = build_status_payload(paths).await?;
             emit_output(as_json, &out, &human)
         }
 
@@ -2273,6 +2216,27 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 output,
                 reveal_secrets,
             } => execute_config_compile(paths, as_json, output, reveal_secrets).await,
+
+            ConfigCommand::ExportGateway {
+                profile,
+                tproxy_port,
+                redir_port,
+                dns_port,
+                output,
+                reveal_secrets,
+            } => {
+                execute_config_export_gateway(
+                    paths,
+                    as_json,
+                    &profile,
+                    tproxy_port,
+                    redir_port,
+                    dns_port,
+                    output,
+                    reveal_secrets,
+                )
+                .await
+            }
 
             ConfigCommand::ExportEnv { shell } => {
                 let cfg = config::load_or_init(paths)?;
@@ -6779,6 +6743,118 @@ async fn execute_config_compile(
     }
 }
 
+fn parse_gateway_export_profile(raw: &str) -> Result<GatewayExportProfile> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "relay-fragment" | "relay_fragment" | "relay" => Ok(GatewayExportProfile::RelayFragment),
+        "transparent-gateway" | "transparent_gateway" | "gateway" => {
+            Ok(GatewayExportProfile::TransparentGateway)
+        }
+        "preferred-nodes" | "preferred_nodes" | "nodes" => Ok(GatewayExportProfile::PreferredNodes),
+        other => anyhow::bail!(
+            "unsupported gateway export profile `{other}` (expected: relay-fragment, transparent-gateway, preferred-nodes)"
+        ),
+    }
+}
+
+fn build_config_export_gateway_result(
+    paths: &AppPaths,
+    profile_raw: &str,
+    tproxy_port: u16,
+    redir_port: u16,
+    dns_port: u16,
+    reveal_secrets: bool,
+) -> Result<GatewayExportOutput> {
+    let profile = parse_gateway_export_profile(profile_raw)?;
+    let cfg = config::load_or_init(paths)?;
+    let db = open_storage(paths)?;
+    let nodes = db.list_nodes()?;
+    let groups = db.list_multi_groups()?;
+    let relays = db.list_preaccel_relays(false)?;
+    let opts = GatewayExportOptions {
+        profile,
+        tproxy_port,
+        redir_port,
+        dns_listen_port: dns_port,
+        redact_secrets: !reveal_secrets,
+    };
+    let exported = export_gateway_yaml(
+        &cfg,
+        &nodes,
+        &groups,
+        &relays,
+        Some(&paths.runtime_dir),
+        &opts,
+    )?;
+    Ok(exported)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_config_export_gateway(
+    paths: &AppPaths,
+    as_json: bool,
+    profile: &str,
+    tproxy_port: u16,
+    redir_port: u16,
+    dns_port: u16,
+    output: Option<PathBuf>,
+    reveal_secrets: bool,
+) -> Result<()> {
+    let exported = build_config_export_gateway_result(
+        paths,
+        profile,
+        tproxy_port,
+        redir_port,
+        dns_port,
+        reveal_secrets,
+    )?;
+    if let Some(path) = output {
+        AppPaths::atomic_write(&path, exported.yaml.as_bytes())?;
+        let file_sha256 = compute_file_sha256(&path)?;
+        let display_path = redact_path_for_display(&path.to_string_lossy());
+        let out = json!({
+            "ok": true,
+            "sanitized": exported.redacted,
+            "redacted": exported.redacted,
+            "profile": exported.profile,
+            "output": &display_path,
+            "sha256": file_sha256,
+            "relay_count": exported.relay_count,
+            "node_count": exported.node_count,
+            "rule_count": exported.rule_count,
+            "warnings": &exported.warnings,
+            "integration_hint": &exported.integration_hint,
+        });
+        emit_output(
+            as_json,
+            &out,
+            &format!(
+                "Wrote gateway YAML (profile={:?}, redacted={}) to {}. {}",
+                exported.profile, exported.redacted, display_path, exported.integration_hint
+            ),
+        )
+    } else if as_json {
+        emit_output(
+            true,
+            &json!({
+                "ok": true,
+                "sanitized": exported.redacted,
+                "redacted": exported.redacted,
+                "profile": exported.profile,
+                "yaml": &exported.yaml,
+                "relay_count": exported.relay_count,
+                "node_count": exported.node_count,
+                "rule_count": exported.rule_count,
+                "warnings": &exported.warnings,
+                "integration_hint": &exported.integration_hint,
+            }),
+            "",
+        )
+    } else {
+        println!("{}", exported.yaml);
+        Ok(())
+    }
+}
+
 async fn run_config_reload_inner(
     paths: &AppPaths,
     dry_run: bool,
@@ -7900,6 +7976,17 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
     let security_products = detect_host_security_products();
     let preaccel_plan = build_preaccel_compile_plan(&cfg.preaccel, &relays, &nodes);
+    let transport_snap = collect_cli_preaccel_transport_snapshot(
+        paths,
+        &cfg,
+        &nodes,
+        &groups,
+        &relays,
+        &active_ports,
+        tun_effective_enabled,
+        compile_stats.as_ref().map(|s| s.effective_tun_mtu),
+    )
+    .await;
     let preaccel_status = match &preaccel_plan {
         Err(_) => {
             recommendations.push(
@@ -7955,6 +8042,10 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             "detected_security_products": security_products,
             "plan_error": preaccel_plan.as_ref().err().map(|e| sanitize_log_line(&e.to_string())),
             "plan_warnings": preaccel_plan.as_ref().map(|p| p.warnings.iter().map(|w| sanitize_log_line(w)).collect::<Vec<_>>()).unwrap_or_default(),
+            "transport_diagnostics": &transport_snap.diagnostics,
+            "active_relay_selected": &transport_snap.active_relay_selected,
+            "active_exit_selected": &transport_snap.active_exit_selected,
+            "runtime_config_sha256": &transport_snap.runtime_config_sha256,
         }
     }));
 
@@ -8161,6 +8252,10 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             "warn": warn_count,
             "fail": fail_count,
         },
+        "preaccel_transport_diagnostics": &transport_snap.diagnostics,
+        "active_relay_selected": &transport_snap.active_relay_selected,
+        "active_exit_selected": &transport_snap.active_exit_selected,
+        "runtime_config_sha256": &transport_snap.runtime_config_sha256,
         "checks": &checks,
         "recommendations": &recommendations,
     });
@@ -8892,6 +8987,437 @@ fn resolve_effective_preaccel_carrier(
     }
 
     ("off", false, false, "off")
+}
+
+#[derive(Debug, Clone)]
+struct CliPreAccelTransportSnapshot {
+    diagnostics: PreAccelTransportDiagnostics,
+    active_relay_selected: Option<String>,
+    active_exit_selected: Option<String>,
+    runtime_config_sha256: Option<String>,
+}
+
+fn read_tun_mtu_from_runtime_yaml(runtime_yaml_path: &Path) -> Option<u16> {
+    catcloud_core::core_adapter::hot_reload::read_runtime_yaml_tun_mtu(runtime_yaml_path)
+}
+
+fn estimate_effective_tun_mtu(
+    cfg: &AppConfig,
+    relays: &[PreAccelRelay],
+    nodes: &[ProxyNode],
+) -> u16 {
+    let enabled_relays: Vec<&PreAccelRelay> = relays.iter().filter(|r| r.enabled).collect();
+    if !cfg.preaccel.enabled || enabled_relays.is_empty() {
+        return cfg.tun.mtu;
+    }
+    let relays_support_ipv6 = enabled_relays.iter().all(|r| r.supports_ipv6);
+    let has_dialer_wrapped = nodes.iter().any(|node| {
+        if !node.enabled || !node.should_apply_preaccel(cfg.preaccel.skip_443_native) {
+            return false;
+        }
+        let skip_for_ipv6 =
+            !relays_support_ipv6 && is_ipv6_only_node(node) && node.preaccel_override != Some(true);
+        !skip_for_ipv6
+    });
+    if has_dialer_wrapped {
+        cfg.tun.mtu.min(1400)
+    } else {
+        cfg.tun.mtu
+    }
+}
+
+fn decode_http_chunked_body(raw: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < raw.len() {
+        let rel_crlf = raw[cursor..].windows(2).position(|w| w == b"\r\n")?;
+        let size_line = std::str::from_utf8(&raw[cursor..cursor + rel_crlf]).ok()?;
+        let size_hex = size_line.split(';').next()?.trim();
+        let chunk_len = usize::from_str_radix(size_hex, 16).ok()?;
+        cursor += rel_crlf + 2;
+        if chunk_len == 0 {
+            return Some(out);
+        }
+        if cursor.checked_add(chunk_len)?.checked_add(2)? > raw.len() {
+            return None;
+        }
+        out.extend_from_slice(&raw[cursor..cursor + chunk_len]);
+        cursor += chunk_len + 2;
+    }
+    Some(out)
+}
+
+fn resolve_proxy_chain_now(
+    proxies: &serde_json::Map<String, Value>,
+    start_group: &str,
+) -> Option<String> {
+    let mut current = start_group.trim();
+    if current.is_empty() {
+        return None;
+    }
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut selected: Option<String> = None;
+
+    for _ in 0..8 {
+        if !visited.insert(current.to_string()) {
+            break;
+        }
+        let Some(entry) = proxies.get(current) else {
+            break;
+        };
+        let Some(next) = entry
+            .get("now")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            break;
+        };
+        selected = Some(next.to_string());
+        let next_has_now = proxies
+            .get(next)
+            .and_then(|v| v.get("now"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if next_has_now {
+            current = next;
+        } else {
+            break;
+        }
+    }
+
+    selected
+}
+
+async fn query_live_controller_selected_proxies(
+    ep: &ResolvedControllerEndpoint,
+    cfg: &AppConfig,
+    groups: &[MultiGroup],
+    live_mode: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    const MAX_PROXIES_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+    let connect_host = match ep.host.trim() {
+        "" | "0.0.0.0" | "*" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        other => other.trim_start_matches('[').trim_end_matches(']'),
+    };
+    let host_header = format_host_port(connect_host, ep.port);
+    let auth_header = if ep.secret.trim().is_empty() {
+        String::new()
+    } else {
+        format!("Authorization: Bearer {}\r\n", ep.secret.trim())
+    };
+    let request = format!(
+        "GET /proxies HTTP/1.1\r\nHost: {host_header}\r\n{auth_header}Accept: application/json\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+    );
+
+    let raw_resp = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut stream = TcpStream::connect((connect_host, ep.port)).await.ok()?;
+        stream.write_all(request.as_bytes()).await.ok()?;
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut chunk).await.ok()?;
+            if n == 0 {
+                break;
+            }
+            if buf.len().saturating_add(n) > MAX_PROXIES_RESPONSE_BYTES {
+                return None;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        Some(buf)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some(raw) = raw_resp else {
+        return (None, None);
+    };
+    let Some(header_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return (None, None);
+    };
+    let headers_str = String::from_utf8_lossy(&raw[..header_end]);
+    let status_ok = headers_str
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .is_some_and(|code| (200..300).contains(&code));
+    if !status_ok {
+        return (None, None);
+    }
+
+    let is_chunked = headers_str.lines().any(|line| {
+        line.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("transfer-encoding")
+                && v.to_ascii_lowercase().contains("chunked")
+        })
+    });
+    let raw_body = &raw[header_end + 4..];
+    let decoded_body;
+    let body_bytes: &[u8] = if is_chunked {
+        let Some(decoded) = decode_http_chunked_body(raw_body) else {
+            return (None, None);
+        };
+        decoded_body = decoded;
+        &decoded_body
+    } else {
+        raw_body
+    };
+
+    let Ok(parsed) = serde_json::from_slice::<Value>(body_bytes) else {
+        return (None, None);
+    };
+    let Some(proxies) = parsed.get("proxies").and_then(Value::as_object) else {
+        return (None, None);
+    };
+
+    let active_relay_selected = resolve_proxy_chain_now(proxies, PREACCEL_SELECT_GROUP_NAME);
+
+    let is_global_mode = live_mode
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| m.eq_ignore_ascii_case("global"))
+        .unwrap_or(cfg.proxy_mode == ProxyMode::Global);
+
+    let mut exit_candidates: Vec<String> = Vec::new();
+    if is_global_mode {
+        exit_candidates.push("GLOBAL".to_string());
+    }
+    if cfg.route_mode == RouteTargetMode::Single {
+        exit_candidates.push(SINGLE_NODE_GROUP_NAME.to_string());
+    }
+    if let Some(active_gid) = cfg
+        .active_group_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if let Some(group) = groups.iter().find(|g| g.id.trim() == active_gid) {
+            let gname = if group.name.trim().is_empty() {
+                group.id.trim()
+            } else {
+                group.name.trim()
+            };
+            if !gname.is_empty() {
+                exit_candidates.push(gname.to_string());
+            }
+        }
+    }
+    if let Some(first_group) = groups.first() {
+        let gname = if first_group.name.trim().is_empty() {
+            first_group.id.trim()
+        } else {
+            first_group.name.trim()
+        };
+        if !gname.is_empty() && !exit_candidates.iter().any(|c| c == gname) {
+            exit_candidates.push(gname.to_string());
+        }
+    }
+    for fallback_name in [
+        DEFAULT_FALLBACK_GROUP_NAME,
+        SINGLE_NODE_GROUP_NAME,
+        "GLOBAL",
+    ] {
+        if !exit_candidates.iter().any(|c| c == fallback_name) {
+            exit_candidates.push(fallback_name.to_string());
+        }
+    }
+
+    let active_exit_selected = exit_candidates
+        .iter()
+        .find_map(|group_name| resolve_proxy_chain_now(proxies, group_name));
+
+    (active_relay_selected, active_exit_selected)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_cli_preaccel_transport_snapshot(
+    paths: &AppPaths,
+    cfg: &AppConfig,
+    nodes: &[ProxyNode],
+    groups: &[MultiGroup],
+    relays: &[PreAccelRelay],
+    active_ports: &ActiveCorePortState,
+    tun_enabled: bool,
+    compiled_effective_tun_mtu: Option<u16>,
+) -> CliPreAccelTransportSnapshot {
+    let has_enabled_relays = relays.iter().any(|r| r.enabled);
+    let live_mode = active_ports
+        .live_config
+        .as_ref()
+        .map(|lc| lc.mode.as_str());
+    let is_direct_mode = live_mode
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| m.eq_ignore_ascii_case("direct"))
+        .unwrap_or(cfg.proxy_mode == ProxyMode::Direct);
+    let raw_meta = read_global_preaccel_runtime_meta(&paths.root_data_dir);
+    let standalone_pid_alive = raw_meta.as_ref().is_some_and(is_live_global_preaccel_pid);
+    let (effective_carrier, standalone_tunnel_running, _, runtime_mode) =
+        resolve_effective_preaccel_carrier(
+            cfg,
+            has_enabled_relays,
+            is_direct_mode,
+            active_ports.core_running,
+            tun_enabled,
+            raw_meta.as_ref(),
+            standalone_pid_alive,
+        );
+    let effective_mode = if standalone_tunnel_running && runtime_mode == "windivert" {
+        "windivert"
+    } else if standalone_tunnel_running {
+        "local_socks5"
+    } else if effective_carrier == "main_core_tun_suspended_standalone" {
+        "main-tun-core"
+    } else if effective_carrier == "main_core_proxy_only" {
+        "main-proxy-core"
+    } else {
+        "off"
+    };
+
+    let runtime_yaml_path = paths.runtime_dir.join("runtime.yaml");
+    let runtime_config_sha256 = runtime_yaml_path
+        .is_file()
+        .then(|| compute_file_sha256(&runtime_yaml_path).ok())
+        .flatten();
+
+    let effective_tun_mtu = active_ports
+        .core_running
+        .then(|| read_tun_mtu_from_runtime_yaml(&runtime_yaml_path))
+        .flatten()
+        .or(compiled_effective_tun_mtu)
+        .unwrap_or_else(|| estimate_effective_tun_mtu(cfg, relays, nodes));
+
+    let diagnostics =
+        build_preaccel_transport_diagnostics(cfg, effective_tun_mtu, effective_mode);
+
+    let (active_relay_selected, active_exit_selected) = if active_ports.core_running {
+        query_live_controller_selected_proxies(&active_ports.endpoint, cfg, groups, live_mode).await
+    } else {
+        (None, None)
+    };
+
+    CliPreAccelTransportSnapshot {
+        diagnostics,
+        active_relay_selected,
+        active_exit_selected,
+        runtime_config_sha256,
+    }
+}
+
+async fn build_status_payload(paths: &AppPaths) -> Result<(Value, String)> {
+    let cfg = config::load_or_init(paths)?;
+    let db = open_storage(paths)?;
+    let plat = default_platform();
+    let caps = plat.capabilities();
+    let mihomo_bin = resolve_mihomo_binary(&cfg, paths, &[], false)
+        .ok()
+        .and_then(|r| r.path);
+    let tun_configured = cfg.tun.enabled;
+    let active_ports = inspect_active_core_ports(paths, &cfg).await;
+    let (tun_enabled, tun_needs_elevation, tun_runtime_source) =
+        resolve_cli_effective_tun_state_with_probe(
+            &cfg,
+            &caps,
+            mihomo_bin.as_deref(),
+            &active_ports,
+        )
+        .await;
+    let wd_files = locate_windivert_files(paths, cfg.preaccel.windivert_dir.as_deref());
+    let subs = db.list_subscriptions()?;
+    let nodes = db.list_nodes()?;
+    let groups = db.list_multi_groups()?;
+    let relays = db.list_preaccel_relays(false)?;
+    let probe_count = db.list_probe_definitions()?.len();
+    let sub_count = subs.len();
+    let node_count = nodes.len();
+    let group_count = groups.len();
+    let relay_count = relays.len();
+    let eff_mixed = active_ports.effective_mixed_port;
+    let eff_ctrl = active_ports.effective_controller_port;
+    let eff_dns = active_ports.effective_dns_port;
+    let transport_snap = collect_cli_preaccel_transport_snapshot(
+        paths,
+        &cfg,
+        &nodes,
+        &groups,
+        &relays,
+        &active_ports,
+        tun_enabled,
+        None,
+    )
+    .await;
+
+    let mut out = json!({
+        "ok": true,
+        "sanitized": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "data_dir": redact_path_for_display(&paths.root_data_dir.to_string_lossy()),
+        "is_portable": paths.is_portable,
+        "instance_hash": paths.instance_hash,
+        "platform": caps,
+        "core_running": active_ports.core_running,
+        "core_version": &active_ports.core_version,
+        "proxy_mode": cfg.proxy_mode,
+        "system_proxy_enabled": cfg.system_proxy.enabled,
+        "tun_enabled": tun_enabled,
+        "tun_configured": tun_configured,
+        "tun_needs_elevation": tun_needs_elevation,
+        "tun_source": tun_runtime_source,
+        "mixed_port": eff_mixed,
+        "controller_addr": format_host_port(&active_ports.endpoint.host, eff_ctrl),
+        "dns_listen_addr": format_host_port(&cfg.dns_listen_host, eff_dns),
+        "ports": active_ports.to_status_json(),
+        "preaccel_enabled": cfg.preaccel.enabled,
+        "preaccel_transport_diagnostics": &transport_snap.diagnostics,
+        "active_relay_selected": &transport_snap.active_relay_selected,
+        "active_exit_selected": &transport_snap.active_exit_selected,
+        "runtime_config_sha256": &transport_snap.runtime_config_sha256,
+        "global_preaccel": {
+            "enabled": cfg.preaccel.global_bypass_enabled,
+            "scope": cfg.preaccel.global_scope,
+            "windivert_available": wd_files.is_some(),
+            "windivert_path": wd_files.as_ref().map(|(dll, _)| redact_path_for_display(&dll.to_string_lossy())),
+            "is_elevated": caps.is_elevated,
+        },
+        "counts": {
+            "subscriptions": sub_count,
+            "nodes": node_count,
+            "multi_groups": group_count,
+            "preaccel_relays": relay_count,
+            "probes": probe_count,
+        }
+    });
+    sanitize_json_value(&mut out);
+
+    let tun_summary = if tun_needs_elevation {
+        "needs_elevation"
+    } else if tun_enabled {
+        "true"
+    } else {
+        "false"
+    };
+    let human = format!(
+        "CatCloud CLI v{} | core_running={} | portable={} | mode={} | port={} | tun={} | nodes={} | groups={} | global_preaccel={} (windivert={})",
+        env!("CARGO_PKG_VERSION"),
+        active_ports.core_running,
+        paths.is_portable,
+        cfg.proxy_mode.as_str(),
+        eff_mixed,
+        tun_summary,
+        node_count,
+        group_count,
+        cfg.preaccel.global_bypass_enabled,
+        wd_files.is_some()
+    );
+    Ok((out, human))
 }
 
 async fn build_global_preaccel_status_payload(paths: &AppPaths) -> Result<(Value, String)> {
@@ -12097,6 +12623,471 @@ mod tests {
         );
 
         server_task.abort();
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn status_and_net_doctor_emit_preaccel_transport_diagnostics_and_sanitize_private_and_public_ips()
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock controller");
+        let mock_port = listener.local_addr().unwrap().port();
+        let secret = "stage21-diag-secret-token";
+
+        let proxies_body = serde_json::json!({
+            "proxies": {
+                PREACCEL_SELECT_GROUP_NAME: {
+                    "type": "Selector",
+                    "now": "🔄 预加速自动双活"
+                },
+                "🔄 预加速自动双活": {
+                    "type": "Fallback",
+                    "now": "Relay-Priv-10.23.45.67-Pub-203.0.113.88"
+                },
+                "AI-Stable": {
+                    "type": "Selector",
+                    "now": "Exit-Priv-192.168.88.12-Pub-198.51.100.77"
+                }
+            }
+        })
+        .to_string();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..32 {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut req_buf = [0u8; 2048];
+                let n = stream.read(&mut req_buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                let has_auth = req_str
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer stage21-diag-secret-token");
+                let (status_line, body) = if !has_auth {
+                    ("HTTP/1.1 401 Unauthorized", r#"{"message":"Unauthorized"}"#.to_string())
+                } else if req_str.starts_with("GET /version ") {
+                    ("HTTP/1.1 200 OK", r#"{"version":"v1.19.34"}"#.to_string())
+                } else if req_str.starts_with("GET /configs ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"tun":{"enable":true},"mixed-port":17890,"port":0,"socks-port":0,"bind-address":"127.0.0.1","allow-lan":false,"mode":"rule"}"#.to_string(),
+                    )
+                } else if req_str.starts_with("GET /connections ") {
+                    (
+                        "HTTP/1.1 200 OK",
+                        r#"{"downloadTotal":0,"uploadTotal":0,"connections":[]}"#.to_string(),
+                    )
+                } else if req_str.starts_with("GET /proxies ") {
+                    ("HTTP/1.1 200 OK", proxies_body.clone())
+                } else {
+                    ("HTTP/1.1 200 OK", r#"{}"#.to_string())
+                };
+                let resp = format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-s21-transport-diag-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+        let mut cfg = config::load_or_init(&paths).expect("init config");
+        cfg.controller_port = mock_port;
+        cfg.controller_secret = Some(secret.to_string());
+        cfg.tun.enabled = true;
+        cfg.tun.mtu = 1500;
+        cfg.preaccel.enabled = true;
+        cfg.active_group_id = Some("grp-ai".to_string());
+        config::save(&paths, &cfg).expect("save config");
+
+        let db = open_storage(&paths).expect("open db");
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-s21".to_string(),
+            name: "Sub-S21".to_string(),
+            kind: SubscriptionKind::File,
+            url_or_cmd: "s21.yaml".to_string(),
+            ..Default::default()
+        })
+        .expect("upsert subscription");
+        db.upsert_preaccel_relay(&PreAccelRelay {
+            id: "relay-s21".to_string(),
+            name: "Relay-Priv-10.23.45.67-Pub-203.0.113.88".to_string(),
+            provider: "cloud-a".to_string(),
+            region: "CN-East".to_string(),
+            server: "203.0.113.88".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-secret-relay-pw".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            supports_ipv6: false,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        })
+        .expect("upsert relay");
+        db.upsert_node(&ProxyNode {
+            id: "node-s21".to_string(),
+            sub_id: "sub-s21".to_string(),
+            name: "Exit-Priv-192.168.88.12-Pub-198.51.100.77".to_string(),
+            protocol: "ss".to_string(),
+            server: "198.51.100.77".to_string(),
+            port: 8443,
+            is_443_native: false,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            enabled: true,
+            raw_config: json!({
+                "name": "Exit-Priv-192.168.88.12-Pub-198.51.100.77",
+                "type": "ss",
+                "server": "198.51.100.77",
+                "port": 8443,
+                "cipher": "aes-128-gcm",
+                "password": "demo-secret-node-pw"
+            }),
+            ..Default::default()
+        })
+        .expect("upsert node");
+        db.upsert_multi_group(&MultiGroup {
+            id: "grp-ai".to_string(),
+            name: "AI-Stable".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["node-s21".to_string()],
+            active_node_id: Some("node-s21".to_string()),
+            ..Default::default()
+        })
+        .expect("upsert multi group");
+
+        let runtime_yaml_path = paths.runtime_dir.join("runtime.yaml");
+        let runtime_yaml_body = "mixed-port: 17890\ntun:\n  enable: true\n  mtu: 1400\n";
+        std::fs::write(&runtime_yaml_path, runtime_yaml_body).expect("write runtime.yaml");
+        let expected_sha256 = compute_file_sha256(&runtime_yaml_path).expect("sha256");
+
+        let (status_json, _) = build_status_payload(&paths).await.expect("status payload");
+        let (doctor_json, _) = build_net_doctor_payload(&paths).await.expect("net doctor payload");
+
+        for (label, payload) in [("status", &status_json), ("net_doctor", &doctor_json)] {
+            let diag = &payload["preaccel_transport_diagnostics"];
+            assert_eq!(diag["effective_mode"], json!("main-tun-core"), "{label}");
+            assert_eq!(diag["effective_tun_mtu"], json!(1400), "{label}");
+            assert_eq!(diag["anytls_tfo"], json!(false), "{label}");
+            assert_eq!(diag["anytls_min_idle_session"], json!(0), "{label}");
+            assert_eq!(diag["keep_alive_idle_sec"], json!(45), "{label}");
+            assert_eq!(diag["keep_alive_interval_sec"], json!(15), "{label}");
+            assert_eq!(diag["expected_probe_status"], json!("204"), "{label}");
+            assert_eq!(diag["lb_strategy"], json!("consistent-hashing"), "{label}");
+            assert_eq!(diag["probe_interval_sec"], json!(30), "{label}");
+
+            assert_eq!(
+                payload["runtime_config_sha256"],
+                json!(expected_sha256),
+                "{label} must preserve 64-hex runtime_config_sha256"
+            );
+            let relay_sel = payload["active_relay_selected"]
+                .as_str()
+                .expect("active_relay_selected present");
+            let exit_sel = payload["active_exit_selected"]
+                .as_str()
+                .expect("active_exit_selected present");
+            assert!(relay_sel.contains("10.23.45.*"), "{label}: {relay_sel}");
+            assert!(relay_sel.contains("203.0.113.*"), "{label}: {relay_sel}");
+            assert!(exit_sel.contains("192.168.88.*"), "{label}: {exit_sel}");
+            assert!(exit_sel.contains("198.51.100.*"), "{label}: {exit_sel}");
+
+            let serialized = serde_json::to_string(payload).expect("serialize payload");
+            for leaked in [
+                "10.23.45.67",
+                "203.0.113.88",
+                "192.168.88.12",
+                "198.51.100.77",
+                "stage21-diag-secret-token",
+                "demo-secret-relay-pw",
+                "demo-secret-node-pw",
+            ] {
+                assert!(
+                    !serialized.contains(leaked),
+                    "{label} leaked raw sensitive fixture `{leaked}`: {serialized}"
+                );
+            }
+        }
+
+        server_task.abort();
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn config_export_gateway_cli_parse_defaults_and_custom_flags() {
+        use clap::Parser;
+
+        #[derive(Parser, Debug)]
+        struct TestCli {
+            #[command(subcommand)]
+            command: Commands,
+        }
+
+        let parsed_default =
+            TestCli::try_parse_from(["catcloud", "config", "export-gateway"]).expect("default parse");
+        match parsed_default.command {
+            Commands::Config {
+                action:
+                    ConfigCommand::ExportGateway {
+                        profile,
+                        tproxy_port,
+                        redir_port,
+                        dns_port,
+                        output,
+                        reveal_secrets,
+                    },
+            } => {
+                assert_eq!(profile, "relay-fragment");
+                assert_eq!(tproxy_port, 7893);
+                assert_eq!(redir_port, 7892);
+                assert_eq!(dns_port, 1053);
+                assert!(output.is_none());
+                assert!(!reveal_secrets, "must default to redacted mode");
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        let parsed_custom = TestCli::try_parse_from([
+            "catcloud",
+            "config",
+            "export-gateway",
+            "--profile",
+            "transparent-gateway",
+            "--tproxy-port",
+            "17893",
+            "--redir-port",
+            "17892",
+            "--dns-port",
+            "11053",
+            "--output",
+            "gateway.yaml",
+            "--reveal-secrets",
+        ])
+        .expect("custom parse");
+        match parsed_custom.command {
+            Commands::Config {
+                action:
+                    ConfigCommand::ExportGateway {
+                        profile,
+                        tproxy_port,
+                        redir_port,
+                        dns_port,
+                        output,
+                        reveal_secrets,
+                    },
+            } => {
+                assert_eq!(
+                    parse_gateway_export_profile(&profile).unwrap(),
+                    GatewayExportProfile::TransparentGateway
+                );
+                assert_eq!(tproxy_port, 17893);
+                assert_eq!(redir_port, 17892);
+                assert_eq!(dns_port, 11053);
+                assert_eq!(output, Some(PathBuf::from("gateway.yaml")));
+                assert!(reveal_secrets);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+
+        assert_eq!(
+            parse_gateway_export_profile("preferred-nodes").unwrap(),
+            GatewayExportProfile::PreferredNodes
+        );
+        assert!(parse_gateway_export_profile("unknown-mode").is_err());
+    }
+
+    #[tokio::test]
+    async fn config_export_gateway_redacts_private_public_ips_and_secrets_by_default_and_writes_atomically()
+    {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-export-gateway-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+        let mut cfg = config::load_or_init(&paths).expect("init config");
+        cfg.preaccel.enabled = true;
+        cfg.tun.enabled = true;
+        cfg.controller_secret = Some("cli-gw-controller-secret-9988".to_string());
+        cfg.rules_override.global_prepend_rules =
+            vec!["IP-CIDR,10.23.45.67/32,DIRECT,no-resolve".to_string()];
+        config::save(&paths, &cfg).expect("save config");
+
+        let db = open_storage(&paths).expect("open db");
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-gw".to_string(),
+            name: "Sub-GW".to_string(),
+            kind: SubscriptionKind::File,
+            url_or_cmd: "gw.yaml".to_string(),
+            ..Default::default()
+        })
+        .expect("upsert subscription");
+        db.upsert_preaccel_relay(&PreAccelRelay {
+            id: "relay-gw-1".to_string(),
+            name: "Relay-CN-East".to_string(),
+            provider: "cloud-a".to_string(),
+            region: "CN-East".to_string(),
+            server: "203.0.113.88".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "cli-gw-relay-secret-pw".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            supports_ipv6: false,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        })
+        .expect("upsert relay");
+        db.upsert_node(&ProxyNode {
+            id: "node-gw-1".to_string(),
+            sub_id: "sub-gw".to_string(),
+            name: "Exit-LAN-192.168.88.12".to_string(),
+            protocol: "ss".to_string(),
+            server: "198.51.100.77".to_string(),
+            port: 8443,
+            is_443_native: false,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            enabled: true,
+            raw_config: json!({
+                "name": "Exit-LAN-192.168.88.12",
+                "type": "ss",
+                "server": "198.51.100.77",
+                "port": 8443,
+                "cipher": "aes-128-gcm",
+                "password": "cli-gw-node-secret-pw"
+            }),
+            ..Default::default()
+        })
+        .expect("upsert node");
+
+        // 1. Redacted export (default) must mask private & public IPs and all credentials while remaining valid YAML.
+        let redacted_out = temp_root.join("gw-redacted.yaml");
+        execute_config_export_gateway(
+            &paths,
+            true,
+            "transparent-gateway",
+            17893,
+            17892,
+            11053,
+            Some(redacted_out.clone()),
+            false,
+        )
+        .await
+        .expect("redacted export succeeds");
+        let redacted_yaml = std::fs::read_to_string(&redacted_out).expect("read redacted file");
+        let redacted_report =
+            validate_compiled_yaml(&redacted_yaml, &[]).expect("redacted YAML must parse cleanly");
+        assert!(
+            !redacted_report.issues.iter().any(|i| matches!(
+                i.code.as_str(),
+                "invalid_proxy_group" | "empty_proxy_group" | "group_cycle" | "unknown_rule_target"
+            )),
+            "redacted transparent gateway YAML had structural errors: {:?}",
+            redacted_report.issues
+        );
+        assert!(redacted_yaml.contains("allow-lan: true"));
+        assert!(redacted_yaml.contains("tproxy-port: 17893"));
+        assert!(redacted_yaml.contains("redir-port: 17892"));
+        assert!(redacted_yaml.contains("listen: 0.0.0.0:11053"));
+        assert!(redacted_yaml.contains("tun:\n  enable: false"));
+
+        for secret_val in [
+            "10.23.45.67",
+            "192.168.88.12",
+            "203.0.113.88",
+            "198.51.100.77",
+            "cli-gw-controller-secret-9988",
+            "cli-gw-relay-secret-pw",
+            "cli-gw-node-secret-pw",
+        ] {
+            assert!(
+                !redacted_yaml.contains(secret_val),
+                "default redacted export leaked `{secret_val}`"
+            );
+        }
+
+        // 2. Explicit `--reveal-secrets` emits deployable plaintext YAML with exact relay/node fields.
+        let plain_out = temp_root.join("gw-plain.yaml");
+        execute_config_export_gateway(
+            &paths,
+            true,
+            "transparent-gateway",
+            17893,
+            17892,
+            11053,
+            Some(plain_out.clone()),
+            true,
+        )
+        .await
+        .expect("plaintext export succeeds");
+        let plain_yaml = std::fs::read_to_string(&plain_out).expect("read plaintext file");
+        let plain_report = validate_compiled_yaml(&plain_yaml, &["203.0.113.88".to_string()])
+            .expect("plaintext YAML must parse cleanly");
+        assert!(
+            plain_report.ok,
+            "plaintext transparent gateway YAML should pass static validation: {:?}",
+            plain_report.issues
+        );
+        assert!(plain_yaml.contains("bind-address: '*'"));
+        assert!(plain_yaml.contains("203.0.113.88"));
+        assert!(plain_yaml.contains("198.51.100.77"));
+        assert!(plain_yaml.contains("cli-gw-relay-secret-pw"));
+        assert!(plain_yaml.contains("cli-gw-node-secret-pw"));
+        assert!(plain_yaml.contains("cli-gw-controller-secret-9988"));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn read_tun_mtu_from_runtime_yaml_checks_tun_enable_and_supports_flow_yaml() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-tun-mtu-yaml-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        std::fs::create_dir_all(&temp_root).unwrap();
+
+        let p_block_on = temp_root.join("block_on.yaml");
+        std::fs::write(&p_block_on, "\u{feff}tun:\n  enable: true\n  mtu: 1400\n").unwrap();
+        assert_eq!(read_tun_mtu_from_runtime_yaml(&p_block_on), Some(1400));
+
+        let p_flow_on = temp_root.join("flow_on.yaml");
+        std::fs::write(&p_flow_on, "tun: { enable: true, mtu: 1420 }\n").unwrap();
+        assert_eq!(read_tun_mtu_from_runtime_yaml(&p_flow_on), Some(1420));
+
+        let p_block_off = temp_root.join("block_off.yaml");
+        std::fs::write(&p_block_off, "tun:\n  enable: false\n  mtu: 1400\n").unwrap();
+        assert_eq!(read_tun_mtu_from_runtime_yaml(&p_block_off), None);
+
+        let p_flow_off = temp_root.join("flow_off.yaml");
+        std::fs::write(&p_flow_off, "tun: { enable: false, mtu: 1400 }\n").unwrap();
+        assert_eq!(read_tun_mtu_from_runtime_yaml(&p_flow_off), None);
+
+        let p_missing_enable = temp_root.join("missing_enable.yaml");
+        std::fs::write(&p_missing_enable, "tun:\n  mtu: 1400\n").unwrap();
+        assert_eq!(read_tun_mtu_from_runtime_yaml(&p_missing_enable), None);
+
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

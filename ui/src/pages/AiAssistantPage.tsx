@@ -242,7 +242,7 @@ function CompactMarkdownView({ content }: { content: string }) {
   }, [content]);
 
   return (
-    <div className="space-y-2.5 text-xs leading-relaxed text-[var(--text-secondary)]">
+    <div className="min-w-0 space-y-2.5 break-words text-xs leading-relaxed text-[var(--text-secondary)]">
       {blocks.map((block, idx) => {
         if (block.type === "h1") {
           return (
@@ -282,7 +282,7 @@ function CompactMarkdownView({ content }: { content: string }) {
           return (
             <pre
               key={idx}
-              className="cc-mono overflow-x-auto rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] leading-relaxed text-[var(--text)]"
+              className="cc-mono max-w-full overflow-x-auto rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-[11px] leading-relaxed text-[var(--text)]"
             >
               {block.code}
             </pre>
@@ -650,9 +650,9 @@ export function AiAssistantPage() {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] font-medium text-[var(--muted)]">
+        <div className="flex max-w-full flex-wrap items-center gap-2">
+          <div className="flex max-w-full flex-wrap items-center gap-2">
+            <span className="whitespace-nowrap text-[11px] font-medium text-[var(--muted)]">
               {dict.aiHub.docLanguageLabel}
             </span>
             <AppSelect
@@ -661,14 +661,14 @@ export function AiAssistantPage() {
               value={docLang}
               onChange={(v) => setDocLang(normalizeUiLanguage(v))}
               options={languageSelectOptions}
-              className="min-w-[188px]"
+              className="min-w-[168px] max-w-full"
             />
           </div>
 
           <button
             type="button"
             onClick={() => appActions.openOnboardingModal()}
-            className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[var(--accent)]/45 bg-[var(--accent-soft)]/70 px-3 text-xs font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--accent)]/45 bg-[var(--accent-soft)]/70 px-3 text-xs font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
           >
             <Sparkles className="h-3.5 w-3.5 shrink-0" />
             <span>{dict.aiHub.reopenOnboardingBtn}</span>
@@ -678,12 +678,12 @@ export function AiAssistantPage() {
             type="button"
             disabled={busyAction === "github-issue"}
             onClick={() => void handleOpenIssue()}
-            className="inline-flex h-8 items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
+            className="inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:opacity-60"
           >
             {busyAction === "github-issue" ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" />
             ) : (
-              <MessageSquareWarning className="h-3.5 w-3.5 text-[var(--amber)]" />
+              <MessageSquareWarning className="h-3.5 w-3.5 shrink-0 text-[var(--amber)]" />
             )}
             <span>{dict.aiHub.reportIssueBtn}</span>
           </button>
@@ -691,7 +691,7 @@ export function AiAssistantPage() {
       </section>
 
       {/* Dual Audience Equal-Height Cards: Left Hero = Local AI Agent Autopilot | Right = Web AI Walkthrough */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-2">
         {/* Left Hero Card: Local AI Agent Full Autopilot */}
         <section
           className={`cc-card cc-glass flex flex-col justify-between gap-3.5 rounded-2xl border-[var(--accent)]/60 p-4 transition-colors ${
@@ -963,9 +963,9 @@ export function AiAssistantPage() {
 
         {manualsAccordionOpen && (
           <div className="border-t border-[var(--line)] p-4">
-            <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+            <div className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-12">
           {/* Left Column: Lightweight 8-doc Index */}
-          <div className="space-y-1 lg:col-span-4">
+          <div className="min-w-0 space-y-1 min-[1160px]:col-span-4">
             {docsLoading ? (
               <div className="flex items-center justify-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--surface)]/60 py-10 text-xs text-[var(--muted)]">
                 <Loader2 className="h-4 w-4 animate-spin text-[var(--accent)]" />
@@ -1019,7 +1019,7 @@ export function AiAssistantPage() {
           </div>
 
           {/* Right Column: On-Demand Single Manual Preview Card */}
-          <div className="flex flex-col rounded-2xl border border-[var(--line)] bg-[var(--surface)]/70 lg:col-span-8">
+          <div className="flex min-w-0 flex-col overflow-hidden rounded-2xl border border-[var(--line)] bg-[var(--surface)]/70 min-[1160px]:col-span-8">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--line)] px-3.5 py-2.5">
               <div className="flex min-w-0 items-center gap-2">
                 <FileText className="h-4 w-4 shrink-0 text-[var(--accent)]" />
@@ -1066,7 +1066,7 @@ export function AiAssistantPage() {
               </div>
             </div>
 
-            <div className="cc-selectable max-h-[420px] min-h-[260px] overflow-y-auto px-4 py-3.5">
+            <div className="cc-selectable min-w-0 max-h-[clamp(220px,calc(100vh-300px),440px)] min-h-[200px] overflow-y-auto px-4 py-3.5">
               {docLoading ? (
                 <div className="flex h-[220px] items-center justify-center gap-2 text-xs text-[var(--muted)]">
                   <Loader2 className="h-4 w-4 animate-spin text-[var(--accent)]" />
@@ -1156,7 +1156,7 @@ export function AiAssistantPage() {
               </button>
             </div>
 
-            <div className="grid grid-cols-1 gap-1.5 lg:grid-cols-2">
+            <div className="grid grid-cols-1 gap-1.5 min-[1160px]:grid-cols-2">
               {READONLY_CLI_ITEMS.map((item) => {
                 const key = `cli:${item.cmd}`;
                 return (

@@ -34,7 +34,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { type FormEvent, memo, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   type ExitIpInfo,
@@ -59,6 +59,19 @@ import {
 import { resolvePlatformOs } from "../utils/platform";
 import { resolvePreAccelSummary } from "../utils/preaccelStatus";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
+import {
+  TITLE_BAR_SAFE_TOP_PX,
+  isAnchorVisibleInScrollHierarchy,
+} from "../utils/viewportVisibility";
+
+interface QuickNodeMenuPosition {
+  left: number;
+  width: number;
+  maxHeight: number;
+  placement: "bottom" | "top";
+  top?: number;
+  bottom?: number;
+}
 
 const MAX_VISIBLE_QUICK_NODES = 60;
 
@@ -505,6 +518,7 @@ export function HomePage() {
   const [togglingProxy, setTogglingProxy] = useState(false);
   const [togglingPreAccel, setTogglingPreAccel] = useState(false);
   const [nodeMenuOpen, setNodeMenuOpen] = useState(false);
+  const [nodeMenuPos, setNodeMenuPos] = useState<QuickNodeMenuPosition | null>(null);
   const [nodeSearch, setNodeSearch] = useState("");
   const [switchingNode, setSwitchingNode] = useState(false);
 
@@ -516,6 +530,8 @@ export function HomePage() {
   const [syncModalOpen, setSyncModalOpen] = useState(false);
 
   const nodeDropdownRef = useRef<HTMLDivElement | null>(null);
+  const nodeMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const nodeMenuPopoverRef = useRef<HTMLDivElement | null>(null);
   const nodeSearchInputRef = useRef<HTMLInputElement | null>(null);
 
   const isSingleMode = runtime.route_mode === "single";
@@ -548,27 +564,131 @@ export function HomePage() {
     }
   }, [isSingleMode]);
 
-  // Close group node quick picker popover on outside click or Escape
+  const computeNodeMenuPosition = useCallback((): QuickNodeMenuPosition | null => {
+    const cardEl = nodeDropdownRef.current;
+    const triggerEl = nodeMenuTriggerRef.current;
+    if (
+      !cardEl ||
+      !triggerEl ||
+      !cardEl.isConnected ||
+      !triggerEl.isConnected ||
+      typeof window === "undefined"
+    ) {
+      return null;
+    }
+    if (!isAnchorVisibleInScrollHierarchy(triggerEl, TITLE_BAR_SAFE_TOP_PX)) {
+      return null;
+    }
+
+    const cardRect = cardEl.getBoundingClientRect();
+    const triggerRect = triggerEl.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const viewportPad = 12;
+    const topSafe = TITLE_BAR_SAFE_TOP_PX + 8;
+    const gap = 8;
+    const maxMenuH = 380;
+
+    const maxAllowedW = Math.max(260, vw - viewportPad * 2);
+    const width = Math.min(Math.max(cardRect.width, 420), Math.min(540, maxAllowedW));
+    const left = Math.max(
+      viewportPad,
+      Math.min(cardRect.left, vw - viewportPad - width)
+    );
+
+    const anchorBottom = Math.max(cardRect.bottom, triggerRect.bottom);
+    const anchorTop = Math.min(cardRect.top, triggerRect.top);
+    const spaceBelow = Math.max(0, vh - anchorBottom - gap - viewportPad);
+    const spaceAbove = Math.max(0, anchorTop - gap - topSafe);
+    const openUpward = spaceBelow < 220 && spaceAbove > spaceBelow;
+    const maxViewportSpan = Math.max(120, vh - topSafe - viewportPad);
+
+    if (openUpward) {
+      const maxHeight = Math.min(
+        maxViewportSpan,
+        Math.min(maxMenuH, Math.max(140, spaceAbove))
+      );
+      const bottom = Math.max(
+        viewportPad,
+        Math.min(vh - anchorTop + gap, vh - topSafe - maxHeight)
+      );
+      return { left, width, maxHeight, placement: "top", bottom };
+    }
+
+    const maxHeight = Math.min(
+      maxViewportSpan,
+      Math.min(maxMenuH, Math.max(140, spaceBelow))
+    );
+    const top = Math.max(
+      topSafe,
+      Math.min(anchorBottom + gap, vh - viewportPad - maxHeight)
+    );
+    return { left, width, maxHeight, placement: "bottom", top };
+  }, []);
+
+  // Close group node quick picker popover on outside click, Escape, scroll out of view, or resize
   useEffect(() => {
     if (!nodeMenuOpen) return;
+
+    const initialPos = computeNodeMenuPosition();
+    if (!initialPos) {
+      setNodeMenuOpen(false);
+      return;
+    }
+    setNodeMenuPos(initialPos);
+
     const handlePointerDown = (ev: MouseEvent) => {
-      const target = ev.target as Node;
-      if (nodeDropdownRef.current && !nodeDropdownRef.current.contains(target)) {
-        setNodeMenuOpen(false);
-      }
+      const target = ev.target as Node | null;
+      if (!target) return;
+      if (nodeDropdownRef.current?.contains(target)) return;
+      if (nodeMenuPopoverRef.current?.contains(target)) return;
+      setNodeMenuOpen(false);
     };
     const handleKeyDown = (ev: KeyboardEvent) => {
       if (ev.key === "Escape") {
+        ev.preventDefault();
+        setNodeMenuOpen(false);
+        nodeMenuTriggerRef.current?.focus();
+      }
+    };
+    const handleScrollOrResize = (ev: Event) => {
+      if (ev.type === "scroll") {
+        const target = ev.target as Node | null;
+        if (target && nodeMenuPopoverRef.current?.contains(target)) {
+          return;
+        }
+      }
+      const nextPos = computeNodeMenuPosition();
+      if (!nextPos) {
+        setNodeMenuOpen(false);
+      } else {
+        setNodeMenuPos(nextPos);
+      }
+    };
+    const handleWindowBlur = () => {
+      setNodeMenuOpen(false);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== "visible") {
         setNodeMenuOpen(false);
       }
     };
-    document.addEventListener("mousedown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
+
+    document.addEventListener("mousedown", handlePointerDown, true);
+    document.addEventListener("keydown", handleKeyDown, true);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("resize", handleScrollOrResize);
+    window.addEventListener("scroll", handleScrollOrResize, true);
+    window.addEventListener("blur", handleWindowBlur);
     return () => {
-      document.removeEventListener("mousedown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("mousedown", handlePointerDown, true);
+      document.removeEventListener("keydown", handleKeyDown, true);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("resize", handleScrollOrResize);
+      window.removeEventListener("scroll", handleScrollOrResize, true);
+      window.removeEventListener("blur", handleWindowBlur);
     };
-  }, [nodeMenuOpen]);
+  }, [computeNodeMenuPosition, nodeMenuOpen]);
 
   useEffect(() => {
     if (!nodeMenuOpen) {
@@ -1338,9 +1458,9 @@ export function HomePage() {
 
       {/* Top Hero Dual-Zone Card: Main Proxy Power Switch + Interactive Current Route Selector */}
       <section className="cc-card cc-glass relative z-20 rounded-2xl p-5">
-        <div className="grid grid-cols-1 gap-5 lg:grid-cols-12 lg:gap-6">
+        <div className="grid grid-cols-1 gap-5 min-[1160px]:grid-cols-12 min-[1160px]:gap-6">
           {/* Left Zone: Prominent Power Switch + Mode & Takeover Controls */}
-          <div className="flex flex-col justify-between gap-4 lg:col-span-5 lg:border-r lg:border-[var(--line)]/70 lg:pr-6">
+          <div className="flex min-w-0 flex-col justify-between gap-4 min-[1160px]:col-span-5 min-[1160px]:border-r min-[1160px]:border-[var(--line)]/70 min-[1160px]:pr-6">
             <div className="space-y-3">
               {/* Large Power Toggle Button */}
               <button
@@ -1372,7 +1492,7 @@ export function HomePage() {
 
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="text-base font-bold tracking-tight text-[var(--text)]">
+                    <span className="truncate whitespace-nowrap text-base font-bold tracking-tight text-[var(--text)]">
                       {togglingProxy
                         ? isProxyEnabled
                           ? "正在关闭代理…"
@@ -1406,7 +1526,7 @@ export function HomePage() {
             <div className="flex flex-wrap items-center justify-between gap-2.5">
               {/* Proxy Mode Segmented Control */}
               <div
-                className="inline-flex rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-xs"
+                className="inline-flex shrink-0 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-xs"
                 role="group"
                 aria-label="代理模式"
               >
@@ -1418,7 +1538,7 @@ export function HomePage() {
                       type="button"
                       onClick={() => void appActions.setProxyMode(mode.id)}
                       title={mode.hint}
-                      className={`rounded-lg px-3 py-1.5 font-medium transition-colors ${
+                      className={`shrink-0 whitespace-nowrap rounded-lg px-3 py-1.5 font-medium transition-colors ${
                         selected
                           ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
                           : "text-[var(--muted)] hover:text-[var(--text)]"
@@ -1435,14 +1555,14 @@ export function HomePage() {
                 <button
                   type="button"
                   onClick={() => void appActions.toggleSystemProxy()}
-                  className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
                     runtime.system_proxy_enabled
                       ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
                       : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
                   }`}
                   title="接管浏览器和大多数常用软件"
                 >
-                  <Wifi className="h-3.5 w-3.5" />
+                  <Wifi className="h-3.5 w-3.5 shrink-0" />
                   <span>{dict.home.systemProxy}</span>
                 </button>
 
@@ -1453,7 +1573,7 @@ export function HomePage() {
                       ? appActions.openTunAdminPrompt(null)
                       : void appActions.toggleTun()
                   }
-                  className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
                     runtime.tun_enabled
                       ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
                       : runtime.tun_needs_elevation
@@ -1483,7 +1603,7 @@ export function HomePage() {
                   disabled={togglingPreAccel}
                   aria-pressed={preaccelSummary.enabled}
                   onClick={() => void handleTogglePreAccelQuick()}
-                  className={`inline-flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:opacity-65 ${
+                  className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:opacity-65 ${
                     !preaccelSummary.enabled
                       ? "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
                       : preaccelSummary.tone === "amber"
@@ -1493,7 +1613,7 @@ export function HomePage() {
                   title={preAccelPillTitle}
                 >
                   <Zap
-                    className={`h-3.5 w-3.5 ${togglingPreAccel ? "animate-pulse" : ""}`}
+                    className={`h-3.5 w-3.5 shrink-0 ${togglingPreAccel ? "animate-pulse" : ""}`}
                   />
                   <span>{preAccelPillLabel}</span>
                 </button>
@@ -1502,7 +1622,7 @@ export function HomePage() {
           </div>
 
           {/* Right Zone: Dual-Mode Current Route (Single Node vs Smart Multi-Group) + Quick Actions + Dual-Form Mascot */}
-          <div className="flex flex-col justify-between gap-3.5 lg:col-span-7">
+          <div className="flex min-w-0 flex-col justify-between gap-3.5 min-[1160px]:col-span-7">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0 flex-1 space-y-2.5">
                 {/* Row 1: Clear Dual-Mode Badge + Status Pills + Mode Switch Link */}
@@ -1708,33 +1828,35 @@ export function HomePage() {
                           </div>
                         </div>
 
-                        <span className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent)] transition-opacity group-hover:opacity-90">
+                        <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent)] transition-opacity group-hover:opacity-90">
                           <span>切换 / 管理多选组</span>
-                          <ArrowRight className="h-3 w-3" />
+                          <ArrowRight className="h-3 w-3 shrink-0" />
                         </span>
                       </button>
 
                       {/* Bottom Half: Current Active Exit Node inside Group + Quick Switch Popover */}
-                      <div className="flex items-center justify-between gap-2 border-t border-[var(--line)]/70 px-3.5 py-2 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)]/70 px-3.5 py-2 text-xs">
                         <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1 text-[var(--muted)]">
-                          <span className="inline-flex min-w-0 items-center gap-1.5 text-[var(--text-secondary)]">
-                            <span className="shrink-0 text-[var(--muted)]">当前出口：</span>
+                          <span className="inline-flex min-w-0 max-w-full items-center gap-1.5 text-[var(--text-secondary)]">
+                            <span className="shrink-0 whitespace-nowrap text-[var(--muted)]">
+                              当前出口：
+                            </span>
                             <span
-                              className="max-w-[180px] truncate font-medium text-[var(--text)]"
+                              className="min-w-0 max-w-[200px] truncate font-medium text-[var(--text)]"
                               title={displayNodeName}
                             >
                               {displayNodeName}
                             </span>
                             {displayRegionCode && displayRegionCode !== "UNK" && (
                               <span
-                                className="shrink-0 rounded bg-[var(--card)] px-1 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]"
+                                className="shrink-0 whitespace-nowrap rounded bg-[var(--card)] px-1 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]"
                                 title={displayRegionLabel}
                               >
                                 {displayRegionCode}
                               </span>
                             )}
                           </span>
-                          <span className="shrink-0">
+                          <span className="shrink-0 whitespace-nowrap">
                             <strong
                               className="cc-mono font-semibold"
                               style={{
@@ -1762,18 +1884,18 @@ export function HomePage() {
                             </strong>
                           </span>
                           {activeGoogleState === "clean" && (
-                            <span className="shrink-0 rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                            <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
                               谷歌正常
                             </span>
                           )}
                           {activeGoogleState === "cn" && (
-                            <span className="shrink-0 rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
+                            <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
                               谷歌送中
                             </span>
                           )}
                           {activeNodeProbe?.google_risk_mismatch && (
                             <span
-                              className="shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                              className="shrink-0 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
                               title="不同网站识别出的地区存在差异，仅供参考"
                             >
                               地区有偏差
@@ -1782,7 +1904,7 @@ export function HomePage() {
                           {activeAiBadges.unlocked.map((ai) => (
                             <span
                               key={ai.id}
-                              className="shrink-0 rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]"
+                              className="shrink-0 whitespace-nowrap rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]"
                             >
                               {ai.label}
                             </span>
@@ -1790,16 +1912,25 @@ export function HomePage() {
                         </div>
 
                         <button
+                          ref={nodeMenuTriggerRef}
                           type="button"
                           onClick={() => {
                             if (nodes.length === 0) {
                               appActions.setNav("nodes");
                               return;
                             }
-                            setNodeMenuOpen((open) => !open);
+                            if (nodeMenuOpen) {
+                              setNodeMenuOpen(false);
+                              return;
+                            }
+                            const pos = computeNodeMenuPosition();
+                            if (pos) {
+                              setNodeMenuPos(pos);
+                              setNodeMenuOpen(true);
+                            }
                           }}
                           aria-expanded={nodeMenuOpen}
-                          className={`inline-flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors ${
+                          className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors ${
                             nodeMenuOpen
                               ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
                               : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
@@ -1808,7 +1939,7 @@ export function HomePage() {
                         >
                           <span>组内快选</span>
                           <ChevronDown
-                            className={`h-3 w-3 transition-transform ${
+                            className={`h-3 w-3 shrink-0 transition-transform ${
                               nodeMenuOpen ? "rotate-180" : ""
                             }`}
                           />
@@ -1839,217 +1970,265 @@ export function HomePage() {
                               </span>
                             </span>
                           </span>
-                          <span className="inline-flex shrink-0 items-center gap-0.5 font-medium text-[var(--amber)]">
+                          <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap font-medium text-[var(--amber)]">
                             <span>查看</span>
-                            <ArrowRight className="h-3 w-3" />
+                            <ArrowRight className="h-3 w-3 shrink-0" />
                           </span>
                         </button>
                       )}
                     </div>
 
-                    {/* In-Group Node Quick Picker Popover */}
-                    {nodeMenuOpen && (
-                      <div
-                        className="absolute left-0 right-0 top-[calc(100%+8px)] z-50 rounded-2xl border border-[var(--line-strong)] bg-[var(--surface)] p-2.5 text-xs"
-                        style={{ boxShadow: "var(--shadow-popover)" }}
-                      >
-                        <div className="relative mb-2">
-                          <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-                          <input
-                            ref={nodeSearchInputRef}
-                            type="text"
-                            value={nodeSearch}
-                            onChange={(e) => setNodeSearch(e.target.value)}
-                            placeholder="搜索本组节点名称或地区…"
-                            className="w-full rounded-xl border border-[var(--line)] bg-[var(--card)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                          />
-                          {nodeSearch && (
-                            <button
-                              type="button"
-                              onClick={() => setNodeSearch("")}
-                              className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted)] hover:text-[var(--text)]"
-                              aria-label="清空搜索"
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </button>
-                          )}
-                        </div>
-
-                        <div className="max-h-[240px] space-y-1 overflow-y-auto pr-0.5">
-                          {visibleDropdownNodes.map((node) => {
-                            const isCurrent = node.id === currentNodeId;
-                            const snap = probes[node.id];
-                            const hint = runtime.node_health_hints?.[node.id];
-                            const isHintHealthy =
-                              hint?.status === "healthy" || hint?.status === "probation";
-                            const isHintCooldown = hint?.status === "cooldown";
-                            const hintLatency =
-                              isHintHealthy &&
-                              typeof hint?.latency_ms === "number" &&
-                              Number.isFinite(hint.latency_ms) &&
-                              hint.latency_ms > 0
-                                ? hint.latency_ms
-                                : null;
-                            const freshLatency =
-                              isCurrent && liveActiveLatencyMs !== null
-                                ? liveActiveLatencyMs
-                                : hintLatency;
-                            const lat =
-                              freshLatency ??
-                              (isHintCooldown ? null : (snap?.latency_ms ?? null));
-                            const latOk =
-                              freshLatency !== null
-                                ? true
-                                : isHintCooldown
-                                  ? false
-                                  : snap
-                                    ? snap.ok
-                                    : null;
-                            const up = snap?.up_mbps ?? null;
-                            const down = snap?.down_mbps ?? null;
-                            const googleState = getProbeGoogleState(snap);
-                            const aiInfo = getProbeAiBadges(snap);
-                            const latColor =
-                              isHintCooldown && freshLatency === null
-                                ? "var(--amber)"
-                                : getLatencyColor(lat, latOk);
-                            const nodeRegionCode = resolveNodeRegionCode(node);
-                            return (
+                    {/* In-Group Node Quick Picker Popover (Viewport-Clamped Portal + Anti-Squish 2-Row Items) */}
+                    {nodeMenuOpen &&
+                      nodeMenuPos &&
+                      typeof document !== "undefined" &&
+                      createPortal(
+                        <div
+                          ref={nodeMenuPopoverRef}
+                          className="fixed z-[60] flex flex-col overflow-hidden rounded-2xl border border-[var(--line-strong)] bg-[var(--surface)] p-2.5 text-xs"
+                          style={{
+                            left: `${nodeMenuPos.left}px`,
+                            top:
+                              nodeMenuPos.placement === "bottom"
+                                ? `${nodeMenuPos.top}px`
+                                : undefined,
+                            bottom:
+                              nodeMenuPos.placement === "top"
+                                ? `${nodeMenuPos.bottom}px`
+                                : undefined,
+                            width: `${nodeMenuPos.width}px`,
+                            maxHeight: `${nodeMenuPos.maxHeight}px`,
+                            boxShadow: "var(--shadow-popover)",
+                          }}
+                        >
+                          <div className="relative mb-2 shrink-0">
+                            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
+                            <input
+                              ref={nodeSearchInputRef}
+                              type="text"
+                              value={nodeSearch}
+                              onChange={(e) => setNodeSearch(e.target.value)}
+                              placeholder="搜索本组节点名称或地区…"
+                              className="w-full rounded-xl border border-[var(--line)] bg-[var(--card)] py-1.5 pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
+                            />
+                            {nodeSearch && (
                               <button
-                                key={node.id}
                                 type="button"
-                                disabled={switchingNode}
-                                onClick={() => void handleSelectNode(node.id)}
-                                className={`flex w-full items-center justify-between gap-2 rounded-xl border px-2.5 py-2 text-left transition-colors ${
-                                  isCurrent
-                                    ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--text)]"
-                                    : "border-transparent bg-transparent text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--text)]"
-                                }`}
+                                onClick={() => setNodeSearch("")}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted)] hover:text-[var(--text)]"
+                                aria-label="清空搜索"
                               >
-                                <div className="flex min-w-0 items-center gap-1.5">
-                                  <span
-                                    className="h-2 w-2 shrink-0 rounded-full"
-                                    style={{ backgroundColor: latColor }}
-                                  />
-                                  <span className="truncate font-medium">{node.name}</span>
-                                  {nodeRegionCode && nodeRegionCode !== "UNK" && (
-                                    <span
-                                      className="shrink-0 rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
-                                      title={getRegionLabel(nodeRegionCode)}
-                                    >
-                                      {nodeRegionCode}
-                                    </span>
-                                  )}
-                                  {googleState === "clean" && (
-                                    <span className="shrink-0 rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                                      正常
-                                    </span>
-                                  )}
-                                  {googleState === "cn" && (
-                                    <span className="shrink-0 rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
-                                      送中
-                                    </span>
-                                  )}
-                                  {snap?.google_risk_mismatch && (
-                                    <span
-                                      className="shrink-0 rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                                      title="不同网站识别出的地区存在差异，仅供参考"
-                                    >
-                                      地区有偏差
-                                    </span>
-                                  )}
-                                  {aiInfo.unlocked.length > 0 && (
-                                    <span
-                                      className="hidden shrink-0 items-center gap-1 sm:inline-flex"
-                                      title={`AI 可用：${aiInfo.unlocked.map((a) => a.label).join(" / ")}`}
-                                    >
-                                      {aiInfo.unlocked.map((ai) => (
-                                        <span
-                                          key={ai.id}
-                                          className="rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--accent)]"
-                                        >
-                                          {ai.short}
-                                        </span>
-                                      ))}
-                                    </span>
-                                  )}
-                                  {isCurrent && (
-                                    <span className="shrink-0 rounded-full bg-[var(--accent)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
-                                      当前
-                                    </span>
-                                  )}
-                                </div>
-
-                                <div className="flex shrink-0 items-center gap-2 cc-mono text-[11px]">
-                                  {up !== null && (
-                                    <span className="text-[var(--coral)]">
-                                      ↑{up.toFixed(1)} Mbps
-                                    </span>
-                                  )}
-                                  {down !== null && (
-                                    <span className="text-[var(--sky)]">
-                                      ↓{down >= 100 ? Math.round(down) : down.toFixed(1)} Mbps
-                                    </span>
-                                  )}
-                                  <span className="font-semibold" style={{ color: latColor }}>
-                                    {freshLatency !== null
-                                      ? `${Math.round(freshLatency)} ms`
-                                      : isHintCooldown
-                                        ? hint && hint.cooldown_remaining_sec > 0
-                                          ? `冷却 ${Math.ceil(hint.cooldown_remaining_sec)}s`
-                                          : "冷却中"
-                                        : snap?.ok === false
-                                          ? "超时"
-                                          : lat !== null
-                                            ? `${Math.round(lat)} ms`
-                                            : "未测"}
-                                  </span>
-                                </div>
+                                <X className="h-3.5 w-3.5" />
                               </button>
-                            );
-                          })}
-
-                          {sortedFilteredNodes.length > MAX_VISIBLE_QUICK_NODES && (
-                            <div className="rounded-lg bg-[var(--bg-elevated)] px-2.5 py-1.5 text-center text-[11px] text-[var(--text-secondary)]">
-                              已显示前 {MAX_VISIBLE_QUICK_NODES} 个，输入关键词可秒搜全部{" "}
-                              {sortedFilteredNodes.length} 个
-                            </div>
-                          )}
-
-                          {sortedFilteredNodes.length === 0 && (
-                            <div className="py-5 text-center text-[11px] text-[var(--muted)]">
-                              没有找到匹配的节点
-                            </div>
-                          )}
-                        </div>
-
-                        <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] pt-2 text-[11px] text-[var(--muted)]">
-                          <span>本组共 {groupCandidateNodes.length} 个节点</span>
-                          <div className="flex items-center gap-3">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setNodeMenuOpen(false);
-                                appActions.setNav("nodes");
-                              }}
-                              className="text-[var(--text-secondary)] hover:text-[var(--accent)] hover:underline"
-                            >
-                              去选任意单节点 →
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setNodeMenuOpen(false);
-                                appActions.setNav("groups");
-                              }}
-                              className="font-medium text-[var(--accent)] hover:underline"
-                            >
-                              管理多选组 →
-                            </button>
+                            )}
                           </div>
-                        </div>
-                      </div>
-                    )}
+
+                          <div className="min-h-0 flex-1 space-y-1 overflow-y-auto overscroll-contain pr-0.5">
+                            {visibleDropdownNodes.map((node) => {
+                              const isCurrent = node.id === currentNodeId;
+                              const snap = probes[node.id];
+                              const hint = runtime.node_health_hints?.[node.id];
+                              const isHintHealthy =
+                                hint?.status === "healthy" || hint?.status === "probation";
+                              const isHintCooldown = hint?.status === "cooldown";
+                              const hintLatency =
+                                isHintHealthy &&
+                                typeof hint?.latency_ms === "number" &&
+                                Number.isFinite(hint.latency_ms) &&
+                                hint.latency_ms > 0
+                                  ? hint.latency_ms
+                                  : null;
+                              const freshLatency =
+                                isCurrent && liveActiveLatencyMs !== null
+                                  ? liveActiveLatencyMs
+                                  : hintLatency;
+                              const lat =
+                                freshLatency ??
+                                (isHintCooldown ? null : (snap?.latency_ms ?? null));
+                              const latOk =
+                                freshLatency !== null
+                                  ? true
+                                  : isHintCooldown
+                                    ? false
+                                    : snap
+                                      ? snap.ok
+                                      : null;
+                              const up = snap?.up_mbps ?? null;
+                              const down = snap?.down_mbps ?? null;
+                              const googleState = getProbeGoogleState(snap);
+                              const aiInfo = getProbeAiBadges(snap);
+                              const latColor =
+                                isHintCooldown && freshLatency === null
+                                  ? "var(--amber)"
+                                  : getLatencyColor(lat, latOk);
+                              const nodeRegionCode = resolveNodeRegionCode(node);
+                              const hasRegionTag = Boolean(
+                                nodeRegionCode && nodeRegionCode !== "UNK"
+                              );
+                              const hasSecondRow =
+                                hasRegionTag ||
+                                googleState === "clean" ||
+                                googleState === "cn" ||
+                                Boolean(snap?.google_risk_mismatch) ||
+                                aiInfo.unlocked.length > 0 ||
+                                up !== null ||
+                                down !== null;
+
+                              return (
+                                <button
+                                  key={node.id}
+                                  type="button"
+                                  disabled={switchingNode}
+                                  onClick={() => void handleSelectNode(node.id)}
+                                  className={`flex w-full flex-col gap-1 rounded-xl border px-2.5 py-2 text-left transition-colors ${
+                                    isCurrent
+                                      ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--text)]"
+                                      : "border-transparent bg-transparent text-[var(--text-secondary)] hover:bg-[var(--card)] hover:text-[var(--text)]"
+                                  }`}
+                                >
+                                  {/* Row 1: Status dot + Full Node Name + Current badge + Latency */}
+                                  <div className="flex w-full min-w-0 items-center gap-2">
+                                    <span
+                                      className="h-2 w-2 shrink-0 rounded-full"
+                                      style={{ backgroundColor: latColor }}
+                                    />
+                                    <span
+                                      className="min-w-0 flex-1 truncate font-medium text-[var(--text)]"
+                                      title={node.name}
+                                    >
+                                      {node.name}
+                                    </span>
+                                    {isCurrent && (
+                                      <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--accent)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
+                                        当前
+                                      </span>
+                                    )}
+                                    <span
+                                      className="shrink-0 whitespace-nowrap cc-mono cc-tabular text-[11px] font-semibold"
+                                      style={{ color: latColor }}
+                                    >
+                                      {freshLatency !== null
+                                        ? `${Math.round(freshLatency)} ms`
+                                        : isHintCooldown
+                                          ? hint && hint.cooldown_remaining_sec > 0
+                                            ? `冷却 ${Math.ceil(hint.cooldown_remaining_sec)}s`
+                                            : "冷却中"
+                                          : snap?.ok === false
+                                            ? "超时"
+                                            : lat !== null
+                                              ? `${Math.round(lat)} ms`
+                                              : "未测"}
+                                    </span>
+                                  </div>
+
+                                  {/* Row 2: Region + Google + AI Badges (always visible) + Up/Down Speeds */}
+                                  {hasSecondRow && (
+                                    <div className="flex w-full min-w-0 flex-wrap items-center gap-x-2 gap-y-1 pl-4 text-[10px]">
+                                      {hasRegionTag && (
+                                        <span
+                                          className="shrink-0 whitespace-nowrap rounded bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[var(--muted)]"
+                                          title={getRegionLabel(nodeRegionCode)}
+                                        >
+                                          {nodeRegionCode}
+                                        </span>
+                                      )}
+                                      {googleState === "clean" && (
+                                        <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 font-medium text-[var(--green)]">
+                                          正常
+                                        </span>
+                                      )}
+                                      {googleState === "cn" && (
+                                        <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 font-medium text-[var(--red)]">
+                                          送中
+                                        </span>
+                                      )}
+                                      {snap?.google_risk_mismatch && (
+                                        <span
+                                          className="shrink-0 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 font-medium text-[var(--amber)]"
+                                          title="不同网站识别出的地区存在差异，仅供参考"
+                                        >
+                                          地区有偏差
+                                        </span>
+                                      )}
+                                      {aiInfo.unlocked.length > 0 && (
+                                        <span
+                                          className="inline-flex shrink-0 flex-wrap items-center gap-1"
+                                          title={`AI 可用：${aiInfo.unlocked.map((a) => a.label).join(" / ")}`}
+                                        >
+                                          {aiInfo.unlocked.map((ai) => (
+                                            <span
+                                              key={ai.id}
+                                              className="whitespace-nowrap rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--accent)]"
+                                            >
+                                              {ai.short}
+                                            </span>
+                                          ))}
+                                        </span>
+                                      )}
+                                      {(up !== null || down !== null) && (
+                                        <span className="ml-auto inline-flex shrink-0 items-center gap-2 whitespace-nowrap cc-mono cc-tabular text-[10.5px]">
+                                          {up !== null && (
+                                            <span className="text-[var(--coral)]">
+                                              ↑{up.toFixed(1)} Mbps
+                                            </span>
+                                          )}
+                                          {down !== null && (
+                                            <span className="text-[var(--sky)]">
+                                              ↓{down >= 100 ? Math.round(down) : down.toFixed(1)} Mbps
+                                            </span>
+                                          )}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+                                </button>
+                              );
+                            })}
+
+                            {sortedFilteredNodes.length > MAX_VISIBLE_QUICK_NODES && (
+                              <div className="rounded-lg bg-[var(--bg-elevated)] px-2.5 py-1.5 text-center text-[11px] text-[var(--text-secondary)]">
+                                已显示前 {MAX_VISIBLE_QUICK_NODES} 个，输入关键词可秒搜全部{" "}
+                                {sortedFilteredNodes.length} 个
+                              </div>
+                            )}
+
+                            {sortedFilteredNodes.length === 0 && (
+                              <div className="py-5 text-center text-[11px] text-[var(--muted)]">
+                                没有找到匹配的节点
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="mt-2 flex shrink-0 flex-wrap items-center justify-between gap-2 border-t border-[var(--line)] pt-2 text-[11px] text-[var(--muted)]">
+                            <span className="whitespace-nowrap">
+                              本组共 {groupCandidateNodes.length} 个节点
+                            </span>
+                            <div className="flex flex-wrap items-center gap-3">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setNodeMenuOpen(false);
+                                  appActions.setNav("nodes");
+                                }}
+                                className="whitespace-nowrap text-[var(--text-secondary)] hover:text-[var(--accent)] hover:underline"
+                              >
+                                去选任意单节点 →
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setNodeMenuOpen(false);
+                                  appActions.setNav("groups");
+                                }}
+                                className="whitespace-nowrap font-medium text-[var(--accent)] hover:underline"
+                              >
+                                管理多选组 →
+                              </button>
+                            </div>
+                          </div>
+                        </div>,
+                        document.body
+                      )}
                   </div>
                 )}
               </div>
@@ -2076,18 +2255,18 @@ export function HomePage() {
                   <button
                     type="button"
                     onClick={() => appActions.setNav("nodes")}
-                    className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
                   >
-                    <Server className="h-3.5 w-3.5" />
+                    <Server className="h-3.5 w-3.5 shrink-0" />
                     <span>更换单个节点</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => appActions.setNav("groups")}
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
                   >
-                    <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
+                    <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                     <span>{dict.home.switchGroup}</span>
                   </button>
                 </>
@@ -2097,18 +2276,18 @@ export function HomePage() {
                     type="button"
                     disabled={switchingNode || nodes.length === 0}
                     onClick={() => void handleSwitchNextBest()}
-                    className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-50"
                   >
-                    <Zap className="h-3.5 w-3.5" />
+                    <Zap className="h-3.5 w-3.5 shrink-0" />
                     <span>{switchingNode ? "正在切换…" : dict.home.switchNextNode}</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => appActions.setNav("groups")}
-                    className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
                   >
-                    <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
+                    <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                     <span>{dict.home.switchGroup}</span>
                   </button>
                 </>
@@ -2117,27 +2296,27 @@ export function HomePage() {
               <button
                 type="button"
                 onClick={() => void appActions.toggleCapsule()}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--accent)]"
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--accent)]"
                 title="显示桌面小悬浮条"
               >
-                <PictureInPicture2 className="h-3.5 w-3.5 text-[var(--accent)]" />
+                <PictureInPicture2 className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
                 <span>{dict.home.openCapsule}</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => void handleEnterWindowless()}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
                 title="关闭主界面仅留托盘图标，大幅减少内存占用"
               >
-                <Minimize2 className="h-3.5 w-3.5 text-[var(--green)]" />
+                <Minimize2 className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
                 <span>{dict.home.traySaveMem}</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => appActions.openAiAssistant(undefined, "agent")}
-                className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-[var(--accent)]/40 bg-[var(--accent-soft)]/55 px-3 py-1.5 text-[11.5px] font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+                className="ml-auto inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[var(--accent)]/40 bg-[var(--accent-soft)]/55 px-3 py-1.5 text-[11.5px] font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
                 title="前往 AI 全权代管：复制本机 AI 全权托管指令或网页 AI 手把手引导"
               >
                 <Bot className="h-3.5 w-3.5 shrink-0" />
@@ -2161,11 +2340,11 @@ export function HomePage() {
       </section>
 
       {/* Lower Detection Section: Site Connectivity Check + Exit Information */}
-      <section className="grid grid-cols-1 gap-3 lg:grid-cols-12">
+      <section className="grid grid-cols-1 gap-3 min-[1160px]:grid-cols-12">
         {/* Site Connectivity Check Card */}
-        <div className="cc-card cc-glass rounded-2xl p-4 lg:col-span-7">
+        <div className="cc-card cc-glass min-w-0 rounded-2xl p-4 min-[1160px]:col-span-7">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-            <div>
+            <div className="min-w-0">
               <h2 className="text-sm font-semibold text-[var(--text)]">
                 {dict.home.quickSitesTitle}
               </h2>
@@ -2173,32 +2352,32 @@ export function HomePage() {
                 点击右侧「测一下」检测，平时零后台流量
               </p>
             </div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5">
               <button
                 type="button"
                 onClick={() => void handleResetDefaultSites()}
-                className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1.5 text-xs font-medium text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+                className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1.5 text-xs font-medium text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
                 title="一键还原 Google / GitHub / YouTube / OpenAI 4 个默认检测站"
               >
-                <RotateCcw className="h-3 w-3" />
+                <RotateCcw className="h-3 w-3 shrink-0" />
                 <span>恢复默认</span>
               </button>
               <button
                 type="button"
                 onClick={() => setShowAddSite((v) => !v)}
-                className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+                className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
                 title="添加常用网站"
               >
-                {showAddSite ? <X className="h-3.5 w-3.5" /> : <Plus className="h-3.5 w-3.5" />}
+                {showAddSite ? <X className="h-3.5 w-3.5 shrink-0" /> : <Plus className="h-3.5 w-3.5 shrink-0" />}
                 <span>{showAddSite ? "收起" : "添加"}</span>
               </button>
               <button
                 type="button"
                 disabled={checkingSites}
                 onClick={() => void handleCheckSites()}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg bg-[var(--accent-soft)] px-3 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
               >
-                <RefreshCw className={`h-3.5 w-3.5 ${checkingSites ? "animate-spin" : ""}`} />
+                <RefreshCw className={`h-3.5 w-3.5 shrink-0 ${checkingSites ? "animate-spin" : ""}`} />
                 <span>{checkingSites ? "检测中…" : "测一下"}</span>
               </button>
             </div>
@@ -2214,18 +2393,18 @@ export function HomePage() {
                 value={newSiteName}
                 onChange={(e) => setNewSiteName(e.target.value)}
                 placeholder="网站名称（如 Claude）"
-                className="rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] sm:col-span-4"
+                className="min-w-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] sm:col-span-4"
               />
               <input
                 type="text"
                 value={newSiteUrl}
                 onChange={(e) => setNewSiteUrl(e.target.value)}
                 placeholder="https://example.com"
-                className="cc-mono rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] sm:col-span-6"
+                className="min-w-0 cc-mono rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)] sm:col-span-6"
               />
               <button
                 type="submit"
-                className="rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 sm:col-span-2"
+                className="whitespace-nowrap rounded-lg bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 sm:col-span-2"
               >
                 添加
               </button>
@@ -2241,28 +2420,28 @@ export function HomePage() {
                 <div
                   key={site.id}
                   title={site.url}
-                  className="group flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2.5 transition-colors hover:border-[var(--line-strong)]"
+                  className="group flex min-w-0 items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-2.5 transition-colors hover:border-[var(--line-strong)]"
                 >
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
+                    <div className="flex min-w-0 items-center gap-2">
                       <span
                         className="h-2 w-2 shrink-0 rounded-full"
                         style={{ backgroundColor: color }}
                       />
-                      <span className="truncate text-xs font-medium text-[var(--text)]">
+                      <span className="min-w-0 flex-1 truncate text-xs font-medium text-[var(--text)]">
                         {displaySiteName}
                       </span>
                       {isCustom && (
-                        <span className="shrink-0 rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                        <span className="shrink-0 whitespace-nowrap rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
                           自添加
                         </span>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex shrink-0 items-center gap-2">
+                  <div className="flex shrink-0 items-center gap-1.5">
                     <span
-                      className="cc-mono cc-tabular text-xs font-semibold"
+                      className="whitespace-nowrap cc-mono cc-tabular text-xs font-semibold"
                       style={{ color }}
                     >
                       {site.ok === false
@@ -2274,11 +2453,11 @@ export function HomePage() {
                     <button
                       type="button"
                       onClick={() => handleRequestRemoveSite(site)}
-                      className="rounded-md p-1 text-[var(--muted)] opacity-0 transition-opacity hover:bg-[var(--card)] hover:text-[var(--red)] group-hover:opacity-100"
+                      className="w-0 overflow-hidden rounded-md p-0 text-[var(--muted)] opacity-0 transition-all hover:bg-[var(--card)] hover:text-[var(--red)] focus-visible:w-auto focus-visible:p-1 focus-visible:opacity-100 group-hover:w-auto group-hover:p-1 group-hover:opacity-100"
                       title={`移除 ${displaySiteName}`}
                       aria-label={`移除 ${displaySiteName}`}
                     >
-                      <Trash2 className="h-3.5 w-3.5" />
+                      <Trash2 className="h-3.5 w-3.5 shrink-0" />
                     </button>
                   </div>
                 </div>
@@ -2293,12 +2472,12 @@ export function HomePage() {
         </div>
 
         {/* Exit Info Card (Clean Chinese labels, probe on demand only) */}
-        <div className="cc-card cc-glass flex flex-col justify-between rounded-2xl p-4 lg:col-span-5">
+        <div className="cc-card cc-glass flex min-w-0 flex-col justify-between rounded-2xl p-4 min-[1160px]:col-span-5">
           <div>
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <div className="flex items-start gap-2">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div className="flex min-w-0 flex-1 items-start gap-2">
                 <Globe className="mt-0.5 h-4 w-4 shrink-0 text-[var(--accent)]" />
-                <div>
+                <div className="min-w-0">
                   <h2 className="text-sm font-semibold text-[var(--text)]">
                     {dict.home.exitInfoTitle}
                   </h2>
@@ -2308,17 +2487,17 @@ export function HomePage() {
                 </div>
               </div>
 
-              <div className="flex items-center gap-1.5">
+              <div className="flex shrink-0 items-center gap-1.5">
                 {hasExitIpData && (
                   <button
                     type="button"
                     onClick={() =>
                       appActions.patchSessionDraft("home", { ipMasked: !ipMasked })
                     }
-                    className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+                    className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
                     title={ipMasked ? "点击查看完整地址" : "点击隐藏末尾数字"}
                   >
-                    {ipMasked ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+                    {ipMasked ? <EyeOff className="h-3.5 w-3.5 shrink-0" /> : <Eye className="h-3.5 w-3.5 shrink-0" />}
                     <span>{ipMasked ? "已遮掩" : "显示中"}</span>
                   </button>
                 )}
@@ -2327,9 +2506,9 @@ export function HomePage() {
                   type="button"
                   disabled={refreshingIp}
                   onClick={() => void handleRefreshExitIp()}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent-soft)] px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg bg-[var(--accent-soft)] px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
                 >
-                  <RefreshCw className={`h-3.5 w-3.5 ${refreshingIp ? "animate-spin" : ""}`} />
+                  <RefreshCw className={`h-3.5 w-3.5 shrink-0 ${refreshingIp ? "animate-spin" : ""}`} />
                   <span>{refreshingIp ? "检测中…" : "测一下"}</span>
                 </button>
               </div>
@@ -2343,14 +2522,14 @@ export function HomePage() {
                 </div>
               </div>
               <span
-                className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2.5 py-1 text-[11px] font-medium ${googleStatusBadge.cls}`}
+                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-medium ${googleStatusBadge.cls}`}
               >
                 {googleStatusBadge.state === "clean" ? (
-                  <CheckCircle2 className="h-3.5 w-3.5" />
+                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
                 ) : googleStatusBadge.state === "risk" ? (
-                  <ShieldAlert className="h-3.5 w-3.5" />
+                  <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
                 ) : (
-                  <Clock className="h-3.5 w-3.5" />
+                  <Clock className="h-3.5 w-3.5 shrink-0" />
                 )}
                 <span>{googleStatusBadge.label}</span>
               </span>
@@ -2389,32 +2568,26 @@ export function HomePage() {
 
       {/* Compact Elegant Bottom Status Bar */}
       <footer className="cc-card cc-glass mb-2 flex flex-wrap items-center justify-between gap-x-4 gap-y-2 rounded-2xl px-4 py-2.5 text-xs text-[var(--muted)]">
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span className="inline-flex items-center gap-1.5 font-medium text-[var(--text-secondary)]">
+        <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1">
+          <span className="inline-flex items-center gap-1.5 whitespace-nowrap font-medium text-[var(--text-secondary)]">
             <span
-              className="h-2 w-2 rounded-full"
+              className="h-2 w-2 shrink-0 rounded-full"
               style={{
                 backgroundColor: runtime.running ? "var(--green)" : "var(--amber)",
               }}
             />
             <HomeLiveUptime running={runtime.running} uptimeSec={runtime.uptime_sec} />
           </span>
-          <span className="text-[var(--line-strong)]" aria-hidden="true">
-            |
-          </span>
-          <span>
+          <span className="whitespace-nowrap">
             本地端口 <span className="cc-mono text-[var(--text-secondary)]">{runtime.mixed_port}</span>
           </span>
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span>
+        <div className="flex flex-wrap items-center gap-x-3.5 gap-y-1">
+          <span className="whitespace-nowrap">
             版本 <span className="cc-mono text-[var(--text-secondary)]">v{runtime.app_version}</span>
           </span>
-          <span className="text-[var(--line-strong)]" aria-hidden="true">
-            |
-          </span>
-          <span className="rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
+          <span className="whitespace-nowrap rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
             {runtime.portable_mode ? "便携版" : "安装版"}
           </span>
         </div>
@@ -2435,7 +2608,7 @@ export function HomePage() {
               aria-modal="true"
               aria-label="确认移除检测网站"
               onClick={(e) => e.stopPropagation()}
-              className="cc-surface w-full max-w-md rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
+              className="cc-surface max-h-[calc(100vh-2rem)] w-full max-w-md overflow-y-auto rounded-2xl border border-[var(--line-strong)] p-5 shadow-2xl"
             >
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-start gap-3">

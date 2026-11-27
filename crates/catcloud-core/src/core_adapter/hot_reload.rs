@@ -1,7 +1,7 @@
 use crate::config::{load_or_default, validate_config};
 use crate::core_adapter::binary_resolver::resolve_mihomo_binary;
 use crate::core_adapter::config_compiler::{
-    CompileInput, compile_mihomo_config_with_runtime_dir,
+    CompileInput, CompiledCoreConfig, compile_mihomo_config_with_runtime_dir,
 };
 use crate::core_adapter::mihomo::{
     MihomoAdapter, generate_controller_secret, verify_config_with_binary,
@@ -250,11 +250,65 @@ struct CoordinatorState {
     last_compiled_hash: Option<String>,
     last_snapshot_fingerprint: Option<String>,
     last_allocated_ports: Option<AllocatedPorts>,
+    last_effective_tun_mtu: Option<u16>,
     controller_secret: Option<String>,
     last_binary_path: Option<PathBuf>,
     last_node_count: usize,
     last_rule_count: usize,
     last_active_selections: BTreeMap<String, String>,
+}
+
+/// Inspect on-disk `runtime.yaml` to recover the active effective `tun.mtu` when TUN is enabled.
+pub fn read_runtime_yaml_tun_mtu(runtime_yaml_path: &Path) -> Option<u16> {
+    let raw = std::fs::read_to_string(runtime_yaml_path).ok()?;
+    let text = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    let mut doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(text).ok()?;
+    let _ = doc.apply_merge();
+    let tun = doc.get("tun")?;
+    if !tun.get("enable").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+    tun.get("mtu")
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u16::try_from(v).ok())
+}
+
+/// Enforce `tun.enable = false` on a final compiled configuration when the current process lacks
+/// TUN privileges (`!options.allow_tun`), preventing `inline_override_yaml` or merge patches from
+/// silently re-enabling TUN.
+fn enforce_tun_disabled_on_compiled(compiled: &mut CompiledCoreConfig) -> CatResult<()> {
+    let Some(root_map) = compiled.value.as_mapping_mut() else {
+        return Ok(());
+    };
+    let tun_key = serde_yaml_ng::Value::String("tun".to_string());
+    let enable_key = serde_yaml_ng::Value::String("enable".to_string());
+    let mut mutated = false;
+    match root_map.get_mut(&tun_key) {
+        Some(serde_yaml_ng::Value::Mapping(tun_map)) => {
+            if tun_map
+                .get(&enable_key)
+                .and_then(serde_yaml_ng::Value::as_bool)
+                != Some(false)
+            {
+                tun_map.insert(enable_key, serde_yaml_ng::Value::Bool(false));
+                mutated = true;
+            }
+        }
+        Some(other) => {
+            let mut tun_map = serde_yaml_ng::Mapping::new();
+            tun_map.insert(enable_key, serde_yaml_ng::Value::Bool(false));
+            *other = serde_yaml_ng::Value::Mapping(tun_map);
+            mutated = true;
+        }
+        None => {}
+    }
+    if mutated {
+        compiled.yaml = serde_yaml_ng::to_string(&compiled.value)?;
+        let mut hasher = Sha256::new();
+        hasher.update(compiled.yaml.as_bytes());
+        compiled.sha256 = hex::encode(hasher.finalize());
+    }
+    Ok(())
 }
 
 /// Orchestrates disk reading, validation, compilation, static anti-loop pre-flight,
@@ -314,10 +368,15 @@ impl HotReloadCoordinator {
         let _op_guard = self.op_lock.lock().await;
         let status = self.adapter.runtime_status().await;
         let active_selections = self.adapter.active_selections_snapshot().await;
+        let seeded_tun_mtu = cfg
+            .tun
+            .enabled
+            .then(|| read_runtime_yaml_tun_mtu(&self.runtime_yaml_path()).unwrap_or(cfg.tun.mtu));
         let mut guard = self.state.lock().await;
         guard.last_applied_config = Some(cfg);
         guard.last_compiled_hash = Some(compiled_hash);
         guard.last_allocated_ports = Some(allocated_ports);
+        guard.last_effective_tun_mtu = seeded_tun_mtu;
         guard.controller_secret = Some(controller_secret);
         if status.binary_path.is_some() {
             guard.last_binary_path = status.binary_path;
@@ -391,6 +450,7 @@ impl HotReloadCoordinator {
             prev_hash,
             prev_snapshot_fp,
             prev_ports,
+            prev_effective_tun_mtu,
             prev_secret,
             prev_bin,
             prev_node_count,
@@ -403,6 +463,7 @@ impl HotReloadCoordinator {
                 guard.last_compiled_hash.clone(),
                 guard.last_snapshot_fingerprint.clone(),
                 guard.last_allocated_ports.clone(),
+                guard.last_effective_tun_mtu,
                 guard.controller_secret.clone(),
                 guard.last_binary_path.clone(),
                 guard.last_node_count,
@@ -542,7 +603,7 @@ impl HotReloadCoordinator {
             group_filtered_members: &options.group_filtered_members,
         };
 
-        let compiled = match compile_mihomo_config_with_runtime_dir(
+        let mut compiled = match compile_mihomo_config_with_runtime_dir(
             &compile_input,
             Some(&self.paths.runtime_dir),
         ) {
@@ -551,6 +612,14 @@ impl HotReloadCoordinator {
                 return rejected_outcome(level, format!("YAML compilation failed: {err}"));
             }
         };
+        if !options.allow_tun {
+            if let Err(err) = enforce_tun_disabled_on_compiled(&mut compiled) {
+                return rejected_outcome(
+                    level,
+                    format!("failed to enforce tun.enable=false under !allow_tun: {err}"),
+                );
+            }
+        }
 
         // 6. Static anti-loop and syntax pre-flight gate: reject before touching active runtime.yaml.
         if !compiled.validation.ok {
@@ -567,6 +636,97 @@ impl HotReloadCoordinator {
             );
         }
 
+        // 6b. When TUN is enabled and the compiled effective TUN MTU crosses (e.g. 1500 <-> 1400
+        //     when dialer-proxy wrapping activates or deactivates), escalate to L3CoreRestart so
+        //     Wintun / virtual NIC MTU changes cleanly, strictly honoring `allow_l3_restart`.
+        let effective_tun_mtu_changed = effective_cfg.tun.enabled
+            && prev_effective_tun_mtu
+                .is_some_and(|prev_mtu| prev_mtu != compiled.stats.effective_tun_mtu);
+        if effective_tun_mtu_changed && level != ReloadLevel::L3CoreRestart {
+            if !options.allow_l3_restart {
+                return rejected_outcome(
+                    ReloadLevel::L3CoreRestart,
+                    format!(
+                        "L3 core restart is required because effective TUN MTU changed ({} -> {}), but allow_l3_restart is disabled; active core and runtime.yaml were left untouched",
+                        prev_effective_tun_mtu.unwrap_or(effective_cfg.tun.mtu),
+                        compiled.stats.effective_tun_mtu
+                    ),
+                );
+            }
+            level = ReloadLevel::L3CoreRestart;
+            let next_ports = match allocate_l3_ports_respecting_running_core(
+                &effective_cfg,
+                &current_status,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    return rejected_outcome(
+                        ReloadLevel::L3CoreRestart,
+                        format!(
+                            "port_guard rejected L3 port allocation for effective TUN MTU change: {err}"
+                        ),
+                    );
+                }
+            };
+            let ports_changed = next_ports.bind_host != allocated_ports.bind_host
+                || next_ports.mixed_port != allocated_ports.mixed_port
+                || next_ports.controller_port != allocated_ports.controller_port
+                || next_ports.dns_port != allocated_ports.dns_port;
+            allocated_ports = next_ports;
+            if ports_changed {
+                let recompile_input = CompileInput {
+                    config: &effective_cfg,
+                    nodes: &snapshot.nodes,
+                    groups: &snapshot.groups,
+                    relays: &snapshot.relays,
+                    controller_secret: &secret,
+                    allocated_ports: &allocated_ports,
+                    extra_prepend_rules: &options.extra_prepend_rules,
+                    extra_fake_ip_filters: &options.extra_fake_ip_filters,
+                    group_filtered_members: &options.group_filtered_members,
+                };
+                compiled = match compile_mihomo_config_with_runtime_dir(
+                    &recompile_input,
+                    Some(&self.paths.runtime_dir),
+                ) {
+                    Ok(c) => c,
+                    Err(err) => {
+                        return rejected_outcome(
+                            ReloadLevel::L3CoreRestart,
+                            format!(
+                                "YAML recompilation failed after L3 MTU port allocation: {err}"
+                            ),
+                        );
+                    }
+                };
+                if !options.allow_tun {
+                    if let Err(err) = enforce_tun_disabled_on_compiled(&mut compiled) {
+                        return rejected_outcome(
+                            ReloadLevel::L3CoreRestart,
+                            format!(
+                                "failed to enforce tun.enable=false after L3 MTU recompilation: {err}"
+                            ),
+                        );
+                    }
+                }
+                if !compiled.validation.ok {
+                    let summary = compiled
+                        .validation
+                        .errors()
+                        .iter()
+                        .map(|i| format!("[{}] {}", i.code, i.message))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return rejected_outcome(
+                        ReloadLevel::L3CoreRestart,
+                        format!(
+                            "static anti-loop/config pre-flight rejected L3 MTU reload: {summary}"
+                        ),
+                    );
+                }
+            }
+        }
+
         let warnings: Vec<String> = compiled
             .validation
             .warnings()
@@ -580,6 +740,10 @@ impl HotReloadCoordinator {
             && prev_hash.as_deref() == Some(compiled.sha256.as_str())
         {
             let mut guard = self.state.lock().await;
+            guard.last_effective_tun_mtu = effective_cfg
+                .tun
+                .enabled
+                .then_some(compiled.stats.effective_tun_mtu);
             guard.last_applied_config = Some(effective_cfg);
             return ReloadOutcome {
                 applied: false,
@@ -839,6 +1003,10 @@ impl HotReloadCoordinator {
         let shifted = std::mem::take(&mut allocated_ports.shifted);
         {
             let mut guard = self.state.lock().await;
+            guard.last_effective_tun_mtu = effective_cfg
+                .tun
+                .enabled
+                .then_some(compiled.stats.effective_tun_mtu);
             guard.last_applied_config = Some(effective_cfg);
             guard.last_compiled_hash = Some(compiled.sha256.clone());
             guard.last_snapshot_fingerprint = Some(current_snapshot_fp);
@@ -2221,6 +2389,309 @@ mod tests {
         );
 
         server.abort();
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[tokio::test]
+    async fn effective_tun_mtu_transition_escalates_to_l3_and_respects_allow_l3_gate() {
+        let paths = temp_paths("tun-mtu-l3-escalation");
+        let guard = Arc::new(JobGuard::new().unwrap());
+        let adapter = Arc::new(MihomoAdapter::new(guard).unwrap());
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        let relay = PreAccelRelay {
+            id: "relay-mtu-test".to_string(),
+            name: "Relay-MTU-443".to_string(),
+            provider: "cloud-a".to_string(),
+            region: "CN-East".to_string(),
+            server: "203.0.113.10".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-mtu-password".to_string(),
+            sni: None,
+            skip_cert_verify: true,
+            priority: 10,
+            expires_at: None,
+            enabled: true,
+            supports_ipv6: false,
+            last_probe_ms: None,
+            last_mbps: None,
+            last_up_mbps: None,
+            last_down_mbps: None,
+        };
+        let mut non443_node = ProxyNode {
+            id: "n-mtu-8443".to_string(),
+            sub_id: "sub-mtu".to_string(),
+            name: "Node-8443".to_string(),
+            protocol: "ss".to_string(),
+            server: "198.51.100.30".to_string(),
+            port: 8443,
+            is_443_native: false,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            enabled: true,
+            raw_config: serde_json::json!({
+                "name": "Node-8443",
+                "type": "ss",
+                "server": "198.51.100.30",
+                "port": 8443,
+                "cipher": "aes-128-gcm",
+                "password": "demo-ss-password"
+            }),
+            ..Default::default()
+        };
+        let native443_node = ProxyNode {
+            id: "n-mtu-443".to_string(),
+            sub_id: "sub-mtu".to_string(),
+            name: "Node-443-Native".to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.44".to_string(),
+            port: 443,
+            is_443_native: true,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            enabled: true,
+            raw_config: serde_json::json!({
+                "name": "Node-443-Native",
+                "type": "trojan",
+                "server": "198.51.100.44",
+                "port": 443,
+                "password": "demo-trojan-password"
+            }),
+            ..Default::default()
+        };
+
+        // 1. Baseline: TUN enabled (MTU 1500), preaccel disabled -> effective MTU = 1500.
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = true;
+        cfg.tun.mtu = 1500;
+        cfg.preaccel.enabled = false;
+        save(&paths, &cfg).unwrap();
+
+        let snapshot_with_non443 = DiskReloadSnapshot {
+            nodes: vec![non443_node.clone()],
+            groups: Vec::new(),
+            relays: vec![relay.clone()],
+        };
+        let out1 = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: true,
+                snapshot_override: Some(snapshot_with_non443.clone()),
+                ..Default::default()
+            })
+            .await;
+        assert!(out1.applied, "initial baseline reload failed: {:?}", out1.error);
+        assert_eq!(out1.level, ReloadLevel::L2HotReload);
+        let baseline_yaml = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
+        let baseline_doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&baseline_yaml).unwrap();
+        assert_eq!(baseline_doc["tun"]["mtu"].as_u64(), Some(1500));
+
+        // 2. Enable preaccel with non-443 node -> effective MTU drops 1500 -> 1400.
+        //    With allow_l3_restart=false, must reject as L3CoreRestart without touching runtime.yaml.
+        cfg.preaccel.enabled = true;
+        save(&paths, &cfg).unwrap();
+        let out_blocked = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: true,
+                snapshot_override: Some(snapshot_with_non443.clone()),
+                ..Default::default()
+            })
+            .await;
+        assert!(out_blocked.rejected);
+        assert_eq!(out_blocked.level, ReloadLevel::L3CoreRestart);
+        assert!(
+            out_blocked
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("effective TUN MTU changed (1500 -> 1400)")
+        );
+        assert_eq!(
+            std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap(),
+            baseline_yaml
+        );
+
+        // 3. With allow_l3_restart=true (and no binary in temp_paths), it escalates to L3CoreRestart
+        //    and hits the L3 binary resolution guard instead of silently applying as L2.
+        let out_escalated = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: true,
+                allow_tun: true,
+                snapshot_override: Some(snapshot_with_non443.clone()),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(out_escalated.level, ReloadLevel::L3CoreRestart);
+        assert!(out_escalated.rejected);
+        assert!(
+            out_escalated
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no Mihomo binary could be resolved")
+        );
+
+        // 4. Reverse direction (1400 -> 1500): seed runtime.yaml with mtu=1400, disable preaccel.
+        let mut seeded_cfg = cfg.clone();
+        seeded_cfg.preaccel.enabled = true;
+        let seeded_yaml = "tun:\n  enable: true\n  mtu: 1400\n";
+        std::fs::write(coordinator.runtime_yaml_path(), seeded_yaml).unwrap();
+        let ports = AllocatedPorts {
+            bind_host: "127.0.0.1".to_string(),
+            mixed_port: seeded_cfg.mixed_port,
+            controller_port: seeded_cfg.controller_port,
+            dns_port: seeded_cfg.dns_listen_port,
+            shifted: Vec::new(),
+        };
+        coordinator
+            .seed_active_state(
+                seeded_cfg.clone(),
+                "seed-1400".into(),
+                ports.clone(),
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .await;
+
+        seeded_cfg.preaccel.enabled = false;
+        save(&paths, &seeded_cfg).unwrap();
+        let out_reverse = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: true,
+                snapshot_override: Some(snapshot_with_non443),
+                ..Default::default()
+            })
+            .await;
+        assert!(out_reverse.rejected);
+        assert_eq!(out_reverse.level, ReloadLevel::L3CoreRestart);
+        assert!(
+            out_reverse
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("effective TUN MTU changed (1400 -> 1500)")
+        );
+
+        // 5. No MTU crossing (all nodes skipped native 443 -> effective MTU stays 1500): stays L2HotReload.
+        let seeded_yaml_1500 = "tun:\n  enable: true\n  mtu: 1500\n";
+        std::fs::write(coordinator.runtime_yaml_path(), seeded_yaml_1500).unwrap();
+        seeded_cfg.preaccel.enabled = false;
+        coordinator
+            .seed_active_state(
+                seeded_cfg.clone(),
+                "seed-1500".into(),
+                ports,
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .await;
+        seeded_cfg.preaccel.enabled = true;
+        seeded_cfg.preaccel.skip_443_native = true;
+        save(&paths, &seeded_cfg).unwrap();
+        non443_node.enabled = false;
+        let out_same_mtu = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: true,
+                snapshot_override: Some(DiskReloadSnapshot {
+                    nodes: vec![native443_node, non443_node],
+                    groups: Vec::new(),
+                    relays: vec![relay],
+                }),
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            out_same_mtu.applied,
+            "same-MTU preaccel toggle must stay L2: {:?}",
+            out_same_mtu.error
+        );
+        assert_eq!(out_same_mtu.level, ReloadLevel::L2HotReload);
+
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[tokio::test]
+    async fn apply_disk_reload_locks_tun_disabled_when_allow_tun_false_even_with_inline_override_yaml()
+    {
+        let paths = temp_paths("allow-tun-false-inline-lock");
+        let adapter = Arc::new(MihomoAdapter::new(Arc::new(JobGuard::new().unwrap())).unwrap());
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = true;
+        cfg.rules_override.override_mode = OverrideMode::Disabled;
+        cfg.rules_override.inline_override_yaml = Some("tun:\n  enable: true\n  mtu: 1480\n".to_string());
+        save(&paths, &cfg).unwrap();
+
+        let out = coordinator
+            .apply_disk_reload(DiskReloadOptions {
+                verify_with_binary: false,
+                allow_l3_restart: false,
+                allow_tun: false,
+                snapshot_override: Some(DiskReloadSnapshot::default()),
+                ..Default::default()
+            })
+            .await;
+        assert!(out.applied, "reload under !allow_tun failed: {:?}", out.error);
+
+        let written = std::fs::read_to_string(coordinator.runtime_yaml_path()).unwrap();
+        let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&written).unwrap();
+        assert_eq!(
+            doc["tun"]["enable"],
+            serde_yaml_ng::Value::Bool(false),
+            "inline_override_yaml must not bypass !allow_tun to enable TUN"
+        );
+
+        let _ = std::fs::remove_dir_all(&paths.root_data_dir);
+    }
+
+    #[tokio::test]
+    async fn seed_active_state_ignores_stale_runtime_yaml_tun_mtu_when_tun_disabled() {
+        let paths = temp_paths("seed-active-state-tun-disabled");
+        let adapter = Arc::new(MihomoAdapter::new(Arc::new(JobGuard::new().unwrap())).unwrap());
+        let coordinator = HotReloadCoordinator::new(paths.clone(), adapter);
+
+        // Leave a stale runtime.yaml with tun.enable: true on disk.
+        std::fs::create_dir_all(&paths.runtime_dir).unwrap();
+        std::fs::write(
+            coordinator.runtime_yaml_path(),
+            "tun:\n  enable: true\n  mtu: 1400\n",
+        )
+        .unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.tun.enabled = false;
+        cfg.tun.mtu = 1500;
+        let ports = AllocatedPorts {
+            bind_host: "127.0.0.1".to_string(),
+            mixed_port: cfg.mixed_port,
+            controller_port: cfg.controller_port,
+            dns_port: cfg.dns_listen_port,
+            shifted: Vec::new(),
+        };
+        coordinator
+            .seed_active_state(
+                cfg,
+                "seed-tun-off".into(),
+                ports,
+                "0123456789abcdef0123456789abcdef".into(),
+            )
+            .await;
+
+        let guard = coordinator.state.lock().await;
+        assert_eq!(
+            guard.last_effective_tun_mtu, None,
+            "seed_active_state must not seed stale runtime.yaml MTU when cfg.tun.enabled is false"
+        );
+        drop(guard);
+
         let _ = std::fs::remove_dir_all(&paths.root_data_dir);
     }
 }

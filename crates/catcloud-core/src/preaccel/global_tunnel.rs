@@ -69,7 +69,7 @@ pub(super) const WINDIVERT_ARM64_UNSUPPORTED_MSG: &str = "当前为 Windows ARM6
 pub const MAX_NAT_ENTRIES: usize = 4096;
 
 /// Idle eviction timeout for stale NAT table entries.
-pub const NAT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+pub const NAT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Grace period keeping a closing NAT entry alive so final `FIN-ACK` / `RST` return packets
 /// still translate back to the client cleanly without leaving half-closed sockets or overly
@@ -111,7 +111,7 @@ const STANDALONE_TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(6);
 const STANDALONE_TUNNEL_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 /// Dedicated memory budget for the lightweight standalone 443 tunnel subprocess.
-pub const STANDALONE_TUNNEL_GOMEMLIMIT: &str = "24MiB";
+pub const STANDALONE_TUNNEL_GOMEMLIMIT: &str = "48MiB";
 
 /// Dedicated GC target for the lightweight standalone 443 tunnel subprocess.
 pub const STANDALONE_TUNNEL_GOGC: &str = "25";
@@ -611,7 +611,7 @@ pub fn compile_standalone_preaccel_yaml_with_interface(
     );
     root.insert(
         Value::String("keep-alive-idle".to_string()),
-        Value::Number(Number::from(15u64)),
+        Value::Number(Number::from(45u64)),
     );
     root.insert(
         Value::String("keep-alive-interval".to_string()),
@@ -708,7 +708,7 @@ pub fn compile_standalone_preaccel_yaml_with_interface(
 /// Managed lightweight Mihomo subprocess serving the standalone domestic :443 dual-active
 /// SOCKS5 tunnel on `127.0.0.1:<socks_port>`.
 ///
-/// Enforces `GOMEMLIMIT=24MiB`, `GOGC=25`, `GODEBUG=madvdontneed=1`, `CREATE_NO_WINDOW` on
+/// Enforces `GOMEMLIMIT=48MiB`, `GOGC=25`, `GODEBUG=madvdontneed=1`, `CREATE_NO_WINDOW` on
 /// Windows, `JobGuard` registration, and deterministic termination on `stop()` and `Drop`.
 #[derive(Debug)]
 pub struct StandalonePreAccelTunnel {
@@ -2404,8 +2404,17 @@ impl NatTable {
                 }
                 keep
             });
-            for port in evicted_ports {
-                self.clear_port_bit_locked(&guard, port);
+            if evicted_ports.len() == 1 {
+                self.clear_port_bit_locked(&guard, evicted_ports[0]);
+            } else if !evicted_ports.is_empty() {
+                let remaining_ports: HashSet<u16> = guard.keys().map(|&(_, p)| p).collect();
+                for port in evicted_ports {
+                    if !remaining_ports.contains(&port) {
+                        let idx = usize::from(port) >> 6;
+                        let mask = !(1u64 << (port & 63));
+                        self.port_bitmap[idx].fetch_and(mask, Ordering::Release);
+                    }
+                }
             }
             // Prefer evicting already-closing entries before live flows when at capacity.
             while guard.len() >= self.max_entries {
@@ -3619,10 +3628,111 @@ impl Default for VerifySnapshot {
     }
 }
 
+/// Normalized static configuration fingerprint of a running WinDivert engine, intentionally
+/// excluding dynamically hot-synced `main_core_pid` so unrelated config reloads keep existing
+/// intercepted flows alive without tearing down WinDivert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+struct WinDivertRuntimeFingerprint {
+    dll_path: PathBuf,
+    sys_path: Option<PathBuf>,
+    relay_ipv4s: Vec<Ipv4Addr>,
+    skip_443_native: bool,
+    scope: GlobalPreAccelScope,
+    target_processes: Vec<String>,
+    static_excluded_pids: Vec<u32>,
+}
+
+#[allow(dead_code)]
+impl WinDivertRuntimeFingerprint {
+    fn from_inputs(
+        dll_path: PathBuf,
+        sys_path: Option<PathBuf>,
+        relay_ipv4s: &[Ipv4Addr],
+        skip_443_native: bool,
+        scope: GlobalPreAccelScope,
+        target_processes: &[String],
+        static_excluded_pids: &HashSet<u32>,
+    ) -> Self {
+        let mut sorted_relays: Vec<Ipv4Addr> = relay_ipv4s.to_vec();
+        sorted_relays.sort_unstable();
+        sorted_relays.dedup();
+
+        let mut normalized_procs: Vec<String> = target_processes
+            .iter()
+            .map(|p| normalize_process_basename(p))
+            .filter(|p| !p.is_empty())
+            .collect();
+        normalized_procs.sort();
+        normalized_procs.dedup();
+
+        let mut sorted_pids: Vec<u32> = static_excluded_pids.iter().copied().collect();
+        sorted_pids.sort_unstable();
+        sorted_pids.dedup();
+
+        Self {
+            dll_path,
+            sys_path,
+            relay_ipv4s: sorted_relays,
+            skip_443_native,
+            scope,
+            target_processes: normalized_procs,
+            static_excluded_pids: sorted_pids,
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn should_skip_windivert_restart(
+    tunnel_changed: bool,
+    old_fp: Option<&WinDivertRuntimeFingerprint>,
+    next_fp: Option<&WinDivertRuntimeFingerprint>,
+) -> bool {
+    !tunnel_changed && old_fp.is_some() && old_fp == next_fp
+}
+
+/// Strict HTTP 204 validator for WinDivert dataplane self-test results (rejects captive-portal
+/// 200/302 responses, 4xx/5xx gateway errors, and empty/truncated non-HTTP replies).
+#[allow(dead_code)]
+pub(crate) fn validate_self_test_http_status(status_code: Option<u16>) -> Result<u16, String> {
+    match status_code {
+        Some(204) => Ok(204),
+        Some(code) => Err(format!(
+            "返回非预期 HTTP {code}（期望 HTTP 204，疑似被门户劫持或上游异常）"
+        )),
+        None => Err("返回空响应或非标准 HTTP 报文（期望 HTTP 204）".to_string()),
+    }
+}
+
+#[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+fn enforce_self_test_strict_204(
+    outcome: super::windivert_win::WinDivertSelfTestOutcome,
+) -> super::windivert_win::WinDivertSelfTestOutcome {
+    match outcome {
+        super::windivert_win::WinDivertSelfTestOutcome::Passed {
+            latency_ms,
+            probe_host,
+            status_code,
+        } => match validate_self_test_http_status(Some(status_code)) {
+            Ok(code) => super::windivert_win::WinDivertSelfTestOutcome::Passed {
+                latency_ms,
+                probe_host,
+                status_code: code,
+            },
+            Err(reason) => super::windivert_win::WinDivertSelfTestOutcome::TunnelUnreachable {
+                detail: format!("{probe_host} {reason}"),
+            },
+        },
+        other => other,
+    }
+}
+
 #[derive(Debug)]
 struct ActiveGlobalRuntime {
     #[cfg(target_os = "windows")]
     engine: Option<super::windivert_win::WinDivertEngine>,
+    #[allow(dead_code)]
+    windivert_fp: Option<WinDivertRuntimeFingerprint>,
     tunnel: StandalonePreAccelTunnel,
     mode: String,
     socks_port: u16,
@@ -3883,6 +3993,8 @@ impl GlobalPreAccelManager {
 
         #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
         let mut win_engine: Option<super::windivert_win::WinDivertEngine> = None;
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        let mut win_engine_fp: Option<WinDivertRuntimeFingerprint> = None;
         #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
         let win_engine: Option<super::windivert_win::WinDivertEngine> = None;
 
@@ -3911,7 +4023,7 @@ impl GlobalPreAccelManager {
                     "当前非管理员权限，已自动运行在本地独立 443 SOCKS5 隧道模式；如需透明加速其它软件请以管理员身份运行"
                         .to_string(),
                 ));
-            } else if let Some((dll_path, _sys_path)) = wd_files {
+            } else if let Some((dll_path, sys_path)) = wd_files {
                 let synced_main_pid = *self
                     .synced_main_core_pid
                     .lock()
@@ -3924,6 +4036,15 @@ impl GlobalPreAccelManager {
                 }
 
                 let relay_ipv4s = collect_enabled_relay_ipv4s(relays);
+                let wd_fp = WinDivertRuntimeFingerprint::from_inputs(
+                    dll_path.clone(),
+                    Some(sys_path),
+                    &relay_ipv4s,
+                    cfg.preaccel.skip_443_native,
+                    cfg.preaccel.global_scope,
+                    &cfg.preaccel.global_target_processes,
+                    &static_excluded_pids,
+                );
                 let bin_dir = dll_path.parent().map(Path::to_path_buf);
                 let engine_cfg = super::windivert_win::WinDivertEngineConfig {
                     dll_path,
@@ -3949,9 +4070,11 @@ impl GlobalPreAccelManager {
                         });
                         let probe_urls = build_self_test_probe_urls(&cfg.preaccel.probe_url);
                         let probe_refs: Vec<&str> = probe_urls.iter().map(String::as_str).collect();
-                        let outcome = engine
-                            .run_self_test(&probe_refs, Duration::from_secs(4))
-                            .await;
+                        let outcome = enforce_self_test_strict_204(
+                            engine
+                                .run_self_test(&probe_refs, Duration::from_secs(4))
+                                .await,
+                        );
                         match outcome {
                             super::windivert_win::WinDivertSelfTestOutcome::Passed {
                                 latency_ms,
@@ -3959,6 +4082,7 @@ impl GlobalPreAccelManager {
                                 status_code,
                             } => {
                                 win_engine = Some(engine);
+                                win_engine_fp = Some(wd_fp);
                                 mode = "windivert".to_string();
                                 self.set_install_state("ready");
                                 self.set_last_error(None);
@@ -4045,6 +4169,7 @@ impl GlobalPreAccelManager {
             let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
             *rt_guard = Some(ActiveGlobalRuntime {
                 engine: win_engine,
+                windivert_fp: win_engine_fp,
                 tunnel,
                 mode,
                 socks_port,
@@ -4059,6 +4184,7 @@ impl GlobalPreAccelManager {
             *rt_guard = Some(ActiveGlobalRuntime {
                 #[cfg(target_os = "windows")]
                 engine: win_engine,
+                windivert_fp: None,
                 tunnel,
                 mode,
                 socks_port,
@@ -4142,7 +4268,7 @@ impl GlobalPreAccelManager {
                 return Ok(self.status());
             }
 
-            let Some((dll_path, _sys_path)) =
+            let Some((dll_path, sys_path)) =
                 locate_windivert_files(&self.paths, cfg.preaccel.windivert_dir.as_deref())
             else {
                 self.set_install_state("failed");
@@ -4175,6 +4301,15 @@ impl GlobalPreAccelManager {
             }
 
             let relay_ipv4s = collect_enabled_relay_ipv4s(relays);
+            let wd_fp = WinDivertRuntimeFingerprint::from_inputs(
+                dll_path.clone(),
+                Some(sys_path),
+                &relay_ipv4s,
+                cfg.preaccel.skip_443_native,
+                cfg.preaccel.global_scope,
+                &cfg.preaccel.global_target_processes,
+                &static_excluded_pids,
+            );
             let bin_dir = dll_path.parent().map(Path::to_path_buf);
             let detected_products = self.refresh_detected_security_products();
             let engine_cfg = super::windivert_win::WinDivertEngineConfig {
@@ -4201,9 +4336,11 @@ impl GlobalPreAccelManager {
                     });
                     let probe_urls = build_self_test_probe_urls(&cfg.preaccel.probe_url);
                     let probe_refs: Vec<&str> = probe_urls.iter().map(String::as_str).collect();
-                    let outcome = engine
-                        .run_self_test(&probe_refs, Duration::from_secs(4))
-                        .await;
+                    let outcome = enforce_self_test_strict_204(
+                        engine
+                            .run_self_test(&probe_refs, Duration::from_secs(4))
+                            .await,
+                    );
                     match outcome {
                         super::windivert_win::WinDivertSelfTestOutcome::Passed {
                             latency_ms,
@@ -4220,6 +4357,7 @@ impl GlobalPreAccelManager {
                                     self.runtime.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(rt) = rt_guard.as_mut() {
                                     let old = rt.engine.replace(engine);
+                                    rt.windivert_fp = Some(wd_fp);
                                     rt.mode = "windivert".to_string();
                                     (true, old)
                                 } else {
@@ -4372,9 +4510,11 @@ impl GlobalPreAccelManager {
                 if let Some(mut engine) = engine_opt {
                     let probe_urls = build_self_test_probe_urls(&cfg.preaccel.probe_url);
                     let probe_refs: Vec<&str> = probe_urls.iter().map(String::as_str).collect();
-                    let outcome = engine
-                        .run_self_test(&probe_refs, Duration::from_secs(4))
-                        .await;
+                    let outcome = enforce_self_test_strict_204(
+                        engine
+                            .run_self_test(&probe_refs, Duration::from_secs(4))
+                            .await,
+                    );
                     match outcome {
                         super::windivert_win::WinDivertSelfTestOutcome::Passed {
                             latency_ms,
@@ -4421,6 +4561,7 @@ impl GlobalPreAccelManager {
                                 let mut guard =
                                     self.runtime.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(rt) = guard.as_mut() {
+                                    rt.windivert_fp = None;
                                     rt.mode = "local_socks5".to_string();
                                 }
                             }
@@ -4477,6 +4618,7 @@ impl GlobalPreAccelManager {
                 if let Some(rt) = rt_guard.as_mut() {
                     let taken = rt.engine.take();
                     if taken.is_some() {
+                        rt.windivert_fp = None;
                         rt.mode = "local_socks5".to_string();
                     }
                     taken
@@ -4520,10 +4662,12 @@ impl GlobalPreAccelManager {
                     rt.bound_physical_interface.clone(),
                     rt.tunnel.config_sha256().to_string(),
                     has_engine,
+                    rt.windivert_fp.clone(),
                 )
             })
         };
-        let Some((socks_port, bound_if, current_yaml_sha, has_windivert_engine)) = runtime_info
+        let Some((socks_port, bound_if, current_yaml_sha, has_windivert_engine, old_wd_fp)) =
+            runtime_info
         else {
             return Ok(self.status());
         };
@@ -4547,11 +4691,50 @@ impl GlobalPreAccelManager {
         #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
         {
             if has_windivert_engine {
+                let synced_main_pid = *self
+                    .synced_main_core_pid
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut static_excluded_pids: HashSet<u32> = HashSet::new();
+                for &pid in extra_excluded_pids {
+                    if pid > 0 && Some(pid) != synced_main_pid {
+                        static_excluded_pids.insert(pid);
+                    }
+                }
+                let next_wd_fp =
+                    locate_windivert_files(&self.paths, cfg.preaccel.windivert_dir.as_deref()).map(
+                        |(dll_path, sys_path)| {
+                            let relay_ipv4s = collect_enabled_relay_ipv4s(relays);
+                            WinDivertRuntimeFingerprint::from_inputs(
+                                dll_path,
+                                Some(sys_path),
+                                &relay_ipv4s,
+                                cfg.preaccel.skip_443_native,
+                                cfg.preaccel.global_scope,
+                                &cfg.preaccel.global_target_processes,
+                                &static_excluded_pids,
+                            )
+                        },
+                    );
+                if should_skip_windivert_restart(
+                    tunnel_changed,
+                    old_wd_fp.as_ref(),
+                    next_wd_fp.as_ref(),
+                ) {
+                    let mut dir_guard = self
+                        .custom_windivert_dir
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    *dir_guard = cfg.preaccel.windivert_dir.clone();
+                    return Ok(self.status());
+                }
+
                 let old_engine = {
                     let mut rt_guard = self.runtime.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(rt) = rt_guard.as_mut() {
                         let taken = rt.engine.take();
                         if taken.is_some() {
+                            rt.windivert_fp = None;
                             rt.mode = "local_socks5".to_string();
                         }
                         taken
@@ -4571,6 +4754,8 @@ impl GlobalPreAccelManager {
                     .await;
             }
         }
+        #[cfg(not(all(target_os = "windows", not(target_arch = "aarch64"))))]
+        let _ = old_wd_fp;
 
         {
             let mut dir_guard = self
@@ -4580,7 +4765,7 @@ impl GlobalPreAccelManager {
             *dir_guard = cfg.preaccel.windivert_dir.clone();
         }
 
-        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
         {
             if !has_windivert_engine
                 && default_platform().capabilities().is_elevated
@@ -4774,16 +4959,16 @@ impl GlobalPreAccelManager {
     }
 }
 
-/// Build an ordered list of non-443 domestic HTTP probe URLs for verifying WinDivert dataplane
-/// transparent interception end-to-end (configured domestic URL first, followed by Huawei & MIUI
-/// HTTP 204 endpoints).
+/// Build an ordered list of non-443 domestic HTTP 204 probe URLs for verifying WinDivert dataplane
+/// transparent interception end-to-end: prioritizes the configured URL when it is a strict 204
+/// endpoint, and always falls back to authoritative Huawei & MIUI HTTP 204 endpoints.
 #[cfg_attr(
     any(not(target_os = "windows"), target_arch = "aarch64"),
     allow(dead_code)
 )]
 pub fn build_self_test_probe_urls(configured_probe_url: &str) -> Vec<String> {
     let mut urls: Vec<String> = Vec::with_capacity(3);
-    let mut push_unique_http = |raw: &str| {
+    let mut push_unique_http_204 = |raw: &str| {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return;
@@ -4797,14 +4982,17 @@ pub fn build_self_test_probe_urls(configured_probe_url: &str) -> Vec<String> {
         if parsed.port_or_known_default() == Some(443) {
             return;
         }
+        if crate::preaccel::generator::expected_probe_status_for_url(trimmed) != "204" {
+            return;
+        }
         if !urls.iter().any(|u| u.eq_ignore_ascii_case(trimmed)) {
             urls.push(trimmed.to_string());
         }
     };
 
-    push_unique_http(configured_probe_url);
-    push_unique_http(crate::preaccel::generator::DEFAULT_DOMESTIC_204_PRIMARY);
-    push_unique_http(crate::preaccel::generator::DEFAULT_DOMESTIC_204_FALLBACK);
+    push_unique_http_204(configured_probe_url);
+    push_unique_http_204(crate::preaccel::generator::DEFAULT_DOMESTIC_204_PRIMARY);
+    push_unique_http_204(crate::preaccel::generator::DEFAULT_DOMESTIC_204_FALLBACK);
     urls
 }
 
@@ -5027,8 +5215,10 @@ mod tests {
         assert!(doc.get("external-controller").is_none());
         assert_eq!(doc["geo-auto-update"].as_bool(), Some(false));
         assert_eq!(doc["geodata-loader"].as_str(), Some("memconservative"));
-        assert_eq!(doc["keep-alive-idle"].as_u64(), Some(15));
+        assert_eq!(doc["keep-alive-idle"].as_u64(), Some(45));
         assert_eq!(doc["keep-alive-interval"].as_u64(), Some(15));
+        assert_eq!(STANDALONE_TUNNEL_GOMEMLIMIT, "48MiB");
+        assert_eq!(NAT_IDLE_TIMEOUT, Duration::from_secs(600));
 
         // Verify 443 relays had unfiled third-party SNI stripped and skip-cert-verify enforced.
         let proxies = doc["proxies"].as_sequence().unwrap();
@@ -5070,7 +5260,8 @@ mod tests {
             .find(|g| g["name"].as_str() == Some(crate::preaccel::schema::PREACCEL_LB_GROUP_NAME))
             .expect("inner multi-cloud load-balance group");
         assert_eq!(lb["type"].as_str(), Some("load-balance"));
-        assert_eq!(lb["strategy"].as_str(), Some("round-robin"));
+        assert_eq!(lb["strategy"].as_str(), Some("consistent-hashing"));
+        assert_eq!(lb["expected-status"].as_str(), Some("204"));
         assert_eq!(lb["lazy"].as_bool(), Some(false));
         let lb_proxies: Vec<&str> = lb["proxies"]
             .as_sequence()
@@ -7115,5 +7306,287 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windivert_runtime_fingerprint_skips_restart_when_unchanged_and_restarts_on_changes() {
+        let base_relays = vec![Ipv4Addr::new(203, 0, 113, 10), Ipv4Addr::new(198, 51, 100, 20)];
+        let base_procs = vec!["mihomo.exe".to_string(), "ssh.exe".to_string()];
+        let mut base_pids = HashSet::new();
+        base_pids.insert(1001);
+        base_pids.insert(2002);
+
+        let fp1 = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\CatCloud\bin\WinDivert64.sys")),
+            &base_relays,
+            true,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &base_procs,
+            &base_pids,
+        );
+        // Reordered inputs and uppercase process names normalize to the identical fingerprint.
+        let fp_same = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\CatCloud\bin\WinDivert64.sys")),
+            &[Ipv4Addr::new(198, 51, 100, 20), Ipv4Addr::new(203, 0, 113, 10)],
+            true,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &["SSH.EXE".to_string(), "mihomo.exe".to_string()],
+            &base_pids,
+        );
+        assert_eq!(fp1, fp_same);
+        assert!(should_skip_windivert_restart(false, Some(&fp1), Some(&fp_same)));
+        assert!(!should_skip_windivert_restart(true, Some(&fp1), Some(&fp_same)));
+        assert!(!should_skip_windivert_restart(false, None, Some(&fp_same)));
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), None));
+
+        // Any static config change must invalidate the fingerprint and force restart.
+        let fp_diff_dll = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\Alt\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\CatCloud\bin\WinDivert64.sys")),
+            &base_relays,
+            true,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &base_procs,
+            &base_pids,
+        );
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), Some(&fp_diff_dll)));
+
+        let fp_diff_sys = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\Alt\WinDivert64.sys")),
+            &base_relays,
+            true,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &base_procs,
+            &base_pids,
+        );
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), Some(&fp_diff_sys)));
+
+        let fp_none_sys = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            None,
+            &base_relays,
+            true,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &base_procs,
+            &base_pids,
+        );
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), Some(&fp_none_sys)));
+
+        let fp_diff_skip443 = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\CatCloud\bin\WinDivert64.sys")),
+            &base_relays,
+            false,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &base_procs,
+            &base_pids,
+        );
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), Some(&fp_diff_skip443)));
+
+        let fp_diff_scope = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\CatCloud\bin\WinDivert64.sys")),
+            &base_relays,
+            true,
+            GlobalPreAccelScope::AllNon443Tcp,
+            &base_procs,
+            &base_pids,
+        );
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), Some(&fp_diff_scope)));
+
+        let fp_diff_procs = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\CatCloud\bin\WinDivert64.sys")),
+            &base_relays,
+            true,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &["mihomo.exe".to_string(), "scp.exe".to_string()],
+            &base_pids,
+        );
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), Some(&fp_diff_procs)));
+
+        let mut changed_pids = base_pids.clone();
+        changed_pids.insert(3003);
+        let fp_diff_pids = WinDivertRuntimeFingerprint::from_inputs(
+            PathBuf::from(r"C:\CatCloud\bin\WinDivert64.dll"),
+            Some(PathBuf::from(r"C:\CatCloud\bin\WinDivert64.sys")),
+            &base_relays,
+            true,
+            GlobalPreAccelScope::ProxyAppsOnly,
+            &base_procs,
+            &changed_pids,
+        );
+        assert!(!should_skip_windivert_restart(false, Some(&fp1), Some(&fp_diff_pids)));
+    }
+
+    #[test]
+    fn nat_table_full_4096_capacity_evicts_expired_and_closing_before_live_flows_in_sync() {
+        let table = NatTable::new(MAX_NAT_ENTRIES, NAT_IDLE_TIMEOUT);
+        let now = Instant::now();
+        let expired_ts = now - (NAT_IDLE_TIMEOUT + Duration::from_secs(5));
+        let closing_ts = now - Duration::from_secs(1);
+
+        // Fill table to exact MAX_NAT_ENTRIES (4096):
+        //   0..128   -> expired entries
+        //   128..132 -> closing (within grace) entries
+        //   132..4096 -> active live entries
+        for i in 0..MAX_NAT_ENTRIES {
+            let port = 20000u16 + (i as u16);
+            let (last_seen, closing_since) = if i < 128 {
+                (expired_ts, None)
+            } else if i < 132 {
+                (now, Some(closing_ts))
+            } else {
+                (now, None)
+            };
+            table.insert(
+                (Ipv4Addr::LOCALHOST, port),
+                NatEntry {
+                    orig_src_ip: Ipv4Addr::new(192, 0, 2, 1),
+                    orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
+                    orig_dst_port: 8443,
+                    if_idx: 1,
+                    sub_if_idx: 0,
+                    owner_pid: 42,
+                    process_name: "mihomo.exe".to_string(),
+                    detected_by: "open_core_name".to_string(),
+                    last_seen,
+                    closing_since,
+                },
+            );
+        }
+
+        // Inserting one fresh entry at full capacity sweeps all 128 expired entries in O(N)
+        // and clears their lock-free bitmap bits while preserving active flows.
+        let fresh_port = 55000u16;
+        table.insert(
+            (Ipv4Addr::LOCALHOST, fresh_port),
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 1),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
+                orig_dst_port: 8443,
+                if_idx: 1,
+                sub_if_idx: 0,
+                owner_pid: 42,
+                process_name: "mihomo.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: now,
+                closing_since: None,
+            },
+        );
+        assert!(!table.may_contain_port(20000));
+        assert!(!table.may_contain_port(20127));
+        assert!(table.may_contain_port(20128));
+        assert!(table.may_contain_port(20132));
+        assert!(table.may_contain_port(fresh_port));
+
+        // Refill the freed 127 slots so capacity reaches 4096 again, then insert 1 more entry:
+        // the closing entry (port 20128..20131) must be evicted before any live entry.
+        for offset in 0..127u16 {
+            table.insert(
+                (Ipv4Addr::LOCALHOST, 56000 + offset),
+                NatEntry {
+                    orig_src_ip: Ipv4Addr::new(192, 0, 2, 1),
+                    orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
+                    orig_dst_port: 8443,
+                    if_idx: 1,
+                    sub_if_idx: 0,
+                    owner_pid: 42,
+                    process_name: "mihomo.exe".to_string(),
+                    detected_by: "open_core_name".to_string(),
+                    last_seen: now,
+                    closing_since: None,
+                },
+            );
+        }
+        table.insert(
+            (Ipv4Addr::LOCALHOST, 57000),
+            NatEntry {
+                orig_src_ip: Ipv4Addr::new(192, 0, 2, 1),
+                orig_dst_ip: Ipv4Addr::new(203, 0, 113, 10),
+                orig_dst_port: 8443,
+                if_idx: 1,
+                sub_if_idx: 0,
+                owner_pid: 42,
+                process_name: "mihomo.exe".to_string(),
+                detected_by: "open_core_name".to_string(),
+                last_seen: now,
+                closing_since: None,
+            },
+        );
+        let closing_remaining = (20128u16..20132)
+            .filter(|&p| table.may_contain_port(p))
+            .count();
+        assert_eq!(closing_remaining, 3, "a closing entry must be evicted before live flows");
+        assert!(table.may_contain_port(20132));
+        assert!(table.may_contain_port(57000));
+    }
+
+    #[test]
+    fn self_test_strict_204_rejects_non_204_and_empty_responses() {
+        assert_eq!(validate_self_test_http_status(Some(204)), Ok(204));
+        for bad in [Some(200), Some(302), Some(403), Some(502), None] {
+            assert!(
+                validate_self_test_http_status(bad).is_err(),
+                "self-test must reject HTTP status {bad:?}"
+            );
+        }
+
+        #[cfg(all(target_os = "windows", not(target_arch = "aarch64")))]
+        {
+            use super::super::windivert_win::WinDivertSelfTestOutcome;
+
+            let ok_outcome = enforce_self_test_strict_204(WinDivertSelfTestOutcome::Passed {
+                latency_ms: 18,
+                probe_host: "connectivitycheck.platform.hicloud.com".to_string(),
+                status_code: 204,
+            });
+            assert!(matches!(
+                ok_outcome,
+                WinDivertSelfTestOutcome::Passed { status_code: 204, .. }
+            ));
+
+            for non_204 in [200u16, 302, 403, 502] {
+                let rejected = enforce_self_test_strict_204(WinDivertSelfTestOutcome::Passed {
+                    latency_ms: 25,
+                    probe_host: "connectivitycheck.platform.hicloud.com".to_string(),
+                    status_code: non_204,
+                });
+                assert!(
+                    matches!(rejected, WinDivertSelfTestOutcome::TunnelUnreachable { .. }),
+                    "HTTP {non_204} must downgrade to TunnelUnreachable, got {rejected:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn build_self_test_probe_urls_prioritizes_custom_204_and_skips_non_204_with_204_fallbacks() {
+        let custom_204 = build_self_test_probe_urls("http://custom-check.cn/generate_204");
+        assert_eq!(
+            custom_204,
+            vec![
+                "http://custom-check.cn/generate_204".to_string(),
+                crate::preaccel::generator::DEFAULT_DOMESTIC_204_PRIMARY.to_string(),
+                crate::preaccel::generator::DEFAULT_DOMESTIC_204_FALLBACK.to_string(),
+            ]
+        );
+
+        let non_204 = build_self_test_probe_urls("http://custom-health.cn/ok");
+        assert_eq!(
+            non_204,
+            vec![
+                crate::preaccel::generator::DEFAULT_DOMESTIC_204_PRIMARY.to_string(),
+                crate::preaccel::generator::DEFAULT_DOMESTIC_204_FALLBACK.to_string(),
+            ]
+        );
+
+        let dedup = build_self_test_probe_urls(
+            crate::preaccel::generator::DEFAULT_DOMESTIC_204_PRIMARY,
+        );
+        assert_eq!(dedup.len(), 2);
     }
 }

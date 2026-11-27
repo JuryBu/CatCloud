@@ -235,9 +235,42 @@ export interface QuickCheckSiteConfig {
 export interface RulesOverrideConfig {
   global_prepend_rules?: string[];
   global_append_rules?: string[];
+  override_mode?: string;
+  override_merge_path?: string | null;
   override_script_path?: string | null;
   block_quic_udp_443?: boolean;
   domestic_direct_enabled?: boolean;
+  custom_rules_only?: boolean;
+  inline_override_yaml?: string | null;
+}
+
+export type GatewayExportProfile =
+  | "relay_fragment"
+  | "transparent_gateway"
+  | "preferred_nodes";
+
+export interface GatewayExportOptions {
+  profile: GatewayExportProfile;
+  tproxy_port: number;
+  redir_port: number;
+  dns_listen_port: number;
+  redact_secrets: boolean;
+}
+
+export interface GatewayExportOutput {
+  profile: GatewayExportProfile;
+  yaml: string;
+  redacted: boolean;
+  relay_count: number;
+  node_count: number;
+  rule_count: number;
+  warnings: string[];
+  integration_hint: string;
+}
+
+export interface BulkRulesParseResult {
+  valid_rules: string[];
+  skipped_lines: string[];
 }
 
 export interface FullAppConfig {
@@ -511,6 +544,8 @@ export interface CoreRuntimeInfo {
   preaccel_enabled?: boolean;
   preaccel_relay_name: string | null;
   preaccel_effective_carrier?: string;
+  effective_tun_mtu?: number | null;
+  preaccel_transport?: Record<string, unknown> | null;
   standalone_tunnel_suspended_for_tun?: boolean;
   global_preaccel_active?: boolean;
   global_preaccel_mode?: GlobalPreAccelMode;
@@ -1485,7 +1520,7 @@ export const DEFAULT_APP_CONFIG: AppConfig = {
     global_target_processes: [...DEFAULT_GLOBAL_TARGET_PROCESSES],
     windivert_dir: null,
     dispatch_strategy: "auto",
-    lb_strategy: "round_robin",
+    lb_strategy: "consistent_hashing",
   },
   personalization: {
     ui_language: "zh-CN",
@@ -1943,9 +1978,13 @@ let mockFullConfig: FullAppConfig = {
   rules_override: {
     global_prepend_rules: [],
     global_append_rules: [],
+    override_mode: "disabled",
+    override_merge_path: null,
     override_script_path: null,
     block_quic_udp_443: true,
     domestic_direct_enabled: true,
+    custom_rules_only: false,
+    inline_override_yaml: null,
   },
   update: {
     ...DEFAULT_APP_CONFIG.update,
@@ -2052,7 +2091,10 @@ function normalizeGlobalPreAccelStatus(raw: unknown): GlobalPreAccelStatus {
   }
   const r = raw as Partial<GlobalPreAccelStatus>;
   const mode: GlobalPreAccelMode =
-    r.mode === "windivert" || r.mode === "local_socks5" || r.mode === "off"
+    r.mode === "windivert" ||
+    r.mode === "local_socks5" ||
+    r.mode === "suspended_for_tun" ||
+    r.mode === "off"
       ? r.mode
       : r.running
         ? "local_socks5"
@@ -2623,6 +2665,16 @@ export const catcloudApi = {
   async saveExtendedSettings(patch: Record<string, unknown>): Promise<FullAppConfig> {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<FullAppConfig>("save_extended_settings", { patch });
+    }
+    if (patch.rules_override && typeof patch.rules_override === "object") {
+      const ro = patch.rules_override as RulesOverrideConfig;
+      if (typeof ro.inline_override_yaml === "string" && ro.inline_override_yaml.trim().length > 0) {
+        const mod = await import("./gatewayMock");
+        const yamlErr = mod.validateInlineOverrideYamlMock(ro.inline_override_yaml);
+        if (yamlErr) {
+          throw new Error(`内联 YAML 覆写校验失败：${yamlErr}`);
+        }
+      }
     }
     mockFullConfig = {
       ...mockFullConfig,
@@ -4333,12 +4385,96 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<CompiledYamlPreview>("compile_preview_yaml");
     }
+    const ro = mockFullConfig.rules_override;
+    const customOnly = Boolean(ro?.custom_rules_only);
+    const prepend = ro?.global_prepend_rules ?? [];
+    const append = ro?.global_append_rules ?? [];
+    const inlineYaml = (ro?.inline_override_yaml ?? "").trim();
+    const previewRules = [
+      "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+      "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+      ...prepend,
+      ...(customOnly ? [] : ["GEOSITE,cn,DIRECT", "GEOIP,CN,DIRECT,no-resolve"]),
+      ...append,
+      `MATCH,${mockGroups[0]?.name || "DIRECT"}`,
+    ];
+    const yamlLines = [
+      "# CatCloud Browser Preview YAML",
+      `mixed-port: ${mockConfig.mixed_port}`,
+      `mode: ${mockConfig.proxy_mode}`,
+      `# custom_rules_only: ${customOnly ? "true" : "false"}`,
+      "rules:",
+      ...previewRules.map((r) => `  - ${r}`),
+      ...(inlineYaml ? ["", "# --- 内联 YAML 覆写片段 ---", inlineYaml] : []),
+    ];
     return {
-      yaml: `# CatCloud Browser Preview YAML\nmixed-port: ${mockConfig.mixed_port}\nmode: ${mockConfig.proxy_mode}\n`,
+      yaml: `${yamlLines.join("\n")}\n`,
       sha256: "browser-preview",
-      stats: {},
+      stats: {
+        total_rules: previewRules.length,
+        total_proxies: mockNodes.length,
+        proxy_groups: mockGroups.length,
+      },
       validation: { ok: true, issues: [] },
     };
+  },
+
+  async exportGatewayYaml(options: GatewayExportOptions): Promise<GatewayExportOutput> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<GatewayExportOutput>("export_gateway_yaml", { options });
+    }
+    const mod = await import("./gatewayMock");
+    return mod.buildMockGatewayExportOutput(options, {
+      relays: mockRelays,
+      nodes: mockNodes,
+      groups: mockGroups,
+      config: mockConfig,
+      fullConfig: mockFullConfig,
+    });
+  },
+
+  async saveGatewayYamlDialog(options: GatewayExportOptions): Promise<string | null> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<string | null>("save_gateway_yaml_dialog", { options });
+    }
+    const mod = await import("./gatewayMock");
+    const exported = mod.buildMockGatewayExportOutput(options, {
+      relays: mockRelays,
+      nodes: mockNodes,
+      groups: mockGroups,
+      config: mockConfig,
+      fullConfig: mockFullConfig,
+    });
+    const filename =
+      options.profile === "relay_fragment"
+        ? "catcloud-relay-fragment.yaml"
+        : options.profile === "transparent_gateway"
+          ? "catcloud-transparent-gateway.yaml"
+          : "catcloud-preferred-nodes.yaml";
+    if (typeof document !== "undefined" && typeof URL !== "undefined") {
+      const blob = new Blob([exported.yaml], { type: "text/yaml;charset=utf-8" });
+      const blobUrl = URL.createObjectURL(blob);
+      try {
+        const link = document.createElement("a");
+        link.href = blobUrl;
+        link.download = filename;
+        link.style.display = "none";
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+      } finally {
+        window.setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+      }
+    }
+    return filename;
+  },
+
+  async parseBulkRulesPreview(rawText: string): Promise<BulkRulesParseResult> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<BulkRulesParseResult>("parse_bulk_rules_preview", { rawText });
+    }
+    const mod = await import("./gatewayMock");
+    return mod.parseBulkRulesTextFallback(rawText);
   },
 
   async scanLocalMigrations(): Promise<MigrationPreviewDto[]> {

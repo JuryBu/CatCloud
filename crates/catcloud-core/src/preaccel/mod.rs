@@ -19,8 +19,8 @@ pub use generator::{
     BuiltPreAccelGroups, DEFAULT_DOMESTIC_204_FALLBACK, DEFAULT_DOMESTIC_204_PRIMARY,
     PREACCEL_FALLBACK_GROUP, PREACCEL_LB_GROUP, PREACCEL_SELECT_GROUP, PreAccelCompilePlan,
     build_preaccel_compile_plan, build_preaccel_proxy_groups, compile_relay_to_mihomo_yaml,
-    host_to_direct_rule, host_to_fake_ip_filter, is_disallowed_domestic_probe_host,
-    validate_domestic_probe_url,
+    expected_probe_status_for_url, host_to_direct_rule, host_to_fake_ip_filter,
+    is_disallowed_domestic_probe_host, validate_domestic_probe_url,
 };
 pub use global_tunnel::{
     GLOBAL_PREACCEL_RUNTIME_META_FILENAME, GlobalPreAccelManager, GlobalPreAccelMetrics,
@@ -389,7 +389,7 @@ mod tests {
     fn compile_plan_dual_relay_fallback_lazy_false_and_anti_loop_rules() {
         let mut cfg = PreAccelConfig::default();
         cfg.enabled = true;
-        cfg.probe_interval_sec = 3; // should clamp to 10
+        cfg.probe_interval_sec = 3; // should clamp to 20
         cfg.campus_direct_domains = vec!["auth.campus.example.edu".to_string()];
 
         let mut disabled_relay = sample_tencent_relay();
@@ -410,7 +410,7 @@ mod tests {
 
         let plan = build_preaccel_compile_plan(&cfg, &relays, &nodes).expect("build compile plan");
         assert!(plan.active);
-        assert_eq!(plan.effective_probe_interval_sec, 10);
+        assert_eq!(plan.effective_probe_interval_sec, 20);
         assert_eq!(plan.ordered_relay_ids, vec!["relay-tx-gz", "relay-ali-sh"]);
         assert_eq!(
             plan.ordered_relay_names,
@@ -418,21 +418,21 @@ mod tests {
         );
         assert_eq!(plan.relay_proxies.len(), 2);
 
-        // Check AnyTLS proxy YAML has no `sni`, `skip-cert-verify: true`, `tfo: true`, and session pool settings.
+        // Check AnyTLS proxy YAML has no `sni`, `skip-cert-verify: true`, `tfo: false`, and `min-idle-session: 0`.
         let anytls_yaml = &plan.relay_proxies[0];
         assert_eq!(anytls_yaml.get("type").and_then(Value::as_str), Some("anytls"));
         assert_eq!(anytls_yaml.get("server").and_then(Value::as_str), Some("203.0.113.10"));
         assert_eq!(anytls_yaml.get("skip-cert-verify").and_then(Value::as_bool), Some(true));
-        assert_eq!(anytls_yaml.get("tfo").and_then(Value::as_bool), Some(true));
-        assert_eq!(anytls_yaml.get("min-idle-session").and_then(Value::as_u64), Some(2));
+        assert_eq!(anytls_yaml.get("tfo").and_then(Value::as_bool), Some(false));
+        assert_eq!(anytls_yaml.get("min-idle-session").and_then(Value::as_u64), Some(0));
         assert!(anytls_yaml.get("sni").is_none());
 
-        // Check VLESS proxy YAML explicitly writes empty `servername: ""`, `tfo: true`, and `skip-cert-verify: true`.
+        // Check VLESS proxy YAML explicitly writes empty `servername: ""`, `tfo: false`, and `skip-cert-verify: true`.
         let vless_yaml = &plan.relay_proxies[1];
         assert_eq!(vless_yaml.get("type").and_then(Value::as_str), Some("vless"));
         assert_eq!(vless_yaml.get("uuid").and_then(Value::as_str), Some(DEMO_UUID));
         assert_eq!(vless_yaml.get("servername").and_then(Value::as_str), Some(""));
-        assert_eq!(vless_yaml.get("tfo").and_then(Value::as_bool), Some(true));
+        assert_eq!(vless_yaml.get("tfo").and_then(Value::as_bool), Some(false));
         assert_eq!(vless_yaml.get("skip-cert-verify").and_then(Value::as_bool), Some(true));
 
         // Check `select` group puts `PREACCEL_FALLBACK_GROUP` first by default and ends with DIRECT.
@@ -479,7 +479,11 @@ mod tests {
             fallback_group.get("url").and_then(Value::as_str),
             Some(DEFAULT_DOMESTIC_204_PRIMARY)
         );
-        assert_eq!(fallback_group.get("interval").and_then(Value::as_u64), Some(10));
+        assert_eq!(
+            fallback_group.get("expected-status").and_then(Value::as_str),
+            Some("204")
+        );
+        assert_eq!(fallback_group.get("interval").and_then(Value::as_u64), Some(30));
         let fb_proxies: Vec<&str> = fallback_group
             .get("proxies")
             .and_then(Value::as_sequence)
@@ -501,8 +505,13 @@ mod tests {
         );
         assert_eq!(
             lb_group.get("strategy").and_then(Value::as_str),
-            Some("round-robin")
+            Some("consistent-hashing")
         );
+        assert_eq!(
+            lb_group.get("expected-status").and_then(Value::as_str),
+            Some("204")
+        );
+        assert_eq!(lb_group.get("interval").and_then(Value::as_u64), Some(20));
         assert_eq!(lb_group.get("lazy").and_then(Value::as_bool), Some(false));
         let lb_proxies: Vec<&str> = lb_group
             .get("proxies")
@@ -1085,5 +1094,112 @@ mod tests {
             build_preaccel_compile_plan(&cfg, &all_relays, &[]).expect("explicit fallback plan");
         assert_eq!(explicit_fb_plan.lb_group_name, None);
         assert_eq!(explicit_fb_plan.proxy_groups.len(), 2);
+    }
+
+    #[test]
+    fn expected_probe_status_adapts_204_vs_custom_and_two_layer_outer_interval_has_30s_floor() {
+        assert_eq!(
+            expected_probe_status_for_url(DEFAULT_DOMESTIC_204_PRIMARY),
+            "204"
+        );
+        assert_eq!(
+            expected_probe_status_for_url(DEFAULT_DOMESTIC_204_FALLBACK),
+            "204"
+        );
+        assert_eq!(
+            expected_probe_status_for_url("http://127.0.0.1:18080/GENERATE_204"),
+            "204"
+        );
+        assert_eq!(
+            expected_probe_status_for_url("http://127.0.0.1:18080/check?expect=204"),
+            "204"
+        );
+        // Host containing `204` with a non-204 path/query must allow `200/204`.
+        assert_eq!(
+            expected_probe_status_for_url("http://203.0.113.204/health"),
+            "200/204"
+        );
+        assert_eq!(
+            expected_probe_status_for_url("http://127.0.0.1:18080/status"),
+            "200/204"
+        );
+
+        let mut trojan = sample_tencent_relay();
+        trojan.id = "relay-trojan".to_string();
+        trojan.protocol = "trojan".to_string();
+        let trojan_yaml = compile_relay_to_mihomo_yaml(&trojan, "Trojan-443").expect("trojan");
+        assert_eq!(trojan_yaml.get("tfo").and_then(Value::as_bool), Some(false));
+
+        let relays = vec![sample_tencent_relay(), sample_aliyun_vless_relay()];
+
+        // 1. Custom non-204 domestic probe with 22s interval:
+        //    inner LB gets 22s, outer two-layer fallback enforces `.max(30)` -> 30s, both `expected-status: "200/204"`.
+        let mut cfg = PreAccelConfig::default();
+        cfg.enabled = true;
+        cfg.probe_url = "http://127.0.0.1:18080/health".to_string();
+        cfg.probe_interval_sec = 22;
+        let custom_plan =
+            build_preaccel_compile_plan(&cfg, &relays, &[]).expect("compile custom probe plan");
+        assert_eq!(custom_plan.effective_probe_interval_sec, 22);
+        let fb_custom = &custom_plan.proxy_groups[1];
+        let lb_custom = &custom_plan.proxy_groups[2];
+        assert_eq!(
+            fb_custom.get("expected-status").and_then(Value::as_str),
+            Some("200/204")
+        );
+        assert_eq!(
+            lb_custom.get("expected-status").and_then(Value::as_str),
+            Some("200/204")
+        );
+        assert_eq!(fb_custom.get("interval").and_then(Value::as_u64), Some(30));
+        assert_eq!(lb_custom.get("interval").and_then(Value::as_u64), Some(22));
+
+        // 2. Standard 204 probe with 45s interval preserves 45s on both layers and enforces `"204"`.
+        cfg.probe_url = DEFAULT_DOMESTIC_204_PRIMARY.to_string();
+        cfg.probe_interval_sec = 45;
+        let plan_45 = build_preaccel_compile_plan(&cfg, &relays, &[]).expect("compile 45s plan");
+        assert_eq!(
+            plan_45.proxy_groups[1]
+                .get("expected-status")
+                .and_then(Value::as_str),
+            Some("204")
+        );
+        assert_eq!(
+            plan_45.proxy_groups[2]
+                .get("expected-status")
+                .and_then(Value::as_str),
+            Some("204")
+        );
+        assert_eq!(
+            plan_45.proxy_groups[1]
+                .get("interval")
+                .and_then(Value::as_u64),
+            Some(45)
+        );
+        assert_eq!(
+            plan_45.proxy_groups[2]
+                .get("interval")
+                .and_then(Value::as_u64),
+            Some(45)
+        );
+
+        // 3. Single-layer fallback with 22s interval keeps 22s directly (no outer layer).
+        cfg.dispatch_strategy = PreAccelDispatchStrategy::Fallback;
+        cfg.probe_interval_sec = 22;
+        let single_layer =
+            build_preaccel_compile_plan(&cfg, &relays, &[]).expect("compile single layer");
+        assert_eq!(single_layer.proxy_groups.len(), 2);
+        assert_eq!(
+            single_layer.proxy_groups[1]
+                .get("interval")
+                .and_then(Value::as_u64),
+            Some(22)
+        );
+        assert_eq!(
+            single_layer.proxy_groups[1]
+                .get("expected-status")
+                .and_then(Value::as_str),
+            Some("204")
+        );
     }
 }

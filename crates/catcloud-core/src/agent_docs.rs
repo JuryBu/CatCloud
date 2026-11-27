@@ -356,7 +356,7 @@ net.ipv4.tcp_wmem = 4096 131072 16777216
 net.core.netdev_max_backlog = 8192
 net.ipv4.tcp_max_syn_backlog = 4096
 net.core.somaxconn = 4096
-net.ipv4.tcp_fastopen = 3
+# AnyTLS 官方不兼容 TCP Fast Open，请勿启用 tcp_fastopen
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_notsent_lowat = 16384
@@ -467,11 +467,11 @@ echo "${MMRELAY_URI}"
      catcloud preaccel test --speed --json
      catcloud preaccel test --speed --node-id <id> --json
      catcloud preaccel global-status --json
-     catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json
+     catcloud preaccel bind --dispatch-strategy auto --lb-strategy consistent_hashing --json
      catcloud config reload --json
      ```
 2. **多云物理机调度与密钥轮换回收**：
-   - 接入 2 台及以上不同物理云时，默认 `--dispatch-strategy auto`（或 `load_balance`）自动按物理机去重做两层嵌套负载均衡（外层 `fallback` 兜底），同机多协议互不抢网卡；也可用 `--dispatch-strategy fallback` 切回纯单线主备，或 `--lb-strategy consistent_hashing`。
+   - 接入 2 台及以上不同物理云时，默认 `--dispatch-strategy auto`（或 `load_balance`）搭配 `--lb-strategy consistent_hashing`（同主机长连接稳定锚定同一物理云，跨主机自然聚合带宽，外层 `fallback` 兜底），同机多协议互不抢网卡；也可用 `--dispatch-strategy fallback` 切回纯单线主备，或按需切 `--lb-strategy round_robin`。
    - 内测/朋友分享后需收回访问权时，使用仓库内置脱敏脚本一键安全轮换远端密钥（默认 SSH stdin 传密、自动生成回滚脚本并输出新 `mmrelay://v1/...`，先加 `--dry-run` 离线验证）：
      `node scripts/relay/rotate_relay_secrets.mjs --host <IP> --user root --key <KEY_PATH> --config /etc/catcloud-relay/config.json --service catcloud-relay --dry-run`
 3. **全局提速（独立加速其他代理软件或终端工具）**：
@@ -489,12 +489,29 @@ echo "${MMRELAY_URI}"
    - 仅在 `/etc/sysctl.d/` 写 `net.core.default_qdisc = fq` **不会**自动套用到开机前已初始化的 `eth0`！若 `tc qdisc show dev eth0` 仍显示 `pfifo_fast`，BBR 会失去 pacing 发包整形导致丢包重传激增、4 并发经常卡死 1～2 条连接。
    - **零断流在线修复**（不踢任何现役连接）：执行 `tc qdisc replace dev <iface> root fq` 并配置上文 `catcloud-fq-qdisc.service` 防止重启后退回 `pfifo_fast`。
 2. **协议首选 `AnyTLS`，宽带放行国内 UDP 443 可并挂 `Hysteria2`**：
-   - `AnyTLS` 原生支持空闲连接池复用（猫猫云梯编译时已自动开启 `tfo: true` 与 `min-idle-session: 2`），比逐连接重打握手的旧 `Trojan` 更抗并发丢包；
+   - `AnyTLS` 支持高效 TLS 会话复用，比旧 `Trojan` 更抗并发抖动；猫猫云梯编译时默认全量关闭 TFO（`tfo: false`，AnyTLS 官方不兼容 TFO，关闭可消除首包 2 秒卡顿）、设置 `min-idle-session: 0`（防止 NAT 半关闭残留僵尸空闲会话引发连环断流），并配合 `keep-alive-idle: 45`、自适应 `expected-status` 探针、`consistent-hashing` 粘性均衡与 TUN MTU `<= 1400` 抗分片钳降保障长流稳定；
    - 若用户宽带不屏蔽国内 UDP 443，可在同一台云服务器的 `UDP 443` 并行部署 `Hysteria2`（与 TCP 443 互不冲突），彻底消除 TCP-over-TCP 队头阻塞。
 3. **搭配轻加密非 443 海外节点，避开双层 TLS**：
    - 外层国内 443 已提供完整 TLS 加密，内层优先搭配 `Shadowsocks` 等轻加密节点（单层 TLS 吞吐显著高于双层 TLS 嵌套且不易触发分片卡死）；原生 443 高速节点保持「自动跳过原生 443」直连。
 4. **按云机数量选调度模式**：
    - 2 台及以上独立健康物理云用默认 `auto`/`load_balance` 聚合带宽（同机多协议自动去重，外层 `fallback` 保兜底）；若备机质量显著弱于主机，切 `--dispatch-strategy fallback` 保持主备秒切。
+
+---
+
+## 六、透明网关 / 软路由标准 YAML 导出
+
+若你在 OpenWrt（OpenClash / ShellCrash）或 Linux 旁路由上自维护 Mihomo，可直接导出标准配置（默认强制脱敏，实际部署时加 `--reveal-secrets`）：
+
+```bash
+# 仅导出国内 443 中转片段（含防环与 fake-ip-filter；在目标海外节点下挂一行 dialer-proxy 即可接入）
+catcloud config export-gateway --profile relay-fragment --reveal-secrets --output relay-fragment.yaml
+
+# 导出完整透明网关配置（自动开启 allow-lan、TPROXY 7893、REDIR 7892、0.0.0.0:1053 DNS 并关闭桌面 TUN）
+catcloud config export-gateway --profile transparent-gateway --reveal-secrets --output gateway.yaml
+
+# 导出优选业务节点与国内 443 中转防环片段
+catcloud config export-gateway --profile preferred-nodes --reveal-secrets --output preferred.yaml
+```
 "###;
 
 const ZH_DOC_03_MULTIGROUP: &str = r###"> 【语言锁定】请全程使用简体中文回复用户，并严格使用猫猫云梯真实中文界面名称（总览 / 智能多选组 / 节点与测速 / 分流与连接 / 国内提速 / 运行日志 / AI 全权代管 / 设置）。
@@ -619,10 +636,11 @@ const ZH_DOC_05_ROUTING_CONNS: &str = r###"> 【语言锁定】请全程使用�
 - **全局代理**：除防环与本机回环外所有流量走代理（排查规则误判时可临时切换；切回规则分流后若内核内存偏高，后台会安全评估并自动回收多余内存）。
 - **直连模式**：所有流量直连不经过海外节点。
 
-## 二、国内直连、AI 域分流与自定义规则
+## 二、国内直连、AI 域分流、纯自写规则与 `rule-providers`
 - **国内直连**：基于 `Country.mmdb`（及可选 `geosite.dat`）将国内域名与国内 IP 直接放行 `DIRECT`。可在「设置」一键刷新地区数据库。
 - **内置 AI 域名分流**：内置覆盖 OpenAI / ChatGPT / Anthropic / Claude / Gemini / Google AI / Antigravity / Windsurf / Codeium / Cursor / Copilot 等主流域名；在「智能多选组」开启某组的「独立分流」后，该组的匹配规则会自动生效并锁定对应稳线，不干扰其他网页流量。
-- **自定义前置/后置规则**：在「分流与连接」添加 `DOMAIN`、`DOMAIN-SUFFIX`、`IP-CIDR` 等规则（前置规则优先于内置规则，后置规则兜底）。
+- **自定义前置/后置规则与批量粘贴**：在「分流与连接」添加或批量粘贴 `DOMAIN`、`DOMAIN-SUFFIX`、`IP-CIDR`、`RULE-SET`、`AND`/`OR`/`NOT`、`MATCH` 等规则（自动剥离 YAML `- `、引号与注释）。
+- **纯自写规则模式与内联 YAML 覆写**：高阶用户可在「分流与连接」开启「纯自写规则模式（`custom_rules_only`）」跳过内置国内直连/QUIC/组自动规则与 AI DNS 覆写（仅保留中转/局域网防环，自写 `MATCH` 时不覆盖），并通过「内联 YAML 覆写（`inline_override_yaml`，上限 1 MiB）」直接粘贴 `rule-providers:` / `rules:` / `dns:` 片段生效。
 
 ## 三、QUIC（UDP 443）双层策略与腾讯系防 Fake-IP
 - **国内 QUIC 放行 + 海外 QUIC 拦截**：开启「阻止海外 QUIC」时，猫猫云梯会在拦截规则**紧前面**自动插入国内 UDP 443 直连放行（`GEOSITE,cn` / `GEOIP,CN` 及国内核心域），既让海外网页/AI 稳走 TCP 避免 UDP 丢包断流，又保证 QQ、微信、国内影音的直连 QUIC 流畅不卡。
@@ -859,7 +877,7 @@ RELAY_NAME="${RELAY_NAME:-CN-443-Primary}"
 SERVER_IP="${SERVER_IP:-$(curl -4s --max-time 6 https://api.ipify.org || hostname -I | awk '{print $1}')}"
 PASSWORD="${PASSWORD:-$(openssl rand -hex 16)}"
 IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
-printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.rmem_max = 16777216\nnet.core.wmem_max = 16777216\nnet.ipv4.tcp_rmem = 4096 131072 16777216\nnet.ipv4.tcp_wmem = 4096 131072 16777216\nnet.core.netdev_max_backlog = 8192\nnet.ipv4.tcp_max_syn_backlog = 4096\nnet.core.somaxconn = 4096\nnet.ipv4.tcp_fastopen = 3\nnet.ipv4.tcp_slow_start_after_idle = 0\nnet.ipv4.tcp_mtu_probing = 1\nnet.ipv4.tcp_notsent_lowat = 16384\n' >/etc/sysctl.d/99-catcloud-relay-tune.conf
+printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\nnet.core.rmem_max = 16777216\nnet.core.wmem_max = 16777216\nnet.ipv4.tcp_rmem = 4096 131072 16777216\nnet.ipv4.tcp_wmem = 4096 131072 16777216\nnet.core.netdev_max_backlog = 8192\nnet.ipv4.tcp_max_syn_backlog = 4096\nnet.core.somaxconn = 4096\nnet.ipv4.tcp_slow_start_after_idle = 0\nnet.ipv4.tcp_mtu_probing = 1\nnet.ipv4.tcp_notsent_lowat = 16384\n' >/etc/sysctl.d/99-catcloud-relay-tune.conf
 sysctl -p /etc/sysctl.d/99-catcloud-relay-tune.conf >/dev/null || true
 [ -n "${IFACE}" ] && tc qdisc replace dev "${IFACE}" root fq || true
 apt-get update -qq && apt-get install -y -qq curl openssl jq python3 ca-certificates
@@ -889,7 +907,7 @@ echo "mmrelay://v1/$(printf '%s' "${MMJSON}" | python3 -c 'import base64,sys; pr
 - **Standalone Global Boost**: Even with CatCloud's main proxy off, enabling **Domestic Boost** can transparently accelerate other proxy cores or `ssh`/`scp` via signed WinDivert on Windows (auto-bypassing domestic port 80 and regular chat apps, with automatic SOCKS5 fallback if blocked by local firewall) or local SOCKS5 on macOS/Linux.
 - **Performance Tuning Checklist (for Agents)**:
   - Always check `tc qdisc show dev <iface>` on Linux relays: `sysctl` `default_qdisc=fq` does NOT retroactively replace `pfifo_fast` on an already-booted NIC. Run `tc qdisc replace dev <iface> root fq` (zero-downtime) and persist it via systemd so BBR pacing actually engages.
-  - Prefer `anytls` (session pooling; CatCloud auto-enables `tfo: true` and `min-idle-session: 2`) over legacy per-connection `trojan`; if domestic UDP 443 is open, co-hosting `hysteria2` on UDP 443 eliminates TCP-over-TCP congestion without conflicting with TCP 443.
+  - Prefer `anytls` over legacy per-connection `trojan` (CatCloud defaults to `tfo: false` because AnyTLS is incompatible with TCP Fast Open, `min-idle-session: 0` to prevent stale NAT-closed idle sessions, `keep-alive-idle: 45`, adaptive `expected-status` probes, `consistent-hashing` stickiness, and TUN MTU `<= 1400` clamping); if domestic UDP 443 is open, co-hosting `hysteria2` on UDP 443 eliminates TCP-over-TCP congestion without conflicting with TCP 443.
   - Pair domestic `:443` relays with lightweight non-443 overseas nodes (e.g. `ss`) to avoid TLS-in-TLS overhead. With 2+ distinct physical cloud relays, `auto` / `load_balance` aggregates bandwidth via nested `load-balance` inside outer `fallback` (deduplicating same-host protocols); switch to `--dispatch-strategy fallback` if a backup VPS has weaker quality.
 - **Secret Rotation & Revocation**: After private testing or sharing, rotate relay credentials cleanly via SSH stdin (auto backup + rollback script + fresh `mmrelay://v1/...`, preview with `--dry-run`):
   `node scripts/relay/rotate_relay_secrets.mjs --host <IP> --user root --key <KEY_PATH> --config /etc/catcloud-relay/config.json --service catcloud-relay --dry-run`
@@ -900,8 +918,12 @@ catcloud preaccel test --json
 catcloud preaccel test --speed --json
 catcloud preaccel test --speed --node-id <id> --json
 catcloud preaccel global-status --json
-catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json
+catcloud preaccel bind --dispatch-strategy auto --lb-strategy consistent_hashing --json
 catcloud preaccel bind --enabled false --json && catcloud config reload --json
+# Export Mihomo YAML for transparent gateway / soft-router (redacted by default; add --reveal-secrets to deploy)
+catcloud config export-gateway --profile relay-fragment --reveal-secrets --output relay-fragment.yaml
+catcloud config export-gateway --profile transparent-gateway --reveal-secrets --output gateway.yaml
+catcloud config export-gateway --profile preferred-nodes --reveal-secrets --output preferred.yaml
 ```
 "###;
 
@@ -994,9 +1016,10 @@ const EN_DOC_05_ROUTING_CONNS: &str = r###"> [LANGUAGE LOCK] Reply strictly in E
 - **Global Mode**: Routes non-exempt traffic through proxy; returning from Global to Rule automatically checks and reclaims excess core memory safely.
 - **Direct Mode**: Sends all traffic directly without overseas proxies.
 
-## 2. Built-In AI Domains & Custom Rules
+## 2. Built-In AI Domains, Custom Rules & `rule-providers`
 - Built-in AI routing covers OpenAI, ChatGPT, Anthropic, Claude, Google AI / Gemini / Antigravity, Windsurf, Codeium, Cursor, and GitHub Copilot.
-- Add custom prepend (highest priority) or append rules in **Rules & Conns** (`DOMAIN`, `DOMAIN-SUFFIX`, `IP-CIDR`).
+- Add or bulk-paste custom prepend/append rules in **Rules & Conns** (`DOMAIN`, `DOMAIN-SUFFIX`, `IP-CIDR`, `RULE-SET`, `AND`/`OR`/`NOT`, `MATCH`; YAML `- `, quotes, and comments are stripped automatically).
+- Enable **Pure Custom-Rules Mode (`custom_rules_only`)** to skip built-in domestic/QUIC/group/AI-DNS overrides while keeping anti-loop guards (user `MATCH` rules are respected verbatim), and paste `rule-providers:` / `rules:` / `dns:` YAML into **Inline YAML Override (`inline_override_yaml`, <= 1 MiB)**.
 
 ## 3. Dual-Layer QUIC (UDP 443) & Domestic IM Protection
 - Domestic QUIC (`GEOSITE,cn` / `GEOIP,CN` and core domestic domains) is explicitly allowed **right before** overseas UDP 443 rejection, keeping QQ/WeChat/domestic media smooth while stabilizing overseas TCP streams.
@@ -1116,7 +1139,7 @@ fn ja_chapter_intro(canonical_id: &str) -> &'static str {
         }
         PREACCEL_DOC_ID => {
             "# 02 · 国内高速化（TCP 443 純 IP 中継）実践マニュアル\n\n\
-             非 443 ポートの上り制限を突破するため、① 友人共有（`mmrelay://v1/...` / `.zip` 共有パック / 手動入力）と ② 自前構築（国内軽量 VPS・ファイアウォール TCP 443 開放・SNI 厳格空欄・AnyTLS/Trojan ワンショット導入スクリプト）、複数物理クラウド自動均衡（`preaccel bind --dispatch-strategy auto|load_balance|fallback --lb-strategy round_robin|consistent_hashing`）、鍵ローテーション（`scripts/relay/rotate_relay_secrets.mjs`）、単体/全中継の実上下り速度テスト（`catcloud preaccel test --speed [--node-id <id>]`）、およびグローバル高速化・`catcloud preaccel global-status --json` 検証手順を提供します。ローカル Agent はユーザー同意後に全工程を代行してください。"
+             非 443 ポートの上り制限を突破するため、① 友人共有（`mmrelay://v1/...` / `.zip` 共有パック / 手動入力）と ② 自前構築（国内軽量 VPS・ファイアウォール TCP 443 開放・SNI 厳格空欄・AnyTLS/Trojan ワンショット導入スクリプト）、複数物理クラウド自動均衡（`preaccel bind --dispatch-strategy auto|load_balance|fallback --lb-strategy consistent_hashing|round_robin`）、鍵ローテーション（`scripts/relay/rotate_relay_secrets.mjs`）、単体/全中継の実上下り速度テスト（`catcloud preaccel test --speed [--node-id <id>]`）、透明ゲートウェイ / ソフトルーター向け Mihomo YAML 出力（`catcloud config export-gateway --profile relay-fragment|transparent-gateway|preferred-nodes`）、およびグローバル高速化・`catcloud preaccel global-status --json` 検証手順を提供します。ローカル Agent はユーザー同意後に全工程を代行してください。"
         }
         MULTIGROUP_DOC_ID => {
             "# 03 · スマートグループ & 安全スコア式ガイド\n\n\
@@ -1133,7 +1156,7 @@ fn ja_chapter_intro(canonical_id: &str) -> &'static str {
         }
         ROUTING_CONNS_DOC_ID => {
             "# 05 · ルールと接続・QUIC 制御 & リアルタイム接続診断\n\n\
-             国内直接、内蔵 AI ドメイン分流、国内 QUIC 優先許可＋海外 QUIC ブロック、`fake-ip-filter` 保護、`catcloud net connections` / `net match` の使い方を解説します。"
+             国内直接、内蔵 AI ドメイン分流、国内 QUIC 優先許可＋海外 QUIC ブロック、`fake-ip-filter` 保護、純自記ルールモード（`custom_rules_only`：内蔵国内直結/QUIC/AI DNS 上書きを無効化しつつ防環・LAN 安全基盤を保持）、一括ルール貼付とインライン YAML 上書き（`inline_override_yaml`、上限 1 MiB、`rule-providers:` / `rules:` / `dns:` 記述対応）、および `catcloud net connections` / `net match` の使い方を解説します。"
         }
         NETWORK_LIFECYCLE_DOC_ID => {
             "# 06 · ネットワーク・DNS・3 段階ホットリロード・省メモリ & 自動更新\n\n\
@@ -1159,7 +1182,7 @@ fn ru_chapter_intro(canonical_id: &str) -> &'static str {
         }
         PREACCEL_DOC_ID => {
             "# 02 · Практическое руководство по «Ускорение 443» (TCP :443 без SNI)\n\n\
-             Включает простой путь (`mmrelay://v1/...`, «Пакет обмена» `.zip`, ручной ввод), самостоятельное развёртывание на сервере (открытие TCP 443 в фаерволе, строго пустой SNI, готовый bash-скрипт AnyTLS/Trojan с выводом `mmrelay://v1/...`), мульти-облачную балансировку (`preaccel bind --dispatch-strategy auto|load_balance|fallback --lb-strategy round_robin|consistent_hashing`), ротацию секретов (`scripts/relay/rotate_relay_secrets.mjs`), тест реальной скорости аплоада/даунлоада одного или всех релеев (`catcloud preaccel test --speed [--node-id <id>]`), глобальное ускорение и проверку `catcloud preaccel global-status --json`. Локальный агент должен выполнять шаги целиком после согласия пользователя."
+             Включает простой путь (`mmrelay://v1/...`, «Пакет обмена» `.zip`, ручной ввод), самостоятельное развёртывание на сервере (открытие TCP 443 в фаерволе, строго пустой SNI, готовый bash-скрипт AnyTLS/Trojan с выводом `mmrelay://v1/...`), мульти-облачную балансировку (`preaccel bind --dispatch-strategy auto|load_balance|fallback --lb-strategy consistent_hashing|round_robin`), ротацию секретов (`scripts/relay/rotate_relay_secrets.mjs`), тест реальной скорости аплоада/даунлоада одного или всех релеев (`catcloud preaccel test --speed [--node-id <id>]`), экспорт Mihomo YAML для прозрачного шлюза и роутеров (`catcloud config export-gateway --profile relay-fragment|transparent-gateway|preferred-nodes`), глобальное ускорение и проверку `catcloud preaccel global-status --json`. Локальный агент должен выполнять шаги целиком после согласия пользователя."
         }
         MULTIGROUP_DOC_ID => {
             "# 03 · «Умные группы» и безопасные формулы оценки\n\n\
@@ -1176,7 +1199,7 @@ fn ru_chapter_intro(canonical_id: &str) -> &'static str {
         }
         ROUTING_CONNS_DOC_ID => {
             "# 05 · «Правила и сети», политика QUIC и диагностика соединений\n\n\
-             Прямой CN-трафик, встроенные AI-домены, разрешение локального QUIC перед блокировкой зарубежного UDP 443, защита `fake-ip-filter`, а также `catcloud net connections` и `net match`."
+             Прямой CN-трафик, встроенные AI-домены, разрешение локального QUIC перед блокировкой зарубежного UDP 443, защита `fake-ip-filter`, режим чистых пользовательских правил (`custom_rules_only` с сохранением защиты от петель и локальных сетей), массовая вставка правил и встроенное YAML-переопределение (`inline_override_yaml`, до 1 MiB, поддержка `rule-providers:` / `rules:` / `dns:`), а также `catcloud net connections` и `net match`."
         }
         NETWORK_LIFECYCLE_DOC_ID => {
             "# 06 · «Сеть и DNS», 3-уровневая горячая перезагрузка, экономия ОЗУ и обновления\n\n\
@@ -1369,7 +1392,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
             ]),
             gui_and_cli_verification: svec(&[
                 "GUI：「国内提速 → + 添加中转」导入 mmrelay://v1 或 JSON，确认开启「自动跳过原生 443 节点」，并可一键执行单条/全部中转真实上下行测速。",
-                "CLI：`catcloud preaccel add --uri ... --json`、`catcloud preaccel pool --json`、`catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json`、`catcloud preaccel test --speed [--node-id <id>] --json`、`catcloud preaccel global-status --json`；轮换回收密钥用 `scripts/relay/rotate_relay_secrets.mjs`。",
+                "CLI：`catcloud preaccel add --uri ... --json`、`catcloud preaccel pool --json`、`catcloud preaccel bind --dispatch-strategy auto --lb-strategy consistent_hashing --json`、`catcloud preaccel test --speed [--node-id <id>] --json`、`catcloud preaccel global-status --json`、`catcloud config export-gateway --profile relay-fragment|transparent-gateway|preferred-nodes --json`；轮换回收密钥用 `scripts/relay/rotate_relay_secrets.mjs`。",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "一键关闭：「国内提速」关总开关或执行 `catcloud preaccel bind --enabled false --json && catcloud config reload --json`。",
@@ -1547,7 +1570,7 @@ fn build_en_docs() -> Vec<AgentModuleDoc> {
             ]),
             gui_and_cli_verification: svec(&[
                 "GUI: Open 'Domestic Boost' -> '+ Add Relay' -> verify 'Auto-skip native 443 nodes', and run single/all relay real upload/download speed tests.",
-                "CLI: `catcloud preaccel add --uri ... --json`, `catcloud preaccel pool --json`, `catcloud preaccel bind --dispatch-strategy auto --lb-strategy round_robin --json`, `catcloud preaccel test --speed [--node-id <id>] --json`, `catcloud preaccel global-status --json`; rotate secrets via `scripts/relay/rotate_relay_secrets.mjs`.",
+                "CLI: `catcloud preaccel add --uri ... --json`, `catcloud preaccel pool --json`, `catcloud preaccel bind --dispatch-strategy auto --lb-strategy consistent_hashing --json`, `catcloud preaccel test --speed [--node-id <id>] --json`, `catcloud preaccel global-status --json`, `catcloud config export-gateway --profile relay-fragment|transparent-gateway|preferred-nodes --json`; rotate secrets via `scripts/relay/rotate_relay_secrets.mjs`.",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "Disable via GUI switch or `catcloud preaccel bind --enabled false --json && catcloud config reload --json`.",
@@ -2278,6 +2301,34 @@ mod tests {
                     );
                 }
             }
+        }
+
+        for lang in ["ja", "ru"] {
+            let preaccel_md =
+                export_agent_docs_with_lang(PREACCEL_DOC_ID, false, lang).expect("export 02");
+            assert!(
+                preaccel_md.contains("config export-gateway"),
+                "lang `{lang}` doc 02 must document config export-gateway"
+            );
+            assert!(
+                preaccel_md.contains("--lb-strategy consistent_hashing|round_robin"),
+                "lang `{lang}` doc 02 must order --lb-strategy consistent_hashing|round_robin"
+            );
+            assert!(
+                !preaccel_md.contains("--lb-strategy round_robin|consistent_hashing"),
+                "lang `{lang}` doc 02 must not keep old round_robin|consistent_hashing order"
+            );
+
+            let routing_md =
+                export_agent_docs_with_lang(ROUTING_CONNS_DOC_ID, false, lang).expect("export 05");
+            assert!(
+                routing_md.contains("custom_rules_only"),
+                "lang `{lang}` doc 05 must document custom_rules_only"
+            );
+            assert!(
+                routing_md.contains("inline_override_yaml"),
+                "lang `{lang}` doc 05 must document inline_override_yaml"
+            );
         }
     }
 

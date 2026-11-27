@@ -1064,10 +1064,10 @@ export function ShareBundleModal({
         aria-modal="true"
         aria-label={modalTitle}
         onClick={(e) => e.stopPropagation()}
-        className="cc-surface flex max-h-[88vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-[var(--line-strong)] shadow-2xl"
+        className="cc-surface flex max-h-[calc(100vh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-[var(--line-strong)] shadow-2xl"
       >
         {/* Modal Header */}
-        <div className="flex items-center justify-between gap-3 border-b border-[var(--line)] px-5 py-3.5">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-b border-[var(--line)] px-5 py-3.5">
           <div className="flex min-w-0 items-center gap-2.5">
             <span className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent)]">
               {(activeMode === "export" && isSyncExportTab) ||
@@ -1136,7 +1136,7 @@ export function ShareBundleModal({
         </div>
 
         {/* Transport Segmented Switcher Bar */}
-        <div className="border-b border-[var(--line)] bg-[var(--bg-elevated)]/45 px-5 py-2">
+        <div className="shrink-0 border-b border-[var(--line)] bg-[var(--bg-elevated)]/45 px-5 py-2">
           {activeMode === "export" ? (
             <div
               className="grid grid-cols-1 gap-1.5 sm:grid-cols-3"
@@ -1890,7 +1890,7 @@ export function ShareBundleModal({
                 {exportError && (
                   <div className="flex items-start gap-2 rounded-xl border border-[var(--red)]/45 bg-[var(--red-soft)] px-3 py-2 text-xs text-[var(--red)]">
                     <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                    <span>{exportError}</span>
+                    <span className="min-w-0 flex-1 break-words">{exportError}</span>
                   </div>
                 )}
               </>
@@ -2696,7 +2696,7 @@ export function ShareBundleModal({
               {importError && (
                 <div className="flex items-start gap-2 rounded-xl border border-[var(--red)]/45 bg-[var(--red-soft)] px-3 py-2 text-xs text-[var(--red)]">
                   <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
-                  <span>{importError}</span>
+                  <span className="min-w-0 flex-1 break-words">{importError}</span>
                 </div>
               )}
             </>
@@ -2704,7 +2704,7 @@ export function ShareBundleModal({
         </div>
 
         {/* Modal Footer */}
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--line)] bg-[var(--bg-elevated)]/55 px-5 py-3">
+        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t border-[var(--line)] bg-[var(--bg-elevated)]/55 px-5 py-3">
           {activeMode === "export" ? (
             exportTransport === "lan_send" && sendSession ? (
               <>
@@ -2722,7 +2722,7 @@ export function ShareBundleModal({
                     </span>
                   )}
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-2">
                   <button
                     type="button"
                     disabled={busy}
@@ -2747,7 +2747,7 @@ export function ShareBundleModal({
                 <div className="cc-tabular text-xs text-[var(--text-secondary)]">
                   {formatBytesShort(relayExportResult.payload_bytes)}
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-2">
                   <button
                     type="button"
                     disabled={busy}
@@ -2779,7 +2779,7 @@ export function ShareBundleModal({
                   </strong>{" "}
                   {dict.share.selectRelaysTab}
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-2">
                   <button
                     type="button"
                     disabled={busy}
@@ -2872,7 +2872,7 @@ export function ShareBundleModal({
                   </span>
                 )}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
                 <button
                   type="button"
                   disabled={busy}

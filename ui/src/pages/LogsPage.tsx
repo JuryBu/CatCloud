@@ -957,11 +957,11 @@ export function LogsPage() {
     <div className="space-y-4">
       {/* 顶部标题与操作栏 */}
       <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-3 rounded-2xl p-4">
-        <div className="flex items-center gap-3">
+        <div className="flex min-w-0 flex-1 items-center gap-3">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--accent)]">
             <ScrollText className="h-5 w-5" />
           </div>
-          <div>
+          <div className="min-w-0">
             <div className="flex flex-wrap items-center gap-2">
               <h1 className="text-sm font-semibold text-[var(--text)]">{dict.nav.logs}</h1>
               <span className="cc-mono rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text-secondary)]">
@@ -973,12 +973,12 @@ export function LogsPage() {
                 </span>
               ) : !runtime.running ? (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--muted)]">
-                  <span className="h-1.5 w-1.5 rounded-full bg-[var(--muted)] opacity-60" />
+                  <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--muted)] opacity-60" />
                   代理核心未启动（开启代理后自动接收日志）
                 </span>
               ) : (
                 <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--green)]">
-                  <span className="cc-pulse-dot h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                  <span className="cc-pulse-dot h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--green)]" />
                   实时更新中
                 </span>
               )}
@@ -989,17 +989,17 @@ export function LogsPage() {
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
             disabled={copyingAiDiag}
             onClick={() => void handleCopyAiDiagnosticBundle()}
-            className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-3 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-2.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
             title="一键打包当前代理状态与脱敏日志，直接粘给 AI 助手排查"
           >
             {copiedAiDiag ? (
               <>
-                <Check className="h-3.5 w-3.5" />
+                <Check className="h-3.5 w-3.5 shrink-0" />
                 <span>已复制诊断包</span>
               </>
             ) : (
@@ -1010,9 +1010,9 @@ export function LogsPage() {
           <button
             type="button"
             onClick={() => appActions.setNav("rules")}
-            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
           >
-            <Network className="h-3.5 w-3.5 text-[var(--muted)]" />
+            <Network className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
             <span>{dict.nav.rules}</span>
           </button>
 
@@ -1024,9 +1024,9 @@ export function LogsPage() {
                 ? "前往 AI 助手查看通用排障总纲与只读诊断命令"
                 : dict.aiHub.subtitle
             }
-            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
           >
-            <BookOpen className="h-3.5 w-3.5 text-[var(--accent)]" />
+            <BookOpen className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
             <span>{uiLang === "zh-CN" ? "AI 协作指南" : dict.nav.ai}</span>
           </button>
 
@@ -1041,12 +1041,12 @@ export function LogsPage() {
               });
             }}
             title={dict.common.openIssue}
-            className="inline-flex items-center gap-1 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--amber)] hover:text-[var(--text)] disabled:opacity-60"
+            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--amber)] hover:text-[var(--text)] disabled:opacity-60"
           >
             {openingIssue ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin text-[var(--amber)]" />
+              <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--amber)]" />
             ) : (
-              <MessageSquareWarning className="h-3.5 w-3.5 text-[var(--amber)]" />
+              <MessageSquareWarning className="h-3.5 w-3.5 shrink-0 text-[var(--amber)]" />
             )}
             <span>{uiLang === "zh-CN" ? "反馈 Issue" : "Issue"}</span>
           </button>
@@ -1054,25 +1054,25 @@ export function LogsPage() {
           <button
             type="button"
             onClick={handleTogglePause}
-            className={`inline-flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
+            className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
               paused
                 ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]"
                 : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text)] hover:border-[var(--line-strong)]"
             }`}
           >
-            {paused ? <Play className="h-3.5 w-3.5" /> : <Pause className="h-3.5 w-3.5" />}
+            {paused ? <Play className="h-3.5 w-3.5 shrink-0" /> : <Pause className="h-3.5 w-3.5 shrink-0" />}
             {paused ? "继续滚动" : "暂停滚动"}
           </button>
 
           <button
             type="button"
             onClick={() => void handleCopySanitized()}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
+            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
           >
             {copied ? (
-              <Check className="h-3.5 w-3.5 text-[var(--green)]" />
+              <Check className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
             ) : (
-              <Copy className="h-3.5 w-3.5 text-[var(--accent)]" />
+              <Copy className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
             )}
             {copied ? "已复制" : "仅复制日志"}
           </button>
@@ -1080,18 +1080,18 @@ export function LogsPage() {
           <button
             type="button"
             onClick={handleExportSanitized}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
+            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text)] hover:border-[var(--accent)]"
           >
-            <Download className="h-3.5 w-3.5 text-[var(--sky)]" />
+            <Download className="h-3.5 w-3.5 shrink-0 text-[var(--sky)]" />
             导出
           </button>
 
           <button
             type="button"
             onClick={handleClear}
-            className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--muted)] hover:border-[var(--red)] hover:text-[var(--red)]"
+            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--muted)] hover:border-[var(--red)] hover:text-[var(--red)]"
           >
-            <Trash2 className="h-3.5 w-3.5" />
+            <Trash2 className="h-3.5 w-3.5 shrink-0" />
             清空
           </button>
         </div>
@@ -1132,7 +1132,7 @@ export function LogsPage() {
           })}
         </div>
 
-        <div className="relative min-w-[240px] flex-1 max-w-md">
+        <div className="relative min-w-[180px] flex-1 max-w-md">
           <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
           <input
             type="text"
@@ -1190,7 +1190,7 @@ export function LogsPage() {
         <div
           ref={scrollContainerRef}
           onScroll={handleScroll}
-          className="cc-selectable cc-mono h-[520px] overflow-y-auto px-3 py-2 text-[11.5px] leading-relaxed"
+          className="cc-selectable cc-mono h-[clamp(260px,calc(100vh-300px),540px)] overflow-y-auto px-3 pt-2 pb-12 text-[11.5px] leading-relaxed"
         >
           {filteredEntries.length === 0 ? (
             <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-[var(--muted)]">
@@ -1241,7 +1241,10 @@ export function LogsPage() {
                     >
                       {meta.label}
                     </span>
-                    <span className="w-[118px] shrink-0 truncate text-[var(--accent)]">
+                    <span
+                      title={item.module}
+                      className="max-w-[116px] shrink-0 truncate text-[var(--accent)]"
+                    >
                       {item.module}
                     </span>
                     <span className="min-w-0 flex-1 break-all text-[var(--text-secondary)]">
@@ -1258,10 +1261,10 @@ export function LogsPage() {
           <button
             type="button"
             onClick={jumpToBottom}
-            className="absolute bottom-4 right-5 inline-flex items-center gap-1.5 rounded-full border border-[var(--accent)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--accent)]"
+            className="absolute bottom-3 right-3 z-10 inline-flex items-center gap-1.5 whitespace-nowrap rounded-full border border-[var(--accent)] bg-[var(--card)] px-3 py-1.5 text-xs font-medium text-[var(--accent)]"
             style={{ boxShadow: "var(--shadow-popover)" }}
           >
-            <ArrowDownToLine className="h-3.5 w-3.5" />
+            <ArrowDownToLine className="h-3.5 w-3.5 shrink-0" />
             回到最新日志
           </button>
         )}
