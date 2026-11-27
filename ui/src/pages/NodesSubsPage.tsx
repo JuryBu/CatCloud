@@ -3265,6 +3265,7 @@ export function NodesSubsPage({
   const storeNodes = useAppSelector((s) => s.nodes);
   const storeProbes = useAppSelector((s) => s.probes);
   const storeGroups = useAppSelector((s) => s.groups);
+  const initialized = useAppSelector((s) => s.initialized);
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.config.preaccel);
   const uiLang = useAppSelector((s) => s.config.personalization.ui_language);
@@ -3403,10 +3404,14 @@ export function NodesSubsPage({
   }, []);
 
   useEffect(() => {
-    if (nodesTabHint?.action !== "migration") return;
-    openMigrationScan();
-    appActions.consumeNodesTabHint();
-  }, [nodesTabHint, openMigrationScan]);
+    if (nodesTabHint?.action === "migration") {
+      openMigrationScan();
+      appActions.consumeNodesTabHint();
+    } else if (nodesTabHint?.action === "share") {
+      openShareImport();
+      appActions.consumeNodesTabHint();
+    }
+  }, [nodesTabHint, openMigrationScan, openShareImport]);
   const openMigrationWithPaste = useCallback((rawText: string) => {
     setMigrationInitialTab("paste");
     setMigrationInitialPaste(rawText.trim());
@@ -3577,6 +3582,16 @@ export function NodesSubsPage({
       setTargetGroupId(groups[0].id);
     }
   }, [groups, targetGroupId]);
+
+  useEffect(() => {
+    if (!initialized || filterSubId === "all") return;
+    if (
+      !subscriptions.some((s) => s.id === filterSubId) &&
+      !nodes.some((n) => n.sub_id === filterSubId)
+    ) {
+      setFilterSubId("all");
+    }
+  }, [initialized, filterSubId, subscriptions, nodes, setFilterSubId]);
 
   // Prune stale selected node IDs whenever the backing node list shrinks
   useEffect(() => {
@@ -4124,15 +4139,7 @@ export function NodesSubsPage({
       nodes.filter((n) => n.sub_id === sub.id).map((n) => n.id)
     );
     try {
-      await catcloudApi.deleteSubscription(sub.id);
-      if (inTauri) {
-        await syncListsFromBackend();
-      } else {
-        appActions.syncSubscriptions(
-          subscriptions.filter((item) => item.id !== sub.id)
-        );
-        appActions.syncNodes(nodes.filter((n) => n.sub_id !== sub.id));
-      }
+      await appActions.deleteSubscription(sub.id);
       if (removedIds.size > 0) {
         setSelectedNodeIds((prev) => {
           const next = new Set(prev);
@@ -4141,6 +4148,13 @@ export function NodesSubsPage({
         });
       }
       if (filterSubId === sub.id) setFilterSubId("all");
+      if (renamingSubId === sub.id) {
+        setRenamingSubId(null);
+        setRenamingSubName("");
+      }
+      if (importSuccessBanner?.subId === sub.id) {
+        setImportSuccessBanner(null);
+      }
       setPendingDeleteSub(null);
       appActions.showToast(`已移除订阅：${sub.name}（同时移除 ${removedIds.size} 个节点）`, "info");
     } catch (err) {
@@ -6211,33 +6225,33 @@ export function NodesSubsPage({
                           const tipTags: string[] = [];
                           if (resolvedLat.isProbation) tipTags.push(dict.latency.probationBadge);
                           if (resolvedLat.isDegraded) tipTags.push(dict.latency.degradedBadge);
-                          if (
-                            healthHint?.status === "cooldown" &&
-                            healthHint.cooldown_remaining_sec > 0
-                          ) {
+                          if (healthHint?.status === "cooldown") {
                             tipTags.push(
-                              formatI18nTemplate(dict.latency.cooldownSec, {
-                                sec: Math.ceil(healthHint.cooldown_remaining_sec),
-                              })
+                              healthHint.cooldown_remaining_sec > 0
+                                ? formatI18nTemplate(dict.latency.cooldownSec, {
+                                    sec: Math.ceil(healthHint.cooldown_remaining_sec),
+                                  })
+                                : dict.latency.cooldownActive
                             );
+                          }
+                          if (healthHint?.reason?.trim()) {
+                            tipTags.push(`${dict.latency.reasonPrefix}${healthHint.reason.trim()}`);
                           }
                           const latTooltip =
                             tipTags.length > 0 ? `${latBaseTip} · ${tipTags.join(" · ")}` : latBaseTip;
                           const isCooldown =
                             healthHint?.status === "cooldown" && resolvedLat.state === "failed";
-                          const sourceShort =
-                            resolvedLat.latencyMs !== null
-                              ? resolvedLat.source === "health"
-                                ? dict.latency.sourceHealthShort
-                                : resolvedLat.source === "probe"
-                                  ? dict.latency.sourceProbeShort
-                                  : null
-                              : null;
-                          const stateBadge = resolvedLat.isDegraded
-                            ? dict.latency.degradedBadge
-                            : resolvedLat.isProbation
-                              ? dict.latency.probationBadge
-                              : null;
+                          const latDotColor = isCooldown
+                            ? "var(--amber)"
+                            : resolvedLat.state === "failed"
+                              ? "var(--red)"
+                              : resolvedLat.latencyMs !== null
+                                ? resolvedLat.latencyMs <= 140
+                                  ? "var(--green)"
+                                  : resolvedLat.latencyMs <= 300
+                                    ? "var(--amber)"
+                                    : "var(--red)"
+                                : "var(--muted)";
                           const hasUp = hasValidUpMbps(probe);
                           const hasDown = hasValidDownMbps(probe);
                           return (
@@ -6245,7 +6259,7 @@ export function NodesSubsPage({
                           <div className="flex flex-wrap items-center gap-1.5 cc-mono">
                             <span
                               title={latTooltip}
-                              className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md px-1.5 py-0.5 font-semibold ${
+                              className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-1.5 py-0.5 font-semibold ${
                                 isCooldown
                                   ? "bg-[var(--amber-soft)] text-[var(--amber)]"
                                   : resolvedLat.state === "failed"
@@ -6259,6 +6273,11 @@ export function NodesSubsPage({
                                       : "bg-[var(--bg-elevated)] text-[var(--muted)]"
                               }`}
                             >
+                              <span
+                                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                style={{ backgroundColor: latDotColor }}
+                                aria-hidden="true"
+                              />
                               <span>
                                 {resolvedLat.latencyMs !== null
                                   ? `${Math.round(resolvedLat.latencyMs)} ms`
@@ -6272,20 +6291,7 @@ export function NodesSubsPage({
                                       ? dict.latency.timeoutShort
                                       : dict.latency.untestedShort}
                               </span>
-                              {sourceShort && (
-                                <span className="font-sans text-[9px] font-normal opacity-80">
-                                  {sourceShort}
-                                </span>
-                              )}
                             </span>
-                            {stateBadge && (
-                              <span
-                                title={latTooltip}
-                                className="rounded bg-[var(--amber-soft)] px-1 py-0.5 font-sans text-[9px] font-medium text-[var(--amber)]"
-                              >
-                                {stateBadge}
-                              </span>
-                            )}
                             {(hasUp || hasDown) && (
                               <div
                                 className="flex flex-col leading-tight text-[11px]"

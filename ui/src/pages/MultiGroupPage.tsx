@@ -1219,12 +1219,17 @@ function formatGroupLatencyTooltip(
   const tags: string[] = [];
   if (resolved.isProbation) tags.push(dict.latency.probationBadge);
   if (resolved.isDegraded) tags.push(dict.latency.degradedBadge);
-  if (hint?.status === "cooldown" && hint.cooldown_remaining_sec > 0) {
+  if (hint?.status === "cooldown") {
     tags.push(
-      formatI18nTemplate(dict.latency.cooldownSec, {
-        sec: Math.ceil(hint.cooldown_remaining_sec),
-      })
+      hint.cooldown_remaining_sec > 0
+        ? formatI18nTemplate(dict.latency.cooldownSec, {
+            sec: Math.ceil(hint.cooldown_remaining_sec),
+          })
+        : dict.latency.cooldownActive
     );
+  }
+  if (hint?.reason?.trim()) {
+    tags.push(`${dict.latency.reasonPrefix}${hint.reason.trim()}`);
   }
   return tags.length > 0 ? `${base} · ${tags.join(" · ")}` : base;
 }
@@ -1339,6 +1344,11 @@ export function MultiGroupPage() {
     false,
     isBoolPref
   );
+  const [moreFiltersOpen, setMoreFiltersOpen] = usePersistedState<boolean>(
+    "multigroup.moreFiltersOpen",
+    false,
+    isBoolPref
+  );
   const [nodePage, setNodePage] = useState(1);
   const [nodePageSize, setNodePageSize] = usePersistedState<number>(
     "multigroup.pageSize",
@@ -1425,6 +1435,15 @@ export function MultiGroupPage() {
   // Sync store groups smoothly without wiping unsaved strategy drafts
   useEffect(() => {
     if (!initialized && storeGroups.length === 0) return;
+    const validGroupIds = new Set(storeGroups.map((g) => g.id));
+    for (const key of Object.keys(latestMembersRef.current)) {
+      if (!validGroupIds.has(key)) {
+        delete latestMembersRef.current[key];
+      }
+    }
+    for (const sg of storeGroups) {
+      latestMembersRef.current[sg.id] = sg.member_node_ids;
+    }
     setGroups((prev) => {
       const prevById = new Map(prev.map((g) => [g.id, g]));
       return storeGroups.map((sg) => {
@@ -1433,7 +1452,7 @@ export function MultiGroupPage() {
           return {
             ...local,
             name: sg.name,
-            member_node_ids: latestMembersRef.current[sg.id] ?? sg.member_node_ids,
+            member_node_ids: sg.member_node_ids,
             active_node_id: sg.active_node_id,
           };
         }
@@ -1634,6 +1653,13 @@ export function MultiGroupPage() {
   );
 
   useEffect(() => {
+    if (!initialized || selectedSubId === "all") return;
+    if (!providerTabs.some((sub) => sub.id === selectedSubId)) {
+      setSelectedSubId("all");
+    }
+  }, [initialized, selectedSubId, providerTabs, setSelectedSubId]);
+
+  useEffect(() => {
     if (filterContinent !== "all" && regionStats.continentCounts[filterContinent] === 0) {
       setFilterContinent("all");
     }
@@ -1645,10 +1671,40 @@ export function MultiGroupPage() {
     }
   }, [regionStats, filterContinent, filterRegion]);
 
+  const effectiveSelectedMemberIds = useMemo(() => {
+    if (!selectedGroup) return [] as string[];
+    return selectedGroup.member_node_ids.filter((id) => nodeById.has(id));
+  }, [selectedGroup, nodeById]);
+
   const memberIdSet = useMemo(
-    () => new Set(selectedGroup?.member_node_ids ?? []),
-    [selectedGroup?.member_node_ids]
+    () => new Set(effectiveSelectedMemberIds),
+    [effectiveSelectedMemberIds]
   );
+
+  const moreFilterActiveCount =
+    (selectedSubId !== "all" ? 1 : 0) +
+    (filterContinent !== "all" || filterRegion !== "all" ? 1 : 0) +
+    (sortMode !== "default" ? 1 : 0);
+
+  const hasAnyActiveFilter =
+    Boolean(searchQuery) ||
+    selectedSubId !== "all" ||
+    filterContinent !== "all" ||
+    filterRegion !== "all" ||
+    filterGoogleClean ||
+    filterAiReady ||
+    sortMode !== "default";
+
+  const handleResetFilters = () => {
+    setSearchQuery("");
+    setSelectedSubId("all");
+    setFilterContinent("all");
+    setFilterRegion("all");
+    setFilterGoogleClean(false);
+    setFilterAiReady(false);
+    setSortMode("default");
+    setNodePage(1);
+  };
 
   // Only bind live probe/member/active dependencies when needed (members view, metric sort, or health filters)
   // so streaming probe updates never re-filter/re-sort all 430+ nodes in default "all" view.
@@ -2098,7 +2154,7 @@ export function MultiGroupPage() {
 
   const handleSwitchNextBestInGroup = async () => {
     if (!selectedGroup || switchingNext) return;
-    if (selectedGroup.member_node_ids.length === 0 && selectedGroup.mode !== "conditional_pool") {
+    if (effectiveSelectedMemberIds.length === 0 && selectedGroup.mode !== "conditional_pool") {
       appActions.showToast("当前组里还没有节点，请先点击下方节点卡片加入本组", "warn");
       return;
     }
@@ -2504,41 +2560,7 @@ export function MultiGroupPage() {
             <span>{showCreateForm ? "取消新建" : "新建多选组"}</span>
           </button>
 
-          {/* 3 One-Click Scenario Presets directly visible without expanding the form */}
-          {!showCreateForm && (
-            <div className="mt-2 space-y-1">
-              <div className="px-0.5 text-[10px] font-medium text-[var(--muted)]">
-                一键场景预设（点选即填好默认）
-              </div>
-              <div className="grid grid-cols-3 gap-1">
-                {CREATE_TEMPLATES.map((tpl) => {
-                  const shortLabel =
-                    tpl.id === "manual"
-                      ? "日常通用"
-                      : tpl.id === "ai"
-                        ? "AI 防跳"
-                        : "均衡高速";
-                  return (
-                    <button
-                      key={tpl.id}
-                      type="button"
-                      title={`${tpl.title}：${tpl.desc}`}
-                      onClick={() => {
-                        setNewGroupTemplate(tpl.id);
-                        setNewGroupName(tpl.title);
-                        setShowCreateForm(true);
-                      }}
-                      className="rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-1.5 py-1 text-center text-[10.5px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/50 hover:text-[var(--accent)]"
-                    >
-                      {shortLabel}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Ultra-simple inline create form */}
+          {/* Ultra-simple inline create form (includes scenario presets inside) */}
           {showCreateForm && (
             <form
               onSubmit={(ev) => void handleCreateGroup(ev)}
@@ -2725,7 +2747,7 @@ export function MultiGroupPage() {
                     <>
                       <div className="mt-1.5 flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
                         <span className="cc-mono font-medium text-[var(--text-secondary)]">
-                          {g.member_node_ids.length} 个节点
+                          {g.member_node_ids.filter((id) => nodeById.has(id)).length} 个节点
                         </span>
                         <div className="flex flex-wrap items-center gap-1">
                           {isIndependentActive && (
@@ -2865,11 +2887,11 @@ export function MultiGroupPage() {
 
                 {/* Plain-language status summary */}
                 <p className="mt-1 truncate text-xs text-[var(--muted)]">
-                  {selectedGroup.member_node_ids.length > 0 ? (
+                  {effectiveSelectedMemberIds.length > 0 ? (
                     <>
                       已加入{" "}
                       <span className="cc-mono font-semibold text-[var(--text)]">
-                        {selectedGroup.member_node_ids.length}
+                        {effectiveSelectedMemberIds.length}
                       </span>{" "}
                       个节点
                       <span className="mx-1.5 opacity-50">·</span>
@@ -2938,9 +2960,9 @@ export function MultiGroupPage() {
             )}
           </div>
 
-          {/* Spacious Two-Row Filter, Sort, Quick Health Pills & Batch Action Bar */}
+          {/* Clean Compact Filter Bar with Collapsible More Filters Drawer */}
           <div className="cc-card cc-glass space-y-2.5 rounded-2xl px-4 py-3">
-            {/* Row 1: Wide Search Box + Source + Continent/Region + Sort Dropdown */}
+            {/* Row 1 (Always Visible): Search + All/Group Switch + Quick Health Pills + More Filters + Reset */}
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative min-w-[160px] flex-1">
                 <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
@@ -2963,160 +2985,202 @@ export function MultiGroupPage() {
                 )}
               </div>
 
-              {/* Source (Subscription) dropdown */}
-              <div className="inline-flex shrink-0 items-center gap-1.5">
-                <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-                <AppSelect
-                  aria-label="按来源筛选"
-                  size="md"
-                  value={selectedSubId}
-                  onChange={setSelectedSubId}
-                  options={[
-                    { value: "all", label: `全部来源 (${enabledNodes.length})` },
-                    ...providerTabs.map((sub) => ({
-                      value: sub.id,
-                      label: `${sub.name} (${sub.count})`,
-                    })),
-                  ]}
-                  className="w-[168px]"
-                />
+              {/* View mode segmented switch */}
+              <div className="inline-flex shrink-0 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-xs">
+                <button
+                  type="button"
+                  onClick={() => setViewMode("all")}
+                  className={`whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors ${
+                    viewMode === "all"
+                      ? "bg-[var(--card)] text-[var(--text)] shadow-xs"
+                      : "text-[var(--muted)] hover:text-[var(--text)]"
+                  }`}
+                >
+                  全部节点
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setViewMode("members")}
+                  className={`whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors ${
+                    viewMode === "members"
+                      ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
+                      : "text-[var(--muted)] hover:text-[var(--text)]"
+                  }`}
+                >
+                  仅看本组 ({effectiveSelectedMemberIds.length})
+                </button>
               </div>
 
-              {/* TAG-style two-tier Continent -> Country/Region filter */}
-              <ContinentRegionFilter
-                variant="select"
-                stats={regionStats}
-                continent={filterContinent}
-                region={filterRegion}
-                onContinentChange={(c) => {
-                  setFilterContinent(c);
-                  setNodePage(1);
-                }}
-                onRegionChange={(r) => {
-                  setFilterRegion(r);
-                  setNodePage(1);
-                }}
-              />
+              {/* Quick Health Filter Pills */}
+              <button
+                type="button"
+                aria-pressed={filterGoogleClean}
+                onClick={() => setFilterGoogleClean((v) => !v)}
+                title="仅看已测出谷歌地区正常的节点（不送中）"
+                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  filterGoogleClean
+                    ? "border-[var(--green)]/60 bg-[var(--green-soft)] text-[var(--green)]"
+                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--green)]/50 hover:text-[var(--text)]"
+                }`}
+              >
+                <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                <span>谷歌正常</span>
+              </button>
 
-              {/* Metric Sort Dropdown */}
-              <div className="inline-flex shrink-0 items-center gap-1.5">
-                <ArrowUpDown
-                  className={`h-3.5 w-3.5 shrink-0 ${
-                    sortMode !== "default" ? "text-[var(--accent)]" : "text-[var(--muted)]"
+              <button
+                type="button"
+                aria-pressed={filterAiReady}
+                onClick={() => setFilterAiReady((v) => !v)}
+                title="仅看已测出支持 ChatGPT / Gemini / Claude / Windsurf 任一 AI 的节点"
+                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  filterAiReady
+                    ? "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
+                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)]/50 hover:text-[var(--text)]"
+                }`}
+              >
+                <Sparkles className="h-3.5 w-3.5 shrink-0" />
+                <span>AI 可用</span>
+              </button>
+
+              {/* Collapsible More Filters Toggle with Warm-Gold Active Count Badge */}
+              <button
+                type="button"
+                aria-expanded={moreFiltersOpen}
+                onClick={() => setMoreFiltersOpen((v) => !v)}
+                className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                  moreFiltersOpen
+                    ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                    : moreFilterActiveCount > 0
+                      ? "border-[var(--amber)]/60 bg-[var(--amber-soft)]/50 text-[var(--text)] hover:border-[var(--amber)]"
+                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
+                }`}
+              >
+                <Filter className="h-3.5 w-3.5 shrink-0" />
+                <span>{dict.groups.moreFiltersBtn}</span>
+                {moreFilterActiveCount > 0 && (
+                  <span className="cc-mono rounded-full border border-[var(--amber)]/50 bg-[var(--amber-soft)] px-1.5 py-0.2 text-[10px] font-semibold text-[var(--amber)]">
+                    {formatI18nTemplate(dict.groups.activeFiltersCount, {
+                      count: moreFilterActiveCount,
+                    })}
+                  </span>
+                )}
+                <ChevronDown
+                  className={`h-3.5 w-3.5 shrink-0 transition-transform ${
+                    moreFiltersOpen ? "rotate-180" : ""
                   }`}
                 />
-                <AppSelect
-                  aria-label="节点排序方式"
-                  size="md"
-                  value={sortMode}
-                  onChange={(v) => setSortMode(v as NodeSortMode)}
-                  options={[
-                    { value: "default", label: "排序：默认（在用优先）" },
-                    { value: "up_desc", label: "排序：上传最快" },
-                    { value: "down_desc", label: "排序：下载最快" },
-                    { value: "latency_asc", label: "排序：延迟最低" },
-                  ]}
-                  className="w-[184px]"
-                  buttonClassName={`font-medium ${
-                    sortMode !== "default" ? "border-[var(--accent)]/60" : ""
-                  }`}
-                />
-              </div>
+              </button>
+
+              {hasAnyActiveFilter && (
+                <button
+                  type="button"
+                  onClick={handleResetFilters}
+                  className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                >
+                  <RotateCcw className="h-3 w-3 shrink-0" />
+                  <span>{dict.groups.resetFiltersBtn}</span>
+                </button>
+              )}
             </div>
 
-            {/* Row 2: View Mode Switch + Quick Health Filter Pills + Batch Actions */}
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)]/60 pt-2.5">
-              <div className="flex flex-wrap items-center gap-2">
-                {/* View mode segmented switch */}
-                <div className="inline-flex rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-xs">
-                  <button
-                    type="button"
-                    onClick={() => setViewMode("all")}
-                    className={`rounded-lg px-2.5 py-1 font-medium transition-colors ${
-                      viewMode === "all"
-                        ? "bg-[var(--card)] text-[var(--text)] shadow-xs"
-                        : "text-[var(--muted)] hover:text-[var(--text)]"
-                    }`}
-                  >
-                    全部节点
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setViewMode("members")}
-                    className={`rounded-lg px-2.5 py-1 font-medium transition-colors ${
-                      viewMode === "members"
-                        ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
-                        : "text-[var(--muted)] hover:text-[var(--text)]"
-                    }`}
-                  >
-                    仅看本组 ({selectedGroup.member_node_ids.length})
-                  </button>
+            {/* Collapsible Row 2: Source + Continent/Region + Sort + Batch Join/Clear Actions */}
+            {moreFiltersOpen && (
+              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)]/60 pt-2.5">
+                <div className="flex flex-wrap items-center gap-2">
+                  {/* Source (Subscription) dropdown */}
+                  <div className="inline-flex shrink-0 items-center gap-1.5">
+                    <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+                    <AppSelect
+                      aria-label="按来源筛选"
+                      size="md"
+                      value={selectedSubId}
+                      onChange={setSelectedSubId}
+                      options={[
+                        { value: "all", label: `全部来源 (${enabledNodes.length})` },
+                        ...providerTabs.map((sub) => ({
+                          value: sub.id,
+                          label: `${sub.name} (${sub.count})`,
+                        })),
+                      ]}
+                      className="w-[168px]"
+                    />
+                  </div>
+
+                  {/* TAG-style two-tier Continent -> Country/Region filter */}
+                  <ContinentRegionFilter
+                    variant="select"
+                    stats={regionStats}
+                    continent={filterContinent}
+                    region={filterRegion}
+                    onContinentChange={(c) => {
+                      setFilterContinent(c);
+                      setNodePage(1);
+                    }}
+                    onRegionChange={(r) => {
+                      setFilterRegion(r);
+                      setNodePage(1);
+                    }}
+                  />
+
+                  {/* Metric Sort Dropdown */}
+                  <div className="inline-flex shrink-0 items-center gap-1.5">
+                    <ArrowUpDown
+                      className={`h-3.5 w-3.5 shrink-0 ${
+                        sortMode !== "default" ? "text-[var(--accent)]" : "text-[var(--muted)]"
+                      }`}
+                    />
+                    <AppSelect
+                      aria-label="节点排序方式"
+                      size="md"
+                      value={sortMode}
+                      onChange={(v) => setSortMode(v as NodeSortMode)}
+                      options={[
+                        { value: "default", label: "排序：默认（在用优先）" },
+                        { value: "up_desc", label: "排序：上传最快" },
+                        { value: "down_desc", label: "排序：下载最快" },
+                        { value: "latency_asc", label: "排序：延迟最低" },
+                      ]}
+                      className="w-[184px]"
+                      buttonClassName={`font-medium ${
+                        sortMode !== "default" ? "border-[var(--accent)]/60" : ""
+                      }`}
+                    />
+                  </div>
                 </div>
 
-                {/* Quick Health Filter Pills */}
-                <button
-                  type="button"
-                  aria-pressed={filterGoogleClean}
-                  onClick={() => setFilterGoogleClean((v) => !v)}
-                  title="仅看已测出谷歌地区正常的节点（不送中）"
-                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1 text-xs font-medium transition-colors ${
-                    filterGoogleClean
-                      ? "border-[var(--green)]/60 bg-[var(--green-soft)] text-[var(--green)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--green)]/50 hover:text-[var(--text)]"
-                  }`}
-                >
-                  <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-                  <span>谷歌正常</span>
-                </button>
+                {/* Batch quick actions */}
+                <div className="flex flex-wrap items-center gap-1.5">
+                  {viewMode === "all" && unjoinedInFilterIds.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleAddFilteredToGroup}
+                      className="inline-flex items-center gap-1 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      <span>当前筛选全加入 ({unjoinedInFilterIds.length})</span>
+                    </button>
+                  )}
 
-                <button
-                  type="button"
-                  aria-pressed={filterAiReady}
-                  onClick={() => setFilterAiReady((v) => !v)}
-                  title="仅看已测出支持 ChatGPT / Gemini / Claude / Windsurf 任一 AI 的节点"
-                  className={`inline-flex items-center gap-1 rounded-xl border px-2.5 py-1 text-xs font-medium transition-colors ${
-                    filterAiReady
-                      ? "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)]/50 hover:text-[var(--text)]"
-                  }`}
-                >
-                  <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                  <span>AI 可用</span>
-                </button>
+                  {effectiveSelectedMemberIds.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={handleClearGroupMembers}
+                      className={`rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
+                        confirmClearMembers
+                          ? "border-[var(--red)] bg-[var(--red-soft)] text-[var(--red)]"
+                          : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--red)]/50 hover:text-[var(--red)]"
+                      }`}
+                    >
+                      {confirmClearMembers
+                        ? hasProtectedActiveMember
+                          ? dict.groups.confirmBelowHint
+                          : "再点一次确认清空"
+                        : "清空本组"}
+                    </button>
+                  )}
+                </div>
               </div>
-
-              {/* Batch quick actions */}
-              <div className="flex flex-wrap items-center gap-1.5">
-                {viewMode === "all" && unjoinedInFilterIds.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={handleAddFilteredToGroup}
-                    className="inline-flex items-center gap-1 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85"
-                  >
-                    <Plus className="h-3.5 w-3.5" />
-                    <span>当前筛选全加入 ({unjoinedInFilterIds.length})</span>
-                  </button>
-                )}
-
-                {selectedGroup.member_node_ids.length > 0 && (
-                  <button
-                    type="button"
-                    onClick={handleClearGroupMembers}
-                    className={`rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                      confirmClearMembers
-                        ? "border-[var(--red)] bg-[var(--red-soft)] text-[var(--red)]"
-                        : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--red)]/50 hover:text-[var(--red)]"
-                    }`}
-                  >
-                    {confirmClearMembers
-                      ? hasProtectedActiveMember
-                        ? dict.groups.confirmBelowHint
-                        : "再点一次确认清空"
-                      : "清空本组"}
-                  </button>
-                )}
-              </div>
-            </div>
+            )}
 
             {confirmClearMembers && hasProtectedActiveMember && (
               <div
@@ -3168,32 +3232,6 @@ export function MultiGroupPage() {
                   {totalNodePages > 1 ? `（第 ${safeNodePage}/${totalNodePages} 页）` : ""}
                 </span>
               </div>
-
-              {(searchQuery ||
-                selectedSubId !== "all" ||
-                filterContinent !== "all" ||
-                filterRegion !== "all" ||
-                filterGoogleClean ||
-                filterAiReady ||
-                sortMode !== "default") && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearchQuery("");
-                    setSelectedSubId("all");
-                    setFilterContinent("all");
-                    setFilterRegion("all");
-                    setFilterGoogleClean(false);
-                    setFilterAiReady(false);
-                    setSortMode("default");
-                    setNodePage(1);
-                  }}
-                  className="inline-flex items-center gap-1 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--accent)]"
-                >
-                  <RotateCcw className="h-3 w-3" />
-                  <span>重置筛选</span>
-                </button>
-              )}
             </div>
           </div>
 
@@ -3232,39 +3270,6 @@ export function MultiGroupPage() {
                 const healthHint = runtime.node_health_hints?.[node.id];
                 const resolvedLat = resolveNodeDisplayLatency(snap, healthHint);
                 const latTooltip = formatGroupLatencyTooltip(resolvedLat, dict, healthHint);
-                const latSourceShort =
-                  resolvedLat.latencyMs !== null
-                    ? resolvedLat.source === "health"
-                      ? dict.latency.sourceHealthShort
-                      : resolvedLat.source === "probe"
-                        ? dict.latency.sourceProbeShort
-                        : null
-                    : null;
-                const healthBadge =
-                  healthHint?.status === "cooldown" && resolvedLat.state === "failed"
-                    ? {
-                        label:
-                          healthHint.cooldown_remaining_sec > 0
-                            ? formatI18nTemplate(dict.latency.cooldownSec, {
-                                sec: Math.ceil(healthHint.cooldown_remaining_sec),
-                              })
-                            : dict.latency.cooldownActive,
-                        cls: "bg-[var(--red-soft)]/80 text-[var(--red)]",
-                        title: dict.latency.cooldownHint,
-                      }
-                    : resolvedLat.isProbation
-                      ? {
-                          label: dict.latency.probationBadge,
-                          cls: "bg-[var(--sky-soft)] text-[var(--sky)]",
-                          title: "刚从冷却恢复，正处于观察期，持续稳定后自动恢复正常权重",
-                        }
-                      : resolvedLat.isDegraded
-                        ? {
-                            label: dict.latency.degradedBadge,
-                            cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
-                            title: "最近探活出现轻微抖动或单源波动，后台正持续观察",
-                          }
-                        : null;
                 const subName = subNameById.get(node.sub_id) ?? "订阅节点";
                 const isProbing = probingNodeIdSet.has(node.id);
                 const isSelecting = selectingNodeId === node.id;
@@ -3396,35 +3401,43 @@ export function MultiGroupPage() {
                       })()}
                     </div>
 
-                    {/* Bottom row: unified latency resolver + throughput + gate status + live health pool hint + 2 quick actions ("测" & "用它") */}
+                    {/* Bottom row: unified latency dot + ms + throughput + gate status + 2 quick actions ("测" & "用它") */}
                     <div className="flex items-center justify-between gap-2 pt-0.5">
                       <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px]">
                         {resolvedLat.latencyMs !== null ? (
                           <span
                             title={latTooltip}
-                            className="inline-flex items-center gap-1 cc-mono cc-tabular font-semibold"
+                            className="inline-flex items-center gap-1.5 cc-mono cc-tabular font-semibold"
                             style={{ color: formatLatencyTone(resolvedLat.latencyMs) }}
                           >
+                            <span
+                              className="h-1.5 w-1.5 shrink-0 rounded-full"
+                              style={{ backgroundColor: formatLatencyTone(resolvedLat.latencyMs) }}
+                              aria-hidden="true"
+                            />
                             <span>{Math.round(resolvedLat.latencyMs)} ms</span>
-                            {latSourceShort && (
-                              <span className="rounded bg-[var(--bg-elevated)] px-1 py-[1px] font-sans text-[9px] font-normal text-[var(--muted)]">
-                                {latSourceShort}
-                              </span>
-                            )}
                           </span>
                         ) : resolvedLat.state === "failed" ? (
                           <span
                             title={latTooltip}
-                            className="rounded-md bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
+                            className="inline-flex items-center gap-1 rounded-md bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
                           >
-                            暂不可达
+                            <span
+                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--red)]"
+                              aria-hidden="true"
+                            />
+                            <span>暂不可达</span>
                           </span>
                         ) : (
                           <span
                             title={latTooltip}
-                            className="rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
+                            className="inline-flex items-center gap-1 rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
                           >
-                            待测
+                            <span
+                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--muted)]/55"
+                              aria-hidden="true"
+                            />
+                            <span>待测</span>
                           </span>
                         )}
                         {hasValidUpMbps(snap) && (
@@ -3453,14 +3466,6 @@ export function MultiGroupPage() {
                             className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
                           >
                             实测未达标
-                          </span>
-                        )}
-                        {healthBadge && (
-                          <span
-                            title={healthBadge.title}
-                            className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${healthBadge.cls}`}
-                          >
-                            {healthBadge.label}
                           </span>
                         )}
                       </div>
@@ -3529,14 +3534,23 @@ export function MultiGroupPage() {
           ) : (
             <div className="flex flex-1 flex-col items-center justify-center px-6 py-12 text-center">
               <p className="text-xs font-medium text-[var(--text-secondary)]">
-                {viewMode === "members" && selectedGroup.member_node_ids.length === 0
-                  ? "当前多选组里还没有节点"
-                  : enabledNodes.length === 0
-                    ? "节点库里还没有节点，请先去「节点与测速 → 订阅与导入」导入订阅"
+                {enabledNodes.length === 0
+                  ? "节点库里还没有节点，请先去「节点与测速 → 订阅与导入」导入订阅"
+                  : viewMode === "members" && effectiveSelectedMemberIds.length === 0
+                    ? "当前多选组里还没有节点，可切到「全部节点」点击卡片加入"
                     : "没有找到符合当前筛选条件的节点"}
               </p>
+              {enabledNodes.length === 0 && (
+                <button
+                  type="button"
+                  onClick={() => appActions.openNodesWorkspace("subs")}
+                  className="mt-3 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
+                >
+                  去导入订阅
+                </button>
+              )}
               {viewMode === "members" &&
-                selectedGroup.member_node_ids.length === 0 &&
+                effectiveSelectedMemberIds.length === 0 &&
                 enabledNodes.length > 0 && (
                   <button
                     type="button"
@@ -3546,27 +3560,13 @@ export function MultiGroupPage() {
                     切到「全部节点」挑选加入
                   </button>
                 )}
-              {(searchQuery ||
-                selectedSubId !== "all" ||
-                filterContinent !== "all" ||
-                filterRegion !== "all" ||
-                filterGoogleClean ||
-                filterAiReady) && (
+              {hasAnyActiveFilter && (
                 <button
                   type="button"
-                  onClick={() => {
-                    setSearchQuery("");
-                    setSelectedSubId("all");
-                    setFilterContinent("all");
-                    setFilterRegion("all");
-                    setFilterGoogleClean(false);
-                    setFilterAiReady(false);
-                    setSortMode("default");
-                    setNodePage(1);
-                  }}
+                  onClick={handleResetFilters}
                   className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
                 >
-                  重置全部筛选
+                  {dict.groups.resetFiltersBtn}
                 </button>
               )}
             </div>

@@ -67,6 +67,7 @@ import {
 import { resolvePlatformOs } from "../utils/platform";
 import { resolvePreAccelSummary } from "../utils/preaccelStatus";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
+import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 import {
   TITLE_BAR_SAFE_TOP_PX,
   isAnchorVisibleInScrollHierarchy,
@@ -124,6 +125,12 @@ const GROUP_MODE_SHORT_LABELS: Record<MultiGroupMode, string> = {
 function formatQuickSiteName(name: string): string {
   const trimmed = name.trim();
   if (/^google\s*204$/i.test(trimmed)) return "Google 连通";
+  return trimmed;
+}
+
+function formatQuickSiteShortName(name: string): string {
+  const trimmed = name.trim();
+  if (/^google(?:\s*204|\s*连通)?$/i.test(trimmed)) return "Google";
   return trimmed;
 }
 
@@ -315,6 +322,26 @@ const HomeLiveKpiGrid = memo(function HomeLiveKpiGrid({
           </div>
         );
       })}
+    </div>
+  );
+});
+
+/**
+ * Lightweight 1Hz leaf component for the compact inline status bar so live traffic
+ * ticks never re-render HomePage itself.
+ */
+const HomeCompactTrafficRates = memo(function HomeCompactTrafficRates() {
+  const traffic = useLatestTraffic();
+  return (
+    <div className="flex shrink-0 items-center gap-2.5 cc-mono cc-tabular text-xs font-semibold">
+      <span className="inline-flex items-center gap-1 whitespace-nowrap text-[var(--coral)]">
+        <ArrowUp className="h-3.5 w-3.5 shrink-0" />
+        <span>{formatRate(traffic.up_bps)}</span>
+      </span>
+      <span className="inline-flex items-center gap-1 whitespace-nowrap text-[var(--sky)]">
+        <ArrowDown className="h-3.5 w-3.5 shrink-0" />
+        <span>{formatRate(traffic.down_bps)}</span>
+      </span>
     </div>
   );
 });
@@ -542,6 +569,7 @@ export function HomePage() {
   );
   const dict = useUiDict(uiLang);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
+  const hasEnabledRelay = useAppSelector((s) => s.preAccelRelays.some((r) => r.enabled));
   const groups = useAppSelector((s) => s.groups);
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
@@ -559,6 +587,12 @@ export function HomePage() {
 
   const [togglingProxy, setTogglingProxy] = useState(false);
   const [togglingPreAccel, setTogglingPreAccel] = useState(false);
+  const [elevatingPreAccel, setElevatingPreAccel] = useState(false);
+  const [detailsOpen, setDetailsOpen] = usePersistedState<boolean>(
+    "home.detailsOpen",
+    false,
+    isBoolPref
+  );
   const [nodeMenuOpen, setNodeMenuOpen] = useState(false);
   const [nodeMenuPos, setNodeMenuPos] = useState<QuickNodeMenuPosition | null>(null);
   const [nodeSearch, setNodeSearch] = useState("");
@@ -917,19 +951,6 @@ export function HomePage() {
     dict,
     activeNodeHealthHint
   );
-  const activeLatencySourceTag =
-    activeResolvedLatency.latencyMs !== null
-      ? activeResolvedLatency.source === "health"
-        ? dict.latency.sourceHealthShort
-        : activeResolvedLatency.source === "probe"
-          ? dict.latency.sourceProbeShort
-          : null
-      : null;
-  const activeLatencyStateBadge = activeResolvedLatency.isDegraded
-    ? dict.latency.degradedBadge
-    : activeResolvedLatency.isProbation
-      ? dict.latency.probationBadge
-      : null;
   const activeLatencyColor =
     activeNodeHealthHint?.status === "cooldown" && activeResolvedLatency.state === "failed"
       ? "var(--amber)"
@@ -967,9 +988,25 @@ export function HomePage() {
   const preaccelSummary = resolvePreAccelSummary(
     runtime,
     globalPreAccel,
-    config.preaccel.enabled
+    config.preaccel.enabled,
+    hasEnabledRelay,
+    uiLang
   );
   const isProxyEnabled = preaccelSummary.proxyActive;
+  const preaccelNeedsElevation =
+    preaccelSummary.enabled &&
+    hasEnabledRelay &&
+    !preaccelSummary.suspendedForTun &&
+    !preaccelSummary.realWinDivertActive &&
+    (preaccelSummary.installState === "need_elevation" ||
+      (platformOs === "windows" &&
+        globalPreAccel.windivert_available &&
+        !globalPreAccel.is_elevated));
+  const preaccelQuickSubText = !preaccelSummary.enabled
+    ? dict.home.preaccelQuickDescOff
+    : preaccelSummary.subBadgeText
+      ? `${preaccelSummary.badgeText} · ${preaccelSummary.subBadgeText}`
+      : preaccelSummary.badgeText;
 
   const trafficStatusSentence = (() => {
     if (!isProxyEnabled) {
@@ -978,16 +1015,19 @@ export function HomePage() {
       }
       if (preaccelSummary.realWinDivertActive) {
         if (preaccelSummary.verifyState === "probing") {
-          return "未开启猫猫代理 · 正在自动探测全局提速链路…";
+          return "未开启猫猫代理 · 正在自动探测国内提速链路…";
         }
         if (preaccelSummary.verifyState === "verified") {
           return preaccelSummary.verifyLatencyMs
-            ? `未开启猫猫代理 · 全局提速已探测畅通（${preaccelSummary.verifyLatencyMs} ms）`
-            : "未开启猫猫代理 · 全局提速已探测畅通";
+            ? `未开启猫猫代理 · 正为原梯子提速（${preaccelSummary.verifyLatencyMs} ms）`
+            : "未开启猫猫代理 · 正为原梯子提速";
         }
-        return "未开启猫猫代理 · 全局国内提速运行中（正在加速其它代理软件）";
+        return "未开启猫猫代理 · 正自动为你的原梯子提速";
       }
       if (preaccelSummary.enabled) {
+        if (!hasEnabledRelay) {
+          return `${dict.home.proxyOffPrefix} · ${preaccelSummary.badgeText}`;
+        }
         if (
           preaccelSummary.installState === "downloading" ||
           preaccelSummary.installState === "verifying"
@@ -995,15 +1035,15 @@ export function HomePage() {
           return "未开启代理 · 正在后台准备提速组件…";
         }
         if (preaccelSummary.installState === "need_elevation") {
-          return "未开启代理 · 提速组件已就绪（需管理员权限以加速其它软件）";
+          return "未开启代理 · 提速组件已就绪（点下方以管理员开启）";
         }
         if (preaccelSummary.verifyState === "probing") {
-          return "未开启猫猫代理 · 正在自动探测全局提速链路…";
+          return "未开启猫猫代理 · 正在自动探测国内提速链路…";
         }
         if (preaccelSummary.verifyState === "degraded") {
-          return "未开启代理 · 底层拦截已自动保护回退（本地通道待命）";
+          return "未开启代理 · 底层拦截已自动保护回退";
         }
-        return "未开启代理 · 国内提速本地通道待命";
+        return `${dict.home.proxyOffPrefix} · ${preaccelSummary.badgeText}`;
       }
       return runtime.running
         ? "未开启代理，仅本地待命，不走流量"
@@ -1027,31 +1067,6 @@ export function HomePage() {
     return "已接管电脑网络流量";
   })();
 
-  const preAccelPillTitle = preaccelSummary.enabled
-    ? `${preaccelSummary.badgeText}（${preaccelSummary.detailText}）· 点击关闭`
-    : "一键开启国内提速（开启后猫猫云梯与电脑上其它代理软件都会一起走国内 443 提速）";
-
-  const preAccelPillLabel = (() => {
-    if (!preaccelSummary.enabled) return dict.home.preaccel;
-    if (!isProxyEnabled) {
-      if (preaccelSummary.realWinDivertActive) {
-        if (preaccelSummary.verifyState === "probing") return `${dict.nav.preaccelProbingBadge}…`;
-        if (preaccelSummary.verifyState === "verified") return dict.nav.preaccelVerifiedBadge;
-        return dict.nav.preaccelActiveBadge;
-      }
-      if (
-        preaccelSummary.installState === "downloading" ||
-        preaccelSummary.installState === "verifying"
-      ) {
-        return "准备组件…";
-      }
-      if (preaccelSummary.installState === "need_elevation") return "需管理员";
-      if (preaccelSummary.verifyState === "probing") return `${dict.nav.preaccelProbingBadge}…`;
-      if (preaccelSummary.verifyState === "degraded") return dict.nav.preaccelDegradedBadge;
-    }
-    return dict.home.preaccel;
-  })();
-
   const tunPillTitle = runtime.tun_needs_elevation
     ? platformOs === "linux"
       ? "配置已开启虚拟网卡但当前核心权限不足，点击一键授予核心网络权限"
@@ -1068,11 +1083,26 @@ export function HomePage() {
 
   const handleTogglePreAccelQuick = async () => {
     if (togglingPreAccel) return;
+    if (!hasEnabledRelay && !preaccelSummary.enabled) {
+      appActions.showToast(dict.home.needAddRelayToast, "info", 3800);
+      appActions.setNav("preaccel");
+      return;
+    }
     setTogglingPreAccel(true);
     try {
       await appActions.togglePreAccel();
     } finally {
       setTogglingPreAccel(false);
+    }
+  };
+
+  const handleRelaunchAdminPreAccel = async () => {
+    if (elevatingPreAccel) return;
+    setElevatingPreAccel(true);
+    try {
+      await appActions.relaunchAsAdminForGlobalPreAccel();
+    } finally {
+      setElevatingPreAccel(false);
     }
   };
 
@@ -1103,6 +1133,7 @@ export function HomePage() {
     switchingNode ||
       togglingProxy ||
       togglingPreAccel ||
+      elevatingPreAccel ||
       bgActivity.groups ||
       bgActivity.settings ||
       runtime.switching_active
@@ -1122,16 +1153,15 @@ export function HomePage() {
     setTogglingProxy(true);
     try {
       if (!isProxyEnabled) {
-        let needsTunAdmin = Boolean(runtime.tun_needs_elevation);
-        if (!runtime.running) {
-          const started = await catcloudApi.startCore();
-          appActions.syncRuntime(started);
-          needsTunAdmin = Boolean(started.tun_needs_elevation ?? needsTunAdmin);
-        }
-        const sysProxyOk = await appActions.toggleSystemProxy(true, needsTunAdmin);
-        if (sysProxyOk && needsTunAdmin) {
+        const started = await appActions.enableProxyPower();
+        if (
+          started.power_on_tun_degraded ||
+          (started.system_proxy_enabled && started.tun_needs_elevation)
+        ) {
           appActions.showToast(
-            "已启用系统代理；如需接管全部桌面软件请点击『虚拟网卡 · 需管理员』一键提权",
+            started.tun_needs_elevation
+              ? "已启用系统代理；如需接管全部桌面软件请点击『虚拟网卡 · 需管理员』一键提权"
+              : "原虚拟网卡因缺少管理员权限已改用系统代理；如需接管全部桌面软件请点击『虚拟网卡』一键提权",
             "info",
             5200
           );
@@ -1139,8 +1169,8 @@ export function HomePage() {
       } else {
         await appActions.disableAllProxyAndStopCore();
       }
-    } catch (err) {
-      appActions.showToast(`切换代理开关失败：${formatErrorMessage(err)}`, "warn");
+    } catch {
+      /* appActions.enableProxyPower already surfaces user-facing toast on error */
     } finally {
       setTogglingProxy(false);
     }
@@ -1284,11 +1314,13 @@ export function HomePage() {
       : preaccelSummary.realWinDivertActive
         ? preaccelSummary.verifyState === "probing"
           ? "探测链路中"
-          : "全局提速运行中"
+          : "正为原梯子提速"
         : preaccelSummary.enabled
-          ? preaccelSummary.verifyState === "degraded"
-            ? "已保护回退"
-            : "本地通道待命"
+          ? !hasEnabledRelay
+            ? "待添加提速线路"
+            : preaccelSummary.verifyState === "degraded"
+              ? "已保护回退"
+              : "本地提速待命"
           : "本地待命";
 
   // Determine whether exit IP has actually been probed
@@ -1494,7 +1526,7 @@ export function HomePage() {
         </section>
       )}
 
-      {/* 0-Node Onboarding Guide Card: car/fuel metaphor + 3 clear entry actions */}
+      {/* 0-Node Onboarding Guide Card: direct boost-only or import-as-main entry actions */}
       {initialized && nodes.length === 0 && (
         <section className="cc-card cc-glass rounded-2xl border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 p-4">
           <div className="space-y-3">
@@ -1511,6 +1543,16 @@ export function HomePage() {
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => appActions.setNav("preaccel")}
+                className="inline-flex shrink-0 items-center justify-center gap-1.5 rounded-xl border border-[var(--green)]/55 bg-[var(--green-soft)] px-3.5 py-2 text-xs font-semibold transition-colors hover:border-[var(--green)]"
+                style={{ color: "color-mix(in srgb, var(--green) 80%, var(--text))" }}
+              >
+                <Zap className="h-3.5 w-3.5 shrink-0" />
+                <span>{dict.home.emptyStepBoostOnly}</span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => appActions.openNodesWorkspace("subs", null, "migration")}
@@ -1552,10 +1594,10 @@ export function HomePage() {
 
       {/* Top Hero Dual-Zone Card: Main Proxy Power Switch + Interactive Current Route Selector */}
       <section className="cc-card cc-glass relative z-20 rounded-2xl p-5">
-        <div className="grid grid-cols-1 gap-5 min-[1160px]:grid-cols-12 min-[1160px]:gap-6">
-          {/* Left Zone: Prominent Power Switch + Mode & Takeover Controls */}
-          <div className="flex min-w-0 flex-col justify-between gap-4 min-[1160px]:col-span-5 min-[1160px]:border-r min-[1160px]:border-[var(--line)]/70 min-[1160px]:pr-6">
-            <div className="space-y-3">
+        <div className="grid grid-cols-1 gap-5 min-[1160px]:grid-cols-12 min-[1160px]:gap-5">
+          {/* Left Zone: Prominent Power Switch + Standalone Domestic Boost Strip + Mode & Takeover Controls */}
+          <div className="flex min-w-0 flex-col justify-between gap-3.5 min-[1160px]:col-span-5 min-[1160px]:border-r min-[1160px]:border-[var(--line)]/70 min-[1160px]:pr-5">
+            <div className="space-y-2.5">
               {/* Large Power Toggle Button */}
               <button
                 type="button"
@@ -1614,6 +1656,110 @@ export function HomePage() {
                   </p>
                 </div>
               </button>
+
+              {/* Standalone Domestic Boost Quick Control Strip (Bug 4 & Bug 5 safe) */}
+              <div
+                title={preaccelSummary.detailText}
+                className={`flex flex-wrap items-center justify-between gap-2 rounded-xl border px-3 py-2.5 transition-colors ${
+                  !preaccelSummary.enabled
+                    ? "border-[var(--line)] bg-[var(--bg-elevated)]"
+                    : preaccelSummary.tone === "green"
+                      ? "border-[var(--green)]/45 bg-[var(--green-soft)]/50"
+                      : preaccelSummary.tone === "accent"
+                        ? "border-[var(--accent)]/50 bg-[var(--accent-soft)]/45"
+                        : "border-[var(--amber)]/55 bg-[var(--amber-soft)]/45"
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => appActions.setNav("preaccel")}
+                  className="group flex min-w-0 flex-1 items-center gap-2.5 text-left"
+                  title={preaccelSummary.detailText}
+                >
+                  <span
+                    className={`inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-lg transition-colors ${
+                      !preaccelSummary.enabled
+                        ? "border border-[var(--line)] bg-[var(--card)] text-[var(--muted)] group-hover:border-[var(--accent)] group-hover:text-[var(--accent)]"
+                        : preaccelSummary.tone === "green"
+                          ? "bg-[var(--green)] text-[var(--accent-ink)]"
+                          : preaccelSummary.tone === "accent"
+                            ? "bg-[var(--accent)] text-[var(--accent-ink)]"
+                            : "bg-[var(--amber)] text-[var(--accent-ink)]"
+                    }`}
+                  >
+                    {preaccelSummary.verifyState === "probing" ? (
+                      <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Zap
+                        className={`h-3.5 w-3.5 ${togglingPreAccel ? "animate-pulse" : ""}`}
+                      />
+                    )}
+                  </span>
+
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs font-semibold text-[var(--text)] group-hover:text-[var(--accent)]">
+                      {dict.home.preaccelQuickTitle}
+                    </div>
+                    <div
+                      className={`mt-0.5 truncate text-[11px] ${
+                        !preaccelSummary.enabled
+                          ? "text-[var(--muted)]"
+                          : preaccelSummary.tone === "green"
+                            ? "font-medium text-[var(--green)]"
+                            : preaccelSummary.tone === "accent"
+                              ? "font-medium text-[var(--accent)]"
+                              : "font-medium text-[var(--amber)]"
+                      }`}
+                    >
+                      {preaccelQuickSubText}
+                    </div>
+                  </div>
+                </button>
+
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {preaccelNeedsElevation && (
+                    <button
+                      type="button"
+                      disabled={elevatingPreAccel}
+                      onClick={() => void handleRelaunchAdminPreAccel()}
+                      title={preaccelSummary.detailText}
+                      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--amber)]/65 bg-[var(--amber-soft)] px-2.5 py-1 text-[11px] font-semibold text-[var(--amber)] transition-colors hover:border-[var(--amber)] disabled:opacity-65"
+                    >
+                      {elevatingPreAccel ? (
+                        <RefreshCw className="h-3 w-3 shrink-0 animate-spin" />
+                      ) : (
+                        <ShieldCheck className="h-3 w-3 shrink-0" />
+                      )}
+                      <span>{dict.home.preaccelQuickNeedAdminBtn}</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={preaccelSummary.enabled}
+                    aria-label={dict.home.preaccelQuickTitle}
+                    disabled={togglingPreAccel}
+                    onClick={() => void handleTogglePreAccelQuick()}
+                    title={preaccelSummary.detailText}
+                    className={`inline-flex h-5 w-9 shrink-0 items-center rounded-full p-0.5 transition-colors disabled:opacity-65 ${
+                      preaccelSummary.enabled
+                        ? preaccelSummary.tone === "amber"
+                          ? "bg-[var(--amber)]"
+                          : preaccelSummary.tone === "green"
+                            ? "bg-[var(--green)]"
+                            : "bg-[var(--accent)]"
+                        : "bg-[var(--line-strong)]"
+                    }`}
+                  >
+                    <span
+                      className={`h-4 w-4 rounded-full bg-[var(--card)] transition-transform ${
+                        preaccelSummary.enabled ? "translate-x-4" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
             </div>
 
             {/* Mode + Takeover Method Controls */}
@@ -1691,53 +1837,33 @@ export function HomePage() {
                     />
                   )}
                 </button>
-
-                <button
-                  type="button"
-                  disabled={togglingPreAccel}
-                  aria-pressed={preaccelSummary.enabled}
-                  onClick={() => void handleTogglePreAccelQuick()}
-                  className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:opacity-65 ${
-                    !preaccelSummary.enabled
-                      ? "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
-                      : preaccelSummary.tone === "amber"
-                        ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)]"
-                        : "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
-                  }`}
-                  title={preAccelPillTitle}
-                >
-                  <Zap
-                    className={`h-3.5 w-3.5 shrink-0 ${togglingPreAccel ? "animate-pulse" : ""}`}
-                  />
-                  <span>{preAccelPillLabel}</span>
-                </button>
               </div>
             </div>
           </div>
 
           {/* Right Zone: Dual-Mode Current Route (Single Node vs Smart Multi-Group) + Quick Actions + Dual-Form Mascot */}
           <div className="flex min-w-0 flex-col justify-between gap-3.5 min-[1160px]:col-span-7">
-            <div className="flex items-start justify-between gap-3">
+            <div className="flex items-start justify-between gap-2.5">
               <div className="min-w-0 flex-1 space-y-2.5">
                 {/* Row 1: Clear Dual-Mode Badge + Status Pills + Mode Switch Link */}
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-x-1.5 gap-y-1">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     {isSingleMode ? (
                       <span
-                        className="inline-flex items-center gap-1.5 rounded-full border border-[var(--green)]/45 bg-[var(--green-soft)] px-2.5 py-0.5 text-xs font-semibold"
+                        className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[var(--green)]/45 bg-[var(--green-soft)] px-2 py-0.5 text-[11px] font-semibold"
                         style={{ color: "color-mix(in srgb, var(--green) 82%, var(--text))" }}
                       >
-                        <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
+                        <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--green)]" />
                         <span>单节点模式</span>
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--accent)]/45 bg-[var(--accent-soft)] px-2.5 py-0.5 text-xs font-semibold text-[var(--accent)]">
+                      <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[var(--accent)]/45 bg-[var(--accent-soft)] px-2 py-0.5 text-[11px] font-semibold text-[var(--accent)]">
                         <Layers className="h-3 w-3 shrink-0" />
                         <span>智能多选组</span>
                       </span>
                     )}
 
-                    <span className="text-[11px] text-[var(--muted)]">
+                    <span className="whitespace-nowrap text-[11px] text-[var(--muted)]">
                       {isSingleMode
                         ? "固定只走这 1 个节点"
                         : activeGroupCount > 0
@@ -1750,7 +1876,7 @@ export function HomePage() {
                       <button
                         type="button"
                         onClick={() => appActions.setNav("preaccel")}
-                        className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold transition-opacity hover:opacity-90 ${
+                        className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-[11px] font-semibold transition-opacity hover:opacity-90 ${
                           preaccelSummary.tone === "green"
                             ? "border-[var(--green)]/50 bg-[var(--green-soft)]"
                             : preaccelSummary.tone === "accent"
@@ -1765,9 +1891,9 @@ export function HomePage() {
                         title={`${preaccelSummary.detailText} · 点击前往国内提速页查看`}
                       >
                         {preaccelSummary.verifyState === "probing" ? (
-                          <RefreshCw className="h-3 w-3 animate-spin" />
+                          <RefreshCw className="h-3 w-3 shrink-0 animate-spin" />
                         ) : (
-                          <Zap className="h-3 w-3" />
+                          <Zap className="h-3 w-3 shrink-0" />
                         )}
                         <span>
                           {preaccelSummary.badgeText}
@@ -1782,9 +1908,9 @@ export function HomePage() {
                       <button
                         type="button"
                         onClick={() => appActions.setNav("preaccel")}
-                        className="inline-flex items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber)]"
+                        className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--amber)]"
                       >
-                        <ShieldAlert className="h-3 w-3" />
+                        <ShieldAlert className="h-3 w-3 shrink-0" />
                         <span>校园网需认证</span>
                       </button>
                     )}
@@ -1793,10 +1919,10 @@ export function HomePage() {
                   <button
                     type="button"
                     onClick={() => appActions.setNav(isSingleMode ? "groups" : "nodes")}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-lg px-1.5 py-0.5 text-[11px] font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent-soft)]/60"
+                    className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-lg px-1 py-0.5 text-[11px] font-medium text-[var(--accent)] transition-colors hover:bg-[var(--accent-soft)]/60"
                   >
                     <span>{isSingleMode ? "切到多选组" : "改用单节点"}</span>
-                    <ArrowRight className="h-3 w-3" />
+                    <ArrowRight className="h-3 w-3 shrink-0" />
                   </button>
                 </div>
 
@@ -1836,10 +1962,13 @@ export function HomePage() {
                           </span>
                         )}
                         <span
-                          className="inline-flex items-center gap-1"
+                          className="inline-flex items-center gap-1.5"
                           title={activeLatencyTooltip}
                         >
-                          延迟{" "}
+                          <span
+                            className="h-2 w-2 shrink-0 rounded-full"
+                            style={{ backgroundColor: activeLatencyColor }}
+                          />
                           <strong
                             className="cc-mono font-semibold"
                             style={{
@@ -1848,16 +1977,6 @@ export function HomePage() {
                           >
                             {activeLatencyText}
                           </strong>
-                          {activeLatencySourceTag && (
-                            <span className="rounded bg-[var(--card)] px-1 py-0.5 text-[9px] text-[var(--muted)]">
-                              {activeLatencySourceTag}
-                            </span>
-                          )}
-                          {activeLatencyStateBadge && (
-                            <span className="rounded bg-[var(--amber-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--amber)]">
-                              {activeLatencyStateBadge}
-                            </span>
-                          )}
                         </span>
                         <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
                           ↑{" "}
@@ -1958,9 +2077,13 @@ export function HomePage() {
                             )}
                           </span>
                           <span
-                            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap"
+                            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap"
                             title={activeLatencyTooltip}
                           >
+                            <span
+                              className="h-2 w-2 shrink-0 rounded-full"
+                              style={{ backgroundColor: activeLatencyColor }}
+                            />
                             <strong
                               className="cc-mono font-semibold"
                               style={{
@@ -1969,16 +2092,6 @@ export function HomePage() {
                             >
                               {activeLatencyText}
                             </strong>
-                            {activeLatencySourceTag && (
-                              <span className="rounded bg-[var(--card)] px-1 py-0.5 text-[9px] text-[var(--muted)]">
-                                {activeLatencySourceTag}
-                              </span>
-                            )}
-                            {activeLatencyStateBadge && (
-                              <span className="rounded bg-[var(--amber-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--amber)]">
-                                {activeLatencyStateBadge}
-                              </span>
-                            )}
                           </span>
                           <span
                             className="inline-flex shrink-0 items-center gap-2 whitespace-nowrap cc-mono"
@@ -2168,19 +2281,6 @@ export function HomePage() {
                                 ? "var(--amber)"
                                 : getLatencyColor(lat, latOk);
                               const latTooltip = formatHomeLatencyTooltip(resolvedLat, dict, hint);
-                              const latSourceShort =
-                                lat !== null
-                                  ? resolvedLat.source === "health"
-                                    ? dict.latency.sourceHealthShort
-                                    : resolvedLat.source === "probe"
-                                      ? dict.latency.sourceProbeShort
-                                      : null
-                                  : null;
-                              const latStateTag = resolvedLat.isDegraded
-                                ? dict.latency.degradedBadge
-                                : resolvedLat.isProbation
-                                  ? dict.latency.probationBadge
-                                  : null;
                               const nodeRegionCode = resolveNodeRegionCode(node);
                               const hasRegionTag = Boolean(
                                 nodeRegionCode && nodeRegionCode !== "UNK"
@@ -2239,16 +2339,6 @@ export function HomePage() {
                                           : resolvedLat.state === "failed"
                                             ? dict.latency.timeoutShort
                                             : dict.latency.untestedShort}
-                                      {latSourceShort && (
-                                        <span className="rounded bg-[var(--bg-elevated)] px-1 py-[1px] font-sans text-[9px] font-normal text-[var(--muted)]">
-                                          {latSourceShort}
-                                        </span>
-                                      )}
-                                      {latStateTag && (
-                                        <span className="rounded bg-[var(--amber-soft)] px-1 py-[1px] font-sans text-[9px] font-medium text-[var(--amber)]">
-                                          {latStateTag}
-                                        </span>
-                                      )}
                                     </span>
                                   </div>
 
@@ -2443,21 +2533,90 @@ export function HomePage() {
                 <Minimize2 className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
                 <span>{dict.home.traySaveMem}</span>
               </button>
-
-              <button
-                type="button"
-                onClick={() => appActions.openAiAssistant(undefined, "agent")}
-                className="ml-auto inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[var(--accent)]/40 bg-[var(--accent-soft)]/55 px-3 py-1.5 text-[11.5px] font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
-                title="前往 AI 全权代管：复制本机 AI 全权托管指令或网页 AI 手把手引导"
-              >
-                <Bot className="h-3.5 w-3.5 shrink-0" />
-                <span>{dict.home.aiQuickBtn}</span>
-              </button>
             </div>
           </div>
         </div>
       </section>
 
+      {/* Compact 1-Row Inline Status Bar: 1Hz Live Rates + 4 Quick Sites + Expand Details Toggle */}
+      <section className="cc-card cc-glass flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-2xl px-3.5 py-2 text-xs">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1.5">
+          <HomeCompactTrafficRates />
+
+          <span className="hidden h-3.5 w-px bg-[var(--line)] sm:block" aria-hidden="true" />
+
+          <div
+            className="flex flex-wrap items-center gap-x-2.5 gap-y-1"
+            aria-label={dict.home.quickSitesInlineLabel}
+          >
+            {(sites.length > 0 ? sites : DEFAULT_QUICK_SITES).slice(0, 4).map((site) => {
+              const color = getLatencyColor(site.latency_ms, site.ok);
+              const fullName = formatQuickSiteName(site.name);
+              const statusDesc =
+                site.ok === false
+                  ? "连不上"
+                  : site.ok === null || site.latency_ms === null
+                    ? "待检测"
+                    : `${site.latency_ms} ms`;
+              return (
+                <span
+                  key={site.id}
+                  title={`${fullName} · ${statusDesc} (${site.url})`}
+                  className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-[11.5px]"
+                >
+                  <span
+                    className="h-2 w-2 shrink-0 rounded-full"
+                    style={{ backgroundColor: color }}
+                  />
+                  <span className="font-medium text-[var(--text-secondary)]">
+                    {formatQuickSiteShortName(site.name)}
+                  </span>
+                  {site.ok === false ? (
+                    <span className="cc-mono text-[10.5px] font-semibold text-[var(--red)]">
+                      ×
+                    </span>
+                  ) : site.latency_ms !== null ? (
+                    <span
+                      className="cc-mono cc-tabular text-[10.5px] font-semibold"
+                      style={{ color }}
+                    >
+                      {site.latency_ms}ms
+                    </span>
+                  ) : null}
+                </span>
+              );
+            })}
+
+            <button
+              type="button"
+              disabled={checkingSites}
+              onClick={() => void handleCheckSites()}
+              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-[var(--accent-soft)] px-2 py-1 text-[11px] font-medium text-[var(--accent)] transition-opacity hover:opacity-85 disabled:opacity-60"
+            >
+              <RefreshCw className={`h-3 w-3 shrink-0 ${checkingSites ? "animate-spin" : ""}`} />
+              <span>{dict.home.quickSitesCheckBtn}</span>
+            </button>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          aria-expanded={detailsOpen}
+          onClick={() => setDetailsOpen((v) => !v)}
+          className="ml-auto inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1 text-[11.5px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+        >
+          <span>{detailsOpen ? dict.home.detailsCollapse : dict.home.detailsExpand}</span>
+          <ChevronDown
+            className={`h-3.5 w-3.5 shrink-0 transition-transform ${
+              detailsOpen ? "rotate-180" : ""
+            }`}
+          />
+        </button>
+      </section>
+
+      {/* Collapsible Detailed Telemetry, Quick Sites, Exit Info & Core Footer (Zero Feature Loss) */}
+      {detailsOpen && (
+        <>
       {/* Middle Traffic Section: 10-Minute Sparkline + Isolated 1Hz 6-Card KPI Grid */}
       <section className="space-y-3">
         <TrafficSparkline variant="full" />
@@ -2723,6 +2882,8 @@ export function HomePage() {
           </span>
         </div>
       </footer>
+        </>
+      )}
 
       {/* In-Page Two-Step Confirmation Modal for Removing a Quick Check Site */}
       {pendingRemoveSite &&

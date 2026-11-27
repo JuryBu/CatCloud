@@ -410,14 +410,17 @@ function isActiveGroupCircuitOpen(runtime: CoreRuntimeInfo): boolean {
  */
 function resolveCapsuleHealthState(
   runtime: CoreRuntimeInfo,
-  preaccel: PreAccelSummary
+  preaccel: PreAccelSummary,
+  hasEnabledRelay: boolean
 ): CapsuleHealthState {
   if (runtime.status === "error") {
     return "error";
   }
+  const preaccelWithRelay = preaccel.enabled && hasEnabledRelay;
   const verifyDegraded =
-    preaccel.enabled && (preaccel.verifyState === "degraded" || preaccel.verifyState === "failed");
-  const verifyProbing = preaccel.enabled && preaccel.verifyState === "probing";
+    preaccelWithRelay &&
+    (preaccel.verifyState === "degraded" || preaccel.verifyState === "failed");
+  const verifyProbing = preaccelWithRelay && preaccel.verifyState === "probing";
   if (
     runtime.status === "warn" ||
     runtime.captive_portal_required ||
@@ -428,14 +431,15 @@ function resolveCapsuleHealthState(
   }
   const isDirectMode = runtime.proxy_mode === "direct";
   if (isDirectMode) {
-    if (!verifyProbing && preaccel.realWinDivertActive) {
+    if (!verifyProbing && hasEnabledRelay && preaccel.realWinDivertActive) {
       return "preaccel";
     }
     return "idle";
   }
   if (
     !verifyProbing &&
-    ((preaccel.proxyActive && runtime.preaccel_active) ||
+    hasEnabledRelay &&
+    ((preaccel.proxyActive && runtime.preaccel_active && preaccel.tone === "green") ||
       preaccel.realWinDivertActive ||
       runtime.status === "preaccel")
   ) {
@@ -450,6 +454,7 @@ function resolveCapsuleHealthState(
 function resolveStatusAccent(
   runtime: CoreRuntimeInfo,
   preaccel: PreAccelSummary,
+  hasEnabledRelay: boolean,
   mascotState: MascotState,
   isLocalBusy: boolean,
   dict: CapsuleDictSlice,
@@ -457,11 +462,13 @@ function resolveStatusAccent(
 ): CapsuleStatusMeta {
   const isZh = uiLang === "zh-CN";
   const circuitOpen = isActiveGroupCircuitOpen(runtime);
+  const preaccelWithRelay = preaccel.enabled && hasEnabledRelay;
   const verifyDegraded =
-    preaccel.enabled && (preaccel.verifyState === "degraded" || preaccel.verifyState === "failed");
-  const verifyProbing = preaccel.enabled && preaccel.verifyState === "probing";
+    preaccelWithRelay &&
+    (preaccel.verifyState === "degraded" || preaccel.verifyState === "failed");
+  const verifyProbing = preaccelWithRelay && preaccel.verifyState === "probing";
   const isInstalling =
-    preaccel.enabled &&
+    preaccelWithRelay &&
     (preaccel.installState === "downloading" || preaccel.installState === "verifying");
   const isWorking =
     isLocalBusy ||
@@ -514,9 +521,7 @@ function resolveStatusAccent(
     return {
       color: "var(--amber)",
       label: verifyProbing
-        ? isZh
-          ? "国内提速（探测中）"
-          : `${dict.nav.preaccelProbingBadge}…`
+        ? preaccel.badgeText
         : dict.capsule.probingNow,
       pulse: "work",
       badge: {
@@ -532,12 +537,12 @@ function resolveStatusAccent(
   if (isInstalling) {
     return {
       color: "var(--amber)",
-      label: isZh ? "准备提速组件…" : "Preparing Boost…",
+      label: preaccel.badgeText,
       pulse: "work",
     };
   }
   if (runtime.proxy_mode === "direct") {
-    if (preaccel.realWinDivertActive && preaccel.verifyState === "verified") {
+    if (hasEnabledRelay && preaccel.realWinDivertActive && preaccel.verifyState === "verified") {
       return {
         color: "var(--green)",
         label: preaccel.verifyLatencyMs
@@ -555,7 +560,7 @@ function resolveStatusAccent(
     };
   }
   if (preaccel.proxyActive) {
-    if (preaccel.enabled) {
+    if (preaccelWithRelay && preaccel.tone === "green") {
       if (preaccel.realWinDivertActive) {
         if (preaccel.verifyState === "verified") {
           return {
@@ -569,13 +574,13 @@ function resolveStatusAccent(
         }
         return {
           color: "var(--accent)",
-          label: isZh ? "国内提速中（全局）" : dict.nav.preaccelActiveBadge,
+          label: preaccel.badgeText,
           pulse: "none",
         };
       }
       return {
         color: "var(--accent)",
-        label: isZh ? "国内提速运行中" : dict.nav.preaccelActiveBadge,
+        label: preaccel.badgeText,
         pulse: "none",
       };
     }
@@ -585,7 +590,7 @@ function resolveStatusAccent(
       pulse: "none",
     };
   }
-  if (preaccel.realWinDivertActive) {
+  if (hasEnabledRelay && preaccel.realWinDivertActive) {
     if (preaccel.verifyState === "verified") {
       return {
         color: "var(--green)",
@@ -598,21 +603,21 @@ function resolveStatusAccent(
     }
     return {
       color: "var(--accent)",
-      label: isZh ? "全局提速中" : dict.nav.preaccelActiveBadge,
+      label: preaccel.badgeText,
       pulse: "none",
     };
   }
   if (preaccel.enabled) {
-    if (preaccel.installState === "need_elevation") {
+    if (!hasEnabledRelay) {
       return {
         color: "var(--amber)",
-        label: isZh ? "提速需管理员" : "Admin Required",
+        label: preaccel.badgeText,
         pulse: "none",
       };
     }
     return {
       color: "var(--amber)",
-      label: isZh ? "本地通道待命" : dict.titleBar.standby,
+      label: preaccel.badgeText,
       pulse: "none",
     };
   }
@@ -669,6 +674,9 @@ export function CapsuleWindow() {
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
+  const hasEnabledRelay = useAppSelector((s) =>
+    s.preAccelRelays.some((r) => r.enabled)
+  );
   const groups = useAppSelector((s) => s.groups);
   const probes = useAppSelector((s) => s.probes);
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
@@ -1711,18 +1719,25 @@ export function CapsuleWindow() {
   const preaccelSummary = resolvePreAccelSummary(
     runtime,
     globalPreAccel,
-    preAccelEnabledConfig
+    preAccelEnabledConfig,
+    hasEnabledRelay,
+    uiLang
   );
   const isLocalBusy = switching || togglingPreAccel;
   const statusMeta = resolveStatusAccent(
     runtime,
     preaccelSummary,
+    hasEnabledRelay,
     mascotState,
     isLocalBusy,
     dict,
     uiLang
   );
-  const capsuleHealthState = resolveCapsuleHealthState(runtime, preaccelSummary);
+  const capsuleHealthState = resolveCapsuleHealthState(
+    runtime,
+    preaccelSummary,
+    hasEnabledRelay
+  );
   const themeMeta = resolveThemeDisplay(resolvedTheme, themeMode, uiLang);
   const isSingleMode = runtime.route_mode === "single";
   const displayNodeName =
@@ -1819,7 +1834,7 @@ export function CapsuleWindow() {
     }
     if (
       runtime.probing_active ||
-      preaccelSummary.verifyState === "probing" ||
+      (hasEnabledRelay && preaccelSummary.verifyState === "probing") ||
       mascotState === "searching"
     ) {
       return "searching";
@@ -1964,7 +1979,7 @@ export function CapsuleWindow() {
         ? `${DOCK_EDGE_LABELS[dockEdge]}中 · 拖离边缘或点解除钮取消贴边`
         : `Docked (${dockEdge}) · Drag away or click undock`
       : preaccelSummary.enabled
-        ? `${isZh ? preaccelSummary.detailText : statusMeta.label}${themeMeta.autoSuffix}`
+        ? `${preaccelSummary.detailText}${themeMeta.autoSuffix}`
         : isZh
           ? `拖动可移动，拖出屏幕边缘松手自动收起 · ${themeMeta.label}${themeMeta.autoSuffix}`
           : `Drag to move; drop past edge to dock · ${themeMeta.label}${themeMeta.autoSuffix}`,
@@ -2007,8 +2022,8 @@ export function CapsuleWindow() {
       }
     : preaccelSummary.enabled
       ? {
-          title: `${dict.home.preaccel} (${statusMeta.label})`,
-          desc: isZh ? preaccelSummary.detailText : "Click to disable domestic boost",
+          title: `${dict.home.preaccel} (${hasEnabledRelay ? statusMeta.label : preaccelSummary.badgeText})`,
+          desc: preaccelSummary.detailText,
           placement: "full",
         }
       : {
@@ -2062,8 +2077,9 @@ export function CapsuleWindow() {
       : "h-[25px] w-[25px]";
   const shellRadiusClass = isTallLayout ? "rounded-[24px]" : "rounded-full";
 
+  const isPreAccelVisuallyOn = preaccelSummary.enabled && hasEnabledRelay;
   const isPreAccelSolidGold =
-    preaccelSummary.enabled &&
+    isPreAccelVisuallyOn &&
     preaccelSummary.tone !== "amber" &&
     (preaccelSummary.proxyActive || preaccelSummary.realWinDivertActive);
   const isFullHintActive = hoveredHint?.placement === "full";
@@ -2420,21 +2436,22 @@ export function CapsuleWindow() {
           className={`inline-flex cursor-pointer items-center justify-center rounded-full border transition-colors disabled:opacity-60 ${btnDimClass} ${
             isPreAccelSolidGold
               ? "border-[var(--amber)] bg-[var(--amber-soft)] text-[var(--amber)] shadow-[0_0_0_1px_rgba(231,184,110,0.28)]"
-              : preaccelSummary.enabled
+              : isPreAccelVisuallyOn
                 ? "border-[var(--accent)]/75 bg-[var(--accent-soft)] text-[var(--accent)]"
                 : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:border-[var(--accent)] hover:text-[var(--text)]"
           }`}
         >
           {togglingPreAccel ||
-          preaccelSummary.installState === "downloading" ||
-          preaccelSummary.installState === "verifying" ||
-          preaccelSummary.verifyState === "probing" ? (
+          (isPreAccelVisuallyOn &&
+            (preaccelSummary.installState === "downloading" ||
+              preaccelSummary.installState === "verifying" ||
+              preaccelSummary.verifyState === "probing")) ? (
             <Loader2 className="h-3 w-3 animate-spin" />
           ) : (
             <Zap
               className="h-3 w-3"
               fill={isPreAccelSolidGold ? "currentColor" : "none"}
-              strokeWidth={preaccelSummary.enabled ? 2.2 : 1.9}
+              strokeWidth={isPreAccelVisuallyOn ? 2.2 : 1.9}
             />
           )}
         </button>
@@ -2511,13 +2528,22 @@ export function CapsuleWindow() {
         : `↑${formatCompactRate(peakUp).replace("/s", "")}`;
     }
     if (statusMeta.badge) return statusMeta.badge.label;
-    if (preaccelSummary.proxyActive && preaccelSummary.enabled) return dict.nav.preaccelActiveBadge;
-    if (!preaccelSummary.proxyActive && preaccelSummary.realWinDivertActive) {
+    if (
+      preaccelSummary.proxyActive &&
+      isPreAccelVisuallyOn &&
+      preaccelSummary.tone === "green"
+    ) {
+      return dict.nav.preaccelActiveBadge;
+    }
+    if (!preaccelSummary.proxyActive && isPreAccelVisuallyOn && preaccelSummary.realWinDivertActive) {
       return preaccelSummary.verifyState === "probing"
         ? dict.nav.preaccelProbingBadge
         : dict.nav.preaccelActiveBadge;
     }
     if (!preaccelSummary.proxyActive && preaccelSummary.enabled) {
+      if (!hasEnabledRelay) {
+        return dict.common.off;
+      }
       if (
         preaccelSummary.installState === "downloading" ||
         preaccelSummary.installState === "verifying"
@@ -2643,7 +2669,12 @@ export function CapsuleWindow() {
                 : "Needs admin"
               : dict.common.off}{" "}
           ·{" "}
-          {dict.home.preaccel}: {preaccelSummary.enabled ? dict.common.on : dict.common.off}
+          {dict.home.preaccel}:{" "}
+          {preaccelSummary.enabled
+            ? hasEnabledRelay
+              ? dict.common.on
+              : preaccelSummary.badgeText
+            : dict.common.off}
         </div>
       </div>
 

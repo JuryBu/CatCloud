@@ -676,16 +676,20 @@ fn format_preaccel_submenu_title(preaccel: &TrayPreAccelSummary) -> String {
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let mode_label = preaccel.global_mode_label.as_deref().map(str::trim);
+    let is_no_relay = mode_label == Some("no_relay");
     let unified_on = preaccel.enabled || preaccel.global_enabled || preaccel.global_running;
     let verify_state = preaccel.global_preaccel_verify_state.trim();
     let status_tag = if !unified_on {
         "已关闭".to_string()
+    } else if is_no_relay {
+        "待添加提速线路".to_string()
     } else if verify_state == "degraded" {
         "已保护回退（请查看国内提速环境放行指引）".to_string()
     } else if verify_state == "probing" {
         "探测链路中…".to_string()
     } else {
-        match preaccel.global_mode_label.as_deref().map(str::trim) {
+        match mode_label {
             Some("dual") => match preaccel.global_preaccel_verify_ms {
                 Some(ms) if verify_state == "verified" => {
                     format!("已开启·猫云+其它软件 · {ms} ms")
@@ -708,7 +712,7 @@ fn format_preaccel_submenu_title(preaccel: &TrayPreAccelSummary) -> String {
     };
 
     match active_suffix {
-        Some(label) if unified_on && verify_state != "degraded" => {
+        Some(label) if unified_on && !is_no_relay && verify_state != "degraded" => {
             format!("国内提速 ({status_tag} · {label})")
         }
         _ => format!("国内提速 ({status_tag})"),
@@ -842,8 +846,14 @@ pub fn build_tray_menu<R: Runtime>(
     // Domestic Pre-Acceleration submenu (single unified toggle across the entire app)
     let preaccel_title = format_preaccel_submenu_title(&state.preaccel);
     let preaccel_submenu = Submenu::new(app, preaccel_title, true)?;
-    let preaccel_unified_checked =
-        state.preaccel.enabled || state.preaccel.global_enabled || state.preaccel.global_running;
+    let preaccel_no_relay = state
+        .preaccel
+        .global_mode_label
+        .as_deref()
+        .map(str::trim)
+        == Some("no_relay");
+    let preaccel_unified_checked = !preaccel_no_relay
+        && (state.preaccel.enabled || state.preaccel.global_enabled || state.preaccel.global_running);
     let preaccel_toggle = CheckMenuItem::with_id(
         app,
         menu_id::PREACCEL_TOGGLE,
@@ -1065,7 +1075,8 @@ pub fn handle_builtin_tray_action<R: Runtime>(app: &AppHandle<R>, action: &TrayA
             if crate::lifecycle::is_windowless_mode(app) {
                 crate::lifecycle::show_or_rebuild_main_window(app);
             } else {
-                crate::lifecycle::enter_pure_windowless_mode(app);
+                crate::lifecycle::destroy_capsule_window(app);
+                crate::lifecycle::hide_or_enter_windowless_main_window(app);
             }
             true
         }
@@ -1131,9 +1142,8 @@ where
                     .unwrap_or_default();
                 match click {
                     TrayClickAction::ToggleMain => {
-                        let snap = crate::lifecycle::window_mode_snapshot(app_handle);
-                        if snap.main_open {
-                            crate::lifecycle::enter_windowless_mode(app_handle);
+                        if crate::lifecycle::is_main_window_visible(app_handle) {
+                            crate::lifecycle::hide_or_enter_windowless_main_window(app_handle);
                         } else {
                             crate::lifecycle::show_or_rebuild_main_window(app_handle);
                         }
@@ -1657,5 +1667,36 @@ mod tests {
             ..Default::default()
         };
         assert!(busy_info.format_tooltip().contains("状态: 测速进行中…"));
+    }
+
+    #[test]
+    fn stage23_preaccel_no_relay_never_reports_false_standby_or_enabled() {
+        let no_relay = TrayPreAccelSummary {
+            enabled: true,
+            active_label: Some("残留标签".into()),
+            global_enabled: true,
+            global_running: false,
+            global_mode_label: Some("no_relay".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_preaccel_submenu_title(&no_relay),
+            "国内提速 (待添加提速线路)"
+        );
+
+        let closed = TrayPreAccelSummary::default();
+        assert_eq!(format_preaccel_submenu_title(&closed), "国内提速 (已关闭)");
+
+        let runtime = TrayRuntimeState::new(
+            TrayMenuState::default(),
+            (TrayIconPack::A, TrayHealthState::Idle),
+            "CatCloud".into(),
+            TrayClickAction::ToggleMain,
+        );
+        let no_relay_menu = TrayMenuState {
+            preaccel: no_relay,
+            ..Default::default()
+        };
+        assert!(runtime.should_rebuild_menu(&no_relay_menu));
     }
 }

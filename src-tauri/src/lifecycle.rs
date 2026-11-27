@@ -1,6 +1,8 @@
 use std::path::{Component, Path};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+#[cfg(target_os = "windows")]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use catcloud_core::AppPaths;
@@ -396,8 +398,7 @@ fn emit_window_mode_changed<R: Runtime>(app: &AppHandle<R>) {
 
 #[cfg(target_os = "macos")]
 fn sync_macos_activation_policy<R: Runtime>(app: &AppHandle<R>) {
-    let snapshot = window_mode_snapshot(app);
-    let policy = if snapshot.main_open {
+    let policy = if is_main_window_visible(app) {
         tauri::ActivationPolicy::Regular
     } else {
         tauri::ActivationPolicy::Accessory
@@ -442,10 +443,11 @@ pub fn show_or_rebuild_main_window<R: Runtime>(app: &AppHandle<R>) {
     tauri::async_runtime::spawn(async move {
         if !DESTROYING_MAIN.load(Ordering::SeqCst) {
             if let Some(win) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = win.unminimize();
                 let _ = win.show();
+                let _ = win.unminimize();
                 let _ = win.set_focus();
                 sync_macos_activation_policy(&app_handle);
+                emit_window_mode_changed(&app_handle);
                 return;
             }
         }
@@ -465,10 +467,11 @@ pub fn show_or_rebuild_main_window<R: Runtime>(app: &AppHandle<R>) {
 
         // Re-check after settling in case another caller restored the window.
         if let Some(win) = app_handle.get_webview_window(MAIN_WINDOW_LABEL) {
-            let _ = win.unminimize();
             let _ = win.show();
+            let _ = win.unminimize();
             let _ = win.set_focus();
             sync_macos_activation_policy(&app_handle);
+            emit_window_mode_changed(&app_handle);
             return;
         }
 
@@ -499,7 +502,9 @@ pub fn show_or_rebuild_main_window<R: Runtime>(app: &AppHandle<R>) {
         match build_res {
             Ok(win) => {
                 let _ = win.show();
+                let _ = win.unminimize();
                 let _ = win.set_focus();
+                sync_macos_activation_policy(&app_handle);
                 emit_window_mode_changed(&app_handle);
             }
             Err(err) => {
@@ -528,6 +533,66 @@ fn schedule_destroy_flag_clear<R: Runtime>(
             trim_process_working_set_throttled();
         }
     });
+}
+
+/// Pure decision helper classifying how tray left-click or global hotkey toggles should transition
+/// the main window without ever destroying an active background task WebView.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainWindowToggleAction {
+    ShowOrRebuild,
+    HidePreservingTasks,
+    EnterWindowless,
+}
+
+/// Resolve the main-window toggle transition from visibility and active-task flags:
+/// - Hidden, minimized, or destroyed -> always `ShowOrRebuild`.
+/// - Visible & unminimized with active background tasks -> `HidePreservingTasks` (never destroy).
+/// - Visible & unminimized while idle -> `EnterWindowless`.
+#[inline]
+pub const fn resolve_main_window_toggle_action(
+    is_visible_and_unminimized: bool,
+    has_active_bg_tasks: bool,
+) -> MainWindowToggleAction {
+    if !is_visible_and_unminimized {
+        MainWindowToggleAction::ShowOrRebuild
+    } else if has_active_bg_tasks {
+        MainWindowToggleAction::HidePreservingTasks
+    } else {
+        MainWindowToggleAction::EnterWindowless
+    }
+}
+
+/// Return `true` when any background task (isolated speed/latency probe, WinDivert installation,
+/// live capture session, or subscription refresh) is actively running and requires keeping the
+/// main WebView alive rather than destroying it.
+pub fn has_active_background_tasks<R: Runtime>(app: &AppHandle<R>) -> bool {
+    app.try_state::<crate::commands::AppState>()
+        .map(|st| {
+            st.probe_running.load(Ordering::SeqCst)
+                || st.windivert_installing.load(Ordering::SeqCst)
+                || st.live_capture.has_active_session()
+                || st
+                    .refreshing_sub_ids
+                    .lock()
+                    .map(|g| !g.is_empty())
+                    .unwrap_or(false)
+        })
+        .unwrap_or(false)
+}
+
+/// Hide the main window without destroying it whenever background tasks are running; otherwise
+/// destroy the main WebView via `enter_windowless_mode` to reclaim memory.
+pub fn hide_or_enter_windowless_main_window<R: Runtime>(app: &AppHandle<R>) {
+    if has_active_background_tasks(app) {
+        if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+            let _ = win.hide();
+        }
+        sync_macos_activation_policy(app);
+        emit_window_mode_changed(app);
+        trim_process_working_set_throttled();
+    } else {
+        enter_windowless_mode(app);
+    }
 }
 
 /// Destroy the main WebView window completely so Windows releases `msedgewebview2.exe`
@@ -873,20 +938,7 @@ pub fn handle_window_event<R: Runtime>(
             MAIN_WINDOW_LABEL if destroy_on_close => {
                 api.prevent_close();
                 let app = window.app_handle().clone();
-                let has_bg = app
-                    .try_state::<crate::commands::AppState>()
-                    .map(|st| {
-                        st.probe_running.load(Ordering::SeqCst)
-                            || st.windivert_installing.load(Ordering::SeqCst)
-                            || st.live_capture.has_active_session()
-                            || st
-                                .refreshing_sub_ids
-                                .lock()
-                                .map(|g| !g.is_empty())
-                                .unwrap_or(false)
-                    })
-                    .unwrap_or(false);
-                if has_bg {
+                if has_active_background_tasks(&app) {
                     let _ = window.hide();
                     sync_macos_activation_policy(&app);
                     emit_window_mode_changed(&app);
@@ -1584,5 +1636,28 @@ mod tests {
             let _ = DestroyWindow(hwnd);
             let _ = UnregisterClassW(class_name.as_ptr(), hinstance);
         }
+    }
+
+    #[test]
+    fn stage23_main_window_toggle_restores_hidden_and_protects_background_tasks() {
+        // Hidden or minimized window MUST restore regardless of background task state (never destroy).
+        assert_eq!(
+            resolve_main_window_toggle_action(false, true),
+            MainWindowToggleAction::ShowOrRebuild
+        );
+        assert_eq!(
+            resolve_main_window_toggle_action(false, false),
+            MainWindowToggleAction::ShowOrRebuild
+        );
+        // Visible & unminimized window with active background tasks MUST hide instead of destroy.
+        assert_eq!(
+            resolve_main_window_toggle_action(true, true),
+            MainWindowToggleAction::HidePreservingTasks
+        );
+        // Visible & unminimized window with no background tasks enters low-memory windowless mode.
+        assert_eq!(
+            resolve_main_window_toggle_action(true, false),
+            MainWindowToggleAction::EnterWindowless
+        );
     }
 }

@@ -35,6 +35,7 @@ import { MascotSprite } from "./MascotSprite";
 import { TrafficSparkline } from "./TrafficSparkline";
 import { resolvePlatformOs } from "../utils/platform";
 import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
+import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 
 const TunAdminPromptModal = lazy(() =>
   import("./TunAdminPromptModal").then((m) => ({ default: m.TunAdminPromptModal }))
@@ -53,15 +54,18 @@ export const NAV_ITEMS: readonly NavItemSpec[] = [
   { id: "nodes", section: "network", label: "节点与测速", shortDesc: "节点管理、订阅导入与测速", icon: Globe },
   { id: "groups", section: "network", label: "智能多选组", shortDesc: "路线分组与自动优选", icon: Layers },
   { id: "preaccel", section: "network", label: "国内提速", shortDesc: "国内中转与稳连加速", icon: Zap },
-  { id: "ai", section: "ai", label: "AI 全权代管", shortDesc: "全自动代配与一键排障", icon: Bot },
+  { id: "ai", section: "ai", label: "AI 帮手", shortDesc: "不会配？点这里帮你搞定", icon: Bot },
+  { id: "settings", section: "assist", label: "设置", shortDesc: "外观、启动与偏好", icon: SlidersHorizontal },
   { id: "rules", section: "assist", label: "分流与连接", shortDesc: "网站分流与当前连接", icon: Network },
   { id: "logs", section: "assist", label: "运行日志", shortDesc: "查看内核运行记录", icon: ScrollText },
-  { id: "settings", section: "assist", label: "设置", shortDesc: "外观、启动与偏好", icon: SlidersHorizontal },
 ] as const;
 
 const NETWORK_NAV_ITEMS = NAV_ITEMS.filter((item) => item.section === "network");
 const AI_NAV_ITEM = NAV_ITEMS.find((item) => item.id === "ai")!;
-const ASSIST_NAV_ITEMS = NAV_ITEMS.filter((item) => item.section === "assist");
+const SETTINGS_NAV_ITEM = NAV_ITEMS.find((item) => item.id === "settings")!;
+const MORE_TOOLS_NAV_ITEMS = NAV_ITEMS.filter(
+  (item) => item.id === "rules" || item.id === "logs"
+);
 
 const THEME_BUTTON_LABELS_I18N: Record<UiLanguage, Record<ThemeMode, string>> = {
   "zh-CN": {
@@ -134,55 +138,79 @@ const PROXY_MODES: ReadonlyArray<{ id: ProxyMode; label: string; hint: string }>
   { id: "direct", label: "直连", hint: "全部流量直接连接" },
 ];
 
-function resolveStatusLabel(status: string, preaccel: PreAccelSummary): string {
-  if (status === "error") return "核心异常";
-  if (status === "warn") return "路线存在波动";
-  if (preaccel.proxyActive) {
-    if (preaccel.enabled) {
-      if (preaccel.suspendedForTun) {
-        return "主内核虚拟网卡提速中（独立 443 通道已自动暂停）";
-      }
-      if (preaccel.realWinDivertActive) {
-        if (preaccel.verifyState === "probing") {
-          return "国内提速中（探测其它软件链路…）";
-        }
-        if (preaccel.verifyState === "verified" && preaccel.verifyLatencyMs) {
-          return `主内核 + 独立底层提速中（${preaccel.verifyLatencyMs} ms）`;
-        }
-        return "主内核 + 独立底层提速中";
-      }
-      if (preaccel.verifyState === "degraded") {
-        return "主内核代理提速中（其它软件已保护回退）";
-      }
-      return "主内核代理提速中";
-    }
-    return "代理运行中";
+const SIDEBAR_STATUS_COPY: Record<
+  UiLanguage,
+  {
+    error: string;
+    warn: string;
+    proxyActive: string;
+    standby: string;
+    noRelayBadge: string;
+    preparingBadge: string;
+    needAdminBadge: string;
   }
-  if (preaccel.realWinDivertActive) {
-    if (preaccel.verifyState === "probing") return "正在探测链路…";
-    if (preaccel.verifyState === "verified") {
-      return preaccel.verifyLatencyMs
-        ? `已探测畅通（${preaccel.verifyLatencyMs} ms）`
-        : "已探测畅通";
+> = {
+  "zh-CN": {
+    error: "核心异常",
+    warn: "路线存在波动",
+    proxyActive: "代理运行中",
+    standby: "待命状态",
+    noRelayBadge: "待加线",
+    preparingBadge: "准备中",
+    needAdminBadge: "需提权",
+  },
+  en: {
+    error: "Core Error",
+    warn: "Route Fluctuating",
+    proxyActive: "Proxy Active",
+    standby: "Standby",
+    noRelayBadge: "No Relay",
+    preparingBadge: "Setup",
+    needAdminBadge: "Admin",
+  },
+  ja: {
+    error: "コア異常",
+    warn: "回線が不安定",
+    proxyActive: "プロキシ稼働中",
+    standby: "待機中",
+    noRelayBadge: "回線なし",
+    preparingBadge: "準備中",
+    needAdminBadge: "権限要",
+  },
+  ru: {
+    error: "Ошибка ядра",
+    warn: "Нестабильный маршрут",
+    proxyActive: "Прокси активен",
+    standby: "Ожидание",
+    noRelayBadge: "Нет реле",
+    preparingBadge: "Подгот.",
+    needAdminBadge: "Админ",
+  },
+};
+
+function resolveStatusLabel(
+  status: string,
+  preaccel: PreAccelSummary,
+  hasEnabledRelay: boolean,
+  uiLang: UiLanguage
+): string {
+  const copy = SIDEBAR_STATUS_COPY[uiLang];
+  if (status === "error") return copy.error;
+  if (status === "warn") return copy.warn;
+  if (preaccel.proxyActive) {
+    if (preaccel.enabled && hasEnabledRelay && preaccel.tone === "green") {
+      return preaccel.subBadgeText
+        ? `${preaccel.badgeText} · ${preaccel.subBadgeText}`
+        : preaccel.badgeText;
     }
-    return "全局提速中";
+    return copy.proxyActive;
   }
   if (preaccel.enabled) {
-    if (preaccel.installState === "downloading" || preaccel.installState === "verifying") {
-      return "正在准备提速组件…";
-    }
-    if (preaccel.installState === "need_elevation") {
-      return "国内提速需管理员权限";
-    }
-    if (preaccel.verifyState === "probing") {
-      return "正在探测链路…";
-    }
-    if (preaccel.verifyState === "degraded") {
-      return "已自动保护回退";
-    }
-    return "本地通道待命";
+    return preaccel.subBadgeText
+      ? `${preaccel.badgeText} · ${preaccel.subBadgeText}`
+      : preaccel.badgeText;
   }
-  return "待命状态";
+  return copy.standby;
 }
 
 export function Sidebar() {
@@ -198,6 +226,9 @@ export function Sidebar() {
   const isZh = uiLang === "zh-CN";
   const mascotState = useAppSelector((s) => s.mascotState);
   const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
+  const hasEnabledRelay = useAppSelector((s) =>
+    s.preAccelRelays.some((r) => r.enabled)
+  );
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
@@ -212,6 +243,40 @@ export function Sidebar() {
   const tunAdminPromptOpen = useAppSelector((s) => s.tunAdminPromptOpen);
   const pendingUpdate = useAppSelector((s) => s.pendingUpdate);
   const updateMode = useAppSelector((s) => s.config.update.mode);
+
+  const [moreToolsOpen, setMoreToolsOpen] = usePersistedState<boolean>(
+    "sidebar.moreToolsOpen",
+    false,
+    isBoolPref
+  );
+  const isMoreToolsRoute = activeNav === "rules" || activeNav === "logs";
+  const [moreToolsTempReveal, setMoreToolsTempReveal] = useState<boolean>(
+    () => isMoreToolsRoute
+  );
+
+  useEffect(() => {
+    setMoreToolsTempReveal(isMoreToolsRoute);
+  }, [isMoreToolsRoute]);
+
+  const isMoreToolsExpanded = moreToolsOpen || moreToolsTempReveal;
+  const handleToggleMoreTools = () => {
+    if (isMoreToolsExpanded) {
+      setMoreToolsTempReveal(false);
+      if (moreToolsOpen) {
+        setMoreToolsOpen(false);
+      }
+    } else {
+      setMoreToolsOpen(true);
+    }
+  };
+
+  const hasDnsDiagAlert = Boolean(
+    runtime.dns_tls_diagnostics && runtime.dns_tls_diagnostics.status !== "healthy"
+  );
+  const hasMoreToolsAlert = runtime.status === "error" || hasDnsDiagAlert;
+  const isMoreToolsAlertSevere =
+    runtime.status === "error" ||
+    runtime.dns_tls_diagnostics?.status === "cert_verification_failed";
 
   const isNextLaunchSilentBadge = Boolean(
     pendingUpdate &&
@@ -237,8 +302,12 @@ export function Sidebar() {
   const preaccelSummary = resolvePreAccelSummary(
     runtime,
     globalPreAccel,
-    preAccelEnabledConfig
+    preAccelEnabledConfig,
+    hasEnabledRelay,
+    uiLang
   );
+  const statusCopy = SIDEBAR_STATUS_COPY[uiLang];
+  const preaccelWithRelay = preaccelSummary.enabled && hasEnabledRelay;
 
   useEffect(() => {
     return () => {
@@ -261,7 +330,7 @@ export function Sidebar() {
         : runtime.switching_active
           ? "thinking"
           : localPetting
-            ? preaccelSummary.enabled
+            ? preaccelWithRelay
               ? "complete"
               : "thinking"
             : mascotState;
@@ -270,10 +339,10 @@ export function Sidebar() {
     effectiveBrandMascotState !== "idle"
       ? dict.mascot[effectiveBrandMascotState]
       : preaccelSummary.proxyActive
-        ? preaccelSummary.enabled
+        ? preaccelWithRelay && preaccelSummary.tone === "green"
           ? dict.mascot.preaccel
           : dict.mascot.ok
-        : preaccelSummary.realWinDivertActive
+        : preaccelWithRelay && preaccelSummary.realWinDivertActive
           ? dict.mascot.preaccel
           : dict.mascot.idle;
   const brandMascotTitle = `${dict.common.appName} · ${brandMascotStatusText}`;
@@ -282,7 +351,19 @@ export function Sidebar() {
     if (!preaccelSummary.enabled && !preaccelSummary.realWinDivertActive) {
       return null;
     }
+    if (!hasEnabledRelay) {
+      return {
+        label: statusCopy.noRelayBadge,
+        cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+      };
+    }
     if (preaccelSummary.proxyActive) {
+      if (preaccelSummary.tone === "amber") {
+        return {
+          label: statusCopy.noRelayBadge,
+          cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
+        };
+      }
       return {
         label: dict.nav.preaccelActiveBadge,
         cls: "bg-[var(--accent-soft)] text-[var(--accent)]",
@@ -311,13 +392,13 @@ export function Sidebar() {
       preaccelSummary.installState === "verifying"
     ) {
       return {
-        label: isZh ? "准备中" : dict.common.loading,
+        label: statusCopy.preparingBadge,
         cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
       };
     }
     if (preaccelSummary.installState === "need_elevation") {
       return {
-        label: isZh ? "需提权" : dict.mascot.approval,
+        label: statusCopy.needAdminBadge,
         cls: "bg-[var(--amber-soft)] text-[var(--amber)]",
       };
     }
@@ -364,21 +445,26 @@ export function Sidebar() {
       ? "var(--red)"
       : runtime.status === "warn"
         ? "var(--amber)"
-        : preaccelSummary.proxyActive && preaccelSummary.enabled
+        : preaccelSummary.proxyActive && preaccelWithRelay && preaccelSummary.tone === "green"
           ? "var(--accent)"
-          : preaccelSummary.realWinDivertActive
+          : preaccelWithRelay && preaccelSummary.realWinDivertActive
             ? preaccelSummary.verifyState === "probing"
               ? "var(--amber)"
               : preaccelSummary.verifyState === "verified"
                 ? "var(--green)"
                 : "var(--accent)"
-            : preaccelSummary.enabled
-              ? "var(--amber)"
-              : preaccelSummary.proxyActive
-                ? "var(--green)"
+            : preaccelSummary.proxyActive
+              ? "var(--green)"
+              : preaccelWithRelay
+                ? "var(--amber)"
                 : "var(--muted)";
 
-  const statusLabel = resolveStatusLabel(runtime.status, preaccelSummary);
+  const statusLabel = resolveStatusLabel(
+    runtime.status,
+    preaccelSummary,
+    hasEnabledRelay,
+    uiLang
+  );
 
   const tunButtonHint =
     platformOs === "linux"
@@ -813,7 +899,7 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* Grouped 8-item primary navigation: Network (4) + Mid-Focus AI Autopilot Card (1) + Advanced & Config (3) */}
+      {/* 6 Permanent Primary Nav Items (Network 4 + AI Helper 1 + Settings 1) + Collapsible More Tools (Rules & Logs) */}
       <nav className="min-h-0 flex-1 overflow-y-auto pr-0.5" aria-label={dict.nav.sectionNetwork}>
         <div className="mb-1 px-2.5 text-[10px] font-medium tracking-wide text-[var(--muted)]/85">
           {dict.nav.sectionNetwork}
@@ -822,8 +908,8 @@ export function Sidebar() {
           {NETWORK_NAV_ITEMS.map((item) => renderNavButton(item))}
         </div>
 
-        {/* Highlighted Mid-Level Warm-Gold AI Autopilot Card (instant 1-second visibility) */}
-        <div className="my-2.5">
+        {/* Highlighted Mid-Level Warm-Gold AI Helper Card (instant 1-second visibility) */}
+        <div className="my-2">
           <button
             type="button"
             onClick={() => appActions.setNav(AI_NAV_ITEM.id)}
@@ -865,11 +951,64 @@ export function Sidebar() {
           </button>
         </div>
 
-        <div className="mb-1 px-2.5 text-[10px] font-medium tracking-wide text-[var(--muted)]/85">
-          {dict.nav.sectionAssist}
-        </div>
+        {/* 6th Permanent Primary Nav Item: Settings */}
         <div className="space-y-0.5">
-          {ASSIST_NAV_ITEMS.map((item) => renderNavButton(item))}
+          {renderNavButton(SETTINGS_NAV_ITEM)}
+        </div>
+
+        {/* Collapsible More Tools Group (Rules & Logs, collapsed by default) */}
+        <div className="mt-2 border-t border-[var(--line)]/60 pt-1.5">
+          <button
+            type="button"
+            onClick={handleToggleMoreTools}
+            aria-expanded={isMoreToolsExpanded}
+            title={hasMoreToolsAlert ? dict.nav.moreToolsAlertTip : dict.nav.moreTools}
+            className={`group relative flex w-full items-center justify-between gap-2 rounded-xl px-2.5 py-1.5 text-left text-[11.5px] font-medium transition-colors ${
+              isMoreToolsRoute && !isMoreToolsExpanded
+                ? "bg-[var(--accent-soft)]/80 font-semibold text-[var(--text)]"
+                : "text-[var(--muted)] hover:bg-[var(--card)] hover:text-[var(--text)]"
+            }`}
+          >
+            {isMoreToolsRoute && !isMoreToolsExpanded && (
+              <span
+                className="absolute left-0 top-1/2 h-3.5 w-[3px] -translate-y-1/2 rounded-r-full bg-[var(--accent)]"
+                aria-hidden="true"
+              />
+            )}
+            <span className="flex min-w-0 items-center gap-1.5">
+              <span className="truncate">{dict.nav.moreTools}</span>
+              {isMoreToolsRoute && !isMoreToolsExpanded && (
+                <span className="truncate rounded-md bg-[var(--surface)]/85 px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]">
+                  {resolveNavLabel(activeNav)}
+                </span>
+              )}
+            </span>
+            <span className="flex shrink-0 items-center gap-1.5">
+              {hasMoreToolsAlert && (
+                <span
+                  className={`cc-pulse-dot h-2 w-2 shrink-0 rounded-full ${
+                    isMoreToolsAlertSevere
+                      ? "bg-[var(--red)] ring-2 ring-[var(--red-soft)]"
+                      : "bg-[var(--amber)] ring-2 ring-[var(--amber-soft)]"
+                  }`}
+                  title={dict.nav.moreToolsAlertTip}
+                  aria-label={dict.nav.moreToolsAlertTip}
+                />
+              )}
+              <ChevronDown
+                className={`h-3.5 w-3.5 shrink-0 opacity-75 transition-transform ${
+                  isMoreToolsExpanded ? "rotate-180" : ""
+                }`}
+                aria-hidden="true"
+              />
+            </span>
+          </button>
+
+          {isMoreToolsExpanded && (
+            <div className="mt-0.5 space-y-0.5 pl-1">
+              {MORE_TOOLS_NAV_ITEMS.map((item) => renderNavButton(item))}
+            </div>
+          )}
         </div>
       </nav>
 

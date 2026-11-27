@@ -44,7 +44,10 @@ use catcloud_core::probe::{
     ThroughputProbeConfig, build_isolated_http_client, run_download_probe_with_config,
     run_funnel_for_node, run_latency_probe, run_upload_probe_with_config,
 };
-use catcloud_core::process_guard::JobGuard;
+use catcloud_core::process_guard::{
+    ConfigReloadWaitOutcome, JobGuard, is_primary_instance_alive,
+    signal_config_reload_and_wait_outcome, signal_config_reload_for_data_dir,
+};
 use catcloud_core::sanitize::{
     redact_compiled_yaml, redact_ip_or_host, redact_node_for_readonly, redact_path_for_display,
     redact_relay_for_readonly, sanitize_json_value, sanitize_log_line,
@@ -112,6 +115,8 @@ impl std::error::Error for AlreadyEmittedJsonError {}
 pub enum Commands {
     /// Print core runtime status, data paths, and storage counts
     Status,
+    /// Trigger live hot-reload on the running CatCloud desktop app (falling back to direct core reload)
+    Reload(ReloadArgs),
     /// Manage multi-provider proxy nodes, imports, readonly migrations, and process attachment
     Node {
         #[command(subcommand)]
@@ -685,15 +690,25 @@ pub enum PreaccelCommand {
     GlobalStatus,
 }
 
+#[derive(Args, Debug, Clone, Default)]
+pub struct ReloadArgs {
+    /// Validate candidate runtime.yaml without writing or signaling the running instance
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Force recompilation and reload even if configuration fingerprint appears unchanged
+    #[arg(long)]
+    pub force: bool,
+    /// Allow L3 core restart (listening ports / TUN / core runtime changes) when handled by desktop
+    #[arg(long)]
+    pub allow_restart: bool,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum ConfigCommand {
     /// Validate config.json, compiled Mihomo YAML, and anti-loop preflight checks
     Validate,
-    /// Validate, write runtime.yaml (with mihomo -t when available), and hot-reload live controller
-    Reload {
-        #[arg(long)]
-        dry_run: bool,
-    },
+    /// Validate, write runtime.yaml (with mihomo -t when available), and hot-reload live instance
+    Reload(ReloadArgs),
     /// Print or export compiled Mihomo YAML (redacted by default)
     Compile {
         #[arg(long)]
@@ -926,6 +941,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             emit_output(as_json, &out, &human)
         }
 
+        Commands::Reload(args) => execute_config_reload(paths, as_json, args).await,
+
         Commands::Node { action } => match action {
             NodeCommand::List(args) => {
                 let db = open_storage(paths)?;
@@ -1007,11 +1024,15 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 };
                 let count = parsed.nodes.len();
                 apply_parsed_subscription(&mut db, &sub_rec, &parsed)?;
+                let _ = db.ensure_default_group_if_empty();
+                drop(db);
+                let live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
                 let out = json!({
                     "ok": true,
                     "sub_id": args.sub_id,
                     "imported_nodes": count,
                     "format": format!("{:?}", parsed.format),
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -1068,11 +1089,18 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             reports.push(rep);
                         }
                     }
+                    drop(db);
+                    let live_reload_signaled = if !reports.is_empty() {
+                        signal_config_reload_for_data_dir(&paths.root_data_dir)
+                    } else {
+                        false
+                    };
                     let out = json!({
                         "ok": true,
                         "sanitized": true,
                         "applied": true,
-                        "reports": reports
+                        "reports": reports,
+                        "live_reload_signaled": live_reload_signaled,
                     });
                     emit_output(as_json, &out, &format!("Applied {} migration(s).", reports.len()))
                 } else {
@@ -1196,6 +1224,9 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         .get_subscription(&single_id)?
                         .with_context(|| format!("subscription `{single_id}` not found"))?;
                     let res = refresh_single_subscription(&mut db, &sub, &proxy_candidates).await?;
+                    drop(db);
+                    let live_reload_signaled =
+                        signal_config_reload_for_data_dir(&paths.root_data_dir);
                     let out = json!({
                         "ok": true,
                         "sanitized": true,
@@ -1203,6 +1234,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         "name": sub.name,
                         "imported_nodes": res.node_count,
                         "format": res.format,
+                        "live_reload_signaled": live_reload_signaled,
                     });
                     emit_output(
                         as_json,
@@ -1258,6 +1290,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         }
                     }
 
+                    drop(db);
+                    let live_reload_signaled = if refreshed > 0 || failed > 0 {
+                        signal_config_reload_for_data_dir(&paths.root_data_dir)
+                    } else {
+                        false
+                    };
                     let out = json!({
                         "ok": failed == 0,
                         "sanitized": true,
@@ -1266,6 +1304,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         "skipped": skipped,
                         "failed": failed,
                         "results": results,
+                        "live_reload_signaled": live_reload_signaled,
                     });
                     let human = format!(
                         "Subscription refresh finished: refreshed={refreshed}, skipped={skipped}, failed={failed}."
@@ -1290,11 +1329,21 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     })?
                     .len();
                 let removed = db.delete_subscription(&sub_id)?;
+                if removed {
+                    let _ = sync_active_single_node_after_mutation(paths, &db, &HashMap::new())?;
+                }
+                drop(db);
+                let live_reload_signaled = if removed {
+                    signal_config_reload_for_data_dir(&paths.root_data_dir)
+                } else {
+                    false
+                };
                 let out = json!({
                     "ok": true,
                     "sub_id": sub_id,
                     "removed": removed,
                     "removed_nodes": if removed { existing_nodes } else { 0 },
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -1309,11 +1358,15 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
             SubCommand::Rename { sub_id, name } => {
                 let db = open_storage(paths)?;
                 let updated = db.rename_subscription(&sub_id, &name)?;
+                drop(db);
+                let live_reload_signaled =
+                    signal_config_reload_for_data_dir(&paths.root_data_dir);
                 let redacted = redact_subscription_for_readonly(&updated);
                 let out = json!({
                     "ok": true,
                     "sanitized": true,
                     "subscription": redacted,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -1332,9 +1385,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let report =
                     db.merge_subscriptions(&source, &target, name.as_deref(), !no_dedup, false)?;
                 let _ = sync_active_single_node_after_mutation(paths, &db, &report.id_remap)?;
+                drop(db);
+                let live_reload_signaled =
+                    signal_config_reload_for_data_dir(&paths.root_data_dir);
                 let out = json!({
                     "ok": true,
                     "merge": report,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -1375,14 +1432,32 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 };
                 validate_definition(&def)?;
                 db.upsert_probe_definition(&def)?;
-                let out = json!({ "ok": true, "probe": def });
+                drop(db);
+                let live_reload_signaled =
+                    signal_config_reload_for_data_dir(&paths.root_data_dir);
+                let out = json!({
+                    "ok": true,
+                    "probe": def,
+                    "live_reload_signaled": live_reload_signaled,
+                });
                 emit_output(as_json, &out, &format!("Saved probe `{}`.", args.id))
             }
 
             ProbeCommand::Remove { id } => {
                 let db = open_storage(paths)?;
                 let removed = db.delete_probe_definition(&id)?;
-                let out = json!({ "ok": true, "id": id, "removed": removed });
+                drop(db);
+                let live_reload_signaled = if removed {
+                    signal_config_reload_for_data_dir(&paths.root_data_dir)
+                } else {
+                    false
+                };
+                let out = json!({
+                    "ok": true,
+                    "id": id,
+                    "removed": removed,
+                    "live_reload_signaled": live_reload_signaled,
+                });
                 emit_output(as_json, &out, &format!("Probe `{id}` removed={removed}."))
             }
 
@@ -1573,6 +1648,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
 
                 let _ = std::fs::remove_dir(&probe_temp_dir);
                 let _ = db.prune_old_probe_results(20);
+                drop(db);
+                let live_reload_signaled = if persisted_records > 0 {
+                    signal_config_reload_for_data_dir(&paths.root_data_dir)
+                } else {
+                    false
+                };
 
                 let order_map: HashMap<&str, usize> = nodes
                     .iter()
@@ -1619,6 +1700,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "persisted_records": persisted_records,
                     "snapshots": &snapshots,
                     "reports": &display_reports,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -1682,11 +1764,15 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let prev = group.active_node_id.clone();
                 group.active_node_id = Some(next_id.clone());
                 db.upsert_multi_group(&group)?;
+                drop(db);
+                let live_reload_signaled =
+                    signal_config_reload_for_data_dir(&paths.root_data_dir);
                 let out = json!({
                     "ok": true,
                     "group_id": group_id,
                     "previous_node_id": prev,
                     "active_node_id": next_id,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -1728,6 +1814,12 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     anyhow::bail!("{}", warnings.join("; "));
                 }
                 let persisted_relays = db.list_preaccel_relays(false)?;
+                drop(db);
+                let live_reload_signaled = if imported_count > 0 {
+                    signal_config_reload_for_data_dir(&paths.root_data_dir)
+                } else {
+                    false
+                };
                 let redacted_relays: Vec<PreAccelRelay> = persisted_relays
                     .iter()
                     .map(redact_relay_for_readonly)
@@ -1738,6 +1830,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "imported_relays": imported_count,
                     "warnings": warnings,
                     "relays": redacted_relays,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -1804,6 +1897,13 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 lb_strategy,
             } => {
                 let mut cfg = config::load_or_init(paths)?;
+                let db = open_storage(paths)?;
+                let enabled_relays = db.list_preaccel_relays(true)?;
+                if enabled == Some(true) && enabled_relays.is_empty() {
+                    anyhow::bail!(
+                        "NO_ENABLED_RELAY: 尚未添加或启用任何国内提速线路（当前已启用中转数为 0），请先通过 `catcloud preaccel add` 添加并启用至少一条中转后再开启提速"
+                    );
+                }
                 if let Some(en) = enabled {
                     cfg.preaccel.enabled = en;
                     cfg.preaccel.global_bypass_enabled = en;
@@ -1824,22 +1924,22 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                         cfg.preaccel.active_relay_id = None;
                     }
                 }
-                if let Ok(db) = open_storage(paths) {
-                    if let Ok(enabled_relays) = db.list_preaccel_relays(true) {
-                        let enabled_ids: HashSet<String> =
-                            enabled_relays.into_iter().map(|r| r.id).collect();
-                        let _ = config::reconcile_dangling_active_relay(&mut cfg, &enabled_ids);
-                    }
-                }
+                let enabled_ids: HashSet<String> =
+                    enabled_relays.into_iter().map(|r| r.id).collect();
+                let _ = config::reconcile_dangling_active_relay(&mut cfg, &enabled_ids);
                 if let Some(lb) = lb_strategy {
                     cfg.preaccel.lb_strategy = parse_preaccel_lb_strategy(&lb)?;
                 }
+                drop(db);
                 config::save(paths, &cfg)?;
+                let live_reload_signaled =
+                    signal_config_reload_for_data_dir(&paths.root_data_dir);
                 let sanitized_preaccel = redact_preaccel_config_for_output(&cfg.preaccel);
                 let out = json!({
                     "ok": true,
                     "sanitized": true,
                     "preaccel": sanitized_preaccel,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -2015,6 +2115,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let mut speed_results: Vec<Value> = Vec::with_capacity(relay_ports.len());
                 let mut human_lines: Vec<String> = Vec::with_capacity(relay_ports.len() + 2);
                 let mut passed_count = 0usize;
+                let mut persisted_speed_updates = 0usize;
                 let mut persist_err: Option<anyhow::Error> = None;
 
                 // Measure relays strictly one-by-one to prevent bandwidth contention.
@@ -2043,6 +2144,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                             persist_err = Some(err.into());
                             break;
                         }
+                        persisted_speed_updates += 1;
                     }
                     if sample.ok {
                         passed_count += 1;
@@ -2095,9 +2197,15 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
 
                 let _ = probe_core.shutdown().await;
                 let _ = std::fs::remove_dir(&probe_temp_dir);
+                drop(db);
                 if let Some(err) = persist_err {
                     return Err(err);
                 }
+                let live_reload_signaled = if persisted_speed_updates > 0 {
+                    signal_config_reload_for_data_dir(&paths.root_data_dir)
+                } else {
+                    false
+                };
 
                 let mode_label = if reference_node.is_some() {
                     "dual_hop"
@@ -2133,6 +2241,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "warnings": warnings,
                     "campus": campus_state,
                     "speed_test": speed_test,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 let header = match &reference_node {
                     Some(n) => format!(
@@ -2221,8 +2330,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 Ok(())
             }
 
-            ConfigCommand::Reload { dry_run } => {
-                execute_config_reload(paths, as_json, dry_run).await
+            ConfigCommand::Reload(args) => {
+                execute_config_reload(paths, as_json, args).await
             }
 
             ConfigCommand::Compile {
@@ -2303,6 +2412,8 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
 
             ConfigCommand::Restore { input } => {
                 let restored = config::import_backup(paths, &input)?;
+                let live_reload_signaled =
+                    signal_config_reload_for_data_dir(&paths.root_data_dir);
                 let display_path = redact_path_for_display(&input.to_string_lossy());
                 let out = json!({
                     "ok": true,
@@ -2314,6 +2425,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     "mixed_port": restored.mixed_port,
                     "controller_port": restored.controller_port,
                     "dns_listen_port": restored.dns_listen_port,
+                    "live_reload_signaled": live_reload_signaled,
                 });
                 emit_output(
                     as_json,
@@ -3461,6 +3573,9 @@ fn execute_share_import(paths: &AppPaths, args: ShareImportArgs) -> Result<(Valu
         0
     };
 
+    drop(db);
+    let live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
+
     let out = json!({
         "ok": true,
         "sanitized": true,
@@ -3476,6 +3591,7 @@ fn execute_share_import(paths: &AppPaths, args: ShareImportArgs) -> Result<(Valu
         "imported_groups": imported_groups_count,
         "node_update": node_update_result,
         "warnings": warnings,
+        "live_reload_signaled": live_reload_signaled,
     });
     let human = format!(
         "Imported share bundle `{}`: {} node(s), {} relay(s), {} group(s).",
@@ -4036,6 +4152,9 @@ fn execute_share_receive_from_zip_bytes(
         0
     };
 
+    drop(db);
+    let live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
+
     let out = json!({
         "ok": true,
         "sanitized": true,
@@ -4052,6 +4171,7 @@ fn execute_share_receive_from_zip_bytes(
         "imported_groups": imported_groups_count,
         "node_update": node_update_result,
         "warnings": warnings,
+        "live_reload_signaled": live_reload_signaled,
     });
     let human = format!(
         "Imported sync bundle `{}` (fp={}): {} node(s), {} relay(s), {} group(s).",
@@ -5549,11 +5669,14 @@ fn execute_group_create(paths: &AppPaths, args: GroupCreateArgs) -> Result<(Valu
     };
 
     db.upsert_multi_group(&group)?;
+    drop(db);
+    let live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
     let out = json!({
         "ok": true,
         "created": created,
         "updated": !created,
         "group": group,
+        "live_reload_signaled": live_reload_signaled,
     });
     let verb = if created { "Created" } else { "Updated" };
     Ok((out, format!("{verb} multi-group `{}`.", args.id)))
@@ -5624,6 +5747,8 @@ fn execute_group_members(paths: &AppPaths, args: GroupMembersArgs) -> Result<(Va
     }
 
     db.upsert_multi_group(&group)?;
+    drop(db);
+    let live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
     let out = json!({
         "ok": true,
         "group_id": &group.id,
@@ -5633,6 +5758,7 @@ fn execute_group_members(paths: &AppPaths, args: GroupMembersArgs) -> Result<(Va
         "member_count": group.member_node_ids.len(),
         "active_node_id": &group.active_node_id,
         "member_node_ids": &group.member_node_ids,
+        "live_reload_signaled": live_reload_signaled,
     });
     let human = format!(
         "Updated members of group `{}` (action={}, added={}, removed={}, member_count={}).",
@@ -5683,7 +5809,13 @@ fn execute_group_policy(paths: &AppPaths, args: GroupPolicyArgs) -> Result<(Valu
         }
     }
     db.upsert_multi_group(&group)?;
-    let out = json!({ "ok": true, "group": group });
+    drop(db);
+    let live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
+    let out = json!({
+        "ok": true,
+        "group": group,
+        "live_reload_signaled": live_reload_signaled,
+    });
     Ok((
         out,
         format!("Updated policy for multi-group `{}`.", args.group_id),
@@ -7275,8 +7407,107 @@ async fn run_config_reload_inner(
     Ok((true, out, human))
 }
 
-async fn execute_config_reload(paths: &AppPaths, as_json: bool, dry_run: bool) -> Result<()> {
-    let (ok, out, human) = run_config_reload_inner(paths, dry_run, None, true).await?;
+async fn run_config_reload_with_desktop_handoff(
+    paths: &AppPaths,
+    args: &ReloadArgs,
+    desktop_timeout: Duration,
+    caps_override: Option<catcloud_core::platform::PlatformCapabilities>,
+    verify_with_binary: bool,
+) -> Result<(bool, Value, String)> {
+    if !args.dry_run {
+        let data_dir = paths.root_data_dir.clone();
+        let allow_l3_restart = args.allow_restart;
+        let wait_result = tokio::task::spawn_blocking(move || {
+            let outcome =
+                signal_config_reload_and_wait_outcome(&data_dir, allow_l3_restart, desktop_timeout);
+            let desktop_alive = match &outcome {
+                ConfigReloadWaitOutcome::TimedOut { .. } => is_primary_instance_alive(&data_dir),
+                _ => false,
+            };
+            (outcome, desktop_alive)
+        })
+        .await
+        .context("failed to join desktop live hot-reload handoff task")?;
+
+        match wait_result {
+            (ConfigReloadWaitOutcome::Ack(ack), _) => {
+                let ok = ack.applied && !ack.rejected;
+                let sanitized_error = ack.error.as_deref().map(sanitize_multiline_text);
+                let mut out = json!({
+                    "ok": ok,
+                    "sanitized": true,
+                    "dry_run": false,
+                    "live_reload_signaled": true,
+                    "via": "desktop_live_hotswap",
+                    "req_id": &ack.req_id,
+                    "applied": ack.applied,
+                    "rejected": ack.rejected,
+                    "level": &ack.level,
+                    "error": &sanitized_error,
+                    "completed_at_ms": ack.completed_at_ms,
+                    "force": args.force,
+                    "allow_l3_restart": args.allow_restart,
+                });
+                sanitize_json_value(&mut out);
+                let level_label = ack.level.as_deref().unwrap_or("unknown");
+                let human = if ok {
+                    format!(
+                        "Desktop live hot-reload applied (via=desktop_live_hotswap, level={level_label}, req_id={}).",
+                        ack.req_id
+                    )
+                } else {
+                    format!(
+                        "Desktop live hot-reload rejected (via=desktop_live_hotswap, level={level_label}, error={}).",
+                        sanitized_error.as_deref().unwrap_or("rejected")
+                    )
+                };
+                return Ok((ok, out, human));
+            }
+            (ConfigReloadWaitOutcome::TimedOut { req_id }, true) => {
+                let err_msg = format!(
+                    "Desktop live hot-reload timed out after {}ms while primary desktop instance is still running (req_id={req_id}); refusing direct controller fallback to avoid concurrent core writes.",
+                    desktop_timeout.as_millis()
+                );
+                let mut out = json!({
+                    "ok": false,
+                    "sanitized": true,
+                    "dry_run": false,
+                    "live_reload_signaled": true,
+                    "via": "desktop_live_hotswap",
+                    "req_id": &req_id,
+                    "timed_out": true,
+                    "desktop_alive": true,
+                    "applied": false,
+                    "rejected": false,
+                    "error": &err_msg,
+                    "force": args.force,
+                    "allow_l3_restart": args.allow_restart,
+                });
+                sanitize_json_value(&mut out);
+                return Ok((false, out, err_msg));
+            }
+            (ConfigReloadWaitOutcome::TimedOut { .. }, false)
+            | (ConfigReloadWaitOutcome::NotRunning, _) => {}
+        }
+    }
+
+    let (ok, mut out, human) =
+        run_config_reload_inner(paths, args.dry_run, caps_override, verify_with_binary).await?;
+    if let Some(obj) = out.as_object_mut() {
+        obj.insert("live_reload_signaled".to_string(), json!(false));
+        if !args.dry_run {
+            obj.insert("via".to_string(), json!("direct_controller"));
+        }
+        obj.entry("force".to_string())
+            .or_insert_with(|| json!(args.force));
+    }
+    Ok((ok, out, human))
+}
+
+async fn execute_config_reload(paths: &AppPaths, as_json: bool, args: ReloadArgs) -> Result<()> {
+    let (ok, out, human) =
+        run_config_reload_with_desktop_handoff(paths, &args, Duration::from_secs(4), None, true)
+            .await?;
     if !ok {
         if as_json {
             emit_output(true, &out, "")?;
@@ -13540,6 +13771,431 @@ mod tests {
         );
 
         server_task.abort();
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn stage23_reload_handoff_uses_desktop_ack_rejects_nonzero_and_falls_back_when_offline() {
+        use catcloud_core::process_guard::{
+            AcquireOutcome, ConfigReloadAck, SingleInstanceGuard, read_config_reload_request,
+            write_config_reload_ack,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud_cli_s23_reload_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).unwrap();
+
+        // Seed one valid node so offline fallback compile succeeds cleanly.
+        {
+            let db = open_storage(&paths).unwrap();
+            db.upsert_subscription(&SubscriptionRecord {
+                id: "sub-s23-reload".to_string(),
+                name: "S23 Reload Sub".to_string(),
+                kind: SubscriptionKind::File,
+                url_or_cmd: "https://example.invalid/s23.yaml".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+            db.upsert_node(&ProxyNode {
+                id: "node-s23-reload-1".to_string(),
+                sub_id: "sub-s23-reload".to_string(),
+                name: "JP-Reload-1".to_string(),
+                protocol: "anytls".to_string(),
+                server: "198.51.100.21".to_string(),
+                port: 443,
+                raw_config: json!({
+                    "name": "JP-Reload-1",
+                    "type": "anytls",
+                    "server": "198.51.100.21",
+                    "port": 443,
+                    "password": "demo-password-reload"
+                }),
+                region_code: "JP".to_string(),
+                multiplier: 1.0,
+                is_443_native: true,
+                preaccel_eligible: false,
+                preaccel_override: None,
+                tags: Vec::new(),
+                enabled: true,
+            })
+            .unwrap();
+        }
+
+        let mut guard =
+            match SingleInstanceGuard::acquire(&paths.root_data_dir, Duration::ZERO).unwrap() {
+                AcquireOutcome::Primary(g) => g,
+                AcquireOutcome::SecondaryWokePrimary => panic!("expected primary instance"),
+            };
+        let reject_mode = Arc::new(AtomicBool::new(false));
+        let silence_mode = Arc::new(AtomicBool::new(false));
+        let reject_c = Arc::clone(&reject_mode);
+        let silence_c = Arc::clone(&silence_mode);
+        let dir_cb = paths.root_data_dir.clone();
+        guard
+            .start_instance_listeners_with_reload(
+                || {},
+                || {},
+                move || {
+                    if silence_c.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if let Some(req) = read_config_reload_request(&dir_cb) {
+                        let should_reject = reject_c.load(Ordering::SeqCst);
+                        let ack = if should_reject {
+                            ConfigReloadAck {
+                                req_id: req.req_id,
+                                applied: false,
+                                rejected: true,
+                                level: Some("l3_core_restart".to_string()),
+                                error: Some("L3 restart requires --allow-restart".to_string()),
+                                completed_at_ms: 1_700_000_001_000,
+                            }
+                        } else {
+                            ConfigReloadAck {
+                                req_id: req.req_id,
+                                applied: true,
+                                rejected: false,
+                                level: Some("l2_hot_reload".to_string()),
+                                error: None,
+                                completed_at_ms: 1_700_000_000_500,
+                            }
+                        };
+                        let _ = write_config_reload_ack(&dir_cb, &ack);
+                    }
+                },
+            )
+            .unwrap();
+
+        // 1. Live desktop accepts hot-reload -> ok=true, live_reload_signaled=true, via=desktop_live_hotswap.
+        let args_ok = ReloadArgs {
+            dry_run: false,
+            force: true,
+            allow_restart: false,
+        };
+        let (ok1, out1, _) = run_config_reload_with_desktop_handoff(
+            &paths,
+            &args_ok,
+            Duration::from_secs(2),
+            None,
+            false,
+        )
+        .await
+        .expect("live handoff ok");
+        assert!(ok1, "expected ok=true from live ack: {out1}");
+        assert_eq!(out1["ok"], json!(true));
+        assert_eq!(out1["live_reload_signaled"], json!(true));
+        assert_eq!(out1["via"], json!("desktop_live_hotswap"));
+        assert_eq!(out1["applied"], json!(true));
+        assert_eq!(out1["rejected"], json!(false));
+        assert_eq!(out1["level"], json!("l2_hot_reload"));
+
+        // 2. Live desktop rejects reload -> ok=false and execute_config_reload returns Err (non-zero exit).
+        reject_mode.store(true, Ordering::SeqCst);
+        let args_rej = ReloadArgs {
+            dry_run: false,
+            force: false,
+            allow_restart: false,
+        };
+        let (ok2, out2, _) = run_config_reload_with_desktop_handoff(
+            &paths,
+            &args_rej,
+            Duration::from_secs(2),
+            None,
+            false,
+        )
+        .await
+        .expect("rejected handoff returns structured payload");
+        assert!(!ok2);
+        assert_eq!(out2["ok"], json!(false));
+        assert_eq!(out2["live_reload_signaled"], json!(true));
+        assert_eq!(out2["via"], json!("desktop_live_hotswap"));
+        assert_eq!(out2["rejected"], json!(true));
+        let cli_err = execute_config_reload(&paths, true, args_rej).await;
+        assert!(
+            cli_err.is_err(),
+            "rejected desktop reload must return non-zero CLI error"
+        );
+
+        // 3. Live desktop times out without ack while still alive -> MUST refuse direct controller
+        //    fallback (avoiding concurrent core writes), clean up request file, and report req_id.
+        silence_mode.store(true, Ordering::SeqCst);
+        let args_timeout = ReloadArgs {
+            dry_run: false,
+            force: false,
+            allow_restart: true,
+        };
+        let (ok_to, out_to, human_to) = run_config_reload_with_desktop_handoff(
+            &paths,
+            &args_timeout,
+            Duration::from_millis(160),
+            None,
+            false,
+        )
+        .await
+        .expect("timed-out live handoff returns structured failure");
+        assert!(!ok_to, "timed-out live desktop reload must fail non-zero");
+        assert_eq!(out_to["ok"], json!(false));
+        assert_eq!(out_to["timed_out"], json!(true));
+        assert_eq!(out_to["desktop_alive"], json!(true));
+        assert_eq!(out_to["via"], json!("desktop_live_hotswap"));
+        let to_req_id = out_to["req_id"]
+            .as_str()
+            .expect("timed-out payload must include req_id");
+        assert!(!to_req_id.is_empty());
+        assert!(
+            human_to.contains(to_req_id),
+            "human timeout error must mention req_id: {human_to}"
+        );
+        assert_eq!(
+            read_config_reload_request(&paths.root_data_dir),
+            None,
+            "timed-out reload must clean up stale allow_l3_restart request file"
+        );
+
+        // 4. Desktop offline -> falls back to direct controller path with live_reload_signaled=false.
+        guard.release();
+        let args_fallback = ReloadArgs {
+            dry_run: false,
+            force: false,
+            allow_restart: false,
+        };
+        let (ok3, out3, _) = run_config_reload_with_desktop_handoff(
+            &paths,
+            &args_fallback,
+            Duration::from_millis(200),
+            None,
+            false,
+        )
+        .await
+        .expect("offline fallback succeeds");
+        assert!(ok3, "offline fallback compile/write failed: {out3}");
+        assert_eq!(out3["live_reload_signaled"], json!(false));
+        assert_eq!(out3["via"], json!("direct_controller"));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn stage23_cli_sub_remove_syncs_active_single_node_and_signals_live_reload() {
+        use catcloud_core::process_guard::{AcquireOutcome, SingleInstanceGuard};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud_cli_s23_subrm_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).unwrap();
+
+        {
+            let db = open_storage(&paths).unwrap();
+            for (sub_id, node_id, ip) in [
+                ("sub-rm-1", "node-rm-1", "198.51.100.31"),
+                ("sub-rm-2", "node-rm-2", "198.51.100.32"),
+            ] {
+                db.upsert_subscription(&SubscriptionRecord {
+                    id: sub_id.to_string(),
+                    name: format!("Sub {sub_id}"),
+                    kind: SubscriptionKind::File,
+                    url_or_cmd: format!("https://example.invalid/{sub_id}.yaml"),
+                    enabled: true,
+                    ..Default::default()
+                })
+                .unwrap();
+                db.upsert_node(&ProxyNode {
+                    id: node_id.to_string(),
+                    sub_id: sub_id.to_string(),
+                    name: format!("Node {node_id}"),
+                    protocol: "anytls".to_string(),
+                    server: ip.to_string(),
+                    port: 443,
+                    raw_config: json!({
+                        "name": format!("Node {node_id}"),
+                        "type": "anytls",
+                        "server": ip,
+                        "port": 443,
+                        "password": "demo-password-subrm"
+                    }),
+                    region_code: "SG".to_string(),
+                    multiplier: 1.0,
+                    is_443_native: true,
+                    preaccel_eligible: false,
+                    preaccel_override: None,
+                    tags: Vec::new(),
+                    enabled: true,
+                })
+                .unwrap();
+            }
+        }
+
+        let mut cfg = config::load_or_init(&paths).unwrap();
+        cfg.active_single_node_id = Some("node-rm-1".to_string());
+        config::save(&paths, &cfg).unwrap();
+
+        let mut guard =
+            match SingleInstanceGuard::acquire(&paths.root_data_dir, Duration::ZERO).unwrap() {
+                AcquireOutcome::Primary(g) => g,
+                AcquireOutcome::SecondaryWokePrimary => panic!("expected primary instance"),
+            };
+        let reload_hits = Arc::new(AtomicUsize::new(0));
+        let hits_c = Arc::clone(&reload_hits);
+        guard
+            .start_instance_listeners_with_reload(
+                || {},
+                || {},
+                move || {
+                    hits_c.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+
+        // Removing `sub-rm-1` must remap `active_single_node_id` to surviving `node-rm-2` and signal reload.
+        dispatch(
+            &paths,
+            true,
+            Commands::Sub {
+                action: SubCommand::Remove {
+                    sub_id: "sub-rm-1".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("sub remove #1 succeeds");
+
+        let cfg_after_first = config::load_or_init(&paths).unwrap();
+        assert_eq!(
+            cfg_after_first.active_single_node_id.as_deref(),
+            Some("node-rm-2")
+        );
+        let deadline1 = std::time::Instant::now() + Duration::from_secs(2);
+        while reload_hits.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline1 {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(reload_hits.load(Ordering::SeqCst) >= 1);
+
+        // Removing the last subscription clears `active_single_node_id` to None and signals reload again.
+        dispatch(
+            &paths,
+            true,
+            Commands::Sub {
+                action: SubCommand::Remove {
+                    sub_id: "sub-rm-2".to_string(),
+                },
+            },
+        )
+        .await
+        .expect("sub remove #2 succeeds");
+
+        let cfg_after_second = config::load_or_init(&paths).unwrap();
+        assert_eq!(cfg_after_second.active_single_node_id, None);
+        let deadline2 = std::time::Instant::now() + Duration::from_secs(2);
+        while reload_hits.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline2 {
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert!(reload_hits.load(Ordering::SeqCst) >= 2);
+
+        guard.release();
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn stage23_cli_preaccel_bind_rejects_enable_when_zero_enabled_relays() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud_cli_s23_preaccel_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).unwrap();
+
+        // Seed only a disabled relay so enabled relay count is 0.
+        let mut relay = PreAccelRelay {
+            id: "relay-disabled-1".to_string(),
+            name: "Aliyun-SH-Disabled".to_string(),
+            provider: "aliyun".to_string(),
+            region: "CN-SH".to_string(),
+            server: "198.51.100.44".to_string(),
+            port: 443,
+            protocol: "anytls".to_string(),
+            password: "demo-password-preaccel".to_string(),
+            skip_cert_verify: true,
+            enabled: false,
+            ..Default::default()
+        };
+        {
+            let db = open_storage(&paths).unwrap();
+            db.upsert_preaccel_relay(&relay).unwrap();
+        }
+
+        // 1. Attempting to enable preaccel with 0 enabled relays MUST fail with NO_ENABLED_RELAY.
+        let err = dispatch(
+            &paths,
+            true,
+            Commands::Preaccel {
+                action: PreaccelCommand::Bind {
+                    enabled: Some(true),
+                    skip_443_native: None,
+                    probe_url: None,
+                    dispatch_strategy: None,
+                    lb_strategy: None,
+                },
+            },
+        )
+        .await
+        .expect_err("enabling preaccel without enabled relays must fail");
+        assert!(
+            err.to_string().contains("NO_ENABLED_RELAY"),
+            "expected NO_ENABLED_RELAY in error, got: {err}"
+        );
+        assert!(
+            !config::load_or_init(&paths).unwrap().preaccel.enabled,
+            "config.preaccel.enabled must stay false after rejected bind"
+        );
+
+        // 2. Disabling or adjusting non-enable flags with 0 enabled relays still succeeds.
+        dispatch(
+            &paths,
+            true,
+            Commands::Preaccel {
+                action: PreaccelCommand::Bind {
+                    enabled: Some(false),
+                    skip_443_native: Some(false),
+                    probe_url: None,
+                    dispatch_strategy: None,
+                    lb_strategy: None,
+                },
+            },
+        )
+        .await
+        .expect("disabling preaccel with 0 enabled relays must succeed");
+
+        // 3. Once at least one relay is enabled, enabling preaccel succeeds cleanly.
+        relay.enabled = true;
+        {
+            let db = open_storage(&paths).unwrap();
+            db.upsert_preaccel_relay(&relay).unwrap();
+        }
+        dispatch(
+            &paths,
+            true,
+            Commands::Preaccel {
+                action: PreaccelCommand::Bind {
+                    enabled: Some(true),
+                    skip_443_native: None,
+                    probe_url: None,
+                    dispatch_strategy: None,
+                    lb_strategy: None,
+                },
+            },
+        )
+        .await
+        .expect("enabling preaccel with >=1 enabled relay must succeed");
+        assert!(config::load_or_init(&paths).unwrap().preaccel.enabled);
+
         let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

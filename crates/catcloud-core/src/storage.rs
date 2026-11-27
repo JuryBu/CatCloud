@@ -2,7 +2,7 @@ use crate::error::{CatError, CatResult};
 use crate::models::{
     DynamicFilterSpec, FallbackPolicy, MultiGroup, MultiGroupMode, MultiGroupState, NodeFilter,
     PreAccelRelay, ProbeDefinition, ProbeKind, ProbeResultRecord, ProbeSnapshot, ProxyNode,
-    SubscriptionKind, SubscriptionRecord, SwitchMode, TriggerRule,
+    SubscriptionKind, SubscriptionRecord, SwitchMode, TriggerRule, pick_smart_default_node_id,
 };
 use crate::subscription::parser::node_dedup_fingerprint;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
@@ -290,9 +290,22 @@ impl Storage {
     }
 
     pub fn delete_subscription(&self, id: &str) -> CatResult<bool> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
+        let tx = self.conn.unchecked_transaction()?;
+        let sub_node_ids = load_node_ids_for_subscription_in_tx(&tx, id)?;
+        let changed = tx.execute("DELETE FROM subscriptions WHERE id = ?1", params![id])?;
+        if changed > 0 {
+            let live_node_ids = load_all_node_ids_in_tx(&tx)?;
+            let empty_remap = HashMap::new();
+            remap_multi_groups_in_tx(
+                &tx,
+                &empty_remap,
+                &sub_node_ids,
+                None,
+                Some(id),
+                Some(&live_node_ids),
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -488,7 +501,14 @@ impl Storage {
                 }
 
                 if !id_remap.is_empty() || !removed_unmapped_ids.is_empty() {
-                    remap_multi_groups_in_tx(&tx, &id_remap, &removed_unmapped_ids, None)?;
+                    remap_multi_groups_in_tx(
+                        &tx,
+                        &id_remap,
+                        &removed_unmapped_ids,
+                        None,
+                        None,
+                        None,
+                    )?;
                 }
 
                 let total_count = kept_count + added_count;
@@ -695,7 +715,14 @@ impl Storage {
             tx.execute("DELETE FROM nodes WHERE id = ?1", params![s_dup_id])?;
         }
         let empty_removed: HashSet<String> = HashSet::new();
-        remap_multi_groups_in_tx(&tx, &id_remap, &empty_removed, Some((src_id, tgt_id)))?;
+        remap_multi_groups_in_tx(
+            &tx,
+            &id_remap,
+            &empty_removed,
+            Some((src_id, tgt_id)),
+            None,
+            None,
+        )?;
 
         // Step 5: Optional target rename and/or kind conversion to `migrated`.
         if let Some(ref new_name) = validated_name {
@@ -868,9 +895,23 @@ impl Storage {
     }
 
     pub fn delete_node(&self, id: &str) -> CatResult<bool> {
-        let changed = self
-            .conn
-            .execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute("DELETE FROM nodes WHERE id = ?1", params![id])?;
+        if changed > 0 {
+            let empty_remap: HashMap<String, String> = HashMap::new();
+            let mut removed_ids: HashSet<String> = HashSet::with_capacity(1);
+            removed_ids.insert(id.to_string());
+            let live_node_ids = load_all_node_ids_in_tx(&tx)?;
+            remap_multi_groups_in_tx(
+                &tx,
+                &empty_remap,
+                &removed_ids,
+                None,
+                None,
+                Some(&live_node_ids),
+            )?;
+        }
+        tx.commit()?;
         Ok(changed > 0)
     }
 
@@ -1309,6 +1350,82 @@ impl Storage {
             params![id, active_node_id, state.as_str(), escalated_since],
         )?;
         Ok(changed > 0)
+    }
+
+    /// Ensure at least one usable default multi-group exists when enabled nodes are present.
+    /// - If no groups exist at all, creates a fresh "默认路线" group containing all enabled nodes.
+    /// - If groups exist, never touches them when any group uses `dynamic_filter` or any static
+    ///   group still has >= 1 valid enabled member.
+    /// - When all existing groups are static and empty (0 valid enabled members), prefers refilling
+    ///   a clean static empty group (no custom `match_rules`, `!independent_routing`, no
+    ///   `dynamic_filter`, prioritizing names containing "默认路线" or "Default"); only creates a
+    ///   new "默认路线" group if every existing empty group has custom rules or independent routing.
+    pub fn ensure_default_group_if_empty(&self) -> CatResult<Option<String>> {
+        let enabled_nodes: Vec<ProxyNode> = self
+            .list_nodes()?
+            .into_iter()
+            .filter(|n| n.enabled)
+            .collect();
+        if enabled_nodes.is_empty() {
+            return Ok(None);
+        }
+
+        let groups = self.list_multi_groups()?;
+        let member_node_ids: Vec<String> = enabled_nodes.iter().map(|n| n.id.clone()).collect();
+        let enabled_id_set: HashSet<&str> = enabled_nodes.iter().map(|n| n.id.as_str()).collect();
+        let snaps = self
+            .get_probe_snapshots_batch(&member_node_ids, None)
+            .unwrap_or_default();
+        let active_node_id = pick_smart_default_node_id(&enabled_nodes, Some(&snaps))
+            .or_else(|| member_node_ids.first().cloned());
+
+        if !groups.is_empty() {
+            if groups.iter().any(|g| g.dynamic_filter.is_some()) {
+                return Ok(None);
+            }
+            let has_usable_static_member = groups.iter().any(|g| {
+                g.member_node_ids
+                    .iter()
+                    .any(|mid| enabled_id_set.contains(mid.as_str()))
+            });
+            if has_usable_static_member {
+                return Ok(None);
+            }
+
+            let is_clean_static_empty = |g: &MultiGroup| {
+                g.dynamic_filter.is_none()
+                    && !g.independent_routing
+                    && g.match_rules.iter().all(|r| r.trim().is_empty())
+            };
+            let reusable_target = groups
+                .iter()
+                .find(|g| {
+                    is_clean_static_empty(g)
+                        && (g.name.contains("默认路线")
+                            || g.name.to_ascii_lowercase().contains("default"))
+                })
+                .or_else(|| groups.iter().find(|g| is_clean_static_empty(g)));
+
+            if let Some(existing) = reusable_target {
+                let mut updated = existing.clone();
+                updated.member_node_ids = member_node_ids;
+                updated.active_node_id = active_node_id;
+                self.upsert_multi_group(&updated)?;
+                return Ok(Some(updated.id));
+            }
+        }
+
+        let group = MultiGroup {
+            id: format!("grp-{}", uuid::Uuid::new_v4().simple()),
+            name: "默认路线".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            hard_gates: Vec::new(),
+            member_node_ids,
+            active_node_id,
+            ..MultiGroup::default()
+        };
+        self.upsert_multi_group(&group)?;
+        Ok(Some(group.id))
     }
 
     // -------------------------------------------------------------------------
@@ -2395,11 +2512,36 @@ fn migrate_newer_probe_results_in_tx(
     Ok(())
 }
 
+fn load_node_ids_for_subscription_in_tx(
+    tx: &Transaction<'_>,
+    sub_id: &str,
+) -> CatResult<HashSet<String>> {
+    let mut stmt = tx.prepare("SELECT id FROM nodes WHERE sub_id = ?1")?;
+    let rows = stmt.query_map(params![sub_id], |row| row.get::<_, String>(0))?;
+    let mut ids = HashSet::new();
+    for r in rows {
+        ids.insert(r?);
+    }
+    Ok(ids)
+}
+
+fn load_all_node_ids_in_tx(tx: &Transaction<'_>) -> CatResult<HashSet<String>> {
+    let mut stmt = tx.prepare("SELECT id FROM nodes")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut ids = HashSet::new();
+    for r in rows {
+        ids.insert(r?);
+    }
+    Ok(ids)
+}
+
 fn remap_multi_groups_in_tx(
     tx: &Transaction<'_>,
     id_remap: &HashMap<String, String>,
     removed_unmapped_ids: &HashSet<String>,
     sub_id_replace: Option<(&str, &str)>,
+    removed_sub_id: Option<&str>,
+    live_node_ids: Option<&HashSet<String>>,
 ) -> CatResult<()> {
     let mut groups: Vec<MultiGroup> = Vec::new();
     {
@@ -2431,6 +2573,11 @@ fn remap_multi_groups_in_tx(
             } else {
                 mid.as_str()
             };
+            if let Some(live) = live_node_ids {
+                if !live.contains(resolved) {
+                    continue;
+                }
+            }
             if seen_members.insert(resolved.to_string()) {
                 new_members.push(resolved.to_string());
             }
@@ -2438,29 +2585,36 @@ fn remap_multi_groups_in_tx(
 
         let new_active = match group.active_node_id.as_deref() {
             Some(cur) => {
-                if let Some(mapped) = id_remap.get(cur) {
-                    Some(mapped.clone())
+                let candidate = if let Some(mapped) = id_remap.get(cur) {
+                    Some(mapped.as_str())
                 } else if removed_unmapped_ids.contains(cur) {
                     None
                 } else {
-                    Some(cur.to_string())
-                }
+                    Some(cur)
+                };
+                candidate
+                    .filter(|resolved| live_node_ids.map_or(true, |live| live.contains(*resolved)))
+                    .map(str::to_string)
             }
             None => None,
         };
 
         let mut new_dynamic_filter = group.dynamic_filter.clone();
-        if let (Some((src_sub, dst_sub)), Some(df)) = (sub_id_replace, new_dynamic_filter.as_mut())
-        {
-            let mut updated_sub_ids = Vec::with_capacity(df.sub_ids.len());
-            let mut seen_subs: HashSet<String> = HashSet::with_capacity(df.sub_ids.len());
-            for sid in &df.sub_ids {
-                let resolved = if sid == src_sub { dst_sub } else { sid.as_str() };
-                if seen_subs.insert(resolved.to_string()) {
-                    updated_sub_ids.push(resolved.to_string());
+        if let Some(df) = new_dynamic_filter.as_mut() {
+            if let Some((src_sub, dst_sub)) = sub_id_replace {
+                let mut updated_sub_ids = Vec::with_capacity(df.sub_ids.len());
+                let mut seen_subs: HashSet<String> = HashSet::with_capacity(df.sub_ids.len());
+                for sid in &df.sub_ids {
+                    let resolved = if sid == src_sub { dst_sub } else { sid.as_str() };
+                    if seen_subs.insert(resolved.to_string()) {
+                        updated_sub_ids.push(resolved.to_string());
+                    }
                 }
+                df.sub_ids = updated_sub_ids;
             }
-            df.sub_ids = updated_sub_ids;
+            if let Some(del_sub) = removed_sub_id {
+                df.sub_ids.retain(|sid| sid != del_sub);
+            }
         }
 
         if new_members != group.member_node_ids
@@ -4375,5 +4529,247 @@ mod tests {
             .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].id, "n-tz");
+    }
+
+    #[test]
+    fn delete_subscription_and_delete_node_atomically_purge_ghost_members_active_and_dynamic_sub_ids()
+    {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-a", "Airport A"))
+            .unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-b", "Airport B"))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-a1", "sub-a", "JP", 1.0, "anytls", true, &[]))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-a2", "sub-a", "SG", 1.0, "anytls", true, &[]))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-b1", "sub-b", "US", 1.0, "vless", true, &[]))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-b2", "sub-b", "HK", 1.0, "vless", true, &[]))
+            .unwrap();
+
+        let grp_mixed = MultiGroup {
+            id: "grp-mixed".into(),
+            name: "Mixed Group".into(),
+            member_node_ids: vec!["n-a1".into(), "n-a2".into(), "n-b1".into()],
+            active_node_id: Some("n-a1".into()),
+            ..MultiGroup::default()
+        };
+        let grp_only_a = MultiGroup {
+            id: "grp-only-a".into(),
+            name: "Only A".into(),
+            member_node_ids: vec!["n-a1".into(), "n-a2".into()],
+            active_node_id: Some("n-a2".into()),
+            ..MultiGroup::default()
+        };
+        let grp_dyn = MultiGroup {
+            id: "grp-dyn".into(),
+            name: "Dynamic Pool".into(),
+            member_node_ids: vec!["n-a1".into(), "n-b2".into()],
+            active_node_id: Some("n-a1".into()),
+            dynamic_filter: Some(DynamicFilterSpec {
+                sub_ids: vec!["sub-a".into(), "sub-b".into()],
+                ..DynamicFilterSpec::default()
+            }),
+            ..MultiGroup::default()
+        };
+        storage.upsert_multi_group(&grp_mixed).unwrap();
+        storage.upsert_multi_group(&grp_only_a).unwrap();
+        storage.upsert_multi_group(&grp_dyn).unwrap();
+
+        // 1. Deleting `sub-a` must atomically purge all ghost member IDs, dangling active_node_id,
+        //    and deleted `sub-a` from `dynamic_filter.sub_ids`.
+        assert!(storage.delete_subscription("sub-a").unwrap());
+
+        let mixed_after = storage.get_multi_group("grp-mixed").unwrap().unwrap();
+        assert_eq!(mixed_after.member_node_ids, vec!["n-b1".to_string()]);
+        assert_eq!(mixed_after.active_node_id, None);
+
+        let only_a_after = storage.get_multi_group("grp-only-a").unwrap().unwrap();
+        assert!(only_a_after.member_node_ids.is_empty());
+        assert_eq!(only_a_after.active_node_id, None);
+
+        let dyn_after = storage.get_multi_group("grp-dyn").unwrap().unwrap();
+        assert_eq!(dyn_after.member_node_ids, vec!["n-b2".to_string()]);
+        assert_eq!(dyn_after.active_node_id, None);
+        assert_eq!(
+            dyn_after
+                .dynamic_filter
+                .as_ref()
+                .expect("dynamic filter retained")
+                .sub_ids,
+            vec!["sub-b".to_string()]
+        );
+
+        // 2. Deleting a single surviving node `n-b1` must also purge it from member_node_ids and active_node_id.
+        let mut mixed_with_active = mixed_after;
+        mixed_with_active.active_node_id = Some("n-b1".into());
+        storage.upsert_multi_group(&mixed_with_active).unwrap();
+
+        assert!(storage.delete_node("n-b1").unwrap());
+        let mixed_final = storage.get_multi_group("grp-mixed").unwrap().unwrap();
+        assert!(mixed_final.member_node_ids.is_empty());
+        assert_eq!(mixed_final.active_node_id, None);
+    }
+
+    #[test]
+    fn ensure_default_group_if_empty_refills_default_group_after_deleting_all_subscriptions_and_reimporting()
+    {
+        let storage = Storage::open_in_memory().unwrap();
+        storage
+            .upsert_subscription(&sample_sub("sub-1", "First Sub"))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-1", "sub-1", "JP", 1.0, "anytls", true, &[]))
+            .unwrap();
+
+        // Initial creation builds "默认路线" populated with enabled nodes.
+        let created_id = storage
+            .ensure_default_group_if_empty()
+            .unwrap()
+            .expect("should create initial default group");
+        let g0 = storage.get_multi_group(&created_id).unwrap().unwrap();
+        assert_eq!(g0.name, "默认路线");
+        assert_eq!(g0.member_node_ids, vec!["n-1".to_string()]);
+        assert_eq!(g0.active_node_id.as_deref(), Some("n-1"));
+
+        // Delete all subscriptions -> default group becomes empty with 0 ghost nodes.
+        assert!(storage.delete_subscription("sub-1").unwrap());
+        let g_empty = storage.get_multi_group(&created_id).unwrap().unwrap();
+        assert!(g_empty.member_node_ids.is_empty());
+        assert_eq!(g_empty.active_node_id, None);
+        assert_eq!(storage.ensure_default_group_if_empty().unwrap(), None);
+
+        // Re-import a new subscription -> existing clean "默认路线" is refilled in place (no duplicate group).
+        storage
+            .upsert_subscription(&sample_sub("sub-2", "Second Sub"))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-2", "sub-2", "SG", 1.0, "vless", true, &[]))
+            .unwrap();
+        storage
+            .upsert_node(&sample_node("n-3", "sub-2", "US", 1.0, "vless", true, &[]))
+            .unwrap();
+
+        let refilled_id = storage
+            .ensure_default_group_if_empty()
+            .unwrap()
+            .expect("should refill existing default group");
+        assert_eq!(refilled_id, created_id);
+        let all_groups = storage.list_multi_groups().unwrap();
+        assert_eq!(all_groups.len(), 1);
+        let g_refilled = &all_groups[0];
+        assert_eq!(g_refilled.member_node_ids.len(), 2);
+        assert!(g_refilled.member_node_ids.contains(&"n-2".to_string()));
+        assert!(g_refilled.member_node_ids.contains(&"n-3".to_string()));
+        assert!(
+            g_refilled
+                .active_node_id
+                .as_deref()
+                .is_some_and(|aid| aid == "n-2" || aid == "n-3")
+        );
+    }
+
+    #[test]
+    fn ensure_default_group_if_empty_never_pollutes_match_rules_independent_or_dynamic_filter_empty_groups()
+    {
+        // Case A: Only custom match_rules / independent_routing empty groups exist ->
+        // must NOT pollute them; creates a separate clean "默认路线" instead.
+        let storage_a = Storage::open_in_memory().unwrap();
+        storage_a
+            .upsert_subscription(&sample_sub("sub-x", "Sub X"))
+            .unwrap();
+        storage_a
+            .upsert_node(&sample_node("n-x1", "sub-x", "JP", 1.0, "anytls", true, &[]))
+            .unwrap();
+        let ruled_empty = MultiGroup {
+            id: "grp-ai-rules".into(),
+            name: "AI 专用".into(),
+            match_rules: vec!["DOMAIN-SUFFIX,openai.com".into()],
+            member_node_ids: Vec::new(),
+            active_node_id: None,
+            ..MultiGroup::default()
+        };
+        let indep_empty = MultiGroup {
+            id: "grp-indep".into(),
+            name: "默认路线 独立路由".into(),
+            independent_routing: true,
+            member_node_ids: Vec::new(),
+            active_node_id: None,
+            ..MultiGroup::default()
+        };
+        storage_a.upsert_multi_group(&ruled_empty).unwrap();
+        storage_a.upsert_multi_group(&indep_empty).unwrap();
+
+        let created_id = storage_a
+            .ensure_default_group_if_empty()
+            .unwrap()
+            .expect("should create clean default group without touching ruled/independent groups");
+        assert_ne!(created_id, "grp-ai-rules");
+        assert_ne!(created_id, "grp-indep");
+
+        let ai_after = storage_a.get_multi_group("grp-ai-rules").unwrap().unwrap();
+        assert!(ai_after.member_node_ids.is_empty());
+        assert_eq!(ai_after.active_node_id, None);
+
+        let indep_after = storage_a.get_multi_group("grp-indep").unwrap().unwrap();
+        assert!(indep_after.member_node_ids.is_empty());
+        assert_eq!(indep_after.active_node_id, None);
+
+        let created = storage_a.get_multi_group(&created_id).unwrap().unwrap();
+        assert_eq!(created.name, "默认路线");
+        assert_eq!(created.member_node_ids, vec!["n-x1".to_string()]);
+        assert_eq!(created.active_node_id.as_deref(), Some("n-x1"));
+
+        // Case B: A group with `dynamic_filter` exists -> do not touch any group or create a new one.
+        let storage_b = Storage::open_in_memory().unwrap();
+        storage_b
+            .upsert_subscription(&sample_sub("sub-y", "Sub Y"))
+            .unwrap();
+        storage_b
+            .upsert_node(&sample_node("n-y1", "sub-y", "SG", 1.0, "vless", true, &[]))
+            .unwrap();
+        let dyn_group = MultiGroup {
+            id: "grp-dynamic".into(),
+            name: "动态筛选组".into(),
+            member_node_ids: Vec::new(),
+            dynamic_filter: Some(DynamicFilterSpec {
+                region_codes: vec!["SG".into()],
+                ..DynamicFilterSpec::default()
+            }),
+            ..MultiGroup::default()
+        };
+        let static_empty = MultiGroup {
+            id: "grp-static-empty".into(),
+            name: "默认路线".into(),
+            member_node_ids: Vec::new(),
+            ..MultiGroup::default()
+        };
+        storage_b.upsert_multi_group(&dyn_group).unwrap();
+        storage_b.upsert_multi_group(&static_empty).unwrap();
+
+        assert_eq!(storage_b.ensure_default_group_if_empty().unwrap(), None);
+        assert!(
+            storage_b
+                .get_multi_group("grp-dynamic")
+                .unwrap()
+                .unwrap()
+                .member_node_ids
+                .is_empty()
+        );
+        assert!(
+            storage_b
+                .get_multi_group("grp-static-empty")
+                .unwrap()
+                .unwrap()
+                .member_node_ids
+                .is_empty()
+        );
     }
 }

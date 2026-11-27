@@ -5,9 +5,9 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(target_os = "windows")]
 use base64::Engine as _;
@@ -30,9 +30,55 @@ pub const RESTART_WAIT_TIMEOUT: Duration = Duration::from_secs(12);
 /// without ever affecting portable deployments or isolated sandboxes.
 pub const INSTALLED_GRACEFUL_EXIT_EVENT_NAME: &str = r"Local\CatCloud_GracefulExit_Installed_v1";
 
+/// Request metadata filename written inside `<data_dir>/run/` before signaling a live
+/// config hot-reload so the running desktop instance knows `req_id` and `allow_l3_restart`.
+pub const CONFIG_RELOAD_REQ_FILE: &str = "config_reload_req.json";
+
+/// Structured acknowledgment filename written atomically inside `<data_dir>/run/` by the
+/// running desktop instance after executing a live hot-reload request.
+pub const CONFIG_RELOAD_ACK_FILE: &str = "config_reload_ack.json";
+
+static CONFIG_RELOAD_REQ_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// Cross-process live hot-reload request payload persisted under `<data_dir>/run/config_reload_req.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigReloadRequest {
+    pub req_id: String,
+    pub allow_l3_restart: bool,
+    pub created_at_ms: u64,
+}
+
+/// Cross-process live hot-reload acknowledgment persisted under `<data_dir>/run/config_reload_ack.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfigReloadAck {
+    pub req_id: String,
+    pub applied: bool,
+    pub rejected: bool,
+    pub level: Option<String>,
+    pub error: Option<String>,
+    pub completed_at_ms: u64,
+}
+
+/// Outcome of signaling a running desktop instance for live config hot-reload and waiting for its ack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigReloadWaitOutcome {
+    /// No live desktop instance accepted the reload signal (safe to fall back to direct controller).
+    NotRunning,
+    /// The running desktop instance processed the request and persisted a matching acknowledgment.
+    Ack(ConfigReloadAck),
+    /// A live instance was signaled, but no matching acknowledgment arrived before timeout
+    /// (any lingering on-disk request file carrying `req_id` has been cleaned up).
+    TimedOut { req_id: String },
+}
+
 /// Format the per-`data_dir` Windows named graceful-exit event name for `instance_hash`.
 pub fn graceful_exit_event_name_for_hash(instance_hash: &str) -> String {
     format!(r"Local\CatCloud_GracefulExit_{instance_hash}")
+}
+
+/// Format the per-`data_dir` Windows named config hot-reload event name for `instance_hash`.
+pub fn config_reload_event_name_for_hash(instance_hash: &str) -> String {
+    format!(r"Local\CatCloud_ConfigReload_{instance_hash}")
 }
 
 /// Compatibility alias for `JobGuard`.
@@ -1776,7 +1822,7 @@ fn repair_event_medium_mandatory_label(
     if verified {
         tracing::info!(
             event = event_label,
-            "repaired pre-existing cross-IL named event mandatory label to S:(ML;;NW;;;ME)"
+            "repaired cross-IL named event mandatory label to S:(ML;;NW;;;ME)"
         );
     } else {
         tracing::warn!(
@@ -1810,9 +1856,7 @@ fn finalize_created_named_event(
         }
     }
     if strict_ml_check && !verify_event_medium_mandatory_label(ev, event_label) {
-        if last_err == ERROR_ALREADY_EXISTS {
-            let _ = repair_event_medium_mandatory_label(ev, event_label);
-        }
+        let _ = repair_event_medium_mandatory_label(ev, event_label);
     }
 }
 
@@ -1888,6 +1932,80 @@ fn signal_existing_wakeup_event(wide_event: &[u16]) {
     let _ = signal_named_event(wide_event);
 }
 
+fn config_reload_run_dir(data_dir: &Path) -> PathBuf {
+    let canonical = crate::paths::normalize_os_path(
+        &std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf()),
+    );
+    canonical.join("run")
+}
+
+fn now_unix_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(unix)]
+fn is_unix_primary_instance_alive(run_dir: &Path) -> bool {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::AsRawFd;
+
+    let lock_path = run_dir.join("instance.lock");
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        return false;
+    };
+    // Probe whether a live primary instance currently holds the exclusive flock.
+    // Because BSD flock is per-open-file-description, a fresh open returns EWOULDBLOCK
+    // while the lock is held (including from another guard inside the same process), and
+    // succeeds with 0 once release() unlocked/closed the descriptor or the process exited.
+    // SAFETY: Valid file descriptor owned by `file` for non-blocking advisory flock probe.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        // SAFETY: Immediately release probe lock; no live primary instance holds it.
+        unsafe {
+            let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        return false;
+    }
+    let raw_os = std::io::Error::last_os_error().raw_os_error();
+    raw_os == Some(libc::EWOULDBLOCK) || raw_os == Some(libc::EAGAIN)
+}
+
+/// Non-destructively probe whether a primary CatCloud instance currently holds the
+/// per-`data_dir` single-instance lock without waking or signaling it.
+/// - Windows: read-only `OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, ...)` on `Local\CatCloud_SI_<hash>`.
+/// - Unix: non-blocking advisory `flock` probe via `is_unix_primary_instance_alive`.
+pub fn is_primary_instance_alive(data_dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
+        use windows_sys::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+
+        const ERROR_ACCESS_DENIED_CODE: u32 = 5;
+
+        let instance_hash = compute_instance_hash_readonly(data_dir);
+        let mutex_name = format!("Local\\CatCloud_SI_{instance_hash}");
+        let wide_mutex = to_wide_null(&mutex_name);
+        // SAFETY: Read-only OpenMutexW probe with NUL-terminated UTF-16 mutex name.
+        let handle = unsafe { OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, 0, wide_mutex.as_ptr()) };
+        if !handle.is_null() {
+            // SAFETY: Valid kernel handle returned by OpenMutexW.
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return true;
+        }
+        unsafe { GetLastError() == ERROR_ACCESS_DENIED_CODE }
+    }
+
+    #[cfg(unix)]
+    {
+        let run_dir = config_reload_run_dir(data_dir);
+        is_unix_primary_instance_alive(&run_dir)
+    }
+}
+
 /// Trigger deterministic cross-IL graceful shutdown for the running instance scoped to `data_dir`.
 /// Returns `true` if a live listener event/signal was found and signaled, `false` otherwise.
 pub fn signal_graceful_exit_for_data_dir(data_dir: &Path) -> bool {
@@ -1901,32 +2019,8 @@ pub fn signal_graceful_exit_for_data_dir(data_dir: &Path) -> bool {
 
     #[cfg(unix)]
     {
-        use std::fs::OpenOptions;
-        use std::os::unix::io::AsRawFd;
-
-        let canonical = std::fs::canonicalize(data_dir).unwrap_or_else(|_| data_dir.to_path_buf());
-        let run_dir = canonical.join("run");
-        let lock_path = run_dir.join("instance.lock");
-        let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
-            return false;
-        };
-        // Probe whether a live primary instance currently holds the exclusive flock.
-        // Because BSD flock is per-open-file-description, a fresh open returns EWOULDBLOCK
-        // while the lock is held (including from another guard inside the same process), and
-        // succeeds with 0 once release() unlocked/closed the descriptor or the process exited.
-        // SAFETY: Valid file descriptor owned by `file` for non-blocking advisory flock probe.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            // SAFETY: Immediately release probe lock; no live primary instance holds it.
-            unsafe {
-                let _ = libc::flock(file.as_raw_fd(), libc::LOCK_UN);
-            }
-            return false;
-        }
-        let raw_os = std::io::Error::last_os_error().raw_os_error();
-        let held_by_live_instance =
-            raw_os == Some(libc::EWOULDBLOCK) || raw_os == Some(libc::EAGAIN);
-        if !held_by_live_instance {
+        let run_dir = config_reload_run_dir(data_dir);
+        if !is_unix_primary_instance_alive(&run_dir) {
             return false;
         }
         let signal_path = run_dir.join("graceful_exit.signal");
@@ -1950,13 +2044,150 @@ pub fn signal_graceful_exit_installed() -> bool {
     }
 }
 
+/// Trigger deterministic cross-IL config hot-reload for the running instance scoped to `data_dir`.
+/// Returns `true` if a live listener event/signal was found and signaled, `false` otherwise.
+pub fn signal_config_reload_for_data_dir(data_dir: &Path) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let instance_hash = compute_instance_hash_readonly(data_dir);
+        let event_name = config_reload_event_name_for_hash(&instance_hash);
+        let wide = to_wide_null(&event_name);
+        signal_named_event(&wide)
+    }
+
+    #[cfg(unix)]
+    {
+        let run_dir = config_reload_run_dir(data_dir);
+        if !is_unix_primary_instance_alive(&run_dir) {
+            return false;
+        }
+        let signal_path = run_dir.join("config_reload.signal");
+        std::fs::write(&signal_path, format!("{}", std::process::id())).is_ok()
+    }
+}
+
+/// Atomically persist a cross-process config hot-reload request under `<data_dir>/run/`.
+pub fn write_config_reload_request(data_dir: &Path, req: &ConfigReloadRequest) -> CatResult<()> {
+    let path = config_reload_run_dir(data_dir).join(CONFIG_RELOAD_REQ_FILE);
+    let bytes = serde_json::to_vec_pretty(req)?;
+    AppPaths::atomic_write(&path, &bytes)
+}
+
+/// Read the latest cross-process config hot-reload request under `<data_dir>/run/` without deleting it.
+pub fn read_config_reload_request(data_dir: &Path) -> Option<ConfigReloadRequest> {
+    let path = config_reload_run_dir(data_dir).join(CONFIG_RELOAD_REQ_FILE);
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Remove `<data_dir>/run/config_reload_req.json` only when its `req_id` matches `expected_req_id`,
+/// preventing a timed-out or expired request's `allow_l3_restart` flag from leaking into a later
+/// unrelated reload signal without deleting a newer concurrent request.
+pub fn clear_config_reload_request_if_matching(data_dir: &Path, expected_req_id: &str) -> bool {
+    let trimmed = expected_req_id.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Some(existing_req) = read_config_reload_request(data_dir) {
+        if existing_req.req_id == trimmed {
+            let req_path = config_reload_run_dir(data_dir).join(CONFIG_RELOAD_REQ_FILE);
+            return std::fs::remove_file(req_path).is_ok();
+        }
+    }
+    false
+}
+
+/// Atomically persist a cross-process config hot-reload acknowledgment under `<data_dir>/run/`.
+/// When the on-disk request file carries the same `req_id`, it is cleaned up so subsequent plain
+/// write-DB signals cannot accidentally inherit an old `allow_l3_restart` flag.
+pub fn write_config_reload_ack(data_dir: &Path, ack: &ConfigReloadAck) -> CatResult<()> {
+    let run_dir = config_reload_run_dir(data_dir);
+    let path = run_dir.join(CONFIG_RELOAD_ACK_FILE);
+    let bytes = serde_json::to_vec_pretty(ack)?;
+    AppPaths::atomic_write(&path, &bytes)?;
+    let _ = clear_config_reload_request_if_matching(data_dir, &ack.req_id);
+    Ok(())
+}
+
+/// Read the latest cross-process config hot-reload acknowledgment under `<data_dir>/run/`.
+pub fn read_config_reload_ack(data_dir: &Path) -> Option<ConfigReloadAck> {
+    let path = config_reload_run_dir(data_dir).join(CONFIG_RELOAD_ACK_FILE);
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Write a unique config hot-reload request, signal the running instance for `data_dir`, and
+/// poll every 40ms until a matching `ConfigReloadAck` is observed or `timeout` elapses.
+///
+/// - Returns `NotRunning` (after cleaning the matching request file) if no live instance accepted the signal.
+/// - Returns `Ack(ack)` when a matching `ConfigReloadAck` arrives within `timeout`.
+/// - Returns `TimedOut { req_id }` if the signal succeeded but no matching ack arrived before `timeout`,
+///   cleaning up the matching request file so a stale `allow_l3_restart = true` cannot leak.
+pub fn signal_config_reload_and_wait_outcome(
+    data_dir: &Path,
+    allow_l3_restart: bool,
+    timeout: Duration,
+) -> ConfigReloadWaitOutcome {
+    let created_at_ms = now_unix_millis();
+    let seq = CONFIG_RELOAD_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let req_id = format!("reload-{}-{created_at_ms}-{seq}", std::process::id());
+    let req = ConfigReloadRequest {
+        req_id: req_id.clone(),
+        allow_l3_restart,
+        created_at_ms,
+    };
+    if write_config_reload_request(data_dir, &req).is_err() {
+        return ConfigReloadWaitOutcome::NotRunning;
+    }
+    if !signal_config_reload_for_data_dir(data_dir) {
+        let _ = clear_config_reload_request_if_matching(data_dir, &req_id);
+        return ConfigReloadWaitOutcome::NotRunning;
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(ack) = read_config_reload_ack(data_dir) {
+            if ack.req_id == req_id {
+                return ConfigReloadWaitOutcome::Ack(ack);
+            }
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            if let Some(ack) = read_config_reload_ack(data_dir) {
+                if ack.req_id == req_id {
+                    return ConfigReloadWaitOutcome::Ack(ack);
+                }
+            }
+            let _ = clear_config_reload_request_if_matching(data_dir, &req_id);
+            return ConfigReloadWaitOutcome::TimedOut { req_id };
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        std::thread::sleep(remaining.min(Duration::from_millis(40)));
+    }
+}
+
+/// Write a unique config hot-reload request, signal the running instance for `data_dir`, and
+/// poll every 40ms until a matching `ConfigReloadAck` is observed or `timeout` elapses.
+/// Compatibility wrapper delegating to [`signal_config_reload_and_wait_outcome`].
+pub fn signal_config_reload_and_wait(
+    data_dir: &Path,
+    allow_l3_restart: bool,
+    timeout: Duration,
+) -> Option<ConfigReloadAck> {
+    match signal_config_reload_and_wait_outcome(data_dir, allow_l3_restart, timeout) {
+        ConfigReloadWaitOutcome::Ack(ack) => Some(ack),
+        ConfigReloadWaitOutcome::NotRunning | ConfigReloadWaitOutcome::TimedOut { .. } => None,
+    }
+}
+
 // ============================================================================
 // SingleInstanceGuard: canonical_data_dir-scoped single instance with wakeup
 // ============================================================================
 
 /// Per-`canonical_data_dir` single-instance guard:
 /// - Windows: `Local\CatCloud_SI_<instance_hash>` Named Mutex + `Local\CatCloud_Wake_<instance_hash>`
-///   Named Event + `Local\CatCloud_GracefulExit_<instance_hash>` Named Event (+ optional
+///   Named Event + `Local\CatCloud_GracefulExit_<instance_hash>` Named Event +
+///   `Local\CatCloud_ConfigReload_<instance_hash>` Named Event (+ optional
 ///   `Local\CatCloud_GracefulExit_Installed_v1` for standard installed instances) + dedicated
 ///   anonymous `stop_event` at `WaitForMultipleObjects` index `0`.
 /// - Unix: `<canonical_data_dir>/run/instance.lock` advisory `flock` lock.
@@ -1978,12 +2209,16 @@ pub struct SingleInstanceGuard {
     graceful_exit_event_handle: Mutex<Option<SendHandle>>,
     #[cfg(target_os = "windows")]
     installed_graceful_exit_event_handle: Mutex<Option<SendHandle>>,
+    #[cfg(target_os = "windows")]
+    config_reload_event_handle: Mutex<Option<SendHandle>>,
     #[cfg(unix)]
     lock_file: Mutex<Option<std::fs::File>>,
     #[cfg(unix)]
     wakeup_signal_path: PathBuf,
     #[cfg(unix)]
     graceful_exit_signal_path: PathBuf,
+    #[cfg(unix)]
+    config_reload_signal_path: PathBuf,
 }
 
 impl std::fmt::Debug for SingleInstanceGuard {
@@ -2046,6 +2281,11 @@ impl SingleInstanceGuard {
         signal_graceful_exit_installed()
     }
 
+    /// Trigger live config hot-reload for a running instance scoped to `data_dir`.
+    pub fn signal_config_reload_for_data_dir(data_dir: &Path) -> bool {
+        signal_config_reload_for_data_dir(data_dir)
+    }
+
     pub fn instance_hash(&self) -> &str {
         &self.instance_hash
     }
@@ -2068,9 +2308,11 @@ impl SingleInstanceGuard {
         let mutex_name = format!("Local\\CatCloud_SI_{instance_hash}");
         let event_name = format!("Local\\CatCloud_Wake_{instance_hash}");
         let graceful_exit_name = graceful_exit_event_name_for_hash(&instance_hash);
+        let config_reload_name = config_reload_event_name_for_hash(&instance_hash);
         let wide_mutex = to_wide_null(&mutex_name);
         let wide_event = to_wide_null(&event_name);
         let wide_graceful_exit = to_wide_null(&graceful_exit_name);
+        let wide_config_reload = to_wide_null(&config_reload_name);
         let deadline = Instant::now() + wait_timeout;
 
         loop {
@@ -2144,6 +2386,18 @@ impl SingleInstanceGuard {
                     None
                 };
 
+                // Per-data_dir cross-IL auto-reset config hot-reload event (strictly checked for S:(ML;;NW;;;ME)).
+                let reload_ev = create_named_event_with_cross_il_sd(
+                    &wide_config_reload,
+                    &config_reload_name,
+                    true,
+                );
+                let reload_ev_opt = if reload_ev.is_null() {
+                    None
+                } else {
+                    Some(SendHandle(reload_ev))
+                };
+
                 return Ok(AcquireOutcome::Primary(Self {
                     instance_hash,
                     lock_identifier: mutex_name,
@@ -2154,6 +2408,7 @@ impl SingleInstanceGuard {
                     event_handle: Mutex::new(wake_ev_opt),
                     graceful_exit_event_handle: Mutex::new(exit_ev_opt),
                     installed_graceful_exit_event_handle: Mutex::new(installed_exit_opt),
+                    config_reload_event_handle: Mutex::new(reload_ev_opt),
                 }));
             }
 
@@ -2188,6 +2443,7 @@ impl SingleInstanceGuard {
         let lock_path = run_dir.join("instance.lock");
         let wakeup_signal_path = run_dir.join("wakeup.signal");
         let graceful_exit_signal_path = run_dir.join("graceful_exit.signal");
+        let config_reload_signal_path = run_dir.join("config_reload.signal");
         let deadline = Instant::now() + wait_timeout;
 
         loop {
@@ -2206,6 +2462,7 @@ impl SingleInstanceGuard {
                 let _ = file.flush();
                 let _ = std::fs::remove_file(&wakeup_signal_path);
                 let _ = std::fs::remove_file(&graceful_exit_signal_path);
+                let _ = std::fs::remove_file(&config_reload_signal_path);
                 return Ok(AcquireOutcome::Primary(Self {
                     instance_hash,
                     lock_identifier: lock_path.to_string_lossy().to_string(),
@@ -2214,6 +2471,7 @@ impl SingleInstanceGuard {
                     lock_file: Mutex::new(Some(file)),
                     wakeup_signal_path,
                     graceful_exit_signal_path,
+                    config_reload_signal_path,
                 }));
             }
 
@@ -2247,16 +2505,34 @@ impl SingleInstanceGuard {
 
     /// Start the unified background listener watching both secondary-instance wake signals
     /// (`on_wake`) and deterministic cross-IL graceful shutdown events (`on_graceful_exit`).
-    ///
-    /// On Windows, `WaitForMultipleObjects` always reserves index `0` for the dedicated anonymous
-    /// `stop_event`. Upon receiving any graceful-exit event, the listener immediately sets
-    /// `stop_flag = true`, dispatches `on_graceful_exit` asynchronously on a detached thread, and
-    /// immediately `break`s out of the loop so `RunEvent::Exit -> release() -> join()` can never
-    /// self-deadlock.
     pub fn start_instance_listeners<FW, FE>(&self, on_wake: FW, on_graceful_exit: FE) -> CatResult<()>
     where
         FW: Fn() + Send + 'static,
         FE: Fn() + Send + 'static,
+    {
+        self.start_instance_listeners_with_reload(on_wake, on_graceful_exit, || {})
+    }
+
+    /// Start the unified background listener watching secondary-instance wake signals (`on_wake`),
+    /// deterministic cross-IL graceful shutdown events (`on_graceful_exit`), and live config
+    /// hot-reload signals (`on_config_reload`).
+    ///
+    /// On Windows, `WaitForMultipleObjects` always reserves index `0` for the dedicated anonymous
+    /// `stop_event` and uses up to 5 handle slots. Receiving `config_reload_event_handle` invokes
+    /// `on_config_reload` and keeps listening (never sets `stop_flag` or `break`s). Upon receiving
+    /// any graceful-exit event, the listener immediately sets `stop_flag = true`, dispatches
+    /// `on_graceful_exit` asynchronously on a detached thread, and immediately `break`s out of the
+    /// loop so `RunEvent::Exit -> release() -> join()` can never self-deadlock.
+    pub fn start_instance_listeners_with_reload<FW, FE, FR>(
+        &self,
+        on_wake: FW,
+        on_graceful_exit: FE,
+        on_config_reload: FR,
+    ) -> CatResult<()>
+    where
+        FW: Fn() + Send + 'static,
+        FE: Fn() + Send + 'static,
+        FR: Fn() + Send + 'static,
     {
         let mut slot = self
             .listener_thread
@@ -2304,8 +2580,19 @@ impl SingleInstanceGuard {
                     .unwrap_or_else(|e| e.into_inner());
                 guard.as_ref().map(|h| h.0 as usize)
             };
+            let reload_addr = {
+                let guard = self
+                    .config_reload_event_handle
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().map(|h| h.0 as usize)
+            };
 
-            if wake_addr.is_none() && exit_addr.is_none() && installed_exit_addr.is_none() {
+            if wake_addr.is_none()
+                && exit_addr.is_none()
+                && installed_exit_addr.is_none()
+                && reload_addr.is_none()
+            {
                 return Err(CatError::Process(
                     "no instance listener event handles are initialized".into(),
                 ));
@@ -2315,7 +2602,7 @@ impl SingleInstanceGuard {
                 .name("catcloud-instance-listener".into())
                 .spawn(move || {
                     let mut handles: Vec<windows_sys::Win32::Foundation::HANDLE> =
-                        Vec::with_capacity(4);
+                        Vec::with_capacity(5);
                     // Index 0 is ALWAYS the dedicated anonymous stop_event.
                     handles.push(stop_addr as windows_sys::Win32::Foundation::HANDLE);
 
@@ -2330,6 +2617,11 @@ impl SingleInstanceGuard {
                         idx
                     });
                     let installed_exit_idx = installed_exit_addr.map(|addr| {
+                        let idx = handles.len();
+                        handles.push(addr as windows_sys::Win32::Foundation::HANDLE);
+                        idx
+                    });
+                    let reload_idx = reload_addr.map(|addr| {
                         let idx = handles.len();
                         handles.push(addr as windows_sys::Win32::Foundation::HANDLE);
                         idx
@@ -2360,6 +2652,9 @@ impl SingleInstanceGuard {
                         }
                         if Some(signaled_idx) == wake_idx {
                             on_wake();
+                        } else if Some(signaled_idx) == reload_idx {
+                            // Live Hot-Swap: never stop listener or break; invoke callback and continue waiting.
+                            on_config_reload();
                         } else if Some(signaled_idx) == exit_idx
                             || Some(signaled_idx) == installed_exit_idx
                         {
@@ -2395,13 +2690,15 @@ impl SingleInstanceGuard {
         {
             let wake_path = self.wakeup_signal_path.clone();
             let exit_path = self.graceful_exit_signal_path.clone();
+            let reload_path = self.config_reload_signal_path.clone();
             let handle = std::thread::Builder::new()
                 .name("catcloud-instance-listener".into())
                 .spawn(move || {
                     let mut on_graceful_exit = Some(on_graceful_exit);
                     while !stop.load(Ordering::Acquire) {
-                        if exit_path.exists() {
-                            let _ = std::fs::remove_file(&exit_path);
+                        // Consume each signal file atomically via `remove_file().is_ok()` to
+                        // eliminate the `exists() -> remove_file()` dropped-signal race window.
+                        if std::fs::remove_file(&exit_path).is_ok() {
                             if !stop.load(Ordering::Acquire) {
                                 stop.store(true, Ordering::Release);
                                 if let Some(cb) = on_graceful_exit.take() {
@@ -2414,10 +2711,14 @@ impl SingleInstanceGuard {
                             }
                             break;
                         }
-                        if wake_path.exists() {
-                            let _ = std::fs::remove_file(&wake_path);
+                        if std::fs::remove_file(&wake_path).is_ok() {
                             if !stop.load(Ordering::Acquire) {
                                 on_wake();
+                            }
+                        }
+                        if std::fs::remove_file(&reload_path).is_ok() {
+                            if !stop.load(Ordering::Acquire) {
+                                on_config_reload();
                             }
                         }
                         std::thread::sleep(Duration::from_millis(120));
@@ -2432,7 +2733,7 @@ impl SingleInstanceGuard {
 
     /// Immediately break the blocking instance listener wait via the dedicated anonymous
     /// `stop_event` so shutdown releases the single-instance lock in 0ms without touching
-    /// wakeup or graceful-exit named events.
+    /// wakeup, graceful-exit, or config-reload named events.
     pub fn signal_stop(&self) {
         self.stop_flag.store(true, Ordering::Release);
         #[cfg(target_os = "windows")]
@@ -2479,6 +2780,7 @@ impl SingleInstanceGuard {
             close_slot(&self.event_handle);
             close_slot(&self.graceful_exit_event_handle);
             close_slot(&self.installed_graceful_exit_event_handle);
+            close_slot(&self.config_reload_event_handle);
             close_slot(&self.mutex_handle);
         }
 
@@ -2486,6 +2788,12 @@ impl SingleInstanceGuard {
         {
             if let Ok(mut slot) = self.lock_file.lock() {
                 if let Some(file) = slot.take() {
+                    // Remove all three signal files BEFORE releasing the exclusive flock so a newly
+                    // acquiring next instance can never have its fresh signals deleted by us, and
+                    // repeated release()/Drop calls after unlock never touch the run directory.
+                    let _ = std::fs::remove_file(&self.wakeup_signal_path);
+                    let _ = std::fs::remove_file(&self.graceful_exit_signal_path);
+                    let _ = std::fs::remove_file(&self.config_reload_signal_path);
                     use std::os::unix::io::AsRawFd;
                     // SAFETY: Unlocking owned file descriptor prior to closing.
                     unsafe {
@@ -2494,8 +2802,6 @@ impl SingleInstanceGuard {
                     drop(file);
                 }
             }
-            let _ = std::fs::remove_file(&self.wakeup_signal_path);
-            let _ = std::fs::remove_file(&self.graceful_exit_signal_path);
         }
     }
 }
@@ -3085,5 +3391,277 @@ mod tests {
             let _ = CloseHandle(opened_ev);
             let _ = CloseHandle(pre_ev);
         }
+    }
+
+    #[test]
+    fn config_reload_listener_triggers_repeatedly_without_stopping_and_stops_after_release() {
+        let dir_a = make_temp_dir("config-reload-a");
+        let dir_b = make_temp_dir("config-reload-b");
+
+        let mut guard_a = match SingleInstanceGuard::acquire(&dir_a, Duration::ZERO).unwrap() {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary A"),
+        };
+        let mut guard_b = match SingleInstanceGuard::acquire(&dir_b, Duration::ZERO).unwrap() {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary B"),
+        };
+
+        #[cfg(target_os = "windows")]
+        {
+            let reload_ev = guard_a.config_reload_event_handle.lock().unwrap();
+            let h = reload_ev
+                .as_ref()
+                .expect("per-data_dir config reload event")
+                .0;
+            assert!(
+                verify_event_medium_mandatory_label(h, "test-config-reload"),
+                "per-data_dir config reload event must carry Medium mandatory label"
+            );
+        }
+
+        let woke_a = Arc::new(AtomicUsize::new(0));
+        let exited_a = Arc::new(AtomicUsize::new(0));
+        let reload_a = Arc::new(AtomicUsize::new(0));
+        let reload_b = Arc::new(AtomicUsize::new(0));
+
+        let woke_a_c = Arc::clone(&woke_a);
+        let exited_a_c = Arc::clone(&exited_a);
+        let reload_a_c = Arc::clone(&reload_a);
+        guard_a
+            .start_instance_listeners_with_reload(
+                move || {
+                    woke_a_c.fetch_add(1, Ordering::SeqCst);
+                },
+                move || {
+                    exited_a_c.fetch_add(1, Ordering::SeqCst);
+                },
+                move || {
+                    reload_a_c.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+
+        let reload_b_c = Arc::clone(&reload_b);
+        guard_b
+            .start_instance_listeners_with_reload(
+                || {},
+                || {},
+                move || {
+                    reload_b_c.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+
+        // Trigger config_reload 3 times sequentially: listener MUST remain alive and keep firing,
+        // without triggering wake, graceful_exit, or touching isolated dir_b.
+        for expected in 1..=3usize {
+            assert!(
+                signal_config_reload_for_data_dir(&dir_a),
+                "config_reload signal #{expected} must succeed while listener is active"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while reload_a.load(Ordering::SeqCst) < expected && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(15));
+            }
+            assert_eq!(
+                reload_a.load(Ordering::SeqCst),
+                expected,
+                "config_reload callback must fire on trigger #{expected}"
+            );
+        }
+        assert_eq!(woke_a.load(Ordering::SeqCst), 0);
+        assert_eq!(exited_a.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            reload_b.load(Ordering::SeqCst),
+            0,
+            "config_reload for dir_a must NOT touch isolated dir_b"
+        );
+
+        // After release(), dir_a's config_reload signal must return false and lock can be reacquired.
+        guard_a.release();
+        assert!(
+            !signal_config_reload_for_data_dir(&dir_a),
+            "released guard must no longer accept config_reload signals"
+        );
+        let reacquired = SingleInstanceGuard::acquire(&dir_a, Duration::ZERO).unwrap();
+        assert!(matches!(reacquired, AcquireOutcome::Primary(_)));
+        drop(reacquired);
+
+        guard_b.release();
+        let _ = std::fs::remove_dir_all(&dir_a);
+        let _ = std::fs::remove_dir_all(&dir_b);
+    }
+
+    #[test]
+    fn config_reload_request_ack_roundtrip_and_signal_and_wait_flow() {
+        let dir = make_temp_dir("config-reload-ack");
+
+        // 1. Direct request/ack atomic persistence roundtrip + matching req_id cleanup.
+        let req = ConfigReloadRequest {
+            req_id: "req-roundtrip-1".to_string(),
+            allow_l3_restart: true,
+            created_at_ms: 1_700_000_000_001,
+        };
+        write_config_reload_request(&dir, &req).expect("write config reload request");
+        assert_eq!(read_config_reload_request(&dir), Some(req.clone()));
+
+        let mismatched_ack = ConfigReloadAck {
+            req_id: "req-other".to_string(),
+            applied: true,
+            rejected: false,
+            level: Some("l2_hot_reload".to_string()),
+            error: None,
+            completed_at_ms: 1_700_000_000_005,
+        };
+        write_config_reload_ack(&dir, &mismatched_ack).expect("write mismatched ack");
+        assert_eq!(read_config_reload_ack(&dir), Some(mismatched_ack));
+        assert_eq!(
+            read_config_reload_request(&dir),
+            Some(req.clone()),
+            "mismatched ack must not delete a pending newer request"
+        );
+
+        let matching_ack = ConfigReloadAck {
+            req_id: req.req_id.clone(),
+            applied: true,
+            rejected: false,
+            level: Some("l2_hot_reload".to_string()),
+            error: None,
+            completed_at_ms: 1_700_000_000_010,
+        };
+        write_config_reload_ack(&dir, &matching_ack).expect("write matching ack");
+        assert_eq!(read_config_reload_ack(&dir), Some(matching_ack));
+        assert_eq!(
+            read_config_reload_request(&dir),
+            None,
+            "writing matching ack must clear stale request file"
+        );
+
+        // 2. When no live instance is running, signal_config_reload_and_wait returns None and cleans req.
+        let offline = signal_config_reload_and_wait(&dir, false, Duration::from_millis(200));
+        assert!(offline.is_none());
+        assert!(
+            !config_reload_run_dir(&dir)
+                .join(CONFIG_RELOAD_REQ_FILE)
+                .exists(),
+            "offline signal_config_reload_and_wait must clean up orphaned request file"
+        );
+
+        // 3. With a live listener answering with matching ConfigReloadAck, roundtrip succeeds.
+        let mut guard = match SingleInstanceGuard::acquire(&dir, Duration::ZERO).unwrap() {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary"),
+        };
+        let observed_allow_l3 = Arc::new(AtomicBool::new(false));
+        let observed_c = Arc::clone(&observed_allow_l3);
+        let dir_cb = dir.clone();
+        guard
+            .start_instance_listeners_with_reload(
+                || {},
+                || {},
+                move || {
+                    if let Some(pending) = read_config_reload_request(&dir_cb) {
+                        observed_c.store(pending.allow_l3_restart, Ordering::SeqCst);
+                        let ack = ConfigReloadAck {
+                            req_id: pending.req_id,
+                            applied: true,
+                            rejected: false,
+                            level: Some("l2_hot_reload".to_string()),
+                            error: None,
+                            completed_at_ms: now_unix_millis(),
+                        };
+                        let _ = write_config_reload_ack(&dir_cb, &ack);
+                    }
+                },
+            )
+            .unwrap();
+
+        let live_ack = signal_config_reload_and_wait(&dir, true, Duration::from_secs(2))
+            .expect("expected live ConfigReloadAck from running listener");
+        assert!(live_ack.applied);
+        assert!(!live_ack.rejected);
+        assert_eq!(live_ack.level.as_deref(), Some("l2_hot_reload"));
+        assert!(live_ack.error.is_none());
+        assert!(observed_allow_l3.load(Ordering::SeqCst));
+        assert_eq!(
+            read_config_reload_request(&dir),
+            None,
+            "completed reload ack must remove its request file"
+        );
+
+        guard.release();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_reload_wait_outcome_cleans_req_on_timeout_and_probes_primary_liveness() {
+        let dir = make_temp_dir("config-reload-timeout");
+
+        // 1. Offline: not alive and wait_outcome returns NotRunning without leaving request file.
+        assert!(!is_primary_instance_alive(&dir));
+        let offline =
+            signal_config_reload_and_wait_outcome(&dir, true, Duration::from_millis(120));
+        assert_eq!(offline, ConfigReloadWaitOutcome::NotRunning);
+        assert_eq!(
+            read_config_reload_request(&dir),
+            None,
+            "NotRunning outcome must not leave stale allow_l3_restart request file"
+        );
+
+        // 2. Live primary without ack response: is_primary_instance_alive is true,
+        //    wait_outcome returns TimedOut { req_id }, and lingering request file is cleaned up.
+        let mut guard = match SingleInstanceGuard::acquire(&dir, Duration::ZERO).unwrap() {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary"),
+        };
+        assert!(is_primary_instance_alive(&dir));
+
+        let signaled = Arc::new(AtomicBool::new(false));
+        let signaled_c = Arc::clone(&signaled);
+        guard
+            .start_instance_listeners_with_reload(
+                || {},
+                || {},
+                move || {
+                    signaled_c.store(true, Ordering::SeqCst);
+                },
+            )
+            .unwrap();
+
+        let timed_out =
+            signal_config_reload_and_wait_outcome(&dir, true, Duration::from_millis(160));
+        match timed_out {
+            ConfigReloadWaitOutcome::TimedOut { req_id } => {
+                assert!(!req_id.is_empty(), "TimedOut outcome must carry req_id");
+            }
+            other => panic!("expected TimedOut outcome, got {other:?}"),
+        }
+        assert!(signaled.load(Ordering::SeqCst));
+        assert_eq!(
+            read_config_reload_request(&dir),
+            None,
+            "TimedOut outcome must delete matching config_reload_req.json to prevent allow_l3_restart leak"
+        );
+
+        // 3. Matching cleanup helper must never delete a newer concurrent request with different req_id.
+        let newer_req = ConfigReloadRequest {
+            req_id: "reload-newer-concurrent".to_string(),
+            allow_l3_restart: false,
+            created_at_ms: now_unix_millis(),
+        };
+        write_config_reload_request(&dir, &newer_req).expect("write newer request");
+        assert!(!clear_config_reload_request_if_matching(&dir, "reload-old-id"));
+        assert_eq!(read_config_reload_request(&dir), Some(newer_req));
+        assert!(clear_config_reload_request_if_matching(
+            &dir,
+            "reload-newer-concurrent"
+        ));
+        assert_eq!(read_config_reload_request(&dir), None);
+
+        // 4. After release, primary liveness probe returns false cleanly.
+        guard.release();
+        assert!(!is_primary_instance_alive(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

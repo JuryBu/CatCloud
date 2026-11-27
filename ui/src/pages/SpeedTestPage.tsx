@@ -812,6 +812,11 @@ export function SpeedTestPage({
     false,
     isBoolPref
   );
+  const [moreFiltersOpen, setMoreFiltersOpen] = usePersistedState<boolean>(
+    "speedtest.moreFiltersOpen",
+    false,
+    isBoolPref
+  );
   const [showAddProbe, setShowAddProbe] = useState(false);
   const [newProbeId, setNewProbeId] = useState("");
   const [newProbeName, setNewProbeName] = useState("");
@@ -1246,7 +1251,14 @@ export function SpeedTestPage({
     if (!sourceOptions.some((opt) => opt.id === sourceFilter)) {
       setSourceFilter("all");
     }
-  }, [initialized, sourceFilter, sourceOptions]);
+  }, [initialized, sourceFilter, sourceOptions, setSourceFilter]);
+
+  useEffect(() => {
+    if (!initialized || groupFilter === "all") return;
+    if (groups.every((g) => g.id !== groupFilter)) {
+      setGroupFilter("all");
+    }
+  }, [initialized, groupFilter, groups, setGroupFilter]);
 
   // Pre-build O(1) lookup structures per group: Map<groupId, Set<nodeId>> & compiled dynamic filters
   const groupMemberSetById = useMemo(() => {
@@ -1608,6 +1620,12 @@ export function SpeedTestPage({
     totalFiltered > 0 && selectedInFilteredCount === totalFiltered;
   const allPageSelected =
     pagedRows.length > 0 && pagedRows.every((r) => validSelectedIds.has(r.node.id));
+
+  const moreFilterActiveCount =
+    (sourceFilter !== "all" ? 1 : 0) +
+    (groupFilter !== "all" ? 1 : 0) +
+    (filterContinent !== "all" || regionFilter !== "all" ? 1 : 0) +
+    (onlyTested ? 1 : 0);
 
   const hasActiveFilters =
     searchQuery.trim().length > 0 ||
@@ -2178,28 +2196,10 @@ export function SpeedTestPage({
                 </p>
               </div>
             </div>
-
-            <button
-              type="button"
-              onClick={() => setShowProbeSettings((v) => !v)}
-              className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors ${
-                showProbeSettings
-                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
-              }`}
-            >
-              <Settings className="h-3.5 w-3.5 shrink-0" />
-              <span>测速项目设置 ({enabledProbeCount} 项)</span>
-              {showProbeSettings ? (
-                <ChevronUp className="h-3.5 w-3.5 shrink-0" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-              )}
-            </button>
           </div>
         )}
 
-        {/* Primary & Auxiliary Speed Test Controls + Pre-Accel & Keepalive Toggles */}
+        {/* Clean Primary Speed Test Controls + Collapsible Probe Options Trigger */}
         <div className={`${embedded ? "" : "mt-3.5"} flex flex-wrap items-center gap-2`}>
           <button
             type="button"
@@ -2210,15 +2210,10 @@ export function SpeedTestPage({
                 ? "国内提速对比测速正在后台进行，完成后可测速"
                 : "主推省流方案：一次测出延迟、谷歌是否送中与 AI 解锁，约 0.2 MB/节点"
             }
-            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
+            className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3.5 py-2 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-55"
           >
             <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
             <span>{dict.nodes.recommendedProbeBtn}</span>
-            {!embedded && (
-              <span className="rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium">
-                约 0.2 MB/节点
-              </span>
-            )}
             <span className="hidden rounded-md bg-black/15 px-1.5 py-0.5 text-[10px] font-medium sm:inline">
               {targetCountTag}
             </span>
@@ -2237,11 +2232,6 @@ export function SpeedTestPage({
           >
             <Rocket className="h-3.5 w-3.5 shrink-0" />
             <span>含上下行完整测速</span>
-            {!embedded && (
-              <span className="rounded-md bg-[var(--card)]/80 px-1.5 py-0.5 text-[10px] font-medium text-[var(--text-secondary)]">
-                测真实上传/下载，约 3 MB/节点
-              </span>
-            )}
           </button>
 
           <button
@@ -2259,79 +2249,32 @@ export function SpeedTestPage({
             <span>仅快测延迟</span>
           </button>
 
-          <span className="mx-0.5 hidden h-5 w-px bg-[var(--line)] sm:inline-block" aria-hidden="true" />
-
           <button
             type="button"
-            role="switch"
-            aria-checked={usePreaccelForProbe && hasEnabledPreAccelRelay}
-            disabled={isRunning || !hasEnabledPreAccelRelay}
-            onClick={() => {
-              const next = !(usePreaccelForProbe && hasEnabledPreAccelRelay);
-              setManualUsePreaccel(next);
-              writeUiPref("speedtest.usePreaccel", next);
-            }}
-            title={
-              hasEnabledPreAccelRelay
-                ? "开启后测速将经由已启用的国内 443 中转测出真实提速表现；关闭可裸连对比"
-                : "需先在「国内提速」中添加并启用国内中转机，方可走国内 443 提速测速"
-            }
-            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
-              usePreaccelForProbe && hasEnabledPreAccelRelay
-                ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
-                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
-            }`}
-          >
-            <Zap className="h-3.5 w-3.5 shrink-0" />
-            <span>{embedded ? "走国内 443 提速" : "同步走国内 443 提速测速"}</span>
-            <span
-              className={`h-2 w-2 shrink-0 rounded-full ${
-                usePreaccelForProbe && hasEnabledPreAccelRelay
-                  ? "bg-[var(--green)]"
-                  : "bg-[var(--muted)]/50"
-              }`}
-            />
-          </button>
-
-          <label
-            title="开启后每节点多耗时约 1 分钟，仅排查断流时建议勾选（与测速项目设置中的 60 秒长连接同步）"
-            className={`inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-2 text-xs transition-colors ${
-              includeKeepalive
-                ? "border-[var(--amber)]/60 bg-[var(--amber-soft)] text-[var(--amber)]"
-                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
-            } ${isRunning ? "pointer-events-none opacity-65" : ""}`}
-          >
-            <input
-              type="checkbox"
-              checked={includeKeepalive}
-              disabled={isRunning}
-              onChange={(e) => setKeepaliveSynced(e.target.checked)}
-              className="h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
-            />
-            <Clock className="h-3.5 w-3.5 shrink-0" />
-            <span className="font-medium">{embedded ? "60秒长连接" : "附带测 60 秒长连接"}</span>
-          </label>
-
-          {embedded && (
-            <button
-              type="button"
-              onClick={() => setShowProbeSettings((v) => !v)}
-              className={`ml-auto inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-2 text-xs font-medium transition-colors ${
-                showProbeSettings
-                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+            aria-expanded={showProbeSettings}
+            onClick={() => setShowProbeSettings((v) => !v)}
+            className={`ml-auto inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-2 text-xs font-medium transition-colors ${
+              showProbeSettings
+                ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                : includeKeepalive
+                  ? "border-[var(--amber)]/60 bg-[var(--amber-soft)]/50 text-[var(--text)] hover:border-[var(--amber)]"
                   : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
-              }`}
-              title="自定义测速项目与网站解锁检测"
-            >
-              <Settings className="h-3.5 w-3.5 shrink-0" />
-              <span>测速项 ({enabledProbeCount})</span>
-              {showProbeSettings ? (
-                <ChevronUp className="h-3.5 w-3.5 shrink-0" />
-              ) : (
-                <ChevronDown className="h-3.5 w-3.5 shrink-0" />
-              )}
-            </button>
-          )}
+            }`}
+            title="展开测速选项（国内提速、60 秒长连接与自定义测速项目）"
+          >
+            <Settings className="h-3.5 w-3.5 shrink-0" />
+            <span>{dict.speedTest.probeOptionsBtn}</span>
+            {includeKeepalive && (
+              <span className="rounded-full border border-[var(--amber)]/50 bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
+                {dict.speedTest.keepaliveActiveTag}
+              </span>
+            )}
+            {showProbeSettings ? (
+              <ChevronUp className="h-3.5 w-3.5 shrink-0" />
+            ) : (
+              <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+            )}
+          </button>
         </div>
 
         {/* Shared Probe Engine Mutex Notice when PreAccel Benchmark is Running */}
@@ -2468,12 +2411,69 @@ export function SpeedTestPage({
         )}
       </section>
 
-      {/* Collapsible Probe Settings Drawer (Hidden by Default) */}
+      {/* Collapsible Probe Options & Settings Drawer (Hidden by Default) */}
       {showProbeSettings && (
         <section className="cc-card cc-glass rounded-2xl p-4">
+          {/* Quick Execution Options: Pre-Accel & 60s Keepalive */}
+          <div className="mb-3.5 flex flex-wrap items-center gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/70 p-2.5">
+            <button
+              type="button"
+              role="switch"
+              aria-checked={usePreaccelForProbe && hasEnabledPreAccelRelay}
+              disabled={isRunning || !hasEnabledPreAccelRelay}
+              onClick={() => {
+                const next = !(usePreaccelForProbe && hasEnabledPreAccelRelay);
+                setManualUsePreaccel(next);
+                writeUiPref("speedtest.usePreaccel", next);
+              }}
+              title={
+                hasEnabledPreAccelRelay
+                  ? "开启后测速将经由已启用的国内提速线路测出真实提速表现；关闭可裸连对比"
+                  : "需先在「国内提速」中添加并启用国内提速线路，方可走国内提速测速"
+              }
+              className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-55 ${
+                usePreaccelForProbe && hasEnabledPreAccelRelay
+                  ? "border-[var(--green)]/55 bg-[var(--green-soft)] text-[var(--green)]"
+                  : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+              }`}
+            >
+              <Zap className="h-3.5 w-3.5 shrink-0" />
+              <span>同步走国内提速测速</span>
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  usePreaccelForProbe && hasEnabledPreAccelRelay
+                    ? "bg-[var(--green)]"
+                    : "bg-[var(--muted)]/50"
+                }`}
+              />
+            </button>
+
+            <label
+              title="开启后每节点多耗时约 1 分钟，仅排查断流时建议勾选（与下方测速项目中的 60 秒长连接同步）"
+              className={`inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-xl border px-3 py-1.5 text-xs transition-colors ${
+                includeKeepalive
+                  ? "border-[var(--amber)]/60 bg-[var(--amber-soft)] text-[var(--amber)]"
+                  : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)] hover:border-[var(--line-strong)] hover:text-[var(--text)]"
+              } ${isRunning ? "pointer-events-none opacity-65" : ""}`}
+            >
+              <input
+                type="checkbox"
+                checked={includeKeepalive}
+                disabled={isRunning}
+                onChange={(e) => setKeepaliveSynced(e.target.checked)}
+                className="h-3.5 w-3.5 shrink-0 accent-[var(--accent)]"
+              />
+              <Clock className="h-3.5 w-3.5 shrink-0" />
+              <span className="font-medium">附带测 60 秒长连接</span>
+              <span className="text-[10.5px] opacity-80">（每节点约 +1 分钟）</span>
+            </label>
+          </div>
+
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <div>
-              <h2 className="text-sm font-semibold text-[var(--text)]">测速项目设置</h2>
+              <h2 className="text-sm font-semibold text-[var(--text)]">
+                测速项目设置（{enabledProbeCount} 项已启用）
+              </h2>
               <p className="mt-0.5 text-[11px] text-[var(--muted)]">
                 可自由开关各项测速内容，或添加自定义的测速网址与网站解锁检查
               </p>
@@ -2693,7 +2693,7 @@ export function SpeedTestPage({
                     <div className="flex items-center justify-between gap-2">
                       <span className="truncate opacity-85">
                         {probe.kind === "keepalive"
-                          ? "与顶部「附带测 60 秒长连接」同步"
+                          ? "与上方「附带测 60 秒长连接」同步"
                           : PROBE_KIND_LABELS[probe.kind]}
                       </span>
                       <span className="cc-mono shrink-0 opacity-85">
@@ -2710,9 +2710,9 @@ export function SpeedTestPage({
 
       {/* Filter Bar + Multi-Select Status Bar + Streaming Results Table */}
       <section className="cc-card cc-glass rounded-2xl p-4">
-        {/* Clean Intuitive Filter Row */}
+        {/* Clean First-Screen Filter Row: Search + Golden + Google Clean + AI Ready + More Filters + Reset */}
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <div className="relative min-w-[180px] flex-1 sm:max-w-[240px]">
+          <div className="relative min-w-[180px] flex-1 sm:max-w-[260px]">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
             <input
               type="text"
@@ -2738,62 +2738,6 @@ export function SpeedTestPage({
               </button>
             )}
           </div>
-
-          <div className="inline-flex items-center gap-1.5">
-            <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-            <AppSelect
-              aria-label="按来源筛选"
-              size="sm"
-              value={sourceFilter}
-              onChange={(v) => {
-                setSourceFilter(v);
-                setPage(1);
-              }}
-              options={[
-                { value: "all", label: "全部来源" },
-                ...sourceOptions.map((sub) => ({ value: sub.id, label: sub.name })),
-              ]}
-              className="min-w-[120px] max-w-[190px]"
-              buttonClassName="rounded-lg"
-            />
-          </div>
-
-          <div className="inline-flex items-center gap-1.5">
-            <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-            <AppSelect
-              aria-label="按多选组筛选"
-              size="sm"
-              value={groupFilter}
-              onChange={(v) => {
-                setGroupFilter(v);
-                setPage(1);
-              }}
-              options={[
-                { value: "all", label: "全部多选组" },
-                ...groups.map((grp) => ({
-                  value: grp.id,
-                  label: formatGroupDisplayName(grp.name),
-                })),
-              ]}
-              className="min-w-[128px] max-w-[200px]"
-              buttonClassName="rounded-lg"
-            />
-          </div>
-
-          <ContinentRegionFilter
-            variant="select"
-            stats={regionStats}
-            continent={filterContinent}
-            region={regionFilter}
-            onContinentChange={(c) => {
-              setFilterContinent(c);
-              setPage(1);
-            }}
-            onRegionChange={(r) => {
-              setRegionFilter(r);
-              setPage(1);
-            }}
-          />
 
           <button
             type="button"
@@ -2845,68 +2789,157 @@ export function SpeedTestPage({
 
           <button
             type="button"
-            onClick={() => {
-              setOnlyTested((v) => !v);
-              setPage(1);
-            }}
-            className={`shrink-0 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-              onlyTested
+            aria-expanded={moreFiltersOpen}
+            onClick={() => setMoreFiltersOpen((v) => !v)}
+            className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+              moreFiltersOpen
                 ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+                : moreFilterActiveCount > 0
+                  ? "border-[var(--amber)]/60 bg-[var(--amber-soft)]/50 text-[var(--text)] hover:border-[var(--amber)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
             }`}
           >
-            仅看已测
+            <Filter className="h-3.5 w-3.5 shrink-0" />
+            <span>{dict.speedTest.moreFiltersBtn}</span>
+            {moreFilterActiveCount > 0 && (
+              <span className="cc-mono rounded-full border border-[var(--amber)]/50 bg-[var(--amber-soft)] px-1.5 py-0.2 text-[10px] font-semibold text-[var(--amber)]">
+                {formatI18nTemplate(dict.speedTest.activeFiltersCount, {
+                  count: moreFilterActiveCount,
+                })}
+              </span>
+            )}
+            {moreFiltersOpen ? (
+              <ChevronUp className="h-3.5 w-3.5 shrink-0" />
+            ) : (
+              <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+            )}
           </button>
-
-          {/* Quick Sort Pills: Upload Fastest / Download Fastest / Lowest Latency */}
-          <div
-            className="inline-flex shrink-0 items-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]"
-            role="group"
-            aria-label="快捷排序"
-          >
-            {(
-              [
-                { key: "up", dir: "desc", label: "上传最快" },
-                { key: "down", dir: "desc", label: "下载最快" },
-                { key: "latency", dir: "asc", label: "延迟最低" },
-              ] as const
-            ).map((opt) => {
-              const active = effectiveSortKey === opt.key && effectiveSortDir === opt.dir;
-              return (
-                <button
-                  key={opt.key}
-                  type="button"
-                  onClick={() => {
-                    setSortKey(opt.key);
-                    setSortDir(opt.dir);
-                    if (onlyGolden) {
-                      setGoldenManualSortOverride(true);
-                    }
-                    setPage(1);
-                  }}
-                  className={`shrink-0 whitespace-nowrap rounded-md px-2 py-1 font-medium transition-colors ${
-                    active
-                      ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
-                      : "text-[var(--muted)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-          </div>
 
           {hasActiveFilters && (
             <button
               type="button"
               onClick={handleResetFilters}
-              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg px-2 py-1.5 text-[11px] text-[var(--muted)] transition-colors hover:text-[var(--text)]"
+              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
             >
               <RotateCcw className="h-3 w-3 shrink-0" />
-              <span>重置</span>
+              <span>{dict.speedTest.resetFiltersBtn}</span>
             </button>
           )}
         </div>
+
+        {/* Collapsible More Filters Panel: Source, Multi-Group, Continent/Region, Tested State & Quick Sort */}
+        {moreFiltersOpen && (
+          <div className="mt-2.5 flex flex-wrap items-center gap-2 border-t border-[var(--line)]/60 pt-2.5 text-xs">
+            <div className="inline-flex items-center gap-1.5">
+              <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+              <AppSelect
+                aria-label="按来源筛选"
+                size="sm"
+                value={sourceFilter}
+                onChange={(v) => {
+                  setSourceFilter(v);
+                  setPage(1);
+                }}
+                options={[
+                  { value: "all", label: "全部来源" },
+                  ...sourceOptions.map((sub) => ({ value: sub.id, label: sub.name })),
+                ]}
+                className="min-w-[120px] max-w-[190px]"
+                buttonClassName="rounded-lg"
+              />
+            </div>
+
+            <div className="inline-flex items-center gap-1.5">
+              <Layers className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+              <AppSelect
+                aria-label="按多选组筛选"
+                size="sm"
+                value={groupFilter}
+                onChange={(v) => {
+                  setGroupFilter(v);
+                  setPage(1);
+                }}
+                options={[
+                  { value: "all", label: "全部多选组" },
+                  ...groups.map((grp) => ({
+                    value: grp.id,
+                    label: formatGroupDisplayName(grp.name),
+                  })),
+                ]}
+                className="min-w-[128px] max-w-[200px]"
+                buttonClassName="rounded-lg"
+              />
+            </div>
+
+            <ContinentRegionFilter
+              variant="select"
+              stats={regionStats}
+              continent={filterContinent}
+              region={regionFilter}
+              onContinentChange={(c) => {
+                setFilterContinent(c);
+                setPage(1);
+              }}
+              onRegionChange={(r) => {
+                setRegionFilter(r);
+                setPage(1);
+              }}
+            />
+
+            <button
+              type="button"
+              onClick={() => {
+                setOnlyTested((v) => !v);
+                setPage(1);
+              }}
+              className={`shrink-0 whitespace-nowrap rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
+                onlyTested
+                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
+                  : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--muted)] hover:text-[var(--text)]"
+              }`}
+            >
+              仅看已测
+            </button>
+
+            {/* Quick Sort Pills: Upload Fastest / Download Fastest / Lowest Latency */}
+            <div
+              className="inline-flex shrink-0 items-center rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-[11px]"
+              role="group"
+              aria-label="快捷排序"
+            >
+              {(
+                [
+                  { key: "up", dir: "desc", label: "上传最快" },
+                  { key: "down", dir: "desc", label: "下载最快" },
+                  { key: "latency", dir: "asc", label: "延迟最低" },
+                ] as const
+              ).map((opt) => {
+                const active = effectiveSortKey === opt.key && effectiveSortDir === opt.dir;
+                return (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => {
+                      setSortKey(opt.key);
+                      setSortDir(opt.dir);
+                      if (onlyGolden) {
+                        setGoldenManualSortOverride(true);
+                      }
+                      setPage(1);
+                    }}
+                    className={`shrink-0 whitespace-nowrap rounded-md px-2 py-1 font-medium transition-colors ${
+                      active
+                        ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
+                        : "text-[var(--muted)] hover:text-[var(--text)]"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Prominent Hint Banner when Golden Filter Hides Core-Qualified Candidates Without Speed Tests */}
         {onlyGolden && goldenHiddenCandidates.length > 0 && (
@@ -3213,19 +3246,6 @@ export function SpeedTestPage({
                     healthHint,
                     cooldownRemainingSec
                   );
-                  const latSourceShort =
-                    resolvedLatency.latencyMs !== null
-                      ? resolvedLatency.source === "health"
-                        ? dict.latency.sourceHealthShort
-                        : resolvedLatency.source === "probe"
-                          ? dict.latency.sourceProbeShort
-                          : null
-                      : null;
-                  const latStateBadge = resolvedLatency.isDegraded
-                    ? dict.latency.degradedBadge
-                    : resolvedLatency.isProbation
-                      ? dict.latency.probationBadge
-                      : null;
 
                   return (
                     <tr
@@ -3386,23 +3406,21 @@ export function SpeedTestPage({
                         {isCooldown ? (
                           <div>
                             <span
-                              className="whitespace-nowrap font-semibold text-[var(--amber)]"
+                              className="inline-flex items-center gap-1.5 whitespace-nowrap font-semibold text-[var(--amber)]"
                               title={latTooltip}
                             >
-                              {cooldownRemainingSec > 0
-                                ? formatI18nTemplate(dict.latency.cooldownSec, {
-                                    sec: cooldownRemainingSec,
-                                  })
-                                : dict.latency.cooldownActive}
+                              <span
+                                className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]"
+                                aria-hidden="true"
+                              />
+                              <span>
+                                {cooldownRemainingSec > 0
+                                  ? formatI18nTemplate(dict.latency.cooldownSec, {
+                                      sec: cooldownRemainingSec,
+                                    })
+                                  : dict.latency.cooldownActive}
+                              </span>
                             </span>
-                            {healthHint?.reason?.trim() && (
-                              <div
-                                className="mt-0.5 max-w-[66px] truncate font-sans text-[9.5px] text-[var(--amber)]/90"
-                                title={healthHint.reason.trim()}
-                              >
-                                {healthHint.reason.trim()}
-                              </div>
-                            )}
                             {snap?.keepalive_60s_ok !== null &&
                               snap?.keepalive_60s_ok !== undefined && (
                                 <div
@@ -3419,12 +3437,22 @@ export function SpeedTestPage({
                         ) : resolvedLatency.state !== "untested" || snap ? (
                           <div>
                             <span
-                              className="inline-flex flex-wrap items-center gap-0.5 whitespace-nowrap font-semibold"
+                              className="inline-flex items-center gap-1.5 whitespace-nowrap font-semibold"
                               style={{
                                 color: getLatencyColor(effectiveLatencyMs, effectiveLatencyOk),
                               }}
                               title={latTooltip}
                             >
+                              <span
+                                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                                style={{
+                                  backgroundColor: getLatencyColor(
+                                    effectiveLatencyMs,
+                                    effectiveLatencyOk
+                                  ),
+                                }}
+                                aria-hidden="true"
+                              />
                               <span>
                                 {effectiveLatencyMs !== null
                                   ? `${Math.round(effectiveLatencyMs)} ms`
@@ -3433,23 +3461,6 @@ export function SpeedTestPage({
                                     : "--"}
                               </span>
                             </span>
-                            {(latSourceShort || latStateBadge) && (
-                              <div
-                                className="mt-0.5 flex flex-wrap items-center gap-0.5 font-sans text-[9px] leading-tight"
-                                title={latTooltip}
-                              >
-                                {latSourceShort && (
-                                  <span className="rounded bg-[var(--bg-elevated)] px-1 py-[1px] text-[var(--muted)]">
-                                    {latSourceShort}
-                                  </span>
-                                )}
-                                {latStateBadge && (
-                                  <span className="rounded bg-[var(--amber-soft)] px-1 py-[1px] font-medium text-[var(--amber)]">
-                                    {latStateBadge}
-                                  </span>
-                                )}
-                              </div>
-                            )}
                             {snap?.keepalive_60s_ok !== null &&
                               snap?.keepalive_60s_ok !== undefined && (
                                 <div
@@ -3464,8 +3475,15 @@ export function SpeedTestPage({
                               )}
                           </div>
                         ) : (
-                          <span className="text-[var(--muted)]" title={latTooltip}>
-                            --
+                          <span
+                            className="inline-flex items-center gap-1.5 text-[var(--muted)]"
+                            title={latTooltip}
+                          >
+                            <span
+                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--muted)]/55"
+                              aria-hidden="true"
+                            />
+                            <span>--</span>
                           </span>
                         )}
                       </td>
@@ -3753,7 +3771,7 @@ export function SpeedTestPage({
                             className="inline-flex items-center gap-1 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-3 py-1 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
                           >
                             <RotateCcw className="h-3 w-3" />
-                            <span>重置筛选</span>
+                            <span>{dict.speedTest.resetFiltersBtn}</span>
                           </button>
                         )}
                       </div>

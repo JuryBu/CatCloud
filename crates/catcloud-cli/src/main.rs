@@ -318,6 +318,23 @@ mod tests {
             ],
             &["catcloud", "config", "validate", "--json"],
             &["catcloud", "config", "reload", "--dry-run", "--json"],
+            &[
+                "catcloud",
+                "config",
+                "reload",
+                "--force",
+                "--allow-restart",
+                "--json",
+            ],
+            &["catcloud", "reload", "--json"],
+            &["catcloud", "reload", "--dry-run", "--json"],
+            &[
+                "catcloud",
+                "reload",
+                "--force",
+                "--allow-restart",
+                "--json",
+            ],
             &["catcloud", "config", "compile", "--json"],
             &[
                 "catcloud",
@@ -917,5 +934,52 @@ mod tests {
         assert!(!recv_args.no_groups);
         assert!(!recv_args.no_nodes);
         assert!(!recv_args.no_relays);
+    }
+
+    #[test]
+    fn cli_reload_top_level_and_config_reload_flags_parse_correctly() {
+        let top_default = Cli::try_parse_from(["catcloud", "reload"]).expect("reload default");
+        let Commands::Reload(args) = top_default.command else {
+            panic!("expected Commands::Reload");
+        };
+        assert!(!args.dry_run);
+        assert!(!args.force);
+        assert!(!args.allow_restart);
+
+        let top_flags = Cli::try_parse_from([
+            "catcloud",
+            "reload",
+            "--dry-run",
+            "--force",
+            "--allow-restart",
+            "--json",
+        ])
+        .expect("reload flags");
+        assert!(top_flags.json);
+        let Commands::Reload(args) = top_flags.command else {
+            panic!("expected Commands::Reload");
+        };
+        assert!(args.dry_run);
+        assert!(args.force);
+        assert!(args.allow_restart);
+
+        let cfg_reload = Cli::try_parse_from([
+            "catcloud",
+            "config",
+            "reload",
+            "--force",
+            "--allow-restart",
+            "--json",
+        ])
+        .expect("config reload flags");
+        let Commands::Config {
+            action: commands::ConfigCommand::Reload(cfg_args),
+        } = cfg_reload.command
+        else {
+            panic!("expected Config::Reload");
+        };
+        assert!(!cfg_args.dry_run);
+        assert!(cfg_args.force);
+        assert!(cfg_args.allow_restart);
     }
 }

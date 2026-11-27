@@ -2,70 +2,132 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { isTauriEnv } from "../api/tauri";
-import { normalizeUiLanguage, useUiDict } from "../i18n";
+import { normalizeUiLanguage, type UiLanguage, useUiDict } from "../i18n";
 import { selectHasBackgroundActivity, useAppSelector } from "../store/appStore";
 import { resolvePlatformOs } from "../utils/platform";
 import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
+
+const TITLEBAR_STATUS_COPY: Record<
+  UiLanguage,
+  { coreError: string; captiveWarn: string }
+> = {
+  "zh-CN": { coreError: "核心异常", captiveWarn: "待认证" },
+  en: { coreError: "Core Error", captiveWarn: "Auth Needed" },
+  ja: { coreError: "コア異常", captiveWarn: "認証待ち" },
+  ru: { coreError: "Ошибка ядра", captiveWarn: "Вход в сеть" },
+};
 
 function resolveModeBadge(
   status: string,
   proxyMode: string,
   preaccel: PreAccelSummary,
+  hasEnabledRelay: boolean,
   dict: ReturnType<typeof useUiDict>,
-  isZh: boolean
-): { label: string; dotColor: string } {
+  uiLang: UiLanguage
+): { label: string; dotColor: string; title: string } {
+  const statusCopy = TITLEBAR_STATUS_COPY[uiLang];
+
   if (!preaccel.proxyActive) {
     if (status === "error") {
-      return { label: isZh ? "核心异常" : dict.mascot.approval, dotColor: "var(--red)" };
+      return {
+        label: statusCopy.coreError,
+        dotColor: "var(--red)",
+        title: statusCopy.coreError,
+      };
     }
-    if (preaccel.realWinDivertActive) {
+    if (preaccel.enabled && !hasEnabledRelay) {
+      if (status === "warn") {
+        return {
+          label: statusCopy.captiveWarn,
+          dotColor: "var(--amber)",
+          title: statusCopy.captiveWarn,
+        };
+      }
+      return {
+        label: preaccel.badgeText,
+        dotColor: "var(--amber)",
+        title: preaccel.detailText,
+      };
+    }
+    if (preaccel.realWinDivertActive && hasEnabledRelay) {
       if (preaccel.verifyState === "probing") {
         return {
           label: dict.nav.preaccelProbingBadge,
           dotColor: "var(--amber)",
+          title: preaccel.detailText,
         };
       }
       if (preaccel.verifyState === "verified") {
+        const label = preaccel.verifyLatencyMs
+          ? `${dict.nav.preaccelVerifiedBadge} ${preaccel.verifyLatencyMs}ms`
+          : dict.nav.preaccelVerifiedBadge;
         return {
-          label: preaccel.verifyLatencyMs
-            ? `${dict.nav.preaccelVerifiedBadge} ${preaccel.verifyLatencyMs}ms`
-            : dict.nav.preaccelVerifiedBadge,
+          label,
           dotColor: status === "warn" ? "var(--amber)" : "var(--green)",
+          title: preaccel.detailText,
         };
       }
       return {
         label: dict.nav.preaccelActiveBadge,
         dotColor: status === "warn" ? "var(--amber)" : "var(--accent)",
+        title: preaccel.detailText,
       };
     }
-    if (preaccel.enabled) {
-      if (preaccel.installState === "downloading" || preaccel.installState === "verifying") {
-        return { label: isZh ? "准备提速组件…" : dict.common.loading, dotColor: "var(--amber)" };
-      }
-      if (preaccel.installState === "need_elevation") {
-        return { label: isZh ? "提速需管理员" : dict.mascot.approval, dotColor: "var(--amber)" };
+    if (preaccel.enabled && hasEnabledRelay) {
+      if (
+        preaccel.installState === "downloading" ||
+        preaccel.installState === "verifying" ||
+        preaccel.installState === "need_elevation"
+      ) {
+        return {
+          label: preaccel.badgeText,
+          dotColor: "var(--amber)",
+          title: preaccel.detailText,
+        };
       }
       if (preaccel.verifyState === "probing") {
-        return { label: dict.nav.preaccelProbingBadge, dotColor: "var(--amber)" };
+        return {
+          label: dict.nav.preaccelProbingBadge,
+          dotColor: "var(--amber)",
+          title: preaccel.detailText,
+        };
       }
       if (preaccel.verifyState === "degraded") {
-        return { label: dict.nav.preaccelDegradedBadge, dotColor: "var(--amber)" };
+        return {
+          label: dict.nav.preaccelDegradedBadge,
+          dotColor: "var(--amber)",
+          title: preaccel.detailText,
+        };
       }
-      return { label: `${dict.titleBar.preaccelOn} · ${dict.titleBar.standby}`, dotColor: "var(--amber)" };
+      return {
+        label: `${dict.titleBar.preaccelOn} · ${dict.titleBar.standby}`,
+        dotColor: "var(--amber)",
+        title: preaccel.detailText,
+      };
     }
     if (status === "warn") {
-      return { label: isZh ? "待认证" : dict.mascot.approval, dotColor: "var(--amber)" };
+      return {
+        label: statusCopy.captiveWarn,
+        dotColor: "var(--amber)",
+        title: statusCopy.captiveWarn,
+      };
     }
-    return { label: dict.titleBar.standby, dotColor: "var(--muted)" };
+    return {
+      label: dict.titleBar.standby,
+      dotColor: "var(--muted)",
+      title: dict.titleBar.standby,
+    };
   }
 
-  const isProbing = preaccel.enabled && preaccel.verifyState === "probing";
+  const proxyPreaccelActive =
+    preaccel.enabled && hasEnabledRelay && preaccel.tone === "green";
+  const isProbing = proxyPreaccelActive && preaccel.verifyState === "probing";
   const dotColor =
     status === "error"
       ? "var(--red)"
       : status === "warn" || isProbing
         ? "var(--amber)"
-        : preaccel.enabled
+        : proxyPreaccelActive
           ? "var(--accent)"
           : "var(--green)";
 
@@ -75,20 +137,27 @@ function resolveModeBadge(
       : proxyMode === "direct"
         ? dict.titleBar.modeDirect
         : dict.titleBar.modeRule;
-  const label = preaccel.enabled
+  const label = proxyPreaccelActive
     ? isProbing
       ? `${modeLabel} · ${dict.nav.preaccelProbingBadge}`
       : preaccel.realWinDivertActive
         ? `${modeLabel} · ${dict.nav.preaccelActiveBadge}`
         : `${modeLabel} · ${dict.titleBar.preaccelOn}`
     : modeLabel;
-  return { label, dotColor };
+  return {
+    label,
+    dotColor,
+    title: proxyPreaccelActive ? `${modeLabel} · ${preaccel.detailText}` : label,
+  };
 }
 
 export function TitleBar() {
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
+  const hasEnabledRelay = useAppSelector((s) =>
+    s.preAccelRelays.some((r) => r.enabled)
+  );
   const minimizeToTrayOnClose = useAppSelector(
     (s) => s.config?.behavior?.minimize_to_tray_on_close ?? true
   );
@@ -97,7 +166,6 @@ export function TitleBar() {
   );
   const bg = useAppSelector(selectHasBackgroundActivity);
   const dict = useUiDict(uiLang);
-  const isZh = uiLang === "zh-CN";
   const hasAnyBgTask = bg.preaccel || bg.nodes || bg.groups || bg.home || bg.settings;
   const [maximized, setMaximized] = useState(false);
   const inTauri = isTauriEnv();
@@ -184,10 +252,19 @@ export function TitleBar() {
   const preaccelSummary = resolvePreAccelSummary(
     runtime,
     globalPreAccel,
-    preAccelEnabledConfig
+    preAccelEnabledConfig,
+    hasEnabledRelay,
+    uiLang
   );
 
-  const badge = resolveModeBadge(runtime.status, runtime.proxy_mode, preaccelSummary, dict, isZh);
+  const badge = resolveModeBadge(
+    runtime.status,
+    runtime.proxy_mode,
+    preaccelSummary,
+    hasEnabledRelay,
+    dict,
+    uiLang
+  );
 
   const closeButtonLabel = minimizeToTrayOnClose
     ? hasAnyBgTask
@@ -226,7 +303,7 @@ export function TitleBar() {
         </span>
 
         <span
-          title={badge.label}
+          title={badge.title}
           className="pointer-events-none inline-flex max-w-[180px] shrink-0 items-center gap-1 rounded-full border border-[var(--line)]/80 bg-[var(--card)]/85 px-2 py-0.5 text-[10px] font-medium leading-none text-[var(--text-secondary)]"
         >
           <span

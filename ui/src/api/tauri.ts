@@ -568,6 +568,7 @@ export interface CoreRuntimeInfo {
   tun_enabled: boolean;
   tun_configured?: boolean;
   tun_needs_elevation?: boolean;
+  power_on_tun_degraded?: boolean;
   tun_admin_ready: boolean;
   app_version: string;
   os_label: string;
@@ -1228,6 +1229,11 @@ export function isTauriEnv(): boolean {
 }
 
 const FRIENDLY_ERROR_RULES: ReadonlyArray<{ pattern: RegExp; message: string }> = [
+  {
+    pattern:
+      /\bNO_ENABLED_RELAY\b|no\s+enabled\s+(?:preaccel\s+)?relay|no\s+available\s+(?:domestic\s+)?relay|尚未(?:添加|配置|启用).*?(?:国内|提速|中转)|没有可用.*?(?:国内|提速|中转)/i,
+    message: "还没有可用的国内提速线路，请先添加并启用至少一条提速线路",
+  },
   {
     pattern:
       /probe[_\s-]?running|another\s+probe.*running|probe\s+already\s+running|benchmark.*already\s+running/i,
@@ -1961,9 +1967,12 @@ function buildMockPendingUpdateDto(
 let mockPendingUpdate: PendingUpdatePromptDto | null = previewUpdateModal
   ? buildMockPendingUpdateDto("0.1.0", DEFAULT_APP_CONFIG.update.repo)
   : null;
+let mockPowerOffTakeoverMemory: [boolean, boolean] | null = null;
 const mockUpdateReadyListeners = new Set<(payload: PendingUpdatePromptDto) => void>();
 const mockGroupsUpdatedListeners = new Set<() => void>();
 const mockRelaysUpdatedListeners = new Set<() => void>();
+const mockNodesUpdatedListeners = new Set<() => void>();
+const mockNavigateListeners = new Set<(nav: string) => void>();
 
 function emitMockGroupsUpdated(): void {
   for (const listener of mockGroupsUpdatedListeners) {
@@ -1977,6 +1986,16 @@ function emitMockGroupsUpdated(): void {
 
 function emitMockRelaysUpdated(): void {
   for (const listener of mockRelaysUpdatedListeners) {
+    try {
+      listener();
+    } catch {
+      /* ignore mock listener error */
+    }
+  }
+}
+
+function emitMockNodesUpdated(): void {
+  for (const listener of mockNodesUpdatedListeners) {
     try {
       listener();
     } catch {
@@ -2844,6 +2863,10 @@ export const catcloudApi = {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<RuntimeInfoDto>("disable_all_proxy_and_stop_core");
     }
+    mockPowerOffTakeoverMemory = [
+      Boolean(mockRuntime.system_proxy_enabled || mockConfig.system_proxy_enabled),
+      Boolean(mockRuntime.tun_enabled),
+    ];
     mockConfig = {
       ...mockConfig,
       system_proxy_enabled: false,
@@ -2866,6 +2889,40 @@ export const catcloudApi = {
     }
     syncMockPreAccelRuntime();
     return { ...mockRuntime };
+  },
+
+  async enableProxyPower(): Promise<CoreRuntimeInfo> {
+    if (isTauriEnv()) {
+      return tauriInvokeOrThrow<CoreRuntimeInfo>("enable_proxy_power");
+    }
+    const remembered = mockPowerOffTakeoverMemory;
+    mockPowerOffTakeoverMemory = null;
+    const wantSys = remembered ? remembered[0] : true;
+    const wantTun = Boolean(remembered?.[1] && mockRuntime.tun_admin_ready);
+    const effSys = wantSys || !wantTun;
+    mockConfig = {
+      ...mockConfig,
+      system_proxy_enabled: effSys,
+      tun_enabled: wantTun,
+    };
+    mockRuntime = {
+      ...mockRuntime,
+      running: true,
+      system_proxy_enabled: effSys,
+      tun_enabled: wantTun,
+      tun_configured: wantTun,
+      tun_needs_elevation: false,
+    };
+    syncMockPreAccelRuntime();
+    return { ...mockRuntime };
+  },
+
+  async consumePendingNav(): Promise<string | null> {
+    if (isTauriEnv()) {
+      const raw = await tauriInvokeOrThrow<string | null>("consume_pending_nav");
+      return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+    }
+    return null;
   },
 
   async restartCore(): Promise<CoreRuntimeInfo> {
@@ -3376,7 +3433,21 @@ export const catcloudApi = {
     const before = mockSubscriptions.length;
     mockSubscriptions = mockSubscriptions.filter((s) => s.id !== subId);
     mockNodes = mockNodes.filter((n) => n.sub_id !== subId);
-    return mockSubscriptions.length < before;
+    const validNodeIds = new Set(mockNodes.map((n) => n.id));
+    mockGroups = mockGroups.map((group) => {
+      const member_node_ids = group.member_node_ids.filter((id) => validNodeIds.has(id));
+      const active_node_id =
+        group.active_node_id && validNodeIds.has(group.active_node_id)
+          ? group.active_node_id
+          : (member_node_ids[0] ?? null);
+      return { ...group, member_node_ids, active_node_id };
+    });
+    const deleted = mockSubscriptions.length < before;
+    if (deleted) {
+      emitMockNodesUpdated();
+      emitMockGroupsUpdated();
+    }
+    return deleted;
   },
 
   async renameSubscription(subId: string, newName: string): Promise<SubscriptionRecord> {
@@ -3830,6 +3901,9 @@ export const catcloudApi = {
   async togglePreAccel(enabled: boolean): Promise<boolean> {
     if (isTauriEnv()) {
       return tauriInvokeOrThrow<boolean>("toggle_preaccel", { enabled });
+    }
+    if (enabled && !mockRelays.some((r) => r.enabled)) {
+      throw new Error(formatErrorMessage("NO_ENABLED_RELAY"));
     }
     mockConfig.preaccel.enabled = enabled;
     if (!enabled) {
@@ -5472,6 +5546,45 @@ export const catcloudApi = {
     mockRelaysUpdatedListeners.add(onUpdate);
     return () => {
       mockRelaysUpdatedListeners.delete(onUpdate);
+    };
+  },
+
+  subscribeNodesUpdated(handler: () => void): () => void {
+    if (isTauriEnv()) {
+      return subscribeTauriEmptyEvent("catcloud://nodes-updated", handler);
+    }
+    mockNodesUpdatedListeners.add(handler);
+    return () => {
+      mockNodesUpdatedListeners.delete(handler);
+    };
+  },
+
+  subscribeNavigate(handler: (nav: string) => void): () => void {
+    if (isTauriEnv()) {
+      return subscribeTauriEvent<unknown>("catcloud://navigate", (payload) => {
+        if (typeof payload === "string") {
+          const trimmed = payload.trim();
+          if (trimmed) handler(trimmed);
+          return;
+        }
+        if (payload && typeof payload === "object") {
+          const rec = payload as { nav?: unknown; route?: unknown; target?: unknown };
+          const raw =
+            typeof rec.nav === "string"
+              ? rec.nav
+              : typeof rec.route === "string"
+                ? rec.route
+                : typeof rec.target === "string"
+                  ? rec.target
+                  : "";
+          const trimmed = raw.trim();
+          if (trimmed) handler(trimmed);
+        }
+      });
+    }
+    mockNavigateListeners.add(handler);
+    return () => {
+      mockNavigateListeners.delete(handler);
     };
   },
 };

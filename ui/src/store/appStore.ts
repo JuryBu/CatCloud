@@ -245,6 +245,32 @@ const VALID_ROUTES = new Set<NavRouteId>([
   "settings",
 ]);
 
+const NAVIGATE_EVENT_ALLOWLIST = new Set<NavRouteId>([
+  "overview",
+  "nodes",
+  "groups",
+  "preaccel",
+  "ai",
+  "rules",
+  "logs",
+  "settings",
+]);
+
+function normalizeAllowedNavRoute(rawNav: string | null | undefined): NavRouteId | null {
+  if (typeof rawNav !== "string") return null;
+  const candidate = rawNav.trim().toLowerCase();
+  if (!candidate) return null;
+  const normalized =
+    candidate === "speedtest"
+      ? "nodes"
+      : candidate === "home"
+        ? "overview"
+        : candidate;
+  return NAVIGATE_EVENT_ALLOWLIST.has(normalized as NavRouteId)
+    ? (normalized as NavRouteId)
+    : null;
+}
+
 function detectNavFromHash(): NavRouteId {
   if (typeof window === "undefined") return "overview";
   const raw = window.location.hash.replace(/^#\/?/, "").toLowerCase();
@@ -633,7 +659,7 @@ export interface AppState {
   nodesTabHint: {
     tab: "nodes" | "subs";
     subId?: string | null;
-    action?: "migration" | null;
+    action?: "migration" | "share" | null;
   } | null;
   config: AppConfig;
   resolvedTheme: ResolvedTheme;
@@ -1544,10 +1570,14 @@ let disposeTunNeedsAdmin: (() => void) | null = null;
 let disposeUpdateReady: (() => void) | null = null;
 let disposeGroupsUpdated: (() => void) | null = null;
 let disposeRelaysUpdated: (() => void) | null = null;
+let disposeNodesUpdated: (() => void) | null = null;
+let disposeNavigate: (() => void) | null = null;
 let groupsRefreshDebounceTimer: number | null = null;
 let relaysRefreshDebounceTimer: number | null = null;
+let nodesRefreshDebounceTimer: number | null = null;
 let groupsRefreshSeq = 0;
 let relaysRefreshSeq = 0;
+let nodesRefreshSeq = 0;
 let themeClockTimer: number | null = null;
 let trafficBackfillInFlight = false;
 let globalPreAccelRefreshInFlight = false;
@@ -1615,6 +1645,38 @@ function scheduleRelaysRefresh(): void {
         /* ignore transient cross-window relay refresh error */
       });
   }, 100);
+}
+
+function runNodesRefreshNow(): void {
+  const mySeq = ++nodesRefreshSeq;
+  void Promise.allSettled([
+    catcloudApi.listNodes(),
+    catcloudApi.listSubscriptions(),
+    catcloudApi.listProbeSnapshots(),
+    appActions.refreshRuntime(),
+  ]).then(([nodesRes, subsRes, probesRes]) => {
+    if (!bootStarted || mySeq !== nodesRefreshSeq) return;
+    setState((prev) => ({
+      ...prev,
+      nodes: nodesRes.status === "fulfilled" ? nodesRes.value : prev.nodes,
+      subscriptions: subsRes.status === "fulfilled" ? subsRes.value : prev.subscriptions,
+      probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
+    }));
+  });
+}
+
+function scheduleNodesRefresh(): void {
+  if (typeof window === "undefined") {
+    runNodesRefreshNow();
+    return;
+  }
+  if (nodesRefreshDebounceTimer !== null) {
+    window.clearTimeout(nodesRefreshDebounceTimer);
+  }
+  nodesRefreshDebounceTimer = window.setTimeout(() => {
+    nodesRefreshDebounceTimer = null;
+    runNodesRefreshNow();
+  }, 200);
 }
 
 async function persistOnboardingCompletedLight(): Promise<void> {
@@ -2433,6 +2495,20 @@ export const appStore = {
       scheduleRelaysRefresh();
     });
 
+    disposeNodesUpdated = catcloudApi.subscribeNodesUpdated(() => {
+      scheduleNodesRefresh();
+    });
+
+    if (state.windowMode === "main") {
+      disposeNavigate = catcloudApi.subscribeNavigate((rawNav) => {
+        if (state.windowMode !== "main") return;
+        const validNav = normalizeAllowedNavRoute(rawNav);
+        if (validNav) {
+          appActions.setNav(validNav);
+        }
+      });
+    }
+
     if (isTauriEnv()) {
       let tunAdminDisposed = false;
       let tunAdminUnlisten: (() => void) | null = null;
@@ -2488,12 +2564,28 @@ export const appStore = {
       };
     }
 
-    void hydrateFromBackend().catch((err) => {
-      setState((prev) => ({ ...prev, initialized: true }));
-      if (isTauriEnv()) {
-        pushToast(`初始化状态同步失败：${formatErrorMessage(err)}`, "warn");
-      }
-    });
+    void hydrateFromBackend()
+      .then(() => {
+        if (!bootStarted || state.windowMode !== "main") return;
+        void catcloudApi
+          .consumePendingNav()
+          .then((rawNav) => {
+            if (!bootStarted || state.windowMode !== "main") return;
+            const validNav = normalizeAllowedNavRoute(rawNav);
+            if (validNav) {
+              appActions.setNav(validNav);
+            }
+          })
+          .catch(() => {
+            /* ignore pending nav consume failure on older backends */
+          });
+      })
+      .catch((err) => {
+        setState((prev) => ({ ...prev, initialized: true }));
+        if (isTauriEnv()) {
+          pushToast(`初始化状态同步失败：${formatErrorMessage(err)}`, "warn");
+        }
+      });
   },
 
   dispose(): void {
@@ -2515,6 +2607,10 @@ export const appStore = {
     disposeGroupsUpdated = null;
     disposeRelaysUpdated?.();
     disposeRelaysUpdated = null;
+    disposeNodesUpdated?.();
+    disposeNodesUpdated = null;
+    disposeNavigate?.();
+    disposeNavigate = null;
     if (groupsRefreshDebounceTimer !== null) {
       window.clearTimeout(groupsRefreshDebounceTimer);
       groupsRefreshDebounceTimer = null;
@@ -2523,8 +2619,13 @@ export const appStore = {
       window.clearTimeout(relaysRefreshDebounceTimer);
       relaysRefreshDebounceTimer = null;
     }
+    if (nodesRefreshDebounceTimer !== null) {
+      window.clearTimeout(nodesRefreshDebounceTimer);
+      nodesRefreshDebounceTimer = null;
+    }
     groupsRefreshSeq += 1;
     relaysRefreshSeq += 1;
+    nodesRefreshSeq += 1;
     if (typeof window !== "undefined") {
       window.removeEventListener("hashchange", handleHashChange);
       window.removeEventListener("storage", handleStorageSync);
@@ -2574,17 +2675,18 @@ export const appActions = {
   },
 
   openNodesWorkspace(
-    tab: "nodes" | "subs" = "nodes",
+    tab: "nodes" | "subs" | "speed" = "nodes",
     subId?: string | null,
-    action?: "migration" | null
+    action?: "migration" | "share" | null
   ): void {
+    const normalizedTab: "nodes" | "subs" = tab === "speed" ? "nodes" : tab;
     setState((prev) => ({
       ...prev,
-      nodesTabHint: { tab, subId: subId ?? null, action: action ?? null },
+      nodesTabHint: { tab: normalizedTab, subId: subId ?? null, action: action ?? null },
       sessionDrafts: {
         ...prev.sessionDrafts,
         nodesWorkspace: {
-          tab,
+          tab: normalizedTab,
           filterSubId: subId ?? "",
         },
       },
@@ -2885,6 +2987,104 @@ export const appActions = {
     setState((prev) => ({ ...prev, globalPreAccel }));
   },
 
+  async refreshRuntime(): Promise<CoreRuntimeInfo | null> {
+    try {
+      const nextRuntime = await catcloudApi.getRuntimeInfo();
+      setState((prev) => ({
+        ...prev,
+        config: alignConfigWithRuntimeTun(prev.config, nextRuntime),
+        runtime: nextRuntime,
+      }));
+      return nextRuntime;
+    } catch {
+      return null;
+    }
+  },
+
+  async deleteSubscription(subId: string): Promise<boolean> {
+    const deleted = await catcloudApi.deleteSubscription(subId);
+    if (isTauriEnv()) {
+      const [subsRes, nodesRes, groupsRes, probesRes, rtRes, cfgRes] = await Promise.allSettled([
+        catcloudApi.listSubscriptions(),
+        catcloudApi.listNodes(),
+        catcloudApi.listGroups(),
+        catcloudApi.listProbeSnapshots(),
+        catcloudApi.getRuntimeInfo(),
+        catcloudApi.getConfig(),
+      ]);
+      setState((prev) => {
+        const nextRuntime = rtRes.status === "fulfilled" ? rtRes.value : prev.runtime;
+        const baseConfig =
+          cfgRes.status === "fulfilled"
+            ? mergeIncomingAppConfig(cfgRes.value, prev.config)
+            : prev.config;
+        return {
+          ...prev,
+          subscriptions: subsRes.status === "fulfilled" ? subsRes.value : prev.subscriptions,
+          nodes: nodesRes.status === "fulfilled" ? nodesRes.value : prev.nodes,
+          groups: groupsRes.status === "fulfilled" ? groupsRes.value : prev.groups,
+          probes: probesRes.status === "fulfilled" ? probesRes.value : prev.probes,
+          runtime: nextRuntime,
+          config:
+            rtRes.status === "fulfilled"
+              ? alignConfigWithRuntimeTun(baseConfig, nextRuntime)
+              : baseConfig,
+        };
+      });
+    } else {
+      const [subsRes, nodesRes, groupsRes, rtRes, cfgRes] = await Promise.allSettled([
+        catcloudApi.listSubscriptions(),
+        catcloudApi.listNodes(),
+        catcloudApi.listGroups(),
+        catcloudApi.getRuntimeInfo(),
+        catcloudApi.getConfig(),
+      ]);
+      setState((prev) => {
+        const nextNodes =
+          nodesRes.status === "fulfilled"
+            ? nodesRes.value
+            : prev.nodes.filter((n) => n.sub_id !== subId);
+        const validIds = new Set(nextNodes.map((n) => n.id));
+        const nextProbes: Record<string, ProbeSnapshot> = {};
+        for (const [id, snap] of Object.entries(prev.probes)) {
+          if (validIds.has(id)) nextProbes[id] = snap;
+        }
+        const nextGroups =
+          groupsRes.status === "fulfilled"
+            ? groupsRes.value
+            : prev.groups.map((g) => {
+                const member_node_ids = g.member_node_ids.filter((id) => validIds.has(id));
+                const active_node_id =
+                  g.active_node_id && validIds.has(g.active_node_id)
+                    ? g.active_node_id
+                    : (member_node_ids[0] ?? null);
+                return { ...g, member_node_ids, active_node_id };
+              });
+        const nextRuntime = rtRes.status === "fulfilled" ? rtRes.value : prev.runtime;
+        const baseConfig =
+          cfgRes.status === "fulfilled"
+            ? mergeIncomingAppConfig(cfgRes.value, prev.config)
+            : prev.config;
+        return {
+          ...prev,
+          subscriptions:
+            subsRes.status === "fulfilled"
+              ? subsRes.value
+              : prev.subscriptions.filter((s) => s.id !== subId),
+          nodes: nextNodes,
+          groups: nextGroups,
+          probes: nextProbes,
+          runtime: nextRuntime,
+          config:
+            rtRes.status === "fulfilled"
+              ? alignConfigWithRuntimeTun(baseConfig, nextRuntime)
+              : baseConfig,
+        };
+      });
+    }
+    return deleted;
+  },
+
   async refreshGlobalPreAccelStatus(): Promise<GlobalPreAccelStatus> {
     if (globalPreAccelRefreshInFlight) {
       globalPreAccelRefreshPending = true;
@@ -2936,21 +3136,21 @@ export const appActions = {
         isRealWinDivertActive(state.runtime, state.globalPreAccel)
     );
     const target = next ?? !currentlyOn;
+    let latestRelays = state.preAccelRelays;
 
     if (target) {
-      let relays = state.preAccelRelays;
       try {
-        relays = await catcloudApi.listPreAccelRelays();
-        setState((prev) => ({ ...prev, preAccelRelays: relays }));
+        latestRelays = await catcloudApi.listPreAccelRelays();
+        setState((prev) => ({ ...prev, preAccelRelays: latestRelays }));
       } catch {
         /* fall back to cached relays on transient IPC failure */
       }
-      const hasEnabledRelay = relays.some((r) => r.enabled);
+      const hasEnabledRelay = latestRelays.some((r) => r.enabled);
       if (!hasEnabledRelay) {
         pushToast(
-          "还没有可用的国内中转线路，请先在「国内提速」页添加并启用至少一条中转",
+          "还没有可用的国内提速线路，请先在「国内提速」页添加并启用至少一条线路",
           "warn",
-          4200
+          4400
         );
         if (state.windowMode === "main" && state.activeNav !== "preaccel") {
           appActions.setNav("preaccel");
@@ -3043,7 +3243,13 @@ export const appActions = {
         return false;
       }
 
-      const summary = resolvePreAccelSummary(nextRt, nextGlobal, nextCfg.preaccel.enabled);
+      const summary = resolvePreAccelSummary(
+        nextRt,
+        nextGlobal,
+        nextCfg.preaccel.enabled,
+        latestRelays.some((r) => r.enabled),
+        nextCfg.personalization.ui_language
+      );
       const os = resolvePlatformOs(nextRt.os_label);
 
       if (summary.proxyActive) {
@@ -3129,17 +3335,34 @@ export const appActions = {
           4800
         );
       } else if (os === "windows") {
-        pushToast("已开启国内提速（当前本地通道待命）", "info", 4200);
+        pushToast("已开启国内提速（本地提速入口已就绪）", "info", 4200);
       } else {
         const portLabel = nextGlobal.socks_port
           ? `127.0.0.1:${nextGlobal.socks_port}`
-          : "本地 443 通道";
-        pushToast(`已开启国内提速（本地独立入口 ${portLabel} 已就绪）`, "ok", 4200);
+          : "本地提速入口";
+        pushToast(`已开启国内提速（本地入口 ${portLabel} 已就绪）`, "ok", 4200);
       }
 
       return true;
     } catch (err) {
-      pushToast(`切换国内提速失败：${formatErrorMessage(err)}`, "warn", 4200);
+      const msg = formatErrorMessage(err);
+      const rawMsg = err instanceof Error ? err.message : String(err ?? "");
+      const isNoEnabledRelay =
+        /\bNO_ENABLED_RELAY\b|no\s+enabled\s+(?:preaccel\s+)?relay|no\s+available\s+(?:domestic\s+)?relay|还没有可用的国内(?:提速线路|中转)|尚未(?:添加|配置|启用).*?(?:提速线路|中转)|没有可用.*?(?:提速线路|中转)/i.test(
+          `${rawMsg} ${msg}`
+        );
+      if (target && isNoEnabledRelay) {
+        pushToast(
+          "还没有可用的国内提速线路，请先在「国内提速」页添加并启用至少一条线路",
+          "warn",
+          4600
+        );
+        if (state.windowMode === "main" && state.activeNav !== "preaccel") {
+          appActions.setNav("preaccel");
+        }
+        return false;
+      }
+      pushToast(`切换国内提速失败：${msg}`, "warn", 4200);
       return false;
     }
   },
@@ -3761,6 +3984,48 @@ export const appActions = {
     } catch (err) {
       pushToast(`关闭代理并停止核心失败：${formatErrorMessage(err)}`, "warn", 4200);
       return false;
+    }
+  },
+
+  async enableProxyPower(): Promise<CoreRuntimeInfo> {
+    try {
+      const nextRt = await catcloudApi.enableProxyPower();
+      const [cfgRes, globalRes] = await Promise.allSettled([
+        catcloudApi.getConfig(),
+        catcloudApi.getGlobalPreAccelStatus(),
+      ]);
+      setState((prev) => {
+        const baseCfg =
+          cfgRes.status === "fulfilled"
+            ? mergeIncomingAppConfig(cfgRes.value, prev.config)
+            : {
+                ...prev.config,
+                system_proxy_enabled: nextRt.system_proxy_enabled,
+                tun_enabled:
+                  typeof nextRt.tun_configured === "boolean"
+                    ? nextRt.tun_configured
+                    : nextRt.tun_enabled,
+              };
+        return {
+          ...prev,
+          config: alignConfigWithRuntimeTun(baseCfg, nextRt),
+          runtime: nextRt,
+          globalPreAccel:
+            globalRes.status === "fulfilled" ? globalRes.value : prev.globalPreAccel,
+          exitIp: buildPendingExitIp(nextRt.running),
+        };
+      });
+      if (nextRt.tun_enabled && nextRt.system_proxy_enabled) {
+        pushToast("已开启代理（虚拟网卡 + 系统代理）", "ok");
+      } else if (nextRt.tun_enabled) {
+        pushToast("已开启代理（虚拟网卡已恢复）", "ok");
+      } else if (nextRt.system_proxy_enabled) {
+        pushToast("已开启系统代理", "ok");
+      }
+      return nextRt;
+    } catch (err) {
+      pushToast(`开启代理失败：${formatErrorMessage(err)}`, "warn", 4200);
+      throw err;
     }
   },
 

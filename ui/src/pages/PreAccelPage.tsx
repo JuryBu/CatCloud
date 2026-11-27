@@ -465,7 +465,8 @@ const INPUT_CLS =
 
 export function PreAccelPage() {
   const config = useAppSelector((s) => s.config);
-  const dict = useUiDict(normalizeUiLanguage(config.personalization.ui_language));
+  const uiLang = normalizeUiLanguage(config.personalization.ui_language);
+  const dict = useUiDict(uiLang);
   const runtime = useAppSelector((s) => s.runtime);
   const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
   const storeRelays = useAppSelector((s) => s.preAccelRelays);
@@ -542,6 +543,7 @@ export function PreAccelPage() {
   // Lightweight Advanced Modals (Probe URL, Share Bundle & Gateway Export)
   const [showProbeModal, setShowProbeModal] = useState(false);
   const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [shareModalMode, setShareModalMode] = useState<"export" | "import">("import");
   const [gatewayModalOpen, setGatewayModalOpen] = useState(false);
   const [pendingDeleteRelay, setPendingDeleteRelay] = useState<PreAccelRelay | null>(null);
   const [deletingRelay, setDeletingRelay] = useState(false);
@@ -1131,7 +1133,8 @@ export function PreAccelPage() {
     const ok = await copyText(addr);
     if (ok) {
       setCopiedGlobalAddr(true);
-      appActions.showToast(`已复制本地独立 443 入口：${addr}`, "ok");
+      const sep = uiLang === "zh-CN" || uiLang === "ja" ? "：" : ": ";
+      appActions.showToast(`${dict.preaccel.copiedLocalSocksToast}${sep}${addr}`, "ok");
       scheduleTimer(() => setCopiedGlobalAddr(false), 1800);
     } else {
       appActions.showToast("复制失败，请手动选中复制", "warn");
@@ -1629,7 +1632,17 @@ export function PreAccelPage() {
   const manualShowDomainHint =
     manualServer.trim() !== "" && !looksLikeIpAddress(manualServer);
 
-  const preaccelSummary = resolvePreAccelSummary(runtime, globalPreAccel, enabled);
+  const hasEnabledRelay = useMemo(
+    () => sortedRelays.some((r) => r.enabled),
+    [sortedRelays]
+  );
+  const preaccelSummary = resolvePreAccelSummary(
+    runtime,
+    globalPreAccel,
+    enabled,
+    hasEnabledRelay,
+    uiLang
+  );
   const effectiveGlobalPort =
     globalPreAccel.socks_port ?? runtime.global_preaccel_socks_port ?? null;
   const effectiveGlobalConns =
@@ -1657,7 +1670,9 @@ export function PreAccelPage() {
   );
   const needsWindowsElevation =
     isWindows &&
+    hasEnabledRelay &&
     preaccelSummary.enabled &&
+    !preaccelSummary.suspendedForTun &&
     !preaccelSummary.realWinDivertActive &&
     (preaccelSummary.installState === "need_elevation" ||
       (globalPreAccel.windivert_available && !globalPreAccel.is_elevated));
@@ -1678,7 +1693,8 @@ export function PreAccelPage() {
   const hasDistinctVerifyDetail =
     isAbnormalVerifyState &&
     Boolean(verifyMessageText) &&
-    verifyMessageText !== preaccelSummary.detailText.trim();
+    verifyMessageText !== preaccelSummary.detailText.trim() &&
+    verifyMessageText !== preaccelSummary.plainText.trim();
   const showSecurityGuidanceBox =
     !preaccelSummary.realWinDivertActive &&
     (Boolean(securityGuidanceText) || hasDistinctVerifyDetail);
@@ -1722,9 +1738,98 @@ export function PreAccelPage() {
     return { label, cls };
   })();
 
+  const hasAdvancedAlert = !probeValidation.ok || portalRequired;
+  const openShareModal = (mode: "export" | "import") => {
+    setShareModalMode(mode);
+    setShareModalOpen(true);
+  };
+
   return (
     <div className="space-y-4">
-      {/* 1. 顶部极简总控卡片：全站唯一「开启国内提速」总开关 + 诚实状态条 + 自动识别进程遥测 */}
+      {sortedRelays.length === 0 ? (
+        /* 0-Relay Empty State: Friendly Hero Guide Card takes center stage (A-P2-8) */
+        <section className="cc-card cc-glass rounded-2xl border-[var(--accent)]/40 bg-[var(--accent-soft)]/25 p-6">
+          <div className="flex items-start gap-3.5">
+            <span className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl bg-[var(--accent-soft)] text-[var(--accent)]">
+              <Zap className="h-5 w-5" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="rounded-full bg-[var(--card)]/85 px-2.5 py-0.5 text-[11px] font-medium text-[var(--accent)]">
+                  {dict.preaccel.title}
+                </span>
+              </div>
+              <h1 className="mt-2 text-base font-semibold tracking-tight text-[var(--text)]">
+                {dict.preaccel.emptyFriendlyTitle}
+              </h1>
+              <p className="mt-1.5 max-w-2xl text-xs leading-relaxed text-[var(--text-secondary)]">
+                {dict.preaccel.emptyFriendlyDesc}
+              </p>
+            </div>
+          </div>
+
+          <div className="mt-5 flex flex-wrap items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => openAddModal("import")}
+              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90"
+            >
+              <Upload className="h-3.5 w-3.5 shrink-0" />
+              <span>{dict.preaccel.emptyPasteCodeBtn}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => openShareModal("import")}
+              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+            >
+              <Package className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+              <span>{dict.common.importShareBundle}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => openAddModal("manual")}
+              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+            >
+              <Plus className="h-3.5 w-3.5 shrink-0" />
+              <span>{dict.preaccel.emptyAddManualBtn}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => appActions.openAiAssistant("preaccel", "agent")}
+              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--accent)]/45 bg-[var(--card)] px-3.5 py-2 text-xs font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/55"
+            >
+              <Bot className="h-3.5 w-3.5 shrink-0" />
+              <span>{dict.preaccel.emptyAskAiDeploy}</span>
+            </button>
+          </div>
+
+          {importWarnings.length > 0 && (
+            <div className="mt-4 flex items-start justify-between gap-3 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2.5 text-xs text-[var(--amber)]">
+              <div>
+                <div className="font-semibold">导入配置提醒</div>
+                <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[11px]">
+                  {importWarnings.map((w) => (
+                    <li key={w}>{w}</li>
+                  ))}
+                </ul>
+              </div>
+              <button
+                type="button"
+                onClick={() => setImportWarnings([])}
+                className="shrink-0 rounded-md p-1 opacity-75 hover:opacity-100"
+                aria-label="关闭提醒"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+        </section>
+      ) : (
+        <>
+      {/* 1. 顶部精简总控卡片：全站唯一「开启国内提速」总开关 + 诚实状态条 */}
       <section className="cc-card cc-glass rounded-2xl p-5">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 flex-1">
@@ -1733,9 +1838,10 @@ export function PreAccelPage() {
                 <Zap className="h-4 w-4" />
               </span>
               <h1 className="whitespace-nowrap text-base font-semibold tracking-tight text-[var(--text)]">
-                国内提速
+                {dict.preaccel.title}
               </h1>
               <span
+                title={preaccelSummary.detailText}
                 className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-medium ${topStatusBadge.cls}`}
               >
                 {(isPreparingDriver || isProbingVerify) && (
@@ -1745,27 +1851,11 @@ export function PreAccelPage() {
               </span>
             </div>
             <p className="mt-1.5 text-xs leading-relaxed text-[var(--muted)]">
-              国内 443 高速入口，帮你突破宽带上传限速，让传图、传文件和远程访问更顺畅。
+              {dict.preaccel.subtitle}
             </p>
           </div>
 
-          {/* 轻按钮高级入口 */}
           <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setShowProbeModal(true)}
-              className="relative inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--line-strong)] hover:text-[var(--text)]"
-            >
-              <SlidersHorizontal className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-              <span>检测地址</span>
-              {!probeValidation.ok && (
-                <span
-                  className="h-2 w-2 shrink-0 rounded-full bg-[var(--red)]"
-                  title="国内连通检测地址需要修正"
-                />
-              )}
-            </button>
-
             <button
               type="button"
               onClick={() => appActions.openAiAssistant("preaccel", "web")}
@@ -1806,10 +1896,12 @@ export function PreAccelPage() {
             </span>
             <div className="min-w-0">
               <div className="text-sm font-semibold text-[var(--text)]">
-                {togglingEnabled ? "正在切换国内提速…" : "开启国内提速"}
+                {togglingEnabled
+                  ? dict.preaccel.toggleMainToggling
+                  : dict.preaccel.toggleMainTitle}
               </div>
               <div className="mt-0.5 text-xs leading-relaxed text-[var(--text-secondary)]">
-                开启后猫猫云梯与电脑上其它代理软件都会一起走国内 443 提速，关闭则全部一起关
+                {dict.preaccel.toggleMainDesc}
               </div>
             </div>
           </div>
@@ -1859,8 +1951,11 @@ export function PreAccelPage() {
                 )}
                 <div className="min-w-0 flex-1">
                   <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <span className="font-medium text-[var(--text)]">
-                      {preaccelSummary.detailText}
+                    <span
+                      title={preaccelSummary.detailText}
+                      className="font-medium text-[var(--text)]"
+                    >
+                      {preaccelSummary.plainText}
                     </span>
                     {isProbingVerify ? (
                       <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[10.5px] font-medium text-[var(--amber)]">
@@ -1889,6 +1984,13 @@ export function PreAccelPage() {
                       </span>
                     ) : null}
                   </div>
+                  {!preaccelSummary.realWinDivertActive &&
+                    !preaccelSummary.suspendedForTun &&
+                    localSocksAddress && (
+                    <div className="mt-1 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                      {dict.preaccel.socksCopyPlainHint}
+                    </div>
+                  )}
                   {preaccelSummary.realWinDivertActive && (
                     <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[11px] text-[var(--text-secondary)]">
                       <span>
@@ -1956,12 +2058,14 @@ export function PreAccelPage() {
                     </button>
                   )}
 
-                {!isWindows && localSocksAddress && (
+                {!preaccelSummary.realWinDivertActive &&
+                  !preaccelSummary.suspendedForTun &&
+                  localSocksAddress && (
                   <button
                     type="button"
                     onClick={() => void handleCopyGlobalAddress(localSocksAddress)}
-                    className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                    title="复制本地独立 443 SOCKS5 入口地址"
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                    title={dict.preaccel.socksCopyPlainHint}
                   >
                     {copiedGlobalAddr ? (
                       <Check className="h-3 w-3 shrink-0 text-[var(--green)]" />
@@ -1978,7 +2082,7 @@ export function PreAccelPage() {
                     disabled={isProbingVerify}
                     onClick={() => void handleVerifyGlobalPreAccel()}
                     className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--accent)]/45 bg-[var(--card)] px-2.5 py-1 text-[11px] font-medium text-[var(--accent)] transition-colors hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/55 disabled:opacity-60"
-                    title="重新实测底层透明拦截与国内 443 中转链路连通性"
+                    title="重新实测底层透明拦截与国内中转链路连通性"
                   >
                     <RefreshCw
                       className={`h-3 w-3 shrink-0 ${isProbingVerify ? "animate-spin" : ""}`}
@@ -1995,7 +2099,7 @@ export function PreAccelPage() {
                   title="刷新提速状态与实时统计"
                 >
                   <RefreshCw className={`h-3 w-3 shrink-0 ${refreshingGlobal ? "animate-spin" : ""}`} />
-                  <span>刷新</span>
+                  <span>{dict.common.refresh}</span>
                 </button>
               </div>
             </div>
@@ -2031,67 +2135,11 @@ export function PreAccelPage() {
                 </div>
               </div>
             )}
-
-            {/* 已自动识别并加速的进程小胶囊列表（含连接数与流量） */}
-            {(processStats.length > 0 ||
-              (preaccelSummary.realWinDivertActive &&
-                acceleratedProcesses.length > 0)) && (
-              <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/80 px-3.5 py-2.5">
-                <div className="mb-2 flex items-center justify-between gap-2 text-[11px]">
-                  <span className="font-medium text-[var(--text-secondary)]">
-                    已自动识别并加速（
-                    {processStats.length > 0
-                      ? processStats.length
-                      : acceleratedProcesses.length}
-                    ）
-                  </span>
-                  <span className="text-[10px] text-[var(--muted)]">
-                    自动排除猫猫云梯自身，零手动配置
-                  </span>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {processStats.length > 0
-                    ? processStats.slice(0, 12).map((stat) => (
-                        <span
-                          key={stat.process_name.toLowerCase()}
-                          title={`PID ${stat.pid} · 来源：${formatDetectedByLabel(stat.detected_by)} · 累计 ${stat.total_connections} 连接`}
-                          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)]/35 bg-[var(--card)] px-2 py-1 text-[11px]"
-                        >
-                          <span className="cc-mono font-semibold text-[var(--text)]">
-                            {stat.process_name}
-                          </span>
-                          <span className="rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9.5px] font-medium text-[var(--accent)]">
-                            {formatDetectedByLabel(stat.detected_by)}
-                          </span>
-                          <span className="cc-mono cc-tabular text-[10px] text-[var(--text-secondary)]">
-                            {stat.active_connections > 0
-                              ? `${stat.active_connections} 连`
-                              : `累计 ${stat.total_connections}`}
-                          </span>
-                          <span className="cc-mono cc-tabular text-[10px] text-[var(--coral)]">
-                            ↑{formatBytes(stat.tx_bytes)}
-                          </span>
-                          <span className="cc-mono cc-tabular text-[10px] text-[var(--sky)]">
-                            ↓{formatBytes(stat.rx_bytes)}
-                          </span>
-                        </span>
-                      ))
-                    : acceleratedProcesses.slice(0, 10).map((proc) => (
-                        <span
-                          key={proc.toLowerCase()}
-                          className="cc-mono rounded-lg border border-[var(--accent)]/35 bg-[var(--accent-soft)]/60 px-2 py-1 text-[11px] font-medium text-[var(--accent)]"
-                        >
-                          {proc}
-                        </span>
-                      ))}
-                </div>
-              </div>
-            )}
           </div>
         )}
       </section>
 
-      {/* 2. 中转线路列表卡片 */}
+      {/* 2. 中转线路列表卡片（首屏清爽头栏 + 清晰卡片核心控制） */}
       <section className="cc-card cc-glass rounded-2xl p-5">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="min-w-0 flex-1">
@@ -2108,32 +2156,12 @@ export function PreAccelPage() {
             </div>
             <p className="mt-0.5 text-[11px] text-[var(--muted)]">
               {isMultiCloudLbActive
-                ? "多云均衡模式：自动按不同物理主机聚合并发带宽，同机多协议自动去重并保留故障兜底"
-                : "单线主备模式：排在首位的是主力线路，遇到波动时自动按顺序切换到备用线路"}
+                ? "多云并发聚合已生效，单台波动时自动无缝兜底"
+                : "优先使用主力线路，遇到波动时自动切换到备用线路"}
             </p>
           </div>
 
           <div className="flex max-w-full flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={() => setShareModalOpen(true)}
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-              title="一键导出或导入国内提速中转与节点 .zip 分享包"
-            >
-              <Package className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-              <span>{dict.common.shareBundle}</span>
-            </button>
-
-            <button
-              type="button"
-              onClick={() => setGatewayModalOpen(true)}
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-              title={dict.preaccel.gatewayExportTooltip}
-            >
-              <Router className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-              <span>{dict.preaccel.gatewayExportBtn}</span>
-            </button>
-
             <button
               type="button"
               disabled={probingAll || relays.length === 0}
@@ -2142,33 +2170,17 @@ export function PreAccelPage() {
               className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-65"
             >
               <RefreshCw className={`h-3.5 w-3.5 shrink-0 ${probingAll ? "animate-spin" : ""}`} />
-              <span>{probingAll ? "检测中..." : "测延迟"}</span>
+              <span>{probingAll ? "测延迟中…" : "全部测延迟"}</span>
             </button>
 
             <button
               type="button"
-              disabled={speedTestingAll || speedTestingAny || isProbeEngineBusy || relays.length === 0}
-              onClick={() => void handleSpeedTestAllRelays()}
-              title="逐条实测所有中转线路的实际上传与下载速率（切页不中断）"
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-65"
+              onClick={() => openShareModal("import")}
+              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              title="一键导入或导出国内提速中转与节点 .zip 分享包"
             >
-              {speedTestingAll ? (
-                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--accent)]" />
-              ) : (
-                <Gauge className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-              )}
-              <span>{speedTestingAll ? "测速中..." : "测上下行"}</span>
-            </button>
-
-            <button
-              type="button"
-              disabled={failoverBusy || enabledRelayCount < 2}
-              onClick={() => void handleFailover()}
-              className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-65"
-              title="将当前流量切换到下一条可用的备用线路"
-            >
-              <ArrowLeftRight className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-              <span>{failoverBusy ? "切换中..." : "切换备用"}</span>
+              <Package className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+              <span>{dict.common.importShareBundle}</span>
             </button>
 
             <button
@@ -2181,114 +2193,6 @@ export function PreAccelPage() {
             </button>
           </div>
         </div>
-
-        {/* 多云均衡聚合 / 单线主备 调度方式控制条 */}
-        {sortedRelays.length > 0 && (
-          <div className="mb-4 space-y-2.5">
-            <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2.5 text-xs">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="inline-flex items-center gap-1.5 font-medium text-[var(--text-secondary)]">
-                  <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
-                  <span>{dict.preaccel.dispatchLabel}</span>
-                </span>
-                <div
-                  className="inline-flex max-w-full flex-wrap rounded-xl border border-[var(--line)] bg-[var(--card)] p-0.5 text-[11px]"
-                  role="group"
-                  aria-label={dict.preaccel.dispatchLabel}
-                >
-                  <button
-                    type="button"
-                    disabled={savingDispatch}
-                    onClick={() => void handleUpdateDispatchConfig("auto", lbStrategy)}
-                    className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors disabled:opacity-60 ${
-                      isMultiCloudLbStrategy
-                        ? "bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
-                        : "text-[var(--muted)] hover:text-[var(--text)]"
-                    }`}
-                  >
-                    {dict.preaccel.dispatchAutoLb}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={savingDispatch}
-                    onClick={() => void handleUpdateDispatchConfig("fallback", lbStrategy)}
-                    className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors disabled:opacity-60 ${
-                      !isMultiCloudLbStrategy
-                        ? "bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
-                        : "text-[var(--muted)] hover:text-[var(--text)]"
-                    }`}
-                  >
-                    {dict.preaccel.dispatchFallback}
-                  </button>
-                </div>
-              </div>
-
-              {isMultiCloudLbActive && (
-                <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                  <span className="shrink-0 whitespace-nowrap text-[var(--muted)]">
-                    {dict.preaccel.lbAlgorithmLabel}
-                  </span>
-                  <button
-                    type="button"
-                    disabled={savingDispatch}
-                    onClick={() =>
-                      void handleUpdateDispatchConfig(
-                        dispatchStrategy,
-                        lbStrategy === "round_robin" ? "consistent_hashing" : "round_robin"
-                      )
-                    }
-                    className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
-                    title={dict.preaccel.lbAlgorithmTooltip}
-                  >
-                    {lbStrategy === "consistent_hashing"
-                      ? dict.preaccel.lbConsistentHashing
-                      : dict.preaccel.lbRoundRobin}
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {physicalHostSummary.distinctHosts >= 2 && isMultiCloudLbActive && (
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--green)]/40 bg-[var(--green-soft)]/45 px-3.5 py-2 text-[11.5px] text-[var(--text)]">
-                <div className="flex min-w-0 items-center gap-2">
-                  <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
-                  <span>
-                    已自动聚合{" "}
-                    <strong className="cc-mono text-[var(--green)]">
-                      {physicalHostSummary.distinctHosts}
-                    </strong>{" "}
-                    台物理云并发带宽
-                    {physicalHostSummary.duplicateProtocolCount > 0
-                      ? `（同机多余 ${physicalHostSummary.duplicateProtocolCount} 条协议已自动去重防抢占网卡）`
-                      : "（同机多协议自动去重）"}
-                    ，单台故障自动切换备用与直连兜底。
-                  </span>
-                </div>
-              </div>
-            )}
-
-            {physicalHostSummary.distinctHosts >= 2 && !isMultiCloudLbActive && (
-              <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)]/45 px-3.5 py-2 text-[11.5px] text-[var(--text)]">
-                <span className="text-[var(--text-secondary)]">
-                  当前已手动固定为单线主备模式（优先使用首位主力线，其余线路作故障兜底）。检测到{" "}
-                  <strong className="cc-mono text-[var(--text)]">
-                    {physicalHostSummary.distinctHosts}
-                  </strong>{" "}
-                  台不同物理云，可随时切回并发聚合。
-                </span>
-                <button
-                  type="button"
-                  disabled={savingDispatch}
-                  onClick={() => void handleUpdateDispatchConfig("auto", lbStrategy)}
-                  className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[var(--accent)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-                >
-                  <Layers className="h-3 w-3" />
-                  <span>{dict.preaccel.switchBackLbBtn}</span>
-                </button>
-              </div>
-            )}
-          </div>
-        )}
 
         {importWarnings.length > 0 && (
           <div className="mb-4 flex items-start justify-between gap-3 rounded-xl border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-3.5 py-2.5 text-xs text-[var(--amber)]">
@@ -2441,14 +2345,14 @@ export function PreAccelPage() {
                         </span>
                       )}
                     </div>
-                    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-[var(--muted)]">
+                    <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-[var(--muted)]/85">
                       <span
                         className="cc-mono min-w-0 max-w-full truncate"
-                        title={`${relay.server}:${relay.port}`}
+                        title={`${relay.server}:${relay.port} (${relay.protocol.toUpperCase()})`}
                       >
                         {relay.server}:{relay.port}
                       </span>
-                      <span className="shrink-0 uppercase">{relay.protocol}</span>
+                      <span className="shrink-0 uppercase opacity-80">{relay.protocol}</span>
                       {hasConfigTip && (
                         <span className="shrink-0 whitespace-nowrap rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] text-[var(--amber)]">
                           {safeSni !== "" ? "建议留空域名" : "建议使用 443 端口"}
@@ -2457,12 +2361,16 @@ export function PreAccelPage() {
                     </div>
                   </div>
 
-                  {/* 实时直连延迟 + 真实上下行 + 经海外对比延迟（严格区分绝不混淆） */}
+                  {/* 实时直连延迟 + 真实上下行（经海外对比延迟收进悬停提示保持首屏清爽） */}
                   <div className="shrink-0 text-right">
                     <div
                       className="whitespace-nowrap cc-mono cc-tabular text-base font-bold leading-tight"
                       style={{ color: getRelayLatencyColor(relay.last_probe_ms) }}
-                      title="本机直连国内中转的真实延迟（绝不被经海外节点的两跳测速延迟污染）"
+                      title={
+                        validChainMs !== null
+                          ? `本机直连国内中转的真实延迟（${dict.preaccel.chainLatencyLabel} ${validChainMs} ms）`
+                          : "本机直连国内中转的真实延迟（绝不被经海外节点的两跳测速延迟污染）"
+                      }
                     >
                       {relay.last_probe_ms !== null
                         ? formatLatencyDisplay(relay.last_probe_ms, "--")
@@ -2493,15 +2401,7 @@ export function PreAccelPage() {
                       </div>
                     ) : (
                       <div className="mt-0.5 whitespace-nowrap text-[10px] text-[var(--muted)]">
-                        {relay.last_probe_ms !== null ? "直连延迟 · 未测上下行" : "直连实时延迟"}
-                      </div>
-                    )}
-                    {validChainMs !== null && (
-                      <div
-                        className="mt-0.5 whitespace-nowrap cc-mono text-[10px] text-[var(--muted)]"
-                        title="经国内中转 + 海外参考节点的两跳对比延迟，仅作上下行测试参考，不影响上方直连延迟"
-                      >
-                        {dict.preaccel.chainLatencyLabel} {validChainMs} ms
+                        {relay.last_probe_ms !== null ? "直连延迟" : "直连实时延迟"}
                       </div>
                     )}
                   </div>
@@ -2509,28 +2409,32 @@ export function PreAccelPage() {
 
                 {/* 卡片第三行：操作栏 */}
                 <div className="mt-3.5 flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)]/65 pt-2.5 text-[11px]">
-                  <div className="flex shrink-0 items-center gap-1.5">
-                    <button
-                      type="button"
-                      disabled={idx === 0}
-                      onClick={() => void handleMoveRelay(relay.id, -1)}
-                      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)] disabled:opacity-75"
-                      title="上移一位"
-                    >
-                      <ArrowUp className="h-3 w-3 shrink-0" />
-                      <span>上移</span>
-                    </button>
-                    <button
-                      type="button"
-                      disabled={idx === sortedRelays.length - 1}
-                      onClick={() => void handleMoveRelay(relay.id, 1)}
-                      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)] disabled:opacity-75"
-                      title="下移一位"
-                    >
-                      <ArrowDown className="h-3 w-3 shrink-0" />
-                      <span>下移</span>
-                    </button>
-                  </div>
+                  {sortedRelays.length > 1 ? (
+                    <div className="flex shrink-0 items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={idx === 0}
+                        onClick={() => void handleMoveRelay(relay.id, -1)}
+                        className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)] disabled:opacity-75"
+                        title="上移一位"
+                      >
+                        <ArrowUp className="h-3 w-3 shrink-0" />
+                        <span>上移</span>
+                      </button>
+                      <button
+                        type="button"
+                        disabled={idx === sortedRelays.length - 1}
+                        onClick={() => void handleMoveRelay(relay.id, 1)}
+                        className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:border-[var(--line)] disabled:bg-[var(--bg-elevated)] disabled:text-[var(--muted)] disabled:opacity-75"
+                        title="下移一位"
+                      >
+                        <ArrowDown className="h-3 w-3 shrink-0" />
+                        <span>下移</span>
+                      </button>
+                    </div>
+                  ) : (
+                    <span />
+                  )}
 
                   <div className="flex min-w-0 flex-wrap items-center justify-end gap-1.5 gap-x-2.5">
                     {canSetPrimary && (
@@ -2590,66 +2494,285 @@ export function PreAccelPage() {
               </div>
             );
           })}
-
-          {sortedRelays.length === 0 && (
-            <div className="col-span-full rounded-2xl border border-[var(--accent)]/40 bg-[var(--accent-soft)]/35 p-5">
-              <div className="flex flex-col items-start justify-between gap-4 sm:flex-row sm:items-center">
-                <div className="flex min-w-0 items-start gap-3">
-                  <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-[var(--accent-soft)] text-[var(--accent)]">
-                    <Sparkles className="h-5 w-5" />
-                  </span>
-                  <div className="min-w-0">
-                    <h3 className="text-sm font-semibold text-[var(--text)]">
-                      {dict.preaccel.emptyFriendlyTitle}
-                    </h3>
-                    <p className="mt-1 max-w-2xl text-xs leading-relaxed text-[var(--text-secondary)]">
-                      {dict.preaccel.emptyFriendlyDesc}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-4 flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => appActions.openAiAssistant("preaccel", "agent")}
-                  className="inline-flex items-center gap-1.5 rounded-xl bg-[var(--accent)] px-4 py-2 text-xs font-semibold text-[var(--accent-ink)] shadow-xs transition-opacity hover:opacity-90"
-                >
-                  <Bot className="h-3.5 w-3.5" />
-                  <span>{dict.preaccel.emptyAskAiDeploy}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openAddModal("manual")}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line-strong)] bg-[var(--card)] px-3.5 py-2 text-xs font-semibold text-[var(--text)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                >
-                  <Plus className="h-3.5 w-3.5" />
-                  <span>添加中转</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => openAddModal("import")}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-                >
-                  <Upload className="h-3.5 w-3.5" />
-                  <span>粘贴导入码</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShareModalOpen(true)}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-[var(--line)] bg-[var(--surface)] px-3.5 py-2 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
-                >
-                  <Package className="h-3.5 w-3.5 text-[var(--accent)]" />
-                  <span>{dict.common.importShareBundle}</span>
-                </button>
-              </div>
-            </div>
-          )}
         </div>
       </section>
+        </>
+      )}
 
-      {/* 3. 底部两张实用卡片：提速前后测速对比 + 校园网认证检测 */}
-      <section className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-12">
+      {/* 3. 统一默认折叠区：高级设置与对比工具（100% 保留全部高阶能力，零阉割） */}
+      <section className="cc-card cc-glass rounded-2xl">
+        <button
+          type="button"
+          aria-expanded={advancedOpen}
+          onClick={() => setAdvancedOpen((v) => !v)}
+          className="flex w-full items-center justify-between gap-3 rounded-2xl px-5 py-3.5 text-left transition-colors hover:bg-[var(--bg-elevated)]/45"
+        >
+          <div className="flex min-w-0 items-center gap-2.5">
+            {advancedOpen ? (
+              <ChevronDown className="h-4 w-4 shrink-0 text-[var(--accent)]" />
+            ) : (
+              <ChevronRight className="h-4 w-4 shrink-0 text-[var(--muted)]" />
+            )}
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 text-xs font-semibold text-[var(--text)]">
+                <span>{dict.preaccel.advancedToolsTitle}</span>
+                {hasAdvancedAlert && (
+                  <span
+                    className={`h-2 w-2 shrink-0 rounded-full ${
+                      !probeValidation.ok ? "bg-[var(--red)]" : "bg-[var(--amber)]"
+                    }`}
+                    title={!probeValidation.ok ? "国内连通检测地址需要修正" : "检测到校园网需要认证"}
+                  />
+                )}
+              </div>
+              <div className="mt-0.5 truncate text-[11px] text-[var(--muted)]">
+                {dict.preaccel.advancedToolsSub}
+              </div>
+            </div>
+          </div>
+          <span className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[10px] font-medium text-[var(--muted)]">
+            {advancedOpen ? dict.preaccel.collapseBtn : dict.preaccel.expandBtn}
+          </span>
+        </button>
+
+        {advancedOpen && (
+          <div className="space-y-4 border-t border-[var(--line)]/70 px-5 pb-5 pt-4">
+            {/* 高级快捷工具栏：检测地址 / 软路由导出 / 分享包导出 / 全部测上下行 / 切换备用 */}
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowProbeModal(true)}
+                className="relative inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+              >
+                <SlidersHorizontal className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
+                <span>检测地址</span>
+                {!probeValidation.ok && (
+                  <span
+                    className="h-2 w-2 shrink-0 rounded-full bg-[var(--red)]"
+                    title="国内连通检测地址需要修正"
+                  />
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setGatewayModalOpen(true)}
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+                title={dict.preaccel.gatewayExportTooltip}
+              >
+                <Router className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                <span>{dict.preaccel.gatewayExportBtn}</span>
+              </button>
+
+              {sortedRelays.length > 0 && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => openShareModal("export")}
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)]"
+                    title={dict.share.exportZipTooltip}
+                  >
+                    <Package className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                    <span>{dict.common.exportShareBundle}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={
+                      speedTestingAll || speedTestingAny || isProbeEngineBusy || relays.length === 0
+                    }
+                    onClick={() => void handleSpeedTestAllRelays()}
+                    title="逐条实测所有中转线路的实际上传与下载速率（切页不中断）"
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-65"
+                  >
+                    {speedTestingAll ? (
+                      <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-[var(--accent)]" />
+                    ) : (
+                      <Gauge className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                    )}
+                    <span>{speedTestingAll ? "测速中…" : "全部测上下行"}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    disabled={failoverBusy || enabledRelayCount < 2}
+                    onClick={() => void handleFailover()}
+                    className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--text)] disabled:cursor-not-allowed disabled:opacity-65"
+                    title="将当前流量切换到下一条可用的备用线路"
+                  >
+                    <ArrowLeftRight className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
+                    <span>{failoverBusy ? "切换中…" : "切换备用"}</span>
+                  </button>
+                </>
+              )}
+            </div>
+
+            {/* 已自动识别并加速的进程小胶囊列表（含连接数与流量） */}
+            {(processStats.length > 0 ||
+              (preaccelSummary.realWinDivertActive &&
+                acceleratedProcesses.length > 0)) && (
+              <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/80 px-3.5 py-2.5">
+                <div className="mb-2 flex items-center justify-between gap-2 text-[11px]">
+                  <span className="font-medium text-[var(--text-secondary)]">
+                    已自动识别并加速（
+                    {processStats.length > 0
+                      ? processStats.length
+                      : acceleratedProcesses.length}
+                    ）
+                  </span>
+                  <span className="text-[10px] text-[var(--muted)]">
+                    自动排除猫猫云梯自身，零手动配置
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {processStats.length > 0
+                    ? processStats.slice(0, 12).map((stat) => (
+                        <span
+                          key={stat.process_name.toLowerCase()}
+                          title={`PID ${stat.pid} · 来源：${formatDetectedByLabel(stat.detected_by)} · 累计 ${stat.total_connections} 连接`}
+                          className="inline-flex items-center gap-1.5 rounded-lg border border-[var(--accent)]/35 bg-[var(--card)] px-2 py-1 text-[11px]"
+                        >
+                          <span className="cc-mono font-semibold text-[var(--text)]">
+                            {stat.process_name}
+                          </span>
+                          <span className="rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9.5px] font-medium text-[var(--accent)]">
+                            {formatDetectedByLabel(stat.detected_by)}
+                          </span>
+                          <span className="cc-mono cc-tabular text-[10px] text-[var(--text-secondary)]">
+                            {stat.active_connections > 0
+                              ? `${stat.active_connections} 连`
+                              : `累计 ${stat.total_connections}`}
+                          </span>
+                          <span className="cc-mono cc-tabular text-[10px] text-[var(--coral)]">
+                            ↑{formatBytes(stat.tx_bytes)}
+                          </span>
+                          <span className="cc-mono cc-tabular text-[10px] text-[var(--sky)]">
+                            ↓{formatBytes(stat.rx_bytes)}
+                          </span>
+                        </span>
+                      ))
+                    : acceleratedProcesses.slice(0, 10).map((proc) => (
+                        <span
+                          key={proc.toLowerCase()}
+                          className="cc-mono rounded-lg border border-[var(--accent)]/35 bg-[var(--accent-soft)]/60 px-2 py-1 text-[11px] font-medium text-[var(--accent)]"
+                        >
+                          {proc}
+                        </span>
+                      ))}
+                </div>
+              </div>
+            )}
+
+            {/* 多云均衡聚合 / 单线主备 调度方式控制条 */}
+            {sortedRelays.length > 0 && (
+              <div className="space-y-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2.5 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="inline-flex items-center gap-1.5 font-medium text-[var(--text-secondary)]">
+                      <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
+                      <span>{dict.preaccel.dispatchLabel}</span>
+                    </span>
+                    <div
+                      className="inline-flex max-w-full flex-wrap rounded-xl border border-[var(--line)] bg-[var(--card)] p-0.5 text-[11px]"
+                      role="group"
+                      aria-label={dict.preaccel.dispatchLabel}
+                    >
+                      <button
+                        type="button"
+                        disabled={savingDispatch}
+                        onClick={() => void handleUpdateDispatchConfig("auto", lbStrategy)}
+                        className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors disabled:opacity-60 ${
+                          isMultiCloudLbStrategy
+                            ? "bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
+                            : "text-[var(--muted)] hover:text-[var(--text)]"
+                        }`}
+                      >
+                        {dict.preaccel.dispatchAutoLb}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={savingDispatch}
+                        onClick={() => void handleUpdateDispatchConfig("fallback", lbStrategy)}
+                        className={`shrink-0 whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors disabled:opacity-60 ${
+                          !isMultiCloudLbStrategy
+                            ? "bg-[var(--accent-soft)] font-semibold text-[var(--accent)]"
+                            : "text-[var(--muted)] hover:text-[var(--text)]"
+                        }`}
+                      >
+                        {dict.preaccel.dispatchFallback}
+                      </button>
+                    </div>
+                  </div>
+
+                  {isMultiCloudLbActive && (
+                    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+                      <span className="shrink-0 whitespace-nowrap text-[var(--muted)]">
+                        {dict.preaccel.lbAlgorithmLabel}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={savingDispatch}
+                        onClick={() =>
+                          void handleUpdateDispatchConfig(
+                            dispatchStrategy,
+                            lbStrategy === "round_robin" ? "consistent_hashing" : "round_robin"
+                          )
+                        }
+                        className="shrink-0 whitespace-nowrap rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-60"
+                        title={dict.preaccel.lbAlgorithmTooltip}
+                      >
+                        {lbStrategy === "consistent_hashing"
+                          ? dict.preaccel.lbConsistentHashing
+                          : dict.preaccel.lbRoundRobin}
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {physicalHostSummary.distinctHosts >= 2 && isMultiCloudLbActive && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--green)]/40 bg-[var(--green-soft)]/45 px-3.5 py-2 text-[11.5px] text-[var(--text)]">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <Sparkles className="h-3.5 w-3.5 shrink-0 text-[var(--green)]" />
+                      <span>
+                        已自动聚合{" "}
+                        <strong className="cc-mono text-[var(--green)]">
+                          {physicalHostSummary.distinctHosts}
+                        </strong>{" "}
+                        台物理云并发带宽
+                        {physicalHostSummary.duplicateProtocolCount > 0
+                          ? `（同机多余 ${physicalHostSummary.duplicateProtocolCount} 条协议已自动去重防抢占网卡）`
+                          : "（同机多协议自动去重）"}
+                        ，单台故障自动切换备用与直连兜底。
+                      </span>
+                    </div>
+                  </div>
+                )}
+
+                {physicalHostSummary.distinctHosts >= 2 && !isMultiCloudLbActive && (
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/40 bg-[var(--amber-soft)]/45 px-3.5 py-2 text-[11.5px] text-[var(--text)]">
+                    <span className="text-[var(--text-secondary)]">
+                      当前已手动固定为单线主备模式（优先使用首位主力线，其余线路作故障兜底）。检测到{" "}
+                      <strong className="cc-mono text-[var(--text)]">
+                        {physicalHostSummary.distinctHosts}
+                      </strong>{" "}
+                      台不同物理云，可随时切回并发聚合。
+                    </span>
+                    <button
+                      type="button"
+                      disabled={savingDispatch}
+                      onClick={() => void handleUpdateDispatchConfig("auto", lbStrategy)}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[var(--accent)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+                    >
+                      <Layers className="h-3 w-3" />
+                      <span>{dict.preaccel.switchBackLbBtn}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* 提速前后测速对比 + 校园网认证检测 */}
+            <div className="grid grid-cols-1 gap-4 min-[1160px]:grid-cols-12">
         {/* 提速效果实测对比 */}
         <div
           className={`cc-card cc-glass min-w-0 rounded-2xl p-5 transition-colors min-[1160px]:col-span-7 ${
@@ -3254,38 +3377,8 @@ export function PreAccelPage() {
             </div>
           </div>
         </div>
-      </section>
-
-      {/* 4. 底部折叠区：高级选项（通常无需调整），默认收起 */}
-      <section className="cc-card cc-glass rounded-2xl">
-        <button
-          type="button"
-          aria-expanded={advancedOpen}
-          onClick={() => setAdvancedOpen((v) => !v)}
-          className="flex w-full items-center justify-between gap-3 rounded-2xl px-5 py-3.5 text-left transition-colors hover:bg-[var(--bg-elevated)]/45"
-        >
-          <div className="flex min-w-0 items-center gap-2.5">
-            {advancedOpen ? (
-              <ChevronDown className="h-4 w-4 shrink-0 text-[var(--accent)]" />
-            ) : (
-              <ChevronRight className="h-4 w-4 shrink-0 text-[var(--muted)]" />
-            )}
-            <div className="min-w-0">
-              <div className="text-xs font-semibold text-[var(--text)]">
-                高级选项（通常无需调整）
-              </div>
-              <div className="mt-0.5 truncate text-[11px] text-[var(--muted)]">
-                高速直连自动跳过 · 驱动状态与重装诊断 · 加速范围及自定义额外/排除进程名
-              </div>
             </div>
-          </div>
-          <span className="shrink-0 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[10px] font-medium text-[var(--muted)]">
-            {advancedOpen ? "收起" : "展开"}
-          </span>
-        </button>
 
-        {advancedOpen && (
-          <div className="space-y-4 border-t border-[var(--line)]/70 px-5 pb-5 pt-4">
             {/* 4.1 路由优化开关：已是高速通道的线路自动跳过 */}
             <button
               type="button"
@@ -3454,29 +3547,6 @@ export function PreAccelPage() {
                     </span>
                   </span>
                 </div>
-
-                {localSocksAddress && (
-                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-[var(--line)] bg-[var(--card)] px-3 py-2 text-[11px]">
-                    <div className="flex items-center gap-2">
-                      <span className="text-[var(--muted)]">本地独立 443 通道入口</span>
-                      <code className="cc-mono cc-selectable font-semibold text-[var(--text)]">
-                        {localSocksAddress}
-                      </code>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void handleCopyGlobalAddress(localSocksAddress)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                    >
-                      {copiedGlobalAddr ? (
-                        <Check className="h-3 w-3 text-[var(--green)]" />
-                      ) : (
-                        <Copy className="h-3 w-3" />
-                      )}
-                      <span>{copiedGlobalAddr ? "已复制" : "复制地址"}</span>
-                    </button>
-                  </div>
-                )}
 
                 {globalPreAccel.last_error && (
                   <div className="flex items-start gap-2 rounded-lg border border-[var(--amber)]/45 bg-[var(--amber-soft)]/60 px-3 py-2 text-[11px] leading-relaxed text-[var(--amber)]">
@@ -4149,7 +4219,7 @@ export function PreAccelPage() {
        * ==================================================================== */}
       <ShareBundleModal
         open={shareModalOpen}
-        mode={relays.length > 0 ? "export" : "import"}
+        mode={shareModalMode}
         allowModeSwitch
         defaultTab="relays"
         defaultPackName="国内提速中转分享包"

@@ -300,12 +300,17 @@ fn reconcile_startup_config_with_storage(
         .into_iter()
         .map(|r| r.id)
         .collect();
-    if config::reconcile_dangling_active_relay(cfg, &enabled_relay_ids) {
-        let _ = config::save(paths, cfg);
-        true
-    } else {
-        false
+    let mut changed = config::reconcile_dangling_active_relay(cfg, &enabled_relay_ids);
+    if enabled_relay_ids.is_empty()
+        && (cfg.preaccel.enabled || cfg.preaccel.global_bypass_enabled)
+    {
+        cfg.preaccel.sync_unified_enabled(false);
+        changed = true;
     }
+    if changed {
+        let _ = config::save(paths, cfg);
+    }
+    changed
 }
 
 fn apply_next_launch_silent_badge_policy(
@@ -586,6 +591,8 @@ pub fn run_with_paths(paths: AppPaths) {
             commands::start_core,
             commands::stop_core,
             commands::disable_all_proxy_and_stop_core,
+            commands::enable_proxy_power,
+            commands::consume_pending_nav,
             commands::restart_core,
             commands::reload_core_config,
             commands::set_proxy_mode,
@@ -740,11 +747,17 @@ pub fn run_with_paths(paths: AppPaths) {
             // Unified single-instance listener:
             // - secondary launch -> rebuild or focus the primary main window
             // - cross-IL graceful-exit event -> mark shutting down and run full graceful exit
+            // - cross-process config-reload event -> debounced live hot-reload worker
+            let config_reload_notify = Arc::new(tokio::sync::Notify::new());
+            spawn_disk_config_hot_reload_worker(&handle, Arc::clone(&config_reload_notify));
+
             if let Ok(guard_lock) = wake_guard_ref.lock() {
                 if let Some(ref si) = *guard_lock {
                     let wake_handle = handle.clone();
                     let exit_handle = handle.clone();
-                    if let Err(err) = si.start_instance_listeners(
+                    let exit_reload_notify = Arc::clone(&config_reload_notify);
+                    let reload_notify_cb = Arc::clone(&config_reload_notify);
+                    if let Err(err) = si.start_instance_listeners_with_reload(
                         move || {
                             lifecycle::show_or_rebuild_main_window(&wake_handle);
                         },
@@ -755,7 +768,11 @@ pub fn run_with_paths(paths: AppPaths) {
                             if let Some(st) = exit_handle.try_state::<AppState>() {
                                 st.shutting_down.store(true, Ordering::SeqCst);
                             }
+                            exit_reload_notify.notify_one();
                             lifecycle::request_graceful_exit(&exit_handle);
+                        },
+                        move || {
+                            reload_notify_cb.notify_one();
                         },
                     ) {
                         tracing::warn!("failed to start single-instance listeners: {err}");
@@ -898,8 +915,21 @@ pub fn run_with_paths(paths: AppPaths) {
                         tauri::async_runtime::spawn(async move {
                             if let Some(st) = app_async.try_state::<AppState>() {
                                 let next = !st.snapshot_config().preaccel.enabled;
-                                let _ =
-                                    commands::toggle_preaccel_internal(&app_async, &st, next).await;
+                                if let Err(err) =
+                                    commands::toggle_preaccel_internal(&app_async, &st, next).await
+                                {
+                                    if err.contains("NO_ENABLED_RELAY") {
+                                        if lifecycle::window_mode_snapshot(&app_async).main_open {
+                                            st.set_pending_nav(None);
+                                            lifecycle::show_or_rebuild_main_window(&app_async);
+                                            let _ = app_async
+                                                .emit(commands::EVENT_NAVIGATE, "preaccel");
+                                        } else {
+                                            st.set_pending_nav(Some("preaccel"));
+                                            lifecycle::show_or_rebuild_main_window(&app_async);
+                                        }
+                                    }
+                                }
                             }
                         });
                     }
@@ -1196,6 +1226,63 @@ fn install_macos_native_menu(app: &tauri::AppHandle) -> tauri::Result<()> {
     let menu = Menu::with_items(app, &[&app_menu, &edit_menu, &window_menu])?;
     let _ = app.set_menu(menu)?;
     Ok(())
+}
+
+fn spawn_disk_config_hot_reload_worker(
+    app: &tauri::AppHandle,
+    notify: Arc<tokio::sync::Notify>,
+) {
+    let app_h = app.clone();
+    tauri::async_runtime::spawn(async move {
+        const DEBOUNCE_WINDOW: Duration = Duration::from_millis(250);
+        const MAX_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+
+        loop {
+            notify.notified().await;
+
+            let Some(st) = app_h.try_state::<AppState>() else {
+                break;
+            };
+            if st.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+
+            let batch_deadline = Instant::now() + MAX_COALESCE_WINDOW;
+            loop {
+                if st.shutting_down.load(Ordering::SeqCst) {
+                    return;
+                }
+                let now = Instant::now();
+                if now >= batch_deadline {
+                    break;
+                }
+                let wait_dur = DEBOUNCE_WINDOW.min(batch_deadline.saturating_duration_since(now));
+                match tokio::time::timeout(wait_dur, notify.notified()).await {
+                    Ok(()) => continue,
+                    Err(_) => break,
+                }
+            }
+
+            if st.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match commands::apply_disk_config_hot_reload_internal(&app_h, &st).await {
+                Ok(ack) => {
+                    tracing::debug!(
+                        req_id = %ack.req_id,
+                        applied = ack.applied,
+                        rejected = ack.rejected,
+                        level = ?ack.level,
+                        "cross-process disk config hot-reload finished"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!("cross-process disk config hot-reload failed: {err}");
+                }
+            }
+        }
+    });
 }
 
 fn spawn_proxy_guard(app: &tauri::AppHandle) {
@@ -4113,5 +4200,52 @@ mod tests {
 
         drop(guard);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn stage23_startup_reconcile_converges_preaccel_to_false_when_zero_enabled_relays() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s23_startup_zero_relay_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let storage = Storage::open(&paths.db_path).unwrap();
+
+        let mut cfg = catcloud_core::models::AppConfig::default();
+        cfg.preaccel.sync_unified_enabled(true);
+        cfg.preaccel.active_relay_id = Some("missing-relay".to_string());
+        config::save(&paths, &cfg).unwrap();
+
+        assert!(reconcile_startup_config_with_storage(&paths, &mut cfg, &storage));
+        assert!(!cfg.preaccel.enabled);
+        assert!(!cfg.preaccel.global_bypass_enabled);
+        assert_eq!(cfg.preaccel.active_relay_id, None);
+
+        let persisted = config::load_or_default(&paths).unwrap();
+        assert!(!persisted.preaccel.enabled);
+        assert!(!persisted.preaccel.global_bypass_enabled);
+
+        // Once an enabled relay exists, startup reconciliation preserves preaccel.enabled = true.
+        storage
+            .upsert_preaccel_relay(&catcloud_core::models::PreAccelRelay {
+                id: "relay-1".to_string(),
+                name: "杭州443".to_string(),
+                server: "203.0.113.10".to_string(),
+                port: 443,
+                protocol: "trojan".to_string(),
+                password: "demo".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        cfg.preaccel.sync_unified_enabled(true);
+        cfg.preaccel.active_relay_id = Some("relay-1".to_string());
+        config::save(&paths, &cfg).unwrap();
+        assert!(!reconcile_startup_config_with_storage(&paths, &mut cfg, &storage));
+        assert!(cfg.preaccel.enabled);
+        assert_eq!(cfg.preaccel.active_relay_id.as_deref(), Some("relay-1"));
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

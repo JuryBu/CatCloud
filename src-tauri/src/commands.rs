@@ -56,7 +56,10 @@ use catcloud_core::probe::{
     run_download_probe_with_config, run_funnel_for_node, run_latency_probe,
     run_upload_probe_with_config,
 };
-use catcloud_core::process_guard::JobGuard;
+use catcloud_core::process_guard::{
+    ConfigReloadAck, JobGuard, clear_config_reload_request_if_matching,
+    read_config_reload_request, write_config_reload_ack,
+};
 #[cfg(target_os = "windows")]
 use catcloud_core::process_guard::relaunch_self_as_admin;
 use catcloud_core::share_bundle::{
@@ -110,6 +113,10 @@ pub const EVENT_CONFIG_UPDATED: &str = "catcloud://config-updated";
 pub const EVENT_UPDATE_READY: &str = "catcloud://update-ready";
 pub const EVENT_GROUPS_UPDATED: &str = "catcloud://groups-updated";
 pub const EVENT_RELAYS_UPDATED: &str = "catcloud://relays-updated";
+pub const EVENT_NODES_UPDATED: &str = "catcloud://nodes-updated";
+pub const EVENT_NAVIGATE: &str = "catcloud://navigate";
+
+pub const NO_ENABLED_RELAY_ERROR: &str = "NO_ENABLED_RELAY: 请先添加并启用至少一条国内提速线路";
 
 /// Physical-pixel anchor tracked during custom Win32 floating capsule dragging (zero HTCAPTION / Aero Snap).
 #[derive(Debug, Clone, Copy)]
@@ -171,6 +178,11 @@ pub struct AppState {
     pub app_logger: Arc<RotatingAppLogger>,
     pub last_app_error: RwLock<Option<String>>,
     pub started_at: Instant,
+    /// In-memory `(was_sys_proxy, was_eff_tun)` takeover combination captured before power-off
+    /// (never persisted to disk; cold startup always begins with `None`).
+    pub power_off_takeover_memory: Mutex<Option<(bool, bool)>>,
+    /// Pending route queued when a tray/background action rebuilds the main window from windowless mode.
+    pub pending_nav: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -317,6 +329,8 @@ impl AppState {
             app_logger,
             last_app_error: RwLock::new(None),
             started_at: Instant::now(),
+            power_off_takeover_memory: Mutex::new(None),
+            pending_nav: Mutex::new(None),
         }
     }
 
@@ -640,6 +654,49 @@ impl AppState {
         if let Ok(mut pool) = self.node_health_pool.write() {
             pool.prune_missing_nodes(valid_ids);
         }
+    }
+
+    pub fn record_power_off_takeover_memory(&self, was_sys_proxy: bool, was_eff_tun: bool) {
+        if let Ok(mut guard) = self.power_off_takeover_memory.lock() {
+            *guard = if was_sys_proxy || was_eff_tun {
+                Some((was_sys_proxy, was_eff_tun))
+            } else {
+                None
+            };
+        }
+    }
+
+    pub fn take_power_off_takeover_memory(&self) -> Option<(bool, bool)> {
+        self.power_off_takeover_memory
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+    }
+
+    pub fn restore_power_off_takeover_memory(&self, memory: Option<(bool, bool)>) {
+        if let Ok(mut guard) = self.power_off_takeover_memory.lock() {
+            *guard = memory;
+        }
+    }
+
+    pub fn clear_power_off_takeover_memory(&self) {
+        if let Ok(mut guard) = self.power_off_takeover_memory.lock() {
+            *guard = None;
+        }
+    }
+
+    pub fn set_pending_nav(&self, route: Option<&str>) {
+        let normalized = route
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        if let Ok(mut guard) = self.pending_nav.lock() {
+            *guard = normalized;
+        }
+    }
+
+    pub fn take_pending_nav(&self) -> Option<String> {
+        self.pending_nav.lock().ok().and_then(|mut guard| guard.take())
     }
 }
 
@@ -1092,6 +1149,8 @@ pub struct CoreRuntimeInfoDto {
     pub tun_enabled: bool,
     pub tun_configured: bool,
     pub tun_needs_elevation: bool,
+    #[serde(default)]
+    pub power_on_tun_degraded: bool,
     pub tun_admin_ready: bool,
     #[serde(default)]
     pub effective_tun_mtu: Option<u16>,
@@ -1900,6 +1959,42 @@ fn effective_config_for_runtime(state: &AppState, cfg: &AppConfig) -> AppConfig 
     eff
 }
 
+/// Resolve the discrete tray pre-acceleration mode label, explicitly surfacing `"no_relay"`
+/// whenever pre-acceleration is flagged on (or standalone is running) without any enabled relay
+/// so the tray never falsely reports `"standby"` / `"已开启·待启动"`.
+fn resolve_tray_preaccel_mode_label(
+    preaccel_enabled: bool,
+    has_enabled_relays: bool,
+    proxy_active: bool,
+    global_running: bool,
+    is_windivert_active: bool,
+    install_state: &str,
+) -> Option<String> {
+    if !preaccel_enabled && !global_running {
+        None
+    } else if !has_enabled_relays {
+        Some("no_relay".to_string())
+    } else if proxy_active && preaccel_enabled {
+        if is_windivert_active {
+            Some("dual".to_string())
+        } else {
+            None
+        }
+    } else if is_windivert_active {
+        Some("windivert".to_string())
+    } else if matches!(install_state, "downloading" | "verifying") {
+        Some("downloading".to_string())
+    } else if install_state == "need_elevation" {
+        Some("need_elevation".to_string())
+    } else if global_running {
+        Some("local_socks5".to_string())
+    } else if preaccel_enabled {
+        Some("standby".to_string())
+    } else {
+        None
+    }
+}
+
 pub fn build_tray_menu_state(app: &AppHandle, state: &AppState) -> TrayMenuState {
     build_tray_menu_state_with_verify_override(app, state, None)
 }
@@ -2001,11 +2096,12 @@ fn build_tray_menu_state_with_verify_override(
         Some(group_summaries.remove(0))
     };
 
+    let has_enabled_relays = relays.iter().any(|r| r.enabled);
     let active_relay_label = cfg
         .preaccel
         .active_relay_id
         .as_deref()
-        .and_then(|id| relays.iter().find(|r| r.id == id))
+        .and_then(|id| relays.iter().find(|r| r.id == id && r.enabled))
         .or_else(|| relays.iter().find(|r| r.enabled))
         .map(|r| r.name.clone());
 
@@ -2053,30 +2149,14 @@ fn build_tray_menu_state_with_verify_override(
     let eff_tun = cfg.tun.enabled && tun_ready;
     let tun_need_elev = cfg.tun.enabled && !tun_ready;
     let proxy_active = is_proxy_takeover_active(rt.running, &cfg, tun_ready);
-    let global_mode_label = if !cfg.preaccel.enabled && !global_status.running {
-        None
-    } else if proxy_active && cfg.preaccel.enabled {
-        if global_status.is_windivert_active {
-            Some("dual".to_string())
-        } else {
-            None
-        }
-    } else if global_status.is_windivert_active {
-        Some("windivert".to_string())
-    } else if matches!(
+    let global_mode_label = resolve_tray_preaccel_mode_label(
+        cfg.preaccel.enabled,
+        has_enabled_relays,
+        proxy_active,
+        global_status.running,
+        global_status.is_windivert_active,
         global_status.install_state.as_str(),
-        "downloading" | "verifying"
-    ) {
-        Some("downloading".to_string())
-    } else if global_status.install_state == "need_elevation" {
-        Some("need_elevation".to_string())
-    } else if global_status.running {
-        Some("local_socks5".to_string())
-    } else if cfg.preaccel.enabled {
-        Some("standby".to_string())
-    } else {
-        None
-    };
+    );
 
     TrayMenuState {
         proxy_mode: match cfg.proxy_mode {
@@ -2307,6 +2387,8 @@ fn build_tray_visual_state_with_verify_override(
             Some(relay) => Some(format!("{prefix} · {relay}")),
             None => Some(prefix),
         }
+    } else if cfg.preaccel.enabled && !has_enabled_relays {
+        Some("待添加提速线路".to_string())
     } else if cfg.preaccel.enabled
         && matches!(
             global_status.install_state.as_str(),
@@ -2781,6 +2863,7 @@ fn build_runtime_info_dto_with_verify_override(
         tun_enabled: eff_tun,
         tun_configured: cfg.tun.enabled,
         tun_needs_elevation: tun_need_elev,
+        power_on_tun_degraded: false,
         tun_admin_ready,
         effective_tun_mtu: Some(effective_tun_mtu_val),
         preaccel_transport,
@@ -2808,6 +2891,10 @@ pub fn emit_groups_updated(app: &AppHandle) {
 
 pub fn emit_relays_updated(app: &AppHandle) {
     let _ = app.emit(EVENT_RELAYS_UPDATED, ());
+}
+
+pub fn emit_nodes_updated(app: &AppHandle) {
+    let _ = app.emit(EVENT_NODES_UPDATED, ());
 }
 
 pub fn refresh_tray(app: &AppHandle, state: &AppState) {
@@ -2885,8 +2972,8 @@ pub fn apply_configured_shortcuts(
         match action {
             ShortcutAction::ToggleCapsule => lifecycle::toggle_capsule_window(app_h),
             ShortcutAction::ToggleMainWindow => {
-                if lifecycle::window_mode_snapshot(app_h).main_open {
-                    lifecycle::enter_windowless_mode(app_h);
+                if lifecycle::is_main_window_visible(app_h) {
+                    lifecycle::hide_or_enter_windowless_main_window(app_h);
                 } else {
                     lifecycle::show_or_rebuild_main_window(app_h);
                 }
@@ -2930,50 +3017,24 @@ pub fn apply_configured_shortcuts(
     }
 }
 
-/// Auto-create a default "默认路线" multi-group when nodes exist but no multi-group is configured yet.
-/// Returns `true` when a new default group was created and persisted into config.
+/// Auto-create or refill a default "默认路线" multi-group when enabled nodes exist and either no
+/// group exists yet or there are no dynamic groups and all existing static groups have 0 valid
+/// enabled members (delegating to `Storage::ensure_default_group_if_empty`, strictly preserving
+/// dynamic groups, independent-routing groups, and custom groups with non-blank `match_rules`).
+/// Returns `true` when a default group was created or refilled and persisted as active.
 fn ensure_default_group_if_empty(state: &AppState) -> bool {
-    let created_group_id = {
+    let target_group_id = {
         let Ok(db) = state.storage.lock() else {
             return false;
         };
-        let Ok(groups) = db.list_multi_groups() else {
-            return false;
-        };
-        if !groups.is_empty() {
-            return false;
+        match db.ensure_default_group_if_empty() {
+            Ok(Some(id)) => id,
+            _ => return false,
         }
-        let Ok(nodes) = db.list_nodes() else {
-            return false;
-        };
-        if nodes.is_empty() {
-            return false;
-        }
-        let enabled_nodes: Vec<ProxyNode> =
-            nodes.iter().filter(|n| n.enabled).cloned().collect();
-        let member_node_ids: Vec<String> = enabled_nodes.iter().map(|n| n.id.clone()).collect();
-        let snaps = db
-            .get_probe_snapshots_batch(&member_node_ids, None)
-            .unwrap_or_default();
-        let active_node_id = pick_smart_default_node_id(&enabled_nodes, Some(&snaps))
-            .or_else(|| member_node_ids.first().cloned());
-        let group = MultiGroup {
-            id: format!("grp-{}", uuid::Uuid::new_v4().simple()),
-            name: "默认路线".to_string(),
-            mode: MultiGroupMode::StickyBest,
-            hard_gates: Vec::new(),
-            member_node_ids,
-            active_node_id,
-            ..MultiGroup::default()
-        };
-        if db.upsert_multi_group(&group).is_err() {
-            return false;
-        }
-        group.id
     };
 
     let mut cfg = state.snapshot_config();
-    cfg.active_group_id = Some(created_group_id);
+    cfg.active_group_id = Some(target_group_id);
     if config::save(&state.paths, &cfg).is_ok() {
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg;
@@ -4188,11 +4249,17 @@ async fn stop_core_preserving_tun_intent_internal(
 /// Atomically disable OS system proxy and TUN virtual NIC, persist both flags as `false`, and
 /// terminate the main `mihomo` core with zero port/memory/connection residue (while keeping the
 /// lightweight standalone 443 pre-acceleration tunnel active if the unified switch is enabled).
+/// Captures `(was_sys_proxy, was_eff_tun)` in transient memory so `enable_proxy_power` can
+/// symmetrically restore the user's prior takeover combination without ever persisting auto-start.
 pub async fn disable_all_proxy_and_stop_core_internal(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<CoreRuntimeInfoDto, String> {
     let _cfg_guard = state.config_transition_lock.lock().await;
+    let old_cfg = state.snapshot_config();
+    let sys_proxy_was_on = old_cfg.system_proxy.enabled;
+    let eff_tun_was_on = effective_tun_enabled(state, &old_cfg);
+    state.record_power_off_takeover_memory(sys_proxy_was_on, eff_tun_was_on);
     let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
     stop_core_locked(app, state, true).await
 }
@@ -4205,13 +4272,16 @@ fn format_reload_level_zh(level: ReloadLevel) -> &'static str {
     }
 }
 
-/// Reload core configuration from disk via `HotReloadCoordinator` when running.
+/// Reload core configuration from disk via `HotReloadCoordinator` when running, allowing callers
+/// to explicitly control whether L3 subprocess restarts are permitted (e.g., cross-process live
+/// hot-reload defaults `allow_l3_restart = false` to protect active TUN/long-lived connections).
 /// Acquires `core_lifecycle_lock` and re-checks shutdown/live-controller state so an in-flight
 /// reload can never resurrect the core after `stop_core`.
-pub async fn trigger_reload_if_running(
+pub async fn trigger_reload_if_running_with_options(
     app: &AppHandle,
     state: &AppState,
     force: bool,
+    allow_l3_restart: bool,
 ) -> Option<ReloadOutcome> {
     let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
     if state.shutting_down.load(Ordering::SeqCst) || !state.adapter.has_live_controller().await {
@@ -4241,7 +4311,7 @@ pub async fn trigger_reload_if_running(
         .apply_disk_reload(DiskReloadOptions {
             force,
             verify_with_binary: true,
-            allow_l3_restart: true,
+            allow_l3_restart,
             allow_tun: is_tun_privilege_ready(state),
             extra_prepend_rules: extra_rules,
             extra_fake_ip_filters: extra_filters,
@@ -4319,6 +4389,423 @@ pub async fn trigger_reload_if_running(
 
     sync_app_side_effects(app, state, &cfg);
     Some(outcome)
+}
+
+/// Reload core configuration from disk via `HotReloadCoordinator` when running (allowing L3 core
+/// restarts by default for explicit in-app operations).
+pub async fn trigger_reload_if_running(
+    app: &AppHandle,
+    state: &AppState,
+    force: bool,
+) -> Option<ReloadOutcome> {
+    trigger_reload_if_running_with_options(app, state, force, true).await
+}
+
+fn current_unix_ms() -> u64 {
+    Utc::now().timestamp_millis().max(0) as u64
+}
+
+/// Pure in-memory reconciliation applied to disk configs during live hot-reload (without writing
+/// back to disk): normalizes unified preaccel flags, clears dangling `active_relay_id`, and forces
+/// `preaccel.enabled = false` whenever zero enabled domestic relays exist.
+fn reconcile_disk_hot_reload_config(
+    cfg: &mut AppConfig,
+    enabled_relay_ids: &HashSet<String>,
+) -> bool {
+    let before_enabled = cfg.preaccel.enabled;
+    let before_global = cfg.preaccel.global_bypass_enabled;
+    cfg.preaccel.reconcile_unified_enabled();
+    let mut changed =
+        cfg.preaccel.enabled != before_enabled || cfg.preaccel.global_bypass_enabled != before_global;
+    if config::reconcile_dangling_active_relay(cfg, enabled_relay_ids) {
+        changed = true;
+    }
+    if enabled_relay_ids.is_empty()
+        && (cfg.preaccel.enabled || cfg.preaccel.global_bypass_enabled)
+    {
+        cfg.preaccel.sync_unified_enabled(false);
+        changed = true;
+    }
+    changed
+}
+
+const CONFIG_RELOAD_REQ_TTL_MS: u64 = 15_000;
+
+fn is_config_reload_request_expired(created_at_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(created_at_ms) > CONFIG_RELOAD_REQ_TTL_MS
+}
+
+/// Cross-process zero-disruption live hot-reload entry point triggered by `SingleInstanceGuard`
+/// whenever CLI, share import, or sync updates disk config / SQLite state while desktop is running.
+pub async fn apply_disk_config_hot_reload_internal(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<ConfigReloadAck, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+
+    let now_ms = current_unix_ms();
+    let req_opt = read_config_reload_request(&state.paths.root_data_dir);
+    let (req_id, allow_l3_restart) = match req_opt {
+        Some(req) => {
+            let trimmed_id = req.req_id.trim().to_string();
+            if is_config_reload_request_expired(req.created_at_ms, now_ms) {
+                if !trimmed_id.is_empty() {
+                    let _ = clear_config_reload_request_if_matching(
+                        &state.paths.root_data_dir,
+                        &trimmed_id,
+                    );
+                }
+                tracing::warn!(
+                    req_id = %trimmed_id,
+                    created_at_ms = req.created_at_ms,
+                    now_ms,
+                    "忽略过期的跨进程热重载请求（超过 15000ms TTL），已清理残留请求并强制 allow_l3_restart=false"
+                );
+                (String::new(), false)
+            } else {
+                (trimmed_id, req.allow_l3_restart)
+            }
+        }
+        None => (String::new(), false),
+    };
+
+    let persist_ack = |ack: &ConfigReloadAck| {
+        if !ack.req_id.is_empty() {
+            if let Err(err) = write_config_reload_ack(&state.paths.root_data_dir, ack) {
+                tracing::warn!("写入跨进程热重载回执失败：{err}");
+            }
+        }
+    };
+
+    if state.shutting_down.load(Ordering::SeqCst) {
+        let ack = ConfigReloadAck {
+            req_id,
+            applied: false,
+            rejected: true,
+            level: None,
+            error: Some("shutting_down".to_string()),
+            completed_at_ms: current_unix_ms(),
+        };
+        persist_ack(&ack);
+        return Ok(ack);
+    }
+
+    let mut next_cfg = match config::load_or_default(&state.paths) {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            let msg = format!("读取或校验磁盘配置文件失败，已保留原运行配置：{err}");
+            state.log_app_event("error", "热重载", &msg);
+            let ack = ConfigReloadAck {
+                req_id,
+                applied: false,
+                rejected: true,
+                level: None,
+                error: Some(msg),
+                completed_at_ms: current_unix_ms(),
+            };
+            persist_ack(&ack);
+            return Ok(ack);
+        }
+    };
+
+    let old_cfg = state.snapshot_config();
+    let enabled_relay_ids: HashSet<String> = state
+        .storage
+        .lock()
+        .ok()
+        .and_then(|db| db.list_preaccel_relays(true).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    let _ = reconcile_disk_hot_reload_config(&mut next_cfg, &enabled_relay_ids);
+
+    let tun_ready = is_tun_privilege_ready(state);
+    let was_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let old_eff_tun = old_cfg.tun.enabled && tun_ready;
+    let was_tun_active = was_core_running && old_eff_tun;
+    let next_eff_tun = next_cfg.tun.enabled && tun_ready;
+    let wants_core_running = next_cfg.system_proxy.enabled || next_eff_tun;
+    let has_nodes = has_enabled_nodes(state).unwrap_or(false);
+
+    let ack_applied: bool;
+    let ack_level: Option<String>;
+
+    if was_core_running {
+        if !wants_core_running {
+            if was_tun_active && state.adapter.has_live_controller().await {
+                let _ = state.adapter.disable_tun_gracefully().await;
+            }
+            if old_cfg.system_proxy.enabled {
+                let _ = clear_system_proxy_if_owned_with_hint(state, true);
+            }
+            if let Ok(mut guard) = state.config.write() {
+                *guard = next_cfg.clone();
+            }
+            let stop_res = {
+                let _lifecycle_guard = state.core_lifecycle_lock.lock().await;
+                stop_core_locked(app, state, !next_cfg.tun.enabled).await
+            };
+            if let Err(err) = stop_res {
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = old_cfg.clone();
+                }
+                let msg = format!("外部配置关闭代理但停止核心失败：{err}");
+                state.log_app_event("error", "热重载", &msg);
+                let ack = ConfigReloadAck {
+                    req_id,
+                    applied: false,
+                    rejected: true,
+                    level: Some("core_stop".to_string()),
+                    error: Some(msg),
+                    completed_at_ms: current_unix_ms(),
+                };
+                persist_ack(&ack);
+                return Ok(ack);
+            }
+            state.bump_config_generation();
+            ack_applied = true;
+            ack_level = Some("core_stopped".to_string());
+        } else {
+            let mut pre_suspended_global_preaccel = false;
+            if allow_l3_restart {
+                if !old_eff_tun && next_eff_tun {
+                    // Suspend standalone WinDivert 443 tunnel BEFORE L3 core restart brings up TUN
+                    // so WinDivert and Wintun never run concurrently for even a transient window.
+                    if state.global_preaccel.status().running {
+                        let active_relays: Vec<String> = load_enabled_preaccel_relays(state)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|r| r.name)
+                            .collect();
+                        let _ = state.global_preaccel.suspend_for_tun(active_relays).await;
+                        pre_suspended_global_preaccel = true;
+                    }
+                } else if old_eff_tun
+                    && !next_eff_tun
+                    && state.adapter.has_live_controller().await
+                {
+                    // Gracefully release Wintun virtual NIC & OS routes BEFORE L3 restart disables TUN.
+                    let _ = state.adapter.disable_tun_gracefully().await;
+                }
+            }
+
+            let reload_outcome =
+                trigger_reload_if_running_with_options(app, state, false, allow_l3_restart).await;
+            match reload_outcome {
+                Some(outcome) if outcome.rejected => {
+                    if pre_suspended_global_preaccel && !state.shutting_down.load(Ordering::SeqCst)
+                    {
+                        if old_cfg.preaccel.enabled && !enabled_relay_ids.is_empty() {
+                            if let Err(err) = start_global_preaccel_engine(state, &old_cfg).await {
+                                state.log_app_event(
+                                    "warning",
+                                    "国内提速",
+                                    &format!(
+                                        "磁盘热重载开启虚拟网卡被拒绝后恢复独立底层国内提速失败：{err}"
+                                    ),
+                                );
+                            }
+                        } else if state.global_preaccel.status().mode == "suspended_for_tun" {
+                            let _ = state.global_preaccel.stop().await;
+                        }
+                    }
+                    let detail = if outcome.level == ReloadLevel::L3CoreRestart && !allow_l3_restart {
+                        "检测到端口、虚拟网卡或内核等需重启项变更；为保护现役长连接已默认拒绝外部 L3 重启，原运行配置未受影响".to_string()
+                    } else {
+                        outcome
+                            .error
+                            .as_deref()
+                            .map(format_mihomo_error_for_user)
+                            .unwrap_or_else(|| "磁盘配置预检未通过，已保留原运行配置".to_string())
+                    };
+                    state.log_app_event("warning", "热重载", &detail);
+                    let ack = ConfigReloadAck {
+                        req_id,
+                        applied: false,
+                        rejected: true,
+                        level: Some(outcome.level.as_str().to_string()),
+                        error: Some(detail),
+                        completed_at_ms: current_unix_ms(),
+                    };
+                    persist_ack(&ack);
+                    return Ok(ack);
+                }
+                other => {
+                    if let Ok(mut guard) = state.config.write() {
+                        *guard = next_cfg.clone();
+                    }
+                    state.bump_config_generation();
+                    if old_cfg.log_level != next_cfg.log_level {
+                        let cur_rt = state.snapshot_runtime();
+                        if cur_rt.running {
+                            let cur_secret = state.adapter.controller_secret().await;
+                            state.attach_streams(
+                                &cur_rt.controller_host,
+                                cur_rt.controller_port,
+                                &cur_secret,
+                                next_cfg.log_level.clone(),
+                            );
+                        }
+                    }
+                    let sys_proxy_changed = old_cfg.system_proxy.enabled
+                        != next_cfg.system_proxy.enabled
+                        || (next_cfg.system_proxy.enabled
+                            && (old_cfg.system_proxy != next_cfg.system_proxy
+                                || old_cfg.mixed_port != next_cfg.mixed_port));
+                    if sys_proxy_changed {
+                        if next_cfg.system_proxy.enabled {
+                            let effective_port = {
+                                let rt = state.snapshot_runtime();
+                                if rt.running {
+                                    rt.mixed_port
+                                } else {
+                                    next_cfg.mixed_port
+                                }
+                            };
+                            if let Err(err) =
+                                apply_system_proxy_if_still_enabled(state, effective_port)
+                            {
+                                state.log_app_event(
+                                    "warning",
+                                    "热重载",
+                                    &format!("外部热重载同步操作系统代理失败：{err}"),
+                                );
+                            }
+                        } else if let Err(err) = clear_system_proxy_if_owned_with_hint(
+                            state,
+                            old_cfg.system_proxy.enabled,
+                        ) {
+                            state.log_app_event(
+                                "warning",
+                                "热重载",
+                                &format!("外部热重载清除操作系统代理失败：{err}"),
+                            );
+                        }
+                    }
+
+                    let now_core_running = state.snapshot_runtime().running
+                        || state.adapter.has_live_controller().await;
+                    let now_tun_active =
+                        now_core_running && effective_tun_enabled(state, &next_cfg);
+                    if pre_suspended_global_preaccel && now_tun_active && next_cfg.preaccel.enabled
+                    {
+                        state.log_app_event(
+                            "info",
+                            "国内提速",
+                            "磁盘热重载已启用虚拟网卡接管全机流量，重启前已暂挂独立底层 443 隧道以避免双跑 443，改由主核心统一提供国内提速",
+                        );
+                    }
+                    coordinate_global_preaccel_on_tun_transition(
+                        app,
+                        state,
+                        &next_cfg,
+                        was_tun_active,
+                        now_tun_active,
+                        "磁盘热重载",
+                    )
+                    .await;
+
+                    ack_applied = true;
+                    ack_level = Some(
+                        other
+                            .map(|o| o.level.as_str().to_string())
+                            .unwrap_or_else(|| "state_synced".to_string()),
+                    );
+                }
+            }
+        }
+    } else {
+        if let Ok(mut guard) = state.config.write() {
+            *guard = next_cfg.clone();
+        }
+        if wants_core_running && has_nodes {
+            if let Err(err) = start_core_internal(app, state).await {
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = old_cfg.clone();
+                }
+                sync_app_side_effects(app, state, &old_cfg);
+                let msg = format!("外部配置开启代理但启动核心失败：{err}");
+                state.log_app_event("error", "热重载", &msg);
+                let ack = ConfigReloadAck {
+                    req_id,
+                    applied: false,
+                    rejected: true,
+                    level: Some("core_start".to_string()),
+                    error: Some(msg),
+                    completed_at_ms: current_unix_ms(),
+                };
+                persist_ack(&ack);
+                return Ok(ack);
+            }
+            state.bump_config_generation();
+            ack_applied = true;
+            ack_level = Some("core_started".to_string());
+        } else {
+            if old_cfg.system_proxy.enabled && !next_cfg.system_proxy.enabled {
+                let _ = clear_system_proxy_if_owned_with_hint(state, true);
+            }
+            state.bump_config_generation();
+            ack_applied = true;
+            ack_level = Some("state_synced".to_string());
+        }
+    }
+
+    // Clear power-off takeover memory ONLY after a committed hot-reload explicitly disables TUN.
+    if ack_applied && old_cfg.tun.enabled && !next_cfg.tun.enabled {
+        state.clear_power_off_takeover_memory();
+    }
+
+    // Synchronize standalone domestic pre-acceleration 443 tunnel (never spawning WinDivert at 0 relays).
+    let final_cfg = state.snapshot_config();
+    let now_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let now_tun_active = now_core_running && effective_tun_enabled(state, &final_cfg);
+    if !final_cfg.preaccel.enabled || enabled_relay_ids.is_empty() {
+        if state.global_preaccel.status().running
+            || state.global_preaccel.status().mode == "suspended_for_tun"
+        {
+            let _ = state.global_preaccel.stop().await;
+        }
+    } else if !now_tun_active {
+        if state.global_preaccel.status().running {
+            sync_running_global_preaccel_if_active(state, &final_cfg).await;
+        } else if let Err(err) = start_global_preaccel_engine(state, &final_cfg).await {
+            state.log_app_event(
+                "warning",
+                "国内提速",
+                &format!("磁盘热重载后拉起独立底层国内提速失败：{err}"),
+            );
+        }
+    }
+
+    prune_node_health_pool_from_db(state);
+    sync_autostart_if_changed(&old_cfg, &final_cfg);
+    sync_app_side_effects(app, state, &final_cfg);
+    emit_config_updated(app, &final_cfg);
+    emit_groups_updated(app);
+    emit_relays_updated(app);
+    emit_nodes_updated(app);
+    state.log_app_event(
+        "info",
+        "热重载",
+        &format!(
+            "已接收外部动态配置热切并同步界面（级别：{}）",
+            ack_level.as_deref().unwrap_or("synced")
+        ),
+    );
+
+    let ack = ConfigReloadAck {
+        req_id,
+        applied: ack_applied,
+        rejected: false,
+        level: ack_level,
+        error: None,
+        completed_at_ms: current_unix_ms(),
+    };
+    persist_ack(&ack);
+    Ok(ack)
 }
 
 /// Coordinate standalone global pre-acceleration whenever TUN virtual NIC takeover transitions
@@ -4604,6 +5091,7 @@ pub async fn apply_system_proxy_internal(
     )
     .await;
 
+    state.clear_power_off_takeover_memory();
     state.log_app_event(
         "info",
         "系统代理",
@@ -5848,6 +6336,7 @@ fn schedule_global_to_rule_heap_reclaim(app: &AppHandle, expected_gen: u64) {
 async fn apply_and_save_config_transition<F>(
     app: &AppHandle,
     state: &AppState,
+    explicit_tun_disable: bool,
     build_next: F,
 ) -> Result<AppConfig, String>
 where
@@ -5871,6 +6360,16 @@ where
 
     if !old.tun.enabled && next.tun.enabled && !tun_ready {
         return Err(tun_needs_admin_error_message());
+    }
+
+    if next.preaccel.enabled {
+        let has_enabled_relays = !load_enabled_preaccel_relays(state)?.is_empty();
+        if !has_enabled_relays {
+            if !old.preaccel.enabled {
+                return Err(NO_ENABLED_RELAY_ERROR.to_string());
+            }
+            next.preaccel.sync_unified_enabled(false);
+        }
     }
 
     if (!old.system_proxy.enabled && next.system_proxy.enabled)
@@ -5913,6 +6412,9 @@ where
             stop_core_preserving_tun_intent_internal(app, state).await?;
         } else {
             stop_core_internal(app, state).await?;
+        }
+        if (old.tun.enabled || explicit_tun_disable) && !next.tun.enabled {
+            state.clear_power_off_takeover_memory();
         }
         if old.preaccel.enabled
             && !next.preaccel.enabled
@@ -6014,6 +6516,10 @@ where
         sync_running_global_preaccel_if_active(state, &next).await;
     }
 
+    if (old.tun.enabled || explicit_tun_disable) && !next.tun.enabled {
+        state.clear_power_off_takeover_memory();
+    }
+
     let next_gen = state.bump_config_generation();
     if old.proxy_mode == ProxyMode::Global && next.proxy_mode == ProxyMode::Rule && now_core_running
     {
@@ -6032,7 +6538,8 @@ pub async fn save_app_config(
     state: State<'_, AppState>,
     config: UiAppConfigDto,
 ) -> Result<UiAppConfigDto, String> {
-    let cfg = apply_and_save_config_transition(&app, &state, |old| {
+    let explicit_tun_disable = !config.tun_enabled;
+    let cfg = apply_and_save_config_transition(&app, &state, explicit_tun_disable, |old| {
         let mut cfg = old.clone();
         apply_ui_dto(&mut cfg, &config);
         cfg.preaccel.sync_unified_enabled(config.preaccel.enabled);
@@ -6198,8 +6705,9 @@ pub async fn save_full_config(
     state: State<'_, AppState>,
     next: AppConfig,
 ) -> Result<AppConfig, String> {
+    let explicit_tun_disable = !next.tun.enabled;
     let state_ref: &AppState = &state;
-    apply_and_save_config_transition(&app, state_ref, move |old| {
+    apply_and_save_config_transition(&app, state_ref, explicit_tun_disable, move |old| {
         prepare_full_config_next(state_ref, old, next)
     })
     .await
@@ -6298,11 +6806,17 @@ pub async fn save_extended_settings(
     state: State<'_, AppState>,
     patch: serde_json::Value,
 ) -> Result<AppConfig, String> {
+    let explicit_tun_disable = patch
+        .get("tun")
+        .and_then(|t| t.get("enabled"))
+        .and_then(|v| v.as_bool())
+        == Some(false);
     let state_ref: &AppState = &state;
-    apply_and_save_config_transition(&app, state_ref, |old| {
+    let saved = apply_and_save_config_transition(&app, state_ref, explicit_tun_disable, |old| {
         prepare_extended_settings_next(state_ref, old, &patch)
     })
-    .await
+    .await?;
+    Ok(saved)
 }
 
 #[tauri::command]
@@ -6331,12 +6845,225 @@ pub async fn stop_core(
     stop_core_internal(&app, &state).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PowerOnTakeoverPlan {
+    enable_sys_proxy: bool,
+    enable_tun: bool,
+    degraded_from_tun_due_to_privilege: bool,
+}
+
+fn resolve_power_on_takeover_plan(
+    memory: Option<(bool, bool)>,
+    tun_privilege_ready: bool,
+) -> PowerOnTakeoverPlan {
+    let (mem_sys, mem_tun) = memory.unwrap_or((true, false));
+    if mem_tun {
+        if tun_privilege_ready {
+            PowerOnTakeoverPlan {
+                enable_sys_proxy: mem_sys,
+                enable_tun: true,
+                degraded_from_tun_due_to_privilege: false,
+            }
+        } else {
+            PowerOnTakeoverPlan {
+                enable_sys_proxy: true,
+                enable_tun: false,
+                degraded_from_tun_due_to_privilege: true,
+            }
+        }
+    } else {
+        PowerOnTakeoverPlan {
+            enable_sys_proxy: true,
+            enable_tun: false,
+            degraded_from_tun_due_to_privilege: false,
+        }
+    }
+}
+
+/// Atomically power ON the main proxy core and restore the prior `(system_proxy, tun)` takeover
+/// combination captured before power-off (defaulting to `(true, false)` on cold start or when
+/// cleared; safely degrading TUN to system proxy if administrator privileges are unavailable).
+pub async fn enable_proxy_power_internal(
+    app: &AppHandle,
+    state: &AppState,
+) -> Result<CoreRuntimeInfoDto, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
+    if !has_enabled_nodes(state)? {
+        return Err("暂无可用节点，请先导入订阅".to_string());
+    }
+
+    let saved_memory = state.take_power_off_takeover_memory();
+    let tun_ready = is_tun_privilege_ready(state);
+    let plan = resolve_power_on_takeover_plan(saved_memory, tun_ready);
+
+    let old_cfg = state.snapshot_config();
+    let was_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let was_tun_active = was_core_running && effective_tun_enabled(state, &old_cfg);
+
+    let mut next_cfg = old_cfg.clone();
+    next_cfg.system_proxy.enabled = plan.enable_sys_proxy;
+    next_cfg.tun.enabled = plan.enable_tun;
+
+    let mut started_core_here = false;
+    let mut reloaded_tun_on_running_core = false;
+    if !state.adapter.has_live_controller().await {
+        // Boot core without dirty-writing `system_proxy.enabled = true` to disk first.
+        let mut boot_cfg = next_cfg.clone();
+        boot_cfg.system_proxy.enabled = false;
+        if let Ok(mut guard) = state.config.write() {
+            *guard = boot_cfg;
+        }
+        if let Err(err) = start_core_internal(app, state).await {
+            if let Ok(mut guard) = state.config.write() {
+                *guard = old_cfg.clone();
+            }
+            state.restore_power_off_takeover_memory(saved_memory);
+            sync_app_side_effects(app, state, &old_cfg);
+            return Err(format!("开启代理核心失败：{err}"));
+        }
+        started_core_here = true;
+        let mut persisted_cfg = state.snapshot_config();
+        persisted_cfg.system_proxy.enabled = plan.enable_sys_proxy;
+        persisted_cfg.tun.enabled = plan.enable_tun;
+        if let Err(e) = config::save(&state.paths, &persisted_cfg) {
+            if let Ok(mut guard) = state.config.write() {
+                *guard = old_cfg.clone();
+            }
+            if !old_cfg.system_proxy.enabled && !effective_tun_enabled(state, &old_cfg) {
+                let _ = stop_core_preserving_tun_intent_internal(app, state).await;
+            }
+            state.restore_power_off_takeover_memory(saved_memory);
+            sync_app_side_effects(app, state, &old_cfg);
+            return Err(format!("保存代理开启状态失败：{e}"));
+        }
+        if let Ok(mut guard) = state.config.write() {
+            *guard = persisted_cfg;
+        }
+    } else {
+        if let Err(e) = config::save(&state.paths, &next_cfg) {
+            state.restore_power_off_takeover_memory(saved_memory);
+            return Err(format!("保存代理开启状态失败：{e}"));
+        }
+        if let Ok(mut guard) = state.config.write() {
+            *guard = next_cfg.clone();
+        }
+        if old_cfg.tun.enabled != next_cfg.tun.enabled {
+            if let Some(outcome) = trigger_reload_if_running(app, state, true).await {
+                if outcome.rejected {
+                    let _ = config::save(&state.paths, &old_cfg);
+                    if let Ok(mut guard) = state.config.write() {
+                        *guard = old_cfg.clone();
+                    }
+                    state.restore_power_off_takeover_memory(saved_memory);
+                    sync_app_side_effects(app, state, &old_cfg);
+                    let detail = outcome
+                        .error
+                        .as_deref()
+                        .map(format_mihomo_error_for_user)
+                        .unwrap_or_else(|| "配置重载未通过，已保持原状态".to_string());
+                    return Err(detail);
+                }
+            }
+            reloaded_tun_on_running_core = true;
+        }
+    }
+
+    if plan.enable_sys_proxy {
+        let effective_port = {
+            let rt = state.snapshot_runtime();
+            if rt.running {
+                rt.mixed_port
+            } else {
+                next_cfg.mixed_port
+            }
+        };
+        if let Err(err) = apply_system_proxy_if_still_enabled(state, effective_port) {
+            let _ = config::save(&state.paths, &old_cfg);
+            if let Ok(mut guard) = state.config.write() {
+                *guard = old_cfg.clone();
+            }
+            if started_core_here
+                && !old_cfg.system_proxy.enabled
+                && !effective_tun_enabled(state, &old_cfg)
+            {
+                let _ = stop_core_preserving_tun_intent_internal(app, state).await;
+            } else if !started_core_here && reloaded_tun_on_running_core {
+                if next_cfg.tun.enabled
+                    && !old_cfg.tun.enabled
+                    && state.adapter.has_live_controller().await
+                {
+                    let _ = state.adapter.disable_tun_gracefully().await;
+                }
+                let _ = trigger_reload_if_running(app, state, true).await;
+            }
+            state.restore_power_off_takeover_memory(saved_memory);
+            sync_app_side_effects(app, state, &old_cfg);
+            emit_config_updated(app, &old_cfg);
+            return Err(err);
+        }
+    } else if old_cfg.system_proxy.enabled {
+        let _ = clear_system_proxy_if_owned_with_hint(state, true);
+    }
+
+    let latest_cfg = state.snapshot_config();
+    let now_core_running =
+        state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+    let now_tun_active = now_core_running && effective_tun_enabled(state, &latest_cfg);
+    coordinate_global_preaccel_on_tun_transition(
+        app,
+        state,
+        &latest_cfg,
+        was_tun_active,
+        now_tun_active,
+        "代理总开关",
+    )
+    .await;
+
+    if plan.degraded_from_tun_due_to_privilege {
+        state.log_app_event(
+            "warning",
+            "虚拟网卡",
+            "上次关闭前为虚拟网卡（TUN）模式，但当前非管理员权限，已自动降级为系统代理开启；如需恢复虚拟网卡请点击「以管理员重启」",
+        );
+    } else {
+        let mode_desc = match (plan.enable_sys_proxy, plan.enable_tun) {
+            (true, true) => "系统代理 + 虚拟网卡（TUN）",
+            (false, true) => "虚拟网卡（TUN）",
+            _ => "系统代理",
+        };
+        state.log_app_event("info", "核心", &format!("已通过总开关一键开启代理（{mode_desc}）"));
+    }
+
+    let final_cfg = state.snapshot_config();
+    sync_app_side_effects(app, state, &final_cfg);
+    emit_config_updated(app, &final_cfg);
+    let mut dto = build_runtime_info_dto(state)?;
+    if plan.degraded_from_tun_due_to_privilege {
+        dto.power_on_tun_degraded = true;
+    }
+    Ok(dto)
+}
+
 #[tauri::command]
 pub async fn disable_all_proxy_and_stop_core(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<CoreRuntimeInfoDto, String> {
     disable_all_proxy_and_stop_core_internal(&app, &state).await
+}
+
+#[tauri::command]
+pub async fn enable_proxy_power(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<CoreRuntimeInfoDto, String> {
+    enable_proxy_power_internal(&app, &state).await
+}
+
+#[tauri::command]
+pub fn consume_pending_nav(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    Ok(state.take_pending_nav())
 }
 
 /// Restart managed core cleanly. Caller MUST already hold outer `state.config_transition_lock`.
@@ -6605,6 +7332,7 @@ pub async fn set_tun_enabled_internal(
         )
         .await;
 
+        state.clear_power_off_takeover_memory();
         state.log_app_event(
             "info",
             "虚拟网卡",
@@ -6618,6 +7346,9 @@ pub async fn set_tun_enabled_internal(
         let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&latest_cfg));
         return Ok(true);
     }
+
+    // Explicit manual TUN disable clears any pending power-off TUN recovery memory.
+    state.clear_power_off_takeover_memory();
 
     // Disabling TUN: gracefully release Wintun adapter & OS routes first (only if actually active), then save.
     if was_tun_active && state.adapter.has_live_controller().await {
@@ -7042,7 +7773,8 @@ pub fn show_main_window(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub fn enter_windowless_mode(app: AppHandle) -> Result<(), String> {
-    lifecycle::enter_pure_windowless_mode(&app);
+    lifecycle::destroy_capsule_window(&app);
+    lifecycle::hide_or_enter_windowless_main_window(&app);
     Ok(())
 }
 
@@ -8630,14 +9362,59 @@ pub async fn delete_subscription(
     state: State<'_, AppState>,
     sub_id: String,
 ) -> Result<bool, String> {
+    let _cfg_guard = state.config_transition_lock.lock().await;
     let deleted = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         db.delete_subscription(&sub_id).map_err(|e| e.to_string())?
     };
     if deleted {
+        let _ = remap_active_single_node_id_if_needed(&state, &HashMap::new())?;
         prune_node_health_pool_from_db(&state);
-        let _ = trigger_reload_if_running(&app, &state, false).await;
+
+        let has_remaining_enabled = has_enabled_nodes(&state).unwrap_or(false);
+        let core_running =
+            state.snapshot_runtime().running || state.adapter.has_live_controller().await;
+
+        if !has_remaining_enabled {
+            if core_running {
+                if let Err(err) = stop_core_internal(&app, &state).await {
+                    state.log_app_event(
+                        "warning",
+                        "订阅",
+                        &format!("删除订阅后已无可用节点，安全停止代理核心失败：{err}"),
+                    );
+                } else {
+                    state.log_app_event(
+                        "info",
+                        "订阅",
+                        "删除订阅后已无可用节点，已自动清除系统代理并安全停止核心",
+                    );
+                }
+            } else {
+                let mut cfg = state.snapshot_config();
+                if cfg.system_proxy.enabled || cfg.tun.enabled {
+                    if cfg.system_proxy.enabled {
+                        let _ = clear_system_proxy_if_owned_with_hint(&state, true);
+                        cfg.system_proxy.enabled = false;
+                    }
+                    if cfg.tun.enabled {
+                        cfg.tun.enabled = false;
+                        state.clear_power_off_takeover_memory();
+                    }
+                    let _ = config::save(&state.paths, &cfg);
+                    if let Ok(mut guard) = state.config.write() {
+                        *guard = cfg;
+                    }
+                }
+            }
+        } else if core_running {
+            let _ = trigger_reload_if_running(&app, &state, false).await;
+        }
+
         let cfg = state.snapshot_config();
+        emit_groups_updated(&app);
+        emit_nodes_updated(&app);
+        emit_config_updated(&app, &cfg);
         sync_app_side_effects(&app, &state, &cfg);
     }
     Ok(deleted)
@@ -8653,8 +9430,9 @@ fn parse_subscription_update_mode(raw: &str) -> Result<SubscriptionUpdateMode, S
     }
 }
 
-/// Synchronize `AppConfig.active_single_node_id` whenever subscription node updates or merges
-/// remap deduplicated node IDs or remove stale nodes.
+/// Synchronize `AppConfig.active_single_node_id` whenever subscription node updates, deletions, or
+/// merges remap deduplicated node IDs or remove stale nodes (falling back strictly to an existing
+/// enabled node, or clearing to `None` when no enabled nodes remain).
 fn remap_active_single_node_id_if_needed(
     state: &AppState,
     id_remap: &HashMap<String, String>,
@@ -8691,17 +9469,15 @@ fn remap_active_single_node_id_if_needed(
                 let nodes = db.list_nodes().ok()?;
                 let enabled_nodes: Vec<ProxyNode> =
                     nodes.iter().filter(|n| n.enabled).cloned().collect();
+                if enabled_nodes.is_empty() {
+                    return None;
+                }
                 let ids: Vec<String> = enabled_nodes.iter().map(|n| n.id.clone()).collect();
                 let snaps = db
                     .get_probe_snapshots_batch(&ids, None)
                     .unwrap_or_default();
-                pick_smart_default_node_id(&enabled_nodes, Some(&snaps)).or_else(|| {
-                    nodes
-                        .iter()
-                        .find(|n| n.enabled)
-                        .or_else(|| nodes.first())
-                        .map(|n| n.id.clone())
-                })
+                pick_smart_default_node_id(&enabled_nodes, Some(&snaps))
+                    .or_else(|| enabled_nodes.first().map(|n| n.id.clone()))
             })
     };
 
@@ -8771,6 +9547,8 @@ pub async fn apply_nodes_to_existing_subscription(
         ),
     );
     let cfg = state.snapshot_config();
+    emit_groups_updated(&app);
+    emit_nodes_updated(&app);
     emit_config_updated(&app, &cfg);
     sync_app_side_effects(&app, &state, &cfg);
     Ok(outcome)
@@ -8814,6 +9592,8 @@ pub async fn merge_subscriptions(
         ),
     );
     let cfg = state.snapshot_config();
+    emit_groups_updated(&app);
+    emit_nodes_updated(&app);
     emit_config_updated(&app, &cfg);
     sync_app_side_effects(&app, &state, &cfg);
     Ok(outcome)
@@ -11081,6 +11861,22 @@ fn normalize_global_target_processes(processes: Vec<String>) -> Vec<String> {
     out
 }
 
+/// Reconcile active relay and enforce zero-relay auto-convergence after mutating `preaccel_relays`:
+/// returns `(cfg_changed, auto_disabled_preaccel)`.
+fn converge_preaccel_after_relay_mutation(
+    cfg: &mut AppConfig,
+    enabled_relay_ids: &HashSet<String>,
+) -> (bool, bool) {
+    let mut cfg_changed = config::reconcile_dangling_active_relay(cfg, enabled_relay_ids);
+    let auto_disabled_preaccel = enabled_relay_ids.is_empty()
+        && (cfg.preaccel.enabled || cfg.preaccel.global_bypass_enabled);
+    if auto_disabled_preaccel {
+        cfg.preaccel.sync_unified_enabled(false);
+        cfg_changed = true;
+    }
+    (cfg_changed, auto_disabled_preaccel)
+}
+
 #[tauri::command]
 pub async fn upsert_preaccel_relay(
     app: AppHandle,
@@ -11108,8 +11904,9 @@ pub async fn upsert_preaccel_relay(
         (prev, enabled_ids)
     };
     let mut cfg = prev_cfg.clone();
-    let active_relay_cleared = config::reconcile_dangling_active_relay(&mut cfg, &enabled_relay_ids);
-    if active_relay_cleared {
+    let (cfg_changed, auto_disabled_preaccel) =
+        converge_preaccel_after_relay_mutation(&mut cfg, &enabled_relay_ids);
+    if cfg_changed {
         config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
@@ -11127,7 +11924,7 @@ pub async fn upsert_preaccel_relay(
                     }
                 }
             }
-            if active_relay_cleared {
+            if cfg_changed {
                 let _ = config::save(&state.paths, &prev_cfg);
                 if let Ok(mut guard) = state.config.write() {
                     *guard = prev_cfg.clone();
@@ -11146,7 +11943,20 @@ pub async fn upsert_preaccel_relay(
         }
     }
     let cfg = state.snapshot_config();
-    sync_running_global_preaccel_if_active(&state, &cfg).await;
+    if auto_disabled_preaccel {
+        if state.global_preaccel.status().running
+            || state.global_preaccel.status().mode == "suspended_for_tun"
+        {
+            let _ = state.global_preaccel.stop().await;
+        }
+        state.log_app_event(
+            "info",
+            "国内提速",
+            "已无已启用的国内提速线路，已自动关闭国内提速开关并停止独立 443 隧道",
+        );
+    } else {
+        sync_running_global_preaccel_if_active(&state, &cfg).await;
+    }
     sync_app_side_effects(&app, &state, &cfg);
     emit_config_updated(&app, &cfg);
     emit_relays_updated(&app);
@@ -11179,9 +11989,9 @@ pub async fn delete_preaccel_relay(
     };
     if deleted {
         let mut cfg = prev_cfg.clone();
-        let active_relay_cleared =
-            config::reconcile_dangling_active_relay(&mut cfg, &enabled_relay_ids);
-        if active_relay_cleared {
+        let (cfg_changed, auto_disabled_preaccel) =
+            converge_preaccel_after_relay_mutation(&mut cfg, &enabled_relay_ids);
+        if cfg_changed {
             config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
             if let Ok(mut guard) = state.config.write() {
                 *guard = cfg.clone();
@@ -11194,7 +12004,7 @@ pub async fn delete_preaccel_relay(
                         let _ = db.upsert_preaccel_relay(old_relay);
                     }
                 }
-                if active_relay_cleared {
+                if cfg_changed {
                     let _ = config::save(&state.paths, &prev_cfg);
                     if let Ok(mut guard) = state.config.write() {
                         *guard = prev_cfg.clone();
@@ -11210,7 +12020,20 @@ pub async fn delete_preaccel_relay(
             }
         }
         let cfg = state.snapshot_config();
-        sync_running_global_preaccel_if_active(&state, &cfg).await;
+        if auto_disabled_preaccel {
+            if state.global_preaccel.status().running
+                || state.global_preaccel.status().mode == "suspended_for_tun"
+            {
+                let _ = state.global_preaccel.stop().await;
+            }
+            state.log_app_event(
+                "info",
+                "国内提速",
+                "删除中转后已无已启用的国内提速线路，已自动关闭国内提速开关并停止独立 443 隧道",
+            );
+        } else {
+            sync_running_global_preaccel_if_active(&state, &cfg).await;
+        }
         sync_app_side_effects(&app, &state, &cfg);
         emit_config_updated(&app, &cfg);
         emit_relays_updated(&app);
@@ -11437,22 +12260,31 @@ pub async fn toggle_preaccel_internal(
     let tun_active = core_running && cfg.tun.enabled && tun_ready;
 
     if enabled {
+        // Hard zero-relay gate: NEVER persist `preaccel.enabled = true` or spawn WinDivert
+        // when no enabled domestic relay exists in SQLite.
+        let enabled_relays = load_enabled_preaccel_relays(state)?;
+        if enabled_relays.is_empty() {
+            if cfg.preaccel.enabled || cfg.preaccel.global_bypass_enabled {
+                cfg.preaccel.sync_unified_enabled(false);
+                let _ = config::save(&state.paths, &cfg);
+                if let Ok(mut guard) = state.config.write() {
+                    *guard = cfg.clone();
+                }
+                sync_app_side_effects(app, state, &cfg);
+                emit_config_updated(app, &cfg);
+            }
+            state.log_app_event(
+                "warning",
+                "国内提速",
+                "尝试开启国内提速但尚未添加已启用的国内提速线路，已拒绝开启",
+            );
+            return Err(NO_ENABLED_RELAY_ERROR.to_string());
+        }
+
         cfg.preaccel.sync_unified_enabled(true);
         config::save(&state.paths, &cfg).map_err(|e| e.to_string())?;
         if let Ok(mut guard) = state.config.write() {
             *guard = cfg.clone();
-        }
-
-        let enabled_relays = load_enabled_preaccel_relays(state)?;
-        if enabled_relays.is_empty() {
-            state.log_app_event(
-                "warning",
-                "国内提速",
-                "已打开国内提速开关，但尚未配置可用的国内 443 中转线路",
-            );
-            sync_app_side_effects(app, state, &cfg);
-            let _ = app.emit(EVENT_CONFIG_UPDATED, UiAppConfigDto::from(&cfg));
-            return Ok(true);
         }
 
         // 1. If main proxy core is running, reload it to compile in-core 443 pre-acceleration.
@@ -19480,16 +20312,29 @@ fn prepare_and_apply_backup_bundle_core(
         // One-way latch: never regress `onboarding_completed` from `true` back to `false`.
         next.personalization.onboarding_completed |= old_cfg.personalization.onboarding_completed;
         let _ = config::reconcile_dangling_active_relay(&mut next, &projected_enabled_relay_ids);
+        if projected_enabled_relay_ids.is_empty()
+            && (next.preaccel.enabled || next.preaccel.global_bypass_enabled)
+        {
+            next.preaccel.sync_unified_enabled(false);
+        }
         config::validate_config(&next)
             .map_err(|e| format!("备份中的配置参数校验未通过：{e}"))?;
         next_cfg_opt = Some(next);
         restored_config = true;
     } else {
         let mut reconciled_existing = old_cfg.clone();
-        if config::reconcile_dangling_active_relay(
+        let mut changed = config::reconcile_dangling_active_relay(
             &mut reconciled_existing,
             &projected_enabled_relay_ids,
-        ) {
+        );
+        if projected_enabled_relay_ids.is_empty()
+            && (reconciled_existing.preaccel.enabled
+                || reconciled_existing.preaccel.global_bypass_enabled)
+        {
+            reconciled_existing.preaccel.sync_unified_enabled(false);
+            changed = true;
+        }
+        if changed {
             next_cfg_opt = Some(reconciled_existing);
         }
     }
@@ -26976,6 +27821,327 @@ mod tests {
         assert!(state.shutting_down.load(Ordering::SeqCst));
 
         drop(held_guard);
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage23_bug2_default_group_refill_and_single_node_remap_guards() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s23_bug2_groups_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let storage = Storage::open(&paths.db_path).unwrap();
+
+        // 1. Existing empty default static group (no match_rules) is refilled on re-import
+        //    instead of leaving the user stuck with an empty group.
+        let empty_default = MultiGroup {
+            id: "grp-empty-default".to_string(),
+            name: "默认路线".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec![],
+            active_node_id: None,
+            ..MultiGroup::default()
+        };
+        storage.upsert_multi_group(&empty_default).unwrap();
+
+        storage
+            .upsert_subscription(&SubscriptionRecord {
+                id: "sub-new".to_string(),
+                name: "测试主力订阅".to_string(),
+                kind: SubscriptionKind::Migrated,
+                url_or_cmd: "local://test-new".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+        storage
+            .upsert_subscription(&SubscriptionRecord {
+                id: "sub-dis".to_string(),
+                name: "禁用节点订阅".to_string(),
+                kind: SubscriptionKind::Migrated,
+                url_or_cmd: "local://test-dis".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .unwrap();
+
+        let n1 = ProxyNode {
+            id: "n-sg-1".to_string(),
+            sub_id: "sub-new".to_string(),
+            name: "SG 新加坡 01".to_string(),
+            protocol: "trojan".to_string(),
+            server: "sg.example.invalid".to_string(),
+            port: 443,
+            region_code: "SG".to_string(),
+            multiplier: 1.0,
+            enabled: true,
+            ..Default::default()
+        };
+        let n_disabled = ProxyNode {
+            id: "n-disabled".to_string(),
+            sub_id: "sub-dis".to_string(),
+            name: "Disabled Node".to_string(),
+            protocol: "trojan".to_string(),
+            server: "dis.example.invalid".to_string(),
+            port: 443,
+            enabled: false,
+            ..Default::default()
+        };
+        storage.upsert_node(&n1).unwrap();
+        storage.upsert_node(&n_disabled).unwrap();
+
+        let mut cfg = AppConfig::default();
+        cfg.active_group_id = Some("grp-empty-default".to_string());
+        cfg.active_single_node_id = Some("deleted-old-node".to_string());
+        let state = AppState::new(
+            paths.clone(),
+            cfg,
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+
+        assert!(ensure_default_group_if_empty(&state));
+        let groups_after = state.storage.lock().unwrap().list_multi_groups().unwrap();
+        assert_eq!(groups_after.len(), 1);
+        assert_eq!(groups_after[0].id, "grp-empty-default");
+        assert_eq!(groups_after[0].member_node_ids, vec!["n-sg-1".to_string()]);
+        assert_eq!(groups_after[0].active_node_id.as_deref(), Some("n-sg-1"));
+
+        // Second call is a no-op because a static group now has valid enabled members.
+        assert!(!ensure_default_group_if_empty(&state));
+
+        // 2. Dynamic group presence suppresses auto-fill even when static groups are empty.
+        {
+            let db = state.storage.lock().unwrap();
+            let mut empty_again = groups_after[0].clone();
+            empty_again.member_node_ids.clear();
+            empty_again.active_node_id = None;
+            db.upsert_multi_group(&empty_again).unwrap();
+            db.upsert_multi_group(&MultiGroup {
+                id: "grp-dynamic".to_string(),
+                name: "动态筛选组".to_string(),
+                dynamic_filter: Some(catcloud_core::models::DynamicFilterSpec::default()),
+                ..MultiGroup::default()
+            })
+            .unwrap();
+        }
+        assert!(!ensure_default_group_if_empty(&state));
+
+        // 3. Static empty group WITH custom match_rules must NOT be polluted; a separate
+        //    unconstrained "默认路线" group is created instead.
+        {
+            let db = state.storage.lock().unwrap();
+            db.delete_multi_group("grp-dynamic").unwrap();
+            db.delete_multi_group("grp-empty-default").unwrap();
+            db.upsert_multi_group(&MultiGroup {
+                id: "grp-custom-rules".to_string(),
+                name: "AI 专用组".to_string(),
+                match_rules: vec!["DOMAIN-SUFFIX,openai.com".to_string()],
+                member_node_ids: vec![],
+                ..MultiGroup::default()
+            })
+            .unwrap();
+        }
+        assert!(ensure_default_group_if_empty(&state));
+        let groups_with_custom = state.storage.lock().unwrap().list_multi_groups().unwrap();
+        let custom_grp = groups_with_custom
+            .iter()
+            .find(|g| g.id == "grp-custom-rules")
+            .unwrap();
+        assert!(
+            custom_grp.member_node_ids.is_empty(),
+            "custom match_rules group must stay untouched"
+        );
+        assert!(
+            groups_with_custom
+                .iter()
+                .any(|g| g.name == "默认路线" && g.member_node_ids == vec!["n-sg-1".to_string()])
+        );
+
+        // 4. `remap_active_single_node_id_if_needed` remaps to enabled node, and clears to `None`
+        //    when only disabled nodes remain (never selecting disabled nodes).
+        assert!(remap_active_single_node_id_if_needed(&state, &HashMap::new()).unwrap());
+        assert_eq!(
+            state.snapshot_config().active_single_node_id.as_deref(),
+            Some("n-sg-1")
+        );
+        {
+            let db = state.storage.lock().unwrap();
+            assert!(db.delete_subscription("sub-new").unwrap());
+        }
+        assert!(remap_active_single_node_id_if_needed(&state, &HashMap::new()).unwrap());
+        assert_eq!(state.snapshot_config().active_single_node_id, None);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage23_bug3_power_off_memory_and_takeover_plan_symmetry() {
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s23_bug3_power_mem_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let state = AppState::new(
+            paths,
+            AppConfig::default(),
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+
+        // Cold startup starts with None (zero auto-start / zero stale memory).
+        assert_eq!(state.take_power_off_takeover_memory(), None);
+
+        // Default plan (no memory) -> system proxy only.
+        assert_eq!(
+            resolve_power_on_takeover_plan(None, true),
+            PowerOnTakeoverPlan {
+                enable_sys_proxy: true,
+                enable_tun: false,
+                degraded_from_tun_due_to_privilege: false,
+            }
+        );
+
+        // Pure TUN memory with admin privilege -> symmetrically restores pure TUN without forcing system proxy.
+        state.record_power_off_takeover_memory(false, true);
+        let mem = state.take_power_off_takeover_memory();
+        assert_eq!(mem, Some((false, true)));
+        assert_eq!(state.take_power_off_takeover_memory(), None);
+        assert_eq!(
+            resolve_power_on_takeover_plan(mem, true),
+            PowerOnTakeoverPlan {
+                enable_sys_proxy: false,
+                enable_tun: true,
+                degraded_from_tun_due_to_privilege: false,
+            }
+        );
+
+        // Dual (sys_proxy + TUN) memory with admin privilege -> restores both.
+        assert_eq!(
+            resolve_power_on_takeover_plan(Some((true, true)), true),
+            PowerOnTakeoverPlan {
+                enable_sys_proxy: true,
+                enable_tun: true,
+                degraded_from_tun_due_to_privilege: false,
+            }
+        );
+
+        // TUN memory WITHOUT admin privilege -> safely degrades to system proxy and flags notice.
+        assert_eq!(
+            resolve_power_on_takeover_plan(Some((false, true)), false),
+            PowerOnTakeoverPlan {
+                enable_sys_proxy: true,
+                enable_tun: false,
+                degraded_from_tun_due_to_privilege: true,
+            }
+        );
+
+        // Explicit clear erases memory; pending_nav is one-shot consumed.
+        state.record_power_off_takeover_memory(false, true);
+        state.clear_power_off_takeover_memory();
+        assert_eq!(state.take_power_off_takeover_memory(), None);
+
+        assert_eq!(state.take_pending_nav(), None);
+        state.set_pending_nav(Some("preaccel"));
+        assert_eq!(state.take_pending_nav().as_deref(), Some("preaccel"));
+        assert_eq!(state.take_pending_nav(), None);
+        state.set_pending_nav(Some("preaccel"));
+        state.set_pending_nav(None);
+        assert_eq!(state.take_pending_nav(), None);
+
+        drop(state);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage23_bug5_and_hotswap_zero_relay_convergence_and_tray_label() {
+        // 1. Tray mode label must explicitly report `no_relay` when enabled with 0 enabled relays.
+        assert_eq!(
+            resolve_tray_preaccel_mode_label(true, false, false, false, false, "idle").as_deref(),
+            Some("no_relay")
+        );
+        assert_eq!(
+            resolve_tray_preaccel_mode_label(true, false, true, false, false, "ready").as_deref(),
+            Some("no_relay")
+        );
+        assert_eq!(
+            resolve_tray_preaccel_mode_label(false, false, false, false, false, "idle"),
+            None
+        );
+        assert_eq!(
+            resolve_tray_preaccel_mode_label(true, true, false, false, false, "idle").as_deref(),
+            Some("standby")
+        );
+
+        // 2. Relay mutation zero-relay convergence disables unified preaccel & clears dangling ID.
+        let mut cfg = AppConfig::default();
+        cfg.preaccel.sync_unified_enabled(true);
+        cfg.preaccel.active_relay_id = Some("relay-deleted".to_string());
+        let empty_relays: HashSet<String> = HashSet::new();
+        let (changed, auto_disabled) =
+            converge_preaccel_after_relay_mutation(&mut cfg, &empty_relays);
+        assert!(changed);
+        assert!(auto_disabled);
+        assert!(!cfg.preaccel.enabled);
+        assert!(!cfg.preaccel.global_bypass_enabled);
+        assert_eq!(cfg.preaccel.active_relay_id, None);
+
+        // 3. Disk hot-reload in-memory reconciliation also enforces 0-relay convergence.
+        let mut disk_cfg = AppConfig::default();
+        disk_cfg.preaccel.enabled = true;
+        disk_cfg.preaccel.global_bypass_enabled = false;
+        disk_cfg.preaccel.active_relay_id = Some("missing-id".to_string());
+        assert!(reconcile_disk_hot_reload_config(&mut disk_cfg, &empty_relays));
+        assert!(!disk_cfg.preaccel.enabled);
+        assert!(!disk_cfg.preaccel.global_bypass_enabled);
+        assert_eq!(disk_cfg.preaccel.active_relay_id, None);
+
+        // 4. With an enabled relay present, disk hot-reload preserves unified preaccel enabled.
+        let mut one_relay = HashSet::new();
+        one_relay.insert("relay-ok".to_string());
+        let mut active_cfg = AppConfig::default();
+        active_cfg.preaccel.enabled = true;
+        active_cfg.preaccel.global_bypass_enabled = false;
+        active_cfg.preaccel.active_relay_id = Some("relay-ok".to_string());
+        assert!(reconcile_disk_hot_reload_config(&mut active_cfg, &one_relay));
+        assert!(!reconcile_disk_hot_reload_config(&mut active_cfg, &one_relay));
+        assert!(active_cfg.preaccel.enabled);
+        assert!(active_cfg.preaccel.global_bypass_enabled);
+        assert_eq!(active_cfg.preaccel.active_relay_id.as_deref(), Some("relay-ok"));
+    }
+
+    #[test]
+    fn stage27_reload_req_ttl_and_power_on_tun_degraded_default() {
+        assert!(!is_config_reload_request_expired(1_000_000, 1_000_000));
+        assert!(!is_config_reload_request_expired(1_000_000, 1_015_000));
+        assert!(is_config_reload_request_expired(1_000_000, 1_015_001));
+        assert!(!is_config_reload_request_expired(1_020_000, 1_000_000));
+
+        let tmp = std::env::temp_dir().join(format!(
+            "catcloud_s27_dto_default_{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let paths = AppPaths::from_data_dir(tmp.clone(), true).unwrap();
+        let storage = Storage::open_in_memory().unwrap();
+        let state = AppState::new(
+            paths,
+            AppConfig::default(),
+            storage,
+            Arc::new(JobGuard::new().unwrap()),
+        );
+        let dto = build_runtime_info_dto(&state).expect("build runtime dto");
+        assert!(!dto.power_on_tun_degraded);
+
+        let mut val = serde_json::to_value(&dto).expect("serialize runtime dto");
+        val.as_object_mut().unwrap().remove("power_on_tun_degraded");
+        let roundtrip: CoreRuntimeInfoDto =
+            serde_json::from_value(val).expect("deserialize legacy dto without power_on_tun_degraded");
+        assert!(!roundtrip.power_on_tun_degraded);
+
         drop(state);
         let _ = std::fs::remove_dir_all(&tmp);
     }
