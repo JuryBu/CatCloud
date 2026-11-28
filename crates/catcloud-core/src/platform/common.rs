@@ -62,9 +62,10 @@ pub fn get_process_start_time_unix(pid: u32) -> Option<u64> {
 
 pub const LAUNCH_AGENT_LABEL: &str = "io.catcloud.app";
 
-/// Default Windows WinINet `ProxyOverride` string with explicit `127.0.0.1` and `::1`
-/// right after `localhost` so Rust/CLI HTTP clients that ignore `127.*` wildcards stay direct.
-pub const DEFAULT_WINDOWS_PROXY_BYPASS: &str = "localhost;127.0.0.1;::1;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
+/// Default Windows WinINet `ProxyOverride` string with explicit `127.0.0.1` and `[::1]`
+/// right after `localhost` so Rust/CLI HTTP clients that ignore `127.*` wildcards stay direct
+/// while remaining 100% valid for `WinHttpOpen` / Schannel (bare `::1` triggers Win32 Error 87).
+pub const DEFAULT_WINDOWS_PROXY_BYPASS: &str = "localhost;127.0.0.1;[::1];127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;<local>";
 
 /// Default Linux desktop bypass list with explicit `127.0.0.1` and `::1` right after `localhost`.
 pub const DEFAULT_LINUX_PROXY_BYPASS: &[&str] = &[
@@ -247,24 +248,126 @@ fn push_unique_ci(out: &mut Vec<String>, candidate: &str) {
     }
 }
 
-/// Sanitize a Windows WinINet bypass list: when empty, falls back to `DEFAULT_WINDOWS_PROXY_BYPASS`;
-/// when non-empty and referencing loopback (`localhost` / `127.*` / `<local>`), ensures explicit
-/// `127.0.0.1` and `::1` appear right after `localhost` (deduplicated case-insensitively).
+fn is_bare_ipv6_entry(entry: &str) -> bool {
+    if entry.contains("://") || entry.contains('/') {
+        return false;
+    }
+    if entry.starts_with('[') && (entry.ends_with(']') || entry.contains("]:")) {
+        return false;
+    }
+    entry.bytes().filter(|&b| b == b':').count() >= 2
+}
+
+fn has_invalid_slash_in_windows_bypass(entry: &str) -> bool {
+    if let Some((_, after_scheme)) = entry.split_once("://") {
+        after_scheme.contains('/')
+    } else {
+        entry.contains('/')
+    }
+}
+
+fn strip_pure_ipv6_brackets(entry: &str) -> &str {
+    if let Some(inner) = entry.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        if !inner.is_empty()
+            && !inner.contains('[')
+            && !inner.contains(']')
+            && inner.bytes().filter(|&b| b == b':').count() >= 2
+        {
+            return inner;
+        }
+    }
+    entry
+}
+
+/// Inspect a raw Windows `ProxyOverride` registry value (semicolon-delimited) and return all
+/// entries that will cause `WinHttpOpen` / Schannel (`cryptnet.dll`) to fail with Win32 Error 87
+/// (`ERROR_INVALID_PARAMETER`), such as bare unbracketed IPv6 literals (`::1`, `fe80::*`) or
+/// slash-delimited CIDR blocks (`10.0.0.0/8`, `fe80::/10`).
+pub fn find_invalid_windows_proxy_override_entries(raw: &str) -> Vec<String> {
+    let mut invalid = Vec::new();
+    for part in raw.split(';') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let has_scheme_bare_v6 = trimmed
+            .split_once("://")
+            .is_some_and(|(_, after)| is_bare_ipv6_entry(after));
+        if trimmed.chars().any(char::is_control)
+            || is_bare_ipv6_entry(trimmed)
+            || has_invalid_slash_in_windows_bypass(trimmed)
+            || has_scheme_bare_v6
+        {
+            invalid.push(trimmed.to_string());
+        }
+    }
+    invalid
+}
+
+fn normalize_windows_bypass_entry(raw: &str) -> Vec<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
+        return Vec::new();
+    }
+
+    match trimmed {
+        "127.0.0.0/8" => return vec!["127.*".to_string()],
+        "10.0.0.0/8" => return vec!["10.*".to_string()],
+        "192.168.0.0/16" => return vec!["192.168.*".to_string()],
+        "172.16.0.0/12" => {
+            return (16..=31).map(|octet| format!("172.{octet}.*")).collect();
+        }
+        _ => {}
+    }
+
+    if has_invalid_slash_in_windows_bypass(trimmed) {
+        return Vec::new();
+    }
+
+    if let Some((scheme, after)) = trimmed.split_once("://") {
+        if is_bare_ipv6_entry(after) {
+            let inner = after.trim_matches(|c| c == '[' || c == ']');
+            if inner.is_empty() {
+                return Vec::new();
+            }
+            return vec![format!("{scheme}://[{inner}]")];
+        }
+        return vec![trimmed.to_string()];
+    }
+
+    if is_bare_ipv6_entry(trimmed) {
+        let inner = trimmed.trim_matches(|c| c == '[' || c == ']');
+        if inner.is_empty() {
+            return Vec::new();
+        }
+        return vec![format!("[{inner}]")];
+    }
+
+    vec![trimmed.to_string()]
+}
+
+/// Sanitize a Windows WinINet / WinHTTP bypass list:
+/// - Wraps bare IPv6 literals/wildcards (`::1`, `fe80::*`, etc.) in `[...]` so `WinHttpOpen` /
+///   Schannel revocation checks never fail with `ERROR_INVALID_PARAMETER (87)`;
+/// - Converts common private IPv4 CIDRs (`127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`,
+///   `192.168.0.0/16`) into valid Windows wildcard entries and strips unconvertible `/` CIDRs
+///   (such as `fe80::/10`);
+/// - Preserves valid `host:port` entries (single colon);
+/// - Falls back to `DEFAULT_WINDOWS_PROXY_BYPASS` when empty, and ensures explicit `127.0.0.1`
+///   and `[::1]` follow `localhost` (deduplicated case-insensitively).
 pub fn sanitize_windows_bypass_list(items: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut has_loopback_rule = false;
     for item in items {
-        let trimmed = item.trim();
-        if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
-            continue;
-        }
-        push_unique_ci(&mut out, trimmed);
-        if trimmed.eq_ignore_ascii_case("localhost") {
-            has_loopback_rule = true;
-            push_unique_ci(&mut out, "127.0.0.1");
-            push_unique_ci(&mut out, "::1");
-        } else if trimmed == "127.*" || trimmed.eq_ignore_ascii_case("<local>") {
-            has_loopback_rule = true;
+        for entry in normalize_windows_bypass_entry(item) {
+            push_unique_ci(&mut out, &entry);
+            if entry.eq_ignore_ascii_case("localhost") {
+                has_loopback_rule = true;
+                push_unique_ci(&mut out, "127.0.0.1");
+                push_unique_ci(&mut out, "[::1]");
+            } else if entry == "127.*" || entry.eq_ignore_ascii_case("<local>") {
+                has_loopback_rule = true;
+            }
         }
     }
 
@@ -277,13 +380,14 @@ pub fn sanitize_windows_bypass_list(items: &[String]) -> Vec<String> {
 
     if has_loopback_rule {
         push_unique_ci(&mut out, "127.0.0.1");
-        push_unique_ci(&mut out, "::1");
+        push_unique_ci(&mut out, "[::1]");
     }
     out
 }
 
 /// Sanitize a system proxy bypass list for Linux desktop environments (GNOME & KDE Plasma).
 /// Replaces Windows WinINet `<local>` syntax with `localhost`, `127.0.0.1`, `::1`, and `127.0.0.0/8`,
+/// strips pure IPv6 brackets (`[::1]` -> `::1`) to prevent cross-platform duplication,
 /// ensures explicit `127.0.0.1` and `::1` follow `localhost` for loopback lists,
 /// and deduplicates case-insensitively while preserving order.
 pub fn sanitize_linux_bypass_list(items: &[String]) -> Vec<String> {
@@ -294,19 +398,20 @@ pub fn sanitize_linux_bypass_list(items: &[String]) -> Vec<String> {
         if trimmed.is_empty() || trimmed.chars().any(char::is_control) {
             continue;
         }
-        if trimmed.eq_ignore_ascii_case("<local>") {
+        let normalized = strip_pure_ipv6_brackets(trimmed);
+        if normalized.eq_ignore_ascii_case("<local>") {
             has_loopback_rule = true;
             push_unique_ci(&mut out, "localhost");
             push_unique_ci(&mut out, "127.0.0.1");
             push_unique_ci(&mut out, "::1");
             push_unique_ci(&mut out, "127.0.0.0/8");
         } else {
-            push_unique_ci(&mut out, trimmed);
-            if trimmed.eq_ignore_ascii_case("localhost") {
+            push_unique_ci(&mut out, normalized);
+            if normalized.eq_ignore_ascii_case("localhost") {
                 has_loopback_rule = true;
                 push_unique_ci(&mut out, "127.0.0.1");
                 push_unique_ci(&mut out, "::1");
-            } else if trimmed == "127.*" || trimmed == "127.0.0.0/8" {
+            } else if normalized == "127.*" || normalized == "127.0.0.0/8" {
                 has_loopback_rule = true;
             }
         }
@@ -492,7 +597,8 @@ pub fn render_linux_desktop_entry_with_env(
 }
 
 /// Clean a bypass domain list for macOS `networksetup -setproxybypassdomains`,
-/// removing Windows WinINet `<local>` syntax and blank/control entries, and ensuring
+/// removing Windows WinINet `<local>` syntax and blank/control entries, stripping pure IPv6
+/// brackets (`[::1]` -> `::1`) to prevent cross-platform duplication, and ensuring
 /// explicit `127.0.0.1` and `::1` follow `localhost` whenever loopback entries are present.
 pub fn sanitize_macos_bypass_list(items: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -505,12 +611,13 @@ pub fn sanitize_macos_bypass_list(items: &[String]) -> Vec<String> {
         {
             continue;
         }
-        push_unique_ci(&mut out, trimmed);
-        if trimmed.eq_ignore_ascii_case("localhost") {
+        let normalized = strip_pure_ipv6_brackets(trimmed);
+        push_unique_ci(&mut out, normalized);
+        if normalized.eq_ignore_ascii_case("localhost") {
             has_loopback_rule = true;
             push_unique_ci(&mut out, "127.0.0.1");
             push_unique_ci(&mut out, "::1");
-        } else if trimmed == "127.*" || trimmed == "127.0.0.0/8" {
+        } else if normalized == "127.*" || normalized == "127.0.0.0/8" {
             has_loopback_rule = true;
         }
     }
@@ -632,7 +739,8 @@ mod tests {
 
     #[test]
     fn default_bypass_constants_explicitly_include_loopback_after_localhost() {
-        assert!(DEFAULT_WINDOWS_PROXY_BYPASS.starts_with("localhost;127.0.0.1;::1;127.*;"));
+        assert!(DEFAULT_WINDOWS_PROXY_BYPASS.starts_with("localhost;127.0.0.1;[::1];127.*;"));
+        assert!(find_invalid_windows_proxy_override_entries(DEFAULT_WINDOWS_PROXY_BYPASS).is_empty());
         assert_eq!(&DEFAULT_LINUX_PROXY_BYPASS[..3], &["localhost", "127.0.0.1", "::1"]);
         assert_eq!(&DEFAULT_MACOS_PROXY_BYPASS[..3], &["localhost", "127.0.0.1", "::1"]);
 
@@ -646,7 +754,7 @@ mod tests {
             vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
-                "::1".to_string(),
+                "[::1]".to_string(),
                 "127.*".to_string(),
                 "<local>".to_string(),
             ]
@@ -654,8 +762,61 @@ mod tests {
         let win_default = sanitize_windows_bypass_list(&[]);
         assert_eq!(
             &win_default[..4],
-            &["localhost", "127.0.0.1", "::1", "127.*"]
+            &["localhost", "127.0.0.1", "[::1]", "127.*"]
         );
+
+        // Windows sanitization wraps bare IPv6, expands private IPv4 CIDRs, drops unconvertible
+        // CIDRs (like fe80::/10), deduplicates `::1` vs `[::1]`, and preserves `host:port`.
+        let win_dirty = sanitize_windows_bypass_list(&[
+            "localhost".to_string(),
+            "::1".to_string(),
+            "[::1]".to_string(),
+            "fe80::*".to_string(),
+            "127.0.0.0/8".to_string(),
+            "10.0.0.0/8".to_string(),
+            "192.168.0.0/16".to_string(),
+            "172.16.0.0/12".to_string(),
+            "fe80::/10".to_string(),
+            "100.64.0.0/10".to_string(),
+            "example.com:8080".to_string(),
+            "<local>".to_string(),
+        ]);
+        assert_eq!(win_dirty.iter().filter(|s| s.as_str() == "[::1]").count(), 1);
+        assert!(!win_dirty.iter().any(|s| s == "::1"));
+        assert!(win_dirty.contains(&"[fe80::*]".to_string()));
+        assert!(win_dirty.contains(&"127.*".to_string()));
+        assert!(win_dirty.contains(&"10.*".to_string()));
+        assert!(win_dirty.contains(&"192.168.*".to_string()));
+        assert!(win_dirty.contains(&"172.16.*".to_string()));
+        assert!(win_dirty.contains(&"172.31.*".to_string()));
+        assert!(win_dirty.contains(&"example.com:8080".to_string()));
+        assert!(!win_dirty.iter().any(|s| s.contains('/')));
+        assert!(find_invalid_windows_proxy_override_entries(&win_dirty.join(";")).is_empty());
+
+        let invalid = find_invalid_windows_proxy_override_entries(
+            "localhost;127.0.0.1;::1;10.0.0.0/8;fe80::/10;fe80::*;example.com:8080;[::1];<local>",
+        );
+        assert_eq!(
+            invalid,
+            vec![
+                "::1".to_string(),
+                "10.0.0.0/8".to_string(),
+                "fe80::/10".to_string(),
+                "fe80::*".to_string(),
+            ]
+        );
+
+        // Linux & macOS sanitizers strip brackets from pure IPv6 (`[::1]` -> `::1`) without duplication.
+        let cross_platform = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "[::1]".to_string(),
+            "127.*".to_string(),
+        ];
+        let linux_clean = sanitize_linux_bypass_list(&cross_platform);
+        assert_eq!(linux_clean, vec!["localhost", "127.0.0.1", "::1", "127.*"]);
+        let macos_clean = sanitize_macos_bypass_list(&cross_platform);
+        assert_eq!(macos_clean, vec!["localhost", "127.0.0.1", "::1", "127.*"]);
     }
 
     #[test]

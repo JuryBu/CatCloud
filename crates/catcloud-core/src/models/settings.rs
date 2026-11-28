@@ -244,6 +244,10 @@ impl Default for SystemProxyConfig {
         Self {
             enabled: false,
             proxy_guard: ProxyGuardConfig::default(),
+            // Keep canonical cross-platform `::1` here for config portability; Windows registry
+            // writes (`apply_system_proxy`) and `detect_proxy_drift` normalize it to `[::1]` via
+            // `sanitize_windows_bypass_list` (preventing WinHTTP/Schannel Win32 Error 87), while
+            // Linux/macOS sanitizers strip brackets back to `::1`.
             bypass: vec![
                 "localhost".to_string(),
                 "127.0.0.1".to_string(),
@@ -1424,6 +1428,14 @@ mod tests {
         );
         assert_eq!(GlobalPreAccelScope::AllNon443Tcp.as_str(), "all_non_443_tcp");
         assert_eq!(&cfg.system_proxy.bypass[..3], &["localhost", "127.0.0.1", "::1"]);
+        let win_sanitized = crate::platform::common::sanitize_windows_bypass_list(&cfg.system_proxy.bypass);
+        assert_eq!(&win_sanitized[..3], &["localhost", "127.0.0.1", "[::1]"]);
+        assert!(
+            crate::platform::common::find_invalid_windows_proxy_override_entries(
+                &win_sanitized.join(";")
+            )
+            .is_empty()
+        );
 
         // Cross-platform unified hotkey defaults & legacy deserialization.
         assert_eq!(

@@ -1186,6 +1186,14 @@ pub struct ExitIpInfoDto {
     pub timezone: String,
     pub google_clean: Option<bool>,
     pub core_running: bool,
+    #[serde(default)]
+    pub ip_clean: Option<bool>,
+    #[serde(default)]
+    pub ip_risk_level: Option<String>,
+    #[serde(default)]
+    pub ip_asn: Option<String>,
+    #[serde(default)]
+    pub ip_risk_flags: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5481,7 +5489,7 @@ async fn select_group_node_core(
     node_id: String,
     close_old: Option<bool>,
     prev_node_name_hint: Option<String>,
-    activate_group: bool,
+    activate_group: Option<bool>,
 ) -> Result<SwitchResultDto, String> {
     let _switching_guard = SwitchingActiveGuard::enter(app, state);
     let _cfg_guard = state.config_transition_lock.lock().await;
@@ -5523,10 +5531,17 @@ async fn select_group_node_core(
     }
 
     let prev_cfg = state.snapshot_config();
+    let effective_activate_group = should_activate_group_on_node_select(
+        activate_group,
+        group.independent_routing,
+        &group.id,
+        prev_cfg.route_mode,
+        prev_cfg.active_group_id.as_deref(),
+    );
     let mut cfg = prev_cfg.clone();
     let was_single = cfg.route_mode == RouteTargetMode::Single;
     let active_group_changed = cfg.active_group_id.as_deref() != Some(group.id.as_str());
-    let route_cfg_changed = activate_group && (was_single || active_group_changed);
+    let route_cfg_changed = effective_activate_group && (was_single || active_group_changed);
     if route_cfg_changed {
         cfg.route_mode = RouteTargetMode::Group;
         cfg.active_group_id = Some(group.id.clone());
@@ -5539,9 +5554,12 @@ async fn select_group_node_core(
     let mut closed_connections = 0usize;
     if state.adapter.has_live_controller().await {
         if members_changed || route_cfg_changed {
-            if let Some(outcome) =
-                trigger_reload_if_running(app, state, (activate_group && was_single) || members_changed)
-                    .await
+            if let Some(outcome) = trigger_reload_if_running(
+                app,
+                state,
+                (effective_activate_group && was_single) || members_changed,
+            )
+            .await
             {
                 if outcome.rejected {
                     if let Ok(db) = state.storage.lock() {
@@ -5601,13 +5619,22 @@ async fn select_group_node_core(
 
     let cfg = state.snapshot_config();
     state.set_group_backoff_until(&group.id, None);
-    if activate_group {
-        let from_label = prev_node_name.as_deref().unwrap_or("未选");
+    let from_label = prev_node_name.as_deref().unwrap_or("未选");
+    if effective_activate_group {
         state.log_app_event(
             "info",
             "节点切换",
             &format!(
                 "分组「{}」切换节点：{} -> {}（断开旧连接 {} 条）",
+                group.name, from_label, target_node.name, closed_connections
+            ),
+        );
+    } else if group.independent_routing {
+        state.log_app_event(
+            "info",
+            "节点切换",
+            &format!(
+                "独立分流组「{}」原地切换节点：{} -> {}（主兜底组保持不变，断开旧连接 {} 条）",
                 group.name, from_label, target_node.name, closed_connections
             ),
         );
@@ -5643,7 +5670,7 @@ pub async fn select_group_node_internal(
         node_id,
         close_old,
         prev_node_name_hint,
-        true,
+        Some(true),
     )
     .await
 }
@@ -5665,7 +5692,7 @@ pub async fn select_group_node_in_place_internal(
         node_id,
         close_old,
         prev_node_name_hint,
-        false,
+        Some(false),
     )
     .await
 }
@@ -7673,6 +7700,25 @@ pub async fn switch_next_best_node(
     switch_next_best_internal(&app, &state, group_id).await
 }
 
+fn should_activate_group_on_node_select(
+    explicit: Option<bool>,
+    group_independent_routing: bool,
+    group_id: &str,
+    current_route_mode: RouteTargetMode,
+    current_active_group_id: Option<&str>,
+) -> bool {
+    if let Some(flag) = explicit {
+        return flag;
+    }
+    if group_independent_routing
+        && current_route_mode == RouteTargetMode::Group
+        && current_active_group_id.is_some_and(|active| !active.is_empty() && active != group_id)
+    {
+        return false;
+    }
+    true
+}
+
 #[tauri::command]
 pub async fn select_group_node(
     app: AppHandle,
@@ -7680,8 +7726,18 @@ pub async fn select_group_node(
     group_id: String,
     node_id: String,
     close_old: Option<bool>,
+    activate_group: Option<bool>,
 ) -> Result<SwitchResultDto, String> {
-    select_group_node_internal(&app, &state, group_id, node_id, close_old, None).await
+    select_group_node_core(
+        &app,
+        &state,
+        group_id,
+        node_id,
+        close_old,
+        None,
+        activate_group,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -7984,6 +8040,22 @@ pub fn list_multi_groups(state: State<'_, AppState>) -> Result<Vec<MultiGroup>, 
     Ok(groups)
 }
 
+fn validate_group_hard_gates(hard_gates: &[String]) -> Result<(), String> {
+    for (idx, gate) in hard_gates.iter().enumerate() {
+        let trimmed = gate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        catcloud_core::strategy::formula::validate_formula(trimmed).map_err(|e| {
+            format!(
+                "分组第 {} 条硬门禁表达式无效（{trimmed}）：{e}",
+                idx + 1
+            )
+        })?;
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn upsert_multi_group(
     app: AppHandle,
@@ -7995,6 +8067,13 @@ pub async fn upsert_multi_group(
     }
     catcloud_core::strategy::formula::validate_formula(&group.formula_expr)
         .map_err(|e| format!("分组排序公式无效：{e}"))?;
+    group.hard_gates = group
+        .hard_gates
+        .into_iter()
+        .map(|g| g.trim().to_string())
+        .filter(|g| !g.is_empty())
+        .collect();
+    validate_group_hard_gates(&group.hard_gates)?;
     let (prev_group, prev_active_id, prev_active_name, next_active_name) = {
         let db = state.storage.lock().map_err(|e| e.to_string())?;
         let existing_group = db.get_multi_group(&group.id).map_err(|e| e.to_string())?;
@@ -14908,6 +14987,10 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
             timezone: "UTC+8".to_string(),
             google_clean: None,
             core_running: false,
+            ip_clean: None,
+            ip_risk_level: None,
+            ip_asn: None,
+            ip_risk_flags: None,
         });
     }
 
@@ -14920,6 +15003,10 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
             timezone: "UTC+8".to_string(),
             google_clean: None,
             core_running: true,
+            ip_clean: None,
+            ip_risk_level: None,
+            ip_asn: None,
+            ip_risk_flags: None,
         });
     }
 
@@ -14945,9 +15032,10 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
         .build()
         .map_err(|e| format!("初始化谷歌送中检测客户端失败：{e}"))?;
 
-    let (geo_res, google_assessment) = tokio::join!(
+    let (geo_res, google_assessment, purity_signals) = tokio::join!(
         query_exit_geoip(&geo_client),
-        probe_live_google_cleanliness(&google_client, Duration::from_secs(5))
+        probe_live_google_cleanliness(&google_client, Duration::from_secs(5)),
+        catcloud_core::probe::builtins::query_ip_purity_signals(&geo_client),
     );
 
     let live_google_clean = if google_assessment
@@ -14960,6 +15048,18 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
         Some(google_assessment.google_clean)
     };
 
+    let ip_risk_level = {
+        let trimmed = purity_signals.ip_risk_level.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("unknown") {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+    let ip_clean = purity_signals.ip_clean;
+    let ip_asn = purity_signals.ip_asn;
+    let ip_risk_flags = purity_signals.ip_risk_flags;
+
     match geo_res {
         Ok(info) => Ok(ExitIpInfoDto {
             ip_masked: mask_ip_address(&info.ip),
@@ -14969,6 +15069,10 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
             timezone: info.timezone,
             google_clean: live_google_clean,
             core_running: true,
+            ip_clean,
+            ip_risk_level,
+            ip_asn,
+            ip_risk_flags,
         }),
         Err(reason) => Ok(ExitIpInfoDto {
             ip_masked: "--.--.--.***".to_string(),
@@ -14978,6 +15082,10 @@ pub async fn get_exit_ip_info(state: State<'_, AppState>) -> Result<ExitIpInfoDt
             timezone: "未知时区".to_string(),
             google_clean: live_google_clean,
             core_running: true,
+            ip_clean,
+            ip_risk_level,
+            ip_asn,
+            ip_risk_flags,
         }),
     }
 }
@@ -18235,6 +18343,47 @@ async fn fetch_geodata_bytes_once(
     Ok(buf)
 }
 
+fn derive_geodata_mirror_urls(primary_url: &str) -> Vec<String> {
+    const PREFIXES: &[&str] = &[
+        "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/",
+        "http://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/",
+    ];
+    let trimmed = primary_url.trim();
+    let without_query = trimmed.split(['?', '#']).next().unwrap_or(trimmed);
+    let rest = PREFIXES.iter().find_map(|prefix| {
+        if without_query.len() > prefix.len()
+            && without_query.is_char_boundary(prefix.len())
+            && without_query[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
+            Some(&without_query[prefix.len()..])
+        } else {
+            None
+        }
+    });
+    let Some(rest) = rest else {
+        return Vec::new();
+    };
+    let filename = rest.trim_matches('/');
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+    {
+        return Vec::new();
+    }
+    let mirror_name = if filename.eq_ignore_ascii_case("country.mmdb") {
+        "country.mmdb"
+    } else {
+        filename
+    };
+    vec![
+        format!("https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/{mirror_name}"),
+        format!(
+            "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/{mirror_name}"
+        ),
+    ]
+}
+
 async fn download_geodata_file_atomic(
     url: &str,
     dest: &std::path::Path,
@@ -18244,14 +18393,43 @@ async fn download_geodata_file_atomic(
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
         return Err("地理数据库下载地址必须是 http:// 或 https:// 链接".to_string());
     }
-    let bytes = if let Some(port) = local_proxy_port {
-        match fetch_geodata_bytes_once(trimmed, Some(port)).await {
-            Ok(b) => b,
-            Err(_) => fetch_geodata_bytes_once(trimmed, None).await?,
+    let mut candidate_urls: Vec<String> = vec![trimmed.to_string()];
+    candidate_urls.extend(derive_geodata_mirror_urls(trimmed));
+
+    let mut downloaded: Option<Vec<u8>> = None;
+    let mut last_err: Option<String> = None;
+
+    for candidate_url in &candidate_urls {
+        let attempt = if let Some(port) = local_proxy_port {
+            match fetch_geodata_bytes_once(candidate_url, Some(port)).await {
+                Ok(b) => Ok(b),
+                Err(proxy_err) => match fetch_geodata_bytes_once(candidate_url, None).await {
+                    Ok(b) => Ok(b),
+                    Err(direct_err) => Err(format!("代理：{proxy_err}；直连：{direct_err}")),
+                },
+            }
+        } else {
+            fetch_geodata_bytes_once(candidate_url, None).await
+        };
+        match attempt {
+            Ok(bytes) => {
+                downloaded = Some(bytes);
+                break;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    url = %candidate_url,
+                    error = %err,
+                    "geodata download attempt failed; trying fallback mirror if available"
+                );
+                last_err = Some(err);
+            }
         }
-    } else {
-        fetch_geodata_bytes_once(trimmed, None).await?
-    };
+    }
+
+    let bytes = downloaded.ok_or_else(|| {
+        last_err.unwrap_or_else(|| "下载地理数据库失败（主源与备用镜像均不可用）".to_string())
+    })?;
     let len = bytes.len();
     let dest_owned = dest.to_path_buf();
     tokio::task::spawn_blocking(move || AppPaths::atomic_write(&dest_owned, &bytes))
@@ -18263,6 +18441,7 @@ async fn download_geodata_file_atomic(
 
 #[tauri::command]
 pub async fn refresh_geo_db(
+    app: AppHandle,
     state: State<'_, AppState>,
     targets: Option<Vec<String>>,
 ) -> Result<serde_json::Value, String> {
@@ -18382,7 +18561,52 @@ pub async fn refresh_geo_db(
         return Err(detail);
     }
 
-    let message = if errors.is_empty() {
+    let mut reloaded = false;
+    let mut reload_err_note: Option<String> = None;
+    if state.adapter.has_live_controller().await {
+        match trigger_reload_if_running_with_options(&app, &state, true, false).await {
+            Some(outcome) if outcome.applied => {
+                reloaded = true;
+                state.log_app_event(
+                    "info",
+                    "地理库",
+                    &format!(
+                        "地理库落盘后已自动强制热重载（级别：{}，目标：{}）",
+                        format_reload_level_zh(outcome.level),
+                        updated_targets.join(", ")
+                    ),
+                );
+            }
+            Some(outcome) => {
+                let reason = outcome
+                    .error
+                    .as_deref()
+                    .map(format_mihomo_error_for_user)
+                    .unwrap_or_else(|| {
+                        if outcome.rejected {
+                            "核心拒绝了本次热重载，请检查规则配置".to_string()
+                        } else {
+                            "核心未应用本次热重载".to_string()
+                        }
+                    });
+                state.log_app_event(
+                    "warn",
+                    "地理库",
+                    &format!("地理库已落盘，但自动热重载失败：{reason}"),
+                );
+                reload_err_note = Some(reason);
+            }
+            None => {
+                state.log_app_event(
+                    "info",
+                    "地理库",
+                    "地理库已落盘，核心已停止，将在下次启动时生效",
+                );
+            }
+        }
+    }
+
+    let base_message = if errors.is_empty() {
         if core_geo_ok {
             "地理数据库已更新并原子写入运行目录".to_string()
         } else {
@@ -18395,10 +18619,18 @@ pub async fn refresh_geo_db(
             errors.join("；")
         )
     };
+    let message = if reloaded {
+        format!("{base_message}，并已自动热重载核心使地理分流规则立即生效")
+    } else if let Some(reason) = reload_err_note {
+        format!("{base_message}，但核心自动热重载失败（{reason}）")
+    } else {
+        base_message
+    };
 
     Ok(serde_json::json!({
         "ok": true,
         "updated_targets": updated_targets,
+        "reloaded": reloaded,
         "message": message
     }))
 }
@@ -20667,6 +20899,8 @@ fn prepare_and_apply_backup_bundle_core(
             }
             catcloud_core::strategy::formula::validate_formula(&g.formula_expr)
                 .map_err(|e| format!("备份中的分组「{}」排序公式无效：{e}", g.name))?;
+            validate_group_hard_gates(&g.hard_gates)
+                .map_err(|e| format!("备份中的分组「{}」{e}", g.name))?;
             parsed_groups.push(g);
         }
     }
@@ -27679,23 +27913,23 @@ mod tests {
         );
 
         // 3. Valid backup with `onboarding_completed=false`, overseas `probe_url`, dangling
-        //    `active_relay_id`, and stale Windsurf probe (`expected_status=None`):
+        //    `active_relay_id`, and legacy official Windsurf probe (`https://windsurf.com` + GET 200):
         //    must latch `onboarding_completed |= true`, heal `probe_url`, clear dangling relay,
-        //    and re-seed built-in Windsurf `expected_status = Some(200)`.
+        //    and migrate built-in Windsurf to ConnectRPC semantic probe (`POST`, `expected_status = None`).
         let mut legacy_cfg = AppConfig::default();
         legacy_cfg.personalization.onboarding_completed = false;
         legacy_cfg.preaccel.probe_url = "https://www.gstatic.com/generate_204".to_string();
         legacy_cfg.preaccel.active_relay_id = Some("nonexistent-relay-id".to_string());
         let stale_windsurf = ProbeDefinition {
             id: "builtin_unlock_windsurf".to_string(),
-            name: "Windsurf".to_string(),
+            name: "Windsurf / Codeium Reachability".to_string(),
             kind: catcloud_core::models::ProbeKind::UnlockRegex,
-            target_url: "https://example.invalid/old".to_string(),
+            target_url: "https://windsurf.com".to_string(),
             method: "GET".to_string(),
-            expected_status: None,
+            expected_status: Some(200),
             body_regex: None,
             payload_bytes: None,
-            timeout_ms: 4000,
+            timeout_ms: 8000,
             builtin: true,
         };
         let good_bundle = serde_json::json!({
@@ -27722,9 +27956,19 @@ mod tests {
             .find(|p| p.id == "builtin_unlock_windsurf")
             .expect("windsurf builtin probe exists");
         assert_eq!(
+            ws.target_url,
+            "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage",
+            "seed_builtin_probes after restore must migrate legacy windsurf target_url to ConnectRPC endpoint"
+        );
+        assert_eq!(
+            ws.method,
+            "POST",
+            "seed_builtin_probes after restore must migrate legacy windsurf method to POST"
+        );
+        assert_eq!(
             ws.expected_status,
-            Some(200),
-            "seed_builtin_probes after restore must keep windsurf expected_status = Some(200)"
+            None,
+            "seed_builtin_probes after restore must migrate legacy windsurf expected_status to None"
         );
 
         drop(state);
@@ -28597,5 +28841,162 @@ mod tests {
 
         drop(state);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn stage26_geodata_mirrors_exit_ip_dto_and_hard_gate_validation() {
+        // 1. `Country.mmdb` normalizes to lowercase `country.mmdb` on MetaCubeX jsDelivr mirrors.
+        assert_eq!(
+            derive_geodata_mirror_urls(
+                "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/Country.mmdb"
+            ),
+            vec![
+                "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"
+                    .to_string(),
+                "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"
+                    .to_string(),
+            ]
+        );
+
+        // 2. `country-lite.mmdb`, `geosite.dat`, `geoip.dat`, `GeoLite2-ASN.mmdb` keep exact casing.
+        assert_eq!(
+            derive_geodata_mirror_urls(
+                "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/country-lite.mmdb"
+            ),
+            vec![
+                "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country-lite.mmdb"
+                    .to_string(),
+                "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country-lite.mmdb"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            derive_geodata_mirror_urls(
+                "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/GeoLite2-ASN.mmdb?raw=1"
+            ),
+            vec![
+                "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"
+                    .to_string(),
+                "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            derive_geodata_mirror_urls(
+                "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/geosite.dat"
+            ),
+            vec![
+                "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+                    .to_string(),
+                "https://testingcf.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"
+                    .to_string(),
+            ]
+        );
+
+        // 3. Non-MetaCubeX or malformed URLs return no mirrors.
+        assert!(
+            derive_geodata_mirror_urls("https://example.com/custom/Country.mmdb").is_empty()
+        );
+        assert!(
+            derive_geodata_mirror_urls(
+                "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/"
+            )
+            .is_empty()
+        );
+        assert!(
+            derive_geodata_mirror_urls(
+                "https://github.com/MetaCubeX/meta-rules-dat/releases/latest/download/sub/geoip.dat"
+            )
+            .is_empty()
+        );
+
+        // 4. Hard-gate expression validation accepts valid gates (including `ip_clean`) and rejects malformed ones.
+        validate_group_hard_gates(&[
+            "site_unlocked(\"windsurf\") == 1".to_string(),
+            "ip_clean == 1".to_string(),
+            "ping_ms <= 300".to_string(),
+            "   ".to_string(),
+        ])
+        .expect("valid hard gates must pass");
+
+        let bad_syntax = validate_group_hard_gates(&["ping_ms <==".to_string()])
+            .expect_err("malformed hard gate syntax must be rejected");
+        assert!(bad_syntax.contains("硬门禁表达式无效"), "unexpected err: {bad_syntax}");
+
+        let bad_ident = validate_group_hard_gates(&["no_such_metric == 1".to_string()])
+            .expect_err("unknown hard gate identifier must be rejected");
+        assert!(bad_ident.contains("硬门禁表达式无效"), "unexpected err: {bad_ident}");
+
+        // 5. `ExitIpInfoDto` backwards-compatible deserialization + roundtrip with purity fields.
+        let legacy_json = serde_json::json!({
+            "ip_masked": "203.0.113.***",
+            "ip_raw": "203.0.113.4",
+            "isp": "Example ISP",
+            "location": "TW",
+            "timezone": "Asia/Taipei",
+            "google_clean": true,
+            "core_running": true
+        });
+        let legacy_dto: ExitIpInfoDto =
+            serde_json::from_value(legacy_json).expect("legacy ExitIpInfoDto must deserialize");
+        assert_eq!(legacy_dto.ip_clean, None);
+        assert_eq!(legacy_dto.ip_risk_level, None);
+        assert_eq!(legacy_dto.ip_asn, None);
+        assert_eq!(legacy_dto.ip_risk_flags, None);
+
+        let full_dto = ExitIpInfoDto {
+            ip_masked: "203.0.113.***".to_string(),
+            ip_raw: Some("203.0.113.4".to_string()),
+            isp: "Example ISP".to_string(),
+            location: "TW".to_string(),
+            timezone: "Asia/Taipei".to_string(),
+            google_clean: Some(true),
+            core_running: true,
+            ip_clean: Some(false),
+            ip_risk_level: Some("proxy_risk".to_string()),
+            ip_asn: Some("AS38136 Akari Networks".to_string()),
+            ip_risk_flags: Some("proxy,datacenter".to_string()),
+        };
+        let encoded = serde_json::to_value(&full_dto).expect("serialize full ExitIpInfoDto");
+        let decoded: ExitIpInfoDto =
+            serde_json::from_value(encoded).expect("deserialize full ExitIpInfoDto");
+        assert_eq!(decoded.ip_clean, Some(false));
+        assert_eq!(
+            decoded.ip_risk_level.as_deref(),
+            Some("proxy_risk")
+        );
+
+        // 6. Selecting a node inside a non-primary independent routing group keeps the primary default group intact.
+        assert!(!should_activate_group_on_node_select(
+            None,
+            true,
+            "grp-wsf",
+            RouteTargetMode::Group,
+            Some("grp-taiwan"),
+        ));
+        assert!(should_activate_group_on_node_select(
+            None,
+            false,
+            "grp-other",
+            RouteTargetMode::Group,
+            Some("grp-taiwan"),
+        ));
+        assert!(should_activate_group_on_node_select(
+            Some(true),
+            true,
+            "grp-wsf",
+            RouteTargetMode::Group,
+            Some("grp-taiwan"),
+        ));
+        assert!(should_activate_group_on_node_select(
+            None,
+            true,
+            "grp-taiwan",
+            RouteTargetMode::Group,
+            Some("grp-taiwan"),
+        ));
+        assert_eq!(decoded.ip_risk_level.as_deref(), Some("proxy_risk"));
+        assert_eq!(decoded.ip_asn.as_deref(), Some("AS38136 Akari Networks"));
+        assert_eq!(decoded.ip_risk_flags.as_deref(), Some("proxy,datacenter"));
     }
 }

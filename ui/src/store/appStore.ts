@@ -657,6 +657,12 @@ export interface AppState {
   aiRouteHint: { moduleId?: string; tab?: "web" | "agent" } | null;
   settingsTabHint: "system" | "appearance" | "dns" | "core" | "updates" | null;
   settingsOpenAgentDocs: boolean;
+  multiGroupCreateHint: "wsf" | "ai" | "manual" | "download" | null;
+  geoRuleContext: {
+    domesticDirectEnabled: boolean;
+    customRulesOnly: boolean;
+    geodataMode: boolean;
+  };
   nodesTabHint: {
     tab: "nodes" | "subs";
     subId?: string | null;
@@ -1069,6 +1075,12 @@ let state: AppState = {
   aiRouteHint: null,
   settingsTabHint: null,
   settingsOpenAgentDocs: false,
+  multiGroupCreateHint: null,
+  geoRuleContext: {
+    domesticDirectEnabled: true,
+    customRulesOnly: false,
+    geodataMode: false,
+  },
   nodesTabHint: null,
   config: initialConfig,
   resolvedTheme: initialResolvedTheme,
@@ -2079,6 +2091,15 @@ async function hydrateFromBackend(): Promise<void> {
   const authoritativePendingUpdate = hasAuthoritativePendingUpdate
     ? pendingUpdateRes.value
     : null;
+  const hydratedGeoRuleContext =
+    fullCfgRes.status === "fulfilled" && fullCfgRes.value
+      ? {
+          domesticDirectEnabled:
+            fullCfgRes.value.rules_override?.domestic_direct_enabled ?? true,
+          customRulesOnly: Boolean(fullCfgRes.value.rules_override?.custom_rules_only),
+          geodataMode: Boolean(fullCfgRes.value.geodata_mode),
+        }
+      : null;
 
   setState((prev) => {
     const resolvedPendingUpdate = hasAuthoritativePendingUpdate
@@ -2100,6 +2121,7 @@ async function hydrateFromBackend(): Promise<void> {
       onboardingHydratedOk: prev.onboardingHydratedOk || configHydratedOk,
       activeNav: startupNav ?? prev.activeNav,
       config: alignConfigWithRuntimeTun(mergedConfig, resolvedRuntime),
+      geoRuleContext: hydratedGeoRuleContext ?? prev.geoRuleContext,
       resolvedTheme: resolved,
       runtime: resolvedRuntime,
       groups: resolvedGroups,
@@ -2476,6 +2498,25 @@ export const appStore = {
       if (includePrereleaseChanged && isTauriEnv() && state.windowMode === "main") {
         void appActions.refreshPendingUpdate();
       }
+      if (isTauriEnv() && state.windowMode === "main") {
+        void catcloudApi
+          .getFullConfig()
+          .then((fullCfg) => {
+            if (!bootStarted || !fullCfg) return;
+            setState((prev) => ({
+              ...prev,
+              geoRuleContext: {
+                domesticDirectEnabled:
+                  fullCfg.rules_override?.domestic_direct_enabled ?? true,
+                customRulesOnly: Boolean(fullCfg.rules_override?.custom_rules_only),
+                geodataMode: Boolean(fullCfg.geodata_mode),
+              },
+            }));
+          })
+          .catch(() => {
+            /* ignore transient full-config refresh error */
+          });
+      }
     });
 
     if (state.windowMode === "main") {
@@ -2572,6 +2613,9 @@ export const appStore = {
     void hydrateFromBackend()
       .then(() => {
         if (!bootStarted || state.windowMode !== "main") return;
+        if (isTauriEnv()) {
+          void appActions.loadGeodataStatus();
+        }
         void catcloudApi
           .consumePendingNav()
           .then((rawNav) => {
@@ -2701,6 +2745,50 @@ export const appActions = {
 
   consumeNodesTabHint(): void {
     setState((prev) => (prev.nodesTabHint === null ? prev : { ...prev, nodesTabHint: null }));
+  },
+
+  openMultiGroup(groupId: string): void {
+    const trimmed = groupId.trim();
+    if (trimmed) {
+      setState((prev) => ({
+        ...prev,
+        sessionDrafts: {
+          ...prev.sessionDrafts,
+          multiGroup: {
+            ...prev.sessionDrafts.multiGroup,
+            selectedId: trimmed,
+          },
+        },
+      }));
+    }
+    appActions.setNav("groups");
+  },
+
+  openMultiGroupCreate(template: "wsf" | "ai" | "manual" | "download"): void {
+    setState((prev) => ({ ...prev, multiGroupCreateHint: template }));
+    appActions.setNav("groups");
+  },
+
+  consumeMultiGroupCreateHint(): void {
+    setState((prev) =>
+      prev.multiGroupCreateHint === null ? prev : { ...prev, multiGroupCreateHint: null }
+    );
+  },
+
+  syncGeoRuleContext(
+    patch: Partial<{
+      domesticDirectEnabled: boolean;
+      customRulesOnly: boolean;
+      geodataMode: boolean;
+    }>
+  ): void {
+    setState((prev) => ({
+      ...prev,
+      geoRuleContext: {
+        ...prev.geoRuleContext,
+        ...patch,
+      },
+    }));
   },
 
   openSettingsTab(tab: "system" | "appearance" | "dns" | "core" | "updates"): void {
@@ -3762,26 +3850,50 @@ export const appActions = {
     }
   },
 
-  async selectGroupNode(groupId: string, nodeId: string, closeOld = true): Promise<void> {
+  async selectGroupNode(
+    groupId: string,
+    nodeId: string,
+    closeOld = true,
+    activateGroup?: boolean
+  ): Promise<void> {
     try {
-      const res = await catcloudApi.selectGroupNode(groupId, nodeId, closeOld);
+      const targetGroup = state.groups.find((g) => g.id === groupId);
+      const keepPrimaryUnchanged =
+        activateGroup === false ||
+        (activateGroup === undefined &&
+          Boolean(targetGroup?.independent_routing) &&
+          state.runtime.route_mode === "group" &&
+          Boolean(state.runtime.active_group_id) &&
+          state.runtime.active_group_id !== groupId);
+      const res = await catcloudApi.selectGroupNode(
+        groupId,
+        nodeId,
+        closeOld,
+        keepPrimaryUnchanged ? false : activateGroup
+      );
       const rt = await catcloudApi.getRuntimeInfo();
-      const nextRuntime: CoreRuntimeInfo = {
-        ...rt,
-        route_mode: "group",
-        active_group_id: rt.active_group_id || res.group_id,
-        active_node_id: rt.active_node_id || res.active_node_id,
-        active_node_name: rt.active_node_name || res.active_node_name,
-      };
+      const nextRuntime: CoreRuntimeInfo = keepPrimaryUnchanged
+        ? { ...rt }
+        : {
+            ...rt,
+            route_mode: "group",
+            active_group_id: rt.active_group_id || res.group_id,
+            active_node_id: rt.active_node_id || res.active_node_id,
+            active_node_name: rt.active_node_name || res.active_node_name,
+          };
       setState((prev) => ({
         ...prev,
         runtime: nextRuntime,
-        exitIp: buildPendingExitIp(nextRuntime.running),
+        exitIp: keepPrimaryUnchanged ? prev.exitIp : buildPendingExitIp(nextRuntime.running),
         groups: prev.groups.map((g) =>
           g.id === res.group_id ? { ...g, active_node_id: res.active_node_id } : g
         ),
       }));
-      pushToast(`已切换至：${res.active_node_name}`, "ok");
+      if (keepPrimaryUnchanged && targetGroup) {
+        pushToast(`已将独立分流组「${targetGroup.name}」出口切至：${res.active_node_name}（主兜底组保持不变）`, "ok");
+      } else {
+        pushToast(`已切换至：${res.active_node_name}`, "ok");
+      }
     } catch (err) {
       pushToast(`切换节点失败：${formatErrorMessage(err)}`, "warn");
     }
@@ -5556,10 +5668,16 @@ export const appActions = {
     });
   },
 
-  async runRefreshGeoDb(target: string): Promise<void> {
+  async runRefreshGeoDb(target: string | string[]): Promise<void> {
+    const busyKey = Array.isArray(target) ? target.join(",") : target;
+    const targetsPayload = Array.isArray(target)
+      ? target
+      : target === "all"
+        ? null
+        : [target];
     const existing = inFlightTasks.get("settings:geoRefresh");
     if (existing) {
-      if (state.bgTasks.settings.geoBusy !== target) {
+      if (state.bgTasks.settings.geoBusy !== busyKey) {
         pushToast("地理数据库正在更新中，请稍候完成后再试", "info");
       }
       return existing as Promise<void>;
@@ -5567,15 +5685,31 @@ export const appActions = {
     return runInFlight(
       "settings:geoRefresh",
       async () => {
-        patchSettingsBg({ geoBusy: target });
+        patchSettingsBg({ geoBusy: busyKey });
         try {
-          const res = await catcloudApi.refreshGeoDb(target === "all" ? null : [target]);
-          try {
-            patchSettingsBg({ geoStatus: await catcloudApi.getGeodataStatus() });
-          } catch {
-            /* ignore secondary status refresh error */
+          const res = await catcloudApi.refreshGeoDb(targetsPayload);
+          const [geoRes, rtRes] = await Promise.allSettled([
+            catcloudApi.getGeodataStatus(),
+            catcloudApi.getRuntimeInfo(),
+          ]);
+          if (geoRes.status === "fulfilled") {
+            patchSettingsBg({ geoStatus: geoRes.value });
           }
-          pushToast(res.message || "地理数据库已更新", res.ok ? "ok" : "warn");
+          if (rtRes.status === "fulfilled") {
+            setState((prev) => ({ ...prev, runtime: rtRes.value }));
+          }
+          const baseMsg = res.message?.trim() || "地理数据库已更新";
+          let finalMsg = baseMsg;
+          if (res.ok) {
+            if (res.reloaded === true && !/热载|生效|reload/i.test(baseMsg)) {
+              finalMsg = `${baseMsg}（已自动热载生效）`;
+            } else if (res.reloaded === false && !/下次|启动|reload/i.test(baseMsg)) {
+              finalMsg = state.runtime.running
+                ? `${baseMsg}（已写入本地，如未立即生效可点重载核心）`
+                : `${baseMsg}（已写入本地，下次启动代理生效）`;
+            }
+          }
+          pushToast(finalMsg, res.ok ? "ok" : "warn");
         } catch (err) {
           pushToast(`更新地理数据库失败：${formatErrorMessage(err)}`, "warn");
         } finally {

@@ -40,6 +40,7 @@ import {
 } from "../api/tauri";
 import { AppSelect, type AppSelectOption } from "../components/AppSelect";
 import { formatBytes, formatRate } from "../components/TrafficSparkline";
+import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
 import { isBoolPref, oneOfPref, usePersistedState } from "../utils/uiPrefs";
 
@@ -56,6 +57,11 @@ type RuleMatchType =
   | "DOMAIN-KEYWORD"
   | "IP-CIDR"
   | "PROCESS-NAME"
+  | "PROCESS-PATH"
+  | "DST-PORT"
+  | "AND"
+  | "OR"
+  | "NOT"
   | "GEOSITE"
   | "GEOIP";
 
@@ -131,9 +137,35 @@ const RULE_TYPE_LABELS: Record<RuleMatchType, string> = {
   "DOMAIN-KEYWORD": "域名关键词",
   "IP-CIDR": "IP 网段",
   "PROCESS-NAME": "软件进程",
+  "PROCESS-PATH": "进程路径",
+  "DST-PORT": "目标端口",
+  AND: "复合与 (AND)",
+  OR: "复合或 (OR)",
+  NOT: "复合非 (NOT)",
   GEOSITE: "网站集合",
   GEOIP: "地区 IP",
 };
+
+const RULE_VALUE_PLACEHOLDERS: Record<RuleMatchType, string> = {
+  "DOMAIN-SUFFIX": "例如 github.com 或 codeium.com（也可直接粘贴整行规则）",
+  DOMAIN: "例如 server.codeium.com",
+  "DOMAIN-KEYWORD": "例如 google 或 openai",
+  "IP-CIDR": "例如 192.168.0.0/16 或 10.0.0.0/8",
+  "PROCESS-NAME": "例如 QQ.exe、WeChat.exe 或 chrome.exe",
+  "PROCESS-PATH": "例如 C:\\Program Files\\Tencent\\QQNT\\QQ.exe",
+  "DST-PORT": "例如 15000、443 或 80/443",
+  AND: "双层括号，例如 ((PROCESS-NAME,QQ.exe),(DST-PORT,15000))",
+  OR: "双层括号，例如 ((PROCESS-NAME,QQ.exe),(PROCESS-NAME,Weixin.exe))",
+  NOT: "双层括号，例如 ((DOMAIN-SUFFIX,cn))",
+  GEOSITE: "例如 cn、google 或 openai",
+  GEOIP: "例如 CN 或 JP",
+};
+
+const IM_DIRECT_PROCESS_RULES: ReadonlyArray<{ process: string; line: string }> = [
+  { process: "QQ.exe", line: "PROCESS-NAME,QQ.exe,DIRECT" },
+  { process: "WeChat.exe", line: "PROCESS-NAME,WeChat.exe,DIRECT" },
+  { process: "Weixin.exe", line: "PROCESS-NAME,Weixin.exe,DIRECT" },
+];
 
 const EXTRA_RULE_TYPE_LABELS: Record<string, string> = {
   "RULE-SET": "规则集合",
@@ -173,35 +205,142 @@ const DEMO_INLINE_OVERRIDE_YAML = [
 ].join("\n");
 
 const LOGICAL_PAREN_RULE_TYPES = new Set(["AND", "OR", "NOT", "SUB-RULE"]);
+const STRICT_LOGICAL_RULE_TYPES = new Set(["AND", "OR", "NOT"]);
+const REGEX_RULE_TYPES = new Set([
+  "DOMAIN-REGEX",
+  "PROCESS-NAME-REGEX",
+  "PROCESS-PATH-REGEX",
+]);
+const KNOWN_MIHOMO_RULE_TYPES = new Set<string>([
+  "DOMAIN",
+  "DOMAIN-SUFFIX",
+  "DOMAIN-KEYWORD",
+  "DOMAIN-REGEX",
+  "DOMAIN-WILDCARD",
+  "GEOSITE",
+  "GEOIP",
+  "IP-CIDR",
+  "IP-CIDR6",
+  "IP-SUFFIX",
+  "IP-ASN",
+  "SRC-IP-CIDR",
+  "SRC-PORT",
+  "DST-PORT",
+  "PROCESS-NAME",
+  "PROCESS-NAME-REGEX",
+  "PROCESS-PATH",
+  "PROCESS-PATH-REGEX",
+  "RULE-SET",
+  "NETWORK",
+  "UID",
+  "IN-TYPE",
+  "IN-USER",
+  "IN-NAME",
+  "SUB-RULE",
+  "AND",
+  "OR",
+  "NOT",
+  "MATCH",
+  "FINAL",
+]);
 
-function splitRuleTopLevel(raw: string): string[] | null {
-  const firstComma = raw.indexOf(",");
-  if (firstComma < 0) return null;
-  const ruleType = raw.slice(0, firstComma).trim().toUpperCase();
-  if (!ruleType) return null;
-
-  if (LOGICAL_PAREN_RULE_TYPES.has(ruleType)) {
-    const parts: string[] = [];
-    let depth = 0;
-    let start = 0;
-    for (let i = 0; i < raw.length; i++) {
-      const ch = raw[i];
-      if (ch === "(") {
-        depth += 1;
-      } else if (ch === ")") {
-        depth -= 1;
-        if (depth < 0) return null;
-      } else if (ch === "," && depth === 0) {
-        parts.push(raw.slice(start, i).trim());
-        start = i + 1;
-      }
+function findBalancedParenEnd(text: string, openIdx: number): number {
+  if (openIdx < 0 || openIdx >= text.length || text[openIdx] !== "(") return -1;
+  let depth = 0;
+  for (let i = openIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return -1;
+      if (depth === 0) return i;
     }
-    if (depth !== 0) return null;
-    parts.push(raw.slice(start).trim());
-    return parts;
   }
+  return -1;
+}
 
-  return raw.split(",").map((s) => s.trim());
+function validateLogicalRuleExpr(expr: string, ruleType: string): string | null {
+  const trimmed = expr.trim();
+  if (!trimmed) {
+    return `${ruleType} 规则条件不能为空，请填写双层括号表达式`;
+  }
+  if (!trimmed.startsWith("(") || !trimmed.endsWith(")")) {
+    return `${ruleType} 规则条件必须使用括号包裹，例如 ((PROCESS-NAME,QQ.exe),(DST-PORT,15000))`;
+  }
+  const endIdx = findBalancedParenEnd(trimmed, 0);
+  if (endIdx !== trimmed.length - 1) {
+    return `${ruleType} 规则括号未正确闭合或存在并列外层括号，请确认外层仅有一对 (...)`;
+  }
+  const inner = trimmed.slice(1, -1).trim();
+  if (!inner) {
+    return `${ruleType} 规则括号内不能为空条件`;
+  }
+  if (!inner.startsWith("(") || !inner.endsWith(")")) {
+    return `${ruleType} 规则需使用 Mihomo 双层括号写法，例如 ${
+      ruleType === "NOT"
+        ? "((DOMAIN-SUFFIX,cn))"
+        : "((PROCESS-NAME,QQ.exe),(DST-PORT,15000))"
+    }`;
+  }
+  // Verify every top-level comma-separated clause inside outer (...) is a non-empty balanced (...)
+  let depth = 0;
+  let clauseStart = 0;
+  const clauses: string[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return `${ruleType} 规则内部括号不匹配`;
+    } else if (ch === "," && depth === 0) {
+      clauses.push(inner.slice(clauseStart, i).trim());
+      clauseStart = i + 1;
+    }
+  }
+  if (depth !== 0) return `${ruleType} 规则内部括号未闭合`;
+  clauses.push(inner.slice(clauseStart).trim());
+  if (clauses.length === 0) return `${ruleType} 规则子条件不能为空`;
+  for (const clause of clauses) {
+    if (!clause.startsWith("(") || !clause.endsWith(")") || findBalancedParenEnd(clause, 0) !== clause.length - 1) {
+      return `${ruleType} 规则每个子条件都必须由独立括号包裹且仅以逗号分隔`;
+    }
+    const body = clause.slice(1, -1).trim();
+    if (!body || !body.includes(",")) {
+      return `${ruleType} 规则子条件不能为空，且需为合法规则格式如 (PROCESS-NAME,QQ.exe)`;
+    }
+  }
+  if (ruleType === "NOT" && clauses.length !== 1) {
+    return "NOT 规则仅允许包含 1 个子条件，例如 ((DOMAIN-SUFFIX,cn))";
+  }
+  return null;
+}
+
+function parseLogicalRuleParts(
+  trimmed: string
+): { ruleType: string; expr: string; target: string | null } | null {
+  const firstComma = trimmed.indexOf(",");
+  if (firstComma < 0) return null;
+  const ruleType = trimmed.slice(0, firstComma).trim().toUpperCase();
+  if (!LOGICAL_PAREN_RULE_TYPES.has(ruleType)) return null;
+  let openIdx = firstComma + 1;
+  while (openIdx < trimmed.length && /\s/.test(trimmed[openIdx])) openIdx += 1;
+  const closeIdx = findBalancedParenEnd(trimmed, openIdx);
+  if (closeIdx < 0) return null;
+  const expr = trimmed.slice(openIdx, closeIdx + 1).trim();
+  const tail = trimmed.slice(closeIdx + 1).trim();
+  if (!tail) {
+    return { ruleType, expr, target: null };
+  }
+  if (!tail.startsWith(",")) return null;
+  const target = tail.slice(1).trim();
+  if (!target) return null;
+  if (ruleType !== "SUB-RULE") {
+    // Mihomo forbids top-level trailing flags (no-resolve/src) or extra commas after logical rule target.
+    if (target.includes(",") || isRuleFlagToken(target)) return null;
+  }
+  return { ruleType, expr, target };
 }
 
 function validateInlineOverrideYamlLocal(raw: string): string | null {
@@ -278,6 +417,7 @@ const AI_PRESETS_TEMPLATE: ReadonlyArray<Omit<AiPresetBundle, "targetGroup" | "e
     desc: "Windsurf、Codeium 与 Devin 编程工具相关域名",
     domains: [
       "codeium.com",
+      "codeiumdata.com",
       "windsurf.com",
       "devin.ai",
       "cognition.ai",
@@ -311,20 +451,39 @@ function parseRuleString(
 ): ManagedRuleItem | null {
   const trimmed = raw.trim();
   if (!trimmed) return null;
-  const parts = splitRuleTopLevel(trimmed);
-  if (!parts || parts.length < 2) return null;
-  const ruleType = parts[0].toUpperCase();
+  const firstComma = trimmed.indexOf(",");
+  if (firstComma < 0) return null;
+  const ruleType = trimmed.slice(0, firstComma).trim().toUpperCase();
+  if (!ruleType) return null;
+
   if (ruleType === "MATCH" || ruleType === "FINAL") {
-    if (parts.length !== 2 || !parts[1]) return null;
+    const target = trimmed.slice(firstComma + 1).trim();
+    if (!target || target.includes(",")) return null;
     return {
       id,
       layer,
       ruleType,
       value: "*",
-      target: parts[1],
+      target,
       rawLine: trimmed,
     };
   }
+
+  if (LOGICAL_PAREN_RULE_TYPES.has(ruleType)) {
+    const logical = parseLogicalRuleParts(trimmed);
+    if (!logical || !logical.expr || !logical.target) return null;
+    return {
+      id,
+      layer,
+      ruleType: logical.ruleType,
+      value: logical.expr,
+      target: logical.target,
+      noResolve: false,
+      rawLine: trimmed,
+    };
+  }
+
+  const parts = trimmed.split(",").map((s) => s.trim());
   if (parts.length < 3) return null;
 
   // Locate target by skipping known trailing flags (no-resolve, src) while preserving commas in regex values
@@ -514,6 +673,33 @@ function formatConnectionRuleLabel(
   }
   if (normalized === "PROCESSNAME") {
     return payload ? `按软件匹配：${payload}` : "按软件匹配";
+  }
+  if (normalized === "PROCESSPATH") {
+    return payload ? `按路径匹配：${payload}` : "按路径匹配";
+  }
+  if (normalized === "PROCESSNAMEREGEX") {
+    return payload ? `进程正则：${payload}` : "进程正则";
+  }
+  if (normalized === "PROCESSPATHREGEX") {
+    return payload ? `路径正则：${payload}` : "路径正则";
+  }
+  if (normalized === "DOMAINREGEX") {
+    return payload ? `域名正则：${payload}` : "域名正则";
+  }
+  if (normalized === "DOMAINWILDCARD") {
+    return payload ? `域名通配：${payload}` : "域名通配";
+  }
+  if (normalized === "AND") {
+    return payload ? `复合与：${payload}` : "复合与";
+  }
+  if (normalized === "OR") {
+    return payload ? `复合或：${payload}` : "复合或";
+  }
+  if (normalized === "NOT") {
+    return payload ? `复合非：${payload}` : "复合非";
+  }
+  if (normalized === "SUBRULE") {
+    return payload ? `子规则：${payload}` : "子规则";
   }
   if (normalized === "GEOSITE") {
     const label = payload.toLowerCase() === "cn" ? "国内常用网站" : payload;
@@ -781,6 +967,13 @@ export function RulesConnsPage() {
   const groups = useAppSelector((s) => s.groups);
   const preAccelRelays = useAppSelector((s) => s.preAccelRelays);
   const runtime = useAppSelector((s) => s.runtime);
+  const uiLang = useAppSelector((s) =>
+    normalizeUiLanguage(s.config.personalization.ui_language)
+  );
+  const dict = useUiDict(uiLang);
+  const geoStatus = useAppSelector((s) => s.bgTasks.settings.geoStatus);
+  const geoBusy = useAppSelector((s) => s.bgTasks.settings.geoBusy);
+  const geoRuleContext = useAppSelector((s) => s.geoRuleContext);
   const preAccelEnabled = useAppSelector(
     (s) => s.runtime.preaccel_active || s.config.preaccel.enabled
   );
@@ -837,6 +1030,10 @@ export function RulesConnsPage() {
   // Advanced rules & transparent gateway export state
   const [gatewayModalOpen, setGatewayModalOpen] = useState<boolean>(false);
   const [advancedOpen, setAdvancedOpen] = useState<boolean>(false);
+  const [domesticDirectEnabled, setDomesticDirectEnabled] = useState<boolean>(
+    geoRuleContext.domesticDirectEnabled
+  );
+  const [geodataMode, setGeodataMode] = useState<boolean>(geoRuleContext.geodataMode);
   const [customRulesOnly, setCustomRulesOnly] = useState<boolean>(false);
   const [savingCustomRulesOnly, setSavingCustomRulesOnly] = useState<boolean>(false);
   const [bulkRawText, setBulkRawText] = useState<string>("");
@@ -899,6 +1096,18 @@ export function RulesConnsPage() {
   userRulesRef.current = userRules;
   const showYamlPreviewRef = useRef<boolean>(showYamlPreview);
   showYamlPreviewRef.current = showYamlPreview;
+  const savingRulesRef = useRef<boolean>(savingRules);
+  savingRulesRef.current = savingRules;
+  const savingInlineYamlRef = useRef<boolean>(savingInlineYaml);
+  savingInlineYamlRef.current = savingInlineYaml;
+  const savingCustomRulesOnlyRef = useRef<boolean>(savingCustomRulesOnly);
+  savingCustomRulesOnlyRef.current = savingCustomRulesOnly;
+  const bulkApplyingRef = useRef<boolean>(bulkApplying);
+  bulkApplyingRef.current = bulkApplying;
+  const inlineOverrideYamlRef = useRef<string>(inlineOverrideYaml);
+  inlineOverrideYamlRef.current = inlineOverrideYaml;
+  const savedInlineOverrideYamlRef = useRef<string>(savedInlineOverrideYaml);
+  savedInlineOverrideYamlRef.current = savedInlineOverrideYaml;
   const userPickedNewTargetRef = useRef<boolean>(false);
   const inFlightRef = useRef<boolean>(false);
   const prevSnapRef = useRef<Map<string, ConnTrafficSnap>>(new Map());
@@ -935,23 +1144,41 @@ export function RulesConnsPage() {
     }
   }, []);
 
-  // Load persisted rules_override from backend config on mount
-  useEffect(() => {
-    let cancelled = false;
-    setLoadingRules(true);
-    void catcloudApi
-      .getFullConfig()
-      .then((fullCfg) => {
-        if (cancelled) return;
+  const hydrateReqSeqRef = useRef<number>(0);
+
+  const hydrateFromFullConfig = useCallback(
+    async (options: { isInitial?: boolean; preserveDirtyInline?: boolean } = {}) => {
+      const { isInitial = false, preserveDirtyInline = false } = options;
+      const reqSeq = ++hydrateReqSeqRef.current;
+      if (isInitial) setLoadingRules(true);
+      try {
+        const fullCfg = await catcloudApi.getFullConfig();
+        if (reqSeq !== hydrateReqSeqRef.current) return;
         const fallbackTarget = groupsRef.current[0]?.name || "DIRECT";
         const savedOverride = fullCfg.rules_override;
+        const savedDomesticDirect = savedOverride?.domestic_direct_enabled ?? true;
+        const savedGeodataMode = Boolean(fullCfg.geodata_mode);
         const savedCustomOnly = Boolean(savedOverride?.custom_rules_only);
         const savedInlineYaml =
           typeof savedOverride?.inline_override_yaml === "string"
             ? savedOverride.inline_override_yaml
             : "";
+
+        setDomesticDirectEnabled(savedDomesticDirect);
+        setGeodataMode(savedGeodataMode);
         setCustomRulesOnly(savedCustomOnly);
-        setInlineOverrideYaml(savedInlineYaml);
+        appActions.syncGeoRuleContext({
+          domesticDirectEnabled: savedDomesticDirect,
+          customRulesOnly: savedCustomOnly,
+          geodataMode: savedGeodataMode,
+        });
+
+        const hasDirtyInlineDraft =
+          preserveDirtyInline &&
+          inlineOverrideYamlRef.current !== savedInlineOverrideYamlRef.current;
+        if (!hasDirtyInlineDraft) {
+          setInlineOverrideYaml(savedInlineYaml);
+        }
         setSavedInlineOverrideYaml(savedInlineYaml);
         if (savedCustomOnly || savedInlineYaml.trim().length > 0) {
           setAdvancedOpen(true);
@@ -963,7 +1190,6 @@ export function RulesConnsPage() {
             Array.isArray(savedOverride.global_append_rules));
 
         if (!inTauri && !hasSavedOverride) {
-          // Browser preview demo defaults before first save
           const demoPrepend = AI_PRESETS_TEMPLATE.flatMap((tpl) =>
             tpl.domains.map((d) => `DOMAIN-SUFFIX,${d},${fallbackTarget}`)
           );
@@ -983,19 +1209,53 @@ export function RulesConnsPage() {
         const hydrated = hydrateRulesFromConfig(prependList, appendList, fallbackTarget);
         setAiPresets(hydrated.presets);
         setUserRules(hydrated.userRules);
-      })
-      .catch((err) => {
-        if (!cancelled) {
+      } catch (err) {
+        if (reqSeq !== hydrateReqSeqRef.current) return;
+        if (isInitial) {
           appActions.showToast(`读取已保存的分流规则失败：${formatErrorMessage(err)}`, "warn");
         }
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingRules(false);
-      });
+      } finally {
+        if (isInitial && reqSeq === hydrateReqSeqRef.current) setLoadingRules(false);
+      }
+    },
+    [inTauri]
+  );
+
+  // Load persisted rules_override & geodata status on mount
+  useEffect(() => {
+    void hydrateFromFullConfig({ isInitial: true, preserveDirtyInline: false });
+    if (appStore.getState().bgTasks.settings.geoStatus === null) {
+      void appActions.loadGeodataStatus();
+    }
+  }, [hydrateFromFullConfig]);
+
+  // Listen to external `catcloud://config-updated` (e.g. CLI hot-reload / Settings save) without clobbering unsaved inline drafts
+  useEffect(() => {
+    if (!inTauri) return;
+    let refreshTimer: number | null = null;
+    const dispose = catcloudApi.subscribeConfigUpdate(() => {
+      if (
+        savingRulesRef.current ||
+        savingInlineYamlRef.current ||
+        savingCustomRulesOnlyRef.current ||
+        bulkApplyingRef.current
+      ) {
+        return;
+      }
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      refreshTimer = window.setTimeout(() => {
+        refreshTimer = null;
+        void hydrateFromFullConfig({ isInitial: false, preserveDirtyInline: true });
+        if (showYamlPreviewRef.current) {
+          void loadCompiledPreview();
+        }
+      }, 150);
+    });
     return () => {
-      cancelled = true;
+      if (refreshTimer !== null) window.clearTimeout(refreshTimer);
+      dispose();
     };
-  }, [inTauri]);
+  }, [hydrateFromFullConfig, inTauri, loadCompiledPreview]);
 
   const targetChoices = useMemo(() => {
     const names = groups
@@ -1214,32 +1474,78 @@ export function RulesConnsPage() {
     return () => window.clearInterval(timer);
   }, [activeTab, connPaused, fetchLiveConnections, inTauri, runtime.running]);
 
-  // Combine group match_rules from store with editable local rules
+  // Combine group match_rules from store with editable local rules (preserving explicit targets on Mihomo rules)
   const groupBoundRules = useMemo<ManagedRuleItem[]>(() => {
+    const builtinTargets = new Set(["DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE"]);
+    const groupNames = new Set(groups.map((g) => g.name.trim()).filter(Boolean));
+    const isKnownExplicitTarget = (candidate: string) =>
+      builtinTargets.has(candidate.toUpperCase()) || groupNames.has(candidate);
+
     const list: ManagedRuleItem[] = [];
     for (const grp of groups) {
       grp.match_rules.forEach((raw, idx) => {
         const trimmed = raw.trim();
-        const parts = splitRuleTopLevel(trimmed);
+        if (!trimmed) return;
+        const firstComma = trimmed.indexOf(",");
         let rType = "DOMAIN-SUFFIX";
         let val = trimmed;
+        let target = grp.name;
         let noResolve = false;
-        if (parts && parts.length >= 2) {
-          rType = (parts[0] ?? "DOMAIN-SUFFIX").trim().toUpperCase();
-          let endIdx = parts.length;
-          while (endIdx > 2 && isRuleFlagToken(parts[endIdx - 1])) {
-            endIdx -= 1;
+
+        if (firstComma > 0) {
+          rType = trimmed.slice(0, firstComma).trim().toUpperCase();
+          if (LOGICAL_PAREN_RULE_TYPES.has(rType)) {
+            const logical = parseLogicalRuleParts(trimmed);
+            if (logical) {
+              val = logical.expr;
+              if (rType !== "SUB-RULE" && logical.target) {
+                target = logical.target;
+              } else if (rType === "SUB-RULE" && logical.target) {
+                val = `${logical.expr},${logical.target}`;
+              }
+            } else {
+              val = trimmed.slice(firstComma + 1).trim() || trimmed;
+            }
+          } else if (REGEX_RULE_TYPES.has(rType)) {
+            let rest = trimmed.slice(firstComma + 1).trim();
+            while (true) {
+              const lastComma = rest.lastIndexOf(",");
+              if (lastComma <= 0) break;
+              const tailToken = rest.slice(lastComma + 1).trim();
+              if (isRuleFlagToken(tailToken)) {
+                if (tailToken.toLowerCase() === "no-resolve") noResolve = true;
+                rest = rest.slice(0, lastComma).trim();
+                continue;
+              }
+              if (isKnownExplicitTarget(tailToken)) {
+                target = tailToken;
+                rest = rest.slice(0, lastComma).trim();
+              }
+              break;
+            }
+            val = rest || trimmed;
+          } else {
+            const parts = trimmed.split(",").map((s) => s.trim());
+            let endIdx = parts.length;
+            while (endIdx > 2 && isRuleFlagToken(parts[endIdx - 1])) {
+              if (parts[endIdx - 1].toLowerCase() === "no-resolve") noResolve = true;
+              endIdx -= 1;
+            }
+            if (endIdx >= 3) {
+              target = parts[endIdx - 1] || grp.name;
+              val = parts.slice(1, endIdx - 1).join(",").trim() || trimmed;
+            } else if (endIdx === 2) {
+              val = parts[1] || trimmed;
+            }
           }
-          const extraParts = parts.slice(endIdx);
-          noResolve = extraParts.some((p) => p.trim().toLowerCase() === "no-resolve");
-          val = parts.slice(1, endIdx).join(",").trim() || trimmed;
         }
+
         list.push({
           id: `grp-${grp.id}-${idx}`,
           layer: "group",
           ruleType: rType,
           value: val,
-          target: grp.name,
+          target,
           noResolve,
           rawLine: trimmed,
           groupId: grp.id,
@@ -1294,19 +1600,120 @@ export function RulesConnsPage() {
 
   const handleAddRule = async () => {
     if (savingRules) return;
-    const val = newValue.trim();
-    if (!val) {
-      appActions.showToast("请填写要匹配的网址、IP 或软件名", "warn");
+    let rawInput = newValue.trim();
+    if (!rawInput) {
+      appActions.showToast("请填写要匹配的网址、IP、进程或复合条件", "warn");
       return;
     }
-    const effectiveTarget = newTarget.trim() || targetChoices[0] || "DIRECT";
+    if (rawInput.startsWith("- ")) {
+      rawInput = rawInput.slice(2).trim();
+    }
+
+    let effectiveType: string = newType;
+    let effectiveVal = rawInput;
+    let effectiveTarget = newTarget.trim() || targetChoices[0] || "DIRECT";
+    let effectiveNoResolve = (newType === "IP-CIDR" || newType === "GEOIP") && newNoResolve;
+
+    // Auto-detect full pasted Mihomo rule lines (deduplicate prefix & preserve inline target/flags)
+    const firstComma = rawInput.indexOf(",");
+    if (firstComma > 0) {
+      const prefixCandidate = rawInput.slice(0, firstComma).trim().toUpperCase();
+      if (KNOWN_MIHOMO_RULE_TYPES.has(prefixCandidate)) {
+        effectiveType = prefixCandidate;
+        if (STRICT_LOGICAL_RULE_TYPES.has(prefixCandidate)) {
+          const parsedLogical = parseLogicalRuleParts(rawInput);
+          if (parsedLogical) {
+            effectiveVal = parsedLogical.expr;
+            if (parsedLogical.target) {
+              effectiveTarget = parsedLogical.target;
+            }
+          } else {
+            effectiveVal = rawInput.slice(firstComma + 1).trim();
+          }
+          effectiveNoResolve = false;
+        } else if (prefixCandidate === "MATCH" || prefixCandidate === "FINAL") {
+          effectiveVal = "*";
+          const pastedTarget = rawInput.slice(firstComma + 1).trim();
+          if (pastedTarget) effectiveTarget = pastedTarget;
+          effectiveNoResolve = false;
+        } else if (
+          prefixCandidate === "DOMAIN-REGEX" ||
+          prefixCandidate === "PROCESS-NAME-REGEX" ||
+          prefixCandidate === "PROCESS-PATH-REGEX"
+        ) {
+          // Regex rules may contain `{1,3}` quantifier commas; only split trailing segment as target
+          // when it matches a built-in policy or known proxy/group name.
+          const restRegex = rawInput.slice(firstComma + 1).trim();
+          const lastComma = restRegex.lastIndexOf(",");
+          const knownTargets = new Set<string>([
+            "DIRECT",
+            "REJECT",
+            "REJECT-DROP",
+            "PASS",
+            ...groups.map((g) => g.name),
+          ]);
+          if (lastComma > 0) {
+            const candidateTarget = restRegex.slice(lastComma + 1).trim();
+            if (knownTargets.has(candidateTarget) || knownTargets.has(candidateTarget.toUpperCase())) {
+              effectiveVal = restRegex.slice(0, lastComma).trim();
+              effectiveTarget = candidateTarget;
+            } else {
+              effectiveVal = restRegex;
+            }
+          } else {
+            effectiveVal = restRegex;
+          }
+          effectiveNoResolve = false;
+        } else {
+          const parts = rawInput.split(",").map((s) => s.trim());
+          let endIdx = parts.length;
+          let pastedNoResolve = false;
+          while (endIdx > 2 && isRuleFlagToken(parts[endIdx - 1])) {
+            if (parts[endIdx - 1].toLowerCase() === "no-resolve") pastedNoResolve = true;
+            endIdx -= 1;
+          }
+          if (endIdx >= 3) {
+            effectiveVal = parts.slice(1, endIdx - 1).join(",").trim();
+            if (parts[endIdx - 1]) {
+              effectiveTarget = parts[endIdx - 1];
+            }
+          } else if (endIdx === 2) {
+            effectiveVal = parts[1];
+          }
+          effectiveNoResolve =
+            pastedNoResolve ||
+            ((effectiveType === "IP-CIDR" || effectiveType === "GEOIP") && newNoResolve);
+        }
+      }
+    }
+
+    if (STRICT_LOGICAL_RULE_TYPES.has(effectiveType)) {
+      effectiveNoResolve = false;
+      const errMsg = validateLogicalRuleExpr(effectiveVal, effectiveType);
+      if (errMsg) {
+        appActions.showToast(errMsg, "warn", 4600);
+        return;
+      }
+    }
+
+    if (!effectiveVal) {
+      appActions.showToast("规则匹配值不能为空，请检查输入格式", "warn");
+      return;
+    }
+
+    const rawLine =
+      effectiveType === "MATCH" || effectiveType === "FINAL"
+        ? `${effectiveType},${effectiveTarget}`
+        : `${effectiveType},${effectiveVal},${effectiveTarget}${effectiveNoResolve ? ",no-resolve" : ""}`;
+
     const created: ManagedRuleItem = {
       id: `rule-custom-${Date.now()}`,
       layer: newLayer,
-      ruleType: newType,
-      value: val,
+      ruleType: effectiveType,
+      value: effectiveVal,
       target: effectiveTarget,
-      noResolve: (newType === "IP-CIDR" || newType === "GEOIP") && newNoResolve,
+      noResolve: effectiveNoResolve,
+      rawLine,
     };
     const nextRules = [created, ...userRules];
     const ok = await persistRulesOverride(
@@ -1317,6 +1724,48 @@ export function RulesConnsPage() {
     if (ok) {
       setNewValue("");
     }
+  };
+
+  const imDirectAllPresent = useMemo(() => {
+    const existingLower = new Set(
+      userRules
+        .filter((r) => r.layer === "prepend")
+        .map((r) => serializeRuleItem(r).trim().toLowerCase())
+    );
+    return IM_DIRECT_PROCESS_RULES.every((item) =>
+      existingLower.has(item.line.toLowerCase())
+    );
+  }, [userRules]);
+
+  const handleAddImDirectRules = async () => {
+    if (savingRules || loadingRules) return;
+    const existingLower = new Set(
+      userRules
+        .filter((r) => r.layer === "prepend")
+        .map((r) => serializeRuleItem(r).trim().toLowerCase())
+    );
+    const missing = IM_DIRECT_PROCESS_RULES.filter(
+      (item) => !existingLower.has(item.line.toLowerCase())
+    );
+    if (missing.length === 0) {
+      appActions.showToast(dict.rules.imDirectExistsToast, "info");
+      return;
+    }
+    const stamp = Date.now();
+    const toPrepend: ManagedRuleItem[] = missing.map((item, idx) => ({
+      id: `rule-im-${stamp}-${idx}`,
+      layer: "prepend",
+      ruleType: "PROCESS-NAME",
+      value: item.process,
+      target: "DIRECT",
+      noResolve: false,
+      rawLine: item.line,
+    }));
+    await persistRulesOverride(
+      aiPresets,
+      [...toPrepend, ...userRules],
+      formatI18nTemplate(dict.rules.imDirectAddedToast, { count: toPrepend.length })
+    );
   };
 
   const handleDeleteRule = async (id: string) => {
@@ -1520,6 +1969,7 @@ export function RulesConnsPage() {
       await catcloudApi.saveExtendedSettings({
         rules_override: { custom_rules_only: next },
       });
+      appActions.syncGeoRuleContext({ customRulesOnly: next });
       appActions.showToast(
         next
           ? "已开启「纯自写规则模式」：跳过内置国内/AI 规则，仅保留防环与局域网直连"
@@ -1884,6 +2334,14 @@ export function RulesConnsPage() {
     .filter((p) => p.enabled)
     .reduce((acc, p) => acc + p.domains.length, 0);
   const innerCountShortLabel = preAccelEnabled ? "提速隧道" : "内核内部连接";
+  const requiredGeoFileName = geodataMode ? "geoip.dat" : "Country.mmdb";
+  const missingGeoDb = Boolean(
+    !loadingRules &&
+      geoStatus !== null &&
+      domesticDirectEnabled &&
+      !customRulesOnly &&
+      (geodataMode ? !geoStatus.geoip_dat.exists : !geoStatus.country_mmdb.exists)
+  );
 
   return (
     <div className="space-y-4">
@@ -1942,6 +2400,43 @@ export function RulesConnsPage() {
 
       {activeTab === "rules" ? (
         <div className="space-y-4">
+          {/* Missing GeoData Reminder Banner (0px when healthy or custom_rules_only) */}
+          {missingGeoDb && (
+            <section
+              role="status"
+              className="cc-card cc-glass rounded-2xl border border-[var(--amber)]/55 bg-[var(--amber-soft)]/45 px-4 py-3 text-xs"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2.5">
+                <div className="flex min-w-0 flex-1 items-start gap-2.5">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[var(--amber)]" />
+                  <div className="min-w-0">
+                    <div className="font-semibold text-[var(--text)]">
+                      {dict.rules.geoMissingTitle}
+                    </div>
+                    <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                      {formatI18nTemplate(dict.rules.geoMissingDesc, {
+                        file: requiredGeoFileName,
+                      })}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  disabled={geoBusy !== null}
+                  onClick={() =>
+                    void appActions.runRefreshGeoDb(
+                      geodataMode ? ["geoip", "geosite"] : ["mmdb", "geosite"]
+                    )
+                  }
+                  className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-1.5 text-[11.5px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 shrink-0 ${geoBusy ? "animate-spin" : ""}`} />
+                  <span>{geoBusy ? dict.rules.geoFetchingBtn : dict.rules.geoFetchBtn}</span>
+                </button>
+              </div>
+            </section>
+          )}
+
           {/* 常用网站分流 */}
           <section className="cc-card cc-glass rounded-2xl p-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
@@ -2163,7 +2658,31 @@ export function RulesConnsPage() {
           {/* 自定义分流规则表单 */}
           <section className="cc-card cc-glass rounded-2xl p-4">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-              <h2 className="text-xs font-semibold text-[var(--text)]">自定义分流规则</h2>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="text-xs font-semibold text-[var(--text)]">自定义分流规则</h2>
+                <button
+                  type="button"
+                  disabled={savingRules || loadingRules}
+                  onClick={() => void handleAddImDirectRules()}
+                  title="一键向优先匹配层去重添加 QQ.exe、WeChat.exe、Weixin.exe 进程直连，防止无地理库时国内 IM 纯 IP 流量绕海外"
+                  className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors disabled:opacity-50 ${
+                    imDirectAllPresent
+                      ? "border-[var(--green)]/40 bg-[var(--green-soft)]/70 text-[var(--green)]"
+                      : "border-[var(--accent)]/45 bg-[var(--accent-soft)]/55 text-[var(--accent)] hover:border-[var(--accent)]"
+                  }`}
+                >
+                  {imDirectAllPresent ? (
+                    <Check className="h-3 w-3 shrink-0" />
+                  ) : (
+                    <Plus className="h-3 w-3 shrink-0" />
+                  )}
+                  <span>
+                    {imDirectAllPresent
+                      ? dict.rules.imDirectAlreadyAdded
+                      : dict.rules.addImDirectBtn}
+                  </span>
+                </button>
+              </div>
               <span className="inline-flex items-center gap-1 rounded-full bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] text-[var(--green)]">
                 <Shield className="h-3 w-3" />
                 系统已自动保护本机直连与防绕路死循环，添加规则后立即保存生效
@@ -2197,7 +2716,7 @@ export function RulesConnsPage() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter") void handleAddRule();
                 }}
-                placeholder="填写网址或内容，例如 github.com、cn 或 chrome.exe"
+                placeholder={RULE_VALUE_PLACEHOLDERS[newType]}
                 className="cc-mono h-9 min-w-0 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3 text-xs text-[var(--text)] placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:outline-none sm:col-span-2 min-[1160px]:col-span-4"
               />
 

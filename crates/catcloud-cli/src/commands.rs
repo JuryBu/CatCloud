@@ -6,8 +6,8 @@ use catcloud_core::core_adapter::config_compiler::{
     GatewayExportOutput, GatewayExportProfile, PREACCEL_SELECT_GROUP_NAME,
     PreAccelTransportDiagnostics, SINGLE_NODE_GROUP_NAME, StaticCheckIssue,
     StaticValidationReport, audit_dangling_global_rules, build_preaccel_transport_diagnostics,
-    compile_mihomo_config_with_runtime_dir, export_gateway_yaml,
-    format_static_validation_summary_zh, repair_dangling_global_rules,
+    cascade_group_name_change_in_global_rules, compile_mihomo_config_with_runtime_dir,
+    export_gateway_yaml, format_static_validation_summary_zh, repair_dangling_global_rules,
     resolve_default_fallback_group_name, validate_compiled_yaml,
 };
 use catcloud_core::core_adapter::dns_diag::{
@@ -16,6 +16,9 @@ use catcloud_core::core_adapter::dns_diag::{
 };
 use catcloud_core::core_adapter::port_guard::{
     AllocatedPorts, PortShiftNotice, allocate_safe_ports_for_hosts, is_port_available_tcp_udp,
+};
+use catcloud_core::core_adapter::rule_matcher::{
+    RuleMatchQuery, evaluate_compiled_rules, matches_compiled_fake_ip_filter,
 };
 use catcloud_core::core_adapter::{
     ActiveConnection, BinaryResolution, DiskReloadOptions, DownloadGuidance, HotReloadCoordinator,
@@ -246,6 +249,12 @@ pub enum NetCommand {
         /// Destination port for rule evaluation
         #[arg(long, default_value_t = 443)]
         port: u16,
+        /// Optional process executable name (e.g. QQ.exe) for PROCESS-NAME / composite rule matching
+        #[arg(long = "process-name")]
+        process_name: Option<String>,
+        /// Optional process executable path for PROCESS-PATH / basename fallback matching
+        #[arg(long = "process-path")]
+        process_path: Option<String>,
     },
 }
 
@@ -609,6 +618,18 @@ pub struct GroupCreateArgs {
     pub switch_mode: Option<String>,
     #[arg(long)]
     pub nodes: Option<String>,
+    /// Enable or disable parallel independent routing for this group
+    #[arg(long)]
+    pub independent_routing: Option<bool>,
+    /// Replace group match rules (semicolon-separated full rules or comma-separated domains)
+    #[arg(long = "match-rules")]
+    pub match_rules: Option<String>,
+    /// Append one or more match rules (repeatable)
+    #[arg(long = "add-match-rule")]
+    pub add_match_rule: Vec<String>,
+    /// Hard gate boolean formula expressions (repeatable)
+    #[arg(long = "hard-gate")]
+    pub hard_gate: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -644,6 +665,9 @@ pub struct GroupPolicyArgs {
     /// Clear all match rules on this group
     #[arg(long = "clear-match-rules")]
     pub clear_match_rules: bool,
+    /// Enable or disable parallel independent routing for this group
+    #[arg(long)]
+    pub independent_routing: Option<bool>,
 }
 
 /// Platform-appropriate default shell for `config export-env`.
@@ -925,17 +949,25 @@ fn looks_like_clash_rule_prefix(token: &str) -> bool {
             | "GEOIP"
             | "IP-CIDR"
             | "IP-CIDR6"
+            | "IP-SUFFIX"
+            | "IP-ASN"
             | "SRC-IP-CIDR"
             | "SRC-PORT"
             | "DST-PORT"
             | "PROCESS-NAME"
+            | "PROCESS-NAME-REGEX"
             | "PROCESS-PATH"
+            | "PROCESS-PATH-REGEX"
             | "NETWORK"
+            | "UID"
+            | "IN-TYPE"
+            | "IN-USER"
+            | "IN-NAME"
+            | "SUB-RULE"
             | "RULE-SET"
             | "AND"
             | "OR"
             | "NOT"
-            | "SUB-RULE"
             | "MATCH"
     )
 }
@@ -945,23 +977,39 @@ fn parse_group_match_rules_arg(raw: &str) -> Vec<String> {
     if trimmed.is_empty() {
         return Vec::new();
     }
-    let items: Vec<&str> = if trimmed.contains(';') {
-        trimmed.split(';').collect()
-    } else if let Some((first, _)) = trimmed.split_once(',') {
-        if looks_like_clash_rule_prefix(first) {
-            vec![trimmed]
-        } else {
-            trimmed.split(',').collect()
-        }
+    // Split multi-rule batches on `;` or newlines first; never blindly split rules containing
+    // parentheses, regex quantifiers/escapes, or Clash rule prefixes on bare `,`.
+    let raw_chunks: Vec<&str> = if trimmed.contains(';') || trimmed.contains('\n') {
+        trimmed.split([';', '\n']).collect()
     } else {
         vec![trimmed]
     };
+
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for part in items {
-        let cleaned = part.trim();
-        if !cleaned.is_empty() && seen.insert(cleaned.to_string()) {
-            out.push(cleaned.to_string());
+    for chunk in raw_chunks {
+        let seg = chunk.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let contains_structured_syntax = seg.contains('(')
+            || seg.contains(')')
+            || seg.contains('{')
+            || seg.contains('}')
+            || seg.contains('\\');
+        let starts_with_rule_prefix = seg
+            .split_once(',')
+            .is_some_and(|(first, _)| looks_like_clash_rule_prefix(first));
+
+        if !contains_structured_syntax && !starts_with_rule_prefix && seg.contains(',') {
+            for part in seg.split(',') {
+                let cleaned = part.trim();
+                if !cleaned.is_empty() && seen.insert(cleaned.to_string()) {
+                    out.push(cleaned.to_string());
+                }
+            }
+        } else if seen.insert(seg.to_string()) {
+            out.push(seg.to_string());
         }
     }
     out
@@ -2364,8 +2412,18 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 domain,
                 network,
                 port,
+                process_name,
+                process_path,
             } => {
-                let (out, human) = build_net_match_payload(paths, &domain, &network, port).await?;
+                let (out, human) = build_net_match_payload(
+                    paths,
+                    &domain,
+                    &network,
+                    port,
+                    process_name.as_deref(),
+                    process_path.as_deref(),
+                )
+                .await?;
                 emit_output(as_json, &out, &human)
             }
         },
@@ -5830,9 +5888,14 @@ async fn probe_live_tun_connections(ep: &ResolvedControllerEndpoint) -> bool {
 const MANAGED_PID_START_TIME_TOLERANCE_SECS: u64 = 2;
 
 fn execute_group_create(paths: &AppPaths, args: GroupCreateArgs) -> Result<(Value, String)> {
+    for gate in &args.hard_gate {
+        validate_formula(gate)?;
+    }
+
     let db = open_storage(paths)?;
     let existing = db.get_multi_group(&args.id)?;
     let created = existing.is_none();
+    let old_name: Option<String> = existing.as_ref().map(|g| g.name.clone());
 
     let group = if let Some(mut existing_group) = existing {
         if let Some(name) = args.name {
@@ -5862,6 +5925,25 @@ fn execute_group_create(paths: &AppPaths, args: GroupCreateArgs) -> Result<(Valu
                 }
             }
         }
+        if let Some(indep) = args.independent_routing {
+            existing_group.independent_routing = indep;
+        }
+        if !args.hard_gate.is_empty() {
+            existing_group.hard_gates = args.hard_gate;
+        }
+        if let Some(raw_rules) = args.match_rules {
+            existing_group.match_rules = parse_group_match_rules_arg(&raw_rules);
+        }
+        if !args.add_match_rule.is_empty() {
+            let mut seen: HashSet<String> = existing_group.match_rules.iter().cloned().collect();
+            for raw in args.add_match_rule {
+                for rule in parse_group_match_rules_arg(&raw) {
+                    if seen.insert(rule.clone()) {
+                        existing_group.match_rules.push(rule);
+                    }
+                }
+            }
+        }
         existing_group
     } else {
         let name = args
@@ -5886,26 +5968,63 @@ fn execute_group_create(paths: &AppPaths, args: GroupCreateArgs) -> Result<(Valu
             None => SwitchMode::ForceCloseOld,
         };
         let member_node_ids = parse_csv_ids(args.nodes.as_deref());
+        let mut match_rules: Vec<String> = args
+            .match_rules
+            .as_deref()
+            .map(parse_group_match_rules_arg)
+            .unwrap_or_default();
+        if !args.add_match_rule.is_empty() {
+            let mut seen: HashSet<String> = match_rules.iter().cloned().collect();
+            for raw in args.add_match_rule {
+                for rule in parse_group_match_rules_arg(&raw) {
+                    if seen.insert(rule.clone()) {
+                        match_rules.push(rule);
+                    }
+                }
+            }
+        }
         MultiGroup {
             id: args.id.clone(),
             name,
             mode,
+            match_rules,
             member_node_ids,
+            hard_gates: args.hard_gate,
             formula_expr: formula,
             fallback_policy,
             switch_mode,
+            independent_routing: args.independent_routing.unwrap_or(false),
             ..MultiGroup::default()
         }
     };
 
     db.upsert_multi_group(&group)?;
     drop(db);
+
+    let mut cascaded_global_rules = 0usize;
+    if let Some(prev_name) = old_name.as_deref() {
+        let prev_trimmed = prev_name.trim();
+        let next_trimmed = group.name.trim();
+        if !prev_trimmed.is_empty() && !next_trimmed.is_empty() && prev_trimmed != next_trimmed {
+            let mut cfg = config::load_or_init(paths)?;
+            cascaded_global_rules = cascade_group_name_change_in_global_rules(
+                &mut cfg,
+                prev_trimmed,
+                Some(next_trimmed),
+            );
+            if cascaded_global_rules > 0 {
+                config::save(paths, &cfg)?;
+            }
+        }
+    }
+
     let live_reload_signaled = signal_config_reload_for_data_dir(&paths.root_data_dir);
     let out = json!({
         "ok": true,
         "created": created,
         "updated": !created,
         "group": group,
+        "cascaded_global_rules": cascaded_global_rules,
         "live_reload_signaled": live_reload_signaled,
     });
     let verb = if created { "Created" } else { "Updated" };
@@ -6037,6 +6156,9 @@ fn execute_group_policy(paths: &AppPaths, args: GroupPolicyArgs) -> Result<(Valu
                 }
             }
         }
+    }
+    if let Some(indep) = args.independent_routing {
+        group.independent_routing = indep;
     }
     db.upsert_multi_group(&group)?;
     drop(db);
@@ -8159,6 +8281,27 @@ fn build_catcloud_managed_process_filter(
     }
 }
 
+fn inspect_windows_proxy_override_warnings(
+    proxy_override_raw: &str,
+) -> (Vec<String>, Option<String>) {
+    let invalid_raw =
+        catcloud_core::platform::common::find_invalid_windows_proxy_override_entries(
+            proxy_override_raw,
+        );
+    if invalid_raw.is_empty() {
+        return (Vec::new(), None);
+    }
+    let invalid_sanitized: Vec<String> = invalid_raw
+        .iter()
+        .map(|entry| sanitize_log_line(entry))
+        .collect();
+    let warning = format!(
+        "Windows system proxy ProxyOverride contains invalid WinHTTP entries ({}) such as bare IPv6 (e.g. `::1`) or `/` CIDR, which can break Windows Schannel TLS certificate revocation checks (0x80092013 / CRYPT_E_REVOCATION_OFFLINE); re-enable or refresh CatCloud system proxy to auto-repair.",
+        invalid_sanitized.join(", ")
+    );
+    (invalid_sanitized, Some(warning))
+}
+
 async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
     let cfg = config::load_or_init(paths)?;
     let db = open_storage(paths)?;
@@ -8374,32 +8517,44 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
 
     // Check 4: System Proxy & TUN readiness
     let os_proxy_res = plat.read_system_proxy();
-    let (os_proxy_val, os_proxy_mismatch, os_proxy_dangling) = match os_proxy_res {
-        Ok(spec) => {
-            let mismatch = spec.enabled && spec.port != effective_mixed_port;
-            let dangling = spec.enabled && !core_running && spec.port == effective_mixed_port;
-            (
+    let (os_proxy_val, os_proxy_mismatch, os_proxy_dangling, invalid_override_entries, proxy_override_warning) =
+        match os_proxy_res {
+            Ok(spec) => {
+                let mismatch = spec.enabled && spec.port != effective_mixed_port;
+                let dangling = spec.enabled && !core_running && spec.port == effective_mixed_port;
+                let (invalid_entries, override_warn) = if cfg!(target_os = "windows") {
+                    inspect_windows_proxy_override_warnings(&spec.bypass.join(";"))
+                } else {
+                    (Vec::new(), None)
+                };
+                (
+                    json!({
+                        "readable": true,
+                        "enabled": spec.enabled,
+                        "host": redact_ip_or_host(&spec.host),
+                        "port": spec.port,
+                        "pac_url": spec.pac_url.as_deref().map(sanitize_log_line),
+                        "bypass_count": spec.bypass.len(),
+                        "invalid_proxy_override_entries": &invalid_entries,
+                    }),
+                    mismatch,
+                    dangling,
+                    invalid_entries,
+                    override_warn,
+                )
+            }
+            Err(err) => (
                 json!({
-                    "readable": true,
-                    "enabled": spec.enabled,
-                    "host": redact_ip_or_host(&spec.host),
-                    "port": spec.port,
-                    "pac_url": spec.pac_url.as_deref().map(sanitize_log_line),
-                    "bypass_count": spec.bypass.len(),
+                    "readable": false,
+                    "error": sanitize_log_line(&err.to_string()),
+                    "invalid_proxy_override_entries": [],
                 }),
-                mismatch,
-                dangling,
-            )
-        }
-        Err(err) => (
-            json!({
-                "readable": false,
-                "error": sanitize_log_line(&err.to_string()),
-            }),
-            false,
-            false,
-        ),
-    };
+                false,
+                false,
+                Vec::new(),
+                None,
+            ),
+        };
     let tun_privilege_ready = is_cli_tun_privilege_ready(&caps, bin_res.path.as_deref());
     let tun_configured = cfg.tun.enabled;
     let has_live_tun_connections = if core_running {
@@ -8415,7 +8570,12 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         has_live_tun_connections,
         live_tun_enable,
     );
-    let proxy_tun_status = if os_proxy_dangling || os_proxy_mismatch || tun_needs_admin {
+    let has_invalid_proxy_override = !invalid_override_entries.is_empty();
+    let proxy_tun_status = if os_proxy_dangling
+        || os_proxy_mismatch
+        || tun_needs_admin
+        || has_invalid_proxy_override
+    {
         if os_proxy_dangling {
             recommendations.push(
                 "OS system proxy points to CatCloud mixed_port while core is stopped; start CatCloud core or disable system proxy."
@@ -8434,6 +8594,9 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
                     .to_string(),
             );
         }
+        if let Some(warn_msg) = proxy_override_warning {
+            recommendations.push(warn_msg);
+        }
         "warn"
     } else {
         "pass"
@@ -8444,7 +8607,7 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
         "name": "System Proxy & Virtual NIC (TUN)",
         "status": proxy_tun_status,
         "detail": format!(
-            "cfg_sys_proxy={}, tun_configured={}, tun_enabled={}, tun_needs_elevation={}, tun_source={}, tun_stack={}, elevated={}, os_proxy_mismatch={}, os_proxy_dangling={}",
+            "cfg_sys_proxy={}, tun_configured={}, tun_enabled={}, tun_needs_elevation={}, tun_source={}, tun_stack={}, elevated={}, os_proxy_mismatch={}, os_proxy_dangling={}, invalid_proxy_override={}",
             cfg.system_proxy.enabled,
             tun_configured,
             tun_effective_enabled,
@@ -8453,7 +8616,8 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             cfg.tun.stack_mode.as_str(),
             caps.is_elevated,
             os_proxy_mismatch,
-            os_proxy_dangling
+            os_proxy_dangling,
+            invalid_override_entries.len()
         ),
         "data": {
             "config_system_proxy_enabled": cfg.system_proxy.enabled,
@@ -8467,6 +8631,7 @@ async fn build_net_doctor_payload(paths: &AppPaths) -> Result<(Value, String)> {
             "tun_runtime_source": tun_runtime_source,
             "tun_stack": cfg.tun.stack_mode,
             "is_elevated": caps.is_elevated,
+            "invalid_proxy_override_entries": invalid_override_entries,
             "os_system_proxy": os_proxy_val,
         }
     }));
@@ -8843,321 +9008,13 @@ fn unquote_yaml_scalar(raw: &str) -> String {
     trimmed.to_string()
 }
 
-fn extract_yaml_sequence_under_key(yaml: &str, key: &str, top_level_only: bool) -> Vec<String> {
-    let mut items = Vec::new();
-    let mut in_section = false;
-    let mut key_indent: usize = 0;
-
-    for raw_line in yaml.lines() {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let indent = raw_line.len() - raw_line.trim_start_matches(' ').len();
-        if !in_section {
-            if (!top_level_only || indent == 0) && trimmed == format!("{key}:") {
-                in_section = true;
-                key_indent = indent;
-            }
-            continue;
-        }
-
-        if indent < key_indent || (indent == key_indent && !trimmed.starts_with('-')) {
-            break;
-        }
-        if let Some(rest) = trimmed.strip_prefix("- ") {
-            items.push(unquote_yaml_scalar(rest));
-        } else if trimmed == "-" {
-            continue;
-        } else if indent <= key_indent {
-            break;
-        }
-    }
-    items
-}
-
-fn domain_matches_wildcard(pattern: &str, host: &str) -> bool {
-    let p = pattern.trim().to_ascii_lowercase();
-    let h = host.trim().to_ascii_lowercase();
-    if p.is_empty() || h.is_empty() {
-        return false;
-    }
-    if let Some(suffix) = p.strip_prefix("+.") {
-        return h == suffix || h.ends_with(&format!(".{suffix}"));
-    }
-    if let Some(suffix) = p.strip_prefix("*.") {
-        return h.ends_with(&format!(".{suffix}"));
-    }
-    if !p.contains('*') {
-        return h == p;
-    }
-    // Simple glob wildcard matching for `*`
-    let parts: Vec<&str> = p.split('*').collect();
-    let mut cursor = 0usize;
-    for (idx, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-        if idx == 0 {
-            if !h.starts_with(part) {
-                return false;
-            }
-            cursor = part.len();
-        } else if idx + 1 == parts.len() {
-            if !h[cursor..].ends_with(part) {
-                return false;
-            }
-            cursor = h.len();
-        } else if let Some(rel) = h[cursor..].find(part) {
-            cursor += rel + part.len();
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-fn ip_matches_cidr(ip: IpAddr, cidr: &str) -> bool {
-    let Some((net_str, prefix_str)) = cidr.trim().split_once('/') else {
-        return false;
-    };
-    let Ok(prefix) = prefix_str.trim().parse::<u32>() else {
-        return false;
-    };
-    match (ip, net_str.trim().parse::<IpAddr>()) {
-        (IpAddr::V4(addr), Ok(IpAddr::V4(net))) if prefix <= 32 => {
-            if prefix == 0 {
-                return true;
-            }
-            let mask = u32::MAX << (32 - prefix);
-            (u32::from(addr) & mask) == (u32::from(net) & mask)
-        }
-        (IpAddr::V6(addr), Ok(IpAddr::V6(net))) if prefix <= 128 => {
-            if prefix == 0 {
-                return true;
-            }
-            let mask = u128::MAX << (128 - prefix);
-            (u128::from(addr) & mask) == (u128::from(net) & mask)
-        }
-        _ => false,
-    }
-}
-
-fn port_matches_spec(port: u16, spec: &str) -> bool {
-    for part in spec.split('/') {
-        let p = part.trim();
-        if let Some((lo, hi)) = p.split_once('-') {
-            if let (Ok(a), Ok(b)) = (lo.trim().parse::<u16>(), hi.trim().parse::<u16>()) {
-                if port >= a && port <= b {
-                    return true;
-                }
-            }
-        } else if let Ok(exact) = p.parse::<u16>() {
-            if port == exact {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn split_top_level_rule_parts(rule: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (idx, ch) in rule.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = (depth - 1).max(0),
-            ',' if depth == 0 => {
-                parts.push(rule[start..idx].trim());
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(rule[start..].trim());
-    parts
-}
-
-fn split_logical_children(expr: &str) -> Option<Vec<&str>> {
-    let trimmed = expr.trim();
-    if !trimmed.starts_with('(') || !trimmed.ends_with(')') {
-        return None;
-    }
-    let inner = &trimmed[1..trimmed.len() - 1];
-    let mut items = Vec::new();
-    let mut depth = 0i32;
-    let mut start = 0usize;
-    for (idx, ch) in inner.char_indices() {
-        match ch {
-            '(' => depth += 1,
-            ')' => depth = (depth - 1).max(0),
-            ',' if depth == 0 => {
-                let seg = inner[start..idx].trim();
-                if !seg.is_empty() {
-                    items.push(seg);
-                }
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    let tail = inner[start..].trim();
-    if !tail.is_empty() {
-        items.push(tail);
-    }
-    Some(items)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConditionEval {
-    Matched,
-    NotMatched,
-    UnknownGeo,
-}
-
-fn eval_rule_condition(
-    rule_type: &str,
-    payload: &str,
-    host: &str,
-    parsed_ip: Option<IpAddr>,
-    network: &str,
-    port: u16,
-) -> ConditionEval {
-    match rule_type.trim().to_ascii_uppercase().as_str() {
-        "MATCH" => ConditionEval::Matched,
-        "DOMAIN" => {
-            if host.eq_ignore_ascii_case(payload.trim()) {
-                ConditionEval::Matched
-            } else {
-                ConditionEval::NotMatched
-            }
-        }
-        "DOMAIN-SUFFIX" => {
-            let suffix = payload.trim().to_ascii_lowercase();
-            if !suffix.is_empty() && (host == suffix || host.ends_with(&format!(".{suffix}"))) {
-                ConditionEval::Matched
-            } else {
-                ConditionEval::NotMatched
-            }
-        }
-        "DOMAIN-KEYWORD" => {
-            let kw = payload.trim().to_ascii_lowercase();
-            if !kw.is_empty() && host.contains(&kw) {
-                ConditionEval::Matched
-            } else {
-                ConditionEval::NotMatched
-            }
-        }
-        "DOMAIN-WILDCARD" => {
-            if domain_matches_wildcard(payload, host) {
-                ConditionEval::Matched
-            } else {
-                ConditionEval::NotMatched
-            }
-        }
-        "IP-CIDR" | "IP-CIDR6" => match parsed_ip {
-            Some(ip) if ip_matches_cidr(ip, payload) => ConditionEval::Matched,
-            _ => ConditionEval::NotMatched,
-        },
-        "NETWORK" => {
-            if network.eq_ignore_ascii_case(payload.trim()) {
-                ConditionEval::Matched
-            } else {
-                ConditionEval::NotMatched
-            }
-        }
-        "DST-PORT" => {
-            if port_matches_spec(port, payload) {
-                ConditionEval::Matched
-            } else {
-                ConditionEval::NotMatched
-            }
-        }
-        "GEOSITE" | "GEOIP" => ConditionEval::UnknownGeo,
-        "AND" => {
-            let Some(children) = split_logical_children(payload) else {
-                return ConditionEval::NotMatched;
-            };
-            let mut saw_unknown = false;
-            for child in children {
-                let inner = child
-                    .strip_prefix('(')
-                    .and_then(|s| s.strip_suffix(')'))
-                    .unwrap_or(child);
-                let parts = split_top_level_rule_parts(inner);
-                if parts.len() < 2 {
-                    return ConditionEval::NotMatched;
-                }
-                match eval_rule_condition(parts[0], parts[1], host, parsed_ip, network, port) {
-                    ConditionEval::Matched => {}
-                    ConditionEval::NotMatched => return ConditionEval::NotMatched,
-                    ConditionEval::UnknownGeo => saw_unknown = true,
-                }
-            }
-            if saw_unknown {
-                ConditionEval::UnknownGeo
-            } else {
-                ConditionEval::Matched
-            }
-        }
-        "OR" => {
-            let Some(children) = split_logical_children(payload) else {
-                return ConditionEval::NotMatched;
-            };
-            let mut saw_unknown = false;
-            for child in children {
-                let inner = child
-                    .strip_prefix('(')
-                    .and_then(|s| s.strip_suffix(')'))
-                    .unwrap_or(child);
-                let parts = split_top_level_rule_parts(inner);
-                if parts.len() < 2 {
-                    continue;
-                }
-                match eval_rule_condition(parts[0], parts[1], host, parsed_ip, network, port) {
-                    ConditionEval::Matched => return ConditionEval::Matched,
-                    ConditionEval::NotMatched => {}
-                    ConditionEval::UnknownGeo => saw_unknown = true,
-                }
-            }
-            if saw_unknown {
-                ConditionEval::UnknownGeo
-            } else {
-                ConditionEval::NotMatched
-            }
-        }
-        "NOT" => {
-            let Some(children) = split_logical_children(payload) else {
-                return ConditionEval::NotMatched;
-            };
-            let Some(first) = children.first() else {
-                return ConditionEval::NotMatched;
-            };
-            let inner = first
-                .strip_prefix('(')
-                .and_then(|s| s.strip_suffix(')'))
-                .unwrap_or(first);
-            let parts = split_top_level_rule_parts(inner);
-            if parts.len() < 2 {
-                return ConditionEval::NotMatched;
-            }
-            match eval_rule_condition(parts[0], parts[1], host, parsed_ip, network, port) {
-                ConditionEval::Matched => ConditionEval::NotMatched,
-                ConditionEval::NotMatched => ConditionEval::Matched,
-                ConditionEval::UnknownGeo => ConditionEval::UnknownGeo,
-            }
-        }
-        _ => ConditionEval::NotMatched,
-    }
-}
-
 async fn build_net_match_payload(
     paths: &AppPaths,
     raw_domain: &str,
     raw_network: &str,
     default_port: u16,
+    process_name: Option<&str>,
+    process_path: Option<&str>,
 ) -> Result<(Value, String)> {
     let (host, port_override) = normalize_match_target(raw_domain)?;
     let port = port_override.unwrap_or(default_port);
@@ -9167,6 +9024,14 @@ async fn build_net_match_payload(
         other => anyhow::bail!("unsupported network `{other}` (use tcp|udp)"),
     };
     let parsed_ip = host.parse::<IpAddr>().ok();
+    let norm_process_name = process_name
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let norm_process_path = process_path
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
 
     let cfg = config::load_or_init(paths)?;
     let db = open_storage(paths)?;
@@ -9202,18 +9067,13 @@ async fn build_net_match_payload(
         Some(&paths.runtime_dir),
     )?;
 
-    let rules = extract_yaml_sequence_under_key(&compiled.yaml, "rules", true);
-    let fake_ip_filters =
-        extract_yaml_sequence_under_key(&compiled.yaml, "fake-ip-filter", false);
-    let bypass_fake_ip = fake_ip_filters
-        .iter()
-        .any(|pat| domain_matches_wildcard(pat, &host));
+    let bypass_fake_ip = matches_compiled_fake_ip_filter(&compiled.value, &host);
 
     let mut skipped_geo_rules: Vec<String> = Vec::new();
     let mut matched_rule_idx: Option<usize> = None;
-    let mut matched_rule = String::new();
-    let mut matched_type = String::new();
-    let mut matched_policy = String::new();
+    let matched_rule: String;
+    let matched_type: String;
+    let matched_policy: String;
 
     match cfg.proxy_mode {
         ProxyMode::Direct => {
@@ -9227,48 +9087,63 @@ async fn build_net_match_payload(
             matched_policy = "GLOBAL".to_string();
         }
         ProxyMode::Rule => {
-            for (idx, rule) in rules.iter().enumerate() {
-                let parts = split_top_level_rule_parts(rule);
-                if parts.is_empty() {
-                    continue;
-                }
-                let rtype = parts[0].to_ascii_uppercase();
-                let (payload, policy) = if rtype == "MATCH" {
-                    ("", parts.get(1).copied().unwrap_or("DIRECT"))
-                } else if parts.len() >= 3 {
-                    (parts[1], parts[2])
-                } else {
-                    continue;
-                };
-
-                match eval_rule_condition(&rtype, payload, &host, parsed_ip, network, port) {
-                    ConditionEval::Matched => {
-                        matched_rule_idx = Some(idx);
-                        matched_rule = sanitize_log_line(rule);
-                        matched_type = rtype;
-                        matched_policy = policy.to_string();
-                        break;
-                    }
-                    ConditionEval::UnknownGeo => {
-                        skipped_geo_rules.push(sanitize_log_line(rule));
-                    }
-                    ConditionEval::NotMatched => {}
-                }
-            }
+            let query = RuleMatchQuery {
+                host: host.clone(),
+                network: network.to_string(),
+                port,
+                process_name: norm_process_name.clone(),
+                process_path: norm_process_path.clone(),
+            };
+            let outcome = evaluate_compiled_rules(&compiled.value, &query);
+            matched_rule_idx = outcome.matched_rule_index;
+            matched_rule = outcome
+                .matched_rule
+                .as_deref()
+                .map(sanitize_log_line)
+                .unwrap_or_default();
+            matched_type = outcome.matched_rule_type.unwrap_or_default();
+            matched_policy = outcome.policy.unwrap_or_default();
+            skipped_geo_rules = outcome
+                .skipped_geo_rules
+                .iter()
+                .map(|r| sanitize_log_line(r))
+                .collect();
         }
     }
+
+    let primary_group_id: Option<&str> = if cfg.route_mode == RouteTargetMode::Single {
+        None
+    } else {
+        cfg.active_group_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|aid| !aid.is_empty() && groups.iter().any(|g| g.id.trim() == *aid))
+            .or_else(|| groups.first().map(|g| g.id.as_str()))
+    };
 
     let resolved_group = compiled
         .group_mappings
         .iter()
         .find(|g| g.group_name == matched_policy)
         .map(|g| {
+            let grp_meta = groups.iter().find(|item| item.id == g.group_id);
+            let independent_routing = grp_meta.is_some_and(|item| item.independent_routing);
+            let is_primary = primary_group_id == Some(g.group_id.as_str());
+            let role = if is_primary {
+                "primary_default"
+            } else if independent_routing {
+                "independent_routing"
+            } else {
+                "standby"
+            };
             json!({
                 "group_id": g.group_id,
                 "group_name": g.group_name,
                 "mihomo_type": g.mihomo_type,
                 "active_proxy_name": g.active_proxy_name,
                 "member_count": g.member_proxy_names.len(),
+                "independent_routing": independent_routing,
+                "role": role,
             })
         });
 
@@ -9314,6 +9189,11 @@ async fn build_net_match_payload(
         None
     };
 
+    let display_process_name = norm_process_name.as_deref().map(sanitize_log_line);
+    let display_process_path = norm_process_path
+        .as_deref()
+        .map(|p| sanitize_log_line(&redact_path_for_display(p)));
+
     let mut out = json!({
         "ok": true,
         "sanitized": true,
@@ -9321,6 +9201,8 @@ async fn build_net_match_payload(
             "host": if parsed_ip.is_some() { redact_ip_or_host(&host) } else { host.clone() },
             "network": network,
             "port": port,
+            "process_name": display_process_name,
+            "process_path": display_process_path,
         },
         "proxy_mode": cfg.proxy_mode,
         "core_running": live_version.is_some(),
@@ -10510,20 +10392,21 @@ mod tests {
         config::save(&paths, &cfg).expect("save config");
 
         let (match_direct, _) =
-            build_net_match_payload(&paths, "api.custom-direct.example", "tcp", 443)
+            build_net_match_payload(&paths, "api.custom-direct.example", "tcp", 443, None, None)
                 .await
                 .expect("match prepend rule");
         assert_eq!(match_direct["policy"], json!("DIRECT"));
         assert_eq!(match_direct["matched_rule_type"], json!("DOMAIN-SUFFIX"));
 
-        let (match_quic_cn, _) = build_net_match_payload(&paths, "qq.com", "udp", 443)
-            .await
-            .expect("match domestic QUIC allow");
+        let (match_quic_cn, _) =
+            build_net_match_payload(&paths, "qq.com", "udp", 443, None, None)
+                .await
+                .expect("match domestic QUIC allow");
         assert_eq!(match_quic_cn["policy"], json!("DIRECT"));
         assert_eq!(match_quic_cn["bypass_fake_ip"], json!(true));
 
         let (match_quic_overseas, _) =
-            build_net_match_payload(&paths, "api.openai.com", "udp", 443)
+            build_net_match_payload(&paths, "api.openai.com", "udp", 443, None, None)
                 .await
                 .expect("match overseas QUIC reject");
         assert_eq!(match_quic_overseas["policy"], json!("REJECT"));
@@ -12106,6 +11989,10 @@ mod tests {
                 fallback: None,
                 switch_mode: None,
                 nodes: Some("n1,n3".to_string()),
+                independent_routing: None,
+                match_rules: None,
+                add_match_rule: Vec::new(),
+                hard_gate: Vec::new(),
             },
         )
         .expect("partial update existing group");
@@ -12184,6 +12071,7 @@ mod tests {
                 match_rules: None,
                 add_match_rule: vec!["DOMAIN-SUFFIX,claude.ai".to_string()],
                 clear_match_rules: false,
+                independent_routing: None,
             },
         )
         .expect("policy add match rule");
@@ -12203,6 +12091,7 @@ mod tests {
                 match_rules: Some("DOMAIN-SUFFIX,anthropic.com;DOMAIN,chatgpt.com".to_string()),
                 add_match_rule: Vec::new(),
                 clear_match_rules: false,
+                independent_routing: None,
             },
         )
         .expect("policy replace match rules");
@@ -12222,6 +12111,7 @@ mod tests {
                 match_rules: None,
                 add_match_rule: Vec::new(),
                 clear_match_rules: true,
+                independent_routing: None,
             },
         )
         .expect("policy clear match rules");
@@ -14590,6 +14480,340 @@ mod tests {
         let (ok_healed, _, _) =
             build_config_validate_payload(&paths).await.expect("validate after repair");
         assert!(ok_healed, "config validate must pass after repair-rules");
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[test]
+    fn stage26_cli_rule_prefix_and_match_rules_parser_preserve_composite_and_regex_rules() {
+        for prefix in [
+            "PROCESS-NAME-REGEX",
+            "PROCESS-PATH-REGEX",
+            "IP-SUFFIX",
+            "IP-ASN",
+            "UID",
+            "IN-TYPE",
+            "IN-USER",
+            "IN-NAME",
+            "SUB-RULE",
+            "RULE-SET",
+        ] {
+            assert!(
+                looks_like_clash_rule_prefix(prefix),
+                "expected `{prefix}` to be recognized as Clash rule prefix"
+            );
+        }
+
+        // Composite AND rules and regex rules with `{1,3}` commas must never be split on bare `,`.
+        assert_eq!(
+            parse_group_match_rules_arg("AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT"),
+            vec!["AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT".to_string()]
+        );
+        assert_eq!(
+            parse_group_match_rules_arg(r"DOMAIN-REGEX,^a{1,3}\.com$"),
+            vec![r"DOMAIN-REGEX,^a{1,3}\.com$".to_string()]
+        );
+        assert_eq!(
+            parse_group_match_rules_arg(r"PROCESS-NAME-REGEX,^qq{1,2}\.exe$"),
+            vec![r"PROCESS-NAME-REGEX,^qq{1,2}\.exe$".to_string()]
+        );
+        assert_eq!(
+            parse_group_match_rules_arg(
+                r"AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT;DOMAIN-REGEX,^a{1,3}\.com$;codeium.com"
+            ),
+            vec![
+                "AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT".to_string(),
+                r"DOMAIN-REGEX,^a{1,3}\.com$".to_string(),
+                "codeium.com".to_string(),
+            ]
+        );
+        // Comma-separated bare domains continue to expand cleanly.
+        assert_eq!(
+            parse_group_match_rules_arg("codeium.com,windsurf.com,devin.ai"),
+            vec![
+                "codeium.com".to_string(),
+                "windsurf.com".to_string(),
+                "devin.ai".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn stage26_group_create_policy_independent_routing_hard_gate_and_rename_cascade() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-stage26-group-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        // 1. Invalid `--hard-gate` formula must be rejected before writing storage.
+        let bad_gate = execute_group_create(
+            &paths,
+            GroupCreateArgs {
+                id: "grp-bad-gate".to_string(),
+                name: Some("Bad".to_string()),
+                mode: None,
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                nodes: None,
+                independent_routing: Some(true),
+                match_rules: None,
+                add_match_rule: Vec::new(),
+                hard_gate: vec!["not_a_valid_formula ((( ".to_string()],
+            },
+        );
+        assert!(bad_gate.is_err());
+
+        // 2. Create independent-routing group with match rules + hard gates.
+        let (created_out, _) = execute_group_create(
+            &paths,
+            GroupCreateArgs {
+                id: "grp-wsf".to_string(),
+                name: Some("WSF-Old".to_string()),
+                mode: None,
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                nodes: Some("n1".to_string()),
+                independent_routing: Some(true),
+                match_rules: Some("DOMAIN-SUFFIX,codeium.com;DOMAIN-SUFFIX,windsurf.com".to_string()),
+                add_match_rule: vec![
+                    "AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT".to_string(),
+                    r"DOMAIN-REGEX,^a{1,3}\.com$".to_string(),
+                ],
+                hard_gate: vec!["site_unlocked(\"windsurf\") == 1".to_string()],
+            },
+        )
+        .expect("create wsf independent group");
+        assert_eq!(created_out["created"], json!(true));
+        assert_eq!(created_out["group"]["independent_routing"], json!(true));
+        assert_eq!(
+            created_out["group"]["hard_gates"],
+            json!(["site_unlocked(\"windsurf\") == 1"])
+        );
+        assert_eq!(
+            created_out["group"]["match_rules"],
+            json!([
+                "DOMAIN-SUFFIX,codeium.com",
+                "DOMAIN-SUFFIX,windsurf.com",
+                "AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT",
+                r"DOMAIN-REGEX,^a{1,3}\.com$",
+            ])
+        );
+
+        // 3. Seed global rules targeting `WSF-Old`, then rename to `WSF (日本)` and verify cascade!
+        let mut cfg = config::load_or_init(&paths).expect("load cfg");
+        cfg.rules_override.global_prepend_rules.push(
+            "AND,((NETWORK,TCP),(DST-PORT,443)),WSF-Old".to_string(),
+        );
+        cfg.rules_override.global_append_rules.push(
+            "DOMAIN-SUFFIX,devin.ai,WSF-Old".to_string(),
+        );
+        config::save(&paths, &cfg).expect("save cfg");
+
+        let (renamed_out, _) = execute_group_create(
+            &paths,
+            GroupCreateArgs {
+                id: "grp-wsf".to_string(),
+                name: Some("WSF (日本)".to_string()),
+                mode: None,
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                nodes: None,
+                independent_routing: None,
+                match_rules: None,
+                add_match_rule: Vec::new(),
+                hard_gate: Vec::new(),
+            },
+        )
+        .expect("rename group with cascade");
+        assert_eq!(renamed_out["cascaded_global_rules"], json!(2));
+        let cfg_after = config::load_or_init(&paths).expect("reload cfg");
+        assert!(
+            cfg_after
+                .rules_override
+                .global_prepend_rules
+                .contains(&"AND,((NETWORK,TCP),(DST-PORT,443)),WSF (日本)".to_string())
+        );
+        assert!(
+            cfg_after
+                .rules_override
+                .global_append_rules
+                .contains(&"DOMAIN-SUFFIX,devin.ai,WSF (日本)".to_string())
+        );
+
+        // 4. `group policy --independent-routing false` toggles and persists.
+        let (pol_out, _) = execute_group_policy(
+            &paths,
+            GroupPolicyArgs {
+                group_id: "grp-wsf".to_string(),
+                formula: None,
+                fallback: None,
+                switch_mode: None,
+                hard_gate: Vec::new(),
+                match_rules: None,
+                add_match_rule: Vec::new(),
+                clear_match_rules: false,
+                independent_routing: Some(false),
+            },
+        )
+        .expect("toggle independent_routing via policy");
+        assert_eq!(pol_out["group"]["independent_routing"], json!(false));
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[tokio::test]
+    async fn stage26_net_match_process_args_redaction_roles_and_proxy_override_doctor() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "catcloud-cli-stage26-netmatch-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&temp_root);
+        let paths = AppPaths::from_data_dir(temp_root.clone(), true).expect("init temp paths");
+
+        let db = open_storage(&paths).expect("open db");
+        db.upsert_subscription(&SubscriptionRecord {
+            id: "sub-1".to_string(),
+            name: "Stage26 Sub".to_string(),
+            kind: SubscriptionKind::File,
+            url_or_cmd: "stage26.yaml".to_string(),
+            ..Default::default()
+        })
+        .unwrap();
+        db.upsert_node(&ProxyNode {
+            id: "n-tw".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "TW-Clean-01".to_string(),
+            protocol: "trojan".to_string(),
+            server: "198.51.100.44".to_string(),
+            port: 443,
+            raw_config: json!({
+                "name": "TW-Clean-01",
+                "type": "trojan",
+                "server": "198.51.100.44",
+                "port": 443,
+                "password": "demo"
+            }),
+            ..ProxyNode::default()
+        })
+        .unwrap();
+        db.upsert_multi_group(&MultiGroup {
+            id: "grp-primary".to_string(),
+            name: "Main-Group".to_string(),
+            member_node_ids: vec!["n-tw".to_string()],
+            independent_routing: false,
+            ..MultiGroup::default()
+        })
+        .unwrap();
+        db.upsert_multi_group(&MultiGroup {
+            id: "grp-wsf".to_string(),
+            name: "WSF-Dedicated".to_string(),
+            member_node_ids: vec!["n-tw".to_string()],
+            match_rules: vec!["DOMAIN-SUFFIX,codeium.com".to_string()],
+            independent_routing: true,
+            ..MultiGroup::default()
+        })
+        .unwrap();
+        drop(db);
+
+        let mut cfg = config::load_or_init(&paths).expect("load cfg");
+        cfg.active_group_id = Some("grp-primary".to_string());
+        cfg.rules_override.global_prepend_rules.push(
+            "AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT".to_string(),
+        );
+        config::save(&paths, &cfg).expect("save cfg");
+
+        // 1. Domain matching independent_routing group reports role = "independent_routing".
+        let (wsf_match, _) =
+            build_net_match_payload(&paths, "server.codeium.com", "tcp", 443, None, None)
+                .await
+                .expect("match wsf");
+        assert_eq!(wsf_match["policy"], json!("WSF-Dedicated"));
+        assert_eq!(
+            wsf_match["resolved_group"]["independent_routing"],
+            json!(true)
+        );
+        assert_eq!(
+            wsf_match["resolved_group"]["role"],
+            json!("independent_routing")
+        );
+
+        // 2. Unmatched overseas domain falls back to primary group with role = "primary_default".
+        let (primary_match, _) =
+            build_net_match_payload(&paths, "api.openai.com", "tcp", 443, None, None)
+                .await
+                .expect("match primary");
+        assert_eq!(primary_match["policy"], json!("Main-Group"));
+        assert_eq!(
+            primary_match["resolved_group"]["independent_routing"],
+            json!(false)
+        );
+        assert_eq!(
+            primary_match["resolved_group"]["role"],
+            json!("primary_default")
+        );
+
+        // 3. Process name + port hits composite AND rule; process_path basename fallback works
+        //    and username inside `process_path` is strictly redacted in JSON output.
+        let (qq_by_name, _) = build_net_match_payload(
+            &paths,
+            "203.0.113.10",
+            "tcp",
+            15000,
+            Some("QQ.exe"),
+            None,
+        )
+        .await
+        .expect("match qq by name");
+        assert_eq!(qq_by_name["policy"], json!("DIRECT"));
+        assert_eq!(qq_by_name["matched_rule_type"], json!("AND"));
+        assert_eq!(qq_by_name["query"]["process_name"], json!("QQ.exe"));
+
+        let sample_user_path = format!(
+            "{}:\\{}\\SecretAlice\\AppData\\Local\\Tencent\\QQNT\\QQ.exe",
+            "C", "Users"
+        );
+        let (qq_by_path, _) = build_net_match_payload(
+            &paths,
+            "203.0.113.10",
+            "tcp",
+            15000,
+            None,
+            Some(&sample_user_path),
+        )
+        .await
+        .expect("match qq by path");
+        assert_eq!(qq_by_path["policy"], json!("DIRECT"));
+        assert_eq!(qq_by_path["matched_rule_type"], json!("AND"));
+        let redacted_path = qq_by_path["query"]["process_path"].as_str().unwrap_or("");
+        assert!(
+            !redacted_path.contains("SecretAlice"),
+            "process_path must redact local username, got: {redacted_path}"
+        );
+        assert!(
+            redacted_path.contains("<USER>"),
+            "expected <USER> placeholder in redacted process_path, got: {redacted_path}"
+        );
+
+        // 4. Windows ProxyOverride diagnostic helper detects bare `::1` and `/` CIDR and emits
+        //    Schannel 0x80092013 warning, while clean bracketed `[::1]` produces zero warnings.
+        let (bad_entries, bad_warn) =
+            inspect_windows_proxy_override_warnings("localhost;127.0.0.1;::1;10.0.0.0/8;<local>");
+        assert!(bad_entries.iter().any(|e| e == "::1"));
+        assert!(bad_entries.iter().any(|e| e.contains('/')));
+        let warn_text = bad_warn.expect("expected Schannel warning");
+        assert!(warn_text.contains("0x80092013"));
+        assert!(warn_text.contains("Schannel"));
+
+        let (clean_entries, clean_warn) = inspect_windows_proxy_override_warnings(
+            "localhost;127.0.0.1;[::1];127.*;10.*;192.168.*;<local>",
+        );
+        assert!(clean_entries.is_empty());
+        assert!(clean_warn.is_none());
 
         let _ = std::fs::remove_dir_all(&temp_root);
     }

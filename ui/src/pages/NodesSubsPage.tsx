@@ -63,6 +63,13 @@ import { ShareBundleModal, type ShareBundleTransport } from "../components/Share
 import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, appStore, useAppSelector } from "../store/appStore";
 import {
+  type AiSiteBadgeDisplay,
+  formatGoogleRegionTooltip,
+  getAiBadgeToneClass,
+  getNodeAiBadgeDisplays,
+  hasVerifiedAiUnlock,
+} from "../utils/aiUnlockDisplay";
+import {
   getLatencyTooltipKey,
   hasValidDownMbps,
   hasValidUpMbps,
@@ -897,33 +904,30 @@ function getNodeAiInfo(probe: ProbeSnapshot | undefined): {
   passed: number;
   total: number;
   unlockedLabels: string[];
+  badges: AiSiteBadgeDisplay[];
   detail: string;
 } {
   if (!probe) {
-    return { passed: 0, total: 0, unlockedLabels: [], detail: "暂无解锁快照" };
+    return { passed: 0, total: 0, unlockedLabels: [], badges: [], detail: "暂无解锁快照" };
   }
-  const sites = probe.unlocked_sites ?? {};
-  const geminiVal = sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai;
-  const claudeVal = sites.claude;
-  const chatgptVal = sites.chatgpt;
-  const windsurfVal = sites.windsurf ?? probe.per_probe_ok?.builtin_unlock_windsurf;
-
-  const normalized: Array<{ label: string; short: string; val: boolean | undefined }> = [
-    { label: "Claude", short: "Claude", val: claudeVal },
-    { label: "Gemini", short: "Gemini", val: geminiVal },
-    { label: "ChatGPT", short: "GPT", val: chatgptVal },
-    { label: "Windsurf", short: "WS", val: windsurfVal },
-  ];
-
-  const measured = normalized.filter((item) => item.val !== undefined);
-  const unlocked = measured.filter((item) => item.val === true);
+  const allBadges = getNodeAiBadgeDisplays(probe);
+  const measured = allBadges.filter((item) => item.measured);
+  const unlocked = measured.filter((item) => item.unlocked);
+  const displayBadges = measured.filter(
+    (item) =>
+      item.unlocked ||
+      item.windsurfState === "proxy_risk" ||
+      item.windsurfState === "legacy_retest"
+  );
   if (measured.length === 0) {
+    const sites = probe.unlocked_sites ?? {};
     const fallbackEntries = Object.entries(sites);
     const passed = fallbackEntries.filter(([, ok]) => ok).length;
     return {
       passed,
       total: fallbackEntries.length,
       unlockedLabels: fallbackEntries.filter(([, ok]) => ok).map(([k]) => k),
+      badges: [],
       detail:
         fallbackEntries.length > 0
           ? fallbackEntries.map(([k, ok]) => `${k}: ${ok ? "解锁" : "受限"}`).join(" · ")
@@ -933,13 +937,14 @@ function getNodeAiInfo(probe: ProbeSnapshot | undefined): {
   return {
     passed: unlocked.length,
     total: measured.length,
-    unlockedLabels: unlocked.map((item) => item.short),
-    detail: measured.map((item) => `${item.label}: ${item.val ? "可用" : "受限"}`).join(" · "),
+    unlockedLabels: unlocked.map((item) => item.shortLabel),
+    badges: displayBadges,
+    detail: measured.map((item) => item.tooltip).join("\n"),
   };
 }
 
 function isAiUnlocked(probe: ProbeSnapshot | undefined): boolean {
-  return getNodeAiInfo(probe).passed > 0;
+  return hasVerifiedAiUnlock(probe);
 }
 
 /* ============================================================================
@@ -6281,6 +6286,7 @@ export function NodesSubsPage({
 
                           <div className="flex flex-wrap items-center gap-1">
                             <span
+                              title={formatGoogleRegionTooltip(probe)}
                               className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${
                                 probe?.google_clean === true
                                   ? "bg-[var(--green-soft)] text-[var(--green)]"
@@ -6299,13 +6305,33 @@ export function NodesSubsPage({
                             {probe?.google_risk_mismatch && (
                               <span
                                 className="whitespace-nowrap rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 font-medium text-[var(--amber)]"
-                                title="不同网站识别出的地区存在差异，仅供参考"
+                                title={formatGoogleRegionTooltip(probe)}
                               >
                                 地区有偏差
                               </span>
                             )}
 
-                            {aiInfo.unlockedLabels.length > 0 ? (
+                            {aiInfo.badges.length > 0 ? (
+                              <span className="inline-flex flex-wrap items-center gap-1">
+                                {aiInfo.badges.map((badge) => {
+                                  const isLegacy = badge.windsurfState === "legacy_retest";
+                                  const toneCls = isLegacy
+                                    ? getAiBadgeToneClass("muted", "legacy")
+                                    : badge.tone === "green"
+                                      ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                      : getAiBadgeToneClass(badge.tone, "soft");
+                                  return (
+                                    <span
+                                      key={badge.id}
+                                      title={badge.tooltip}
+                                      className={`whitespace-nowrap rounded-md px-1.5 py-0.5 font-medium ${toneCls}`}
+                                    >
+                                      {badge.shortLabel}
+                                    </span>
+                                  );
+                                })}
+                              </span>
+                            ) : aiInfo.unlockedLabels.length > 0 ? (
                               <span
                                 title={aiInfo.detail}
                                 className="inline-flex flex-wrap items-center gap-1"

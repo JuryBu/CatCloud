@@ -426,4 +426,51 @@ describe("mergeProbeSnapshotSafe", () => {
     assert.equal(mergedAuth.per_probe_ok?.deleted_old_probe, undefined);
     assert.equal(mergedAuth.per_probe_ok?.builtin_upload, false);
   });
+
+  it("preserves ip_clean/ip_risk_level/ip_asn/ip_risk_flags during partial L0 latency retests", () => {
+    const prev = makeSnap({
+      ip_clean: false,
+      ip_risk_level: "proxy_risk",
+      ip_asn: "AS38136 Akari Networks",
+      ip_risk_flags: "proxy,datacenter",
+      unlocked_sites: { windsurf: false },
+      per_probe_ok: { builtin_latency: true, builtin_unlock_windsurf: false },
+      per_probe_detail: {
+        builtin_unlock_windsurf: "semantic_windsurf: unlocked=false, ip_risk=proxy_risk",
+      },
+    });
+    const latencyOnlyPartial: ProbeSnapshot = {
+      node_id: "node-jp-01",
+      tested_at: "2026-11-28T07:00:00Z",
+      ok: true,
+      latency_ms: 52,
+      jitter_ms: 1.5,
+      loss_pct: 0,
+      up_mbps: null,
+      down_mbps: null,
+      cf_loc: null,
+      yt_gl: null,
+      google_clean: null,
+      google_risk_mismatch: false,
+      keepalive_60s_ok: null,
+      ip_clean: null,
+      ip_risk_level: null,
+      ip_asn: null,
+      ip_risk_flags: null,
+      unlocked_sites: {},
+      per_probe_ok: { builtin_latency: true },
+      per_probe_up_mbps: {},
+      per_probe_down_mbps: {},
+      per_probe_ping_ms: { builtin_latency: 52 },
+      per_probe_detail: { builtin_latency: "latency_ms=52" },
+      per_probe_tested_at: { builtin_latency: "2026-11-28T07:00:00Z" },
+    };
+
+    const merged = mergeProbeSnapshotSafe(prev, latencyOnlyPartial);
+    assert.equal(merged.latency_ms, 52);
+    assert.equal(merged.ip_clean, false);
+    assert.equal(merged.ip_risk_level, "proxy_risk");
+    assert.equal(merged.ip_asn, "AS38136 Akari Networks");
+    assert.equal(merged.ip_risk_flags, "proxy,datacenter");
+  });
 });

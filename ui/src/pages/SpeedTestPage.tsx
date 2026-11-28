@@ -62,6 +62,14 @@ import {
   useAppSelector,
 } from "../store/appStore";
 import {
+  countVerifiedAiUnlocks,
+  formatGoogleRegionTooltip,
+  getAiBadgeToneClass,
+  getNodeAiBadgeDisplays,
+  hasVerifiedAiUnlock,
+  isProxyRiskSnapshot,
+} from "../utils/aiUnlockDisplay";
+import {
   type ResolvedNodeLatency,
   getLatencyTooltipKey,
   hasValidDownMbps,
@@ -169,8 +177,8 @@ const FRIENDLY_BUILTIN_PROBES: Record<string, { title: string; desc: string }> =
     desc: "测试连接静置 60 秒后是否稳定不断流",
   },
   builtin_unlock_windsurf: {
-    title: "Windsurf 解锁",
-    desc: "检测是否支持正常访问 Windsurf",
+    title: "Windsurf / Devin 纯净解锁",
+    desc: "检测 Windsurf / Devin AI 推理网关与出口 IP 纯净度（防代理风控假绿灯）",
   },
   builtin_unlock_claude: {
     title: "Claude 解锁",
@@ -246,13 +254,12 @@ const INITIAL_PROBES: ProbeItem[] = [
   },
   {
     id: "builtin_unlock_windsurf",
-    name: "Windsurf 解锁",
+    name: "Windsurf / Devin AI 纯净解锁",
     kind: "unlock_regex",
-    target: "https://windsurf.com",
-    method: "GET",
-    expectedStatus: 200,
-    bodyRegex: "windsurf|codeium",
-    timeoutMs: 8000,
+    target: "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage",
+    method: "POST",
+    expectedStatus: null,
+    timeoutMs: 9000,
     builtin: true,
     enabled: true,
   },
@@ -315,9 +322,9 @@ const UNLOCK_PRESETS: ReadonlyArray<{
   {
     label: "Windsurf 模板",
     id: "unlock_windsurf_ide",
-    name: "Windsurf 解锁",
-    target: "https://windsurf.com",
-    bodyRegex: "windsurf|codeium",
+    name: "Windsurf 推理网关可达",
+    target: "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage",
+    bodyRegex: "",
   },
 ];
 
@@ -508,17 +515,17 @@ function getLatencyColor(latencyMs: number | null | undefined, ok: boolean | und
 }
 
 function hasAnyAiUnlocked(snap: ProbeSnapshot | undefined): boolean {
-  if (!snap) return false;
-  const sites = snap.unlocked_sites ?? {};
-  const gemini = Boolean(sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai);
-  const chatgpt = Boolean(sites.chatgpt);
-  const claude = Boolean(sites.claude);
-  const windsurf = Boolean(sites.windsurf ?? snap.per_probe_ok?.builtin_unlock_windsurf);
-  return gemini || chatgpt || claude || windsurf;
+  return hasVerifiedAiUnlock(snap);
 }
 
 function isGoldenCore(snap: ProbeSnapshot | undefined): boolean {
-  return Boolean(snap && snap.ok && snap.google_clean === true && hasAnyAiUnlocked(snap));
+  return Boolean(
+    snap &&
+      snap.ok &&
+      snap.google_clean === true &&
+      !isProxyRiskSnapshot(snap) &&
+      hasAnyAiUnlocked(snap)
+  );
 }
 
 function hasMeasuredSpeed(snap: ProbeSnapshot | undefined): boolean {
@@ -1361,24 +1368,15 @@ export function SpeedTestPage({
         const sourceName = subNameById.get(node.sub_id) ?? node.sub_id;
         const regionCode = resolveNodeRegionCode(node);
         const regionLabel = getRegionLabel(regionCode);
-        const unlocks = {
-          gemini:
-            snap?.unlocked_sites?.gemini ??
-            snap?.unlocked_sites?.gemini_aistudio ??
-            snap?.unlocked_sites?.google_ai ??
-            false,
-          chatgpt: snap?.unlocked_sites?.chatgpt ?? false,
-          claude: snap?.unlocked_sites?.claude ?? false,
-          windsurf:
-            snap?.unlocked_sites?.windsurf ?? snap?.per_probe_ok?.builtin_unlock_windsurf ?? false,
-        };
+        const aiBadges = getNodeAiBadgeDisplays(snap);
         const hasUnlockData = Boolean(
           snap &&
             (Object.keys(snap.unlocked_sites ?? {}).length > 0 ||
               snap.per_probe_ok?.builtin_unlock_windsurf !== undefined ||
+              snap.ip_risk_level != null ||
               snap.google_clean !== null)
         );
-        const unlockScore = Object.values(unlocks).filter(Boolean).length;
+        const unlockScore = countVerifiedAiUnlocks(snap);
         const isGoogleClean = snap?.google_clean === true;
         const goldenCore = isGoldenCore(snap);
         const measuredSpeed = hasMeasuredSpeed(snap);
@@ -1403,7 +1401,7 @@ export function SpeedTestPage({
           sourceName,
           regionCode,
           regionLabel,
-          unlocks,
+          aiBadges,
           hasUnlockData,
           unlockScore,
           isGoogleClean,
@@ -3184,7 +3182,7 @@ export function SpeedTestPage({
                       title: "测速带宽单位 Mbps（8 Mbps ≈ 1 MB/s）",
                     },
                     { key: "google", label: "谷歌地区", cls: "w-[68px] px-1" },
-                    { key: "unlocks", label: "AI 解锁", cls: "w-[116px] px-1" },
+                    { key: "unlocks", label: "AI 解锁", cls: "w-[126px] px-1" },
                   ] as ReadonlyArray<{
                     key: SortKey;
                     label: string;
@@ -3229,8 +3227,9 @@ export function SpeedTestPage({
                   effectiveLatencyMs,
                   effectiveLatencyOk,
                   sourceName,
+                  regionCode,
                   regionLabel,
-                  unlocks,
+                  aiBadges,
                   hasUnlockData,
                   regionMismatch,
                 }) => {
@@ -3525,7 +3524,10 @@ export function SpeedTestPage({
                       </td>
 
                       {/* Google Region Status */}
-                      <td className="w-[68px] whitespace-nowrap px-1 py-2">
+                      <td
+                        className="w-[68px] whitespace-nowrap px-1 py-2"
+                        title={formatGoogleRegionTooltip(snap, regionCode)}
+                      >
                         <div className="flex flex-col items-start gap-1">
                           {snap?.google_clean === true ? (
                             <span className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
@@ -3544,7 +3546,7 @@ export function SpeedTestPage({
                           {regionMismatch && (
                             <span
                               className="inline-flex items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1 py-0.5 text-[9px] text-[var(--amber)]"
-                              title="不同网站识别出的地区存在差异，仅供参考"
+                              title={formatGoogleRegionTooltip(snap, regionCode)}
                             >
                               <AlertTriangle className="h-2.5 w-2.5 shrink-0" />
                               地区偏差
@@ -3553,29 +3555,31 @@ export function SpeedTestPage({
                         </div>
                       </td>
 
-                      {/* AI Unlocks (2x2 compact micro-grid) */}
-                      <td className="w-[116px] px-1 py-2">
+                      {/* AI Unlocks (2x2 compact micro-grid with Windsurf 4-state & per_probe_detail hover) */}
+                      <td className="w-[126px] px-1 py-2">
                         {hasUnlockData ? (
                           <div className="grid w-full grid-cols-2 gap-0.5">
-                            {(
-                              [
-                                { id: "gemini", label: "Gemini", ok: unlocks.gemini },
-                                { id: "chatgpt", label: "ChatGPT", ok: unlocks.chatgpt },
-                                { id: "claude", label: "Claude", ok: unlocks.claude },
-                                { id: "windsurf", label: "Windsurf", ok: unlocks.windsurf },
-                              ] as const
-                            ).map((badge) => (
-                              <span
-                                key={badge.id}
-                                className={`truncate whitespace-nowrap rounded-md px-0.5 py-0.5 text-center text-[9.5px] font-medium leading-tight ${
-                                  badge.ok
-                                    ? "bg-[var(--green-soft)] text-[var(--green)]"
-                                    : "bg-[var(--bg-elevated)] text-[var(--muted)] opacity-55"
-                                }`}
-                              >
-                                {badge.label}
-                              </span>
-                            ))}
+                            {aiBadges.map((badge) => {
+                              const isLegacy = badge.windsurfState === "legacy_retest";
+                              const isDimmed =
+                                !isLegacy &&
+                                badge.tone === "muted" &&
+                                !badge.unlocked;
+                              const toneCls = isLegacy
+                                ? getAiBadgeToneClass("muted", "legacy")
+                                : getAiBadgeToneClass(badge.tone, "soft");
+                              return (
+                                <span
+                                  key={badge.id}
+                                  title={badge.tooltip}
+                                  className={`truncate whitespace-nowrap rounded-md px-0.5 py-0.5 text-center text-[9.5px] font-medium leading-tight ${toneCls} ${
+                                    isDimmed ? "opacity-55" : ""
+                                  }`}
+                                >
+                                  {badge.label}
+                                </span>
+                              );
+                            })}
                           </div>
                         ) : (
                           <span className="text-[11px] text-[var(--muted)]">--</span>

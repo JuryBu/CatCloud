@@ -274,12 +274,17 @@ fn has_balanced_parens(expr: &str) -> bool {
         return false;
     }
     let mut depth: i32 = 0;
-    for ch in trimmed.chars() {
+    let mut chars = trimmed.chars().peekable();
+    while let Some(ch) = chars.next() {
         match ch {
             '(' => depth += 1,
             ')' => {
                 depth -= 1;
                 if depth < 0 {
+                    return false;
+                }
+                // Reject juxtaposed top-level groups like `(NETWORK,UDP),(DST-PORT,443)`.
+                if depth == 0 && chars.peek().is_some() {
                     return false;
                 }
             }
@@ -292,6 +297,166 @@ fn has_balanced_parens(expr: &str) -> bool {
 fn is_logical_rule_type(rule_type: &str) -> bool {
     let upper = rule_type.trim().to_ascii_uppercase();
     matches!(upper.as_str(), "AND" | "OR" | "NOT")
+}
+
+fn is_regex_rule_type(rule_type: &str) -> bool {
+    let upper = rule_type.trim().to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "DOMAIN-REGEX" | "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX"
+    )
+}
+
+/// Scan from the leading `(` of `rest` until parenthesis depth first returns to 0.
+///
+/// Stopping at the first balanced `)` preserves targets containing parentheses
+/// (such as `AI (日本)`, `Node (2)`, or unmatched `Node :)`) verbatim in the remainder.
+fn split_leading_balanced_paren_expr(rest: &str) -> Option<(&str, &str)> {
+    let trimmed = rest.trim();
+    if !trimmed.starts_with('(') {
+        return None;
+    }
+    let mut depth: i32 = 0;
+    for (idx, ch) in trimmed.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth < 0 {
+                    return None;
+                }
+                if depth == 0 {
+                    let end = idx + ch.len_utf8();
+                    let expr = &trimmed[..end];
+                    let after = trimmed[end..].trim();
+                    return Some((expr, after));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Validate a Mihomo double-parenthesized logical condition payload `((...))` recursively.
+///
+/// Each top-level comma-separated clause inside the outer `(...)` must itself be a non-empty
+/// balanced `(...)` expression; nested `AND`/`OR`/`NOT` clauses are validated recursively up to
+/// `MAX_LOGICAL_CONDITION_DEPTH`, and leaf clauses must contain `<RULE_TYPE>,<payload>`.
+fn is_valid_logical_condition_expr(rule_type: &str, expr: &str) -> bool {
+    is_valid_logical_condition_expr_inner(rule_type, expr, 0)
+}
+
+fn is_valid_logical_condition_expr_inner(rule_type: &str, expr: &str, depth: usize) -> bool {
+    const MAX_LOGICAL_CONDITION_DEPTH: usize = 16;
+    if depth >= MAX_LOGICAL_CONDITION_DEPTH || !has_balanced_parens(expr) {
+        return false;
+    }
+    let trimmed = expr.trim();
+    let inner = trimmed[1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return false;
+    }
+    let mut clauses: Vec<&str> = Vec::new();
+    let mut paren_depth: i32 = 0;
+    let mut start = 0usize;
+    for (idx, ch) in inner.char_indices() {
+        match ch {
+            '(' => paren_depth += 1,
+            ')' => {
+                paren_depth -= 1;
+                if paren_depth < 0 {
+                    return false;
+                }
+            }
+            ',' if paren_depth == 0 => {
+                clauses.push(inner[start..idx].trim());
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if paren_depth != 0 {
+        return false;
+    }
+    clauses.push(inner[start..].trim());
+    if clauses.is_empty() {
+        return false;
+    }
+    if rule_type.trim().eq_ignore_ascii_case("NOT") && clauses.len() != 1 {
+        return false;
+    }
+    clauses.iter().all(|clause| {
+        if !has_balanced_parens(clause) {
+            return false;
+        }
+        let body = clause[1..clause.len() - 1].trim();
+        let Some((sub_type, sub_rest)) = body.split_once(',') else {
+            return false;
+        };
+        let sub_type_upper = sub_type.trim().to_ascii_uppercase();
+        let sub_rest_trimmed = sub_rest.trim();
+        if sub_type_upper.is_empty() || sub_rest_trimmed.is_empty() {
+            return false;
+        }
+        if matches!(sub_type_upper.as_str(), "AND" | "OR" | "NOT") {
+            is_valid_logical_condition_expr_inner(&sub_type_upper, sub_rest_trimmed, depth + 1)
+        } else {
+            is_valid_mihomo_rule_type(&sub_type_upper)
+        }
+    })
+}
+
+/// Parse `<TYPE>,((...)),<TARGET>` for Mihomo logical rules (`AND`/`OR`/`NOT`).
+///
+/// Matches upstream Mihomo `ParseRulePayload` strictly:
+/// - Condition must be double-parenthesized `((...))`.
+/// - Top-level trailing flags (`no-resolve`/`src`) are rejected (they belong inside sub-clauses).
+/// - Parenthesized or asymmetric targets (`AI (日本)`, `Node (2)`, `Node :)`) are preserved verbatim.
+fn parse_logical_rule_expr_and_target<'a>(
+    rule_type: &str,
+    rest: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let (expr, after) = split_leading_balanced_paren_expr(rest)?;
+    if !is_valid_logical_condition_expr(rule_type, expr) {
+        return None;
+    }
+    let after_comma = after.strip_prefix(',')?;
+    let target = after_comma.trim();
+    if target.is_empty() || target.contains(',') || is_mihomo_rule_flag(target) {
+        return None;
+    }
+    Some((expr, target))
+}
+
+/// Parse `SUB-RULE,(...),<SUB_RULE_NAME>` (allowing single- or multi-layer parenthesized conditions).
+fn parse_sub_rule_expr_and_target(rest: &str) -> Option<(&str, &str)> {
+    let (expr, after) = split_leading_balanced_paren_expr(rest)?;
+    if !has_balanced_parens(expr) {
+        return None;
+    }
+    let inner = expr[1..expr.len() - 1].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let after_comma = after.strip_prefix(',')?;
+    let target = after_comma.trim();
+    if target.is_empty() || target.contains(',') {
+        return None;
+    }
+    Some((expr, target))
+}
+
+/// Parse `<REGEX-TYPE>,<PATTERN>,<TARGET>` by splitting on the final comma so commas inside
+/// regex quantifiers (`{1,3}`) and escaped parentheses (`\(bar`) are preserved verbatim.
+fn parse_regex_rule_pattern_and_target(rest: &str) -> Option<(&str, &str)> {
+    let (pattern, target) = rest.rsplit_once(',')?;
+    let pattern = pattern.trim();
+    let target = target.trim();
+    if pattern.is_empty() || target.is_empty() || is_mihomo_rule_flag(target) {
+        return None;
+    }
+    Some((pattern, target))
 }
 
 /// Parse a Mihomo catch-all `MATCH,<target>` rule tolerating ASCII whitespace around the comma
@@ -340,39 +505,22 @@ fn is_plausible_global_rule(rule: &str) -> bool {
         return is_match_rule(trimmed);
     }
     if is_logical_rule_type(rule_type) {
-        // Logical composite rules look like: `AND,((NETWORK,UDP),(DST-PORT,443)),REJECT`
-        // and may optionally carry trailing flags such as `no-resolve` / `src`.
-        let mut remainder = rest.trim();
-        while let Some((head, tail)) = remainder.rsplit_once(',') {
-            let candidate = tail.trim();
-            if candidate.is_empty() {
-                return false;
-            }
-            if is_mihomo_rule_flag(candidate) {
-                remainder = head.trim();
-                continue;
-            }
-            return !candidate.contains('(')
-                && !candidate.contains(')')
-                && has_balanced_parens(head);
-        }
-        return false;
+        return parse_logical_rule_expr_and_target(rule_type, rest).is_some();
     }
     if rule_type.eq_ignore_ascii_case("SUB-RULE") {
-        let rest_trimmed = rest.trim();
-        if rest_trimmed.starts_with('(') {
-            let Some((expr, target)) = rest_trimmed.rsplit_once(',') else {
-                return false;
-            };
-            let target = target.trim();
-            return !target.is_empty()
-                && !target.contains('(')
-                && !target.contains(')')
-                && has_balanced_parens(expr);
-        }
+        return parse_sub_rule_expr_and_target(rest).is_some();
     }
-    let parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
-    parts.len() >= 3 && parts.iter().all(|p| !p.is_empty())
+    if is_regex_rule_type(rule_type) {
+        return parse_regex_rule_pattern_and_target(rest).is_some();
+    }
+    let mut parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
+    if parts.len() < 3 || parts.iter().any(|p| p.is_empty()) {
+        return false;
+    }
+    while parts.len() > 2 && parts.last().is_some_and(|tok| is_mihomo_rule_flag(tok)) {
+        parts.pop();
+    }
+    parts.len() >= 3 && !parts[1].is_empty() && !parts[parts.len() - 1].is_empty()
 }
 
 fn is_builtin_rule_action(target: &str) -> bool {
@@ -401,32 +549,13 @@ fn extract_mihomo_rule_raw_target(rule: &str) -> Option<&str> {
         return None;
     }
     if rule_type.eq_ignore_ascii_case("MATCH") {
-        let target = rest.trim();
-        if target.is_empty() || target.contains(',') {
-            return None;
-        }
-        return Some(target);
+        return parse_match_rule_target(trimmed);
     }
     if is_logical_rule_type(rule_type) {
-        let mut remainder = rest.trim();
-        while let Some((head, tail)) = remainder.rsplit_once(',') {
-            let candidate = tail.trim();
-            if candidate.is_empty() {
-                return None;
-            }
-            if is_mihomo_rule_flag(candidate) {
-                remainder = head.trim();
-                continue;
-            }
-            if !candidate.contains('(')
-                && !candidate.contains(')')
-                && has_balanced_parens(head)
-            {
-                return Some(candidate);
-            }
-            return None;
-        }
-        return None;
+        return parse_logical_rule_expr_and_target(rule_type, rest).map(|(_, target)| target);
+    }
+    if is_regex_rule_type(rule_type) {
+        return parse_regex_rule_pattern_and_target(rest).map(|(_, target)| target);
     }
 
     let mut parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
@@ -472,40 +601,16 @@ pub fn rewrite_mihomo_rule_target(rule: &str, new_target: &str) -> Option<String
         return None;
     }
     if rule_type.eq_ignore_ascii_case("MATCH") {
-        let target = rest.trim();
-        if target.is_empty() || target.contains(',') {
-            return None;
-        }
+        parse_match_rule_target(trimmed)?;
         return Some(format!("{rule_type},{replacement}"));
     }
     if is_logical_rule_type(rule_type) {
-        let mut remainder = rest.trim();
-        let mut trailing_flags: Vec<&str> = Vec::new();
-        while let Some((head, tail)) = remainder.rsplit_once(',') {
-            let candidate = tail.trim();
-            if candidate.is_empty() {
-                return None;
-            }
-            if is_mihomo_rule_flag(candidate) {
-                trailing_flags.push(candidate);
-                remainder = head.trim();
-                continue;
-            }
-            if !candidate.contains('(')
-                && !candidate.contains(')')
-                && has_balanced_parens(head)
-            {
-                trailing_flags.reverse();
-                let mut rebuilt = format!("{rule_type},{},{replacement}", head.trim());
-                for flag in trailing_flags {
-                    rebuilt.push(',');
-                    rebuilt.push_str(flag);
-                }
-                return Some(rebuilt);
-            }
-            return None;
-        }
-        return None;
+        let (expr, _) = parse_logical_rule_expr_and_target(rule_type, rest)?;
+        return Some(format!("{rule_type},{expr},{replacement}"));
+    }
+    if is_regex_rule_type(rule_type) {
+        let (pattern, _) = parse_regex_rule_pattern_and_target(rest)?;
+        return Some(format!("{rule_type},{pattern},{replacement}"));
     }
 
     let mut parts: Vec<&str> = trimmed.split(',').map(str::trim).collect();
@@ -979,6 +1084,14 @@ pub fn format_static_validation_summary_zh(
 /// - 3-part rules ending in `no-resolve` insert `group_name` before `no-resolve`; otherwise
 ///   kept only when `rule_type` is valid and all 3 segments are non-empty.
 pub fn expand_group_match_rule(rule: &str, group_name: &str) -> Vec<String> {
+    expand_group_match_rule_with_known_targets(rule, group_name, None)
+}
+
+fn expand_group_match_rule_with_known_targets(
+    rule: &str,
+    group_name: &str,
+    known_targets: Option<&HashSet<String>>,
+) -> Vec<String> {
     let trimmed = rule.trim();
     let target = group_name.trim();
     if trimmed.is_empty() || target.is_empty() {
@@ -989,23 +1102,51 @@ pub fn expand_group_match_rule(rule: &str, group_name: &str) -> Vec<String> {
     }
 
     if let Some((raw_type, rest)) = trimmed.split_once(',') {
-        if is_logical_rule_type(raw_type) {
-            let rt = raw_type.trim().to_ascii_uppercase();
-            let rest_trimmed = rest.trim();
-            if has_balanced_parens(rest_trimmed) {
-                return vec![format!("{rt},{rest_trimmed},{target}")];
+        let rt_raw = raw_type.trim();
+        if is_logical_rule_type(rt_raw) {
+            let rt = rt_raw.to_ascii_uppercase();
+            let Some((expr, after)) = split_leading_balanced_paren_expr(rest) else {
+                return Vec::new();
+            };
+            if !is_valid_logical_condition_expr(&rt, expr) {
+                return Vec::new();
             }
-            if let Some((expr, action)) = rest_trimmed.rsplit_once(',') {
-                let action = action.trim();
-                if !action.is_empty()
-                    && !action.contains('(')
-                    && !action.contains(')')
-                    && has_balanced_parens(expr)
-                {
-                    return vec![format!("{rt},{},{action}", expr.trim())];
+            if after.is_empty() {
+                return vec![format!("{rt},{expr},{target}")];
+            }
+            if let Some(after_comma) = after.strip_prefix(',') {
+                let action = after_comma.trim();
+                if !action.is_empty() && !action.contains(',') && !is_mihomo_rule_flag(action) {
+                    return vec![format!("{rt},{expr},{action}")];
                 }
             }
             return Vec::new();
+        }
+        if rt_raw.eq_ignore_ascii_case("SUB-RULE") {
+            if let Some((expr, sub_name)) = parse_sub_rule_expr_and_target(rest) {
+                return vec![format!("SUB-RULE,{expr},{sub_name}")];
+            }
+            return Vec::new();
+        }
+        if is_regex_rule_type(rt_raw) {
+            let rt = rt_raw.to_ascii_uppercase();
+            let rest_trimmed = rest.trim();
+            if rest_trimmed.is_empty() {
+                return Vec::new();
+            }
+            if let Some((pattern, tail)) = rest_trimmed.rsplit_once(',') {
+                let pattern = pattern.trim();
+                let tail = tail.trim();
+                let is_explicit_target = !pattern.is_empty()
+                    && !tail.is_empty()
+                    && (is_builtin_rule_action(tail)
+                        || tail == target
+                        || known_targets.is_some_and(|set| set.contains(tail)));
+                if is_explicit_target {
+                    return vec![format!("{rt},{pattern},{tail}")];
+                }
+            }
+            return vec![format!("{rt},{rest_trimmed},{target}")];
         }
     }
 
@@ -1040,25 +1181,30 @@ pub fn expand_group_match_rule(rule: &str, group_name: &str) -> Vec<String> {
                 return Vec::new();
             }
             let rt = rule_type.to_ascii_uppercase();
-            if third.eq_ignore_ascii_case("no-resolve") {
-                vec![format!("{rt},{payload},{target},no-resolve")]
+            if is_mihomo_rule_flag(third) {
+                vec![format!("{rt},{payload},{target},{}", third.to_ascii_lowercase())]
             } else {
                 vec![format!("{rt},{payload},{third}")]
             }
         }
         [rule_type, payload, third, fourth] => {
-            if is_valid_mihomo_rule_type(rule_type)
-                && !rule_type.eq_ignore_ascii_case("MATCH")
-                && !payload.is_empty()
-                && !third.is_empty()
-                && !fourth.is_empty()
+            if !is_valid_mihomo_rule_type(rule_type)
+                || rule_type.eq_ignore_ascii_case("MATCH")
+                || payload.is_empty()
+                || third.is_empty()
+                || fourth.is_empty()
             {
+                return Vec::new();
+            }
+            let rt = rule_type.to_ascii_uppercase();
+            if is_mihomo_rule_flag(third) && is_mihomo_rule_flag(fourth) {
                 vec![format!(
-                    "{},{payload},{third},{fourth}",
-                    rule_type.to_ascii_uppercase()
+                    "{rt},{payload},{target},{},{}",
+                    third.to_ascii_lowercase(),
+                    fourth.to_ascii_lowercase()
                 )]
             } else {
-                Vec::new()
+                vec![format!("{rt},{payload},{third},{fourth}")]
             }
         }
         _ => Vec::new(),
@@ -1814,6 +1960,17 @@ pub fn compile_mihomo_config_with_runtime_dir(
         );
     }
     if !custom_rules_only && !single_mode_active {
+        let mut known_targets = collect_valid_rule_target_names(input.groups, input.nodes);
+        for gm in &group_mappings {
+            if !gm.group_name.trim().is_empty() {
+                known_targets.insert(gm.group_name.clone());
+            }
+        }
+        for pname in &all_enabled_node_names {
+            if !pname.trim().is_empty() {
+                known_targets.insert(pname.clone());
+            }
+        }
         let active_group_id_ref = effective_active_group_id.as_deref();
         // Emit the active home group's match_rules FIRST for highest priority, followed ONLY by
         // other groups with `independent_routing == true`. Unselected groups with
@@ -1838,7 +1995,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
                 continue;
             }
             for raw_rule in &group.match_rules {
-                for expanded in expand_group_match_rule(raw_rule, target) {
+                for expanded in
+                    expand_group_match_rule_with_known_targets(raw_rule, target, Some(&known_targets))
+                {
                     push_unique(&mut rules, expanded);
                 }
             }
@@ -1896,6 +2055,7 @@ pub fn compile_mihomo_config_with_runtime_dir(
         // Core domestic portals & Tencent / QQ / WeChat
         "qq.com",
         "weixin.qq.com",
+        "gtimg.cn",
         "gtimg.com",
         "qpic.cn",
         "qlogo.cn",
@@ -1905,6 +2065,9 @@ pub fn compile_mihomo_config_with_runtime_dir(
         "tencent.com",
         "myqcloud.com",
         "qcloud.com",
+        "qcloudimg.com",
+        "tencentcs.com",
+        "tencent-cloud.net",
         // Taobao / Aliyun / Alipay / DingTalk / Amap (excluding international alibaba.com)
         "taobao.com",
         "tmall.com",
@@ -4963,11 +5126,21 @@ fn build_dns_section(
         "+.gtimg.com",
         "+.nt.qq.com.cn",
         "+.weixin.qq.com",
+        "+.wechat.com",
+        "+.wechatpay.com",
+        "+.tenpay.com",
         "+.tencent.com",
         "+.qcloud.com",
         "+.myqcloud.com",
+        "+.qcloudimg.com",
+        "+.tencentcs.com",
+        "+.tencent-cloud.net",
     ];
     for item in DOMESTIC_IM_FAKE_IP_FILTERS {
+        push_unique(&mut merged_fake_ip_filter, (*item).to_string());
+    }
+    const SYSTEM_CERT_FAKE_IP_FILTERS: &[&str] = &["ctldl.windowsupdate.com"];
+    for item in SYSTEM_CERT_FAKE_IP_FILTERS {
         push_unique(&mut merged_fake_ip_filter, (*item).to_string());
     }
     for item in anti_loop_fake_ip_domains {
@@ -5034,6 +5207,10 @@ fn build_dns_section(
         "+.antigravity.google",
         "+.windsurf.com",
         "+.codeium.com",
+        "+.codeiumdata.com",
+        "+.devin.ai",
+        "+.cognition.ai",
+        "+.exafunction.com",
         "+.github.com",
         "+.x.com",
         "+.twitter.com",
@@ -9111,7 +9288,8 @@ rules: # header comment
   - GEOSITE,cn,DIRECT
   - GEOIP,CN,DIRECT,no-resolve # geoip comment
   - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT # quic block
-  - OR,((DOMAIN-SUFFIX,a.test),(DOMAIN-SUFFIX,b.test)),PROXY,no-resolve
+  - OR,((DOMAIN-SUFFIX,a.test),(GEOIP,CN,no-resolve)),PROXY
+  - AND,((NETWORK,UDP),(DST-PORT,443)),REJECT,no-resolve
   - NOT,((DST-PORT,80)),DIRECT
   - SUB-RULE,(NETWORK,TCP),sub-tcp-rules
   - DOMAIN-SUFFIX,openai.com,AI-Group
@@ -9129,7 +9307,7 @@ rules: # header comment
                 "GEOSITE,cn,DIRECT",
                 "GEOIP,CN,DIRECT,no-resolve",
                 "AND,((NETWORK,UDP),(DST-PORT,443)),REJECT",
-                "OR,((DOMAIN-SUFFIX,a.test),(DOMAIN-SUFFIX,b.test)),PROXY,no-resolve",
+                "OR,((DOMAIN-SUFFIX,a.test),(GEOIP,CN,no-resolve)),PROXY",
                 "NOT,((DST-PORT,80)),DIRECT",
                 "SUB-RULE,(NETWORK,TCP),sub-tcp-rules",
                 "MATCH,DIRECT",
@@ -9138,6 +9316,7 @@ rules: # header comment
         assert_eq!(
             parsed.skipped_lines,
             vec![
+                "- AND,((NETWORK,UDP),(DST-PORT,443)),REJECT,no-resolve",
                 "- INVALID-TYPE,foo,DIRECT",
                 "- broken-line-without-comma",
             ]
@@ -10145,5 +10324,209 @@ geox-url:
             gw_redacted.yaml.contains("WG Node #1"),
             "node name containing `#1` must NOT be corrupted"
         );
+    }
+
+    #[test]
+    fn stage26_composite_and_regex_rule_parsing_matches_mihomo_real_grammar() {
+        // 1. `has_balanced_parens` rejects juxtaposed `(A),(B)` where depth hits 0 before end.
+        assert!(has_balanced_parens("((NETWORK,UDP),(DST-PORT,443))"));
+        assert!(!has_balanced_parens("(NETWORK,UDP),(DST-PORT,443)"));
+        assert!(!has_balanced_parens("((NETWORK,UDP),(DST-PORT,443)"));
+
+        // 2. Logical rules with parenthesized or asymmetric target names (`AI (日本)`, `Node (2)`, `Node :)`).
+        let rule_jp = "AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),AI (日本)";
+        let rule_smile = "AND,((NETWORK,TCP),(DST-PORT,443)),Node :)";
+        let rule_direct = "AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT";
+        assert!(is_plausible_global_rule(rule_jp));
+        assert!(is_plausible_global_rule(rule_smile));
+        assert!(is_plausible_global_rule(rule_direct));
+        assert_eq!(extract_mihomo_rule_target(rule_jp), Some("AI (日本)"));
+        assert_eq!(extract_mihomo_rule_target(rule_smile), Some("Node :)"));
+        assert_eq!(extract_mihomo_rule_target(rule_direct), None);
+        assert_eq!(
+            rewrite_mihomo_rule_target(rule_jp, "Node (2)").as_deref(),
+            Some("AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),Node (2)")
+        );
+        assert_eq!(
+            rewrite_mihomo_rule_target(rule_smile, "AI (日本)").as_deref(),
+            Some("AND,((NETWORK,TCP),(DST-PORT,443)),AI (日本)")
+        );
+        assert_eq!(
+            expand_group_match_rule("AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))", "AI (日本)"),
+            vec!["AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),AI (日本)".to_string()]
+        );
+        assert_eq!(
+            expand_group_match_rule(rule_jp, "Other"),
+            vec![rule_jp.to_string()]
+        );
+
+        // 3. Invalid juxtaposed parens, single-layer NOT, empty AND, and top-level trailing flags
+        //    must all be rejected so they never break `mihomo -t`.
+        for invalid in [
+            "AND,(NETWORK,UDP),(DST-PORT,443),DIRECT",
+            "AND,((NETWORK,UDP),(DST-PORT,443)),DIRECT,no-resolve",
+            "AND,((NETWORK,UDP),(DST-PORT,443)),DIRECT,src",
+            "AND,((NETWORK,UDP),(DST-PORT,443)),no-resolve",
+            "AND,(),DIRECT",
+            "AND,((DOMAIN,a.com),()),DIRECT",
+            "NOT,(DOMAIN,a.com),DIRECT",
+        ] {
+            assert!(
+                !is_plausible_global_rule(invalid),
+                "expected invalid global rule to be rejected: {invalid}"
+            );
+            assert_eq!(
+                extract_mihomo_rule_raw_target(invalid),
+                None,
+                "expected raw target None for invalid rule: {invalid}"
+            );
+            assert_eq!(
+                rewrite_mihomo_rule_target(invalid, "AI"),
+                None,
+                "expected rewrite None for invalid rule: {invalid}"
+            );
+            assert!(
+                expand_group_match_rule(invalid, "AI").is_empty(),
+                "expected expand_group_match_rule empty for invalid rule: {invalid}"
+            );
+        }
+
+        // Sub-clause `no-resolve` inside double parens remains valid!
+        let valid_inner_flag = "AND,((NETWORK,UDP),(DST-PORT,443),(GEOIP,CN,no-resolve)),DIRECT";
+        assert!(is_plausible_global_rule(valid_inner_flag));
+        assert_eq!(
+            expand_group_match_rule(valid_inner_flag, "AI"),
+            vec![valid_inner_flag.to_string()]
+        );
+
+        // 4. `*-REGEX` rules preserve commas inside `{1,3}` quantifiers and escaped `\(bar` parens.
+        let regex_global = r"DOMAIN-REGEX,^a{1,3}\.com$,DIRECT";
+        let regex_paren_escaped = r"PROCESS-NAME-REGEX,foo\(bar,AI (日本)";
+        assert!(is_plausible_global_rule(regex_global));
+        assert!(is_plausible_global_rule(regex_paren_escaped));
+        assert_eq!(extract_mihomo_rule_raw_target(regex_global), Some("DIRECT"));
+        assert_eq!(extract_mihomo_rule_target(regex_global), None);
+        assert_eq!(
+            extract_mihomo_rule_target(regex_paren_escaped),
+            Some("AI (日本)")
+        );
+        assert_eq!(
+            rewrite_mihomo_rule_target(regex_paren_escaped, "Node (2)").as_deref(),
+            Some(r"PROCESS-NAME-REGEX,foo\(bar,Node (2)")
+        );
+        // Group match_rules with `{1,3}` quantifier and no target must append `,group_name` intact!
+        assert_eq!(
+            expand_group_match_rule(r"DOMAIN-REGEX,^a{1,3}\.com$", "AI (日本)"),
+            vec![r"DOMAIN-REGEX,^a{1,3}\.com$,AI (日本)".to_string()]
+        );
+        assert_eq!(
+            expand_group_match_rule(regex_global, "AI (日本)"),
+            vec![regex_global.to_string()]
+        );
+        assert_eq!(
+            expand_group_match_rule(r"DOMAIN-REGEX,^a{1,3}\.com$,AI (日本)", "AI (日本)"),
+            vec![r"DOMAIN-REGEX,^a{1,3}\.com$,AI (日本)".to_string()]
+        );
+
+        // 5. `SUB-RULE` allows single-layer parens and MUST keep returning `None` for target
+        //    extraction and rewriting to avoid false-positive `unknown_rule_target` errors.
+        let sub_single = "SUB-RULE,(NETWORK,TCP),sub-tcp";
+        let sub_double = "SUB-RULE,((DOMAIN,example.com)),sub-chain";
+        assert!(is_plausible_global_rule(sub_single));
+        assert!(is_plausible_global_rule(sub_double));
+        assert_eq!(extract_mihomo_rule_raw_target(sub_single), None);
+        assert_eq!(extract_mihomo_rule_target(sub_single), None);
+        assert_eq!(rewrite_mihomo_rule_target(sub_single, "AI"), None);
+        assert_eq!(extract_mihomo_rule_raw_target(sub_double), None);
+        assert_eq!(rewrite_mihomo_rule_target(sub_double, "AI"), None);
+    }
+
+    #[test]
+    fn stage26_domestic_direct_fake_ip_filter_and_wsf_ai_dns_policies_are_complete() {
+        let cfg = AppConfig::default();
+        let ports = sample_ports();
+        let nodes = vec![sample_node("n1", "Node-JP-01", 443, true)];
+        let group = MultiGroup {
+            id: "g-jp".to_string(),
+            name: "AI (日本)".to_string(),
+            match_rules: vec![
+                "AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT".to_string(),
+                r"DOMAIN-REGEX,^a{1,3}\.com$".to_string(),
+            ],
+            member_node_ids: vec!["n1".to_string()],
+            ..Default::default()
+        };
+        let empty = HashMap::new();
+        let compiled = compile_mihomo_config(&CompileInput {
+            config: &cfg,
+            nodes: &nodes,
+            groups: &[group],
+            relays: &[],
+            controller_secret: "0123456789abcdef0123456789abcdef",
+            allocated_ports: &ports,
+            extra_prepend_rules: &[],
+            extra_fake_ip_filters: &[],
+            group_filtered_members: &empty,
+        })
+        .expect("compile ok");
+        assert!(
+            compiled.validation.ok,
+            "unexpected validation issues: {:?}",
+            compiled.validation.issues
+        );
+
+        let rules: Vec<&str> = compiled.value["rules"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for dom in ["gtimg.cn", "qcloudimg.com", "tencentcs.com", "tencent-cloud.net"] {
+            let expected = format!("DOMAIN-SUFFIX,{dom},DIRECT");
+            assert!(
+                rules.contains(&expected.as_str()),
+                "missing fallback domestic direct rule `{expected}`"
+            );
+        }
+        assert!(rules.contains(&"AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT"));
+        assert!(rules.contains(&r"DOMAIN-REGEX,^a{1,3}\.com$,AI (日本)"));
+
+        let fake_filters: Vec<&str> = compiled.value["dns"]["fake-ip-filter"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        for pat in [
+            "+.wechat.com",
+            "+.wechatpay.com",
+            "+.tenpay.com",
+            "+.qcloudimg.com",
+            "+.tencentcs.com",
+            "+.tencent-cloud.net",
+            "ctldl.windowsupdate.com",
+        ] {
+            assert!(
+                fake_filters.contains(&pat),
+                "missing fake-ip-filter entry `{pat}`"
+            );
+        }
+
+        let ns_policy = compiled.value["dns"]["nameserver-policy"]
+            .as_mapping()
+            .expect("nameserver-policy mapping");
+        for ai_dom in [
+            "+.windsurf.com",
+            "+.codeium.com",
+            "+.codeiumdata.com",
+            "+.devin.ai",
+            "+.cognition.ai",
+            "+.exafunction.com",
+        ] {
+            assert!(
+                ns_policy.contains_key(Value::String(ai_dom.to_string())),
+                "missing AI DNS policy domain `{ai_dom}`"
+            );
+        }
     }
 }

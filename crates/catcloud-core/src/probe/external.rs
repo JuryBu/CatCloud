@@ -102,6 +102,7 @@ pub fn parse_external_probe_output(
         keepalive_60s_ok: parsed.keepalive_60s_ok,
         unlocked_map: parsed.unlocked_map,
         detail: parsed.detail,
+        ..Default::default()
     })
 }
 

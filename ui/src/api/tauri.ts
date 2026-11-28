@@ -288,6 +288,7 @@ export interface FullAppConfig {
   unified_delay?: boolean;
   log_level?: string;
   core_ipv6?: boolean;
+  geodata_mode?: boolean;
   system_proxy?: {
     enabled?: boolean;
     proxy_guard?: { enabled?: boolean; interval_sec?: number };
@@ -420,6 +421,10 @@ export interface ProbeSnapshot {
   google_clean: boolean | null;
   google_risk_mismatch: boolean;
   keepalive_60s_ok: boolean | null;
+  ip_clean?: boolean | null;
+  ip_risk_level?: "clean" | "datacenter" | "proxy_risk" | "unknown" | string | null;
+  ip_asn?: string | null;
+  ip_risk_flags?: string | null;
   unlocked_sites: Record<string, boolean>;
   per_probe_ok?: Record<string, boolean>;
   per_probe_up_mbps: Record<string, number>;
@@ -589,6 +594,10 @@ export interface ExitIpInfo {
   timezone: string;
   google_clean: boolean | null;
   core_running?: boolean;
+  ip_clean?: boolean | null;
+  ip_risk_level?: "clean" | "datacenter" | "proxy_risk" | "unknown" | string | null;
+  ip_asn?: string | null;
+  ip_risk_flags?: string | null;
 }
 
 export type ExitIpInfoDto = ExitIpInfo;
@@ -1107,6 +1116,7 @@ export interface RefreshGeoDbResult {
   ok: boolean;
   updated_targets: string[];
   message: string;
+  reloaded?: boolean;
 }
 
 export interface GeoDataFileStatus {
@@ -1706,8 +1716,15 @@ const MOCK_PROBE_BASE = {
   google_clean: true,
   google_risk_mismatch: false,
   keepalive_60s_ok: true,
+  ip_clean: true,
+  ip_risk_level: "clean" as const,
+  ip_asn: "AS15169 Example Residential ISP",
+  ip_risk_flags: null as string | null,
   unlocked_sites: MOCK_UNLOCKED_ALL,
   per_probe_ok: { builtin_unlock_windsurf: true },
+  per_probe_detail: {
+    builtin_unlock_windsurf: "semantic_windsurf(status=415, ip_risk=clean)",
+  },
 };
 const makeMockProbe = (
   node_id: string,
@@ -1750,7 +1767,7 @@ const makeMockProbeDef = (
   kind: ProbeKind,
   target_url: string,
   timeout_ms: number,
-  expected_status = 204,
+  expected_status: number | null = 204,
   method = "GET",
   body_regex: string | null = null,
   payload_bytes: number | null = null
@@ -1773,7 +1790,16 @@ const MOCK_PROBE_DEFINITIONS: ProbeDefinition[] = [
   makeMockProbeDef("builtin_upload", "上行吞吐 (512KB 快熔断)", "upload", "https://speed.cloudflare.com/__up", 12000, 200, "POST", null, 512 * 1024),
   makeMockProbeDef("builtin_download", "下行吞吐测速", "download", "https://speed.cloudflare.com/__down?bytes=2097152", 12000, 200, "GET", null, 2 * 1024 * 1024),
   makeMockProbeDef("builtin_keepalive_60s", "60s 静默长连接黑洞检测", "keepalive", "https://cp.cloudflare.com/generate_204", 65000),
-  makeMockProbeDef("builtin_unlock_windsurf", "Windsurf / Codeium 解锁", "unlock_regex", "https://windsurf.com", 8000, 200, "GET", "windsurf|codeium"),
+  makeMockProbeDef(
+    "builtin_unlock_windsurf",
+    "Windsurf / Devin AI 纯净解锁",
+    "unlock_regex",
+    "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage",
+    9000,
+    null,
+    "POST",
+    null
+  ),
 ];
 
 const MOCK_GROUPS: MultiGroup[] = [
@@ -2125,6 +2151,87 @@ const DETECTED_BY_PRIORITY: Record<string, number> = {
 
 function detectedByRank(kind: string): number {
   return DETECTED_BY_PRIORITY[kind.trim().toLowerCase()] ?? 0;
+}
+
+const MOCK_LOGICAL_RULE_TYPES = new Set(["AND", "OR", "NOT"]);
+const MOCK_REGEX_RULE_TYPES = new Set([
+  "DOMAIN-REGEX",
+  "PROCESS-NAME-REGEX",
+  "PROCESS-PATH-REGEX",
+]);
+
+function locateMockMihomoRuleTarget(
+  trimmed: string
+): { target: string; start: number; end: number } | null {
+  const firstComma = trimmed.indexOf(",");
+  if (firstComma < 0) return null;
+  const ruleType = trimmed.slice(0, firstComma).trim().toUpperCase();
+  if (!ruleType || ruleType === "SUB-RULE") return null;
+
+  if (ruleType === "MATCH" || ruleType === "FINAL") {
+    let start = firstComma + 1;
+    while (start < trimmed.length && /\s/.test(trimmed[start])) start += 1;
+    const end = trimmed.length;
+    const target = trimmed.slice(start, end).trim();
+    return target ? { target, start, end } : null;
+  }
+
+  if (MOCK_LOGICAL_RULE_TYPES.has(ruleType)) {
+    let i = firstComma + 1;
+    while (i < trimmed.length && /\s/.test(trimmed[i])) i += 1;
+    if (i >= trimmed.length || trimmed[i] !== "(") return null;
+    let depth = 0;
+    let closeIdx = -1;
+    for (; i < trimmed.length; i++) {
+      const ch = trimmed[i];
+      if (ch === "(") {
+        depth += 1;
+      } else if (ch === ")") {
+        depth -= 1;
+        if (depth < 0) return null;
+        if (depth === 0) {
+          closeIdx = i;
+          break;
+        }
+      }
+    }
+    if (closeIdx < 0) return null;
+    let after = closeIdx + 1;
+    while (after < trimmed.length && /\s/.test(trimmed[after])) after += 1;
+    if (after >= trimmed.length || trimmed[after] !== ",") return null;
+    let targetStart = after + 1;
+    while (targetStart < trimmed.length && /\s/.test(trimmed[targetStart])) targetStart += 1;
+    const target = trimmed.slice(targetStart).trim();
+    if (!target || target.includes(",") || /^(no-resolve|src)$/i.test(target)) {
+      return null;
+    }
+    return { target, start: targetStart, end: trimmed.length };
+  }
+
+  // Regex rules and standard rules: scan trailing flags from the right
+  let end = trimmed.length;
+  while (end > firstComma + 1) {
+    const prevComma = trimmed.lastIndexOf(",", end - 1);
+    if (prevComma <= firstComma) break;
+    const seg = trimmed.slice(prevComma + 1, end).trim();
+    if (/^(no-resolve|src)$/i.test(seg)) {
+      end = prevComma;
+      continue;
+    }
+    break;
+  }
+  const targetComma = trimmed.lastIndexOf(",", end - 1);
+  if (targetComma <= firstComma) return null;
+  if (!MOCK_REGEX_RULE_TYPES.has(ruleType)) {
+    const valSegment = trimmed.slice(firstComma + 1, targetComma).trim();
+    if (!valSegment) return null;
+  }
+  let targetStart = targetComma + 1;
+  while (targetStart < end && /\s/.test(trimmed[targetStart])) targetStart += 1;
+  let targetEnd = end;
+  while (targetEnd > targetStart && /\s/.test(trimmed[targetEnd - 1])) targetEnd -= 1;
+  const target = trimmed.slice(targetStart, targetEnd);
+  return target ? { target, start: targetStart, end: targetEnd } : null;
 }
 
 function normalizeAcceleratedProcessStats(raw: unknown): AcceleratedProcessStat[] {
@@ -3038,26 +3145,47 @@ export const catcloudApi = {
     };
   },
 
-  async selectGroupNode(groupId: string, nodeId: string, closeOld = true): Promise<SwitchResult> {
+  async selectGroupNode(
+    groupId: string,
+    nodeId: string,
+    closeOld = true,
+    activateGroup?: boolean
+  ): Promise<SwitchResult> {
     if (isTauriEnv()) {
-      return tauriInvokeOrThrow<SwitchResult>("select_group_node", { groupId, nodeId, closeOld });
+      return tauriInvokeOrThrow<SwitchResult>("select_group_node", {
+        groupId,
+        nodeId,
+        closeOld,
+        activateGroup: activateGroup ?? null,
+      });
     }
     const group = mockGroups.find((g) => g.id === groupId);
     const prevId = group?.active_node_id ?? null;
     if (group) group.active_node_id = nodeId;
     const node = mockNodes.find((n) => n.id === nodeId) ?? mockNodes[0];
     const snap = mockProbes[nodeId];
-    mockRuntime = {
-      ...mockRuntime,
-      route_mode: "group",
-      active_group_id: groupId,
-      active_group_name: group?.name ?? mockRuntime.active_group_name,
-      active_node_id: node.id,
-      active_node_name: node.name,
-      active_node_region: node.region_code,
-      active_node_latency_ms: snap?.latency_ms ?? null,
-      active_node_up_mbps: snap?.up_mbps ?? null,
-    };
+    const shouldActivate =
+      activateGroup !== undefined
+        ? activateGroup
+        : !(
+            Boolean(group?.independent_routing) &&
+            mockRuntime.route_mode === "group" &&
+            Boolean(mockRuntime.active_group_id) &&
+            mockRuntime.active_group_id !== groupId
+          );
+    if (shouldActivate) {
+      mockRuntime = {
+        ...mockRuntime,
+        route_mode: "group",
+        active_group_id: groupId,
+        active_group_name: group?.name ?? mockRuntime.active_group_name,
+        active_node_id: node.id,
+        active_node_name: node.name,
+        active_node_region: node.region_code,
+        active_node_latency_ms: snap?.latency_ms ?? null,
+        active_node_up_mbps: snap?.up_mbps ?? null,
+      };
+    }
     return {
       group_id: groupId,
       previous_node_id: prevId,
@@ -4876,12 +5004,9 @@ export const catcloudApi = {
     for (const raw of rules) {
       const trimmed = raw.trim();
       if (!trimmed || trimmed.startsWith("#")) continue;
-      const parts = trimmed.split(",").map((s) => s.trim());
-      if (parts.length < 3) continue;
-      while (parts.length > 2 && /^(no-resolve|src)$/i.test(parts[parts.length - 1])) {
-        parts.pop();
-      }
-      const target = parts[parts.length - 1];
+      const span = locateMockMihomoRuleTarget(trimmed);
+      if (!span) continue;
+      const target = span.target;
       if (!target || validTargets.has(target) || validTargets.has(target.toUpperCase())) continue;
       total += 1;
       const cur = counts.get(target) ?? { count: 0, samples: [] };
@@ -4924,14 +5049,11 @@ export const catcloudApi = {
     const processList = (list: string[]) => {
       const next: string[] = [];
       for (const raw of list) {
-        const parts = raw.trim().split(",").map((s) => s.trim());
-        let idx = parts.length - 1;
-        while (idx > 1 && /^(no-resolve|src)$/i.test(parts[idx])) idx -= 1;
-        const target = parts[idx];
-        if (target && badSet.has(target)) {
+        const trimmed = raw.trim();
+        const span = locateMockMihomoRuleTarget(trimmed);
+        if (span && badSet.has(span.target)) {
           if (mode === "rewrite") {
-            parts[idx] = dest;
-            next.push(parts.join(","));
+            next.push(`${trimmed.slice(0, span.start)}${dest}${trimmed.slice(span.end)}`);
             rewritten += 1;
           } else {
             removed += 1;
@@ -5304,6 +5426,7 @@ export const catcloudApi = {
       ok: true,
       updated_targets: targets ?? ["geoip", "geosite", "mmdb", "asn"],
       message: "浏览器预览模式：已模拟刷新地理库",
+      reloaded: true,
     };
   },
 

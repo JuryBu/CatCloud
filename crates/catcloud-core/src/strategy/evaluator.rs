@@ -39,6 +39,7 @@ pub fn build_eval_context_for_probe(
             multiplier,
             keepalive_ok: false,
             google_clean: false,
+            ip_clean: false,
             unlocked: false,
             is_443_native: node.is_443_native,
             ok: false,
@@ -117,6 +118,7 @@ pub fn build_eval_context_for_probe(
 
     let keepalive_ok = snap.keepalive_60s_ok.unwrap_or(false);
     let google_clean = snap.google_clean.unwrap_or(false);
+    let ip_clean = snap.ip_clean.unwrap_or(false);
     let unlocked = !snap.unlocked_sites.is_empty() && snap.unlocked_sites.values().all(|&v| v);
 
     EvalContext {
@@ -128,6 +130,7 @@ pub fn build_eval_context_for_probe(
         multiplier,
         keepalive_ok,
         google_clean,
+        ip_clean,
         unlocked,
         is_443_native: node.is_443_native,
         ok,
@@ -482,7 +485,10 @@ pub fn evaluate_group_candidates_with_runtime(
         compare_candidates_with_runtime_desc(a, b, snapshots, health_pool, now)
     });
     gate_rejected.sort_by(|a, b| {
-        compare_candidates_with_runtime_desc(a, b, snapshots, health_pool, now)
+        a.failed_hard_gates
+            .len()
+            .cmp(&b.failed_hard_gates.len())
+            .then_with(|| compare_candidates_with_runtime_desc(a, b, snapshots, health_pool, now))
     });
 
     let active_assessment = match group.active_node_id.as_deref().map(str::trim) {
@@ -570,20 +576,31 @@ pub(crate) fn score_node_with_group_formula(
     Ok((score, formula.uses_multiplier()))
 }
 
-fn evaluate_hard_gates(
+pub(crate) fn evaluate_hard_gates(
     hard_gates: &[(String, FormulaExpr)],
     ctx: &EvalContext,
     snapshot: Option<&ProbeSnapshot>,
 ) -> CatResult<Vec<String>> {
     let keepalive_untested = snapshot.and_then(|s| s.keepalive_60s_ok).is_none();
+    let ip_clean_untested = snapshot.and_then(|s| s.ip_clean).is_none();
     let mut failed = Vec::new();
     for (raw, expr) in hard_gates {
-        let passed = if keepalive_untested && expr.uses_keepalive_ok() {
-            // Node has never been tested for 60s keep-alive (`keepalive_60s_ok == None`):
-            // treat `keepalive_ok` as pass within hard gates so untested nodes are not falsely
-            // eliminated while still enforcing all other predicates in compound expressions.
+        let need_keepalive_override = keepalive_untested && expr.uses_keepalive_ok();
+        let need_ip_clean_override = ip_clean_untested && expr.uses_ip_clean();
+        let passed = if need_keepalive_override || need_ip_clean_override {
             let mut gate_ctx = ctx.clone();
-            gate_ctx.keepalive_ok = true;
+            if need_keepalive_override {
+                // Node has never been tested for 60s keep-alive (`keepalive_60s_ok == None`):
+                // treat `keepalive_ok` as pass within hard gates so untested nodes are not falsely
+                // eliminated while still enforcing all other predicates in compound expressions.
+                gate_ctx.keepalive_ok = true;
+            }
+            if need_ip_clean_override {
+                // Node has never been tested for IP purity (`ip_clean == None`):
+                // treat `ip_clean` as pass within hard gates so untested nodes are not falsely
+                // eliminated; explicit `Some(false)` is strictly enforced.
+                gate_ctx.ip_clean = true;
+            }
             expr.eval_bool(&gate_ctx)?
         } else {
             expr.eval_bool(ctx)?
@@ -697,6 +714,10 @@ fn has_probe_data(snap: Option<&ProbeSnapshot>) -> bool {
         || s.down_mbps.is_some()
         || s.google_clean.is_some()
         || s.keepalive_60s_ok.is_some()
+        || s.ip_clean.is_some()
+        || s.ip_risk_level
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
         || !s.per_probe_ok.is_empty()
         || !s.unlocked_sites.is_empty()
 }
@@ -1366,5 +1387,199 @@ mod tests {
             build_eval_context_for_probe(&node, Some(&mixed_snap), Some("custom_latency_hk"));
         assert!(!ctx_primary_failed.ok);
         assert_eq!(ctx_primary_failed.ping_ms, DEFAULT_MISSING_PING_MS);
+    }
+
+    #[test]
+    fn ip_clean_hard_gate_allows_untested_none_rejects_false_and_combines_with_keepalive() {
+        let nodes = vec![
+            test_node("tw-clean", "TW-Residential", "TW"),
+            test_node("tw-untested", "TW-Untested", "TW"),
+            test_node("tw-dc", "TW-Datacenter", "TW"),
+            test_node("tw-dirty-google", "TW-GoogleDirty", "TW"),
+            test_node("tw-ka-fail", "TW-KeepaliveFail", "TW"),
+        ];
+
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "tw-clean".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-clean".to_string(),
+                tested_at: "2026-11-28T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(45.0),
+                up_mbps: Some(20.0),
+                down_mbps: Some(100.0),
+                google_clean: Some(true),
+                keepalive_60s_ok: Some(true),
+                ip_clean: Some(true),
+                ip_risk_level: Some("clean".to_string()),
+                ..Default::default()
+            },
+        );
+        // Both keepalive_60s_ok and ip_clean are None -> compound gate MUST allow both independently!
+        snaps.insert(
+            "tw-untested".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-untested".to_string(),
+                tested_at: "2026-11-28T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(40.0),
+                up_mbps: Some(20.0),
+                down_mbps: Some(100.0),
+                google_clean: Some(true),
+                keepalive_60s_ok: None,
+                ip_clean: None,
+                ..Default::default()
+            },
+        );
+        // Explicitly measured `ip_clean == Some(false)` -> MUST be rejected.
+        snaps.insert(
+            "tw-dc".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-dc".to_string(),
+                tested_at: "2026-11-28T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(20.0),
+                up_mbps: Some(60.0),
+                down_mbps: Some(300.0),
+                google_clean: Some(true),
+                keepalive_60s_ok: Some(true),
+                ip_clean: Some(false),
+                ip_risk_level: Some("datacenter".to_string()),
+                ..Default::default()
+            },
+        );
+        // Untested keepalive/ip_clean, but google_clean == false -> compound gate MUST reject!
+        snaps.insert(
+            "tw-dirty-google".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-dirty-google".to_string(),
+                tested_at: "2026-11-28T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(25.0),
+                google_clean: Some(false),
+                keepalive_60s_ok: None,
+                ip_clean: None,
+                ..Default::default()
+            },
+        );
+        // Untested ip_clean, but explicit keepalive_60s_ok == Some(false) -> MUST reject!
+        snaps.insert(
+            "tw-ka-fail".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-ka-fail".to_string(),
+                tested_at: "2026-11-28T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(25.0),
+                google_clean: Some(true),
+                keepalive_60s_ok: Some(false),
+                ip_clean: None,
+                ..Default::default()
+            },
+        );
+
+        let group = MultiGroup {
+            id: "grp-ip-clean".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec![
+                "tw-clean".to_string(),
+                "tw-untested".to_string(),
+                "tw-dc".to_string(),
+                "tw-dirty-google".to_string(),
+                "tw-ka-fail".to_string(),
+            ],
+            hard_gates: vec!["google_clean == 1 && keepalive_ok == 1 && ip_clean == 1".to_string()],
+            formula_expr: "up_mbps * 10 - ping_ms + ip_clean * 120".to_string(),
+            ..Default::default()
+        };
+
+        let rep = evaluate_group_candidates(&group, &nodes, &snaps).unwrap();
+        let passed_ids: Vec<&str> = rep.gate_passed.iter().map(|c| c.node_id.as_str()).collect();
+        // `tw-clean` gets +120 ip_clean bonus and ranks #1 ahead of `tw-untested`.
+        assert_eq!(passed_ids, vec!["tw-clean", "tw-untested"]);
+
+        let rejected_ids: HashSet<&str> = rep
+            .gate_rejected
+            .iter()
+            .map(|c| c.node_id.as_str())
+            .collect();
+        assert!(rejected_ids.contains("tw-dc"));
+        assert!(rejected_ids.contains("tw-dirty-google"));
+        assert!(rejected_ids.contains("tw-ka-fail"));
+    }
+
+    #[test]
+    fn gate_rejected_orders_fewer_failed_gates_ahead_of_higher_raw_score() {
+        let nodes = vec![
+            test_node("tw-akari-fast", "TW-Akari-Fast", "TW"),
+            test_node("tw-dc-slower", "TW-DC-Slower", "TW"),
+        ];
+
+        let mut akari_sites = HashMap::new();
+        akari_sites.insert("windsurf".to_string(), false);
+        let mut dc_sites = HashMap::new();
+        dc_sites.insert("windsurf".to_string(), true);
+
+        let mut snaps = HashMap::new();
+        // Akari has much higher throughput / lower ping (higher raw score) BUT fails BOTH gates.
+        snaps.insert(
+            "tw-akari-fast".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-akari-fast".to_string(),
+                tested_at: "2026-11-28T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(18.0),
+                up_mbps: Some(80.0),
+                down_mbps: Some(300.0),
+                ip_clean: Some(false),
+                ip_risk_level: Some("proxy_risk".to_string()),
+                unlocked_sites: akari_sites,
+                ..Default::default()
+            },
+        );
+        // Datacenter node has lower raw score BUT passes windsurf and only fails `ip_clean == 1`.
+        snaps.insert(
+            "tw-dc-slower".to_string(),
+            ProbeSnapshot {
+                node_id: "tw-dc-slower".to_string(),
+                tested_at: "2026-11-28T00:00:00Z".to_string(),
+                ok: true,
+                latency_ms: Some(65.0),
+                up_mbps: Some(12.0),
+                down_mbps: Some(80.0),
+                ip_clean: Some(false),
+                ip_risk_level: Some("datacenter".to_string()),
+                unlocked_sites: dc_sites,
+                ..Default::default()
+            },
+        );
+
+        let group = MultiGroup {
+            id: "grp-wsf-strict".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["tw-akari-fast".to_string(), "tw-dc-slower".to_string()],
+            hard_gates: vec![
+                r#"site_unlocked("windsurf") == 1"#.to_string(),
+                "ip_clean == 1".to_string(),
+            ],
+            formula_expr: "up_mbps * 10 - ping_ms".to_string(),
+            ..Default::default()
+        };
+
+        let rep = evaluate_group_candidates(&group, &nodes, &snaps).unwrap();
+        assert!(rep.all_failed_hard_gates);
+        assert_eq!(rep.gate_rejected.len(), 2);
+        assert_eq!(rep.gate_rejected[0].node_id, "tw-dc-slower");
+        assert_eq!(rep.gate_rejected[0].failed_hard_gates.len(), 1);
+        assert_eq!(rep.gate_rejected[1].node_id, "tw-akari-fast");
+        assert_eq!(rep.gate_rejected[1].failed_hard_gates.len(), 2);
+
+        // `has_probe_data` must recognize IP purity metadata even when latency/speed are absent.
+        let ip_only = ProbeSnapshot {
+            node_id: "n-ip-only".to_string(),
+            ip_risk_level: Some("clean".to_string()),
+            ..Default::default()
+        };
+        assert!(has_probe_data(Some(&ip_only)));
     }
 }

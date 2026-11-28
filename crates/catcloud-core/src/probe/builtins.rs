@@ -47,6 +47,11 @@ const CHATGPT_API_MODELS_URL: &str = "https://api.openai.com/v1/models";
 const CHATGPT_AB_URL: &str = "https://ab.chatgpt.com/v1/rgstr";
 const GEMINI_API_MODELS_CHECK_URL: &str =
     "https://generativelanguage.googleapis.com/v1beta/models?key=catcloud_probe_check";
+const WINDSURF_API_CHAT_URL: &str =
+    "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage";
+const IPQUERY_JSON_URL: &str = "https://api.ipquery.io/?format=json";
+const IPAPI_JSON_URL: &str =
+    "http://ip-api.com/json/?fields=status,countryCode,isp,org,as,mobile,proxy,hosting";
 
 /// Unsupported jurisdictions for Claude / ChatGPT Cloudflare trace pre-filtering.
 const AI_TRACE_BLOCKED_COUNTRIES: &[&str] =
@@ -957,6 +962,7 @@ pub fn infer_unlock_site_key(def: &ProbeDefinition) -> String {
             }
             if h.contains("windsurf.com")
                 || h.contains("codeium.com")
+                || h.contains("codeiumdata.com")
                 || h.contains("exafunction.com")
             {
                 return "windsurf".to_string();
@@ -1164,6 +1170,467 @@ fn evaluate_gemini_semantic_unlock(
     (unlocked, detail)
 }
 
+/// Aggregated exit-IP purity / risk intelligence collected from dual credential-free sources
+/// (`api.ipquery.io` + `ip-api.com`) strictly through the caller's proxied HTTP client.
+/// Never stores plaintext exit IP addresses.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IpPuritySignals {
+    pub country_code: Option<String>,
+    pub ip_clean: Option<bool>,
+    pub ip_risk_level: String, // "clean" | "datacenter" | "proxy_risk" | "unknown"
+    pub ip_asn: Option<String>,
+    pub ip_risk_flags: Option<String>,
+    pub risk_score: Option<u32>,
+    pub sources_used: Vec<&'static str>,
+}
+
+/// Captured response signals from `POST https://server.codeium.com/.../GetChatMessage`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WindsurfApiResponseSignals {
+    pub status: Option<u16>,
+    pub via_header: Option<String>,
+    pub has_accept_post: bool,
+    pub content_type: Option<String>,
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IpQuerySourceData {
+    country_code: Option<String>,
+    asn: Option<String>,
+    is_proxy: Option<bool>,
+    is_vpn: Option<bool>,
+    is_tor: Option<bool>,
+    is_datacenter: Option<bool>,
+    risk_score: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IpApiSourceData {
+    country_code: Option<String>,
+    asn: Option<String>,
+    proxy: Option<bool>,
+    hosting: Option<bool>,
+}
+
+const WINDSURF_BLOCK_MARKERS: &[&str] = &[
+    "just a moment",
+    "attention required",
+    "cf-challenge",
+    "challenge-platform",
+    "enable javascript and cookies",
+    "sorry, you have been blocked",
+    "not available in your country",
+    "not available in your region",
+    "unsupported_country",
+    "unsupported_region",
+    "access denied",
+];
+
+fn sanitize_asn_text(raw: &str) -> Option<String> {
+    let cleaned_tokens: Vec<String> = raw
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .split_whitespace()
+        .filter_map(|tok| {
+            let trimmed = tok.trim_matches(|c: char| matches!(c, '[' | ']' | '(' | ')' | ',' | ';' | ':'));
+            if trimmed.parse::<std::net::IpAddr>().is_ok() {
+                None
+            } else {
+                Some(tok.to_string())
+            }
+        })
+        .collect();
+    let cleaned = cleaned_tokens.join(" ");
+    if cleaned.is_empty() {
+        return None;
+    }
+    Some(cleaned)
+}
+
+fn starts_with_ascii_as(s: &str) -> bool {
+    s.as_bytes()
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"as"))
+}
+
+fn normalize_asn_prefix(raw: &str) -> String {
+    let mut parts = raw.splitn(2, ' ');
+    let first = parts.next().unwrap_or("");
+    let rest = parts.next().map(str::trim).unwrap_or("");
+
+    let mut stripped = first;
+    while starts_with_ascii_as(stripped) {
+        let tail = &stripped[2..];
+        if !tail.is_empty()
+            && (tail.bytes().all(|b| b.is_ascii_digit()) || starts_with_ascii_as(tail))
+        {
+            stripped = tail;
+        } else {
+            break;
+        }
+    }
+
+    let norm_first = if !stripped.is_empty() && stripped.bytes().all(|b| b.is_ascii_digit()) {
+        format!("AS{stripped}")
+    } else {
+        first.to_string()
+    };
+
+    if rest.is_empty() {
+        norm_first
+    } else {
+        format!("{norm_first} {rest}")
+    }
+}
+
+fn format_asn_label(asn_raw: Option<&str>, org_raw: Option<&str>) -> Option<String> {
+    let asn_clean = asn_raw.and_then(sanitize_asn_text).map(|s| normalize_asn_prefix(&s));
+    let org_clean = org_raw.and_then(sanitize_asn_text);
+
+    match (asn_clean, org_clean) {
+        (Some(asn), Some(org)) => {
+            let asn_lower = asn.to_ascii_lowercase();
+            let org_lower = org.to_ascii_lowercase();
+            if asn_lower.contains(&org_lower) {
+                Some(asn)
+            } else if org_lower.starts_with(&asn_lower) {
+                Some(normalize_asn_prefix(&org))
+            } else {
+                Some(format!("{asn} {org}"))
+            }
+        }
+        (Some(asn), None) => Some(asn),
+        (None, Some(org)) => Some(org),
+        (None, None) => None,
+    }
+}
+
+fn parse_ipquery_json(status: u16, body: &str) -> Option<IpQuerySourceData> {
+    if status != 200 {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let risk = val.get("risk").and_then(serde_json::Value::as_object)?;
+
+    let is_proxy = risk.get("is_proxy").and_then(serde_json::Value::as_bool);
+    let is_vpn = risk.get("is_vpn").and_then(serde_json::Value::as_bool);
+    let is_tor = risk.get("is_tor").and_then(serde_json::Value::as_bool);
+    let is_datacenter = risk.get("is_datacenter").and_then(serde_json::Value::as_bool);
+    let risk_score = risk.get("risk_score").and_then(|v| {
+        v.as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .or_else(|| {
+                v.as_f64()
+                    .filter(|f| f.is_finite() && *f >= 0.0)
+                    .map(|f| f.round() as u32)
+            })
+    });
+
+    // Reject empty/degraded `risk: {}` objects so missing fields are NEVER mistaken for `false`.
+    if is_proxy.is_none()
+        && is_vpn.is_none()
+        && is_tor.is_none()
+        && is_datacenter.is_none()
+        && risk_score.is_none()
+    {
+        return None;
+    }
+
+    let country_code = val
+        .get("location")
+        .and_then(|l| l.get("country_code"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_country_code);
+    let isp_obj = val.get("isp");
+    let asn_raw = isp_obj
+        .and_then(|i| i.get("asn"))
+        .and_then(serde_json::Value::as_str);
+    let org_raw = isp_obj
+        .and_then(|i| {
+            i.get("org")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| i.get("isp").and_then(serde_json::Value::as_str))
+        });
+
+    Some(IpQuerySourceData {
+        country_code,
+        asn: format_asn_label(asn_raw, org_raw),
+        is_proxy,
+        is_vpn,
+        is_tor,
+        is_datacenter,
+        risk_score,
+    })
+}
+
+fn parse_ipapi_json(status: u16, body: &str) -> Option<IpApiSourceData> {
+    if status != 200 {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(body.trim()).ok()?;
+    let status_ok = val
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("success"));
+    if !status_ok {
+        return None;
+    }
+
+    let proxy = val.get("proxy").and_then(serde_json::Value::as_bool);
+    let hosting = val.get("hosting").and_then(serde_json::Value::as_bool);
+    if proxy.is_none() && hosting.is_none() {
+        return None;
+    }
+
+    let country_code = val
+        .get("countryCode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(normalize_country_code);
+    let as_raw = val.get("as").and_then(serde_json::Value::as_str);
+    let org_raw = val
+        .get("org")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| val.get("isp").and_then(serde_json::Value::as_str));
+
+    Some(IpApiSourceData {
+        country_code,
+        asn: format_asn_label(as_raw, org_raw),
+        proxy,
+        hosting,
+    })
+}
+
+fn merge_ip_purity_signals(
+    ipq: Option<&IpQuerySourceData>,
+    ipapi: Option<&IpApiSourceData>,
+) -> IpPuritySignals {
+    let mut sources_used = Vec::new();
+    if ipq.is_some() {
+        sources_used.push("ipquery");
+    }
+    if ipapi.is_some() {
+        sources_used.push("ip-api");
+    }
+
+    if sources_used.is_empty() {
+        return IpPuritySignals {
+            country_code: None,
+            ip_clean: None,
+            ip_risk_level: "unknown".to_string(),
+            ip_asn: None,
+            ip_risk_flags: None,
+            risk_score: None,
+            sources_used,
+        };
+    }
+
+    let ipq_cc = ipq.and_then(|d| d.country_code.as_deref());
+    let ipapi_cc = ipapi.and_then(|d| d.country_code.as_deref());
+    // Conservative union for geo-blocking: if either source flags a blocked country (e.g. HK/CN
+    // on broadcast IPs), keep the blocked country code so geo_blocked is never masked.
+    let country_code = if let Some(cc) = ipq_cc.filter(|c| is_ai_trace_country_blocked(c)) {
+        Some(cc.to_string())
+    } else if let Some(cc) = ipapi_cc.filter(|c| is_ai_trace_country_blocked(c)) {
+        Some(cc.to_string())
+    } else {
+        ipq_cc.or(ipapi_cc).map(ToString::to_string)
+    };
+    let ip_asn = ipq
+        .and_then(|d| d.asn.clone())
+        .or_else(|| ipapi.and_then(|d| d.asn.clone()));
+    let risk_score = ipq.and_then(|d| d.risk_score);
+
+    let is_proxy_flag =
+        ipapi.and_then(|d| d.proxy) == Some(true) || ipq.and_then(|d| d.is_proxy) == Some(true);
+    let is_tor_flag = ipq.and_then(|d| d.is_tor) == Some(true);
+    let is_vpn_flag = ipq.and_then(|d| d.is_vpn) == Some(true);
+    let is_hosting_flag = ipq.and_then(|d| d.is_datacenter) == Some(true)
+        || ipapi.and_then(|d| d.hosting) == Some(true);
+
+    let is_proxy_risk = is_proxy_flag || is_tor_flag || risk_score.is_some_and(|s| s >= 80);
+    let is_datacenter = is_hosting_flag || is_vpn_flag;
+
+    let mut flags: Vec<String> = Vec::new();
+    if is_proxy_flag {
+        flags.push("proxy".to_string());
+    }
+    if is_tor_flag {
+        flags.push("tor".to_string());
+    }
+    if is_vpn_flag {
+        flags.push("vpn".to_string());
+    }
+    if is_hosting_flag {
+        flags.push("datacenter".to_string());
+    }
+    let is_medium_risk_score = risk_score.is_some_and(|s| (50..80).contains(&s));
+    if let Some(score) = risk_score {
+        if score >= 50 {
+            flags.push(format!("risk={score}"));
+        }
+    }
+    let ip_risk_flags = if flags.is_empty() {
+        None
+    } else {
+        Some(flags.join(","))
+    };
+
+    let any_proxy_confirmed_false = ipq.is_some_and(|d| d.is_proxy == Some(false))
+        || ipapi.is_some_and(|d| d.proxy == Some(false));
+    let any_dc_confirmed_false = ipq.is_some_and(|d| d.is_datacenter == Some(false))
+        || ipapi.is_some_and(|d| d.hosting == Some(false));
+
+    let (ip_risk_level, ip_clean) = if is_proxy_risk {
+        ("proxy_risk".to_string(), Some(false))
+    } else if is_datacenter || is_medium_risk_score {
+        ("datacenter".to_string(), Some(false))
+    } else if any_proxy_confirmed_false && any_dc_confirmed_false {
+        ("clean".to_string(), Some(true))
+    } else {
+        ("unknown".to_string(), None)
+    };
+
+    IpPuritySignals {
+        country_code,
+        ip_clean,
+        ip_risk_level,
+        ip_asn,
+        ip_risk_flags,
+        risk_score,
+        sources_used,
+    }
+}
+
+/// Query dual credential-free IP risk sources (`api.ipquery.io` + `ip-api.com`) concurrently
+/// within a strict 4-second overall budget through the caller's proxied `client`.
+pub async fn query_ip_purity_signals(client: &reqwest::Client) -> IpPuritySignals {
+    let work = async {
+        let ipq_fut = async {
+            let resp = client
+                .get(IPQUERY_JSON_URL)
+                .timeout(Duration::from_millis(3500))
+                .send()
+                .await
+                .ok()?;
+            let status = resp.status().as_u16();
+            let bytes = drain_capped_body(resp, 32 * 1024).await.ok()?;
+            let body = String::from_utf8_lossy(&bytes);
+            parse_ipquery_json(status, &body)
+        };
+        let ipapi_fut = async {
+            let resp = client
+                .get(IPAPI_JSON_URL)
+                .timeout(Duration::from_millis(3000))
+                .send()
+                .await
+                .ok()?;
+            let status = resp.status().as_u16();
+            let bytes = drain_capped_body(resp, 32 * 1024).await.ok()?;
+            let body = String::from_utf8_lossy(&bytes);
+            parse_ipapi_json(status, &body)
+        };
+        let (ipq, ipapi) = tokio::join!(ipq_fut, ipapi_fut);
+        merge_ip_purity_signals(ipq.as_ref(), ipapi.as_ref())
+    };
+
+    match tokio::time::timeout(Duration::from_secs(4), work).await {
+        Ok(signals) => signals,
+        Err(_) => IpPuritySignals {
+            ip_risk_level: "unknown".to_string(),
+            ..Default::default()
+        },
+    }
+}
+
+/// Pure semantic evaluator for `builtin_unlock_windsurf` combining Codeium ConnectRPC gateway
+/// reachability with dual-source IP purity signals.
+pub fn evaluate_windsurf_semantic_unlock(
+    api: &WindsurfApiResponseSignals,
+    ip: &IpPuritySignals,
+) -> (bool, String) {
+    let country_code = ip.country_code.as_deref().and_then(normalize_country_code);
+    let geo_blocked = country_code
+        .as_deref()
+        .is_some_and(is_ai_trace_country_blocked);
+
+    let (api_ok, api_reason) = match api.status {
+        Some(status) => {
+            let body_lower = api.body.as_deref().unwrap_or("").to_ascii_lowercase();
+            let marker_blocked = WINDSURF_BLOCK_MARKERS
+                .iter()
+                .any(|m| body_lower.contains(m));
+            if matches!(status, 403 | 429 | 451) || marker_blocked {
+                (
+                    false,
+                    format!("blocked(status={status},marker={marker_blocked})"),
+                )
+            } else if status >= 500 {
+                (false, format!("server_error(status={status})"))
+            } else if matches!(status, 415 | 400 | 401 | 404) {
+                let has_google_via = api
+                    .via_header
+                    .as_deref()
+                    .is_some_and(|v| v.to_ascii_lowercase().contains("google"));
+                let has_structured_api_ct = api.content_type.as_deref().is_some_and(|ct| {
+                    let lower = ct.to_ascii_lowercase();
+                    lower.contains("json") || lower.contains("grpc") || lower.contains("connect")
+                });
+                let has_plain_ct = api
+                    .content_type
+                    .as_deref()
+                    .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/plain"));
+                let gateway_ok = has_google_via
+                    || api.has_accept_post
+                    || has_structured_api_ct
+                    || (status == 415 && has_plain_ct);
+                if gateway_ok {
+                    (true, format!("ok(status={status})"))
+                } else {
+                    (false, format!("missing_gateway_signature(status={status})"))
+                }
+            } else {
+                (false, format!("unexpected_status({status})"))
+            }
+        }
+        None => (false, "request_failed".to_string()),
+    };
+
+    let risk_level = if ip.ip_risk_level.trim().is_empty() {
+        "unknown"
+    } else {
+        ip.ip_risk_level.as_str()
+    };
+    let is_proxy_risk = risk_level == "proxy_risk";
+    let unlocked = api_ok && !geo_blocked && !is_proxy_risk;
+
+    let reason = if geo_blocked {
+        "geo_blocked"
+    } else if !api_ok {
+        "api_unreachable_or_blocked"
+    } else if is_proxy_risk {
+        "high_risk_proxy_ip"
+    } else if risk_level == "datacenter" {
+        "ok_datacenter_advisory"
+    } else if risk_level == "clean" {
+        "ok_clean"
+    } else {
+        "ok_ip_risk_unavailable"
+    };
+
+    let flags_display = ip.ip_risk_flags.as_deref().unwrap_or("");
+    let asn_display = ip.ip_asn.as_deref().unwrap_or("NONE");
+    let cc_display = country_code.as_deref().unwrap_or("NONE");
+
+    let detail = format!(
+        "semantic_windsurf: unlocked={unlocked}, reason={reason}, api={api_reason}, ip_risk={risk_level}, flags=[{flags_display}], asn={asn_display}, cc={cc_display}"
+    );
+    (unlocked, detail)
+}
+
 async fn run_builtin_ai_semantic_unlock_probe(
     client: &reqwest::Client,
     node_id: &str,
@@ -1172,7 +1639,12 @@ async fn run_builtin_ai_semantic_unlock_probe(
 ) -> ProbeResultRecord {
     let timeout = Duration::from_millis(def.timeout_ms.max(500));
 
-    let (unlocked, latency_ms, detail) = match def.id.trim() {
+    let (unlocked, latency_ms, detail, ip_purity): (
+        bool,
+        Option<f64>,
+        String,
+        Option<IpPuritySignals>,
+    ) = match def.id.trim() {
         "builtin_unlock_claude" => {
             let trace_fut = async {
                 let Ok(resp) = client.get(CLAUDE_TRACE_URL).timeout(timeout).send().await else {
@@ -1210,7 +1682,7 @@ async fn run_builtin_ai_semantic_unlock_probe(
                 api_status,
                 api_body.as_deref(),
             );
-            (ok, api_ms, detail)
+            (ok, api_ms, detail, None)
         }
         "builtin_unlock_chatgpt" => {
             let trace_fut = async {
@@ -1260,7 +1732,7 @@ async fn run_builtin_ai_semantic_unlock_probe(
                 ab_status,
                 ab_body.as_deref(),
             );
-            (ok, api_ms, detail)
+            (ok, api_ms, detail, None)
         }
         "builtin_unlock_gemini" => {
             let api_fut = async {
@@ -1318,9 +1790,60 @@ async fn run_builtin_ai_semantic_unlock_probe(
                 ai_redirect.as_deref(),
                 ai_body.as_deref(),
             );
-            (ok, api_ms, detail)
+            (ok, api_ms, detail, None)
         }
-        _ => (false, None, format!("unsupported semantic probe {}", def.id)),
+        "builtin_unlock_windsurf" => {
+            let api_fut = async {
+                let started = Instant::now();
+                match client
+                    .post(WINDSURF_API_CHAT_URL)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body("{}")
+                    .timeout(timeout)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        let status = resp.status().as_u16();
+                        let elapsed_ms = round2(started.elapsed().as_secs_f64() * 1000.0);
+                        let via_header = resp
+                            .headers()
+                            .get("via")
+                            .and_then(|v| v.to_str().ok())
+                            .map(ToString::to_string);
+                        let has_accept_post = resp.headers().contains_key("accept-post");
+                        let content_type = resp
+                            .headers()
+                            .get(CONTENT_TYPE)
+                            .and_then(|v| v.to_str().ok())
+                            .map(ToString::to_string);
+                        let bytes = drain_capped_body(resp, 32 * 1024).await.unwrap_or_default();
+                        let body = String::from_utf8_lossy(&bytes).into_owned();
+                        (
+                            WindsurfApiResponseSignals {
+                                status: Some(status),
+                                via_header,
+                                has_accept_post,
+                                content_type,
+                                body: Some(body),
+                            },
+                            Some(elapsed_ms),
+                        )
+                    }
+                    Err(_) => (WindsurfApiResponseSignals::default(), None),
+                }
+            };
+            let ip_fut = query_ip_purity_signals(client);
+            let ((api_signals, api_ms), ip_signals) = tokio::join!(api_fut, ip_fut);
+            let (ok, detail) = evaluate_windsurf_semantic_unlock(&api_signals, &ip_signals);
+            (ok, api_ms, detail, Some(ip_signals))
+        }
+        _ => (
+            false,
+            None,
+            format!("unsupported semantic probe {}", def.id),
+            None,
+        ),
     };
 
     let mut unlocked_map = HashMap::new();
@@ -1328,6 +1851,18 @@ async fn run_builtin_ai_semantic_unlock_probe(
     if def.id != site_key && !def.id.is_empty() {
         unlocked_map.insert(def.id.clone(), unlocked);
     }
+
+    let (ip_clean, ip_risk_level, ip_asn, ip_risk_flags) = match ip_purity {
+        Some(sig) => {
+            let level = if sig.ip_risk_level.trim().is_empty() {
+                "unknown".to_string()
+            } else {
+                sig.ip_risk_level
+            };
+            (sig.ip_clean, Some(level), sig.ip_asn, sig.ip_risk_flags)
+        }
+        None => (None, None, None, None),
+    };
 
     ProbeResultRecord {
         node_id: node_id.to_string(),
@@ -1337,6 +1872,10 @@ async fn run_builtin_ai_semantic_unlock_probe(
         latency_ms,
         unlocked_map,
         detail: Some(detail),
+        ip_clean,
+        ip_risk_level,
+        ip_asn,
+        ip_risk_flags,
         ..Default::default()
     }
 }
@@ -1344,8 +1883,8 @@ async fn run_builtin_ai_semantic_unlock_probe(
 /// Execute an L1 arbitrary site unlock probe with configurable URL, HTTP method,
 /// expected status code, and optional response-body regular expression.
 /// For built-in AI unlock probes (`builtin_unlock_claude`, `builtin_unlock_chatgpt`,
-/// `builtin_unlock_gemini`) without custom regex/status targeting non-loopback endpoints,
-/// dispatches to credential-free semantic unlock detection to avoid Cloudflare 403 false negatives.
+/// `builtin_unlock_gemini`, `builtin_unlock_windsurf`) without custom regex/status targeting
+/// non-loopback endpoints, dispatches to credential-free semantic unlock detection.
 pub async fn run_unlock_regex_probe(
     client: &reqwest::Client,
     node_id: &str,
@@ -1361,7 +1900,10 @@ pub async fn run_unlock_regex_probe(
         && def.expected_status.is_none()
         && matches!(
             def.id.trim(),
-            "builtin_unlock_claude" | "builtin_unlock_chatgpt" | "builtin_unlock_gemini"
+            "builtin_unlock_claude"
+                | "builtin_unlock_chatgpt"
+                | "builtin_unlock_gemini"
+                | "builtin_unlock_windsurf"
         )
         && !is_loopback_url(&def.target_url)
     {
@@ -2827,5 +3369,222 @@ mod tests {
         assert_eq!(rec_abort_down.down_mbps, None);
 
         server.abort();
+    }
+
+    #[test]
+    fn ip_purity_parsers_reject_invalid_or_missing_fields_and_prevent_ip_leak_or_asas_prefix() {
+        // 1. ip-api.com: HTTP != 200, status:"fail", or missing both proxy & hosting -> None!
+        assert_eq!(parse_ipapi_json(429, r#"{"status":"success","proxy":false,"hosting":false}"#), None);
+        assert_eq!(
+            parse_ipapi_json(200, r#"{"status":"fail","message":"private range"}"#),
+            None
+        );
+        assert_eq!(
+            parse_ipapi_json(200, r#"{"status":"success","countryCode":"TW","isp":"HiNet"}"#),
+            None
+        );
+        assert_eq!(parse_ipapi_json(200, "<html>Rate Limited</html>"), None);
+
+        // Valid ip-api Akari proxy=true payload (must never leak query IP).
+        let akari_api = parse_ipapi_json(
+            200,
+            r#"{"status":"success","query":"203.0.113.88","countryCode":"TW","isp":"Akari Networks","org":"Akari Networks","as":"AS38136 Akari Networks","mobile":false,"proxy":true,"hosting":true}"#,
+        )
+        .expect("valid akari ip-api payload");
+        assert_eq!(akari_api.country_code.as_deref(), Some("TW"));
+        assert_eq!(akari_api.proxy, Some(true));
+        assert_eq!(akari_api.hosting, Some(true));
+        assert_eq!(akari_api.asn.as_deref(), Some("AS38136 Akari Networks"));
+        assert!(!akari_api.asn.as_deref().unwrap_or("").contains("203.0.113.88"));
+
+        // 2. ipquery.io: HTTP != 200, missing risk, or empty risk:{} -> None!
+        assert_eq!(parse_ipquery_json(503, r#"{"risk":{"is_proxy":false}}"#), None);
+        assert_eq!(parse_ipquery_json(200, r#"{"ip":"203.0.113.10","location":{"country_code":"TW"}}"#), None);
+        assert_eq!(parse_ipquery_json(200, r#"{"risk":{}}"#), None);
+
+        // ASN prefix deduplication: "ASAS3462", "AS3462", "3462" all normalize cleanly to "AS3462 HiNet".
+        let tw_ipq = parse_ipquery_json(
+            200,
+            r#"{"ip":"198.51.100.7","isp":{"asn":"ASAS3462","org":"HiNet"},"location":{"country_code":"tw"},"risk":{"is_proxy":false,"is_vpn":false,"is_tor":false,"is_datacenter":false,"is_mobile":false,"risk_score":0}}"#,
+        )
+        .expect("valid tw ipquery payload");
+        assert_eq!(tw_ipq.country_code.as_deref(), Some("TW"));
+        assert_eq!(tw_ipq.asn.as_deref(), Some("AS3462 HiNet"));
+        assert!(!tw_ipq.asn.as_deref().unwrap_or("").contains("ASAS"));
+        assert!(!tw_ipq.asn.as_deref().unwrap_or("").contains("198.51.100.7"));
+
+        // Pure numeric ASN and literal IP in org must be normalized/stripped safely.
+        assert_eq!(format_asn_label(Some("3462"), Some("HiNet")).as_deref(), Some("AS3462 HiNet"));
+        assert_eq!(format_asn_label(Some("198.51.100.1"), Some("2001:db8::1")), None);
+    }
+
+    #[test]
+    fn windsurf_semantic_unlock_kills_akari_proxy_risk_allows_clean_and_advises_datacenter_vpn() {
+        let ok_codeium_api = WindsurfApiResponseSignals {
+            status: Some(415),
+            via_header: Some("1.1 google".to_string()),
+            has_accept_post: true,
+            content_type: Some("application/json".to_string()),
+            body: Some(r#"{"code":"unknown","message":"unsupported media type"}"#.to_string()),
+        };
+
+        // 1. Akari proxy=true (exact training-machine bug): MUST fail unlocked=false + proxy_risk!
+        let akari_ipapi = parse_ipapi_json(
+            200,
+            r#"{"status":"success","countryCode":"TW","as":"AS38136 Akari Networks","proxy":true,"hosting":true,"mobile":false}"#,
+        )
+        .unwrap();
+        let akari_sig = merge_ip_purity_signals(None, Some(&akari_ipapi));
+        assert_eq!(akari_sig.ip_risk_level, "proxy_risk");
+        assert_eq!(akari_sig.ip_clean, Some(false));
+        let (ok, detail) = evaluate_windsurf_semantic_unlock(&ok_codeium_api, &akari_sig);
+        assert!(!ok, "Akari proxy=true MUST NOT pass Windsurf semantic unlock: {detail}");
+        assert!(detail.starts_with("semantic_windsurf: "), "detail={detail}");
+        assert!(detail.contains("reason=high_risk_proxy_ip"), "detail={detail}");
+        assert!(detail.contains("ip_risk=proxy_risk"), "detail={detail}");
+        assert!(detail.contains("AS38136 Akari Networks"), "detail={detail}");
+
+        // 2. Ordinary airport node: ipquery is_vpn=true + risk_score=35, ip-api proxy=false, hosting=true
+        //    MUST be classified as `datacenter` (NOT proxy_risk) and unlocked=true so ordinary
+        //    datacenter relays are not false-killed while still carrying ip_clean=Some(false).
+        let vpn_ipq = parse_ipquery_json(
+            200,
+            r#"{"isp":{"asn":"AS20473","org":"Vultr"},"location":{"country_code":"JP"},"risk":{"is_proxy":false,"is_vpn":true,"is_tor":false,"is_datacenter":true,"risk_score":35}}"#,
+        )
+        .unwrap();
+        let vpn_ipapi = parse_ipapi_json(
+            200,
+            r#"{"status":"success","countryCode":"JP","as":"AS20473 The Constant Company","proxy":false,"hosting":true,"mobile":false}"#,
+        )
+        .unwrap();
+        let dc_sig = merge_ip_purity_signals(Some(&vpn_ipq), Some(&vpn_ipapi));
+        assert_eq!(dc_sig.ip_risk_level, "datacenter");
+        assert_eq!(dc_sig.ip_clean, Some(false));
+        let (ok_dc, detail_dc) = evaluate_windsurf_semantic_unlock(&ok_codeium_api, &dc_sig);
+        assert!(ok_dc, "ordinary datacenter/vpn should remain unlocked with advisory: {detail_dc}");
+        assert!(detail_dc.contains("ip_risk=datacenter"), "detail={detail_dc}");
+
+        // 3. Taiwan residential ISP (HiNet clean): unlocked=true + ip_clean=Some(true) + clean.
+        let tw_ipq = parse_ipquery_json(
+            200,
+            r#"{"isp":{"asn":"AS3462","org":"HiNet"},"location":{"country_code":"TW"},"risk":{"is_proxy":false,"is_vpn":false,"is_tor":false,"is_datacenter":false,"risk_score":0}}"#,
+        )
+        .unwrap();
+        let tw_ipapi = parse_ipapi_json(
+            200,
+            r#"{"status":"success","countryCode":"TW","as":"AS3462 Data Communication Business Group","proxy":false,"hosting":false,"mobile":false}"#,
+        )
+        .unwrap();
+        let clean_sig = merge_ip_purity_signals(Some(&tw_ipq), Some(&tw_ipapi));
+        assert_eq!(clean_sig.ip_risk_level, "clean");
+        assert_eq!(clean_sig.ip_clean, Some(true));
+        assert_eq!(clean_sig.ip_risk_flags, None);
+        let (ok_clean, detail_clean) = evaluate_windsurf_semantic_unlock(&ok_codeium_api, &clean_sig);
+        assert!(ok_clean, "clean TW residential must unlock: {detail_clean}");
+        assert!(detail_clean.contains("ip_risk=clean"), "detail={detail_clean}");
+
+        // 4. Blocked jurisdictions (HK / CN): MUST fail unlocked=false even with clean IP & 415 API.
+        for blocked_cc in ["HK", "CN"] {
+            let blocked_sig = IpPuritySignals {
+                country_code: Some(blocked_cc.to_string()),
+                ip_clean: Some(true),
+                ip_risk_level: "clean".to_string(),
+                ip_asn: Some("AS4760 HKT".to_string()),
+                ..Default::default()
+            };
+            let (ok_geo, detail_geo) =
+                evaluate_windsurf_semantic_unlock(&ok_codeium_api, &blocked_sig);
+            assert!(!ok_geo, "country {blocked_cc} must be geo-blocked: {detail_geo}");
+            assert!(detail_geo.contains("reason=geo_blocked"), "detail={detail_geo}");
+        }
+
+        // 5. Dual-source failure/timeout -> ip_risk_level="unknown", ip_clean=None; degrades to API truth.
+        let unknown_sig = merge_ip_purity_signals(None, None);
+        assert_eq!(unknown_sig.ip_risk_level, "unknown");
+        assert_eq!(unknown_sig.ip_clean, None);
+        let (ok_unknown, detail_unknown) =
+            evaluate_windsurf_semantic_unlock(&ok_codeium_api, &unknown_sig);
+        assert!(ok_unknown, "unknown IP risk degrades to Codeium API truth: {detail_unknown}");
+        assert!(detail_unknown.contains("ip_risk=unknown"), "detail={detail_unknown}");
+
+        // 6. Partial source missing `hosting` (ip-api returns only proxy:false) MUST stay unknown (no fake green).
+        let partial_api = parse_ipapi_json(200, r#"{"status":"success","proxy":false}"#).unwrap();
+        let partial_sig = merge_ip_purity_signals(None, Some(&partial_api));
+        assert_eq!(partial_sig.ip_risk_level, "unknown");
+        assert_eq!(partial_sig.ip_clean, None);
+
+        // 7. Codeium API 403 / 429 / Cloudflare challenge / missing gateway signature -> unlocked=false.
+        let cf_403 = WindsurfApiResponseSignals {
+            status: Some(403),
+            body: Some("<html><title>Just a moment...</title></html>".to_string()),
+            ..Default::default()
+        };
+        let (ok_403, _) = evaluate_windsurf_semantic_unlock(&cf_403, &clean_sig);
+        assert!(!ok_403);
+
+        let hijack_404 = WindsurfApiResponseSignals {
+            status: Some(404),
+            content_type: Some("text/html".to_string()),
+            body: Some("<html>Captive Portal Not Found</html>".to_string()),
+            ..Default::default()
+        };
+        let (ok_hijack, detail_hijack) = evaluate_windsurf_semantic_unlock(&hijack_404, &clean_sig);
+        assert!(!ok_hijack, "404 without ConnectRPC/Google gateway signature must fail: {detail_hijack}");
+
+        // 8. 404/400/401 with bare text/plain (no Google Via or Accept-Post) MUST also fail.
+        for status_code in [400u16, 401u16, 404u16] {
+            let plain_err = WindsurfApiResponseSignals {
+                status: Some(status_code),
+                content_type: Some("text/plain".to_string()),
+                body: Some("Not Found".to_string()),
+                ..Default::default()
+            };
+            let (ok_plain, detail_plain) =
+                evaluate_windsurf_semantic_unlock(&plain_err, &clean_sig);
+            assert!(
+                !ok_plain,
+                "status {status_code} bare text/plain without gateway header must fail: {detail_plain}"
+            );
+        }
+
+        // 9. Non-ASCII ASN/Org strings must never panic UTF-8 slicing and embedded IPs must be stripped.
+        assert_eq!(
+            format_asn_label(Some("中华电信"), Some("台湾节点 203.0.113.55")).as_deref(),
+            Some("中华电信 台湾节点")
+        );
+        assert_eq!(
+            format_asn_label(Some("AS中国"), Some("AS3462 HiNet 2001:db8::9")).as_deref(),
+            Some("AS中国 AS3462 HiNet")
+        );
+
+        // 10. Dual-source country mismatch: blocked region (HK/CN) MUST win conservatively over non-blocked (TW).
+        let conflict_ipq = parse_ipquery_json(
+            200,
+            r#"{"isp":{"asn":"AS3462","org":"Broadcast"},"location":{"country_code":"TW"},"risk":{"is_proxy":false,"is_vpn":false,"is_tor":false,"is_datacenter":false,"risk_score":10}}"#,
+        )
+        .unwrap();
+        let conflict_ipapi = parse_ipapi_json(
+            200,
+            r#"{"status":"success","countryCode":"HK","as":"AS3462 Broadcast","proxy":false,"hosting":false,"mobile":false}"#,
+        )
+        .unwrap();
+        let conflict_sig = merge_ip_purity_signals(Some(&conflict_ipq), Some(&conflict_ipapi));
+        assert_eq!(conflict_sig.country_code.as_deref(), Some("HK"));
+        let (ok_conflict, detail_conflict) =
+            evaluate_windsurf_semantic_unlock(&ok_codeium_api, &conflict_sig);
+        assert!(
+            !ok_conflict,
+            "dual-source conflict with HK must conservatively geo-block: {detail_conflict}"
+        );
+
+        // 11. Medium risk_score (50..79) without proxy/tor classifies as datacenter advisory (not proxy_risk).
+        let med_risk_ipq = parse_ipquery_json(
+            200,
+            r#"{"isp":{"asn":"AS20473","org":"Vultr"},"location":{"country_code":"JP"},"risk":{"is_proxy":false,"is_vpn":false,"is_tor":false,"is_datacenter":false,"risk_score":65}}"#,
+        )
+        .unwrap();
+        let med_sig = merge_ip_purity_signals(Some(&med_risk_ipq), None);
+        assert_eq!(med_sig.ip_risk_level, "datacenter");
+        assert_eq!(med_sig.ip_clean, Some(false));
     }
 }

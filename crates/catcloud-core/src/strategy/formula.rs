@@ -37,6 +37,7 @@ pub struct EvalContext {
     pub multiplier: f64,
     pub keepalive_ok: bool,
     pub google_clean: bool,
+    pub ip_clean: bool,
     pub unlocked: bool,
     pub is_443_native: bool,
     pub ok: bool,
@@ -58,6 +59,7 @@ impl Default for EvalContext {
             multiplier: 1.0,
             keepalive_ok: false,
             google_clean: false,
+            ip_clean: false,
             unlocked: false,
             is_443_native: false,
             ok: false,
@@ -81,6 +83,7 @@ impl EvalContext {
             ScalarField::Multiplier => sanitize_f64(self.multiplier),
             ScalarField::KeepaliveOk => bool_to_f64(self.keepalive_ok),
             ScalarField::GoogleClean => bool_to_f64(self.google_clean),
+            ScalarField::IpClean => bool_to_f64(self.ip_clean),
             ScalarField::Unlocked => bool_to_f64(self.unlocked),
             ScalarField::Is443Native => bool_to_f64(self.is_443_native),
             ScalarField::Ok => bool_to_f64(self.ok),
@@ -238,6 +241,11 @@ impl FormulaExpr {
     pub fn uses_keepalive_ok(&self) -> bool {
         self.root.uses_keepalive_ok()
     }
+
+    /// Return `true` if this AST explicitly references the `ip_clean` scalar.
+    pub fn uses_ip_clean(&self) -> bool {
+        self.root.uses_ip_clean()
+    }
 }
 
 /// Validate a formula string without evaluating it.
@@ -269,6 +277,7 @@ enum ScalarField {
     Multiplier,
     KeepaliveOk,
     GoogleClean,
+    IpClean,
     Unlocked,
     Is443Native,
     Ok,
@@ -285,6 +294,7 @@ impl ScalarField {
             "multiplier" => Some(Self::Multiplier),
             "keepalive_ok" => Some(Self::KeepaliveOk),
             "google_clean" => Some(Self::GoogleClean),
+            "ip_clean" => Some(Self::IpClean),
             "unlocked" => Some(Self::Unlocked),
             "is_443_native" => Some(Self::Is443Native),
             "ok" => Some(Self::Ok),
@@ -412,6 +422,25 @@ impl Expr {
                     || then_val.uses_keepalive_ok()
                     || else_val.uses_keepalive_ok()
             }
+        }
+    }
+
+    fn uses_ip_clean(&self) -> bool {
+        match self {
+            Self::Scalar(ScalarField::IpClean) => true,
+            Self::Number(_) | Self::Scalar(_) | Self::ProbeLookup { .. } => false,
+            Self::Unary { operand, .. } | Self::Abs(operand) => operand.uses_ip_clean(),
+            Self::Binary { left, right, .. } | Self::Min(left, right) | Self::Max(left, right) => {
+                left.uses_ip_clean() || right.uses_ip_clean()
+            }
+            Self::Clamp { x, lo, hi } => {
+                x.uses_ip_clean() || lo.uses_ip_clean() || hi.uses_ip_clean()
+            }
+            Self::If {
+                cond,
+                then_val,
+                else_val,
+            } => cond.uses_ip_clean() || then_val.uses_ip_clean() || else_val.uses_ip_clean(),
         }
     }
 }
@@ -1376,5 +1405,22 @@ mod tests {
                 .uses_keepalive_ok()
         );
         assert!(!FormulaExpr::parse("google_clean == 1").unwrap().uses_keepalive_ok());
+
+        // `ip_clean` scalar evaluation & `uses_ip_clean` AST inspection.
+        let ip_gate = FormulaExpr::parse("ip_clean == 1").unwrap();
+        let compound_ip_gate = FormulaExpr::parse("keepalive_ok == 1 && ip_clean == 1").unwrap();
+        let ip_bonus = FormulaExpr::parse("100 + ip_clean * 120").unwrap();
+        assert!(ip_gate.uses_ip_clean());
+        assert!(compound_ip_gate.uses_ip_clean());
+        assert!(compound_ip_gate.uses_keepalive_ok());
+        assert!(ip_bonus.uses_ip_clean());
+        assert!(!FormulaExpr::parse("google_clean == 1").unwrap().uses_ip_clean());
+
+        let mut clean_ctx = EvalContext::default();
+        assert!(!ip_gate.eval_bool(&clean_ctx).unwrap());
+        assert_eq!(ip_bonus.eval_f64(&clean_ctx).unwrap(), 100.0);
+        clean_ctx.ip_clean = true;
+        assert!(ip_gate.eval_bool(&clean_ctx).unwrap());
+        assert_eq!(ip_bonus.eval_f64(&clean_ctx).unwrap(), 220.0);
     }
 }

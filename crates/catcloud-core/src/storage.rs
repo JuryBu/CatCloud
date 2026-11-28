@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 /// Current SQLite schema version tracked via `PRAGMA user_version`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Strategy used by `Storage::update_subscription_nodes_with_mode` when updating an existing
 /// subscription group with newly fetched, captured, or imported nodes.
@@ -201,6 +201,40 @@ impl Storage {
                     "supports_ipv6",
                     "INTEGER NOT NULL DEFAULT 0",
                 )?;
+            }
+            if current < 5 {
+                tx.execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS probe_results (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        node_id TEXT NOT NULL,
+                        probe_id TEXT NOT NULL,
+                        tested_at TEXT NOT NULL,
+                        ok INTEGER NOT NULL DEFAULT 0,
+                        latency_ms REAL,
+                        jitter_ms REAL,
+                        loss_pct REAL,
+                        up_mbps REAL,
+                        down_mbps REAL,
+                        cf_loc TEXT,
+                        yt_gl TEXT,
+                        google_clean INTEGER,
+                        keepalive_60s_ok INTEGER,
+                        unlocked_map_json TEXT NOT NULL DEFAULT '{}',
+                        detail TEXT,
+                        ip_clean INTEGER,
+                        ip_risk_level TEXT,
+                        ip_asn TEXT,
+                        ip_risk_flags TEXT,
+                        FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+                        FOREIGN KEY (probe_id) REFERENCES probe_definitions(id) ON DELETE CASCADE
+                    );
+                    ",
+                )?;
+                ensure_column_exists(tx, "probe_results", "ip_clean", "INTEGER")?;
+                ensure_column_exists(tx, "probe_results", "ip_risk_level", "TEXT")?;
+                ensure_column_exists(tx, "probe_results", "ip_asn", "TEXT")?;
+                ensure_column_exists(tx, "probe_results", "ip_risk_flags", "TEXT")?;
             }
             tx.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION as i64)?;
             Ok(())
@@ -1156,7 +1190,7 @@ impl Storage {
             "
             SELECT node_id, probe_id, tested_at, ok, latency_ms, jitter_ms, loss_pct,
                    up_mbps, down_mbps, cf_loc, yt_gl, google_clean, keepalive_60s_ok,
-                   unlocked_map_json, detail
+                   unlocked_map_json, detail, ip_clean, ip_risk_level, ip_asn, ip_risk_flags
             FROM (
                 SELECT *,
                        ROW_NUMBER() OVER (
@@ -1230,7 +1264,7 @@ impl Storage {
             "
             SELECT node_id, probe_id, tested_at, ok, latency_ms, jitter_ms, loss_pct,
                    up_mbps, down_mbps, cf_loc, yt_gl, google_clean, keepalive_60s_ok,
-                   unlocked_map_json, detail
+                   unlocked_map_json, detail, ip_clean, ip_risk_level, ip_asn, ip_risk_flags
             FROM (
                 SELECT *,
                        ROW_NUMBER() OVER (
@@ -1685,6 +1719,10 @@ CREATE TABLE IF NOT EXISTS probe_results (
     keepalive_60s_ok INTEGER,
     unlocked_map_json TEXT NOT NULL DEFAULT '{}',
     detail TEXT,
+    ip_clean INTEGER,
+    ip_risk_level TEXT,
+    ip_asn TEXT,
+    ip_risk_flags TEXT,
     FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
     FOREIGN KEY (probe_id) REFERENCES probe_definitions(id) ON DELETE CASCADE
 );
@@ -2088,48 +2126,44 @@ fn seed_builtin_probes_in_tx(tx: &Transaction<'_>) -> CatResult<usize> {
                         params![def.id, def.kind.as_str(), def.target_url, def.method],
                     )?;
                 }
-                // Precisely heal `builtin_unlock_windsurf` rows whose `expected_status` was
-                // cleared to NULL by an older bug/backup without clobbering user customizations.
+                // Losslessly upgrade legacy default `builtin_unlock_windsurf` definitions to the
+                // semantic Codeium API + dual-source IP purity probe without clobbering user
+                // customizations (`body_regex` or custom `target_url`).
                 "builtin_unlock_windsurf" => {
-                    let healed_official = tx.execute(
+                    tx.execute(
                         "
                         UPDATE probe_definitions
-                        SET kind = ?2,
-                            expected_status = ?3,
+                        SET name = ?2,
+                            kind = ?3,
+                            expected_status = NULL,
                             target_url = ?4,
-                            method = ?5
+                            method = ?5,
+                            timeout_ms = CASE WHEN timeout_ms < ?6 THEN ?6 ELSE timeout_ms END
                         WHERE id = ?1
                           AND builtin = 1
                           AND (body_regex IS NULL OR TRIM(body_regex) = '')
-                          AND expected_status IS NULL
-                          AND target_url IN (
-                              'https://windsurf.com',
-                              'https://windsurf.com/',
-                              'https://codeium.com',
-                              'https://codeium.com/'
+                          AND (
+                              target_url IN (
+                                  'https://windsurf.com',
+                                  'https://windsurf.com/',
+                                  'https://codeium.com',
+                                  'https://codeium.com/'
+                              )
+                              OR (
+                                  target_url = ?4
+                                  AND (kind != ?3 OR expected_status IS NOT NULL OR method != ?5)
+                              )
                           )
                         ",
                         params![
                             def.id,
+                            def.name,
                             def.kind.as_str(),
-                            def.expected_status.map(i64::from),
                             def.target_url,
                             def.method,
+                            def.timeout_ms as i64,
                         ],
                     )?;
-                    if healed_official == 0 {
-                        tx.execute(
-                            "
-                            UPDATE probe_definitions
-                            SET expected_status = ?2
-                            WHERE id = ?1
-                              AND builtin = 1
-                              AND (body_regex IS NULL OR TRIM(body_regex) = '')
-                              AND expected_status IS NULL
-                            ",
-                            params![def.id, def.expected_status.map(i64::from)],
-                        )?;
-                    }
                 }
                 _ => {}
             }
@@ -2160,8 +2194,8 @@ fn insert_probe_result_with_conn(conn: &Connection, rec: &ProbeResultRecord) -> 
         INSERT INTO probe_results (
             node_id, probe_id, tested_at, ok, latency_ms, jitter_ms, loss_pct,
             up_mbps, down_mbps, cf_loc, yt_gl, google_clean, keepalive_60s_ok,
-            unlocked_map_json, detail
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            unlocked_map_json, detail, ip_clean, ip_risk_level, ip_asn, ip_risk_flags
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
         ",
         params![
             rec.node_id,
@@ -2179,6 +2213,10 @@ fn insert_probe_result_with_conn(conn: &Connection, rec: &ProbeResultRecord) -> 
             rec.keepalive_60s_ok.map(bool_to_int),
             unlocked_map_json,
             rec.detail,
+            rec.ip_clean.map(bool_to_int),
+            rec.ip_risk_level,
+            rec.ip_asn,
+            rec.ip_risk_flags,
         ],
     )?;
     Ok(conn.last_insert_rowid())
@@ -2263,6 +2301,7 @@ fn row_to_probe_result(row: &Row<'_>) -> rusqlite::Result<ProbeResultRecord> {
     let unlocked_json: String = row.get(13)?;
     let unlocked_map: HashMap<String, bool> =
         serde_json::from_str(&unlocked_json).unwrap_or_default();
+    let ip_clean: Option<i64> = row.get(15)?;
 
     Ok(ProbeResultRecord {
         node_id: row.get(0)?,
@@ -2280,6 +2319,10 @@ fn row_to_probe_result(row: &Row<'_>) -> rusqlite::Result<ProbeResultRecord> {
         keepalive_60s_ok: keepalive.map(|v| v != 0),
         unlocked_map,
         detail: row.get(14)?,
+        ip_clean: ip_clean.map(|v| v != 0),
+        ip_risk_level: row.get(16)?,
+        ip_asn: row.get(17)?,
+        ip_risk_flags: row.get(18)?,
     })
 }
 
@@ -3339,22 +3382,29 @@ mod tests {
             Some(custom_non_builtin_chatgpt)
         );
 
-        // `builtin_unlock_windsurf` MUST keep `expected_status: Some(200)` and accurately heal
-        // when `expected_status` was cleared to NULL on the official URL, while user customizations
-        // to `builtin_latency` / `builtin_upload` / `builtin_download` / custom URLs MUST persist!
+        // `builtin_unlock_windsurf` MUST default to the semantic Codeium API POST definition
+        // (`expected_status: None`, `timeout_ms: 9000`) and losslessly upgrade legacy official
+        // `https://windsurf.com` / `https://codeium.com` rows while preserving user-customized
+        // `body_regex` or custom URLs (and user edits to latency/upload/download).
         let ws = storage
             .get_probe_definition("builtin_unlock_windsurf")
             .unwrap()
             .expect("windsurf builtin exists");
-        assert_eq!(ws.expected_status, Some(200));
+        assert_eq!(ws.expected_status, None);
+        assert_eq!(ws.method, "POST");
+        assert_eq!(
+            ws.target_url,
+            "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage"
+        );
+        assert_eq!(ws.timeout_ms, 9000);
 
         let stale_ws = ProbeDefinition {
             id: "builtin_unlock_windsurf".to_string(),
-            name: ws.name.clone(),
+            name: "Windsurf / Codeium Reachability".to_string(),
             kind: ProbeKind::UnlockRegex,
             target_url: "https://windsurf.com".to_string(),
-            method: "HEAD".to_string(),
-            expected_status: None,
+            method: "GET".to_string(),
+            expected_status: Some(200),
             body_regex: None,
             payload_bytes: None,
             timeout_ms: 8000,
@@ -3366,9 +3416,52 @@ mod tests {
             .get_probe_definition("builtin_unlock_windsurf")
             .unwrap()
             .unwrap();
-        assert_eq!(realigned_ws.expected_status, Some(200));
-        assert_eq!(realigned_ws.target_url, "https://windsurf.com");
-        assert_eq!(realigned_ws.method, "GET");
+        assert_eq!(realigned_ws.expected_status, None);
+        assert_eq!(
+            realigned_ws.target_url,
+            "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage"
+        );
+        assert_eq!(realigned_ws.method, "POST");
+        assert_eq!(realigned_ws.timeout_ms, 9000);
+
+        // User-customized Windsurf regex or custom URL MUST NOT be overwritten by reseeding.
+        let custom_ws_regex = ProbeDefinition {
+            id: "builtin_unlock_windsurf".to_string(),
+            name: "Custom Windsurf Regex".to_string(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://windsurf.com".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(200),
+            body_regex: Some("custom_ws_marker".to_string()),
+            payload_bytes: None,
+            timeout_ms: 8000,
+            builtin: true,
+        };
+        storage.upsert_probe_definition(&custom_ws_regex).unwrap();
+        storage.seed_builtin_probes().unwrap();
+        assert_eq!(
+            storage.get_probe_definition("builtin_unlock_windsurf").unwrap(),
+            Some(custom_ws_regex)
+        );
+
+        let custom_ws_url = ProbeDefinition {
+            id: "builtin_unlock_windsurf".to_string(),
+            name: "Custom Windsurf Endpoint".to_string(),
+            kind: ProbeKind::UnlockRegex,
+            target_url: "https://my-wsf-check.example.invalid/ping".to_string(),
+            method: "GET".to_string(),
+            expected_status: Some(200),
+            body_regex: None,
+            payload_bytes: None,
+            timeout_ms: 7000,
+            builtin: true,
+        };
+        storage.upsert_probe_definition(&custom_ws_url).unwrap();
+        storage.seed_builtin_probes().unwrap();
+        assert_eq!(
+            storage.get_probe_definition("builtin_unlock_windsurf").unwrap(),
+            Some(custom_ws_url)
+        );
 
         // User-edited built-in latency/upload/download endpoints MUST survive restart seeding!
         let custom_lat = ProbeDefinition {
@@ -4300,10 +4393,10 @@ mod tests {
             .expect("seed legacy v3 schema");
         }
 
-        // First open: migrates v3 -> v4 idempotently with supports_ipv6 defaulting to false.
+        // First open: migrates v3 -> latest schema idempotently with supports_ipv6 defaulting to false.
         {
             let storage = Storage::open(&db_path).expect("open & migrate v3 db");
-            assert_eq!(storage.schema_version().unwrap(), 4);
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
             let mut relay = storage
                 .get_preaccel_relay("relay-v3-legacy")
                 .unwrap()
@@ -4321,10 +4414,10 @@ mod tests {
             assert!(updated.supports_ipv6);
         }
 
-        // Re-opening migrated v4 database is idempotent and preserves supports_ipv6 == true.
+        // Re-opening migrated database is idempotent and preserves supports_ipv6 == true.
         {
             let storage = Storage::open(&db_path).expect("reopen migrated v4 db");
-            assert_eq!(storage.schema_version().unwrap(), 4);
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
             let relays = storage.list_preaccel_relays(true).unwrap();
             assert_eq!(relays.len(), 1);
             assert!(relays[0].supports_ipv6);
@@ -4413,7 +4506,7 @@ mod tests {
             kind: ProbeKind::UnlockRegex,
             target_url: "https://windsurf.com".into(),
             method: "GET".into(),
-            expected_status: None,
+            expected_status: Some(200),
             body_regex: None,
             payload_bytes: None,
             timeout_ms: 8000,
@@ -4442,14 +4535,17 @@ mod tests {
         assert!(storage.get_multi_group("grp-new").unwrap().is_some());
         assert!(storage.get_preaccel_relay("relay-new").unwrap().is_some());
         assert!(storage.get_probe_definition("custom_backup_probe").unwrap().is_some());
+        let healed_ws = storage
+            .get_probe_definition("builtin_unlock_windsurf")
+            .unwrap()
+            .unwrap();
+        assert_eq!(healed_ws.expected_status, None);
+        assert_eq!(healed_ws.method, "POST");
         assert_eq!(
-            storage
-                .get_probe_definition("builtin_unlock_windsurf")
-                .unwrap()
-                .unwrap()
-                .expected_status,
-            Some(200)
+            healed_ws.target_url,
+            "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage"
         );
+        assert_eq!(healed_ws.timeout_ms, 9000);
 
         // 3. Rollback with `replace_all = true` restores exact prior snapshot, removes added IDs,
         //    and MUST NOT cascade-delete existing `probe_results` for surviving probes!
@@ -4792,5 +4888,181 @@ mod tests {
                 .member_node_ids
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn migrates_v4_probe_results_to_v5_and_upgrades_legacy_windsurf_probe_losslessly() {
+        let dir = std::env::temp_dir().join(format!("catcloud-db-mig-v5-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("legacy-v4.sqlite");
+
+        // Build a realistic v4 database whose `probe_results` lacks the 4 IP purity columns and
+        // whose `builtin_unlock_windsurf` still uses the legacy `GET https://windsurf.com == 200`.
+        {
+            let conn = Connection::open(&db_path).expect("create legacy v4 sqlite");
+            conn.execute_batch(
+                "
+                CREATE TABLE subscriptions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    url_or_cmd TEXT NOT NULL,
+                    refresh_interval_sec INTEGER NOT NULL DEFAULT 3600,
+                    traffic_used INTEGER NOT NULL DEFAULT 0,
+                    traffic_total INTEGER NOT NULL DEFAULT 0,
+                    expires_at TEXT,
+                    etag TEXT,
+                    last_ok_at TEXT,
+                    last_error TEXT,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    updated_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE nodes (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    sub_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    protocol TEXT NOT NULL,
+                    server TEXT NOT NULL,
+                    port INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    region_code TEXT NOT NULL DEFAULT 'UNK',
+                    multiplier REAL NOT NULL DEFAULT 1.0,
+                    is_443_native INTEGER NOT NULL DEFAULT 0,
+                    preaccel_eligible INTEGER NOT NULL DEFAULT 1,
+                    preaccel_override INTEGER,
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    FOREIGN KEY (sub_id) REFERENCES subscriptions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE probe_definitions (
+                    id TEXT PRIMARY KEY NOT NULL,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    target_url TEXT NOT NULL,
+                    method TEXT NOT NULL DEFAULT 'GET',
+                    expected_status INTEGER,
+                    body_regex TEXT,
+                    payload_bytes INTEGER,
+                    timeout_ms INTEGER NOT NULL DEFAULT 8000,
+                    builtin INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE TABLE probe_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    node_id TEXT NOT NULL,
+                    probe_id TEXT NOT NULL,
+                    tested_at TEXT NOT NULL,
+                    ok INTEGER NOT NULL DEFAULT 0,
+                    latency_ms REAL,
+                    jitter_ms REAL,
+                    loss_pct REAL,
+                    up_mbps REAL,
+                    down_mbps REAL,
+                    cf_loc TEXT,
+                    yt_gl TEXT,
+                    google_clean INTEGER,
+                    keepalive_60s_ok INTEGER,
+                    unlocked_map_json TEXT NOT NULL DEFAULT '{}',
+                    detail TEXT,
+                    FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE,
+                    FOREIGN KEY (probe_id) REFERENCES probe_definitions(id) ON DELETE CASCADE
+                );
+                INSERT INTO subscriptions (id, name, kind, url_or_cmd) VALUES ('sub-v4', 'V4 Sub', 'url', 'https://example.invalid/sub');
+                INSERT INTO nodes (id, sub_id, name, protocol, server, port, raw_json, region_code)
+                    VALUES ('n-v4', 'sub-v4', 'TW Legacy', 'trojan', '198.51.100.44', 443, '{}', 'TW');
+                INSERT INTO probe_definitions (id, name, kind, target_url, method, expected_status, body_regex, timeout_ms, builtin)
+                    VALUES ('builtin_unlock_windsurf', 'Windsurf / Codeium Reachability', 'unlock_regex', 'https://windsurf.com/', 'GET', 200, NULL, 8000, 1);
+                INSERT INTO probe_results (node_id, probe_id, tested_at, ok, latency_ms, unlocked_map_json, detail)
+                    VALUES ('n-v4', 'builtin_unlock_windsurf', '2026-11-27T12:00:00.000000Z', 1, 280.0, '{\"windsurf\":true}', 'site=windsurf, status=200, status_ok=true, regex_ok=true');
+                PRAGMA user_version = 4;
+                ",
+            )
+            .expect("seed legacy v4 schema");
+        }
+
+        // 1. Open migrates v4 -> v5 losslessly; legacy probe row reads back with 4 IP fields None.
+        {
+            let mut storage = Storage::open(&db_path).expect("open & migrate v4 db");
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let legacy_rows = storage.latest_probe_results_for_node("n-v4").unwrap();
+            assert_eq!(legacy_rows.len(), 1);
+            assert!(legacy_rows[0].ok);
+            assert_eq!(legacy_rows[0].ip_clean, None);
+            assert_eq!(legacy_rows[0].ip_risk_level, None);
+            assert_eq!(legacy_rows[0].ip_asn, None);
+            assert_eq!(legacy_rows[0].ip_risk_flags, None);
+
+            // 2. Seeding built-in probes upgrades legacy `builtin_unlock_windsurf` to semantic POST.
+            storage.seed_builtin_probes().unwrap();
+            let ws_def = storage
+                .get_probe_definition("builtin_unlock_windsurf")
+                .unwrap()
+                .expect("windsurf def present");
+            assert_eq!(ws_def.name, "Windsurf / Devin AI 纯净解锁");
+            assert_eq!(
+                ws_def.target_url,
+                "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage"
+            );
+            assert_eq!(ws_def.method, "POST");
+            assert_eq!(ws_def.expected_status, None);
+            assert_eq!(ws_def.timeout_ms, 9000);
+
+            // 3. Inserting a v5 semantic Windsurf result round-trips all 4 IP purity columns via
+            //    both `latest_probe_results_for_node` and `get_probe_snapshots_batch`.
+            let mut unlocked = HashMap::new();
+            unlocked.insert("windsurf".to_string(), false);
+            storage
+                .insert_probe_result(&ProbeResultRecord {
+                    node_id: "n-v4".into(),
+                    probe_id: "builtin_unlock_windsurf".into(),
+                    tested_at: "2026-11-28T06:00:00Z".into(),
+                    ok: false,
+                    latency_ms: Some(145.0),
+                    unlocked_map: unlocked,
+                    detail: Some(
+                        "semantic_windsurf: unlocked=false, reason=high_risk_proxy_ip, api=ok(status=415), ip_risk=proxy_risk, flags=[proxy,datacenter], asn=AS38136 Akari Networks, cc=TW"
+                            .into(),
+                    ),
+                    ip_clean: Some(false),
+                    ip_risk_level: Some("proxy_risk".into()),
+                    ip_asn: Some("AS38136 Akari Networks".into()),
+                    ip_risk_flags: Some("proxy,datacenter".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+
+            let latest = storage.latest_probe_results_for_node("n-v4").unwrap();
+            assert_eq!(latest.len(), 1);
+            assert!(!latest[0].ok);
+            assert_eq!(latest[0].ip_clean, Some(false));
+            assert_eq!(latest[0].ip_risk_level.as_deref(), Some("proxy_risk"));
+            assert_eq!(latest[0].ip_asn.as_deref(), Some("AS38136 Akari Networks"));
+            assert_eq!(latest[0].ip_risk_flags.as_deref(), Some("proxy,datacenter"));
+
+            let batch = storage
+                .get_probe_snapshots_batch(&["n-v4".to_string()], None)
+                .unwrap();
+            let snap = batch.get("n-v4").expect("snapshot present");
+            assert_eq!(snap.ip_clean, Some(false));
+            assert_eq!(snap.ip_risk_level.as_deref(), Some("proxy_risk"));
+            assert_eq!(snap.ip_asn.as_deref(), Some("AS38136 Akari Networks"));
+            assert_eq!(snap.ip_risk_flags.as_deref(), Some("proxy,datacenter"));
+            assert_eq!(snap.unlocked_sites.get("windsurf"), Some(&false));
+        }
+
+        // 4. Re-opening migrated v5 DB is idempotent and retains all 4 IP columns.
+        {
+            let storage = Storage::open(&db_path).expect("reopen migrated v5 db");
+            assert_eq!(storage.schema_version().unwrap(), CURRENT_SCHEMA_VERSION);
+            let snap = storage
+                .get_probe_snapshot("n-v4", None)
+                .unwrap()
+                .expect("persisted snapshot");
+            assert_eq!(snap.ip_clean, Some(false));
+            assert_eq!(snap.ip_risk_level.as_deref(), Some("proxy_risk"));
+            assert_eq!(snap.ip_asn.as_deref(), Some("AS38136 Akari Networks"));
+            assert_eq!(snap.ip_risk_flags.as_deref(), Some("proxy,datacenter"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -157,6 +157,22 @@ export const ja: DeepStringDict<TranslationDict> = {
     danglingRewriteBtn: "すべて「{group}」へ変更",
     coreErrorBannerTitle: "プロキシコアの起動または再読込に失敗しました",
     askAiFixOrIssueBtn: "AI で修復 / Issue 報告",
+    mainFallbackBadge: "メイン規定",
+    parallelIndepTitle: "並列独立ルーティング",
+    parallelIndepHint: "メイン切替不要",
+    indepBadge: "独立分岐",
+    indepRulesCount: "{count} ルール",
+    singleModeIndepPaused:
+      "単一ノードモード中は {count} 件の独立分岐グループが一時停止中です（グループモードで自動再開）",
+    geoMissingTitle:
+      "GeoIP データベース未取得のため、QQ など国内アプリの直接 IP 通信が海外経由になる場合があります",
+    geoMissingDesc:
+      "国内直結を効かせるため Country.mmdb と geosite.dat を取得してください。完了後すぐ自動反映されます。",
+    geoFetchBtn: "今すぐ取得して反映",
+    geoFetchingBtn: "取得して反映中…",
+    exitProxyRiskHint:
+      "現在の出口 IP はプロキシ高リスク判定のため、Windsurf / Devin 推論が失敗しやすい状態です",
+    createWsfCleanGroupBtn: "WSF 専用クリーン組を作成",
   },
   aiHub: {
     title: "AI 自動設定",
@@ -593,6 +609,29 @@ export const ja: DeepStringDict<TranslationDict> = {
     moreFiltersBtn: "詳細フィルタ",
     resetFiltersBtn: "フィルタをリセット",
     activeFiltersCount: "{count} 件選択中",
+    mainFallbackActive: "メイン規定 · 使用中",
+    indepRoutingCount: "独立分岐 · {count}件",
+    indepRoutingPending: "独立分岐 · ルール未設定",
+    indepCapsuleActive: "独立分岐有効 · {count} 件",
+    indepCapsulePending: "独立分岐 · ルール追加待ち",
+    indepCapsuleOff: "独立分岐：オフ",
+    section5Title: "5. 分岐ルール（サイト / プロセス / 複合ルール）",
+    section5Placeholder:
+      "例: codeium.com / PROCESS-NAME,QQ.exe / AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))",
+    wsfTemplateTitle: "Windsurf / Devin クリーン専用",
+    wsfTemplateDesc: "独立分岐を自動有効化・プロキシ高リスク除外＆クリーン回線優先",
+  },
+  rules: {
+    geoMissingTitle:
+      "GeoIP データベース未取得のため、QQ など国内アプリの直接 IP 通信が海外経由になる場合があります",
+    geoMissingDesc:
+      "国内直結が有効ですが {file} が見つかりません。今すぐ取得して GEOIP / GEOSITE ルールを即時反映してください。",
+    geoFetchBtn: "GeoData を取得して反映",
+    geoFetchingBtn: "取得して反映中…",
+    addImDirectBtn: "QQ / WeChat 直結を追加",
+    imDirectAlreadyAdded: "QQ / WeChat 直結済み",
+    imDirectAddedToast: "QQ / WeChat のプロセス直結ルールを {count} 件追加して反映しました",
+    imDirectExistsToast: "QQ / WeChat（QQ.exe / WeChat.exe / Weixin.exe）の直結ルールはすべて登録済みです",
   },
   shareBundle: {
     cancelUpdateExisting: "キャンセル",

@@ -157,6 +157,22 @@ export const ru: DeepStringDict<TranslationDict> = {
     danglingRewriteBtn: "Заменить все на «{group}»",
     coreErrorBannerTitle: "Не удалось запустить или перезагрузить ядро прокси",
     askAiFixOrIssueBtn: "Поручить ИИ ремонт / Issue",
+    mainFallbackBadge: "Основная",
+    parallelIndepTitle: "Параллельная маршрутизация",
+    parallelIndepHint: "Без смены основной",
+    indepBadge: "Независимо",
+    indepRulesCount: "Правил: {count}",
+    singleModeIndepPaused:
+      "В режиме одного узла приостановлено независимых групп: {count} (возобновятся в режиме групп)",
+    geoMissingTitle:
+      "Отсутствует база GeoIP — прямые IP-подключения (напр. QQ) могут уходить через прокси",
+    geoMissingDesc:
+      "Загрузите Country.mmdb и geosite.dat — правила прямого доступа применятся автоматически.",
+    geoFetchBtn: "Загрузить и применить",
+    geoFetchingBtn: "Загрузка и применение…",
+    exitProxyRiskHint:
+      "Текущий выходной IP отмечен как рискованный прокси — Windsurf / Devin может выдавать ошибки",
+    createWsfCleanGroupBtn: "Создать чистую группу WSF",
   },
   aiHub: {
     title: "ИИ-автопилот",
@@ -593,6 +609,29 @@ export const ru: DeepStringDict<TranslationDict> = {
     moreFiltersBtn: "Ещё фильтры",
     resetFiltersBtn: "Сбросить фильтры",
     activeFiltersCount: "Выбрано: {count}",
+    mainFallbackActive: "Основная · Активна",
+    indepRoutingCount: "Независимо · {count}",
+    indepRoutingPending: "Независимо · Нет правил",
+    indepCapsuleActive: "Независимая маршрутизация · {count}",
+    indepCapsulePending: "Независимо · Добавьте правила",
+    indepCapsuleOff: "Независимо: Выкл",
+    section5Title: "5. Правила маршрутизации (домены / процессы / составные)",
+    section5Placeholder:
+      "Напр.: codeium.com / PROCESS-NAME,QQ.exe / AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))",
+    wsfTemplateTitle: "Windsurf / Devin Чистый IP",
+    wsfTemplateDesc: "Независимая маршрутизация · блокирует рисковые IP и предпочитает чистые",
+  },
+  rules: {
+    geoMissingTitle:
+      "Отсутствует база GeoIP — прямые IP-подключения (напр. QQ) могут уходить через прокси",
+    geoMissingDesc:
+      "Прямой доступ включён, но файл {file} отсутствует. Загрузите его для мгновенной активации GEOIP / GEOSITE.",
+    geoFetchBtn: "Загрузить GeoData и применить",
+    geoFetchingBtn: "Загрузка и применение…",
+    addImDirectBtn: "Добавить QQ / WeChat напрямую",
+    imDirectAlreadyAdded: "QQ / WeChat уже напрямую",
+    imDirectAddedToast: "Добавлено правил прямого доступа QQ / WeChat: {count}",
+    imDirectExistsToast: "Правила прямого доступа для QQ / WeChat (QQ.exe / WeChat.exe / Weixin.exe) уже добавлены",
   },
   shareBundle: {
     cancelUpdateExisting: "Отмена",

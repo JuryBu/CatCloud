@@ -500,6 +500,17 @@ impl Default for ProbeDefinition {
     }
 }
 
+/// Canonical Windsurf / Devin / Codeium domains shared by dedicated WSF split-routing templates
+/// and built-in AI routing presets.
+pub const DEFAULT_WSF_ROUTING_DOMAINS: &[&str] = &[
+    "codeium.com",
+    "codeiumdata.com",
+    "windsurf.com",
+    "devin.ai",
+    "cognition.ai",
+    "exafunction.com",
+];
+
 /// Default public AI service domains included in CatCloud built-in AI routing presets
 /// (covers OpenAI, Anthropic, Google AI / Antigravity / Cloud Code / OAuth, Windsurf/Devin/Codeium,
 /// Cursor, Perplexity, xAI, and GitHub Copilot endpoints; intentionally excludes `play.googleapis.com`).
@@ -553,6 +564,7 @@ pub const DEFAULT_AI_ROUTING_DOMAINS: &[&str] = &[
     "notebooklm.google.com",
     "jules.google.com",
     "codeium.com",
+    "codeiumdata.com",
     "windsurf.com",
     "devin.ai",
     "cognition.ai",
@@ -634,14 +646,14 @@ impl ProbeDefinition {
             },
             Self {
                 id: "builtin_unlock_windsurf".to_string(),
-                name: "Windsurf / Codeium Reachability".to_string(),
+                name: "Windsurf / Devin AI 纯净解锁".to_string(),
                 kind: ProbeKind::UnlockRegex,
-                target_url: "https://windsurf.com".to_string(),
-                method: "GET".to_string(),
-                expected_status: Some(200),
+                target_url: "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage".to_string(),
+                method: "POST".to_string(),
+                expected_status: None,
                 body_regex: None,
                 payload_bytes: None,
-                timeout_ms: 8000,
+                timeout_ms: 9000,
                 builtin: true,
             },
             Self {
@@ -703,6 +715,14 @@ pub struct ProbeResultRecord {
     pub keepalive_60s_ok: Option<bool>,
     pub unlocked_map: HashMap<String, bool>,
     pub detail: Option<String>,
+    #[serde(default)]
+    pub ip_clean: Option<bool>,
+    #[serde(default)]
+    pub ip_risk_level: Option<String>,
+    #[serde(default)]
+    pub ip_asn: Option<String>,
+    #[serde(default)]
+    pub ip_risk_flags: Option<String>,
 }
 
 /// Aggregated per-node probe view consumed by the strategy formula engine and UI.
@@ -724,6 +744,14 @@ pub struct ProbeSnapshot {
     pub google_clean: Option<bool>,
     pub google_risk_mismatch: bool,
     pub keepalive_60s_ok: Option<bool>,
+    #[serde(default)]
+    pub ip_clean: Option<bool>,
+    #[serde(default)]
+    pub ip_risk_level: Option<String>,
+    #[serde(default)]
+    pub ip_asn: Option<String>,
+    #[serde(default)]
+    pub ip_risk_flags: Option<String>,
     pub unlocked_sites: HashMap<String, bool>,
     pub per_probe_ok: HashMap<String, bool>,
     pub per_probe_up_mbps: HashMap<String, f64>,
@@ -899,6 +927,35 @@ impl ProbeSnapshot {
             }
         }
 
+        // Atomically populate all 4 IP purity fields from the single newest record carrying
+        // `ip_risk_level` or `ip_clean`, preventing cross-record field tearing.
+        if let Some((ip_rec, _)) = latest_records.iter().find(|(rec, _)| {
+            rec.ip_risk_level
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+                || rec.ip_clean.is_some()
+        }) {
+            snap.ip_clean = ip_rec.ip_clean;
+            snap.ip_risk_level = ip_rec
+                .ip_risk_level
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            snap.ip_asn = ip_rec
+                .ip_asn
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            snap.ip_risk_flags = ip_rec
+                .ip_risk_flags
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+        }
+
         // `unlocked_sites`: `builtin_unlock_gemini` strictly owns `"gemini"` whenever present;
         // `builtin_google_cn` independently maintains `"gemini_aistudio"` and never overrides `"gemini"`.
         let dedicated_gemini = latest_records
@@ -913,7 +970,23 @@ impl ProbeSnapshot {
         };
 
         for (rec, _) in &latest_records {
+            // Do not treat legacy pre-Stage26 Windsurf homepage HTTP-200 records
+            // (`site=windsurf, status=200...` without `semantic_windsurf` or IP purity fields)
+            // as verified Windsurf unlocks in `unlocked_sites` so policy hard gates align with UI.
+            let is_legacy_windsurf_false_green = rec.probe_id == "builtin_unlock_windsurf"
+                && rec.ip_risk_level.is_none()
+                && rec.ip_clean.is_none()
+                && rec
+                    .detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("site=windsurf,") && !d.contains("semantic_windsurf"));
             for (site, unlocked) in &rec.unlocked_map {
+                if is_legacy_windsurf_false_green
+                    && *unlocked
+                    && (site == "windsurf" || site == "builtin_unlock_windsurf")
+                {
+                    continue;
+                }
                 if site == "gemini" {
                     if gemini_owned_by_dedicated {
                         continue;
@@ -1103,6 +1176,10 @@ mod tests {
             "generativelanguage.googleapis.com",
             "windsurf.com",
             "codeium.com",
+            "codeiumdata.com",
+            "devin.ai",
+            "cognition.ai",
+            "exafunction.com",
             "cursor.com",
             "githubcopilot.com",
         ] {
@@ -1111,9 +1188,41 @@ mod tests {
                 "missing required AI routing domain `{required}`"
             );
         }
+        assert_eq!(
+            DEFAULT_WSF_ROUTING_DOMAINS,
+            &[
+                "codeium.com",
+                "codeiumdata.com",
+                "windsurf.com",
+                "devin.ai",
+                "cognition.ai",
+                "exafunction.com",
+            ]
+        );
+        for d in DEFAULT_WSF_ROUTING_DOMAINS {
+            assert!(
+                DEFAULT_AI_ROUTING_DOMAINS.contains(d),
+                "DEFAULT_AI_ROUTING_DOMAINS missing WSF domain `{d}`"
+            );
+        }
 
         let builtins = ProbeDefinition::builtin_defaults();
         assert_eq!(builtins.len(), 9);
+        let windsurf = builtins
+            .iter()
+            .find(|p| p.id == "builtin_unlock_windsurf")
+            .expect("missing builtin_unlock_windsurf");
+        assert_eq!(windsurf.name, "Windsurf / Devin AI 纯净解锁");
+        assert_eq!(windsurf.kind, ProbeKind::UnlockRegex);
+        assert_eq!(
+            windsurf.target_url,
+            "https://server.codeium.com/exa.api_server_pb.ApiServerService/GetChatMessage"
+        );
+        assert_eq!(windsurf.method, "POST");
+        assert_eq!(windsurf.expected_status, None);
+        assert_eq!(windsurf.body_regex, None);
+        assert_eq!(windsurf.timeout_ms, 9000);
+        assert!(windsurf.builtin);
         let claude = builtins
             .iter()
             .find(|p| p.id == "builtin_unlock_claude")
@@ -1547,5 +1656,56 @@ mod tests {
         let snap_edge = ProbeSnapshot::from_results_with_kinds("n3", &edge_results, None, &kinds);
         assert_eq!(snap_edge.probe_ping("custom_lat_fail"), None);
         assert_eq!(snap_edge.probe_ping("custom_lat_zero"), None);
+    }
+
+    #[test]
+    fn probe_snapshot_ip_purity_fields_are_taken_atomically_from_single_newest_record() {
+        let mut kinds = HashMap::new();
+        for def in ProbeDefinition::builtin_defaults() {
+            kinds.insert(def.id, def.kind);
+        }
+
+        // Newer latency probe carries NO IP purity metadata; newer windsurf probe is `clean`
+        // with `ip_risk_flags: None`; older custom probe had `proxy_risk` with flags & ASN.
+        // The snapshot MUST atomically take all 4 fields from the single newest IP-carrying record
+        // (windsurf) and MUST NEVER leak stale `ip_risk_flags` from the older record.
+        let results = vec![
+            ProbeResultRecord {
+                node_id: "n-ip".into(),
+                probe_id: "builtin_latency".into(),
+                tested_at: "2026-11-28T06:02:00Z".into(),
+                ok: true,
+                latency_ms: Some(32.0),
+                ..Default::default()
+            },
+            ProbeResultRecord {
+                node_id: "n-ip".into(),
+                probe_id: "builtin_unlock_windsurf".into(),
+                tested_at: "2026-11-28T06:01:00Z".into(),
+                ok: true,
+                ip_clean: Some(true),
+                ip_risk_level: Some("clean".into()),
+                ip_asn: Some("AS3462 HiNet".into()),
+                ip_risk_flags: None,
+                ..Default::default()
+            },
+            ProbeResultRecord {
+                node_id: "n-ip".into(),
+                probe_id: "legacy_ip_probe".into(),
+                tested_at: "2026-11-28T05:00:00Z".into(),
+                ok: false,
+                ip_clean: Some(false),
+                ip_risk_level: Some("proxy_risk".into()),
+                ip_asn: Some("AS38136 Akari Networks".into()),
+                ip_risk_flags: Some("proxy,datacenter".into()),
+                ..Default::default()
+            },
+        ];
+
+        let snap = ProbeSnapshot::from_results_with_kinds("n-ip", &results, None, &kinds);
+        assert_eq!(snap.ip_clean, Some(true));
+        assert_eq!(snap.ip_risk_level.as_deref(), Some("clean"));
+        assert_eq!(snap.ip_asn.as_deref(), Some("AS3462 HiNet"));
+        assert_eq!(snap.ip_risk_flags, None);
     }
 }

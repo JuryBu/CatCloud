@@ -139,10 +139,11 @@ const ZH_DOC_00_TROUBLESHOOTING: &str = r###"> 【语言锁定】请全程使用
 - 先确认关闭代理后国内普通网站能否打开；校园网/酒店 Wi-Fi 若返回 302 登录页，需先完成网页认证。
 - 检查命令：`catcloud preaccel test --campus --json`、`catcloud net doctor --json`。
 
-### 第 2 层：冲突代理软件与残留系统服务
+### 第 2 层：冲突代理软件、残留系统服务与 Windows `ProxyOverride`
 - 检查电脑是否同时运行了其他代理客户端、遗留的第三方虚拟网卡驱动、被锁死的系统代理地址，或终端残留的 `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` 环境变量。
+- Windows 原生 `curl.exe` / PowerShell / Schannel 若出现 `CRYPT_E_REVOCATION_OFFLINE (0x80092013)`，常见原因是注册表 `ProxyOverride` 中存在裸 `::1` 或 `/` CIDR 导致 `WinHttpOpen` 报参数错（87）；猫猫云梯已自动将排除项规范为 `[::1]` 与 Windows 通配符并通过代理守护自愈。
 - 安全软件（Windows Defender / 火绒 / 360 / 电脑管家）拦截核心或驱动时，需在信任区放行猫猫云梯目录并重测。
-- 检查命令：`catcloud net doctor --json`（自动检查端口冲突、代理环境变量与常见冲突服务）。
+- 检查命令：`catcloud net doctor --json`（自动检查端口冲突、代理环境变量、Windows 注册表 `ProxyOverride` 合法性与常见冲突服务）。
 
 ### 第 3 层：猫猫云梯核心、端口与虚拟网卡（TUN 模式）
 - 浏览器正常但终端/游戏/桌面软件不通：去「总览」开启「虚拟网卡（TUN 模式）」（Windows 首次开启需点 UAC 管理员确认）。
@@ -530,11 +531,12 @@ const ZH_DOC_03_MULTIGROUP: &str = r###"> 【语言锁定】请全程使用简�
 | 使用场景 | 推荐模式 | 推荐硬门禁 | 推荐安全评分公式 | 推荐兜底与切线策略 |
 |---|---|---|---|---|
 | **AI 编程防封号（推荐）** | `sticky_best` | `google_clean == 1`、`keepalive_ok == 1` | `(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08 - jitter_ms * 0.15) / max(multiplier, 0.25)` | `cross_pool_escalate` + `force_close_old` |
+| **Windsurf / Devin 纯净专用（独立分流）** | `sticky_best` | `site_unlocked("windsurf") == 1`（可选 `ip_clean == 1`） | `(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25) + ip_clean * 120` | `degrade_best_warn` + `force_close_old` |
 | **低倍率省流 + 高倍率兜底** | `conditional_pool` | `multiplier <= 1.0`、`google_clean == 1` | `(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)` | 主池配 `cross_pool_escalate` 借道高倍率备池，恢复自动滞回回切 |
 | **影音流媒体 / 大文件下载** | `sticky_best` | `ok == 1` | `down_mbps * 30 + up_mbps * 5 - ping_ms * 0.15 - jitter_ms * 0.2` | `degrade_best_warn` + `graceful_new_only` |
 | **纯极速性能优先（不计倍率）** | `sticky_best` | `google_clean == 1` | `up_mbps * 45 + min(down_mbps, 200) * 0.35 - ping_ms * 0.1` | `degrade_best_warn` + `force_close_old` |
 
-> **安全公式可用变量与函数**（零 `eval`）：`up_mbps`、`down_mbps`、`ping_ms`（别名 `latency_ms`）、`jitter_ms`、`loss_pct`、`multiplier`、`keepalive_ok`、`google_clean`、`unlocked`、`is_443_native`、`ok`；纯函数 `min(a,b)`、`max(a,b)`、`clamp(x,lo,hi)`、`if(c,t,f)`、`abs(x)`；按探针 ID 寻址 `probe_up("id")`、`probe_down("id")`、`probe_ping("id")`、`probe_ok("id")`、`site_unlocked("name")`。
+> **安全公式可用变量与函数**（零 `eval`）：`up_mbps`、`down_mbps`、`ping_ms`（别名 `latency_ms`）、`jitter_ms`、`loss_pct`、`multiplier`、`keepalive_ok`、`google_clean`、`ip_clean`（出口 IP 纯净住宅为 `1`、机房/代理风控为 `0`，硬门禁中未测节点中立放行防误杀）、`unlocked`、`is_443_native`、`ok`；纯函数 `min(a,b)`、`max(a,b)`、`clamp(x,lo,hi)`、`if(c,t,f)`、`abs(x)`；按探针 ID 寻址 `probe_up("id")`、`probe_down("id")`、`probe_ping("id")`、`probe_ok("id")`、`site_unlocked("name")`。
 
 ## 三、GUI 操作与 CLI 精确命令
 
@@ -545,8 +547,9 @@ const ZH_DOC_03_MULTIGROUP: &str = r###"> 【语言锁定】请全程使用简�
 # 查看全部多选组与当前选中节点
 catcloud group list --json
 
-# 创建或局部更新智能多选组（已有组未传字段全部安全保留）
+# 创建或局部更新智能多选组（支持 --independent-routing、--match-rules、--add-match-rule、--hard-gate；已有组未传字段安全保留）
 catcloud group create --id grp-ai --name "AI 稳定组" --mode sticky_best --fallback cross_pool_escalate --switch-mode force_close_old --json
+catcloud group create --id grp-wsf --name "WSF 纯净专用" --mode sticky_best --independent-routing true --hard-gate 'site_unlocked("windsurf") == 1' --add-match-rule "DOMAIN-SUFFIX,codeium.com" --add-match-rule "DOMAIN-SUFFIX,windsurf.com" --json
 
 # 专用成员维护（安全增删/替换成员，零触碰策略与分流规则）
 catcloud group members --id grp-ai add --nodes node_1,node_2 --json
@@ -560,8 +563,8 @@ catcloud group eval grp-ai --json
 catcloud group switch grp-ai --json
 catcloud group switch grp-ai --node <node_id> --json
 
-# 更新评分公式、兜底、硬门禁与分流规则
-catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)" --fallback degrade_best_warn --hard-gate "google_clean == 1" --add-match-rule "DOMAIN-SUFFIX,openai.com" --json
+# 更新评分公式、兜底、硬门禁、独立分流开关与分流规则
+catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25) + ip_clean * 120" --fallback degrade_best_warn --hard-gate "google_clean == 1" --independent-routing true --add-match-rule "DOMAIN-SUFFIX,openai.com" --json
 catcloud group policy grp-ai --match-rules "DOMAIN-SUFFIX,openai.com;DOMAIN-SUFFIX,claude.ai" --json
 catcloud group policy grp-ai --clear-match-rules --json
 ```
@@ -578,7 +581,7 @@ const ZH_DOC_04_NODES_PROBES: &str = r###"> 【语言锁定】请全程使用简
 ## 一、三档零干扰测速体系（页面：`节点与测速`）
 
 测速运行在独立临时沙箱核心（仅绑定本机回环、关闭虚拟网卡、低内存上限、结束即销毁），**全程不打断当前上网**：
-1. **省流快测（L1，推荐首选）**：极低流量一次性测出真实延迟、是否「谷歌送中」（以 Google 侧真值为硬门禁）以及 Claude / ChatGPT / Gemini / Windsurf 解锁状态。
+1. **省流快测（L1，推荐首选）**：极低流量一次性测出真实延迟、是否「谷歌送中」（以 Google 侧真值为硬门禁）以及 Claude / ChatGPT / Gemini / Windsurf 真实语义解锁；其中 `builtin_unlock_windsurf` 并发探测 Codeium API 网关（`POST server.codeium.com/.../GetChatMessage`）与双源出口 IP 纯净度情报（`api.ipquery.io` + `ip-api.com`，仅记录 ASN 与风险等级，绝不落盘明文公网 IP），直接拦截高危代理出口（`proxy_risk`）并区分纯净住宅（`clean` / `ip_clean=1`）与普通机房提醒（`datacenter`）。
 2. **完整测速（L2，按需跑）**：在 L1 基础上实测真实上传（512 KB 快切防卡死）与下载带宽，为「智能多选组」提供排序依据。
 3. **60 秒静默保活（Keep-Alive）**：排查「能 ping 通但静默 20～60 秒就黑洞断流」的假活线路。
 - **黄金节点智能降级**：若刚跑完省流快测还没有上下行速度数据，列表会自动降级按「未送中 + AI 解锁 + 有效延迟升序」排优，并提示一键为黄金节点补测上下行。
@@ -654,9 +657,10 @@ const ZH_DOC_05_ROUTING_CONNS: &str = r###"> 【语言锁定】请全程使用�
 # 查看活跃连接摘要（默认脱敏）
 catcloud net connections --json
 
-# 模拟测试某域名会命中哪条规则与目标组
+# 模拟测试某域名/进程会命中哪条规则与目标组（支持 --process-name / --process-path / --port）
 catcloud net match chatgpt.com --json
-catcloud net match qq.com --json
+catcloud net match qq.com --process-name QQ.exe --port 15000 --json
+catcloud net match server.codeium.com --process-path "C:\\Apps\\Windsurf\\Windsurf.exe" --json
 ```
 "###;
 
@@ -754,7 +758,7 @@ const EN_DOC_00_TROUBLESHOOTING: &str = r###"> [LANGUAGE LOCK] Reply strictly in
 
 ## 1. 6-Layer Bottom-Up Diagnostic Order
 1. **Layer 1 — Physical Network & Captive Portal**: Confirm direct domestic sites load with proxy off. On campus/hotel Wi-Fi returning HTTP 302 login portals, authenticate first (`catcloud preaccel test --campus --json`).
-2. **Layer 2 — Conflicting Proxy Apps & Residual Services**: Check for other running proxy clients, leftover system proxy entries, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env vars, or security software blocking core/driver binaries (`catcloud net doctor --json`).
+2. **Layer 2 — Conflicting Proxy Apps, Residual Services & Windows `ProxyOverride`**: Check for other running proxy clients, leftover system proxy entries, `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` env vars, security software blocking core/driver binaries, or invalid Windows registry `ProxyOverride` entries (bare unbracketed `::1` or `/` CIDRs break `WinHttpOpen`/Schannel with `0x80092013` / Win32 Error 87; CatCloud auto-sanitizes to `[::1]` and validates via `catcloud net doctor --json`).
 3. **Layer 3 — CatCloud Core, Ports & TUN Mode**: If browsers work but terminals/IDEs/games fail, enable **TUN Mode** on **Overview** (requires admin elevation on Windows). If CatCloud was started without Windows elevation while TUN was configured, the UI honestly shows **TUN · Admin Required** (only System Proxy is active, so browsers work while desktop apps/terminals may time out); click it for one-click admin relaunch, or choose to turn TUN off. Check port auto-shift in **Settings → Network & DNS**, and verify config with `catcloud status --json` and `catcloud config validate --json`.
 4. **Layer 4 — Routing Rules, DNS & QUIC Policy**: Ensure domestic direct routing and `Country.mmdb` are present (**Rules & Conns** / **Settings → Network & DNS**). On campus/enterprise networks blocking outbound plaintext UDP 53, direct or proxy-node DNS can time out; CatCloud now defaults to pure-IP DoH 443 (`223.5.5.5` / `1.12.12.12`) while keeping `system` resolution in `nameserver-policy` for `+.edu.cn`/LAN suffixes and configured campus direct domains—switch back to pure-IP DoH 443 if you manually set plaintext UDP 53. CatCloud allows domestic QUIC (UDP 443) before overseas QUIC blocking and bypasses Fake-IP for major domestic IM domains. Inspect with `catcloud net match <domain> --json` and `catcloud net connections --json`.
 5. **Layer 5 — Domestic Boost**: Verify relay expiry, cloud firewall TCP 443 inbound allow rule, strictly EMPTY `sni`, domestic 204 health probe, real relay speeds, and standalone global tunnel status (`catcloud preaccel pool --json`, `catcloud preaccel test --json`, `catcloud preaccel test --speed --json`, `catcloud preaccel global-status --json`). Quick rollback: `catcloud preaccel bind --enabled false --json && catcloud config reload --json`.
@@ -941,23 +945,25 @@ const EN_DOC_03_MULTIGROUP: &str = r###"> [LANGUAGE LOCK] Reply strictly in Engl
 | Scenario | Mode | Hard Gates | Safe AST Formula | Fallback & Switch |
 |---|---|---|---|---|
 | **AI Coding & Anti-Ban** | `sticky_best` | `google_clean == 1`, `keepalive_ok == 1` | `(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08 - jitter_ms * 0.15) / max(multiplier, 0.25)` | `cross_pool_escalate` + `force_close_old` |
+| **Windsurf / Devin Pure Dedicated** | `sticky_best` | `site_unlocked("windsurf") == 1` (optional `ip_clean == 1`) | `(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25) + ip_clean * 120` | `degrade_best_warn` + `force_close_old` |
 | **Low-Multiplier + Backup Escalation** | `conditional_pool` | `multiplier <= 1.0`, `google_clean == 1` | `(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)` | `cross_pool_escalate` (auto hysteresis return) |
 | **Streaming & Downloads** | `sticky_best` | `ok == 1` | `down_mbps * 30 + up_mbps * 5 - ping_ms * 0.15 - jitter_ms * 0.2` | `degrade_best_warn` + `graceful_new_only` |
 | **Max Raw Speed** | `sticky_best` | `google_clean == 1` | `up_mbps * 45 + min(down_mbps, 200) * 0.35 - ping_ms * 0.1` | `degrade_best_warn` + `force_close_old` |
 
-- Available scalars/functions (zero `eval`): `up_mbps`, `down_mbps`, `ping_ms`, `jitter_ms`, `loss_pct`, `multiplier`, `keepalive_ok`, `google_clean`, `unlocked`, `is_443_native`, `ok`, `min`, `max`, `clamp`, `if`, `abs`, `probe_up("id")`, `probe_down("id")`, `probe_ping("id")`, `probe_ok("id")`, `site_unlocked("name")`.
+- Available scalars/functions (zero `eval`): `up_mbps`, `down_mbps`, `ping_ms`, `jitter_ms`, `loss_pct`, `multiplier`, `keepalive_ok`, `google_clean`, `ip_clean` (`1` for clean residential exit IP, `0` for datacenter/proxy risk; untested nodes pass neutrally in hard gates), `unlocked`, `is_443_native`, `ok`, `min`, `max`, `clamp`, `if`, `abs`, `probe_up("id")`, `probe_down("id")`, `probe_ping("id")`, `probe_ok("id")`, `site_unlocked("name")`.
 
 ## 3. CLI Reference (`<group_id>` Is Positional)
 ```bash
 catcloud group list --json
 catcloud group create --id grp-ai --name "AI Sticky" --mode sticky_best --fallback cross_pool_escalate --switch-mode force_close_old --json
+catcloud group create --id grp-wsf --name "WSF Pure" --mode sticky_best --independent-routing true --hard-gate 'site_unlocked("windsurf") == 1' --match-rules "DOMAIN-SUFFIX,codeium.com;DOMAIN-SUFFIX,windsurf.com" --add-match-rule "DOMAIN-SUFFIX,devin.ai" --json
 catcloud group members --id grp-ai add --nodes node_1,node_2 --json
 catcloud group members --id grp-ai remove --nodes node_2 --json
 catcloud group members --id grp-ai set --nodes node_1,node_3 --json
 catcloud group eval grp-ai --json
 catcloud group switch grp-ai --json
 catcloud group switch grp-ai --node <node_id> --json
-catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25)" --fallback degrade_best_warn --add-match-rule "DOMAIN-SUFFIX,openai.com" --json
+catcloud group policy grp-ai --formula "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08) / max(multiplier, 0.25) + ip_clean * 120" --fallback degrade_best_warn --independent-routing true --add-match-rule "DOMAIN-SUFFIX,openai.com" --json
 ```
 
 ## 4. Rollback & Troubleshooting
@@ -971,7 +977,7 @@ const EN_DOC_04_NODES_PROBES: &str = r###"> [LANGUAGE LOCK] Reply strictly in En
 
 ## 1. Zero-Interference 3-Tier Speed Testing (`Nodes & Speed`)
 Tests execute in an ephemeral loopback-only sandbox core (no TUN, low memory cap, immediate teardown) with zero interruption to active traffic:
-- **Lite Test (L1, recommended first)**: Minimal bandwidth; measures latency, Google region truth (hard gate), and AI service unlocks (Claude / ChatGPT / Gemini / Windsurf).
+- **Lite Test (L1, recommended first)**: Minimal bandwidth; measures latency, Google region truth (hard gate), and real semantic AI unlocks (Claude / ChatGPT / Gemini / Windsurf). Specifically, `builtin_unlock_windsurf` probes the Codeium API gateway (`POST server.codeium.com/.../GetChatMessage`) concurrently with dual-source exit-IP purity checks (`api.ipquery.io` + `ip-api.com`, storing ASN & risk level only—never plaintext public IPs) to reject high-risk proxy exits (`proxy_risk`) while distinguishing clean residential IPs (`clean` / `ip_clean=1`) from advisory datacenter exits (`datacenter`).
 - **Full Test (L2)**: Measures upload (512 KB fast-cut) and download throughput for **Smart Groups** scoring.
 - **60s Silent Keep-Alive**: Filters out nodes that answer pings yet blackhole idle streams after 20-60s.
 - **Golden Nodes Fallback**: When throughput has not been measured yet, **Golden Nodes** gracefully rank by Clean Google + AI Unlock + lowest latency, with a one-click throughput top-up button.
@@ -1029,7 +1035,8 @@ const EN_DOC_05_ROUTING_CONNS: &str = r###"> [LANGUAGE LOCK] Reply strictly in E
 ```bash
 catcloud net connections --json
 catcloud net match chatgpt.com --json
-catcloud net match qq.com --json
+catcloud net match qq.com --process-name QQ.exe --port 15000 --json
+catcloud net match server.codeium.com --process-path "C:\\Apps\\Windsurf\\Windsurf.exe" --json
 ```
 "###;
 
@@ -1413,8 +1420,8 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
                 "支持 sticky_best / conditional_pool / load_balance_*，兜底策略支持 degrade_best_warn / cross_pool_escalate / strict_circuit_break。",
             ]),
             gui_and_cli_verification: svec(&[
-                "GUI：「智能多选组」配置成员、硬门禁（如 google_clean == 1）、安全评分公式与切换模式。",
-                "CLI：`catcloud group list --json`、`catcloud group create --id grp-ai --name AI --mode sticky_best --json`、`catcloud group members --id grp-ai add|remove|set --nodes <csv> --json`、`catcloud group eval <group_id> --json`、`catcloud group switch <group_id> --json`、`catcloud group policy <group_id> --formula \"...\" --match-rules \"...\" --json`。",
+                "GUI：「智能多选组」配置成员、硬门禁（如 google_clean == 1、ip_clean == 1）、独立分流规则、安全评分公式与切换模式。",
+                "CLI：`catcloud group list --json`、`catcloud group create --id grp-ai --name AI --mode sticky_best --independent-routing true --hard-gate 'site_unlocked(\"windsurf\") == 1' --match-rules \"...\" --add-match-rule \"...\" --json`、`catcloud group members --id grp-ai add|remove|set --nodes <csv> --json`、`catcloud group eval <group_id> --json`、`catcloud group switch <group_id> --json`、`catcloud group policy <group_id> --formula \"...\" --independent-routing true --match-rules \"...\" --json`。",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "组触发熔断（REJECT）时，用 `catcloud group eval <group_id> --json` 排查硬门禁或将兜底改回 degrade_best_warn。",
@@ -1459,7 +1466,7 @@ fn build_zh_docs() -> Vec<AgentModuleDoc> {
             ]),
             gui_and_cli_verification: svec(&[
                 "GUI：「分流与连接」查看实时活跃连接、命中规则与开关国内直连/QUIC 策略。",
-                "CLI：`catcloud net connections --json`、`catcloud net match <domain> --json`。",
+                "CLI：`catcloud net connections --json`、`catcloud net match <domain> [--process-name <name>] [--process-path <path>] [--port <port>] --json`。",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "误配自定义规则导致某站不通时，用 `catcloud net match <domain> --json` 核查命中条目并移除错误前置规则后重载。",
@@ -1588,8 +1595,8 @@ fn build_en_docs() -> Vec<AgentModuleDoc> {
                 "At least 2 enabled nodes plus recent speed test results; safe zero-eval AST formulas.",
             ]),
             gui_and_cli_verification: svec(&[
-                "GUI: 'Smart Groups' -> mode, hard gates, formula, fallback, switch mode.",
-                "CLI: `catcloud group list --json`, `catcloud group create --id grp-ai --name AI --mode sticky_best --json`, `catcloud group members --id grp-ai add|remove|set --nodes <csv> --json`, `catcloud group eval <group_id> --json`, `catcloud group switch <group_id> --json`, `catcloud group policy <group_id> --formula \"...\" --match-rules \"...\" --json`.",
+                "GUI: 'Smart Groups' -> mode, hard gates (e.g. google_clean == 1, ip_clean == 1), independent routing rules, formula, fallback, switch mode.",
+                "CLI: `catcloud group list --json`, `catcloud group create --id grp-ai --name AI --mode sticky_best --independent-routing true --hard-gate 'site_unlocked(\"windsurf\") == 1' --match-rules \"...\" --add-match-rule \"...\" --json`, `catcloud group members --id grp-ai add|remove|set --nodes <csv> --json`, `catcloud group eval <group_id> --json`, `catcloud group switch <group_id> --json`, `catcloud group policy <group_id> --formula \"...\" --independent-routing true --match-rules \"...\" --json`.",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "Inspect `circuit_open` via `catcloud group eval <group_id> --json` or set fallback to `degrade_best_warn`.",
@@ -1627,7 +1634,7 @@ fn build_en_docs() -> Vec<AgentModuleDoc> {
                 "Uses Country.mmdb (and optional geosite.dat); domestic UDP 443 allow precedes overseas QUIC block; QQ/WeChat domains added to fake-ip-filter.",
             ]),
             gui_and_cli_verification: svec(&[
-                "GUI: 'Rules & Conns'. CLI: `catcloud net connections --json`, `catcloud net match <domain> --json`.",
+                "GUI: 'Rules & Conns'. CLI: `catcloud net connections --json`, `catcloud net match <domain> [--process-name <name>] [--process-path <path>] [--port <port>] --json`.",
             ]),
             rollback_and_troubleshooting: svec(&[
                 "Remove misbehaving custom prepend rules after checking `catcloud net match <domain> --json`.",
@@ -2601,6 +2608,14 @@ mod tests {
             assert!(preaccel_md.contains("--dispatch-strategy"));
             let mg_md = export_agent_docs_with_lang(MULTIGROUP_DOC_ID, false, lang).unwrap();
             assert!(mg_md.contains("group members --id"));
+            assert!(mg_md.contains("ip_clean"));
+            assert!(mg_md.contains("--independent-routing"));
+            let rc_md = export_agent_docs_with_lang(ROUTING_CONNS_DOC_ID, false, lang).unwrap();
+            assert!(rc_md.contains("--process-name"));
+            assert!(rc_md.contains("--process-path"));
+            let np_md = export_agent_docs_with_lang(NODES_PROBES_DOC_ID, false, lang).unwrap();
+            assert!(np_md.contains("builtin_unlock_windsurf"));
+            assert!(trouble_md.contains("ProxyOverride"));
         }
     }
 

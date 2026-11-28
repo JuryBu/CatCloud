@@ -58,6 +58,14 @@ import {
   useLatestTraffic,
 } from "../store/appStore";
 import {
+  type AiSiteBadgeDisplay,
+  formatGoogleRegionTooltip,
+  formatIpPurityBadge,
+  getAiBadgeToneClass,
+  getNodeAiBadgeDisplays,
+  isProxyRiskSnapshot,
+} from "../utils/aiUnlockDisplay";
+import {
   type ResolvedNodeLatency,
   getLatencyTooltipKey,
   hasValidDownMbps,
@@ -155,28 +163,21 @@ function getProbeGoogleState(snap: ProbeSnapshot | undefined): "clean" | "cn" | 
 }
 
 function getProbeAiBadges(snap: ProbeSnapshot | undefined): {
-  unlocked: Array<{ id: string; label: string; short: string }>;
+  unlocked: AiSiteBadgeDisplay[];
+  display: AiSiteBadgeDisplay[];
   anyMeasured: boolean;
 } {
-  if (!snap) return { unlocked: [], anyMeasured: false };
-  const sites = snap.unlocked_sites ?? {};
-  const geminiVal = sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai;
-  const claudeVal = sites.claude;
-  const chatgptVal = sites.chatgpt;
-  const windsurfVal = sites.windsurf;
-  const anyMeasured =
-    geminiVal !== undefined ||
-    claudeVal !== undefined ||
-    chatgptVal !== undefined ||
-    windsurfVal !== undefined;
-  const unlocked: Array<{ id: string; label: string; short: string }> = [];
-  if (claudeVal === true) unlocked.push({ id: "claude", label: "Claude", short: "Claude" });
-  if (geminiVal === true) unlocked.push({ id: "gemini", label: "Gemini", short: "Gemini" });
-  if (chatgptVal === true) unlocked.push({ id: "chatgpt", label: "ChatGPT", short: "ChatGPT" });
-  if (windsurfVal === true) {
-    unlocked.push({ id: "windsurf", label: "Windsurf", short: "Windsurf" });
-  }
-  return { unlocked, anyMeasured };
+  if (!snap) return { unlocked: [], display: [], anyMeasured: false };
+  const all = getNodeAiBadgeDisplays(snap);
+  const measured = all.filter((item) => item.measured);
+  const unlocked = measured.filter((item) => item.unlocked);
+  const display = measured.filter(
+    (item) =>
+      item.unlocked ||
+      item.windsurfState === "proxy_risk" ||
+      item.windsurfState === "legacy_retest"
+  );
+  return { unlocked, display, anyMeasured: measured.length > 0 };
 }
 
 function formatHomeLatencyTooltip(
@@ -586,12 +587,24 @@ export function HomePage() {
   const initialized = useAppSelector((s) => s.initialized);
   const danglingRulesAudit = useAppSelector((s) => s.danglingRulesAudit);
   const repairingDanglingRules = useAppSelector((s) => s.repairingDanglingRules);
+  const geoStatus = useAppSelector((s) => s.bgTasks.settings.geoStatus);
+  const geoBusy = useAppSelector((s) => s.bgTasks.settings.geoBusy);
+  const geoRuleContext = useAppSelector((s) => s.geoRuleContext);
+  const [geoBannerDismissed, setGeoBannerDismissed] = useState(false);
 
   useEffect(() => {
-    if (initialized) {
-      void appActions.refreshDanglingRulesAudit();
+    if (geoStatus === null) {
+      void appActions.loadGeodataStatus();
     }
-  }, [initialized]);
+  }, [geoStatus]);
+
+  useEffect(() => {
+    if (!initialized) return;
+    const timer = window.setTimeout(() => {
+      void appActions.refreshDanglingRulesAudit();
+    }, 220);
+    return () => window.clearTimeout(timer);
+  }, [initialized, config, groups]);
 
   const [togglingProxy, setTogglingProxy] = useState(false);
   const [togglingPreAccel, setTogglingPreAccel] = useState(false);
@@ -791,16 +804,24 @@ export function HomePage() {
 
   const activeGroupId = activeGroup?.id ?? runtime.active_group_id ?? "";
 
-  const otherIndependentGroups = useMemo(
+  const allIndependentGroups = useMemo(
     () =>
       groups.filter(
-        (g) =>
-          g.id !== activeGroupId &&
-          Boolean(g.independent_routing) &&
-          g.match_rules.length > 0
+        (g) => Boolean(g.independent_routing) && g.match_rules.length > 0
       ),
-    [groups, activeGroupId]
+    [groups]
   );
+
+  const otherIndependentGroups = useMemo(
+    () => allIndependentGroups.filter((g) => g.id !== activeGroupId),
+    [allIndependentGroups, activeGroupId]
+  );
+
+  const nodeById = useMemo(() => {
+    const map = new Map<string, ProxyNode>();
+    for (const n of nodes) map.set(n.id, n);
+    return map;
+  }, [nodes]);
 
   const groupCandidateNodes = useMemo<ProxyNode[]>(() => {
     if (nodes.length === 0) return [];
@@ -990,6 +1011,23 @@ export function HomePage() {
     : null;
   const activeGoogleState = getProbeGoogleState(activeNodeProbe);
   const activeAiBadges = getProbeAiBadges(activeNodeProbe);
+  const canFallbackActiveNodePurity =
+    runtime.running && runtime.proxy_mode !== "direct";
+  const exitPurityBadge =
+    formatIpPurityBadge(exitIp) ??
+    (canFallbackActiveNodePurity ? formatIpPurityBadge(activeNodeProbe) : null);
+  const isActiveExitProxyRisk =
+    canFallbackActiveNodePurity &&
+    (isProxyRiskSnapshot(exitIp) || isProxyRiskSnapshot(activeNodeProbe));
+  const missingGeoDb = Boolean(
+    initialized &&
+      geoStatus !== null &&
+      geoRuleContext.domesticDirectEnabled &&
+      !geoRuleContext.customRulesOnly &&
+      (geoRuleContext.geodataMode
+        ? !geoStatus.geoip_dat.exists
+        : !geoStatus.country_mmdb.exists)
+  );
 
   // Main power switch state & human-friendly traffic status
   const platformOs = resolvePlatformOs(runtime.os_label);
@@ -1646,6 +1684,51 @@ export function HomePage() {
           </section>
         )}
 
+      {/* Missing GeoData Reminder Banner (0px when healthy or dismissed) */}
+      {missingGeoDb && !geoBannerDismissed && (
+        <section
+          role="status"
+          className="cc-card cc-glass rounded-2xl border border-[var(--amber)]/55 bg-[var(--amber-soft)]/45 px-4 py-3 text-xs"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex min-w-0 flex-1 items-start gap-2.5">
+              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-[var(--amber)]" />
+              <div className="min-w-0">
+                <div className="font-semibold text-[var(--text)]">
+                  {dict.home.geoMissingTitle}
+                </div>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-[var(--text-secondary)]">
+                  {dict.home.geoMissingDesc}
+                </p>
+              </div>
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <button
+                type="button"
+                disabled={geoBusy !== null}
+                onClick={() =>
+                  void appActions.runRefreshGeoDb(
+                    geoRuleContext.geodataMode ? ["geoip", "geosite"] : ["mmdb", "geosite"]
+                  )
+                }
+                className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl bg-[var(--accent)] px-3 py-1.5 text-[11.5px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
+              >
+                <RefreshCw className={`h-3.5 w-3.5 shrink-0 ${geoBusy ? "animate-spin" : ""}`} />
+                <span>{geoBusy ? dict.home.geoFetchingBtn : dict.home.geoFetchBtn}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setGeoBannerDismissed(true)}
+                aria-label={dict.common.close}
+                className="rounded-lg p-1 text-[var(--muted)] transition-colors hover:bg-[var(--surface)] hover:text-[var(--text)]"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
       {/* 0-Node Onboarding Guide Card: direct boost-only or import-as-main entry actions */}
       {initialized && nodes.length === 0 && (
         <section className="cc-card cc-glass rounded-2xl border-[var(--accent)]/45 bg-[var(--accent-soft)]/50 p-4">
@@ -2048,107 +2131,155 @@ export function HomePage() {
 
                 {/* Row 2: Direct-Jump Route Card (Single Node Card vs Two-Layer Smart Group Card) */}
                 {isSingleMode ? (
-                  <button
-                    type="button"
-                    onClick={() => appActions.setNav("nodes")}
-                    className="group flex w-full items-center justify-between gap-3 rounded-2xl border border-[var(--green)]/45 bg-[var(--bg-elevated)] px-3.5 py-3 text-left transition-all hover:border-[var(--green)] hover:bg-[var(--green-soft)]/30"
-                    title="点击前往「节点与测速」挑选单个节点"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="truncate text-base font-semibold tracking-tight text-[var(--text)]">
-                          {displayNodeName}
-                        </span>
-                        {displayRegionLabel && (
-                          <span
-                            className="shrink-0 rounded-md border border-[var(--green)]/35 bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium"
-                            style={{ color: "color-mix(in srgb, var(--green) 82%, var(--text))" }}
-                            title={displayRegionCode}
-                          >
-                            {displayRegionLabel}
-                            {displayRegionCode &&
-                            displayRegionCode !== "UNK" &&
-                            displayRegionLabel !== displayRegionCode
-                              ? ` · ${displayRegionCode}`
-                              : ""}
+                  <div className="space-y-1.5">
+                    <button
+                      type="button"
+                      onClick={() => appActions.setNav("nodes")}
+                      className="group flex w-full items-center justify-between gap-3 rounded-2xl border border-[var(--green)]/45 bg-[var(--bg-elevated)] px-3.5 py-3 text-left transition-all hover:border-[var(--green)] hover:bg-[var(--green-soft)]/30"
+                      title="点击前往「节点与测速」挑选单个节点"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="truncate text-base font-semibold tracking-tight text-[var(--text)]">
+                            {displayNodeName}
                           </span>
-                        )}
+                          {displayRegionLabel && (
+                            <span
+                              className="shrink-0 rounded-md border border-[var(--green)]/35 bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium"
+                              style={{ color: "color-mix(in srgb, var(--green) 82%, var(--text))" }}
+                              title={displayRegionCode}
+                            >
+                              {displayRegionLabel}
+                              {displayRegionCode &&
+                              displayRegionCode !== "UNK" &&
+                              displayRegionLabel !== displayRegionCode
+                                ? ` · ${displayRegionCode}`
+                                : ""}
+                            </span>
+                          )}
+                        </div>
+
+                        <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-[var(--muted)]">
+                          {activeNodeSourceName && (
+                            <span className="max-w-[140px] truncate text-[var(--text-secondary)]">
+                              {activeNodeSourceName}
+                            </span>
+                          )}
+                          <span
+                            className="inline-flex items-center gap-1.5"
+                            title={activeLatencyTooltip}
+                          >
+                            <span
+                              className="h-2 w-2 shrink-0 rounded-full"
+                              style={{ backgroundColor: activeLatencyColor }}
+                            />
+                            <strong
+                              className="cc-mono font-semibold"
+                              style={{
+                                color: activeLatencyColor,
+                              }}
+                            >
+                              {activeLatencyText}
+                            </strong>
+                          </span>
+                          <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
+                            ↑{" "}
+                            <strong className="cc-mono font-semibold text-[var(--coral)]">
+                              {displayUpMbps !== null ? `${displayUpMbps.toFixed(1)} Mbps` : "未测"}
+                            </strong>
+                          </span>
+                          <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
+                            ↓{" "}
+                            <strong className="cc-mono font-semibold text-[var(--sky)]">
+                              {displayDownMbps !== null ? `${displayDownMbps.toFixed(1)} Mbps` : "未测"}
+                            </strong>
+                          </span>
+                          {activeGoogleState === "clean" && (
+                            <span
+                              title={formatGoogleRegionTooltip(activeNodeProbe, displayRegionCode)}
+                              className="rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]"
+                            >
+                              谷歌正常
+                            </span>
+                          )}
+                          {activeGoogleState === "cn" && (
+                            <span
+                              title={formatGoogleRegionTooltip(activeNodeProbe, displayRegionCode)}
+                              className="rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
+                            >
+                              谷歌送中
+                            </span>
+                          )}
+                          {activeNodeProbe?.google_risk_mismatch && (
+                            <span
+                              className="rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
+                              title={formatGoogleRegionTooltip(activeNodeProbe, displayRegionCode)}
+                            >
+                              地区有偏差
+                            </span>
+                          )}
+                          {activeAiBadges.display.map((ai) => {
+                            const isLegacy = ai.windsurfState === "legacy_retest";
+                            const toneCls = isLegacy
+                              ? getAiBadgeToneClass("muted", "legacy")
+                              : ai.tone === "green"
+                                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                : getAiBadgeToneClass(ai.tone, "soft");
+                            return (
+                              <span
+                                key={ai.id}
+                                title={ai.tooltip}
+                                className={`rounded-md px-1.5 py-0.5 text-[10px] font-medium ${toneCls}`}
+                              >
+                                {ai.label}
+                              </span>
+                            );
+                          })}
+                          {activeAiBadges.anyMeasured && activeAiBadges.display.length === 0 && (
+                            <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
+                              AI 受限
+                            </span>
+                          )}
+                        </div>
                       </div>
 
-                      <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs text-[var(--muted)]">
-                        {activeNodeSourceName && (
-                          <span className="max-w-[140px] truncate text-[var(--text-secondary)]">
-                            {activeNodeSourceName}
-                          </span>
-                        )}
-                        <span
-                          className="inline-flex items-center gap-1.5"
-                          title={activeLatencyTooltip}
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-xl border border-[var(--green)]/45 bg-[var(--card)] px-2.5 py-1.5 text-xs font-semibold text-[var(--green)] transition-colors group-hover:border-[var(--green)] group-hover:bg-[var(--green)] group-hover:text-[var(--accent-ink)]">
+                        <span>更换节点</span>
+                        <ArrowRight className="h-3.5 w-3.5" />
+                      </span>
+                    </button>
+
+                    {allIndependentGroups.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => appActions.setNav("groups")}
+                        className="flex w-full items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)]/70 px-3 py-1.5 text-left text-[11px] text-[var(--muted)] transition-colors hover:border-[var(--accent)]/45 hover:text-[var(--text-secondary)]"
+                      >
+                        <span className="truncate">
+                          {formatI18nTemplate(dict.home.singleModeIndepPaused, {
+                            count: allIndependentGroups.length,
+                          })}
+                        </span>
+                        <ArrowRight className="h-3 w-3 shrink-0" />
+                      </button>
+                    )}
+
+                    {isActiveExitProxyRisk && (
+                      <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--red)]/40 bg-[var(--red-soft)]/45 px-3 py-1.5 text-[11px]">
+                        <span className="min-w-0 flex-1 text-[var(--red)]">
+                          {dict.home.exitProxyRiskHint}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => appActions.openMultiGroupCreate("wsf")}
+                          className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-[var(--red)] px-2 py-0.5 text-[10.5px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
                         >
-                          <span
-                            className="h-2 w-2 shrink-0 rounded-full"
-                            style={{ backgroundColor: activeLatencyColor }}
-                          />
-                          <strong
-                            className="cc-mono font-semibold"
-                            style={{
-                              color: activeLatencyColor,
-                            }}
-                          >
-                            {activeLatencyText}
-                          </strong>
-                        </span>
-                        <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
-                          ↑{" "}
-                          <strong className="cc-mono font-semibold text-[var(--coral)]">
-                            {displayUpMbps !== null ? `${displayUpMbps.toFixed(1)} Mbps` : "未测"}
-                          </strong>
-                        </span>
-                        <span title="单位 Mbps（8 Mbps ≈ 1 MB/s）">
-                          ↓{" "}
-                          <strong className="cc-mono font-semibold text-[var(--sky)]">
-                            {displayDownMbps !== null ? `${displayDownMbps.toFixed(1)} Mbps` : "未测"}
-                          </strong>
-                        </span>
-                        {activeGoogleState === "clean" && (
-                          <span className="rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
-                            谷歌正常
-                          </span>
-                        )}
-                        {activeGoogleState === "cn" && (
-                          <span className="rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
-                            谷歌送中
-                          </span>
-                        )}
-                        {activeNodeProbe?.google_risk_mismatch && (
-                          <span
-                            className="rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                            title="不同网站识别出的地区存在差异，仅供参考"
-                          >
-                            地区有偏差
-                          </span>
-                        )}
-                        {activeAiBadges.unlocked.map((ai) => (
-                          <span
-                            key={ai.id}
-                            className="rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]"
-                          >
-                            {ai.label}
-                          </span>
-                        ))}
-                        {activeAiBadges.anyMeasured && activeAiBadges.unlocked.length === 0 && (
-                          <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                            AI 受限
-                          </span>
-                        )}
+                          <span>{dict.home.createWsfCleanGroupBtn}</span>
+                          <ArrowRight className="h-3 w-3 shrink-0" />
+                        </button>
                       </div>
-                    </div>
-
-                    <span className="inline-flex shrink-0 items-center gap-1 rounded-xl border border-[var(--green)]/45 bg-[var(--card)] px-2.5 py-1.5 text-xs font-semibold text-[var(--green)] transition-colors group-hover:border-[var(--green)] group-hover:bg-[var(--green)] group-hover:text-[var(--accent-ink)]">
-                      <span>更换节点</span>
-                      <ArrowRight className="h-3.5 w-3.5" />
-                    </span>
-                  </button>
+                    )}
+                  </div>
                 ) : (
                   <div ref={nodeDropdownRef} className="relative">
                     <div className="rounded-2xl border border-[var(--accent)]/40 bg-[var(--bg-elevated)] transition-colors">
@@ -2162,10 +2293,13 @@ export function HomePage() {
                         className="group flex w-full items-center justify-between gap-3 rounded-t-2xl px-3.5 py-2.5 text-left transition-colors hover:bg-[var(--accent-soft)]/35"
                         title="点击前往「智能多选组」切换或管理分组"
                       >
-                        <div className="min-w-0 flex-1">
+                        <div className="flex min-w-0 flex-1 items-center gap-2">
                           <div className="truncate text-base font-semibold tracking-tight text-[var(--text)]">
                             {displayGroupName}
                           </div>
+                          <span className="shrink-0 whitespace-nowrap rounded-full border border-[var(--green)]/40 bg-[var(--green-soft)] px-2 py-0.5 text-[10px] font-semibold text-[var(--green)]">
+                            {dict.home.mainFallbackBadge}
+                          </span>
                         </div>
 
                         <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-[var(--accent-soft)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent)] transition-opacity group-hover:opacity-90">
@@ -2225,31 +2359,46 @@ export function HomePage() {
                             </strong>
                           </span>
                           {activeGoogleState === "clean" && (
-                            <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                            <span
+                              title={formatGoogleRegionTooltip(activeNodeProbe, displayRegionCode)}
+                              className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]"
+                            >
                               谷歌正常
                             </span>
                           )}
                           {activeGoogleState === "cn" && (
-                            <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
+                            <span
+                              title={formatGoogleRegionTooltip(activeNodeProbe, displayRegionCode)}
+                              className="shrink-0 whitespace-nowrap rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
+                            >
                               谷歌送中
                             </span>
                           )}
                           {activeNodeProbe?.google_risk_mismatch && (
                             <span
                               className="shrink-0 whitespace-nowrap rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                              title="不同网站识别出的地区存在差异，仅供参考"
+                              title={formatGoogleRegionTooltip(activeNodeProbe, displayRegionCode)}
                             >
                               地区有偏差
                             </span>
                           )}
-                          {activeAiBadges.unlocked.map((ai) => (
-                            <span
-                              key={ai.id}
-                              className="shrink-0 whitespace-nowrap rounded-md bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--accent)]"
-                            >
-                              {ai.label}
-                            </span>
-                          ))}
+                          {activeAiBadges.display.map((ai) => {
+                            const isLegacy = ai.windsurfState === "legacy_retest";
+                            const toneCls = isLegacy
+                              ? getAiBadgeToneClass("muted", "legacy")
+                              : ai.tone === "green"
+                                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                : getAiBadgeToneClass(ai.tone, "soft");
+                            return (
+                              <span
+                                key={ai.id}
+                                title={ai.tooltip}
+                                className={`shrink-0 whitespace-nowrap rounded-md px-1.5 py-0.5 text-[10px] font-medium ${toneCls}`}
+                              >
+                                {ai.label}
+                              </span>
+                            );
+                          })}
                         </div>
 
                         <button
@@ -2287,35 +2436,96 @@ export function HomePage() {
                         </button>
                       </div>
 
-                      {/* Transparent notice when other groups have independent site routing enabled */}
-                      {otherIndependentGroups.length > 0 && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setNodeMenuOpen(false);
-                            appActions.setNav("groups");
-                          }}
-                          className="flex w-full items-center justify-between gap-2 rounded-b-2xl border-t border-[var(--amber)]/25 bg-[var(--amber-soft)]/45 px-3.5 py-1.5 text-left text-[11px] transition-colors hover:bg-[var(--amber-soft)]/70"
-                          title="点击前往「智能多选组」查看或管理独立分流组"
-                        >
-                          <span className="flex min-w-0 items-center gap-1.5 text-[var(--text-secondary)]">
-                            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]" />
-                            <span className="truncate">
-                              另有{" "}
-                              <strong className="cc-mono font-semibold text-[var(--amber)]">
-                                {otherIndependentGroups.length}
-                              </strong>{" "}
-                              个独立分流组生效：
-                              <span className="font-medium text-[var(--text)]">
-                                {otherIndependentGroups.map((g) => g.name).join("、")}
-                              </span>
-                            </span>
+                      {/* Zero-height when clean; concise warning + 1-click clean WSF group when main exit is proxy_risk */}
+                      {isActiveExitProxyRisk && (
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--red)]/30 bg-[var(--red-soft)]/40 px-3.5 py-1.5 text-[11px]">
+                          <span className="min-w-0 flex-1 text-[var(--red)]">
+                            {dict.home.exitProxyRiskHint}
                           </span>
-                          <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap font-medium text-[var(--amber)]">
-                            <span>查看</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setNodeMenuOpen(false);
+                              appActions.openMultiGroupCreate("wsf");
+                            }}
+                            className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-lg bg-[var(--red)] px-2 py-0.5 text-[10.5px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
+                          >
+                            <span>{dict.home.createWsfCleanGroupBtn}</span>
                             <ArrowRight className="h-3 w-3 shrink-0" />
-                          </span>
-                        </button>
+                          </button>
+                        </div>
+                      )}
+
+                      {/* Compact Parallel Independent Routing Sub-list (0px when 0 independent groups) */}
+                      {otherIndependentGroups.length > 0 && (
+                        <div className="rounded-b-2xl border-t border-[var(--amber)]/30 bg-[var(--amber-soft)]/35 px-3 py-2 text-[11px]">
+                          <div className="mb-1 flex items-center justify-between gap-2 text-[10.5px]">
+                            <span className="inline-flex items-center gap-1.5 font-semibold text-[var(--amber)]">
+                              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]" />
+                              <span>{dict.home.parallelIndepTitle}</span>
+                            </span>
+                            <span className="text-[10px] text-[var(--muted)]">
+                              {dict.home.parallelIndepHint}
+                            </span>
+                          </div>
+                          <div className="space-y-1">
+                            {otherIndependentGroups.map((indepGroup) => {
+                              const exitNode = indepGroup.active_node_id
+                                ? nodeById.get(indepGroup.active_node_id)
+                                : undefined;
+                              const exitSnap = indepGroup.active_node_id
+                                ? probes[indepGroup.active_node_id]
+                                : undefined;
+                              const exitHint = indepGroup.active_node_id
+                                ? runtime.node_health_hints?.[indepGroup.active_node_id]
+                                : undefined;
+                              const exitLat = resolveNodeDisplayLatency(exitSnap, exitHint);
+                              const exitLatMs = exitLat.latencyMs;
+                              return (
+                                <button
+                                  key={indepGroup.id}
+                                  type="button"
+                                  onClick={() => {
+                                    setNodeMenuOpen(false);
+                                    appActions.openMultiGroup(indepGroup.id);
+                                  }}
+                                  className="flex w-full items-center justify-between gap-2 rounded-lg border border-transparent bg-[var(--surface)]/75 px-2 py-1 text-left transition-colors hover:border-[var(--amber)]/45 hover:bg-[var(--surface)]"
+                                  title={`点击直达独立分流组「${indepGroup.name}」`}
+                                >
+                                  <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                                    <span className="shrink-0 whitespace-nowrap rounded-full border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-1.5 py-0.2 text-[9.5px] font-semibold text-[var(--amber)]">
+                                      {dict.home.indepBadge}
+                                    </span>
+                                    <span className="truncate font-semibold text-[var(--text)]">
+                                      {indepGroup.name}
+                                    </span>
+                                    <span className="shrink-0 whitespace-nowrap text-[10px] text-[var(--muted)]">
+                                      {formatI18nTemplate(dict.home.indepRulesCount, {
+                                        count: indepGroup.match_rules.length,
+                                      })}
+                                    </span>
+                                  </span>
+                                  <span className="flex shrink-0 items-center gap-1.5 text-[10.5px]">
+                                    <span className="max-w-[120px] truncate text-[var(--text-secondary)]">
+                                      {exitNode?.name ?? "待选节点"}
+                                    </span>
+                                    {exitLatMs !== null && (
+                                      <span
+                                        className="cc-mono font-semibold"
+                                        style={{
+                                          color: getLatencyColor(exitLatMs, exitLat.ok),
+                                        }}
+                                      >
+                                        {Math.round(exitLatMs)}ms
+                                      </span>
+                                    )}
+                                    <ArrowRight className="h-3 w-3 shrink-0 text-[var(--amber)]" />
+                                  </span>
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
                       )}
                     </div>
 
@@ -2410,7 +2620,7 @@ export function HomePage() {
                                 googleState === "clean" ||
                                 googleState === "cn" ||
                                 Boolean(snap?.google_risk_mismatch) ||
-                                aiInfo.unlocked.length > 0 ||
+                                aiInfo.display.length > 0 ||
                                 up !== null ||
                                 down !== null;
 
@@ -2491,19 +2701,25 @@ export function HomePage() {
                                           地区有偏差
                                         </span>
                                       )}
-                                      {aiInfo.unlocked.length > 0 && (
-                                        <span
-                                          className="inline-flex shrink-0 flex-wrap items-center gap-1"
-                                          title={`AI 可用：${aiInfo.unlocked.map((a) => a.label).join(" / ")}`}
-                                        >
-                                          {aiInfo.unlocked.map((ai) => (
-                                            <span
-                                              key={ai.id}
-                                              className="whitespace-nowrap rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--accent)]"
-                                            >
-                                              {ai.short}
-                                            </span>
-                                          ))}
+                                      {aiInfo.display.length > 0 && (
+                                        <span className="inline-flex shrink-0 flex-wrap items-center gap-1">
+                                          {aiInfo.display.map((ai) => {
+                                            const isLegacy = ai.windsurfState === "legacy_retest";
+                                            const toneCls = isLegacy
+                                              ? getAiBadgeToneClass("muted", "legacy")
+                                              : ai.tone === "green"
+                                                ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                                : getAiBadgeToneClass(ai.tone, "soft");
+                                            return (
+                                              <span
+                                                key={ai.id}
+                                                title={ai.tooltip}
+                                                className={`whitespace-nowrap rounded px-1 py-0.5 text-[9px] font-medium ${toneCls}`}
+                                              >
+                                                {ai.shortLabel}
+                                              </span>
+                                            );
+                                          })}
                                         </span>
                                       )}
                                       {(up !== null || down !== null) && (
@@ -2924,25 +3140,45 @@ export function HomePage() {
               </div>
             </div>
 
-            <div className="mb-3 flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2.5">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-2.5">
               <div className="min-w-0">
                 <div className="text-[11px] text-[var(--muted)]">出口地址</div>
                 <div className="mt-0.5 truncate cc-mono cc-selectable text-base font-semibold tracking-tight text-[var(--text)]">
                   {displayedExitAddress}
                 </div>
               </div>
-              <span
-                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-medium ${googleStatusBadge.cls}`}
-              >
-                {googleStatusBadge.state === "clean" ? (
-                  <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
-                ) : googleStatusBadge.state === "risk" ? (
-                  <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
-                ) : (
-                  <Clock className="h-3.5 w-3.5 shrink-0" />
+              <div className="flex shrink-0 flex-wrap items-center gap-1.5">
+                {exitPurityBadge && (
+                  <span
+                    title={exitPurityBadge.tooltip}
+                    className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-medium ${getAiBadgeToneClass(
+                      exitPurityBadge.tone,
+                      "soft"
+                    )}`}
+                  >
+                    {exitPurityBadge.level === "clean" ? (
+                      <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
+                    ) : exitPurityBadge.level === "proxy_risk" ? (
+                      <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+                    ) : (
+                      <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                    )}
+                    <span>{exitPurityBadge.shortLabel}</span>
+                  </span>
                 )}
-                <span>{googleStatusBadge.label}</span>
-              </span>
+                <span
+                  className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full px-2.5 py-1 text-[11px] font-medium ${googleStatusBadge.cls}`}
+                >
+                  {googleStatusBadge.state === "clean" ? (
+                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                  ) : googleStatusBadge.state === "risk" ? (
+                    <ShieldAlert className="h-3.5 w-3.5 shrink-0" />
+                  ) : (
+                    <Clock className="h-3.5 w-3.5 shrink-0" />
+                  )}
+                  <span>{googleStatusBadge.label}</span>
+                </span>
+              </div>
             </div>
 
             <dl className="space-y-2 text-xs">
@@ -2959,6 +3195,23 @@ export function HomePage() {
                   {displayedExitIsp}
                 </dd>
               </div>
+              {(exitPurityBadge?.asn || exitPurityBadge?.flags) && (
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--line)]/60 pb-1.5">
+                  <dt className="shrink-0 text-[var(--muted)]">纯净度 / 自治域</dt>
+                  <dd
+                    className={`truncate font-medium ${
+                      exitPurityBadge.level === "proxy_risk"
+                        ? "text-[var(--red)]"
+                        : exitPurityBadge.level === "datacenter"
+                          ? "text-[var(--amber)]"
+                          : "text-[var(--green)]"
+                    }`}
+                    title={exitPurityBadge.tooltip}
+                  >
+                    {[exitPurityBadge.asn, exitPurityBadge.flags].filter(Boolean).join(" · ")}
+                  </dd>
+                </div>
+              )}
               <div className="flex items-center justify-between gap-3 border-b border-[var(--line)]/60 pb-1.5">
                 <dt className="shrink-0 text-[var(--muted)]">城市地区</dt>
                 <dd className="truncate font-medium text-[var(--text-secondary)]" title={displayedExitLocation}>

@@ -157,6 +157,22 @@ export const en: DeepStringDict<TranslationDict> = {
     danglingRewriteBtn: "Remap All to “{group}”",
     coreErrorBannerTitle: "Proxy Core Failed to Start or Reload",
     askAiFixOrIssueBtn: "Ask AI to Fix / File Issue",
+    mainFallbackBadge: "Main Fallback",
+    parallelIndepTitle: "Parallel Independent Routing",
+    parallelIndepHint: "No need to switch main",
+    indepBadge: "Independent",
+    indepRulesCount: "{count} rules",
+    singleModeIndepPaused:
+      "{count} independent routing group(s) paused in Single-Node mode — switch back to Multi-Group to resume",
+    geoMissingTitle:
+      "Missing GeoIP DB — direct-IP traffic (e.g. QQ) may fall back to overseas proxy",
+    geoMissingDesc:
+      "Fetch Country.mmdb and geosite.dat so domestic direct IP rules take effect automatically via hot-reload.",
+    geoFetchBtn: "Fetch & Apply Now",
+    geoFetchingBtn: "Fetching & Applying…",
+    exitProxyRiskHint:
+      "Current exit IP is flagged as proxy-risk — Windsurf / Devin inference may hit error 13",
+    createWsfCleanGroupBtn: "New Clean WSF Group",
   },
   aiHub: {
     title: "AI Autopilot",
@@ -593,6 +609,29 @@ export const en: DeepStringDict<TranslationDict> = {
     moreFiltersBtn: "More Filters",
     resetFiltersBtn: "Reset Filters",
     activeFiltersCount: "{count} active",
+    mainFallbackActive: "Main Fallback · Active",
+    indepRoutingCount: "Independent · {count}",
+    indepRoutingPending: "Independent · Add Rules",
+    indepCapsuleActive: "Independent Routing On · {count} rules",
+    indepCapsulePending: "Independent · Add Rules",
+    indepCapsuleOff: "Independent: Off",
+    section5Title: "5. Routing Rules (Domains / Processes / Compound)",
+    section5Placeholder:
+      "e.g. codeium.com / PROCESS-NAME,QQ.exe / AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))",
+    wsfTemplateTitle: "Windsurf / Devin Clean",
+    wsfTemplateDesc: "Independent routing · blocks proxy-risk IPs & prefers residential",
+  },
+  rules: {
+    geoMissingTitle:
+      "Missing GeoIP DB — direct-IP traffic (e.g. QQ) may fall back to overseas proxy",
+    geoMissingDesc:
+      "Domestic Direct is enabled, but {file} is missing. Fetch it to hot-reload GEOIP / GEOSITE rules immediately.",
+    geoFetchBtn: "Fetch GeoData & Apply",
+    geoFetchingBtn: "Fetching & Applying…",
+    addImDirectBtn: "Add QQ / WeChat Direct",
+    imDirectAlreadyAdded: "QQ / WeChat Direct Added",
+    imDirectAddedToast: "Added {count} QQ / WeChat direct process rule(s) and applied",
+    imDirectExistsToast: "QQ / WeChat (QQ.exe / WeChat.exe / Weixin.exe) direct rules are already present",
   },
   shareBundle: {
     cancelUpdateExisting: "Cancel",

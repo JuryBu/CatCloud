@@ -507,33 +507,23 @@ pub fn detect_proxy_drift(
         ));
     }
 
-    if !expected.bypass.is_empty() {
-        let mut obs_norm: Vec<String> = observed
-            .bypass
-            .iter()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
+    let mut obs_norm: Vec<String> = observed
+        .bypass
+        .iter()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut exp_sanitized_norm: Vec<String> =
+        super::common::sanitize_windows_bypass_list(&expected.bypass)
+            .into_iter()
+            .map(|s| s.to_ascii_lowercase())
             .collect();
-        let mut exp_raw_norm: Vec<String> = expected
-            .bypass
-            .iter()
-            .map(|s| s.trim().to_ascii_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let mut exp_sanitized_norm: Vec<String> =
-            super::common::sanitize_windows_bypass_list(&expected.bypass)
-                .into_iter()
-                .map(|s| s.to_ascii_lowercase())
-                .collect();
-        obs_norm.sort();
-        obs_norm.dedup();
-        exp_raw_norm.sort();
-        exp_raw_norm.dedup();
-        exp_sanitized_norm.sort();
-        exp_sanitized_norm.dedup();
-        if obs_norm != exp_raw_norm && obs_norm != exp_sanitized_norm {
-            return Some("proxy bypass list modified externally".into());
-        }
+    obs_norm.sort();
+    obs_norm.dedup();
+    exp_sanitized_norm.sort();
+    exp_sanitized_norm.dedup();
+    if obs_norm != exp_sanitized_norm {
+        return Some("proxy bypass list modified externally or requires Windows sanitization".into());
     }
 
     None
@@ -1236,10 +1226,47 @@ mod tests {
             enabled: true,
             host: "127.0.0.1".into(),
             port: 27890,
-            bypass: vec!["<local>".into(), "localhost".into(), "127.*".into()],
+            bypass: vec![
+                "<local>".into(),
+                "localhost".into(),
+                "127.0.0.1".into(),
+                "[::1]".into(),
+                "127.*".into(),
+            ],
             pac_url: None,
         };
         assert!(detect_proxy_drift(&matching, &expected).is_none());
+
+        // Legacy registry carrying bare `::1` MUST trigger drift even if expected.bypass is empty
+        // or also contains legacy `::1`, forcing ProxyGuard to self-heal to `[::1]`.
+        let legacy_bare_v6 = SystemProxySpec {
+            enabled: true,
+            host: "127.0.0.1".into(),
+            port: 27890,
+            bypass: vec![
+                "localhost".into(),
+                "127.0.0.1".into(),
+                "::1".into(),
+                "127.*".into(),
+                "<local>".into(),
+            ],
+            pac_url: None,
+        };
+        assert!(detect_proxy_drift(&legacy_bare_v6, &expected).is_some());
+
+        let expected_empty_bypass = SystemProxySpec {
+            bypass: Vec::new(),
+            ..expected.clone()
+        };
+        assert!(detect_proxy_drift(&legacy_bare_v6, &expected_empty_bypass).is_some());
+        let matching_default = SystemProxySpec {
+            bypass: DEFAULT_PROXY_BYPASS
+                .split(';')
+                .map(ToString::to_string)
+                .collect(),
+            ..matching.clone()
+        };
+        assert!(detect_proxy_drift(&matching_default, &expected_empty_bypass).is_none());
 
         let changed_port = SystemProxySpec {
             port: 10809,
@@ -1252,6 +1279,87 @@ mod tests {
             ..matching
         };
         assert!(detect_proxy_drift(&disabled, &expected).is_some());
+    }
+
+    #[test]
+    fn winhttp_open_accepts_sanitized_windows_proxy_override_and_rejects_bare_ipv6() {
+        const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+        const ERROR_INVALID_PARAMETER: u32 = 87;
+
+        #[link(name = "winhttp")]
+        unsafe extern "system" {
+            fn WinHttpOpen(
+                psz_agent: *const u16,
+                dw_access_type: u32,
+                psz_proxy: *const u16,
+                psz_proxy_bypass: *const u16,
+                dw_flags: u32,
+            ) -> *mut std::ffi::c_void;
+            fn WinHttpCloseHandle(h_internet: *mut std::ffi::c_void) -> i32;
+        }
+
+        let agent = to_wide_null("CatCloud-WinHttp-Test/1.0");
+        let proxy = to_wide_null("127.0.0.1:7890");
+
+        let try_open = |bypass_raw: &str| -> Result<(), u32> {
+            let bypass_w = to_wide_null(bypass_raw);
+            // SAFETY: Valid null-terminated UTF-16 pointers passed to WinHttpOpen; non-null
+            // handle is immediately closed via WinHttpCloseHandle.
+            unsafe {
+                let handle = WinHttpOpen(
+                    agent.as_ptr(),
+                    WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                    proxy.as_ptr(),
+                    bypass_w.as_ptr(),
+                    0,
+                );
+                if handle.is_null() {
+                    Err(GetLastError())
+                } else {
+                    let _ = WinHttpCloseHandle(handle);
+                    Ok(())
+                }
+            }
+        };
+
+        // 1. Bare unbracketed `::1` reproduces the exact Schannel/WinHTTP Win32 Error 87 root cause.
+        let bare_res = try_open("localhost;127.0.0.1;::1;127.*;<local>");
+        assert_eq!(
+            bare_res,
+            Err(ERROR_INVALID_PARAMETER),
+            "bare `::1` in ProxyOverride must fail WinHttpOpen with ERROR_INVALID_PARAMETER (87)"
+        );
+
+        // 2. Built-in `DEFAULT_WINDOWS_PROXY_BYPASS` must succeed cleanly (`Ok(())`).
+        assert_eq!(
+            try_open(DEFAULT_PROXY_BYPASS),
+            Ok(()),
+            "DEFAULT_WINDOWS_PROXY_BYPASS must pass WinHttpOpen cleanly"
+        );
+
+        // 3. Dirty user/cross-platform inputs (bare IPv6, IPv4 CIDR, IPv6 CIDR, host:port)
+        //    must pass WinHttpOpen 100% after `sanitize_windows_bypass_list`.
+        let dirty_inputs = vec![
+            "localhost".to_string(),
+            "::1".to_string(),
+            "10.0.0.0/8".to_string(),
+            "172.16.0.0/12".to_string(),
+            "192.168.0.0/16".to_string(),
+            "fe80::*".to_string(),
+            "fe80::/10".to_string(),
+            "example.com:8080".to_string(),
+            "<local>".to_string(),
+        ];
+        let sanitized = super::super::common::sanitize_windows_bypass_list(&dirty_inputs).join(";");
+        assert!(
+            super::super::common::find_invalid_windows_proxy_override_entries(&sanitized).is_empty(),
+            "sanitized bypass still had invalid entries: {sanitized}"
+        );
+        assert_eq!(
+            try_open(&sanitized),
+            Ok(()),
+            "sanitized ProxyOverride `{sanitized}` must pass WinHttpOpen cleanly"
+        );
     }
 
     #[test]

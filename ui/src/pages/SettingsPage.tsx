@@ -141,7 +141,7 @@ const DEFAULT_WEBUI_ENTRIES: WebUiEntry[] = [
 ];
 
 const DEFAULT_EXTENDED: ExtendedSettings = {
-  bypassDomains: "localhost, 127.0.0.1, ::1, 127.*, 10.*, 172.16.*, 192.168.*, *.local, <local>",
+  bypassDomains: "localhost, 127.0.0.1, [::1], 127.*, 10.*, 172.16.*, 192.168.*, *.local, <local>",
   domesticDirectEnabled: true,
   blockQuicUdp443: true,
   allowLan: false,

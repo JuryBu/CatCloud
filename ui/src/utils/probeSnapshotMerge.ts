@@ -5,6 +5,7 @@ const BUILTIN_UPLOAD_ID = "builtin_upload";
 const BUILTIN_DOWNLOAD_ID = "builtin_download";
 const BUILTIN_GOOGLE_CN_ID = "builtin_google_cn";
 const BUILTIN_KEEPALIVE_ID = "builtin_keepalive_60s";
+const BUILTIN_UNLOCK_WINDSURF_ID = "builtin_unlock_windsurf";
 const BUILTIN_UNLOCK_PREFIX = "builtin_unlock_";
 
 const UNLOCK_PROBE_SITE_MAP: Record<string, string> = {
@@ -242,6 +243,11 @@ export function mergeProbeSnapshotSafe(
     BUILTIN_KEEPALIVE_ID
   );
 
+  const incomingTouchedWindsurf =
+    Object.prototype.hasOwnProperty.call(incomingOkMap, BUILTIN_UNLOCK_WINDSURF_ID) ||
+    incoming.ip_risk_level != null ||
+    incoming.ip_clean != null;
+
   // 1. Merge per-probe maps & purge stale values for probes that explicitly failed.
   const mergedPerProbeOk: Record<string, boolean> = {
     ...prevOkMap,
@@ -468,6 +474,23 @@ export function mergeProbeSnapshotSafe(
     nextKeepalive60sOk = incoming.keepalive_60s_ok ?? prev.keepalive_60s_ok;
   }
 
+  // 5b. Protect IP purity fields from being wiped by partial latency/speed probes.
+  let nextIpClean: boolean | null;
+  let nextIpRiskLevel: ProbeSnapshot["ip_risk_level"];
+  let nextIpAsn: string | null;
+  let nextIpRiskFlags: string | null;
+  if (isFullDbSnapshot || incomingTouchedWindsurf) {
+    nextIpClean = incoming.ip_clean ?? null;
+    nextIpRiskLevel = incoming.ip_risk_level ?? null;
+    nextIpAsn = incoming.ip_asn ?? null;
+    nextIpRiskFlags = incoming.ip_risk_flags ?? null;
+  } else {
+    nextIpClean = prev.ip_clean ?? null;
+    nextIpRiskLevel = prev.ip_risk_level ?? null;
+    nextIpAsn = prev.ip_asn ?? null;
+    nextIpRiskFlags = prev.ip_risk_flags ?? null;
+  }
+
   // 6. Merge unlocked_sites (protecting builtin_unlock_gemini precedence over builtin_google_cn).
   let mergedUnlocked: Record<string, boolean>;
   if (isFullDbSnapshot) {
@@ -518,6 +541,10 @@ export function mergeProbeSnapshotSafe(
     google_clean: nextGoogleClean,
     google_risk_mismatch: nextGoogleRiskMismatch,
     keepalive_60s_ok: nextKeepalive60sOk,
+    ip_clean: nextIpClean,
+    ip_risk_level: nextIpRiskLevel,
+    ip_asn: nextIpAsn,
+    ip_risk_flags: nextIpRiskFlags,
     unlocked_sites: mergedUnlocked,
     per_probe_ok: mergedPerProbeOk,
     per_probe_up_mbps: mergedPerProbeUp,

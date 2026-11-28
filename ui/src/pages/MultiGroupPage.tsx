@@ -51,6 +51,14 @@ import {
   useAppSelector,
 } from "../store/appStore";
 import {
+  type AiBadgeTone,
+  formatGoogleRegionTooltip,
+  getAiBadgeToneClass,
+  getNodeAiBadgeDisplays,
+  hasVerifiedAiUnlock,
+  resolveWindsurfUnlockDisplay,
+} from "../utils/aiUnlockDisplay";
+import {
   MISSING_LATENCY_PENALTY_MS,
   type ResolvedNodeLatency,
   getLatencyTooltipKey,
@@ -91,7 +99,7 @@ function formatGroupDisplayName(name: string): string {
   return FRIENDLY_GROUP_NAME_MAP[name] ?? name;
 }
 
-type CreateTemplateId = "manual" | "ai" | "download";
+type CreateTemplateId = "manual" | "wsf" | "ai" | "download";
 
 interface CreateTemplateMeta {
   id: CreateTemplateId;
@@ -99,9 +107,22 @@ interface CreateTemplateMeta {
   desc: string;
   mode: MultiGroupMode;
   switchMode: "force_close_old" | "graceful_new_only";
+  independentRouting?: boolean;
+  hardGates?: string[];
   formula: string;
   matchRules: string[];
 }
+
+const WSF_AUTHORITATIVE_MATCH_RULES: readonly string[] = [
+  "DOMAIN-SUFFIX,codeium.com",
+  "DOMAIN-SUFFIX,codeiumdata.com",
+  "DOMAIN-SUFFIX,windsurf.com",
+  "DOMAIN-SUFFIX,devin.ai",
+  "DOMAIN-SUFFIX,cognition.ai",
+  "DOMAIN-SUFFIX,exafunction.com",
+];
+
+const FORMULA_WSF_CLEAN = `${FORMULA_COST_EFFECTIVE} + ip_clean * 120`;
 
 const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
   {
@@ -112,6 +133,17 @@ const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
     switchMode: "graceful_new_only",
     formula: FORMULA_COST_EFFECTIVE,
     matchRules: [],
+  },
+  {
+    id: "wsf",
+    title: "Windsurf / Devin 纯净专用",
+    desc: "自动开启独立分流，拦截代理风控并优先纯净家宽",
+    mode: "sticky_best",
+    switchMode: "force_close_old",
+    independentRouting: true,
+    hardGates: ['site_unlocked("windsurf") == 1'],
+    formula: FORMULA_WSF_CLEAN,
+    matchRules: [...WSF_AUTHORITATIVE_MATCH_RULES],
   },
   {
     id: "ai",
@@ -127,6 +159,7 @@ const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
       "DOMAIN-SUFFIX,anthropic.com",
       "DOMAIN-SUFFIX,claude.ai",
       "DOMAIN-SUFFIX,googleapis.com",
+      ...WSF_AUTHORITATIVE_MATCH_RULES,
     ],
   },
   {
@@ -185,6 +218,7 @@ const LEGACY_GEMINI_GATE_EXPR = 'site_unlocked("google_ai") == 1';
 
 const HARD_GATE_PRESETS: readonly GatePreset[] = [
   { expr: "google_clean == 1", label: "谷歌地区正常", failText: "谷歌地区异常" },
+  { expr: "ip_clean == 1", label: "纯净住宅 / 避开代理机房", failText: "非纯净住宅 IP" },
   { expr: "keepalive_ok == 1", label: "长连接稳定(60秒)", failText: "60秒长连接未通过" },
   { expr: 'site_unlocked("chatgpt") == 1', label: "ChatGPT 可用", failText: "ChatGPT 未解锁" },
   { expr: GEMINI_GATE_EXPR, label: "Gemini 可用", failText: "Gemini 未解锁" },
@@ -238,6 +272,7 @@ const FORMULA_VARIABLES: ReadonlyArray<{ token: string; label: string }> = [
   { token: "multiplier", label: "倍率" },
   { token: "keepalive_ok", label: "60秒保活" },
   { token: "google_clean", label: "谷歌地区正常" },
+  { token: "ip_clean", label: "纯净住宅 IP" },
   { token: "unlocked", label: "全站点解锁" },
 ];
 
@@ -393,8 +428,32 @@ function formatMatchRuleChip(rule: string): { display: string; tag: string | nul
   if (upper.startsWith("DOMAIN-KEYWORD,")) {
     return { display: trimmed.slice("DOMAIN-KEYWORD,".length).trim(), tag: "关键词" };
   }
-  if (upper.startsWith("PROCESS-NAME,")) {
-    return { display: trimmed.slice("PROCESS-NAME,".length).trim(), tag: "程序" };
+  if (upper.startsWith("DOMAIN-REGEX,")) {
+    return { display: trimmed.slice("DOMAIN-REGEX,".length).trim(), tag: "正则" };
+  }
+  if (upper.startsWith("PROCESS-NAME,") || upper.startsWith("PROCESS-NAME-REGEX,")) {
+    const idx = trimmed.indexOf(",");
+    return { display: trimmed.slice(idx + 1).trim(), tag: "程序" };
+  }
+  if (upper.startsWith("PROCESS-PATH,") || upper.startsWith("PROCESS-PATH-REGEX,")) {
+    const idx = trimmed.indexOf(",");
+    return { display: trimmed.slice(idx + 1).trim(), tag: "路径" };
+  }
+  if (upper.startsWith("DST-PORT,") || upper.startsWith("SRC-PORT,")) {
+    const idx = trimmed.indexOf(",");
+    return { display: trimmed.slice(idx + 1).trim(), tag: "端口" };
+  }
+  if (upper.startsWith("AND,")) {
+    return { display: trimmed.slice("AND,".length).trim(), tag: "复合与" };
+  }
+  if (upper.startsWith("OR,")) {
+    return { display: trimmed.slice("OR,".length).trim(), tag: "复合或" };
+  }
+  if (upper.startsWith("NOT,")) {
+    return { display: trimmed.slice("NOT,".length).trim(), tag: "复合非" };
+  }
+  if (upper.startsWith("SUB-RULE,")) {
+    return { display: trimmed.slice("SUB-RULE,".length).trim(), tag: "子规则" };
   }
   if (upper.startsWith("IP-CIDR,") || upper.startsWith("IP-CIDR6,")) {
     const idx = trimmed.indexOf(",");
@@ -446,7 +505,111 @@ const BARE_RULE_KEYWORDS = new Set<string>([
 const DOMAIN_LIKE_RE =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i;
 
-const INVALID_MATCH_RULE_MSG = "请输入域名或完整规则（如 anthropic.com）";
+const INVALID_MATCH_RULE_MSG =
+  "请输入域名或完整规则（如 codeium.com / PROCESS-NAME,QQ.exe / AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))）";
+
+const NO_COMMA_SPLIT_MATCH_RULE_TYPES = new Set<string>([
+  "SUB-RULE",
+  "DOMAIN-REGEX",
+  "PROCESS-NAME-REGEX",
+  "PROCESS-PATH-REGEX",
+]);
+
+function hasStrictBalancedOuterParens(expr: string): boolean {
+  const trimmed = expr.trim();
+  if (trimmed.length < 3 || !trimmed.startsWith("(") || !trimmed.endsWith(")")) {
+    return false;
+  }
+  let depth = 0;
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return false;
+      if (depth === 0 && i < trimmed.length - 1) {
+        return false;
+      }
+    }
+  }
+  if (depth !== 0) return false;
+  const inner = trimmed.slice(1, -1).trim();
+  return inner.length > 0 && inner.startsWith("(") && inner.endsWith(")");
+}
+
+function countTopLevelLogicalChildren(parenBlock: string): number {
+  const inner = parenBlock.trim().slice(1, -1).trim();
+  if (!inner || inner === "()") return 0;
+  let depth = 0;
+  let clauseStart = 0;
+  const clauses: string[] = [];
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return -1;
+    } else if (ch === "," && depth === 0) {
+      clauses.push(inner.slice(clauseStart, i).trim());
+      clauseStart = i + 1;
+    }
+  }
+  if (depth !== 0) return -1;
+  clauses.push(inner.slice(clauseStart).trim());
+  for (const clause of clauses) {
+    if (!clause.startsWith("(") || !clause.endsWith(")")) return -1;
+    let cDepth = 0;
+    for (let j = 0; j < clause.length; j++) {
+      if (clause[j] === "(") cDepth += 1;
+      else if (clause[j] === ")") {
+        cDepth -= 1;
+        if (cDepth < 0 || (cDepth === 0 && j !== clause.length - 1)) return -1;
+      }
+    }
+    if (cDepth !== 0) return -1;
+    const body = clause.slice(1, -1).trim();
+    if (!body || !body.includes(",")) return -1;
+  }
+  return clauses.length;
+}
+
+function validateLogicalMatchRuleRest(restRaw: string, ruleType?: string): boolean {
+  const trimmed = restRaw.trim();
+  if (!trimmed.startsWith("(")) return false;
+  let depth = 0;
+  let closeIdx = -1;
+  for (let i = 0; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === "(") {
+      depth += 1;
+    } else if (ch === ")") {
+      depth -= 1;
+      if (depth < 0) return false;
+      if (depth === 0) {
+        closeIdx = i;
+        break;
+      }
+    }
+  }
+  if (closeIdx < 0) return false;
+  const parenBlock = trimmed.slice(0, closeIdx + 1);
+  if (!hasStrictBalancedOuterParens(parenBlock)) return false;
+  const childCount = countTopLevelLogicalChildren(parenBlock);
+  if (childCount <= 0) return false;
+  if (ruleType === "NOT" && childCount !== 1) return false;
+  const tail = trimmed.slice(closeIdx + 1).trim();
+  if (!tail) return true;
+  // Allow explicit target after closing paren (e.g. AND,((...)),DIRECT),
+  // but reject top-level trailing flags (no-resolve/src) or extra commas forbidden by Mihomo.
+  if (!tail.startsWith(",")) return false;
+  const target = tail.slice(1).trim();
+  if (!target || target.includes(",")) return false;
+  const lower = target.toLowerCase();
+  if (lower === "no-resolve" || lower === "src") return false;
+  return true;
+}
 
 function normalizeSingleMatchRule(raw: string): { rule: string | null; invalid: boolean } {
   const trimmed = raw.trim();
@@ -460,6 +623,12 @@ function normalizeSingleMatchRule(raw: string): { rule: string | null; invalid: 
       return { rule: null, invalid: true };
     }
     if (ruleType === "AND" || ruleType === "OR" || ruleType === "NOT") {
+      if (!validateLogicalMatchRuleRest(restRaw, ruleType)) {
+        return { rule: null, invalid: true };
+      }
+      return { rule: `${ruleType},${restRaw}`, invalid: false };
+    }
+    if (NO_COMMA_SPLIT_MATCH_RULE_TYPES.has(ruleType)) {
       return { rule: `${ruleType},${restRaw}`, invalid: false };
     }
     const restParts = restRaw
@@ -1056,6 +1225,7 @@ function buildEvalContextForNode(node: ProxyNode, snap: ProbeSnapshot | undefine
       multiplier: Number.isFinite(node.multiplier) && node.multiplier >= 0 ? node.multiplier : 1,
       keepalive_ok: snap?.keepalive_60s_ok === true ? 1 : 0,
       google_clean: snap?.google_clean === true ? 1 : 0,
+      ip_clean: snap?.ip_clean === true ? 1 : 0,
       unlocked: allUnlocked ? 1 : 0,
       is_443_native: node.is_443_native ? 1 : 0,
       ok: ok ? 1 : 0,
@@ -1115,9 +1285,28 @@ function assessNodeAgainstGates(
       }
       continue;
     }
+    if (compact === "ip_clean==1") {
+      if (snap.ip_clean === null || snap.ip_clean === undefined) {
+        untestedCount += 1;
+      } else if (snap.ip_clean === false) {
+        failedReasons.push(
+          snap.ip_risk_level === "proxy_risk" ? "出口 IP 高危代理风控" : "非纯净住宅 IP"
+        );
+      }
+      continue;
+    }
     const siteMatch = /^site_unlocked\(["']([^"']+)["']\)==1$/.exec(compact);
     if (siteMatch) {
       const siteKey = siteMatch[1];
+      if (siteKey.toLowerCase() === "windsurf" || siteKey.toLowerCase() === "builtin_unlock_windsurf") {
+        const ws = resolveWindsurfUnlockDisplay(snap);
+        if (ws.state === "untested" || ws.state === "legacy_retest") {
+          untestedCount += 1;
+        } else if (!ws.unlocked) {
+          failedReasons.push(ws.state === "proxy_risk" ? "Windsurf 出口代理风控" : "Windsurf 未解锁");
+        }
+        continue;
+      }
       const measured = lookupSiteUnlockedRaw(snap.unlocked_sites ?? {}, siteKey);
       if (measured === null) {
         untestedCount += 1;
@@ -1127,15 +1316,27 @@ function assessNodeAgainstGates(
       }
       continue;
     }
-    // Custom / compound gate expression: neutrally allow untested keepalive_ok (matching Rust evaluator)
+    // Custom / compound gate expression: neutrally allow untested keepalive_ok & ip_clean independently (matching Rust evaluator)
     if (!lazyCtx) {
       lazyCtx = buildEvalContextForNode(node, snap);
     }
-    const evalCtx =
+    let patchedVars = lazyCtx.vars;
+    let patched = false;
+    if (
       (snap.keepalive_60s_ok === null || snap.keepalive_60s_ok === undefined) &&
       gate.includes("keepalive_ok")
-        ? { ...lazyCtx, vars: { ...lazyCtx.vars, keepalive_ok: 1 } }
-        : lazyCtx;
+    ) {
+      patchedVars = { ...patchedVars, keepalive_ok: 1 };
+      patched = true;
+    }
+    if (
+      (snap.ip_clean === null || snap.ip_clean === undefined) &&
+      gate.includes("ip_clean")
+    ) {
+      patchedVars = { ...patchedVars, ip_clean: 1 };
+      patched = true;
+    }
+    const evalCtx = patched ? { ...lazyCtx, vars: patchedVars } : lazyCtx;
     if (!checkHardGate(gate, evalCtx)) {
       failedReasons.push(gate);
     }
@@ -1163,27 +1364,28 @@ function extractCardAiDots(snap: ProbeSnapshot | undefined): Array<{
   id: string;
   label: string;
   short: string;
+  tone: AiBadgeTone;
+  isLegacy: boolean;
 }> {
   if (!snap) return [];
-  const sites = snap.unlocked_sites ?? {};
-  const list: Array<{ id: string; label: string; short: string }> = [];
-  if (sites.claude === true) list.push({ id: "claude", label: "Claude 可用", short: "C" });
-  if ((sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai) === true) {
-    list.push({ id: "gemini", label: "Gemini 可用", short: "G" });
-  }
-  if (sites.chatgpt === true) list.push({ id: "chatgpt", label: "ChatGPT 可用", short: "GPT" });
-  return list;
+  return getNodeAiBadgeDisplays(snap)
+    .filter(
+      (b) =>
+        b.unlocked ||
+        b.windsurfState === "proxy_risk" ||
+        b.windsurfState === "legacy_retest"
+    )
+    .map((b) => ({
+      id: b.id,
+      label: b.tooltip,
+      short: b.dotLabel,
+      tone: b.tone,
+      isLegacy: b.windsurfState === "legacy_retest",
+    }));
 }
 
 function isNodeAiReady(snap: ProbeSnapshot | undefined): boolean {
-  if (!snap) return false;
-  const sites = snap.unlocked_sites ?? {};
-  return (
-    sites.claude === true ||
-    sites.chatgpt === true ||
-    sites.windsurf === true ||
-    (sites.gemini ?? sites.gemini_aistudio ?? sites.google_ai) === true
-  );
+  return hasVerifiedAiUnlock(snap);
 }
 
 /* ============================================================================
@@ -1268,6 +1470,7 @@ export function MultiGroupPage() {
   const isProbeEngineBusy = useAppSelector(selectIsProbeEngineBusy);
   const benchmarkRunning = useAppSelector((s) => s.bgTasks.preaccel.benchmark.running);
   const savedDraftSelectedId = useAppSelector((s) => s.sessionDrafts.multiGroup.selectedId);
+  const multiGroupCreateHint = useAppSelector((s) => s.multiGroupCreateHint);
   const inTauri = isTauriEnv();
 
   // Local group drafts (keeps unsaved strategy edits per group while syncing live active_node_id & members)
@@ -1401,6 +1604,46 @@ export function MultiGroupPage() {
   const memberReqSeqRef = useRef<Record<string, number>>({});
   const deleteConfirmTimerRef = useRef<number | null>(null);
   const clearConfirmTimerRef = useRef<number | null>(null);
+  const section5Ref = useRef<HTMLDivElement | null>(null);
+  const pendingScrollSection5Ref = useRef(false);
+
+  const handleOpenIndepSection = () => {
+    pendingScrollSection5Ref.current = true;
+    if (drawerOpen) {
+      window.requestAnimationFrame(() => {
+        section5Ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+        pendingScrollSection5Ref.current = false;
+      });
+    } else {
+      setDrawerOpen(true);
+    }
+  };
+
+  useEffect(() => {
+    if (drawerOpen && pendingScrollSection5Ref.current) {
+      pendingScrollSection5Ref.current = false;
+      const tid = window.setTimeout(() => {
+        section5Ref.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 60);
+      return () => window.clearTimeout(tid);
+    }
+  }, [drawerOpen]);
+
+  useEffect(() => {
+    if (savedDraftSelectedId && storeGroups.some((g) => g.id === savedDraftSelectedId)) {
+      setSelectedId((prev) => (prev === savedDraftSelectedId ? prev : savedDraftSelectedId));
+    }
+  }, [savedDraftSelectedId, storeGroups]);
+
+  useEffect(() => {
+    if (!multiGroupCreateHint) return;
+    setNewGroupTemplate(multiGroupCreateHint);
+    setShowCreateForm(true);
+    if (multiGroupCreateHint === "wsf") {
+      setNewGroupName((prev) => prev.trim() || "WSF / Devin 纯净专用");
+    }
+    appActions.consumeMultiGroupCreateHint();
+  }, [multiGroupCreateHint]);
 
   useEffect(() => {
     return () => {
@@ -1924,6 +2167,7 @@ export function MultiGroupPage() {
         multiplier: 1,
         keepalive_ok: 1,
         google_clean: 1,
+        ip_clean: 1,
         unlocked: 1,
         is_443_native: 1,
         ok: 1,
@@ -2074,7 +2318,18 @@ export function MultiGroupPage() {
         if (!joined) return;
       }
       const closeOld = selectedGroup.switch_mode === "force_close_old";
-      await appActions.selectGroupNode(selectedGroup.id, node.id, closeOld);
+      const persistedGroup = storeGroups.find((g) => g.id === selectedGroup.id);
+      const isSecondaryIndependent =
+        Boolean(persistedGroup?.independent_routing) &&
+        runtime.route_mode === "group" &&
+        Boolean(runtime.active_group_id) &&
+        selectedGroup.id !== runtime.active_group_id;
+      await appActions.selectGroupNode(
+        selectedGroup.id,
+        node.id,
+        closeOld,
+        isSecondaryIndependent ? false : undefined
+      );
       setGroups((prev) =>
         prev.map((g) => (g.id === selectedGroup.id ? { ...g, active_node_id: node.id } : g))
       );
@@ -2194,17 +2449,16 @@ export function MultiGroupPage() {
     setCreatingGroup(true);
 
     const tpl = CREATE_TEMPLATES.find((t) => t.id === newGroupTemplate) ?? CREATE_TEMPLATES[0];
-    // Always start clean: zero hard_gates, zero trigger_rules, zero member_node_ids!
     const created: MultiGroup = {
       id: `grp-${Date.now().toString(36)}`,
       name,
       mode: tpl.mode,
-      independent_routing: false,
+      independent_routing: Boolean(tpl.independentRouting),
       match_rules: [...tpl.matchRules],
       member_node_ids: [],
       dynamic_filter: null,
       primary_probe_id: null,
-      hard_gates: [],
+      hard_gates: [...(tpl.hardGates ?? [])],
       trigger_rules: [],
       trigger_expr: null,
       formula_expr: tpl.formula,
@@ -2599,9 +2853,11 @@ export function MultiGroupPage() {
                         }`}
                       >
                         <div className="text-[11px] font-semibold text-[var(--text)]">
-                          {tpl.title}
+                          {tpl.id === "wsf" ? dict.groups.wsfTemplateTitle : tpl.title}
                         </div>
-                        <div className="mt-0.5 text-[10px] text-[var(--muted)]">{tpl.desc}</div>
+                        <div className="mt-0.5 text-[10px] text-[var(--muted)]">
+                          {tpl.id === "wsf" ? dict.groups.wsfTemplateDesc : tpl.desc}
+                        </div>
                       </button>
                     );
                   })}
@@ -2609,7 +2865,9 @@ export function MultiGroupPage() {
               </div>
 
               <div className="text-[10px] leading-relaxed text-[var(--muted)]">
-                新建后不设限制门槛，直接去中间点选节点加入即可。
+                {newGroupTemplate === "wsf"
+                  ? "将自动开启独立分流与 Windsurf 防风控门禁（含 6 条官方域名并优先纯净家宽），去中间点选节点加入即可。"
+                  : "新建后直接去中间点选节点加入即可，随时可在右侧抽屉调整门槛与分流规则。"}
               </div>
 
               <button
@@ -2660,7 +2918,7 @@ export function MultiGroupPage() {
             {groups.map((g) => {
               const isSelected = selectedGroup?.id === g.id;
               const isSystemActive = isGroupMode && runtime.active_group_id === g.id;
-              const isIndependentActive = !isSystemActive && Boolean(g.independent_routing);
+              const isIndependentEnabled = Boolean(g.independent_routing);
               const activeNode = g.active_node_id ? nodeById.get(g.active_node_id) : null;
               const modeMeta = GROUP_MODES.find((m) => m.id === g.mode) ?? GROUP_MODES[0];
               const isDirty = Boolean(dirtyGroupIds[g.id]);
@@ -2750,17 +3008,27 @@ export function MultiGroupPage() {
                           {g.member_node_ids.filter((id) => nodeById.has(id)).length} 个节点
                         </span>
                         <div className="flex flex-wrap items-center gap-1">
-                          {isIndependentActive && (
+                          {isIndependentEnabled && (
                             <span
                               title={
                                 g.match_rules.length > 0
-                                  ? `已开启独立分流：即使首页在用其它组，命中本组 ${g.match_rules.length} 条适用网站规则的流量也会单独走此组`
-                                  : "已开启独立分流开关（在右侧添加适用网站域名后将单独接管对应流量）"
+                                  ? `已开启独立分流：即使首页在用其它组，命中本组 ${g.match_rules.length} 条分流规则的流量也会单独走此组`
+                                  : "已开启独立分流开关（在右侧第 5 节添加至少一条规则后将单独接管对应流量）"
                               }
-                              className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border border-[var(--amber)]/45 bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--amber)]"
+                              className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-[10px] font-semibold ${
+                                g.match_rules.length > 0
+                                  ? "border-[var(--amber)]/50 bg-[var(--amber-soft)] text-[var(--amber)]"
+                                  : "border-dashed border-[var(--amber)]/50 bg-[var(--amber-soft)]/45 text-[var(--amber)]"
+                              }`}
                             >
                               <span className="h-1.5 w-1.5 rounded-full bg-[var(--amber)]" />
-                              <span>分站生效中</span>
+                              <span>
+                                {g.match_rules.length > 0
+                                  ? formatI18nTemplate(dict.groups.indepRoutingCount, {
+                                      count: g.match_rules.length,
+                                    })
+                                  : dict.groups.indepRoutingPending}
+                              </span>
                             </span>
                           )}
                           <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
@@ -2776,7 +3044,7 @@ export function MultiGroupPage() {
                         </span>
                         {isSystemActive ? (
                           <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
-                            当前使用中
+                            {dict.groups.mainFallbackActive}
                           </span>
                         ) : (
                           <button
@@ -2862,7 +3130,7 @@ export function MultiGroupPage() {
                   {isRuntimeActiveGroup ? (
                     <span className="inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border border-[var(--green)]/40 bg-[var(--green-soft)] px-2.5 py-0.5 text-[11px] font-semibold text-[var(--green)]">
                       <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
-                      当前使用中
+                      {dict.groups.mainFallbackActive}
                     </span>
                   ) : (
                     <button
@@ -2874,6 +3142,35 @@ export function MultiGroupPage() {
                       <span>使用此组</span>
                     </button>
                   )}
+
+                  {/* Persistent Independent Routing Status Capsule (click opens Drawer & jumps to Section 5) */}
+                  <button
+                    type="button"
+                    onClick={handleOpenIndepSection}
+                    title="点击展开右侧策略抽屉并定位到「5. 分流规则（独立分流）」"
+                    className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-0.5 text-[11px] font-semibold transition-colors ${
+                      selectedGroup.independent_routing
+                        ? selectedGroup.match_rules.length > 0
+                          ? "border-[var(--amber)]/55 bg-[var(--amber-soft)] text-[var(--amber)] hover:border-[var(--amber)]"
+                          : "border-dashed border-[var(--amber)]/55 bg-[var(--amber-soft)]/50 text-[var(--amber)] hover:border-[var(--amber)]"
+                        : "border-[var(--line)] bg-[var(--bg-elevated)] font-medium text-[var(--muted)] hover:border-[var(--amber)]/45 hover:text-[var(--text-secondary)]"
+                    }`}
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                        selectedGroup.independent_routing ? "bg-[var(--amber)]" : "bg-[var(--muted)]/55"
+                      }`}
+                    />
+                    <span>
+                      {selectedGroup.independent_routing
+                        ? selectedGroup.match_rules.length > 0
+                          ? formatI18nTemplate(dict.groups.indepCapsuleActive, {
+                              count: selectedGroup.match_rules.length,
+                            })
+                          : dict.groups.indepCapsulePending
+                        : dict.groups.indepCapsuleOff}
+                    </span>
+                  </button>
 
                   <button
                     type="button"
@@ -3359,19 +3656,25 @@ export function MultiGroupPage() {
                       )}
 
                       {snap?.google_clean === true && (
-                        <span className="rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]">
+                        <span
+                          title={formatGoogleRegionTooltip(snap, regionCode)}
+                          className="rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]"
+                        >
                           谷歌正常
                         </span>
                       )}
                       {snap?.google_clean === false && (
-                        <span className="rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]">
+                        <span
+                          title={formatGoogleRegionTooltip(snap, regionCode)}
+                          className="rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
+                        >
                           送中
                         </span>
                       )}
                       {snap?.google_risk_mismatch && (
                         <span
                           className="rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                          title="不同网站识别出的地区存在差异，仅供参考"
+                          title={formatGoogleRegionTooltip(snap, regionCode)}
                         >
                           地区有偏差
                         </span>
@@ -3381,21 +3684,33 @@ export function MultiGroupPage() {
                         const aiDots = extractCardAiDots(snap);
                         if (aiDots.length === 0) return null;
                         return (
-                          <span
-                            className="inline-flex items-center gap-1"
-                            title={`AI 解锁：${aiDots.map((d) => d.label).join(" · ")}`}
-                          >
-                            {aiDots.map((dot) => (
-                              <span
-                                key={dot.id}
-                                title={dot.label}
-                                aria-label={dot.label}
-                                className="inline-flex items-center gap-0.5 rounded bg-[var(--accent-soft)] px-1 py-0.5 text-[9px] font-medium text-[var(--accent)]"
-                              >
-                                <span className="h-1.5 w-1.5 rounded-full bg-[var(--green)]" />
-                                {dot.short}
-                              </span>
-                            ))}
+                          <span className="inline-flex items-center gap-1">
+                            {aiDots.map((dot) => {
+                              const dotColor =
+                                dot.tone === "green"
+                                  ? "bg-[var(--green)]"
+                                  : dot.tone === "amber"
+                                    ? "bg-[var(--amber)]"
+                                    : dot.tone === "red"
+                                      ? "bg-[var(--red)]"
+                                      : "bg-[var(--muted)]";
+                              const pillCls = dot.isLegacy
+                                ? getAiBadgeToneClass("muted", "legacy")
+                                : dot.tone === "green"
+                                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
+                                  : getAiBadgeToneClass(dot.tone, "soft");
+                              return (
+                                <span
+                                  key={dot.id}
+                                  title={dot.label}
+                                  aria-label={dot.label}
+                                  className={`inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-medium ${pillCls}`}
+                                >
+                                  <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
+                                  {dot.short}
+                                </span>
+                              );
+                            })}
                           </span>
                         );
                       })()}
@@ -4016,10 +4331,10 @@ export function MultiGroupPage() {
                 )}
               </div>
 
-              {/* 5. 适用网站 */}
-              <div className="space-y-2.5 border-t border-[var(--line)]/70 pt-4">
+              {/* 5. 分流规则（网站 / 软件进程 / 复合规则） */}
+              <div ref={section5Ref} className="space-y-2.5 border-t border-[var(--line)]/70 pt-4">
                 <div className="text-xs font-semibold text-[var(--text)]">
-                  5. 适用网站（哪些网站走这个组）
+                  {dict.groups.section5Title}
                 </div>
 
                 {/* Independent site routing switch (default off so inactive groups never steal traffic) */}
@@ -4041,7 +4356,7 @@ export function MultiGroupPage() {
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-semibold text-[var(--text)]">
-                      独立接管专属网站分流
+                      独立接管专属分流（无需切为主组）
                     </span>
                     <span
                       className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold transition-colors ${
@@ -4054,11 +4369,11 @@ export function MultiGroupPage() {
                     </span>
                   </div>
                   <p className="mt-1.5 text-[10px] leading-relaxed text-[var(--muted)]">
-                    关闭时，只有首页选中本组才会走这里，绝不抢其它组的流量；打开后，即使首页在用别的组，命中下方域名的网站也会单独走本组
+                    关闭时，只有首页选中本组才会走这里，绝不抢其它组的流量；打开后，即使首页在用别的组，命中下方域名、软件进程或复合规则的流量也会单独走本组
                   </p>
                   {selectedGroup.independent_routing && selectedGroup.match_rules.length === 0 && (
                     <p className="mt-1 text-[10px] font-medium text-[var(--amber)]">
-                      提示：请在下方添加至少一条网站域名，独立分流才会匹配生效
+                      提示：请在下方添加至少一条域名、进程或复合规则，独立分流才会匹配生效
                     </p>
                   )}
                 </button>
@@ -4087,7 +4402,7 @@ export function MultiGroupPage() {
                                 match_rules: g.match_rules.filter((r) => r !== rule),
                               }))
                             }
-                            aria-label={`移除网站 ${chip.display}`}
+                            aria-label={`移除规则 ${chip.display}`}
                             className="shrink-0 text-[var(--muted)] hover:text-[var(--red)]"
                           >
                             <X className="h-3 w-3" />
@@ -4097,7 +4412,7 @@ export function MultiGroupPage() {
                     })
                   ) : (
                     <span className="text-[11px] text-[var(--muted)]">
-                      暂未限定网站（可作手动主力组或备用组）
+                      暂未限定规则（可作主兜底组或备用组）
                     </span>
                   )}
                 </div>
@@ -4107,7 +4422,7 @@ export function MultiGroupPage() {
                     type="text"
                     value={newRuleInput}
                     onChange={(e) => setNewRuleInput(e.target.value)}
-                    placeholder="输入域名，如 openai.com"
+                    placeholder={dict.groups.section5Placeholder}
                     className="min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
                   />
                   <button
@@ -4118,7 +4433,7 @@ export function MultiGroupPage() {
                   </button>
                 </form>
                 <div className="text-[10px] text-[var(--muted)]">
-                  直接填域名会自动匹配子域名；完整规则（如 DOMAIN-SUFFIX,anthropic.com）会原样保留，多条请用分号或换行分隔。
+                  直接填域名自动按后缀匹配；支持软件进程（如 PROCESS-NAME,QQ.exe）、复合规则（如 AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))）及正则规则，多条请用分号或换行分隔。
                 </div>
               </div>
 

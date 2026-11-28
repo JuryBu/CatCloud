@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Future post-beta iterations will be tracked here.
 
+## [0.1.4] - 2026-11-28
+
+> **快速选包指引（大多数 Windows 电脑请认准 `x64`，切勿误下 `arm64`）**
+> - **普通 Windows 电脑（Intel / AMD，64 位）**：优先下载 `CatCloud-0.1.4-windows-x64-setup.exe`（安装版）或 `CatCloud-0.1.4-windows-x64-portable.zip`（绿色便携版，解压即用）
+> - **ARM 架构 Windows 笔记本（骁龙等）**：下载 `CatCloud-0.1.4-windows-arm64-setup.exe` 或 `CatCloud-0.1.4-windows-arm64-portable.zip`
+> - **macOS（Apple Silicon M1–M4）**：下载 `CatCloud-0.1.4-macos-aarch64.dmg`；**Intel Mac**：下载 `CatCloud-0.1.4-macos-x64.dmg`
+> - **Linux（x86_64）**：下载 `.AppImage` / `.deb` / `.rpm`；纯终端/软路由环境可下 `catcloud-*` 无头版
+
+### Windsurf / Devin 真语义与出口 IP 纯净度风控识别
+- **消除「仅测官网 200」假绿灯**：内置 `builtin_unlock_windsurf` 升级为 `server.codeium.com` ConnectRPC 推理网关语义校验 + 双源并发出口 IP 纯净度交叉探测（`api.ipquery.io` + `ip-api.com`，4 秒严格总预算，兼容老库 Schema v4→v5 无损升级），精准拦截被标为 `proxy=true`/Tor/高危代理的出口 IP，防止 `sticky_best` 长期锁死高风控机房 IP 导致 `error number 13`。
+- **节点表四态呈现与详情悬停**：节点表与多选组全面消费 `per_probe_detail` 与出口风险字段，清晰区分「纯净可用（绿）」「机房可达·易风控（暖琥珀）」「代理风控/受限（红）」「旧版记录·需重测（灰）」；策略公式引擎新增 `ip_clean` 标量与「纯净住宅 / 避开代理机房」门禁，并优化全员未过门禁时的降级排序防反选高危代理 IP。
+- **内置一键「Windsurf / Devin 纯净专用」独立分流模板**：全仓统一 6 条官方后缀域名（`codeium.com` / `codeiumdata.com` / `windsurf.com` / `devin.ai` / `cognition.ai` / `exafunction.com`），一键开启独立分流与防风控策略，不干扰主组日常高速流量。
+
+### 独立分流全栈闭环、组合规则无损与离线进程匹配
+- **总览与多选组主次清晰区隔**：总览页明确标注「默认兜底」主组并在下方展示「并行独立分流」紧凑子列表（含规则数、活跃节点与延迟、点击直达且明确「无需切为主组」）；在非主组的独立分流组内切换节点时原地生效，不再误把全机默认主兜底组顶换掉。
+- **CLI 与离线匹配引擎全线补齐**：`catcloud group create` / `policy` 新增 `--independent-routing`、`--match-rules`、`--add-match-rule`、`--hard-gate`；新增统一离线规则求值引擎，`catcloud net match` 支持 `--process-name` 与 `--process-path`（含跨平台路径 basename 提取与严格 Mihomo `AND`/`OR`/`NOT` 语法对齐）。
+- **Mihomo `AND`/`OR`/`NOT` 组合规则与正则全链路无损**：前后端按上游 Mihomo 真实语法重构规则解析，完整支持 `AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000)),DIRECT`、含括号组名与含逗号量词 `{1,3}` 正则的新增、重开、编辑、保存与编译校验，同时修复外部 CLI 热重载后分流页自动刷新。
+
+### 地理库自动热载生效与 Windows Schannel 证书吊销失败根治
+- **彻底根治 Windows `CRYPT_E_REVOCATION_OFFLINE (0x80092013)`**：将 Windows 系统代理排除表 `ProxyOverride` 中的裸写 `::1` 规范化为 `[::1]` 并自动清洗/转换非法 `/` CIDR，经原生 `WinHttpOpen` 校验通过，消除 `cryptnet.dll` 0 毫秒报 `0x80070057` 导致原生 `curl.exe` / PowerShell / .NET 证书吊销失败的问题；`ProxyGuard` 与 `catcloud net doctor` 同步支持自动修复与诊断遗留注册表项。
+- **地理库缺失提醒、镜像容错与自动热载生效**：`refresh_geo_db` 落盘后自动强制 L2 热重载激活 `GEOIP,CN,DIRECT,no-resolve` 并支持 jsDelivr 镜像回退；总览页与分流规则页在开启国内直连且缺库时提供一键拉取入口，并新增可选的「QQ / 微信（含 `Weixin.exe`）进程直连」快捷按钮，避免国内裸 IP 绕走海外兜底。
+
 ## [0.1.3] - 2026-11-28
 
 > **快速选包指引（大多数 Windows 电脑请认准 `x64`，切勿误下 `arm64`）**

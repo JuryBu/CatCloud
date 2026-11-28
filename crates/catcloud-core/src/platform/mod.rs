@@ -12,7 +12,8 @@ pub mod linux;
 
 pub use common::{
     DEFAULT_LINUX_PROXY_BYPASS, DEFAULT_MACOS_PROXY_BYPASS, DEFAULT_WINDOWS_PROXY_BYPASS,
-    LinuxDesktopHint, PortListenerOwner, classify_linux_desktop, format_gsettings_bypass_list,
+    LinuxDesktopHint, PortListenerOwner, classify_linux_desktop,
+    find_invalid_windows_proxy_override_entries, format_gsettings_bypass_list,
     format_kde_no_proxy_for, format_kde_proxy_url, format_shell_env_snippet,
     get_process_start_time_unix, is_macos_ignored_network_service, is_pkexec_user_cancelled,
     list_listening_port_owners, macos_bypass_command_args, parse_getcap_has_net_admin,

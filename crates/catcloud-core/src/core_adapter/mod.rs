@@ -4,6 +4,7 @@ pub mod dns_diag;
 pub mod hot_reload;
 pub mod mihomo;
 pub mod port_guard;
+pub mod rule_matcher;
 pub mod stream_client;
 
 use crate::error::CatResult;
@@ -57,6 +58,10 @@ pub use mihomo::{
 pub use port_guard::{
     AllocatedPorts as CoreAllocatedPorts, PortShiftNotice as CorePortShiftNotice,
     allocate_safe_ports, allocate_safe_ports_for_hosts, is_port_available_tcp_udp,
+};
+pub use rule_matcher::{
+    MAX_LOGICAL_RULE_DEPTH, RuleMatchOutcome, RuleMatchQuery, domain_matches_wildcard,
+    evaluate_compiled_rules, matches_compiled_fake_ip_filter,
 };
 pub use stream_client::{
     BoundedRingBuffer, CoreTelemetryStore, DEFAULT_MAX_LOG_ENTRIES, DEFAULT_MAX_MEMORY_SAMPLES,

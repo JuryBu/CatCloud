@@ -9,7 +9,7 @@ use crate::models::{
 };
 use crate::strategy::evaluator::{
     EvaluatedCandidate, GroupEvaluationReport, build_eval_context_for_probe,
-    evaluate_group_candidates, score_node_with_group_formula,
+    evaluate_group_candidates, evaluate_hard_gates, score_node_with_group_formula,
 };
 use crate::strategy::formula::FormulaExpr;
 use chrono::{DateTime, TimeZone, Utc};
@@ -1213,6 +1213,17 @@ struct EscalatedActiveInfo {
     formula_uses_multiplier: bool,
 }
 
+fn compile_hard_gates(raw_gates: &[String]) -> CatResult<Vec<(String, FormulaExpr)>> {
+    let mut compiled = Vec::with_capacity(raw_gates.len());
+    for raw in raw_gates {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            compiled.push((trimmed.to_string(), FormulaExpr::parse(trimmed)?));
+        }
+    }
+    Ok(compiled)
+}
+
 fn inspect_escalated_active_node(
     group: &MultiGroup,
     fallback_group: Option<&MultiGroup>,
@@ -1231,25 +1242,14 @@ fn inspect_escalated_active_node(
 
     let snap = snapshots.get(&node.id);
     let ctx = build_eval_context_for_probe(node, snap, group.primary_probe_id.as_deref());
-    let mut passed_hard_gates = true;
-    for raw_gate in &group.hard_gates {
-        let trimmed = raw_gate.trim();
-        if !trimmed.is_empty() && !FormulaExpr::parse(trimmed)?.eval_bool(&ctx)? {
-            passed_hard_gates = false;
-            break;
-        }
-    }
+    let primary_gates = compile_hard_gates(&group.hard_gates)?;
+    let mut passed_hard_gates = evaluate_hard_gates(&primary_gates, &ctx, snap)?.is_empty();
     if passed_hard_gates {
         if let Some(fb_group) = fallback_group {
             let fb_ctx =
                 build_eval_context_for_probe(node, snap, fb_group.primary_probe_id.as_deref());
-            for raw_gate in &fb_group.hard_gates {
-                let trimmed = raw_gate.trim();
-                if !trimmed.is_empty() && !FormulaExpr::parse(trimmed)?.eval_bool(&fb_ctx)? {
-                    passed_hard_gates = false;
-                    break;
-                }
-            }
+            let fb_gates = compile_hard_gates(&fb_group.hard_gates)?;
+            passed_hard_gates = evaluate_hard_gates(&fb_gates, &fb_ctx, snap)?.is_empty();
         }
     }
     let (score, formula_uses_multiplier) = score_node_with_group_formula(group, node, snap)?;
@@ -1682,5 +1682,72 @@ mod tests {
         assert!(!lb_steady.should_close_old_connections);
         assert!(!lb_steady.trigger_adapter_refresh);
         assert!(lb_steady.shorten_reprobe_interval);
+    }
+
+    #[test]
+    fn escalated_active_node_inspection_uses_shared_hard_gate_untested_semantics() {
+        let nodes = vec![test_node("p1", 1.0), test_node("fb1", 3.0)];
+
+        // Case 1: Borrowed fallback node `fb1` has never been tested for `keepalive_60s_ok` or
+        // `ip_clean` (both `None`). Shared `evaluate_hard_gates` must NOT falsely reject it.
+        let mut snaps_untested = HashMap::new();
+        snaps_untested.insert("p1".into(), test_snap("p1", false, 999.0, true));
+        let mut fb_untested = test_snap("fb1", true, 40.0, true);
+        fb_untested.keepalive_60s_ok = None;
+        fb_untested.ip_clean = None;
+        snaps_untested.insert("fb1".into(), fb_untested);
+
+        let primary = MultiGroup {
+            id: "grp-wsf-main".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["p1".into()],
+            hard_gates: vec!["keepalive_ok == 1 && ip_clean == 1".to_string()],
+            formula_expr: "-ping_ms".to_string(),
+            fallback_policy: FallbackPolicy::CrossPoolEscalate,
+            fallback_pool_id: Some("grp-wsf-fb".into()),
+            active_node_id: Some("fb1".into()),
+            state: MultiGroupState::Escalated,
+            escalated_since: Some("2026-11-28T00:00:00Z".into()),
+            cooldown_sec: 0,
+            ..Default::default()
+        };
+        let fallback = MultiGroup {
+            id: "grp-wsf-fb".to_string(),
+            mode: MultiGroupMode::StickyBest,
+            member_node_ids: vec!["fb1".into()],
+            hard_gates: vec!["google_clean == 1 && ip_clean == 1".to_string()],
+            formula_expr: "-ping_ms".to_string(),
+            ..Default::default()
+        };
+
+        let info_untested = inspect_escalated_active_node(
+            &primary,
+            Some(&fallback),
+            &nodes,
+            &snaps_untested,
+        )
+        .unwrap()
+        .expect("active fallback node info");
+        assert!(
+            info_untested.passed_hard_gates,
+            "untested keepalive_60s_ok/ip_clean must pass via shared evaluate_hard_gates"
+        );
+
+        // Case 2: Once `ip_clean` is measured `Some(false)`, shared `evaluate_hard_gates` MUST
+        // reject the escalated active node strictly.
+        let mut snaps_dirty_ip = snaps_untested;
+        snaps_dirty_ip.get_mut("fb1").unwrap().ip_clean = Some(false);
+        let info_dirty = inspect_escalated_active_node(
+            &primary,
+            Some(&fallback),
+            &nodes,
+            &snaps_dirty_ip,
+        )
+        .unwrap()
+        .expect("active fallback node info");
+        assert!(
+            !info_dirty.passed_hard_gates,
+            "explicit ip_clean == Some(false) must fail shared hard-gate evaluation"
+        );
     }
 }
