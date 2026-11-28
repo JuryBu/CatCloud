@@ -46,6 +46,15 @@ pub struct ConfigReloadRequest {
     pub req_id: String,
     pub allow_l3_restart: bool,
     pub created_at_ms: u64,
+    /// When `true`, instructs a running self-updatable portable desktop instance to verify
+    /// `<data_dir>/.update_staging/` and perform an in-place portable update handoff (inheriting
+    /// the running process token with zero UAC prompt).
+    #[serde(default)]
+    pub apply_staged_update: bool,
+    /// When `true` alongside `apply_staged_update`, relaunches the updated binary silently to tray
+    /// without popping the main window (`--silent-relaunch`).
+    #[serde(default)]
+    pub silent_relaunch: bool,
 }
 
 /// Cross-process live hot-reload acknowledgment persisted under `<data_dir>/run/config_reload_ack.json`.
@@ -2125,19 +2134,12 @@ pub fn read_config_reload_ack(data_dir: &Path) -> Option<ConfigReloadAck> {
 /// - Returns `Ack(ack)` when a matching `ConfigReloadAck` arrives within `timeout`.
 /// - Returns `TimedOut { req_id }` if the signal succeeded but no matching ack arrived before `timeout`,
 ///   cleaning up the matching request file so a stale `allow_l3_restart = true` cannot leak.
-pub fn signal_config_reload_and_wait_outcome(
+fn signal_reload_request_and_wait_outcome(
     data_dir: &Path,
-    allow_l3_restart: bool,
+    req: ConfigReloadRequest,
     timeout: Duration,
 ) -> ConfigReloadWaitOutcome {
-    let created_at_ms = now_unix_millis();
-    let seq = CONFIG_RELOAD_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-    let req_id = format!("reload-{}-{created_at_ms}-{seq}", std::process::id());
-    let req = ConfigReloadRequest {
-        req_id: req_id.clone(),
-        allow_l3_restart,
-        created_at_ms,
-    };
+    let req_id = req.req_id.clone();
     if write_config_reload_request(data_dir, &req).is_err() {
         return ConfigReloadWaitOutcome::NotRunning;
     }
@@ -2166,6 +2168,44 @@ pub fn signal_config_reload_and_wait_outcome(
         let remaining = deadline.saturating_duration_since(now);
         std::thread::sleep(remaining.min(Duration::from_millis(40)));
     }
+}
+
+pub fn signal_config_reload_and_wait_outcome(
+    data_dir: &Path,
+    allow_l3_restart: bool,
+    timeout: Duration,
+) -> ConfigReloadWaitOutcome {
+    let created_at_ms = now_unix_millis();
+    let seq = CONFIG_RELOAD_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let req_id = format!("reload-{}-{created_at_ms}-{seq}", std::process::id());
+    let req = ConfigReloadRequest {
+        req_id,
+        allow_l3_restart,
+        created_at_ms,
+        apply_staged_update: false,
+        silent_relaunch: false,
+    };
+    signal_reload_request_and_wait_outcome(data_dir, req, timeout)
+}
+
+/// Signal a running self-updatable portable instance scoped to `data_dir` to verify
+/// `<data_dir>/.update_staging/` and perform an in-place portable update relaunch.
+pub fn signal_portable_self_update_and_wait_outcome(
+    data_dir: &Path,
+    silent_relaunch: bool,
+    timeout: Duration,
+) -> ConfigReloadWaitOutcome {
+    let created_at_ms = now_unix_millis();
+    let seq = CONFIG_RELOAD_REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+    let req_id = format!("self-update-{}-{created_at_ms}-{seq}", std::process::id());
+    let req = ConfigReloadRequest {
+        req_id,
+        allow_l3_restart: true,
+        created_at_ms,
+        apply_staged_update: true,
+        silent_relaunch,
+    };
+    signal_reload_request_and_wait_outcome(data_dir, req, timeout)
 }
 
 /// Write a unique config hot-reload request, signal the running instance for `data_dir`, and
@@ -3504,6 +3544,8 @@ mod tests {
             req_id: "req-roundtrip-1".to_string(),
             allow_l3_restart: true,
             created_at_ms: 1_700_000_000_001,
+            apply_staged_update: false,
+            silent_relaunch: false,
         };
         write_config_reload_request(&dir, &req).expect("write config reload request");
         assert_eq!(read_config_reload_request(&dir), Some(req.clone()));
@@ -3655,6 +3697,8 @@ mod tests {
             req_id: "reload-newer-concurrent".to_string(),
             allow_l3_restart: false,
             created_at_ms: now_unix_millis(),
+            apply_staged_update: false,
+            silent_relaunch: false,
         };
         write_config_reload_request(&dir, &newer_req).expect("write newer request");
         assert!(!clear_config_reload_request_if_matching(&dir, "reload-old-id"));
@@ -3668,6 +3712,63 @@ mod tests {
         // 4. After release, primary liveness probe returns false cleanly.
         guard.release();
         assert!(!is_primary_instance_alive(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn portable_self_update_request_roundtrip_and_legacy_json_compat() {
+        let dir = make_temp_dir("portable-self-update-req");
+        let legacy_json = r#"{"req_id":"legacy-1","allow_l3_restart":true,"created_at_ms":123}"#;
+        let parsed: ConfigReloadRequest =
+            serde_json::from_str(legacy_json).expect("legacy 3-field json must parse");
+        assert!(!parsed.apply_staged_update);
+        assert!(!parsed.silent_relaunch);
+
+        let mut guard = match SingleInstanceGuard::acquire(&dir, Duration::ZERO).unwrap() {
+            AcquireOutcome::Primary(g) => g,
+            AcquireOutcome::SecondaryWokePrimary => panic!("expected primary"),
+        };
+        let seen_apply = Arc::new(AtomicBool::new(false));
+        let seen_silent = Arc::new(AtomicBool::new(false));
+        let seen_apply_c = Arc::clone(&seen_apply);
+        let seen_silent_c = Arc::clone(&seen_silent);
+        let dir_cb = dir.clone();
+        guard
+            .start_instance_listeners_with_reload(
+                || {},
+                || {},
+                move || {
+                    if let Some(pending) = read_config_reload_request(&dir_cb) {
+                        seen_apply_c.store(pending.apply_staged_update, Ordering::SeqCst);
+                        seen_silent_c.store(pending.silent_relaunch, Ordering::SeqCst);
+                        let ack = ConfigReloadAck {
+                            req_id: pending.req_id,
+                            applied: true,
+                            rejected: false,
+                            level: Some("portable_self_update_relaunch".to_string()),
+                            error: None,
+                            completed_at_ms: now_unix_millis(),
+                        };
+                        let _ = write_config_reload_ack(&dir_cb, &ack);
+                    }
+                },
+            )
+            .unwrap();
+
+        let outcome =
+            signal_portable_self_update_and_wait_outcome(&dir, true, Duration::from_secs(2));
+        match outcome {
+            ConfigReloadWaitOutcome::Ack(ack) => {
+                assert!(ack.applied && !ack.rejected);
+                assert_eq!(ack.level.as_deref(), Some("portable_self_update_relaunch"));
+            }
+            other => panic!("expected Ack, got {other:?}"),
+        }
+        assert!(seen_apply.load(Ordering::SeqCst));
+        assert!(seen_silent.load(Ordering::SeqCst));
+        assert_eq!(read_config_reload_request(&dir), None);
+
+        guard.release();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

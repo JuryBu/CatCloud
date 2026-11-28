@@ -396,6 +396,14 @@ fn build_post_update_cleanup_relaunch_args(
         }
     }
 
+    if current_raw_args
+        .iter()
+        .any(|a| a.to_string_lossy() == "--silent-relaunch")
+        && !relaunch_args.iter().any(|a| a == "--silent-relaunch")
+    {
+        relaunch_args.push("--silent-relaunch".to_string());
+    }
+
     if !relaunch_args.iter().any(|a| a == "--post-update-cleanup") {
         relaunch_args.push("--post-update-cleanup".to_string());
     }
@@ -452,7 +460,7 @@ pub fn run_with_paths(paths: AppPaths) {
     catcloud_core::init_crypto_provider();
 
     let restarting = has_cli_flag("--restarting");
-    let silent_flag = has_cli_flag("--silent");
+    let silent_flag = has_cli_flag("--silent") || has_cli_flag("--silent-relaunch");
     let post_update_cleanup = has_cli_flag("--post-update-cleanup");
     let apply_staged_update_flag = has_cli_flag("--apply-staged-update");
     let enable_tun_flag = has_cli_flag("--enable-tun");
@@ -556,9 +564,11 @@ pub fn run_with_paths(paths: AppPaths) {
     let exit_job_ref = Arc::clone(&job_guard);
 
     // Best-effort cleanup of any stale ephemeral probe sandboxes left by prior hard crashes.
-    let stale_sandbox_dir = paths.runtime_dir.join("probe_sandbox");
-    if stale_sandbox_dir.exists() {
-        let _ = std::fs::remove_dir_all(&stale_sandbox_dir);
+    for stale_dir_name in ["probe_sandbox", "probe-tmp"] {
+        let stale_dir = paths.runtime_dir.join(stale_dir_name);
+        if stale_dir.exists() {
+            let _ = std::fs::remove_dir_all(&stale_dir);
+        }
     }
 
     let has_updater_plugin_cfg = context
@@ -3890,6 +3900,23 @@ mod tests {
             built_eq,
             vec![
                 "--data-dir=/tmp/catcloud-portable".to_string(),
+                "--post-update-cleanup".to_string(),
+                "--restarting".to_string(),
+            ]
+        );
+
+        // Explicitly propagates `--silent-relaunch` for cross-process silent self-update.
+        let silent_relaunch_args = vec![
+            OsString::from("--data-dir=/tmp/catcloud-portable"),
+            OsString::from("--apply-staged-update"),
+            OsString::from("--silent-relaunch"),
+        ];
+        let built_silent = build_post_update_cleanup_relaunch_args(&[], &silent_relaunch_args);
+        assert_eq!(
+            built_silent,
+            vec![
+                "--data-dir=/tmp/catcloud-portable".to_string(),
+                "--silent-relaunch".to_string(),
                 "--post-update-cleanup".to_string(),
                 "--restarting".to_string(),
             ]

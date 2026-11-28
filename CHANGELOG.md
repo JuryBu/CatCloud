@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Future post-beta iterations will be tracked here.
 
+## [0.1.3] - 2026-11-28
+
+> **快速选包指引（大多数 Windows 电脑请认准 `x64`，切勿误下 `arm64`）**
+> - **普通 Windows 电脑（Intel / AMD，64 位）**：优先下载 `CatCloud-0.1.3-windows-x64-setup.exe`（安装版）或 `CatCloud-0.1.3-windows-x64-portable.zip`（绿色便携版，解压即用）
+> - **ARM 架构 Windows 笔记本（骁龙等）**：下载 `CatCloud-0.1.3-windows-arm64-setup.exe` 或 `CatCloud-0.1.3-windows-arm64-portable.zip`
+> - **macOS（Apple Silicon M1–M4）**：下载 `CatCloud-0.1.3-macos-aarch64.dmg`；**Intel Mac**：下载 `CatCloud-0.1.3-macos-x64.dmg`
+> - **Linux（x86_64）**：下载 `.AppImage` / `.deb` / `.rpm`；纯终端/软路由环境可下 `catcloud-*` 无头版
+
+### 便携版跨进程 2 秒零弹窗原地自热切升级
+- **新增 `catcloud update apply --silent` 跨进程原地热切**：在便携版已验证暂存新包（`.update_staging/`）后，命令行可通过跨完整性级别（Cross-IL）原生事件安全通知正在运行的桌面端，由运行中的桌面端完成二次 SHA-256 完整性与防降级校验、优雅停核并用自身权限令牌静默重启换轨（`--silent-relaunch`），全程无 UAC 弹窗、无主窗抢焦点、实际切换仅约 2 秒。
+- **扩展 `catcloud update stage --from-version` 与旧测速目录清理**：支持跨版本暂存指定基线版本号；桌面端冷启动同步自动清理早期遗留的 `data/run/probe-tmp/` 临时测速核，减少磁盘占用。
+
 ## [0.1.2] - 2026-11-28
 
 > **快速选包指引（大多数 Windows 电脑请认准 `x64`，切勿误下 `arm64`）**

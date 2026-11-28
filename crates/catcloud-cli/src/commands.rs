@@ -49,6 +49,7 @@ use catcloud_core::probe::{
 use catcloud_core::process_guard::{
     ConfigReloadWaitOutcome, JobGuard, is_primary_instance_alive,
     signal_config_reload_and_wait_outcome, signal_config_reload_for_data_dir,
+    signal_portable_self_update_and_wait_outcome,
 };
 use catcloud_core::sanitize::{
     redact_compiled_yaml, redact_ip_or_host, redact_node_for_readonly, redact_path_for_display,
@@ -88,9 +89,10 @@ use catcloud_core::subscription::process_attach::{
     list_process_candidates,
 };
 use catcloud_core::updater::{
-    LatestManifest, MAX_METADATA_BYTES, MAX_ZIP_BYTES, PlatformAsset, Updater,
+    LatestManifest, MAX_METADATA_BYTES, MAX_ZIP_BYTES, PlatformAsset, StagedUpdateKind, Updater,
     current_update_platform_key_opt, is_update_available_for_channel, parse_latest_manifest,
     parse_sha256sums, read_pending_staged_update, resolve_asset_sha256, stage_verified_archive,
+    verify_staged_payload_integrity,
 };
 use catcloud_core::{AppPaths, CatError, CatResult};
 use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, TimeZone, Utc};
@@ -819,6 +821,18 @@ pub enum UpdateCommand {
         checksums: PathBuf,
         #[arg(long)]
         asset_name: Option<String>,
+        /// Optional current version override recorded as `from_version` (defaults to CLI version)
+        #[arg(long)]
+        from_version: Option<String>,
+    },
+    /// Signal a running portable desktop instance to verify `.update_staging/` and self-update in place
+    Apply {
+        /// Relaunch silently to tray without popping the main window (`--silent-relaunch`)
+        #[arg(long)]
+        silent: bool,
+        /// Timeout in seconds waiting for desktop handoff acknowledgment
+        #[arg(long, default_value_t = 12)]
+        timeout_secs: u64,
     },
 }
 
@@ -2813,6 +2827,7 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 archive,
                 checksums,
                 asset_name,
+                from_version,
             } => {
                 let manifest_bytes =
                     read_file_with_limit(&manifest, MAX_METADATA_BYTES, "update manifest")?;
@@ -2840,10 +2855,15 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                 let expected = resolve_asset_sha256(target_asset, Some(&sums))?;
                 let zip_bytes =
                     read_file_with_limit(&archive, MAX_ZIP_BYTES, "update archive")?;
+                let effective_from = from_version
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(env!("CARGO_PKG_VERSION"));
                 let staged = stage_verified_archive(
                     &zip_bytes,
                     &expected,
-                    env!("CARGO_PKG_VERSION"),
+                    effective_from,
                     &parsed_manifest.version,
                     &paths.staging_dir,
                 )?;
@@ -2852,10 +2872,102 @@ pub async fn dispatch(paths: &AppPaths, as_json: bool, cmd: Commands) -> Result<
                     as_json,
                     &out,
                     &format!(
-                        "Staged verified update v{} (ready to apply on user confirmation/restart).",
+                        "Staged verified update v{} (ready to apply via `catcloud update apply --silent` or restart).",
                         parsed_manifest.version
                     ),
                 )
+            }
+
+            UpdateCommand::Apply {
+                silent,
+                timeout_secs,
+            } => {
+                let pending = verify_staged_payload_integrity(&paths.staging_dir)
+                    .context("staged update verification failed; stage a verified portable package first")?;
+                if pending.kind != StagedUpdateKind::PortableZip {
+                    anyhow::bail!(
+                        "staged update kind `{:?}` is not a PortableZip; in-place hot-swap only supports portable archives",
+                        pending.kind
+                    );
+                }
+                let wait_dur = Duration::from_secs(timeout_secs.clamp(2, 60));
+                let outcome = signal_portable_self_update_and_wait_outcome(
+                    &paths.root_data_dir,
+                    silent,
+                    wait_dur,
+                );
+                match outcome {
+                    ConfigReloadWaitOutcome::Ack(ack) if ack.applied && !ack.rejected => {
+                        let out = json!({
+                            "ok": true,
+                            "applied": true,
+                            "target_version": pending.target_version,
+                            "silent": silent,
+                            "ack": ack,
+                        });
+                        emit_output(
+                            as_json,
+                            &out,
+                            &format!(
+                                "Desktop accepted portable self-update to v{} (silent={}); swapping in place.",
+                                pending.target_version, silent
+                            ),
+                        )
+                    }
+                    ConfigReloadWaitOutcome::Ack(ack) => {
+                        let reason = ack
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "desktop rejected portable self-update".to_string());
+                        let out = json!({
+                            "ok": false,
+                            "applied": false,
+                            "rejected": true,
+                            "target_version": pending.target_version,
+                            "error": reason,
+                            "ack": ack,
+                        });
+                        if as_json {
+                            emit_output(true, &out, "")?;
+                            return Err(AlreadyEmittedJsonError(reason).into());
+                        }
+                        anyhow::bail!("portable self-update rejected by desktop: {reason}");
+                    }
+                    ConfigReloadWaitOutcome::NotRunning => {
+                        let out = json!({
+                            "ok": true,
+                            "applied": false,
+                            "status": "not_running",
+                            "target_version": pending.target_version,
+                        });
+                        emit_output(
+                            as_json,
+                            &out,
+                            &format!(
+                                "No running desktop instance detected for this data dir; staged v{} will apply on next launch with --apply-staged-update.",
+                                pending.target_version
+                            ),
+                        )
+                    }
+                    ConfigReloadWaitOutcome::TimedOut { req_id } => {
+                        let msg = format!(
+                            "timed out waiting for desktop self-update handoff ack (req_id={req_id})"
+                        );
+                        let out = json!({
+                            "ok": false,
+                            "applied": false,
+                            "status": "timed_out",
+                            "req_id": req_id,
+                            "target_version": pending.target_version,
+                            "error": msg,
+                        });
+                        if as_json {
+                            emit_output(true, &out, "")?;
+                            return Err(AlreadyEmittedJsonError(msg).into());
+                        }
+                        anyhow::bail!(msg);
+                    }
+                }
             }
         },
     }

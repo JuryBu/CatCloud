@@ -4443,11 +4443,11 @@ pub async fn apply_disk_config_hot_reload_internal(
     app: &AppHandle,
     state: &AppState,
 ) -> Result<ConfigReloadAck, String> {
-    let _cfg_guard = state.config_transition_lock.lock().await;
+    let cfg_guard = state.config_transition_lock.lock().await;
 
     let now_ms = current_unix_ms();
     let req_opt = read_config_reload_request(&state.paths.root_data_dir);
-    let (req_id, allow_l3_restart) = match req_opt {
+    let (req_id, allow_l3_restart, apply_staged_update, silent_relaunch) = match req_opt {
         Some(req) => {
             let trimmed_id = req.req_id.trim().to_string();
             if is_config_reload_request_expired(req.created_at_ms, now_ms) {
@@ -4463,12 +4463,17 @@ pub async fn apply_disk_config_hot_reload_internal(
                     now_ms,
                     "忽略过期的跨进程热重载请求（超过 15000ms TTL），已清理残留请求并强制 allow_l3_restart=false"
                 );
-                (String::new(), false)
+                (String::new(), false, false, false)
             } else {
-                (trimmed_id, req.allow_l3_restart)
+                (
+                    trimmed_id,
+                    req.allow_l3_restart,
+                    req.apply_staged_update,
+                    req.silent_relaunch,
+                )
             }
         }
-        None => (String::new(), false),
+        None => (String::new(), false, false, false),
     };
 
     let persist_ack = |ack: &ConfigReloadAck| {
@@ -4490,6 +4495,12 @@ pub async fn apply_disk_config_hot_reload_internal(
         };
         persist_ack(&ack);
         return Ok(ack);
+    }
+
+    if apply_staged_update {
+        drop(cfg_guard);
+        return handle_cross_process_portable_self_update(app, state, req_id, silent_relaunch)
+            .await;
     }
 
     let mut next_cfg = match config::load_or_default(&state.paths) {
@@ -19944,13 +19955,17 @@ pub async fn clear_skipped_update_version(
     Ok(true)
 }
 
-fn collect_portable_update_relaunch_args(raw_args: &[std::ffi::OsString]) -> Vec<String> {
+fn collect_portable_update_relaunch_args(
+    raw_args: &[std::ffi::OsString],
+    silent_relaunch: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     for raw in raw_args {
         let s = raw.to_string_lossy();
         if matches!(
             s.as_ref(),
             "--silent"
+                | "--silent-relaunch"
                 | "--restarting"
                 | "--post-update-cleanup"
                 | "--apply-staged-update"
@@ -19964,7 +19979,155 @@ fn collect_portable_update_relaunch_args(raw_args: &[std::ffi::OsString]) -> Vec
     }
     out.push("--apply-staged-update".to_string());
     out.push("--restarting".to_string());
+    if silent_relaunch {
+        out.push("--silent-relaunch".to_string());
+    }
     out
+}
+
+/// Cross-process in-place portable update handoff triggered via `catcloud update apply`.
+/// Verifies SHA-256 integrity, portable install kind, and anti-downgrade rules inside the
+/// running process, then stops core and relaunches itself with `--apply-staged-update`
+/// (inheriting elevated token with zero UAC prompt and optional `--silent-relaunch`).
+async fn handle_cross_process_portable_self_update(
+    app: &AppHandle,
+    state: &AppState,
+    req_id: String,
+    silent_relaunch: bool,
+) -> Result<ConfigReloadAck, String> {
+    let persist_ack = |ack: &ConfigReloadAck| {
+        if !ack.req_id.is_empty() {
+            if let Err(err) = write_config_reload_ack(&state.paths.root_data_dir, ack) {
+                tracing::warn!("写入跨进程自热切更新回执失败：{err}");
+            }
+        }
+    };
+    let reject = |msg: String| {
+        let ack = ConfigReloadAck {
+            req_id: req_id.clone(),
+            applied: false,
+            rejected: true,
+            level: Some("portable_self_update_rejected".to_string()),
+            error: Some(msg),
+            completed_at_ms: current_unix_ms(),
+        };
+        persist_ack(&ack);
+        Ok(ack)
+    };
+
+    if !state.paths.is_self_updatable_portable() {
+        return reject("仅便携版支持原地静默自热切升级".to_string());
+    }
+
+    let apply_guard = match ApplyInProgressGuard::acquire(&state.update_apply_in_progress) {
+        Ok(g) => g,
+        Err(err) => return reject(err),
+    };
+
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let include_prerelease = state.snapshot_config().update.include_prerelease;
+    let staging_dir = state.paths.staging_dir.clone();
+
+    let verified = {
+        let _staging_guard = state.update_staging_lock.lock().await;
+        tokio::task::spawn_blocking(
+            move || -> Result<catcloud_core::updater::PendingUpdateMetadata, String> {
+                if !staging_dir.exists() {
+                    return Err("未找到已预下载的便携更新包".to_string());
+                }
+                let pending = catcloud_core::updater::verify_staged_payload_integrity(&staging_dir)
+                    .map_err(|e| format!("便携更新包完整性校验未通过：{e}"))?;
+                if pending.kind != catcloud_core::updater::StagedUpdateKind::PortableZip {
+                    return Err("已暂存更新包不是便携版 ZIP，已拒绝原地热切".to_string());
+                }
+                if !catcloud_core::updater::is_update_available_for_channel(
+                    &pending.target_version,
+                    &current_version,
+                    include_prerelease,
+                )
+                .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "暂存版本 v{} 不高于当前版本 v{}",
+                        pending.target_version, current_version
+                    ));
+                }
+                Ok(pending)
+            },
+        )
+        .await
+        .map_err(|e| format!("更新包校验任务异常中止：{e}"))
+    };
+
+    let pending = match verified {
+        Ok(Ok(p)) => p,
+        Ok(Err(err)) => return reject(err),
+        Err(err) => return reject(err),
+    };
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(err) => return reject(format!("无法获取当前程序路径：{err}")),
+    };
+    let Some(app_root) = exe.parent().map(|p| p.to_path_buf()) else {
+        return reject("无法定位当前程序所在目录".to_string());
+    };
+    let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args = collect_portable_update_relaunch_args(&raw_args, silent_relaunch);
+
+    let app_cleanup = app.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(st) = app_cleanup.try_state::<AppState>() {
+            emergency_cleanup_on_exit(&st);
+            let _ = st.job_guard.terminate_all();
+        }
+    })
+    .await;
+
+    let exe_clone = exe.clone();
+    let app_root_clone = app_root.clone();
+    let spawn_res = tokio::task::spawn_blocking(move || {
+        catcloud_core::process_guard::spawn_detached_self(&exe_clone, &args, &app_root_clone)
+    })
+    .await
+    .map_err(|e| format!("拉起重启更新进程任务异常中止：{e}"))
+    .and_then(|r| r.map_err(|e| format!("拉起重启更新进程失败：{e}")));
+
+    if let Err(err) = spawn_res {
+        state.shutting_down.store(false, Ordering::SeqCst);
+        state.exit_cleanup_done.store(false, Ordering::SeqCst);
+        let latest_status = state.adapter.status().await;
+        state.update_cached_runtime(latest_status);
+        let latest_cfg = state.snapshot_config();
+        emit_runtime_snapshot(app, state);
+        sync_app_side_effects(app, state, &latest_cfg);
+        return reject(format!("{err}；核心已停止，请重试更新或手动重连"));
+    }
+
+    let msg = format!(
+        "收到跨进程自热切指令：已拉起 v{} 便携更新换轨进程（静默：{}），应用即将退出并无缝重启",
+        pending.target_version, silent_relaunch
+    );
+    state.log_app_event("info", "软件更新", &msg);
+
+    let ack = ConfigReloadAck {
+        req_id,
+        applied: true,
+        rejected: false,
+        level: Some("portable_self_update_relaunch".to_string()),
+        error: None,
+        completed_at_ms: current_unix_ms(),
+    };
+    persist_ack(&ack);
+
+    apply_guard.keep_locked();
+    let app_exit = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lifecycle::request_graceful_exit(&app_exit);
+    });
+
+    Ok(ack)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -20076,7 +20239,7 @@ pub async fn apply_staged_update_and_restart(
                 .map(|p| p.to_path_buf())
                 .ok_or_else(|| "无法定位当前程序所在目录".to_string())?;
             let raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-            let args = collect_portable_update_relaunch_args(&raw_args);
+            let args = collect_portable_update_relaunch_args(&raw_args, false);
 
             // Track A (PortableZip, no UAC): synchronously stop core/TUN/WinDivert, clear owned
             // OS proxy, and release child process file locks BEFORE spawning the swapper binary.
@@ -25821,12 +25984,22 @@ mod tests {
             OsString::from("--enable-global-preaccel"),
         ];
         assert_eq!(
-            collect_portable_update_relaunch_args(&raw),
+            collect_portable_update_relaunch_args(&raw, false),
             vec![
                 "--data-dir".to_string(),
                 r"E:\CatCloud\data".to_string(),
                 "--apply-staged-update".to_string(),
                 "--restarting".to_string(),
+            ]
+        );
+        assert_eq!(
+            collect_portable_update_relaunch_args(&raw, true),
+            vec![
+                "--data-dir".to_string(),
+                r"E:\CatCloud\data".to_string(),
+                "--apply-staged-update".to_string(),
+                "--restarting".to_string(),
+                "--silent-relaunch".to_string(),
             ]
         );
     }
