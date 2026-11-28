@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Future post-beta iterations will be tracked here.
 
+## [0.1.5] - 2026-11-28
+
+> **快速选包指引（大多数 Windows 电脑请认准 `x64`，切勿误下 `arm64`）**
+> - **普通 Windows 电脑（Intel / AMD，64 位）**：优先下载 `CatCloud-0.1.5-windows-x64-setup.exe`（安装版）或 `CatCloud-0.1.5-windows-x64-portable.zip`（绿色便携版，解压即用）
+> - **ARM 架构 Windows 笔记本（骁龙等）**：下载 `CatCloud-0.1.5-windows-arm64-setup.exe` 或 `CatCloud-0.1.5-windows-arm64-portable.zip`
+> - **macOS（Apple Silicon M1–M4）**：下载 `CatCloud-0.1.5-macos-aarch64.dmg`；**Intel Mac**：下载 `CatCloud-0.1.5-macos-x64.dmg`
+> - **Linux（x86_64）**：下载 `.AppImage` / `.deb` / `.rpm`；纯终端/软路由环境可下 `catcloud-*` 无头版
+
+### 深度内存瘦身与运行期性能优化
+- **无窗托盘常驻物理内存显著压降**：在进入纯无窗/静默驻留态后先异步压缩 SQLite 内存缓存、再触发操作系统工作集回收（`SetProcessWorkingSetSize`），实测静默常驻工作集由 `9.07 MB` 降至 **`2.35 MB`（-74.1%）**，且 10 秒稳态私有内存零增长。
+- **消除高频后台全表 JSON 反序列化与配置克隆**：新增 `NodeSummary` 轻量 SQL 投影（免读 `raw_json`），覆盖托盘菜单、运行态快照、国内提速判定与每 25 秒后台多选组守护循环；核心 `AppState.config` 升级为 `RwLock<Arc<AppConfig>>` 实现零堆分配读路径；SQLite 启用有界页缓存（1 MiB）、静态 `prepare_cached` 预编译语句与测速历史自动裁剪（每节点最多保留近期 20 条），300 节点批量导入提速约 **2 倍**。
+- **前端包体瘦身与界面渲染防泄漏**：修复 Windows 中文路径构建残留旧产物问题（`ui/dist/assets` 恒定 39 份 / `1.73 MB`），主包缩减至 `231 KiB`、`NodesWorkspacePage` 抽屉与工作台子页全面按需懒加载（`242 kB -> 6.22 kB`）、`previewMock` 彻底与桌面端主包剥离且防止桌面端误加载；壁纸改用共享 `Blob ObjectURL` 与内容指纹去重并在持久化成功后再安全释放，批量测速与日志流改为 100–150 ms 合并提交并在窗口隐藏时暂停轮询、恢复可见立即重同步。
+
+### 全栈模块化架构解耦（零行为回归）
+- **后端 Rust 严格无环分层**：将原巨型单文件 `src-tauri/src/commands.rs`（29,002 行）、`catcloud-cli/src/commands.rs`（14,820 行）、`config_compiler.rs`（10,532 行）、`global_tunnel.rs`（7,592 行）及 `src-tauri/src/lib.rs` 全面拆分为职责清晰的零环子模块与独立 `watchdog.rs` / `telemetry_loop.rs`。
+- **前端 TypeScript / React 零环域化拆分**：将 `appStore.ts`（6,290 行）、`tauri.ts`（5,882 行）与六大核心页面按业务领域拆分为独立组件、Store Actions 与共享解析工具模块（全前端 98 文件严格 0 循环依赖），完整保留并扩充全部 642 条 Rust 单测、39 条前端单测与 671 键四语词条。
+
 ## [0.1.4] - 2026-11-28
 
 > **快速选包指引（大多数 Windows 电脑请认准 `x64`，切勿误下 `arm64`）**
