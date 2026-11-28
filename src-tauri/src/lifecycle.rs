@@ -1,8 +1,9 @@
 use std::path::{Component, Path};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 #[cfg(target_os = "windows")]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use catcloud_core::AppPaths;
@@ -38,6 +39,8 @@ static TOGGLING_CAPSULE: AtomicBool = AtomicBool::new(false);
 static DESTROYING_CAPSULE: AtomicBool = AtomicBool::new(false);
 static LAST_CAPSULE_DESTROY_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_WORKING_SET_TRIM_MS: AtomicU64 = AtomicU64::new(0);
+static MAIN_WAS_HIDDEN_OR_MINIMIZED: AtomicBool = AtomicBool::new(false);
+static WINDOWLESS_RECLAIM_GEN: AtomicU64 = AtomicU64::new(0);
 
 static START_INSTANT: OnceLock<Instant> = OnceLock::new();
 
@@ -396,6 +399,55 @@ fn emit_window_mode_changed<R: Runtime>(app: &AppHandle<R>) {
     let _ = app.emit(EVENT_WINDOW_MODE_CHANGED, snapshot);
 }
 
+fn emit_runtime_snapshot_after_restore<R: Runtime>(app: &AppHandle<R>) {
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // Offload SQLite reads off the OS UI event-loop thread so window restore never stalls
+        // behind a concurrent background prune/write transaction.
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(st) = app_handle.try_state::<crate::commands::AppState>() {
+                crate::commands::emit_runtime_snapshot(&app_handle, &st);
+            }
+        })
+        .await;
+    });
+}
+
+/// Schedule a delayed (2.5 s) secondary OS working-set trim and SQLite memory compaction after
+/// destroying GUI WebView windows so pages released by exiting Chromium/WebView2 child processes
+/// are reclaimed without penalizing users who immediately reopen a window.
+fn schedule_delayed_windowless_memory_reclaim<R: Runtime>(app: &AppHandle<R>) {
+    let generation = WINDOWLESS_RECLAIM_GEN
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        if WINDOWLESS_RECLAIM_GEN.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        if !is_windowless_mode(&app_handle) {
+            return;
+        }
+        if let Some(st) = app_handle.try_state::<crate::commands::AppState>() {
+            let storage = Arc::clone(&st.storage);
+            let _ = tokio::task::spawn_blocking(move || {
+                if let Ok(db) = storage.lock() {
+                    db.compact_memory();
+                }
+            })
+            .await;
+        }
+        if WINDOWLESS_RECLAIM_GEN.load(Ordering::SeqCst) != generation
+            || !is_windowless_mode(&app_handle)
+        {
+            return;
+        }
+        LAST_WORKING_SET_TRIM_MS.store(monotonic_now_ms(), Ordering::SeqCst);
+        let _ = trim_process_working_set();
+    });
+}
+
 #[cfg(target_os = "macos")]
 fn sync_macos_activation_policy<R: Runtime>(app: &AppHandle<R>) {
     let policy = if is_main_window_visible(app) {
@@ -446,8 +498,10 @@ pub fn show_or_rebuild_main_window<R: Runtime>(app: &AppHandle<R>) {
                 let _ = win.show();
                 let _ = win.unminimize();
                 let _ = win.set_focus();
+                MAIN_WAS_HIDDEN_OR_MINIMIZED.store(false, Ordering::SeqCst);
                 sync_macos_activation_policy(&app_handle);
                 emit_window_mode_changed(&app_handle);
+                emit_runtime_snapshot_after_restore(&app_handle);
                 return;
             }
         }
@@ -470,8 +524,10 @@ pub fn show_or_rebuild_main_window<R: Runtime>(app: &AppHandle<R>) {
             let _ = win.show();
             let _ = win.unminimize();
             let _ = win.set_focus();
+            MAIN_WAS_HIDDEN_OR_MINIMIZED.store(false, Ordering::SeqCst);
             sync_macos_activation_policy(&app_handle);
             emit_window_mode_changed(&app_handle);
+            emit_runtime_snapshot_after_restore(&app_handle);
             return;
         }
 
@@ -587,6 +643,7 @@ pub fn hide_or_enter_windowless_main_window<R: Runtime>(app: &AppHandle<R>) {
         if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
             let _ = win.hide();
         }
+        MAIN_WAS_HIDDEN_OR_MINIMIZED.store(true, Ordering::SeqCst);
         sync_macos_activation_policy(app);
         emit_window_mode_changed(app);
         trim_process_working_set_throttled();
@@ -611,9 +668,11 @@ pub fn enter_windowless_mode<R: Runtime>(app: &AppHandle<R>) {
             schedule_destroy_flag_clear(app, MAIN_WINDOW_LABEL, &DESTROYING_MAIN);
         }
     }
+    MAIN_WAS_HIDDEN_OR_MINIMIZED.store(false, Ordering::SeqCst);
     sync_macos_activation_policy(app);
     emit_window_mode_changed(app);
     trim_process_working_set_throttled();
+    schedule_delayed_windowless_memory_reclaim(app);
 }
 
 /// Destroy both main and capsule WebView windows to reach the minimal pure windowless footprint.
@@ -636,6 +695,9 @@ pub fn destroy_capsule_window<R: Runtime>(app: &AppHandle<R>) {
     }
     sync_macos_activation_policy(app);
     emit_window_mode_changed(app);
+    if is_windowless_mode(app) {
+        schedule_delayed_windowless_memory_reclaim(app);
+    }
 }
 
 /// Ensure the floating capsule window restores its default expanded size and min/max bounds
@@ -820,6 +882,7 @@ pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
                 restore_capsule_default_bounds(&app_handle, &win);
                 let _ = win.show();
                 let _ = win.set_focus();
+                emit_runtime_snapshot_after_restore(&app_handle);
                 return;
             }
         }
@@ -840,6 +903,7 @@ pub fn show_capsule_window<R: Runtime>(app: &AppHandle<R>) {
             install_capsule_win32_guard(&win);
             restore_capsule_default_bounds(&app_handle, &win);
             let _ = win.show();
+            emit_runtime_snapshot_after_restore(&app_handle);
             return;
         }
 
@@ -889,6 +953,9 @@ pub fn toggle_capsule_window<R: Runtime>(app: &AppHandle<R>) {
             }
             sync_macos_activation_policy(&app_handle);
             emit_window_mode_changed(&app_handle);
+            if is_windowless_mode(&app_handle) {
+                schedule_delayed_windowless_memory_reclaim(&app_handle);
+            }
             return;
         }
 
@@ -940,6 +1007,7 @@ pub fn handle_window_event<R: Runtime>(
                 let app = window.app_handle().clone();
                 if has_active_background_tasks(&app) {
                     let _ = window.hide();
+                    MAIN_WAS_HIDDEN_OR_MINIMIZED.store(true, Ordering::SeqCst);
                     sync_macos_activation_policy(&app);
                     emit_window_mode_changed(&app);
                 } else {
@@ -961,24 +1029,43 @@ pub fn handle_window_event<R: Runtime>(
             _ => {}
         },
         WindowEvent::Resized(size) => {
-            if window.label() == MAIN_WINDOW_LABEL
-                && ((size.width == 0 && size.height == 0)
-                    || window.is_minimized().unwrap_or(false))
-            {
-                trim_process_working_set_throttled();
+            if window.label() == MAIN_WINDOW_LABEL {
+                if (size.width == 0 && size.height == 0)
+                    || window.is_minimized().unwrap_or(false)
+                {
+                    MAIN_WAS_HIDDEN_OR_MINIMIZED.store(true, Ordering::SeqCst);
+                    trim_process_working_set_throttled();
+                } else if size.width > 0
+                    && size.height > 0
+                    && window.is_visible().unwrap_or(false)
+                    && !window.is_minimized().unwrap_or(false)
+                    && MAIN_WAS_HIDDEN_OR_MINIMIZED.swap(false, Ordering::SeqCst)
+                {
+                    emit_runtime_snapshot_after_restore(window.app_handle());
+                }
             }
         }
-        WindowEvent::Focused(false) => {
-            if window.label() == MAIN_WINDOW_LABEL
-                && (!window.is_visible().unwrap_or(true)
-                    || window.is_minimized().unwrap_or(false))
-            {
-                trim_process_working_set_throttled();
+        WindowEvent::Focused(focused) => {
+            if window.label() == MAIN_WINDOW_LABEL {
+                if !*focused {
+                    if !window.is_visible().unwrap_or(true)
+                        || window.is_minimized().unwrap_or(false)
+                    {
+                        MAIN_WAS_HIDDEN_OR_MINIMIZED.store(true, Ordering::SeqCst);
+                        trim_process_working_set_throttled();
+                    }
+                } else if window.is_visible().unwrap_or(false)
+                    && !window.is_minimized().unwrap_or(false)
+                    && MAIN_WAS_HIDDEN_OR_MINIMIZED.swap(false, Ordering::SeqCst)
+                {
+                    emit_runtime_snapshot_after_restore(window.app_handle());
+                }
             }
         }
         WindowEvent::Destroyed => match window.label() {
             MAIN_WINDOW_LABEL => {
                 DESTROYING_MAIN.store(false, Ordering::SeqCst);
+                MAIN_WAS_HIDDEN_OR_MINIMIZED.store(false, Ordering::SeqCst);
                 let app = window.app_handle();
                 sync_macos_activation_policy(app);
                 emit_window_mode_changed(app);

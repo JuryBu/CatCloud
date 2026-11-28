@@ -34,7 +34,17 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { type FormEvent, memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  Suspense,
+  lazy,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import {
   type ExitIpInfo,
@@ -48,7 +58,6 @@ import {
   formatErrorMessage,
 } from "../api/tauri";
 import { type MascotState, MascotSprite } from "../components/MascotSprite";
-import { ShareBundleModal } from "../components/ShareBundleModal";
 import { TrafficSparkline, formatBytes, formatRate } from "../components/TrafficSparkline";
 import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import {
@@ -75,11 +84,16 @@ import {
 import { resolvePlatformOs } from "../utils/platform";
 import { resolvePreAccelSummary } from "../utils/preaccelStatus";
 import { getRegionLabel, resolveNodeRegionCode } from "../utils/regions";
+import { getLatencyColor } from "../utils/releaseUrl";
 import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 import {
   TITLE_BAR_SAFE_TOP_PX,
   isAnchorVisibleInScrollHierarchy,
 } from "../utils/viewportVisibility";
+
+const ShareBundleModal = lazy(() =>
+  import("../components/ShareBundleModal").then((m) => ({ default: m.ShareBundleModal }))
+);
 
 interface QuickNodeMenuPosition {
   left: number;
@@ -212,14 +226,6 @@ function hasRealExitIp(info: ExitIpInfo): boolean {
     Boolean(info.ip_raw?.trim()) ||
     (info.ip_masked.trim().length > 0 && !info.ip_masked.includes("--"))
   );
-}
-
-function getLatencyColor(latencyMs: number | null, ok: boolean | null): string {
-  if (ok === false) return "var(--red)";
-  if (latencyMs === null) return "var(--muted)";
-  if (latencyMs <= 140) return "var(--green)";
-  if (latencyMs <= 300) return "var(--amber)";
-  return "var(--red)";
 }
 
 const HomeLiveKpiGrid = memo(function HomeLiveKpiGrid({
@@ -3338,13 +3344,17 @@ export function HomePage() {
           document.body
         )}
 
-      <ShareBundleModal
-        open={syncModalOpen}
-        mode="import"
-        initialTransport="listen_qr"
-        allowModeSwitch
-        onClose={() => setSyncModalOpen(false)}
-      />
+      {syncModalOpen && (
+        <Suspense fallback={null}>
+          <ShareBundleModal
+            open={syncModalOpen}
+            mode="import"
+            initialTransport="listen_qr"
+            allowModeSwitch
+            onClose={() => setSyncModalOpen(false)}
+          />
+        </Suspense>
+      )}
     </div>
   );
 }

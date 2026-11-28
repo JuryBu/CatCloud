@@ -18,7 +18,7 @@ import {
   Zap,
   type LucideIcon,
 } from "lucide-react";
-import { Suspense, lazy, useEffect, useRef, useState } from "react";
+import { Suspense, lazy, useEffect, useMemo, useRef, useState } from "react";
 import { formatI18nTemplate, normalizeUiLanguage, type UiLanguage, useUiDict } from "../i18n";
 import {
   BUILTIN_WALLPAPER_PRESETS,
@@ -34,7 +34,12 @@ import {
 import { MascotSprite } from "./MascotSprite";
 import { TrafficSparkline } from "./TrafficSparkline";
 import { resolvePlatformOs } from "../utils/platform";
-import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
+import {
+  type GlobalPreAccelFields,
+  type PreAccelSummary,
+  type RuntimePreAccelFields,
+  resolvePreAccelSummary,
+} from "../utils/preaccelStatus";
 import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 
 const TunAdminPromptModal = lazy(() =>
@@ -230,8 +235,60 @@ export function Sidebar() {
     s.preAccelRelays.some((r) => r.enabled)
   );
   const resolvedTheme = useAppSelector((s) => s.resolvedTheme);
-  const runtime = useAppSelector((s) => s.runtime);
-  const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
+  // Atomic primitive selectors prevent Sidebar from re-rendering on unrelated runtime ticks.
+  const runtimeStatus = useAppSelector((s) => s.runtime.status);
+  const runtimeOsLabel = useAppSelector((s) => s.runtime.os_label);
+  const runtimeAppVersion = useAppSelector((s) => s.runtime.app_version);
+  const runtimeRunning = useAppSelector((s) => s.runtime.running);
+  const runtimeSystemProxyEnabled = useAppSelector((s) => s.runtime.system_proxy_enabled);
+  const runtimeTunEnabled = useAppSelector((s) => s.runtime.tun_enabled);
+  const runtimeTunNeedsElevation = useAppSelector((s) => s.runtime.tun_needs_elevation);
+  const runtimeTunAdminReady = useAppSelector((s) => s.runtime.tun_admin_ready);
+  const runtimeProxyMode = useAppSelector((s) => s.runtime.proxy_mode);
+  const runtimeCaptivePortalRequired = useAppSelector((s) => s.runtime.captive_portal_required);
+  const runtimeActiveGroupCircuitOpen = useAppSelector(
+    (s) => s.runtime.active_group_circuit_open
+  );
+  const runtimeProbingActive = useAppSelector((s) => s.runtime.probing_active);
+  const runtimeSwitchingActive = useAppSelector((s) => s.runtime.switching_active);
+  const runtimeDnsTlsDiagStatus = useAppSelector(
+    (s) => s.runtime.dns_tls_diagnostics?.status ?? null
+  );
+  const runtimePreaccelActive = useAppSelector((s) => s.runtime.preaccel_active);
+  const runtimePreaccelEnabled = useAppSelector((s) => s.runtime.preaccel_enabled);
+  const runtimePreaccelRelayName = useAppSelector((s) => s.runtime.preaccel_relay_name);
+  const runtimeGlobalPreaccelActive = useAppSelector((s) => s.runtime.global_preaccel_active);
+  const runtimeGlobalPreaccelMode = useAppSelector((s) => s.runtime.global_preaccel_mode);
+  const runtimeGlobalPreaccelSocksPort = useAppSelector(
+    (s) => s.runtime.global_preaccel_socks_port
+  );
+  const runtimePreaccelEffectiveCarrier = useAppSelector(
+    (s) => s.runtime.preaccel_effective_carrier
+  );
+  const runtimeStandaloneSuspendedForTun = useAppSelector(
+    (s) => s.runtime.standalone_tunnel_suspended_for_tun
+  );
+  const runtimeGlobalWinDivertActive = useAppSelector((s) => s.runtime.global_windivert_active);
+  const runtimePreaccelInstallState = useAppSelector((s) => s.runtime.preaccel_install_state);
+  const runtimeGlobalPreaccelVerifyState = useAppSelector(
+    (s) => s.runtime.global_preaccel_verify_state
+  );
+  const runtimeGlobalPreaccelVerifyMs = useAppSelector(
+    (s) => s.runtime.global_preaccel_verify_ms
+  );
+
+  const globalRunning = useAppSelector((s) => s.globalPreAccel.running);
+  const globalMode = useAppSelector((s) => s.globalPreAccel.mode);
+  const globalSocksPort = useAppSelector((s) => s.globalPreAccel.socks_port);
+  const globalWindivertAvailable = useAppSelector((s) => s.globalPreAccel.windivert_available);
+  const globalIsElevated = useAppSelector((s) => s.globalPreAccel.is_elevated);
+  const globalLastError = useAppSelector((s) => s.globalPreAccel.last_error);
+  const globalIsWindivertActive = useAppSelector((s) => s.globalPreAccel.is_windivert_active);
+  const globalInstallState = useAppSelector((s) => s.globalPreAccel.install_state);
+  const globalVerifyState = useAppSelector((s) => s.globalPreAccel.verify_state);
+  const globalVerifyLatencyMs = useAppSelector((s) => s.globalPreAccel.verify_latency_ms);
+  const globalVerifyMessage = useAppSelector((s) => s.globalPreAccel.verify_message);
+
   const isProbeRunning = useAppSelector((s) => s.probeProgress.running);
   const bgPreaccel = useAppSelector((s) => selectHasBackgroundActivity(s).preaccel);
   const bgNodes = useAppSelector((s) => selectHasBackgroundActivity(s).nodes);
@@ -271,12 +328,12 @@ export function Sidebar() {
   };
 
   const hasDnsDiagAlert = Boolean(
-    runtime.dns_tls_diagnostics && runtime.dns_tls_diagnostics.status !== "healthy"
+    runtimeDnsTlsDiagStatus && runtimeDnsTlsDiagStatus !== "healthy"
   );
-  const hasMoreToolsAlert = runtime.status === "error" || hasDnsDiagAlert;
+  const hasMoreToolsAlert = runtimeStatus === "error" || hasDnsDiagAlert;
   const isMoreToolsAlertSevere =
-    runtime.status === "error" ||
-    runtime.dns_tls_diagnostics?.status === "cert_verification_failed";
+    runtimeStatus === "error" ||
+    runtimeDnsTlsDiagStatus === "cert_verification_failed";
 
   const isNextLaunchSilentBadge = Boolean(
     pendingUpdate &&
@@ -298,10 +355,77 @@ export function Sidebar() {
   const [localPetting, setLocalPetting] = useState(false);
   const themeMenuRef = useRef<HTMLDivElement | null>(null);
   const petTimerRef = useRef<number | null>(null);
-  const platformOs = resolvePlatformOs(runtime.os_label);
+  const platformOs = resolvePlatformOs(runtimeOsLabel);
+
+  const runtimePreAccelFields = useMemo<RuntimePreAccelFields>(
+    () => ({
+      running: runtimeRunning,
+      system_proxy_enabled: runtimeSystemProxyEnabled,
+      tun_enabled: runtimeTunEnabled,
+      preaccel_active: runtimePreaccelActive,
+      preaccel_enabled: runtimePreaccelEnabled,
+      preaccel_relay_name: runtimePreaccelRelayName,
+      global_preaccel_active: runtimeGlobalPreaccelActive,
+      global_preaccel_mode: runtimeGlobalPreaccelMode,
+      global_preaccel_socks_port: runtimeGlobalPreaccelSocksPort,
+      preaccel_effective_carrier: runtimePreaccelEffectiveCarrier,
+      standalone_tunnel_suspended_for_tun: runtimeStandaloneSuspendedForTun,
+      global_windivert_active: runtimeGlobalWinDivertActive,
+      preaccel_install_state: runtimePreaccelInstallState,
+      global_preaccel_verify_state: runtimeGlobalPreaccelVerifyState,
+      global_preaccel_verify_ms: runtimeGlobalPreaccelVerifyMs,
+    }),
+    [
+      runtimeRunning,
+      runtimeSystemProxyEnabled,
+      runtimeTunEnabled,
+      runtimePreaccelActive,
+      runtimePreaccelEnabled,
+      runtimePreaccelRelayName,
+      runtimeGlobalPreaccelActive,
+      runtimeGlobalPreaccelMode,
+      runtimeGlobalPreaccelSocksPort,
+      runtimePreaccelEffectiveCarrier,
+      runtimeStandaloneSuspendedForTun,
+      runtimeGlobalWinDivertActive,
+      runtimePreaccelInstallState,
+      runtimeGlobalPreaccelVerifyState,
+      runtimeGlobalPreaccelVerifyMs,
+    ]
+  );
+
+  const globalPreAccelFields = useMemo<GlobalPreAccelFields>(
+    () => ({
+      running: globalRunning,
+      mode: globalMode,
+      socks_port: globalSocksPort,
+      windivert_available: globalWindivertAvailable,
+      is_elevated: globalIsElevated,
+      last_error: globalLastError,
+      is_windivert_active: globalIsWindivertActive,
+      install_state: globalInstallState,
+      verify_state: globalVerifyState,
+      verify_latency_ms: globalVerifyLatencyMs,
+      verify_message: globalVerifyMessage,
+    }),
+    [
+      globalRunning,
+      globalMode,
+      globalSocksPort,
+      globalWindivertAvailable,
+      globalIsElevated,
+      globalLastError,
+      globalIsWindivertActive,
+      globalInstallState,
+      globalVerifyState,
+      globalVerifyLatencyMs,
+      globalVerifyMessage,
+    ]
+  );
+
   const preaccelSummary = resolvePreAccelSummary(
-    runtime,
-    globalPreAccel,
+    runtimePreAccelFields,
+    globalPreAccelFields,
     preAccelEnabledConfig,
     hasEnabledRelay,
     uiLang
@@ -320,14 +444,14 @@ export function Sidebar() {
 
   const effectiveBrandMascotState: MascotState = !mascotEnabled
     ? "idle"
-    : runtime.status === "error" ||
-        runtime.captive_portal_required ||
-        runtime.active_group_circuit_open ||
-        runtime.tun_needs_elevation
+    : runtimeStatus === "error" ||
+        runtimeCaptivePortalRequired ||
+        runtimeActiveGroupCircuitOpen ||
+        runtimeTunNeedsElevation
       ? "approval"
-      : isProbeRunning || runtime.probing_active
+      : isProbeRunning || runtimeProbingActive
         ? "searching"
-        : runtime.switching_active
+        : runtimeSwitchingActive
           ? "thinking"
           : localPetting
             ? preaccelWithRelay
@@ -441,9 +565,9 @@ export function Sidebar() {
   }, [themeMenuOpen]);
 
   const statusColor =
-    runtime.status === "error"
+    runtimeStatus === "error"
       ? "var(--red)"
-      : runtime.status === "warn"
+      : runtimeStatus === "warn"
         ? "var(--amber)"
         : preaccelSummary.proxyActive && preaccelWithRelay && preaccelSummary.tone === "green"
           ? "var(--accent)"
@@ -460,7 +584,7 @@ export function Sidebar() {
                 : "var(--muted)";
 
   const statusLabel = resolveStatusLabel(
-    runtime.status,
+    runtimeStatus,
     preaccelSummary,
     hasEnabledRelay,
     uiLang
@@ -583,7 +707,7 @@ export function Sidebar() {
     const hasRightIndicator =
       (item.id === "nodes" && isProbeRunning) ||
       (item.id === "preaccel" && Boolean(preaccelNavBadge)) ||
-      (item.id === "overview" && runtime.captive_portal_required) ||
+      (item.id === "overview" && runtimeCaptivePortalRequired) ||
       showBgDot ||
       showDirtyDot;
 
@@ -676,7 +800,7 @@ export function Sidebar() {
                 {preaccelNavBadge.label}
               </span>
             )}
-            {item.id === "overview" && runtime.captive_portal_required && (
+            {item.id === "overview" && runtimeCaptivePortalRequired && (
               <span
                 className="h-2 w-2 rounded-full bg-[var(--red)]"
                 title="校园网待认证"
@@ -738,7 +862,7 @@ export function Sidebar() {
               {dict.common.appName}
             </div>
             <div className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--muted)]">
-              <span className="cc-mono truncate">v{runtime.app_version}</span>
+              <span className="cc-mono truncate">v{runtimeAppVersion}</span>
               {pendingUpdate && (
                 <button
                   type="button"
@@ -1047,7 +1171,7 @@ export function Sidebar() {
               type="button"
               onClick={() => void appActions.toggleSystemProxy()}
               className={`flex min-w-0 items-center justify-between gap-0.5 rounded-xl border px-1.5 py-1.5 text-[10px] font-medium transition-colors min-[1160px]:gap-1 min-[1160px]:px-2 min-[1160px]:text-[10.5px] ${
-                runtime.system_proxy_enabled
+                runtimeSystemProxyEnabled
                   ? "border-[var(--green)]/45 bg-[var(--green-soft)] text-[var(--green)]"
                   : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
@@ -1059,7 +1183,7 @@ export function Sidebar() {
               </span>
               <span
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                  runtime.system_proxy_enabled ? "bg-[var(--green)]" : "bg-[var(--muted)]/50"
+                  runtimeSystemProxyEnabled ? "bg-[var(--green)]" : "bg-[var(--muted)]/50"
                 }`}
               />
             </button>
@@ -1067,21 +1191,21 @@ export function Sidebar() {
             <button
               type="button"
               onClick={() =>
-                runtime.tun_needs_elevation
+                runtimeTunNeedsElevation
                   ? appActions.openTunAdminPrompt(null)
                   : void appActions.toggleTun()
               }
               className={`flex min-w-0 items-center justify-between gap-0.5 rounded-xl border px-1.5 py-1.5 text-[10px] font-medium transition-colors min-[1160px]:gap-1 min-[1160px]:px-2 min-[1160px]:text-[10.5px] ${
-                runtime.tun_enabled
+                runtimeTunEnabled
                   ? "border-[var(--accent)]/55 bg-[var(--accent-soft)] text-[var(--accent)]"
-                  : runtime.tun_needs_elevation
+                  : runtimeTunNeedsElevation
                     ? "border-[var(--amber)]/65 bg-[var(--amber-soft)] text-[var(--amber)] hover:border-[var(--amber)]"
                     : "border-[var(--line)] bg-[var(--card)] text-[var(--muted)] hover:text-[var(--text)]"
               }`}
               title={
-                runtime.tun_needs_elevation
+                runtimeTunNeedsElevation
                   ? "配置已开启虚拟网卡但当前权限不足，点击一键以管理员重启生效"
-                  : runtime.tun_admin_ready
+                  : runtimeTunAdminReady
                     ? dict.home.tunMode
                     : tunButtonHint
               }
@@ -1089,14 +1213,14 @@ export function Sidebar() {
               <span className="inline-flex min-w-0 flex-1 items-center gap-0.5 min-[1160px]:gap-1">
                 <ShieldCheck className="h-3 w-3 shrink-0" />
                 <span className="truncate">
-                  {runtime.tun_needs_elevation ? dict.home.tunNeedsAdminShort : dict.home.tunMode}
+                  {runtimeTunNeedsElevation ? dict.home.tunNeedsAdminShort : dict.home.tunMode}
                 </span>
               </span>
               <span
                 className={`h-1.5 w-1.5 shrink-0 rounded-full ${
-                  runtime.tun_enabled
+                  runtimeTunEnabled
                     ? "bg-[var(--accent)]"
-                    : runtime.tun_needs_elevation
+                    : runtimeTunNeedsElevation
                       ? "bg-[var(--amber)]"
                       : "bg-[var(--muted)]/50"
                 }`}
@@ -1112,7 +1236,7 @@ export function Sidebar() {
               aria-label="快捷切换代理模式"
             >
               {proxyModeOptions.map((m) => {
-                const selected = runtime.proxy_mode === m.id;
+                const selected = runtimeProxyMode === m.id;
                 return (
                   <button
                     key={m.id}

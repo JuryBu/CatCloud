@@ -22,6 +22,7 @@ import { catcloudApi, formatErrorMessage } from "../api/tauri";
 import { normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, useAppSelector } from "../store/appStore";
 import { resolvePlatformOs } from "../utils/platform";
+import { buildReleasesFallbackUrl } from "../utils/releaseUrl";
 
 function formatPackageSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "";
@@ -30,15 +31,10 @@ function formatPackageSize(bytes: number): string {
   return `${Math.round(bytes)} B`;
 }
 
-function buildReleasesFallbackUrl(repo: string | null | undefined): string {
-  const cleaned = (repo ?? "").trim().replace(/^\/+|\/+$/g, "");
-  return `https://github.com/${cleaned || "JuryBu/CatCloud"}/releases`;
-}
-
 export function UpdateReadyModal() {
   const pendingUpdate = useAppSelector((s) => s.pendingUpdate);
   const updateModalVisible = useAppSelector((s) => s.updateModalVisible);
-  const runtime = useAppSelector((s) => s.runtime);
+  const runtimeOsLabel = useAppSelector((s) => s.runtime.os_label);
   const updateRepo = useAppSelector((s) => s.config.update.repo);
   const uiLang = normalizeUiLanguage(
     useAppSelector((s) => s.config.personalization.ui_language)
@@ -88,7 +84,7 @@ export function UpdateReadyModal() {
   }
 
   const platformOs = resolvePlatformOs(
-    pendingUpdate.platform_key || runtime.os_label
+    pendingUpdate.platform_key || runtimeOsLabel
   );
   const sizeLabel = formatPackageSize(pendingUpdate.package_size_bytes);
   const shaShort = pendingUpdate.archive_sha256

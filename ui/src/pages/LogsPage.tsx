@@ -15,10 +15,11 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { catcloudApi, isTauriEnv } from "../api/tauri";
 import { normalizeUiLanguage, useUiDict } from "../i18n";
 import { appActions, useAppSelector } from "../store/appStore";
+import { copyText } from "../utils/clipboard";
 import { isBoolPref, usePersistedState } from "../utils/uiPrefs";
 
 export type LogLevel = "debug" | "info" | "warning" | "error";
@@ -39,6 +40,7 @@ interface LogBufferState {
 const MAX_LOG_LINES = 2000;
 const DEFAULT_RENDER_LIMIT = 300;
 const RENDER_STEP = 300;
+const FOREGROUND_BATCH_FLUSH_MS = 150;
 
 const LEVEL_META: Record<
   LogLevel,
@@ -499,9 +501,36 @@ const STREAM_SAMPLES: Array<{ level: LogLevel; module: string; message: string }
   },
 ];
 
+const LogEntryRow = memo(function LogEntryRow({ item }: { item: CoreLogEntry }) {
+  const meta = LEVEL_META[item.level];
+  return (
+    <div className="flex items-start gap-2 rounded-lg px-2 py-1 hover:bg-[var(--card-hover)]">
+      <span className="shrink-0 text-[var(--muted)]">{item.time}</span>
+      <span
+        className="inline-block w-[46px] shrink-0 rounded px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none"
+        style={{
+          color: meta.color,
+          backgroundColor: meta.softBg,
+        }}
+      >
+        {meta.label}
+      </span>
+      <span
+        title={item.module}
+        className="max-w-[116px] shrink-0 truncate text-[var(--accent)]"
+      >
+        {item.module}
+      </span>
+      <span className="min-w-0 flex-1 break-all text-[var(--text-secondary)]">
+        {item.message}
+      </span>
+    </div>
+  );
+});
+
 export function LogsPage() {
   const inTauri = isTauriEnv();
-  const runtime = useAppSelector((s) => s.runtime);
+  const runtimeRunning = useAppSelector((s) => s.runtime.running);
   const uiLang = normalizeUiLanguage(
     useAppSelector((s) => s.config.personalization.ui_language)
   );
@@ -534,6 +563,8 @@ export function LogsPage() {
   const pausedRef = useRef<boolean>(paused);
   const entriesRef = useRef<CoreLogEntry[]>(logState.entries);
   const pendingBufferRef = useRef<CoreLogEntry[]>([]);
+  const liveBatchQueueRef = useRef<RawLogPayload[]>([]);
+  const liveBatchTimerRef = useRef<number | null>(null);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const copiedTimerRef = useRef<number | null>(null);
   const copiedAiTimerRef = useRef<number | null>(null);
@@ -646,12 +677,49 @@ export function LogsPage() {
           };
         });
 
+      const clearLiveBatchTimer = () => {
+        if (liveBatchTimerRef.current !== null) {
+          window.clearTimeout(liveBatchTimerRef.current);
+          liveBatchTimerRef.current = null;
+        }
+      };
+
+      const flushLiveBatch = () => {
+        clearLiveBatchTimer();
+        if (disposed || liveBatchQueueRef.current.length === 0) {
+          liveBatchQueueRef.current = [];
+          return;
+        }
+        if (typeof document !== "undefined" && document.hidden) {
+          liveBatchQueueRef.current = [];
+          return;
+        }
+        const batch = liveBatchQueueRef.current;
+        liveBatchQueueRef.current = [];
+        enqueueEntries(batch);
+      };
+
+      const enqueueLiveBatched = (item: RawLogPayload) => {
+        liveBatchQueueRef.current.push(item);
+        if (liveBatchQueueRef.current.length > MAX_LOG_LINES) {
+          liveBatchQueueRef.current = liveBatchQueueRef.current.slice(-MAX_LOG_LINES);
+        }
+        if (liveBatchTimerRef.current === null) {
+          liveBatchTimerRef.current = window.setTimeout(
+            flushLiveBatch,
+            FOREGROUND_BATCH_FLUSH_MS
+          );
+        }
+      };
+
       const backfillOnResume = async () => {
         if (disposed || !historyLoaded) return;
         if (backfilling) {
           backfillQueuedAgain = true;
           return;
         }
+        clearLiveBatchTimer();
+        liveBatchQueueRef.current = [];
         backfilling = true;
         backfillEarlyQueue = [];
         try {
@@ -699,6 +767,11 @@ export function LogsPage() {
       };
 
       const handleVisibilityChange = () => {
+        if (document.hidden) {
+          clearLiveBatchTimer();
+          liveBatchQueueRef.current = [];
+          return;
+        }
         if (document.visibilityState === "visible") {
           void backfillOnResume();
         }
@@ -722,6 +795,9 @@ export function LogsPage() {
             timestamp?: string;
           }>("catcloud://core-log", (ev) => {
             if (disposed) return;
+            // Skip live log ingestion & rendering completely while window is hidden;
+            // returning to visible automatically restores recent 500 lines via backfillOnResume.
+            if (typeof document !== "undefined" && document.hidden) return;
             const message = ev.payload.message ?? ev.payload.payload ?? "";
             const item: RawLogPayload = {
               time: ev.payload.time ?? formatLogTimestamp(ev.payload.timestamp),
@@ -743,7 +819,7 @@ export function LogsPage() {
               }
               return;
             }
-            enqueueEntries([item]);
+            enqueueLiveBatched(item);
           });
 
           if (disposed) {
@@ -779,6 +855,11 @@ export function LogsPage() {
 
     return () => {
       disposed = true;
+      if (liveBatchTimerRef.current !== null) {
+        window.clearTimeout(liveBatchTimerRef.current);
+        liveBatchTimerRef.current = null;
+      }
+      liveBatchQueueRef.current = [];
       removeVisibilityListener?.();
       unlisten?.();
       if (mockTimer !== null) {
@@ -846,6 +927,11 @@ export function LogsPage() {
   };
 
   const handleClear = () => {
+    if (liveBatchTimerRef.current !== null) {
+      window.clearTimeout(liveBatchTimerRef.current);
+      liveBatchTimerRef.current = null;
+    }
+    liveBatchQueueRef.current = [];
     pendingBufferRef.current = [];
     setBufferedWhilePaused(0);
     setLogState({ entries: [], truncatedCount: 0 });
@@ -904,8 +990,8 @@ export function LogsPage() {
 
   const handleCopySanitized = async () => {
     const text = formatSanitizedLogText();
-    try {
-      await navigator.clipboard.writeText(text);
+    const ok = await copyText(text);
+    if (ok) {
       setCopied(true);
       appActions.showToast(`已复制 ${filteredEntries.length} 条日志（隐私已自动打码）`, "ok");
       if (copiedTimerRef.current !== null) {
@@ -915,7 +1001,7 @@ export function LogsPage() {
         copiedTimerRef.current = null;
         setCopied(false);
       }, 1800);
-    } catch {
+    } else {
       appActions.showToast("无法写入剪贴板，请改用「导出」保存为日志文件", "warn");
     }
   };
@@ -971,7 +1057,7 @@ export function LogsPage() {
                 <span className="rounded-full bg-[var(--amber-soft)] px-2 py-0.5 text-[11px] font-medium text-[var(--amber)]">
                   已暂停{bufferedWhilePaused > 0 ? `（新增 +${bufferedWhilePaused} 条）` : ""}
                 </span>
-              ) : !runtime.running ? (
+              ) : !runtimeRunning ? (
                 <span className="inline-flex items-center gap-1.5 rounded-full border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-0.5 text-[11px] font-medium text-[var(--muted)]">
                   <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--muted)] opacity-60" />
                   代理核心未启动（开启代理后自动接收日志）
@@ -1178,7 +1264,7 @@ export function LogsPage() {
               </button>
             )}
             <span className="text-[10px]">
-              {!runtime.running
+              {!runtimeRunning
                 ? "等待核心启动"
                 : autoScroll && !paused
                   ? "自动跟随最新"
@@ -1196,7 +1282,7 @@ export function LogsPage() {
             <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-[var(--muted)]">
               <ScrollText className="h-6 w-6 opacity-50" />
               <span>
-                {entries.length === 0 && !runtime.running
+                {entries.length === 0 && !runtimeRunning
                   ? "代理核心未启动，开启代理后将自动接收实时运行日志"
                   : "暂无符合条件的运行日志"}
               </span>
@@ -1224,35 +1310,9 @@ export function LogsPage() {
                   </div>
                 </div>
               )}
-              {visibleEntries.map((item) => {
-                const meta = LEVEL_META[item.level];
-                return (
-                  <div
-                    key={item.id}
-                    className="flex items-start gap-2 rounded-lg px-2 py-1 hover:bg-[var(--card-hover)]"
-                  >
-                    <span className="shrink-0 text-[var(--muted)]">{item.time}</span>
-                    <span
-                      className="inline-block w-[46px] shrink-0 rounded px-1.5 py-0.5 text-center text-[10px] font-semibold leading-none"
-                      style={{
-                        color: meta.color,
-                        backgroundColor: meta.softBg,
-                      }}
-                    >
-                      {meta.label}
-                    </span>
-                    <span
-                      title={item.module}
-                      className="max-w-[116px] shrink-0 truncate text-[var(--accent)]"
-                    >
-                      {item.module}
-                    </span>
-                    <span className="min-w-0 flex-1 break-all text-[var(--text-secondary)]">
-                      {item.message}
-                    </span>
-                  </div>
-                );
-              })}
+              {visibleEntries.map((item) => (
+                <LogEntryRow key={item.id} item={item} />
+              ))}
             </div>
           )}
         </div>

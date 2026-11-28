@@ -640,4 +640,155 @@ export const en: DeepStringDict<TranslationDict> = {
     nextLaunchBadgeTip:
       "A verified update is ready in the background and will prompt on next launch",
   },
+  preaccelStatus: {
+    msSuffix: " ({ms} ms)",
+    localSocksRelayPart: " (relay: {relay})",
+    offBadge: "Off",
+    offDetail: "Domestic boost is off for both CatCloud proxy and other proxy apps.",
+    addRelayBadge: "Add Boost Relay",
+    addRelayDetail:
+      "Domestic Boost is inactive: please add or import at least one enabled domestic boost relay first.",
+    activeBadge: "Domestic Boost Active",
+    boostingOtherBadge: "Boosting Other Apps",
+    probingShort: "Probing…",
+    probingBadge: "Probing Link…",
+    degradedShort: "Other Apps Fallback",
+    degradedBadge: "Protected Fallback",
+    preparingBadge: "Preparing Boost…",
+    needAdminBadge: "Admin Required",
+    localReadyBadge: "Local Boost Ready",
+    standbyBadge: "Boost Standby",
+    tunDetailWithRelay:
+      "Main core TUN is boosting via \"{relay}\"{msPart}; standalone :443 tunnel auto-paused to avoid conflict.",
+    tunDetailNoRelay:
+      "Main core TUN boost active{msPart}; standalone :443 tunnel auto-paused to avoid conflict.",
+    proxyDualProbingDetailWithRelay:
+      "Main core boosted via \"{relay}\" · Probing standalone tunnel for other proxy apps…",
+    proxyDualProbingDetailNoRelay:
+      "Main core boosted · Probing standalone tunnel for other proxy apps…",
+    proxyDualVerifiedDetailWithRelay:
+      "Main core + standalone tunnel verified via \"{relay}\"{msPart}.",
+    proxyDualVerifiedDetailNoRelay: "Main core + standalone tunnel verified{msPart}.",
+    proxyDualActiveDetailWithRelay: "Main core + standalone tunnel boosting via \"{relay}\".",
+    proxyDualActiveDetailNoRelay: "Main core + standalone tunnel boosting active.",
+    proxyProbingOtherDetailWithRelay:
+      "Main core boosted via \"{relay}\" · Probing acceleration path for other apps…",
+    proxyProbingOtherDetailNoRelay:
+      "Main core boosted · Probing acceleration path for other apps…",
+    proxyDegradedFallbackDetail:
+      "Standalone interception failed verification and fell back safely to prevent disconnects; main core boost remains active.",
+    proxyInstallingDetailWithRelay:
+      "Main core boosted via \"{relay}\" · Preparing boost component for other apps in background…",
+    proxyInstallingDetailNoRelay:
+      "Main core boosted · Preparing boost component for other apps in background…",
+    proxyNeedAdminDetailWithRelay:
+      "Main core boosted via \"{relay}\" · Admin privilege needed to auto-boost other proxy apps.",
+    proxyNeedAdminDetailNoRelay:
+      "Main core boosted · Admin privilege needed to auto-boost other proxy apps.",
+    proxyOnlyDetailWithRelay:
+      "Main core proxy is boosting upload and connectivity via \"{relay}\".",
+    proxyOnlyDetailNoRelay: "Main core proxy is boosting via domestic relay.",
+    standaloneProbingDetailWithRelay:
+      "Standalone boost started via \"{relay}\"; verifying connectivity for your current proxy app…",
+    standaloneProbingDetailNoRelay:
+      "Standalone boost started; verifying connectivity for your current proxy app…",
+    standaloneVerifiedDetailWithRelay:
+      "Standalone tunnel verified via \"{relay}\"{msPart}, automatically boosting your other proxy apps.",
+    standaloneVerifiedDetailNoRelay:
+      "Standalone tunnel verified{msPart}, automatically boosting your other proxy apps.",
+    standaloneActiveDetailWithRelay:
+      "Standalone tunnel is boosting your other proxy apps via \"{relay}\".",
+    standaloneActiveDetailNoRelay: "Standalone tunnel is boosting your other proxy apps.",
+    verifyingDriverDetail:
+      "Verifying official boost component integrity; will activate automatically…",
+    downloadingDriverDetail:
+      "Downloading official boost component in background; will activate automatically…",
+    needAdminDetailWithPort:
+      "Boost component is ready. Click \"Enable as Admin\" to auto-boost other proxy apps (or use local 127.0.0.1:{port} as upstream proxy).",
+    needAdminDetailNoPort:
+      "Boost component is ready. Click \"Enable as Admin\" to auto-boost your current proxy app.",
+    probingLinkDetailWithRelay: "Verifying standalone boost link via \"{relay}\"…",
+    probingLinkDetailNoRelay: "Verifying standalone boost link…",
+    degradedStandaloneDetailWithPort:
+      "Standalone interception fell back safely to avoid disconnects (local 127.0.0.1:{port} remains ready).",
+    degradedStandaloneDetailNoPort:
+      "Standalone interception fell back safely to avoid disconnects.",
+    installFailedDetailWithPort:
+      "Boost component setup incomplete ({err}); local entry 127.0.0.1:{port} remains available.",
+    installFailedDetailNoPort:
+      "Boost component setup incomplete ({err}); main core proxy boost still works when enabled.",
+    verifyFailedDetailWithPort:
+      "Link verification failed; local entry 127.0.0.1:{port} is standing by.",
+    verifyFailedDetailNoPort: "Link verification failed; boost is standing by.",
+    localSocksDetailWithPort:
+      "Local SOCKS5 boost entry 127.0.0.1:{port} is ready{relayPart}. Set it as your proxy app's upstream, or enable as Admin for auto-boost.",
+    localSocksDetailNoPort:
+      "Local boost entry is ready{relayPart}. Start proxy or enable as Admin to activate automatically.",
+    standbyDetailWithRelay:
+      "Domestic Boost enabled (relay: {relay}); start proxy or enable as Admin to activate.",
+    standbyDetailNoRelay:
+      "Domestic Boost enabled; start proxy or enable as Admin to activate.",
+    offPlain: "Domestic Boost is off.",
+    addRelayPlain: "Add and enable at least one domestic boost relay first.",
+    tunPlainWithRelay: "Boosting your uploads and browsing via \"{relay}\"{msPart}.",
+    tunPlainNoRelay: "Boosting your uploads and browsing{msPart}.",
+    proxyDualProbingPlainWithRelay:
+      "Boosting via \"{relay}\" while checking acceleration for other proxy apps…",
+    proxyDualProbingPlainNoRelay:
+      "Boosting while checking acceleration for other proxy apps…",
+    proxyDualVerifiedPlainWithRelay:
+      "Boosting CatCloud and your other proxy apps via \"{relay}\"{msPart}.",
+    proxyDualVerifiedPlainNoRelay:
+      "Boosting CatCloud and your other proxy apps{msPart}.",
+    proxyDualActivePlainWithRelay:
+      "Boosting CatCloud and your other proxy apps via \"{relay}\".",
+    proxyDualActivePlainNoRelay: "Boosting CatCloud and your other proxy apps.",
+    proxyDegradedPlainWithRelay:
+      "Boosting CatCloud via \"{relay}\" (other proxy apps safely paused to avoid disconnects).",
+    proxyDegradedPlainNoRelay:
+      "Boosting CatCloud (other proxy apps safely paused to avoid disconnects).",
+    proxyInstallingPlainWithRelay:
+      "Boosting via \"{relay}\" while preparing acceleration for other proxy apps…",
+    proxyInstallingPlainNoRelay:
+      "Boosting while preparing acceleration for other proxy apps…",
+    proxyNeedAdminPlainWithRelay:
+      "Boosting CatCloud via \"{relay}\". Click the button on the right to restart as admin and auto-boost other proxy apps.",
+    proxyNeedAdminPlainNoRelay:
+      "Boosting CatCloud. Click the button on the right to restart as admin and auto-boost other proxy apps.",
+    proxyOnlyPlainWithRelay: "Boosting your uploads and browsing via \"{relay}\".",
+    proxyOnlyPlainNoRelay: "Boosting your uploads and browsing.",
+    standaloneProbingPlainWithRelay:
+      "Enabled via \"{relay}\" — checking acceleration for your other proxy apps…",
+    standaloneProbingPlainNoRelay:
+      "Enabled — checking acceleration for your other proxy apps…",
+    standaloneVerifiedPlainWithRelay:
+      "Enabled — automatically boosting your other proxy apps via \"{relay}\"{msPart}.",
+    standaloneVerifiedPlainNoRelay:
+      "Enabled — automatically boosting your other proxy apps{msPart}.",
+    standaloneActivePlainWithRelay:
+      "Enabled — automatically boosting your other proxy apps via \"{relay}\".",
+    standaloneActivePlainNoRelay:
+      "Enabled — automatically boosting your other proxy apps.",
+    verifyingDriverPlain: "Verifying boost component — will activate automatically…",
+    downloadingDriverPlain:
+      "Preparing boost component in background — will activate automatically…",
+    needAdminPlain:
+      "Boost component is ready — click the button on the right to restart as admin for auto-boost.",
+    probingLinkPlainWithRelay: "Checking boost connectivity via \"{relay}\"…",
+    probingLinkPlainNoRelay: "Checking boost connectivity…",
+    degradedStandalonePlain:
+      "Auto-check did not pass; auto-boost paused safely to prevent disconnects.",
+    installFailedPlain:
+      "Boost component setup is incomplete — retry on the right or enable CatCloud proxy directly.",
+    verifyFailedPlain:
+      "Boost connectivity check failed — standing by; click right to probe again.",
+    localReadyPlainWithRelay:
+      "Local boost ready ({relay}) — set it as your proxy app's upstream to accelerate.",
+    localReadyPlainNoRelay:
+      "Local boost ready — set it as your proxy app's upstream to accelerate.",
+    standbyPlainWithRelay:
+      "Domestic Boost enabled ({relay}) — start proxy or restart as admin to accelerate.",
+    standbyPlainNoRelay:
+      "Domestic Boost enabled — start proxy or restart as admin to accelerate.",
+  },
 };

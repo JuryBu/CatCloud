@@ -6,7 +6,7 @@
   "packageManager": "pnpm@10.30.3",
   "scripts": {
     "dev": "vite --config ui/vite.config.ts",
-    "build": "tsc -p ui/tsconfig.json --noEmit && vite build --config ui/vite.config.ts",
+    "build": "node -e \"import('node:fs').then(f=>{const r=p=>{if(!f.existsSync(p))return;for(const e of f.readdirSync(p,{withFileTypes:true})){const c=p+'/'+e.name;e.isDirectory()&&!e.isSymbolicLink()?r(c):f.unlinkSync(c);}f.rmdirSync(p);};r('ui/dist');})\" && tsc -p ui/tsconfig.json --noEmit && vite build --config ui/vite.config.ts",
     "preview": "vite preview --config ui/vite.config.ts",
     "tauri": "tauri",
     "check:sanitize": "node scripts/ci/check_public_sanitization.mjs"

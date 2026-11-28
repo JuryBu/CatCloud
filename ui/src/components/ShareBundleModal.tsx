@@ -438,15 +438,32 @@ export function ShareBundleModal({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [open, busy, handleRequestClose]);
 
-  // Countdown ticker only while an active send or receive session is displayed
+  // Countdown ticker only while an active send or receive session is displayed and window is visible
   const hasCountdownSession = sendSession !== null || receiveSession !== null;
   useEffect(() => {
     if (!open || !hasCountdownSession) return;
-    setNowUnixSec(Math.floor(Date.now() / 1000));
-    const tid = window.setInterval(() => {
+    const tickIfVisible = () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        return;
+      }
       setNowUnixSec(Math.floor(Date.now() / 1000));
-    }, 1000);
-    return () => window.clearInterval(tid);
+    };
+    tickIfVisible();
+    const tid = window.setInterval(tickIfVisible, 1000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        setNowUnixSec(Math.floor(Date.now() / 1000));
+      }
+    };
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+    return () => {
+      window.clearInterval(tid);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+    };
   }, [open, hasCountdownSession]);
 
   // Subscribe to Tauri sync events while modal is open

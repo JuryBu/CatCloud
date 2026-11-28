@@ -124,14 +124,98 @@ impl Default for ProxyNode {
     }
 }
 
+/// Lightweight projection of a stored proxy node without deserializing `raw_json` or `tags_json`.
+///
+/// Field types mirror [`ProxyNode`] 1:1 so hot read paths (tray menu, tray visual state, runtime
+/// DTO, pre-acceleration wrappability checks) avoid per-node `serde_json::Value` allocations.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct NodeSummary {
+    pub id: String,
+    pub sub_id: String,
+    pub name: String,
+    pub region_code: String,
+    pub enabled: bool,
+    pub protocol: String,
+    pub server: String,
+    pub port: u16,
+    pub multiplier: f64,
+    pub is_443_native: bool,
+    pub preaccel_eligible: bool,
+    pub preaccel_override: Option<bool>,
+    pub raw_ip_version: Option<String>,
+}
+
+impl Default for NodeSummary {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            sub_id: String::new(),
+            name: String::new(),
+            region_code: "UNK".to_string(),
+            enabled: true,
+            protocol: String::new(),
+            server: String::new(),
+            port: 443,
+            multiplier: 1.0,
+            is_443_native: false,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            raw_ip_version: None,
+        }
+    }
+}
+
+impl NodeSummary {
+    /// Returns true for UDP/QUIC-only proxy transports (matching [`ProxyNode::is_udp_only_transport`]).
+    pub fn is_udp_only_transport(&self) -> bool {
+        is_udp_only_protocol(&self.protocol)
+    }
+
+    /// Resolve whether domestic pre-acceleration should wrap this node (matching
+    /// [`ProxyNode::should_apply_preaccel`]).
+    pub fn should_apply_preaccel(&self, global_skip_443_native: bool) -> bool {
+        if let Some(forced) = self.preaccel_override {
+            return forced;
+        }
+        if !self.preaccel_eligible {
+            return false;
+        }
+        if self.is_udp_only_transport() {
+            return false;
+        }
+        if global_skip_443_native && self.is_443_native {
+            return false;
+        }
+        true
+    }
+
+    /// Returns true when this summary row appears to be a subscription informational banner
+    /// (matching [`is_info_proxy_node`]).
+    pub fn is_info_node(&self) -> bool {
+        is_info_proxy_node_name(&self.name)
+    }
+
+    /// Conservatively classify whether this summary represents an IPv6-only business proxy
+    /// (matching [`is_ipv6_only_node`] without requiring full `raw_config` JSON).
+    pub fn is_ipv6_only(&self) -> bool {
+        is_ipv6_only_node_fields(&self.server, self.raw_ip_version.as_deref())
+            || has_exclusive_ipv6_only_name(&self.name)
+    }
+}
+
+fn is_udp_only_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol.trim().to_ascii_lowercase().as_str(),
+        "hysteria2" | "hy2" | "hysteria" | "tuic" | "wireguard"
+    )
+}
+
 impl ProxyNode {
     /// Returns true for UDP/QUIC-only proxy transports (such as Hysteria2, TUIC, WireGuard)
     /// that must not be wrapped by TCP-only `:443` domestic relays by default.
     pub fn is_udp_only_transport(&self) -> bool {
-        matches!(
-            self.protocol.trim().to_ascii_lowercase().as_str(),
-            "hysteria2" | "hy2" | "hysteria" | "tuic" | "wireguard"
-        )
+        is_udp_only_protocol(&self.protocol)
     }
 
     /// Resolve whether domestic pre-acceleration should wrap this node.
@@ -154,11 +238,8 @@ impl ProxyNode {
     }
 }
 
-/// Return `true` when `node` appears to be a subscription metadata/informational banner row
-/// (e.g. remaining traffic, expiry notice, official website, maintenance alert) rather than a
-/// usable proxy endpoint.
-pub fn is_info_proxy_node(node: &ProxyNode) -> bool {
-    let trimmed = node.name.trim();
+fn is_info_proxy_node_name(name: &str) -> bool {
+    let trimmed = name.trim();
     if trimmed.is_empty() {
         return false;
     }
@@ -211,6 +292,13 @@ pub fn is_info_proxy_node(node: &ProxyNode) -> bool {
     }
 
     false
+}
+
+/// Return `true` when `node` appears to be a subscription metadata/informational banner row
+/// (e.g. remaining traffic, expiry notice, official website, maintenance alert) rather than a
+/// usable proxy endpoint.
+pub fn is_info_proxy_node(node: &ProxyNode) -> bool {
+    is_info_proxy_node_name(&node.name)
 }
 
 /// Pick a sensible default proxy node ID for fresh/fallback selections (avoiding disabled rows,
@@ -337,30 +425,16 @@ pub fn pick_smart_default_node_id(
     best.map(|(_, id)| id.to_string())
 }
 
-/// Conservatively classify whether `node` is an IPv6-only business proxy that would fail when
-/// chained through an IPv4-only domestic relay (strictly avoiding false positives on dual-stack
-/// nodes such as `"HK-01-IPv6"`):
+/// Conservatively classify whether a proxy endpoint is IPv6-only from its `server` and
+/// optional Mihomo `ip-version` directive (without deserializing full `raw_config` JSON):
 ///
-/// 1. `node.server` (or fallback `raw_config["server"]`) parses as `IpAddr::V6`;
-/// 2. `raw_config["ip-version"]` explicitly specifies `"ipv6"` (or `"ipv6-only"`);
+/// 1. `server` parses as `IpAddr::V6` (with or without `[...]` brackets);
+/// 2. `raw_ip_version` explicitly specifies `"ipv6"` or `"ipv6-only"`;
 /// 3. `server` hostname carries a dedicated IPv6 label (`ipv6.` / `v6.` / `-ipv6.` / `-v6.` /
-///    `.ipv6.` / `.v6.`) and does NOT contain `"dual"` or `"v4"`;
-/// 4. `node.name` contains an exclusive IPv6-only marker (`ipv6-only` / `ipv6 only` / `v6-only` /
-///    `纯ipv6` / `仅ipv6`, etc.).
-pub fn is_ipv6_only_node(node: &ProxyNode) -> bool {
-    let raw_server = {
-        let s = node.server.trim();
-        if !s.is_empty() {
-            s
-        } else {
-            node.raw_config
-                .get("server")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .unwrap_or("")
-        }
-    };
-    let clean_server = raw_server
+///    `.ipv6.` / `.v6.`) and does NOT contain `"dual"` or `"v4"`.
+pub fn is_ipv6_only_node_fields(server: &str, raw_ip_version: Option<&str>) -> bool {
+    let clean_server = server
+        .trim()
         .trim_start_matches('[')
         .trim_end_matches(']')
         .trim_end_matches('.');
@@ -370,12 +444,8 @@ pub fn is_ipv6_only_node(node: &ProxyNode) -> bool {
         return true;
     }
 
-    // 2. Explicit Mihomo `ip-version: ipv6` directive in raw_config.
-    if let Some(ip_ver) = node
-        .raw_config
-        .get("ip-version")
-        .and_then(serde_json::Value::as_str)
-    {
+    // 2. Explicit Mihomo `ip-version: ipv6` directive.
+    if let Some(ip_ver) = raw_ip_version {
         let normalized_ver = ip_ver.trim().to_ascii_lowercase();
         if matches!(normalized_ver.as_str(), "ipv6" | "ipv6-only") {
             return true;
@@ -384,7 +454,7 @@ pub fn is_ipv6_only_node(node: &ProxyNode) -> bool {
 
     // 3. Dedicated IPv6-only DNS label in server hostname (excluding dual-stack / v4 markers).
     let server_lower = clean_server.to_ascii_lowercase();
-    if !server_lower.is_empty()
+    !server_lower.is_empty()
         && !server_lower.contains("dual")
         && !server_lower.contains("v4")
         && (server_lower.starts_with("ipv6.")
@@ -393,12 +463,10 @@ pub fn is_ipv6_only_node(node: &ProxyNode) -> bool {
             || server_lower.contains(".v6.")
             || server_lower.contains("-ipv6.")
             || server_lower.contains("-v6."))
-    {
-        return true;
-    }
+}
 
-    // 4. Exclusive IPv6-only terms in display name (never matching generic `HK-01-IPv6`).
-    let name_lower = node.name.trim().to_ascii_lowercase();
+fn has_exclusive_ipv6_only_name(name: &str) -> bool {
+    let name_lower = name.trim().to_ascii_lowercase();
     const EXCLUSIVE_V6_NAME_MARKERS: &[&str] = &[
         "ipv6-only",
         "ipv6 only",
@@ -424,6 +492,38 @@ pub fn is_ipv6_only_node(node: &ProxyNode) -> bool {
     EXCLUSIVE_V6_NAME_MARKERS
         .iter()
         .any(|marker| name_lower.contains(marker))
+}
+
+/// Conservatively classify whether `node` is an IPv6-only business proxy that would fail when
+/// chained through an IPv4-only domestic relay (strictly avoiding false positives on dual-stack
+/// nodes such as `"HK-01-IPv6"`):
+///
+/// 1. `node.server` (or fallback `raw_config["server"]`) parses as `IpAddr::V6`;
+/// 2. `raw_config["ip-version"]` explicitly specifies `"ipv6"` (or `"ipv6-only"`);
+/// 3. `server` hostname carries a dedicated IPv6 label (`ipv6.` / `v6.` / `-ipv6.` / `-v6.` /
+///    `.ipv6.` / `.v6.`) and does NOT contain `"dual"` or `"v4"`;
+/// 4. `node.name` contains an exclusive IPv6-only marker (`ipv6-only` / `ipv6 only` / `v6-only` /
+///    `纯ipv6` / `仅ipv6`, etc.).
+pub fn is_ipv6_only_node(node: &ProxyNode) -> bool {
+    let raw_server = {
+        let s = node.server.trim();
+        if !s.is_empty() {
+            s
+        } else {
+            node.raw_config
+                .get("server")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or("")
+        }
+    };
+    let raw_ip_version = node
+        .raw_config
+        .get("ip-version")
+        .and_then(serde_json::Value::as_str);
+
+    is_ipv6_only_node_fields(raw_server, raw_ip_version)
+        || has_exclusive_ipv6_only_name(&node.name)
 }
 
 /// Supported built-in and extensible probe kinds.
@@ -1707,5 +1807,52 @@ mod tests {
         assert_eq!(snap.ip_risk_level.as_deref(), Some("clean"));
         assert_eq!(snap.ip_asn.as_deref(), Some("AS3462 HiNet"));
         assert_eq!(snap.ip_risk_flags, None);
+    }
+
+    #[test]
+    fn node_summary_helpers_and_ipv6_only_node_fields_match_proxy_node_semantics() {
+        assert!(is_ipv6_only_node_fields("2001:db8::1", None));
+        assert!(is_ipv6_only_node_fields("[2001:db8::2]", None));
+        assert!(is_ipv6_only_node_fields("edge.example.test", Some("ipv6")));
+        assert!(is_ipv6_only_node_fields("edge.example.test", Some("IPv6-Only")));
+        assert!(!is_ipv6_only_node_fields("edge.example.test", Some("dual")));
+        assert!(is_ipv6_only_node_fields("ipv6.tokyo.example.test", None));
+        assert!(!is_ipv6_only_node_fields("dual-ipv6.tokyo.example.test", None));
+        assert!(!is_ipv6_only_node_fields("198.51.100.10", None));
+
+        let summary_v6_name = NodeSummary {
+            id: "n-v6".to_string(),
+            sub_id: "sub-1".to_string(),
+            name: "香港 纯IPv6 01".to_string(),
+            region_code: "HK".to_string(),
+            enabled: true,
+            protocol: "trojan".to_string(),
+            server: "198.51.100.20".to_string(),
+            port: 8443,
+            multiplier: 1.0,
+            is_443_native: false,
+            preaccel_eligible: true,
+            preaccel_override: None,
+            raw_ip_version: None,
+        };
+        assert!(summary_v6_name.is_ipv6_only());
+        assert!(!summary_v6_name.is_info_node());
+        assert!(summary_v6_name.should_apply_preaccel(true));
+
+        let summary_hy2 = NodeSummary {
+            protocol: "hysteria2".to_string(),
+            name: "剩余流量：120 GB".to_string(),
+            ..summary_v6_name.clone()
+        };
+        assert!(summary_hy2.is_udp_only_transport());
+        assert!(!summary_hy2.should_apply_preaccel(false));
+        assert!(summary_hy2.is_info_node());
+
+        let summary_forced = NodeSummary {
+            is_443_native: true,
+            preaccel_override: Some(true),
+            ..summary_hy2
+        };
+        assert!(summary_forced.should_apply_preaccel(true));
     }
 }

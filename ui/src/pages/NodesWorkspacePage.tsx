@@ -1,9 +1,14 @@
 import { ArrowLeft, Globe, Link2, Plus } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { Suspense, lazy, useEffect, useRef, useState } from "react";
 import { appActions, useAppSelector } from "../store/appStore";
 import { oneOfPref, readUiPref, usePersistedState } from "../utils/uiPrefs";
-import { NodesSubsPage } from "./NodesSubsPage";
-import { SpeedTestPage } from "./SpeedTestPage";
+
+const NodesSubsPage = lazy(() =>
+  import("./NodesSubsPage").then((m) => ({ default: m.NodesSubsPage }))
+);
+const SpeedTestPage = lazy(() =>
+  import("./SpeedTestPage").then((m) => ({ default: m.SpeedTestPage }))
+);
 
 type WorkspaceTab = "nodes" | "subs";
 
@@ -11,6 +16,14 @@ const WORKSPACE_TAB_PREF_KEY = "nodesWorkspace.tab";
 const WORKSPACE_TAB_VALIDATOR = oneOfPref(["nodes", "subs"] as const);
 
 let workspaceInitialTabAligned = false;
+
+function WorkspaceTabFallback() {
+  return (
+    <div className="cc-card cc-glass flex min-h-[220px] items-center justify-center rounded-2xl text-xs text-[var(--muted)]">
+      正在加载…
+    </div>
+  );
+}
 
 export function NodesWorkspacePage() {
   const nodes = useAppSelector((s) => s.nodes);
@@ -39,13 +52,29 @@ export function NodesWorkspacePage() {
     WORKSPACE_TAB_VALIDATOR
   );
 
-  const tab: WorkspaceTab = persistedTab;
+  // Immediately honor pending nodesTabHint.tab on first render so lazy chunks load the target tab without flashing or dropping actions
+  const tab: WorkspaceTab = nodesTabHint ? nodesTabHint.tab : persistedTab;
   const activeSubFilter: string | null = workspaceDraft.filterSubId || null;
   const isSubsBusy =
     subsBg.refreshingAll ||
     subsBg.refreshingIds.length > 0 ||
     subsBg.importing ||
     captureActive;
+
+  // Lazy-mount each tab only on first activation, then keep it alive via CSS `hidden` so selections & drafts survive switches
+  const [visitedSpeed, setVisitedSpeed] = useState<boolean>(() => tab === "nodes");
+  const [visitedSubs, setVisitedSubs] = useState<boolean>(() => tab === "subs");
+
+  useEffect(() => {
+    if (tab === "nodes" && !visitedSpeed) {
+      setVisitedSpeed(true);
+    } else if (tab === "subs" && !visitedSubs) {
+      setVisitedSubs(true);
+    }
+  }, [tab, visitedSpeed, visitedSubs]);
+
+  const shouldMountSpeed = visitedSpeed || tab === "nodes";
+  const shouldMountSubs = visitedSubs || tab === "subs";
 
   // Keep sessionDrafts aligned with persisted sub-tab across reloads/reopens
   useEffect(() => {
@@ -54,12 +83,17 @@ export function NodesWorkspacePage() {
     }
   }, [persistedTab, workspaceDraft.tab]);
 
-  // Consume navigation tab hints from other pages (e.g. HomePage / MultiGroupPage)
+  // Consume navigation tab hints from other pages (e.g. HomePage / MultiGroupPage / OnboardingModal)
   useEffect(() => {
     if (!nodesTabHint) return;
     workspaceInitialTabAligned = true;
     hasStoredTabRef.current = true;
     setPersistedTab(nodesTabHint.tab);
+    if (nodesTabHint.tab === "subs") {
+      setVisitedSubs(true);
+    } else {
+      setVisitedSpeed(true);
+    }
     appActions.patchSessionDraft("nodesWorkspace", {
       tab: nodesTabHint.tab,
       ...(nodesTabHint.subId !== undefined ? { filterSubId: nodesTabHint.subId ?? "" } : {}),
@@ -70,7 +104,7 @@ export function NodesWorkspacePage() {
         page: 1,
       });
     }
-    // Defer consuming hint when a sub-page action (e.g. "migration") needs to be handled by NodesSubsPage
+    // Defer consuming hint when a sub-page action (e.g. "migration" or "share") needs to be handled by NodesSubsPage once mounted
     if (!nodesTabHint.action) {
       appActions.consumeNodesTabHint();
     }
@@ -82,6 +116,7 @@ export function NodesWorkspacePage() {
     workspaceInitialTabAligned = true;
     if (!hasStoredTabRef.current && nodes.length === 0 && tab !== "subs") {
       setPersistedTab("subs");
+      setVisitedSubs(true);
       appActions.patchSessionDraft("nodesWorkspace", { tab: "subs" });
     }
   }, [initialized, nodes.length, nodesTabHint, setPersistedTab, tab]);
@@ -89,6 +124,11 @@ export function NodesWorkspacePage() {
   const handleSelectTab = (next: WorkspaceTab) => {
     workspaceInitialTabAligned = true;
     hasStoredTabRef.current = true;
+    if (nodesTabHint) {
+      appActions.consumeNodesTabHint();
+    }
+    if (next === "nodes") setVisitedSpeed(true);
+    else setVisitedSubs(true);
     setPersistedTab(next);
     appActions.patchSessionDraft("nodesWorkspace", { tab: next });
   };
@@ -96,6 +136,10 @@ export function NodesWorkspacePage() {
   const handleOpenSubs = () => {
     workspaceInitialTabAligned = true;
     hasStoredTabRef.current = true;
+    if (nodesTabHint) {
+      appActions.consumeNodesTabHint();
+    }
+    setVisitedSubs(true);
     setPersistedTab("subs");
     appActions.patchSessionDraft("nodesWorkspace", { tab: "subs" });
   };
@@ -103,6 +147,10 @@ export function NodesWorkspacePage() {
   const handleBackToNodes = () => {
     workspaceInitialTabAligned = true;
     hasStoredTabRef.current = true;
+    if (nodesTabHint) {
+      appActions.consumeNodesTabHint();
+    }
+    setVisitedSpeed(true);
     setPersistedTab("nodes");
     appActions.patchSessionDraft("nodesWorkspace", {
       tab: "nodes",
@@ -117,6 +165,10 @@ export function NodesWorkspacePage() {
   const handleViewSubNodes = (subId: string | null) => {
     workspaceInitialTabAligned = true;
     hasStoredTabRef.current = true;
+    if (nodesTabHint) {
+      appActions.consumeNodesTabHint();
+    }
+    setVisitedSpeed(true);
     setPersistedTab("nodes");
     appActions.patchSessionDraft("nodesWorkspace", {
       tab: "nodes",
@@ -205,20 +257,28 @@ export function NodesWorkspacePage() {
         </div>
       </div>
 
-      {/* Symmetrically keep both tabs mounted via CSS `hidden` so state, filters, and drawers survive tab switches */}
-      <div className={tab === "nodes" ? "contents" : "hidden"}>
-        <SpeedTestPage
-          embedded
-          initialSubId={activeSubFilter}
-          onOpenSubs={handleOpenSubs}
-        />
-      </div>
-      <div className={tab === "subs" ? "contents" : "hidden"}>
-        <NodesSubsPage
-          embeddedSubsOnly
-          onViewSubNodes={handleViewSubNodes}
-        />
-      </div>
+      {/* Lazy-load each tab on first activation, then keep mounted via CSS `hidden` so state, filters, and selections survive switches */}
+      {shouldMountSpeed && (
+        <div className={tab === "nodes" ? "contents" : "hidden"}>
+          <Suspense fallback={<WorkspaceTabFallback />}>
+            <SpeedTestPage
+              embedded
+              initialSubId={activeSubFilter}
+              onOpenSubs={handleOpenSubs}
+            />
+          </Suspense>
+        </div>
+      )}
+      {shouldMountSubs && (
+        <div className={tab === "subs" ? "contents" : "hidden"}>
+          <Suspense fallback={<WorkspaceTabFallback />}>
+            <NodesSubsPage
+              embeddedSubsOnly
+              onViewSubNodes={handleViewSubNodes}
+            />
+          </Suspense>
+        </div>
+      )}
     </div>
   );
 }

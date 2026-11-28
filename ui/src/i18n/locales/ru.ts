@@ -640,4 +640,163 @@ export const ru: DeepStringDict<TranslationDict> = {
     nextLaunchBadgeTip:
       "Новая версия готова в фоне — предложение об обновлении появится при следующем запуске",
   },
+  preaccelStatus: {
+    msSuffix: " ({ms} мс)",
+    localSocksRelayPart: " (реле: {relay})",
+    offBadge: "Выкл",
+    offDetail: "Ускорение отключено для CatCloud и других прокси-клиентов.",
+    addRelayBadge: "Добавьте реле",
+    addRelayDetail:
+      "Ускорение не активно: сначала добавьте или импортируйте хотя бы одно включённое реле ускорения.",
+    activeBadge: "Ускорение активно",
+    boostingOtherBadge: "Ускорение других ПО",
+    probingShort: "Проверка…",
+    probingBadge: "Проверка канала…",
+    degradedShort: "Защитный откат",
+    degradedBadge: "Защитный откат",
+    preparingBadge: "Подготовка…",
+    needAdminBadge: "Нужны права",
+    localReadyBadge: "Локальный вход готов",
+    standbyBadge: "Ожидание ускорения",
+    tunDetailWithRelay:
+      "TUN основного ядра ускоряется через «{relay}»{msPart}; отдельный туннель :443 приостановлен во избежание конфликта.",
+    tunDetailNoRelay:
+      "TUN основного ядра ускоряется{msPart}; отдельный туннель :443 приостановлен во избежание конфликта.",
+    proxyDualProbingDetailWithRelay:
+      "Основное ядро ускоряется через «{relay}» · Проверка отдельного канала для других программ…",
+    proxyDualProbingDetailNoRelay:
+      "Основное ядро ускоряется · Проверка отдельного канала для других программ…",
+    proxyDualVerifiedDetailWithRelay:
+      "Основное ядро и отдельный канал проверены через «{relay}»{msPart}.",
+    proxyDualVerifiedDetailNoRelay:
+      "Основное ядро и отдельный канал проверены{msPart}.",
+    proxyDualActiveDetailWithRelay:
+      "Основное ядро и отдельный канал ускоряются через «{relay}».",
+    proxyDualActiveDetailNoRelay: "Основное ядро и отдельный канал ускоряются.",
+    proxyProbingOtherDetailWithRelay:
+      "Основное ядро ускоряется через «{relay}» · Проверка ускорения других программ…",
+    proxyProbingOtherDetailNoRelay:
+      "Основное ядро ускоряется · Проверка ускорения других программ…",
+    proxyDegradedFallbackDetail:
+      "Отдельный перехват не прошёл проверку и безопасно отключён во избежание обрывов; ускорение основного ядра продолжает работать.",
+    proxyInstallingDetailWithRelay:
+      "Основное ядро ускоряется через «{relay}» · В фоне готовится компонент для других программ…",
+    proxyInstallingDetailNoRelay:
+      "Основное ядро ускоряется · В фоне готовится компонент для других программ…",
+    proxyNeedAdminDetailWithRelay:
+      "Основное ядро ускоряется через «{relay}» · Для автоускорения других клиентов нужны права администратора.",
+    proxyNeedAdminDetailNoRelay:
+      "Основное ядро ускоряется · Для автоускорения других клиентов нужны права администратора.",
+    proxyOnlyDetailWithRelay:
+      "Основное ядро ускоряет отдачу и соединение через «{relay}».",
+    proxyOnlyDetailNoRelay: "Основное ядро работает через реле ускорения.",
+    standaloneProbingDetailWithRelay:
+      "Отдельный канал запущен через «{relay}», выполняется проверка связи…",
+    standaloneProbingDetailNoRelay:
+      "Отдельный канал запущен, выполняется проверка связи…",
+    standaloneVerifiedDetailWithRelay:
+      "Отдельный канал проверен через «{relay}»{msPart} и автоматически ускоряет ваш прокси-клиент.",
+    standaloneVerifiedDetailNoRelay:
+      "Отдельный канал проверен{msPart} и автоматически ускоряет ваш прокси-клиент.",
+    standaloneActiveDetailWithRelay:
+      "Отдельный канал автоматически ускоряет ваш прокси-клиент через «{relay}».",
+    standaloneActiveDetailNoRelay:
+      "Отдельный канал автоматически ускоряет ваш прокси-клиент.",
+    verifyingDriverDetail:
+      "Проверка целостности компонента ускорения; включится автоматически…",
+    downloadingDriverDetail:
+      "Фоновая загрузка компонента ускорения; включится автоматически…",
+    needAdminDetailWithPort:
+      "Компонент готов. Нажмите «Включить от админа» для автоускорения других клиентов (или укажите 127.0.0.1:{port} как входной прокси).",
+    needAdminDetailNoPort:
+      "Компонент готов. Нажмите «Включить от админа» для автоускорения вашего прокси-клиента.",
+    probingLinkDetailWithRelay:
+      "Проверка доступности канала ускорения через «{relay}»…",
+    probingLinkDetailNoRelay: "Проверка доступности канала ускорения…",
+    degradedStandaloneDetailWithPort:
+      "Проверка перехвата не прошла, включён безопасный откат (локальный вход 127.0.0.1:{port} доступен).",
+    degradedStandaloneDetailNoPort:
+      "Проверка перехвата не прошла, включён безопасный откат.",
+    installFailedDetailWithPort:
+      "Подготовка компонента не завершена ({err}); локальный вход 127.0.0.1:{port} доступен.",
+    installFailedDetailNoPort:
+      "Подготовка компонента не завершена ({err}); ускорение ядра доступно при включённом прокси.",
+    verifyFailedDetailWithPort:
+      "Проверка канала не прошла; локальный вход 127.0.0.1:{port} в режиме ожидания.",
+    verifyFailedDetailNoPort: "Проверка канала не прошла; ожидание запуска.",
+    localSocksDetailWithPort:
+      "Локальный SOCKS5 вход 127.0.0.1:{port} готов{relayPart}. Укажите его в вашем клиенте или включите от администратора.",
+    localSocksDetailNoPort:
+      "Локальный вход ускорения готов{relayPart}. Включите прокси или запустите от администратора.",
+    standbyDetailWithRelay:
+      "Ускорение включено (реле: {relay}); запустите прокси или права администратора для активации.",
+    standbyDetailNoRelay:
+      "Ускорение включено; запустите прокси или права администратора для активации.",
+    offPlain: "Ускорение отключено.",
+    addRelayPlain:
+      "Сначала добавьте и включите хотя бы одно реле ускорения.",
+    tunPlainWithRelay:
+      "Ускоряет отправку и доступ через «{relay}»{msPart}.",
+    tunPlainNoRelay: "Ускоряет отправку и доступ{msPart}.",
+    proxyDualProbingPlainWithRelay:
+      "Ускорение через «{relay}», проверка других прокси-клиентов…",
+    proxyDualProbingPlainNoRelay:
+      "Ускорение активно, проверка других прокси-клиентов…",
+    proxyDualVerifiedPlainWithRelay:
+      "Ускоряет CatCloud и другие прокси-клиенты через «{relay}»{msPart}.",
+    proxyDualVerifiedPlainNoRelay:
+      "Ускоряет CatCloud и другие прокси-клиенты{msPart}.",
+    proxyDualActivePlainWithRelay:
+      "Ускоряет CatCloud и другие прокси-клиенты через «{relay}».",
+    proxyDualActivePlainNoRelay: "Ускоряет CatCloud и другие прокси-клиенты.",
+    proxyDegradedPlainWithRelay:
+      "CatCloud ускоряется через «{relay}» (для других программ включён безопасный откат).",
+    proxyDegradedPlainNoRelay:
+      "CatCloud ускоряется (для других программ включён безопасный откат).",
+    proxyInstallingPlainWithRelay:
+      "Ускорение через «{relay}», в фоне готовится компонент для других клиентов…",
+    proxyInstallingPlainNoRelay:
+      "Ускорение активно, в фоне готовится компонент для других клиентов…",
+    proxyNeedAdminPlainWithRelay:
+      "CatCloud ускоряется через «{relay}». Нажмите кнопку справа для перезапуска от администратора и автоускорения других клиентов.",
+    proxyNeedAdminPlainNoRelay:
+      "CatCloud ускоряется. Нажмите кнопку справа для перезапуска от администратора и автоускорения других клиентов.",
+    proxyOnlyPlainWithRelay: "Ускоряет отправку и доступ через «{relay}».",
+    proxyOnlyPlainNoRelay: "Ускоряет отправку и доступ.",
+    standaloneProbingPlainWithRelay:
+      "Включено через «{relay}» — проверка ускорения других прокси-клиентов…",
+    standaloneProbingPlainNoRelay:
+      "Включено — проверка ускорения других прокси-клиентов…",
+    standaloneVerifiedPlainWithRelay:
+      "Включено — автоматически ускоряет другие прокси-клиенты через «{relay}»{msPart}.",
+    standaloneVerifiedPlainNoRelay:
+      "Включено — автоматически ускоряет другие прокси-клиенты{msPart}.",
+    standaloneActivePlainWithRelay:
+      "Включено — автоматически ускоряет другие прокси-клиенты через «{relay}».",
+    standaloneActivePlainNoRelay:
+      "Включено — автоматически ускоряет другие прокси-клиенты.",
+    verifyingDriverPlain:
+      "Проверка компонента ускорения — включится автоматически…",
+    downloadingDriverPlain:
+      "Подготовка компонента ускорения — включится автоматически…",
+    needAdminPlain:
+      "Компонент готов — нажмите кнопку справа для перезапуска от администратора и автоускорения.",
+    probingLinkPlainWithRelay:
+      "Проверка соединения ускорения через «{relay}»…",
+    probingLinkPlainNoRelay: "Проверка соединения ускорения…",
+    degradedStandalonePlain:
+      "Автопроверка не прошла — автоускорение безопасно приостановлено во избежание обрывов.",
+    installFailedPlain:
+      "Подготовка компонента не завершена — повторите справа или включите прокси CatCloud.",
+    verifyFailedPlain:
+      "Проверка ускорения не прошла — режим ожидания; повторите проверку справа.",
+    localReadyPlainWithRelay:
+      "Локальное ускорение готово ({relay}) — укажите адрес в вашем прокси-клиенте.",
+    localReadyPlainNoRelay:
+      "Локальное ускорение готово — укажите адрес в вашем прокси-клиенте.",
+    standbyPlainWithRelay:
+      "Ускорение включено ({relay}) — запустите прокси или перезапустите от администратора.",
+    standbyPlainNoRelay:
+      "Ускорение включено — запустите прокси или перезапустите от администратора.",
+  },
 };

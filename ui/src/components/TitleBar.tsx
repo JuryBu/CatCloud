@@ -1,11 +1,16 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Copy, Minus, Square, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { isTauriEnv } from "../api/tauri";
 import { normalizeUiLanguage, type UiLanguage, useUiDict } from "../i18n";
 import { selectHasBackgroundActivity, useAppSelector } from "../store/appStore";
 import { resolvePlatformOs } from "../utils/platform";
-import { type PreAccelSummary, resolvePreAccelSummary } from "../utils/preaccelStatus";
+import {
+  type GlobalPreAccelFields,
+  type PreAccelSummary,
+  type RuntimePreAccelFields,
+  resolvePreAccelSummary,
+} from "../utils/preaccelStatus";
 
 const TITLEBAR_STATUS_COPY: Record<
   UiLanguage,
@@ -152,8 +157,48 @@ function resolveModeBadge(
 }
 
 export function TitleBar() {
-  const runtime = useAppSelector((s) => s.runtime);
-  const globalPreAccel = useAppSelector((s) => s.globalPreAccel);
+  // Atomic primitive selectors avoid re-rendering TitleBar on unrelated runtime ticks (memory/uptime/bps).
+  const runtimeStatus = useAppSelector((s) => s.runtime.status);
+  const runtimeProxyMode = useAppSelector((s) => s.runtime.proxy_mode);
+  const runtimeOsLabel = useAppSelector((s) => s.runtime.os_label);
+  const runtimeRunning = useAppSelector((s) => s.runtime.running);
+  const runtimeSystemProxyEnabled = useAppSelector((s) => s.runtime.system_proxy_enabled);
+  const runtimeTunEnabled = useAppSelector((s) => s.runtime.tun_enabled);
+  const runtimePreaccelActive = useAppSelector((s) => s.runtime.preaccel_active);
+  const runtimePreaccelEnabled = useAppSelector((s) => s.runtime.preaccel_enabled);
+  const runtimePreaccelRelayName = useAppSelector((s) => s.runtime.preaccel_relay_name);
+  const runtimeGlobalPreaccelActive = useAppSelector((s) => s.runtime.global_preaccel_active);
+  const runtimeGlobalPreaccelMode = useAppSelector((s) => s.runtime.global_preaccel_mode);
+  const runtimeGlobalPreaccelSocksPort = useAppSelector(
+    (s) => s.runtime.global_preaccel_socks_port
+  );
+  const runtimePreaccelEffectiveCarrier = useAppSelector(
+    (s) => s.runtime.preaccel_effective_carrier
+  );
+  const runtimeStandaloneSuspendedForTun = useAppSelector(
+    (s) => s.runtime.standalone_tunnel_suspended_for_tun
+  );
+  const runtimeGlobalWinDivertActive = useAppSelector((s) => s.runtime.global_windivert_active);
+  const runtimePreaccelInstallState = useAppSelector((s) => s.runtime.preaccel_install_state);
+  const runtimeGlobalPreaccelVerifyState = useAppSelector(
+    (s) => s.runtime.global_preaccel_verify_state
+  );
+  const runtimeGlobalPreaccelVerifyMs = useAppSelector(
+    (s) => s.runtime.global_preaccel_verify_ms
+  );
+
+  const globalRunning = useAppSelector((s) => s.globalPreAccel.running);
+  const globalMode = useAppSelector((s) => s.globalPreAccel.mode);
+  const globalSocksPort = useAppSelector((s) => s.globalPreAccel.socks_port);
+  const globalWindivertAvailable = useAppSelector((s) => s.globalPreAccel.windivert_available);
+  const globalIsElevated = useAppSelector((s) => s.globalPreAccel.is_elevated);
+  const globalLastError = useAppSelector((s) => s.globalPreAccel.last_error);
+  const globalIsWindivertActive = useAppSelector((s) => s.globalPreAccel.is_windivert_active);
+  const globalInstallState = useAppSelector((s) => s.globalPreAccel.install_state);
+  const globalVerifyState = useAppSelector((s) => s.globalPreAccel.verify_state);
+  const globalVerifyLatencyMs = useAppSelector((s) => s.globalPreAccel.verify_latency_ms);
+  const globalVerifyMessage = useAppSelector((s) => s.globalPreAccel.verify_message);
+
   const preAccelEnabledConfig = useAppSelector((s) => s.config.preaccel.enabled);
   const hasEnabledRelay = useAppSelector((s) =>
     s.preAccelRelays.some((r) => r.enabled)
@@ -164,12 +209,80 @@ export function TitleBar() {
   const uiLang = normalizeUiLanguage(
     useAppSelector((s) => s.config.personalization.ui_language)
   );
-  const bg = useAppSelector(selectHasBackgroundActivity);
+  const hasAnyBgTask = useAppSelector((s) => {
+    const bg = selectHasBackgroundActivity(s);
+    return bg.preaccel || bg.nodes || bg.groups || bg.home || bg.settings;
+  });
   const dict = useUiDict(uiLang);
-  const hasAnyBgTask = bg.preaccel || bg.nodes || bg.groups || bg.home || bg.settings;
   const [maximized, setMaximized] = useState(false);
   const inTauri = isTauriEnv();
-  const isMac = resolvePlatformOs(runtime.os_label) === "macos";
+  const isMac = resolvePlatformOs(runtimeOsLabel) === "macos";
+
+  const runtimePreAccelFields = useMemo<RuntimePreAccelFields>(
+    () => ({
+      running: runtimeRunning,
+      system_proxy_enabled: runtimeSystemProxyEnabled,
+      tun_enabled: runtimeTunEnabled,
+      preaccel_active: runtimePreaccelActive,
+      preaccel_enabled: runtimePreaccelEnabled,
+      preaccel_relay_name: runtimePreaccelRelayName,
+      global_preaccel_active: runtimeGlobalPreaccelActive,
+      global_preaccel_mode: runtimeGlobalPreaccelMode,
+      global_preaccel_socks_port: runtimeGlobalPreaccelSocksPort,
+      preaccel_effective_carrier: runtimePreaccelEffectiveCarrier,
+      standalone_tunnel_suspended_for_tun: runtimeStandaloneSuspendedForTun,
+      global_windivert_active: runtimeGlobalWinDivertActive,
+      preaccel_install_state: runtimePreaccelInstallState,
+      global_preaccel_verify_state: runtimeGlobalPreaccelVerifyState,
+      global_preaccel_verify_ms: runtimeGlobalPreaccelVerifyMs,
+    }),
+    [
+      runtimeRunning,
+      runtimeSystemProxyEnabled,
+      runtimeTunEnabled,
+      runtimePreaccelActive,
+      runtimePreaccelEnabled,
+      runtimePreaccelRelayName,
+      runtimeGlobalPreaccelActive,
+      runtimeGlobalPreaccelMode,
+      runtimeGlobalPreaccelSocksPort,
+      runtimePreaccelEffectiveCarrier,
+      runtimeStandaloneSuspendedForTun,
+      runtimeGlobalWinDivertActive,
+      runtimePreaccelInstallState,
+      runtimeGlobalPreaccelVerifyState,
+      runtimeGlobalPreaccelVerifyMs,
+    ]
+  );
+
+  const globalPreAccelFields = useMemo<GlobalPreAccelFields>(
+    () => ({
+      running: globalRunning,
+      mode: globalMode,
+      socks_port: globalSocksPort,
+      windivert_available: globalWindivertAvailable,
+      is_elevated: globalIsElevated,
+      last_error: globalLastError,
+      is_windivert_active: globalIsWindivertActive,
+      install_state: globalInstallState,
+      verify_state: globalVerifyState,
+      verify_latency_ms: globalVerifyLatencyMs,
+      verify_message: globalVerifyMessage,
+    }),
+    [
+      globalRunning,
+      globalMode,
+      globalSocksPort,
+      globalWindivertAvailable,
+      globalIsElevated,
+      globalLastError,
+      globalIsWindivertActive,
+      globalInstallState,
+      globalVerifyState,
+      globalVerifyLatencyMs,
+      globalVerifyMessage,
+    ]
+  );
 
   useEffect(() => {
     if (!isTauriEnv()) return;
@@ -250,16 +363,16 @@ export function TitleBar() {
   };
 
   const preaccelSummary = resolvePreAccelSummary(
-    runtime,
-    globalPreAccel,
+    runtimePreAccelFields,
+    globalPreAccelFields,
     preAccelEnabledConfig,
     hasEnabledRelay,
     uiLang
   );
 
   const badge = resolveModeBadge(
-    runtime.status,
-    runtime.proxy_mode,
+    runtimeStatus,
+    runtimeProxyMode,
     preaccelSummary,
     hasEnabledRelay,
     dict,

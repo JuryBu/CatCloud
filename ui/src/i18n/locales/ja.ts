@@ -640,4 +640,143 @@ export const ja: DeepStringDict<TranslationDict> = {
     nextLaunchBadgeTip:
       "新バージョンがバックグラウンドで準備完了しています。次回起動時にワンクリック更新を案内します",
   },
+  preaccelStatus: {
+    msSuffix: "（{ms} ms）",
+    localSocksRelayPart: "（回線：{relay}）",
+    offBadge: "オフ",
+    offDetail: "CatCloud および他のプロキシアプリで国内高速化はオフになっています。",
+    addRelayBadge: "高速化回線を追加",
+    addRelayDetail:
+      "国内高速化は未稼働です。利用可能な国内高速化回線を 1 件以上追加または取込してください。",
+    activeBadge: "国内高速化 稼働中",
+    boostingOtherBadge: "他アプリを高速化中",
+    probingShort: "検証中…",
+    probingBadge: "回線を検証中…",
+    degradedShort: "他アプリ保護切替",
+    degradedBadge: "保護フォールバック",
+    preparingBadge: "コンポーネント準備中…",
+    needAdminBadge: "管理者権限が必要",
+    localReadyBadge: "ローカル高速化準備完了",
+    standbyBadge: "高速化待機中",
+    tunDetailWithRelay:
+      "メインコア仮想 NIC が「{relay}」経由で高速化中{msPart}（独立 443 経路は競合回避のため自動一時停止）",
+    tunDetailNoRelay:
+      "メインコア仮想 NIC 高速化中{msPart}（独立 443 経路は競合回避のため自動一時停止）",
+    proxyDualProbingDetailWithRelay:
+      "メインコアは「{relay}」で高速化中 · 他アプリ向け独立経路を検証中…",
+    proxyDualProbingDetailNoRelay: "メインコア高速化中 · 他アプリ向け独立経路を検証中…",
+    proxyDualVerifiedDetailWithRelay:
+      "メインコア＋独立経路が「{relay}」経由で疎通確認済み{msPart}",
+    proxyDualVerifiedDetailNoRelay: "メインコア＋独立経路が疎通確認済み{msPart}",
+    proxyDualActiveDetailWithRelay: "メインコア＋独立経路が「{relay}」経由で高速化中",
+    proxyDualActiveDetailNoRelay: "メインコア＋独立経路で高速化中",
+    proxyProbingOtherDetailWithRelay:
+      "メインコアは「{relay}」で高速化中 · 他アプリ向け高速化経路を検証中…",
+    proxyProbingOtherDetailNoRelay: "メインコア高速化中 · 他アプリ向け高速化経路を検証中…",
+    proxyDegradedFallbackDetail:
+      "他アプリ向け独立制御の検証に失敗したため断線防止で自動停止しました。メインコア高速化は継続中です。",
+    proxyInstallingDetailWithRelay:
+      "メインコアは「{relay}」で高速化中 · 他アプリ向けコンポーネントを準備中…",
+    proxyInstallingDetailNoRelay: "メインコア高速化中 · 他アプリ向けコンポーネントを準備中…",
+    proxyNeedAdminDetailWithRelay:
+      "メインコアは「{relay}」で高速化中 · 他アプリの自動高速化には管理者権限が必要です",
+    proxyNeedAdminDetailNoRelay:
+      "メインコア高速化中 · 他アプリの自動高速化には管理者権限が必要です",
+    proxyOnlyDetailWithRelay: "メインコアプロキシが「{relay}」経由で高速化中",
+    proxyOnlyDetailNoRelay: "メインコアプロキシが国内中継経由で高速化中",
+    standaloneProbingDetailWithRelay:
+      "「{relay}」経由の独立高速化を開始し、疎通を検証中…",
+    standaloneProbingDetailNoRelay: "独立高速化を開始し、疎通を検証中…",
+    standaloneVerifiedDetailWithRelay:
+      "独立経路が「{relay}」経由で疎通確認済み{msPart}、既存プロキシアプリを自動高速化中",
+    standaloneVerifiedDetailNoRelay:
+      "独立経路が疎通確認済み{msPart}、既存プロキシアプリを自動高速化中",
+    standaloneActiveDetailWithRelay:
+      "独立経路が「{relay}」経由で既存プロキシアプリを自動高速化中",
+    standaloneActiveDetailNoRelay: "独立経路が既存プロキシアプリを自動高速化中",
+    verifyingDriverDetail:
+      "公式高速化コンポーネントを検証中です。完了後に自動で有効になります…",
+    downloadingDriverDetail:
+      "公式高速化コンポーネントをバックグラウンドで取得中です…",
+    needAdminDetailWithPort:
+      "コンポーネント準備完了。「管理者で有効化」で他アプリを自動高速化できます（127.0.0.1:{port} を前置プロキシとしても利用可）",
+    needAdminDetailNoPort:
+      "コンポーネント準備完了。「管理者で有効化」で既存プロキシアプリを自動高速化できます",
+    probingLinkDetailWithRelay: "「{relay}」経由の疎通を自動検証中…",
+    probingLinkDetailNoRelay: "高速化経路の疎通を自動検証中…",
+    degradedStandaloneDetailWithPort:
+      "独立制御の疎通検証に失敗したため自動保護切替しました（ローカル入口 127.0.0.1:{port} は待機中）",
+    degradedStandaloneDetailNoPort:
+      "独立制御の疎通検証に失敗したため自動保護切替しました",
+    installFailedDetailWithPort:
+      "コンポーネント準備未完了（{err}）。ローカル入口 127.0.0.1:{port} は利用可能です",
+    installFailedDetailNoPort:
+      "コンポーネント準備未完了（{err}）。プロキシ有効時は引き続き高速化されます",
+    verifyFailedDetailWithPort:
+      "疎通検証に失敗しました（ローカル入口 127.0.0.1:{port} 待機中）",
+    verifyFailedDetailNoPort: "疎通検証に失敗しました（待機中）",
+    localSocksDetailWithPort:
+      "ローカル SOCKS5 入口 127.0.0.1:{port} 準備完了{relayPart}。既存アプリの前置プロキシに設定するか管理者で有効化してください",
+    localSocksDetailNoPort:
+      "ローカル高速化入口が準備完了{relayPart}。プロキシ開始または管理者有効化で稼働します",
+    standbyDetailWithRelay:
+      "国内高速化オン（回線：{relay}）。プロキシ開始または管理者有効化で稼働します",
+    standbyDetailNoRelay: "国内高速化オン。プロキシ開始または管理者有効化で稼働します",
+    offPlain: "国内高速化はオフです",
+    addRelayPlain: "有効な国内高速化回線を 1 件以上追加してください",
+    tunPlainWithRelay: "「{relay}」経由でアップロードとアクセスを高速化中{msPart}",
+    tunPlainNoRelay: "アップロードとアクセスを高速化中{msPart}",
+    proxyDualProbingPlainWithRelay:
+      "「{relay}」で高速化中・他のプロキシアプリの状態を確認中…",
+    proxyDualProbingPlainNoRelay: "高速化中・他のプロキシアプリの状態を確認中…",
+    proxyDualVerifiedPlainWithRelay:
+      "「{relay}」経由で CatCloud と他のプロキシアプリを同時高速化中{msPart}",
+    proxyDualVerifiedPlainNoRelay:
+      "CatCloud と他のプロキシアプリを同時高速化中{msPart}",
+    proxyDualActivePlainWithRelay:
+      "「{relay}」経由で CatCloud と他のプロキシアプリを高速化中",
+    proxyDualActivePlainNoRelay: "CatCloud と他のプロキシアプリを高速化中",
+    proxyDegradedPlainWithRelay:
+      "「{relay}」で CatCloud を高速化中（他アプリは断線防止のため自動一時停止）",
+    proxyDegradedPlainNoRelay:
+      "CatCloud を高速化中（他アプリは断線防止のため自動一時停止）",
+    proxyInstallingPlainWithRelay:
+      "「{relay}」で高速化中・他アプリ向けコンポーネントを準備中…",
+    proxyInstallingPlainNoRelay: "高速化中・他アプリ向けコンポーネントを準備中…",
+    proxyNeedAdminPlainWithRelay:
+      "「{relay}」で CatCloud を高速化中。右のボタンから管理者で再起動すると他アプリも自動高速化できます",
+    proxyNeedAdminPlainNoRelay:
+      "CatCloud を高速化中。右のボタンから管理者で再起動すると他アプリも自動高速化できます",
+    proxyOnlyPlainWithRelay: "「{relay}」経由でアップロードとアクセスを高速化中",
+    proxyOnlyPlainNoRelay: "アップロードとアクセスを高速化中",
+    standaloneProbingPlainWithRelay:
+      "オン（「{relay}」）・他のプロキシアプリ向けの高速化を確認中…",
+    standaloneProbingPlainNoRelay: "オン・他のプロキシアプリ向けの高速化を確認中…",
+    standaloneVerifiedPlainWithRelay:
+      "オン・「{relay}」経由で他のプロキシアプリを自動高速化中{msPart}",
+    standaloneVerifiedPlainNoRelay: "オン・他のプロキシアプリを自動高速化中{msPart}",
+    standaloneActivePlainWithRelay:
+      "オン・「{relay}」経由で他のプロキシアプリを自動高速化中",
+    standaloneActivePlainNoRelay: "オン・他のプロキシアプリを自動高速化中",
+    verifyingDriverPlain: "高速化コンポーネントを検証中…完了後に自動有効化されます",
+    downloadingDriverPlain: "高速化コンポーネントを準備中…完了後に自動有効化されます",
+    needAdminPlain:
+      "高速化コンポーネント準備完了。右のボタンから管理者で再起動すると自動高速化されます",
+    probingLinkPlainWithRelay: "「{relay}」経由の高速化接続を確認中…",
+    probingLinkPlainNoRelay: "高速化接続を確認中…",
+    degradedStandalonePlain:
+      "自動チェックが通らなかったため、断線防止で自動高速化を一時停止しました",
+    installFailedPlain:
+      "コンポーネントの準備が未完了です。右から再試行するか CatCloud プロキシを有効にしてください",
+    verifyFailedPlain:
+      "高速化チェックに失敗しました（待機中）。右のボタンから再チェックできます",
+    localReadyPlainWithRelay:
+      "ローカル高速化準備完了（{relay}）。既存アプリの前置プロキシに設定して加速できます",
+    localReadyPlainNoRelay:
+      "ローカル高速化準備完了。既存アプリの前置プロキシに設定して加速できます",
+    standbyPlainWithRelay:
+      "国内高速化オン（{relay}）。プロキシ開始または管理者再起動で高速化されます",
+    standbyPlainNoRelay:
+      "国内高速化オン。プロキシ開始または管理者再起動で高速化されます",
+  },
 };

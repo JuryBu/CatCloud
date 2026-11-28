@@ -1,48 +1,23 @@
 import {
-  Activity,
   AlertTriangle,
   ArrowLeft,
-  ArrowUpDown,
-  Check,
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
-  Filter,
-  Layers,
   Loader2,
   Pencil,
   Play,
-  Plus,
-  RefreshCw,
-  RotateCcw,
-  Save,
-  Search,
   Settings2,
-  ShieldCheck,
-  Sparkles,
-  Star,
-  Trash2,
-  X,
   Zap,
 } from "lucide-react";
-import { type FormEvent, type KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  type DynamicFilterSpec,
-  type FallbackPolicy,
   type GroupEvaluationReport,
   type MultiGroup,
-  type MultiGroupMode,
-  type NodeHealthHint,
   type ProbeSnapshot,
   type ProxyNode,
-  type TriggerRule,
   catcloudApi,
   formatErrorMessage,
   isTauriEnv,
 } from "../api/tauri";
-import { AppSelect } from "../components/AppSelect";
-import { ContinentRegionFilter, PaginationBar } from "../components/ContinentRegionFilter";
+import { PaginationBar } from "../components/ContinentRegionFilter";
 import { formatI18nTemplate, normalizeUiLanguage, useUiDict } from "../i18n";
 import {
   appActions,
@@ -50,22 +25,21 @@ import {
   selectIsProbeEngineBusy,
   useAppSelector,
 } from "../store/appStore";
+import { hasVerifiedAiUnlock } from "../utils/aiUnlockDisplay";
 import {
-  type AiBadgeTone,
-  formatGoogleRegionTooltip,
-  getAiBadgeToneClass,
-  getNodeAiBadgeDisplays,
-  hasVerifiedAiUnlock,
-  resolveWindsurfUnlockDisplay,
-} from "../utils/aiUnlockDisplay";
+  GEMINI_GATE_EXPR,
+  HARD_GATE_PRESETS,
+  LEGACY_GEMINI_GATE_EXPR,
+  assessNodeAgainstGates,
+  evaluateFormulaSafely,
+} from "../utils/formulaEvaluator";
 import {
   MISSING_LATENCY_PENALTY_MS,
-  type ResolvedNodeLatency,
-  getLatencyTooltipKey,
   hasValidDownMbps,
   hasValidUpMbps,
   resolveNodeDisplayLatency,
 } from "../utils/latencyDisplay";
+import { INVALID_MATCH_RULE_MSG, parseUserMatchRules } from "../utils/mihomoRuleParser";
 import {
   type ContinentId,
   buildContinentRegionStats,
@@ -73,1324 +47,26 @@ import {
   nodeMatchesContinentAndRegion,
   resolveNodeRegionCode,
 } from "../utils/regions";
+import { formatGroupDisplayName } from "../utils/releaseUrl";
 import { isBoolPref, oneOfPref, usePersistedState } from "../utils/uiPrefs";
+import {
+  GroupConfigDrawer,
+  type TriggerMeta,
+  formatDynamicFilter,
+  getPrimaryTriggerExpr,
+  getPrimaryTriggerMeta,
+  normalizeGroupForBackend,
+  parseUploadTriggerInfo,
+} from "./multi-group/GroupConfigDrawer";
+import {
+  GroupFilterBar,
+  type NodeSortMode,
+  type NodeViewMode,
+} from "./multi-group/GroupFilterBar";
+import { GroupNodeCard } from "./multi-group/GroupNodeCard";
+import { GroupSidebarList } from "./multi-group/GroupSidebarList";
 
-/* ============================================================================
- * Constants & Human-Friendly Presets
- * ============================================================================ */
-
-const FORMULA_COST_EFFECTIVE =
-  "(up_mbps * 35 + min(down_mbps, 200) * 0.25 - ping_ms * 0.08 - jitter_ms * 0.15) / max(multiplier, 0.25)";
-
-const FORMULA_MAX_PERF =
-  "up_mbps * 45 + min(down_mbps, 200) * 0.35 - ping_ms * 0.1";
-
-const DEFAULT_MISSING_PING_MS = MISSING_LATENCY_PENALTY_MS;
-const EPSILON_ZERO = 1e-12;
-const EPSILON_EQ = 1e-9;
 const NODE_PAGE_SIZE_OPTIONS = [24, 48, 96] as const;
-
-const FRIENDLY_GROUP_NAME_MAP: Record<string, string> = {
-  流媒体与下载受控均衡: "影音下载均衡组",
-  高优家宽备援池: "备用精选组",
-};
-
-function formatGroupDisplayName(name: string): string {
-  return FRIENDLY_GROUP_NAME_MAP[name] ?? name;
-}
-
-type CreateTemplateId = "manual" | "wsf" | "ai" | "download";
-
-interface CreateTemplateMeta {
-  id: CreateTemplateId;
-  title: string;
-  desc: string;
-  mode: MultiGroupMode;
-  switchMode: "force_close_old" | "graceful_new_only";
-  independentRouting?: boolean;
-  hardGates?: string[];
-  formula: string;
-  matchRules: string[];
-}
-
-const WSF_AUTHORITATIVE_MATCH_RULES: readonly string[] = [
-  "DOMAIN-SUFFIX,codeium.com",
-  "DOMAIN-SUFFIX,codeiumdata.com",
-  "DOMAIN-SUFFIX,windsurf.com",
-  "DOMAIN-SUFFIX,devin.ai",
-  "DOMAIN-SUFFIX,cognition.ai",
-  "DOMAIN-SUFFIX,exafunction.com",
-];
-
-const FORMULA_WSF_CLEAN = `${FORMULA_COST_EFFECTIVE} + ip_clean * 120`;
-
-const CREATE_TEMPLATES: readonly CreateTemplateMeta[] = [
-  {
-    id: "manual",
-    title: "日常通用",
-    desc: "智能默认，稳选低延迟常用节点",
-    mode: "sticky_best",
-    switchMode: "graceful_new_only",
-    formula: FORMULA_COST_EFFECTIVE,
-    matchRules: [],
-  },
-  {
-    id: "wsf",
-    title: "Windsurf / Devin 纯净专用",
-    desc: "自动开启独立分流，拦截代理风控并优先纯净家宽",
-    mode: "sticky_best",
-    switchMode: "force_close_old",
-    independentRouting: true,
-    hardGates: ['site_unlocked("windsurf") == 1'],
-    formula: FORMULA_WSF_CLEAN,
-    matchRules: [...WSF_AUTHORITATIVE_MATCH_RULES],
-  },
-  {
-    id: "ai",
-    title: "AI 专线防跳 IP",
-    desc: "稳选最优防频繁换地区，切线断旧连接",
-    mode: "sticky_best",
-    switchMode: "force_close_old",
-    formula: FORMULA_COST_EFFECTIVE,
-    matchRules: [
-      "DOMAIN-SUFFIX,chatgpt.com",
-      "DOMAIN-SUFFIX,ab.chatgpt.com",
-      "DOMAIN-SUFFIX,openai.com",
-      "DOMAIN-SUFFIX,anthropic.com",
-      "DOMAIN-SUFFIX,claude.ai",
-      "DOMAIN-SUFFIX,googleapis.com",
-      ...WSF_AUTHORITATIVE_MATCH_RULES,
-    ],
-  },
-  {
-    id: "download",
-    title: "均衡高速",
-    desc: "多条线路并发轮询分摊，下载传文件更快",
-    mode: "load_balance_round_robin",
-    switchMode: "graceful_new_only",
-    formula: FORMULA_MAX_PERF,
-    matchRules: [],
-  },
-];
-
-interface ModeMeta {
-  id: MultiGroupMode;
-  title: string;
-  shortLabel: string;
-  desc: string;
-}
-
-const GROUP_MODES: readonly ModeMeta[] = [
-  {
-    id: "sticky_best",
-    title: "平时稳选最好（推荐 · 防跳 IP）",
-    shortLabel: "稳选最好",
-    desc: "一直稳用综合表现最好的一条线，不乱跳地区，减少网站风控。",
-  },
-  {
-    id: "load_balance_consistent_hash",
-    title: "同网站固定、多路分摊",
-    shortLabel: "同站分摊",
-    desc: "同一个网站走固定线路，不同网站自动分摊到组内多条线路。",
-  },
-  {
-    id: "load_balance_round_robin",
-    title: "多线路轮流分摊（下载提速）",
-    shortLabel: "轮流分摊",
-    desc: "多个连接轮流走不同线路，适合并发下载和大流量拉取。",
-  },
-  {
-    id: "conditional_pool",
-    title: "按条件自动吸纳节点",
-    shortLabel: "自动吸纳",
-    desc: "订阅更新后，按倍率或谷歌地区条件自动把达标新节点收进本组。",
-  },
-];
-
-interface GatePreset {
-  expr: string;
-  label: string;
-  failText: string;
-}
-
-const GEMINI_GATE_EXPR = 'site_unlocked("gemini") == 1';
-const LEGACY_GEMINI_GATE_EXPR = 'site_unlocked("google_ai") == 1';
-
-const HARD_GATE_PRESETS: readonly GatePreset[] = [
-  { expr: "google_clean == 1", label: "谷歌地区正常", failText: "谷歌地区异常" },
-  { expr: "ip_clean == 1", label: "纯净住宅 / 避开代理机房", failText: "非纯净住宅 IP" },
-  { expr: "keepalive_ok == 1", label: "长连接稳定(60秒)", failText: "60秒长连接未通过" },
-  { expr: 'site_unlocked("chatgpt") == 1', label: "ChatGPT 可用", failText: "ChatGPT 未解锁" },
-  { expr: GEMINI_GATE_EXPR, label: "Gemini 可用", failText: "Gemini 未解锁" },
-  { expr: 'site_unlocked("claude") == 1', label: "Claude 可用", failText: "Claude 未解锁" },
-  { expr: 'site_unlocked("windsurf") == 1', label: "Windsurf 可用", failText: "Windsurf 未解锁" },
-];
-
-const SITE_FRIENDLY_NAMES: Record<string, string> = {
-  chatgpt: "ChatGPT",
-  google_ai: "Gemini",
-  gemini: "Gemini",
-  gemini_aistudio: "Gemini",
-  claude: "Claude",
-  windsurf: "Windsurf",
-};
-
-interface FallbackMeta {
-  id: FallbackPolicy;
-  title: string;
-  desc: string;
-  tone: "amber" | "accent" | "red";
-}
-
-const FALLBACK_POLICIES: readonly FallbackMeta[] = [
-  {
-    id: "degrade_best_warn",
-    title: "先挑最好的顶着，提醒我（推荐）",
-    desc: "即使暂时都不达标也不断网，挑相对最好的一条继续用并提醒你。",
-    tone: "amber",
-  },
-  {
-    id: "cross_pool_escalate",
-    title: "临时借用备用组",
-    desc: "主组撑不住时先借用下面选好的备用组，主组恢复后自动切回。",
-    tone: "accent",
-  },
-  {
-    id: "strict_circuit_break",
-    title: "暂停连接，防止走错线路",
-    desc: "严格防风控模式：没有符合要求的节点时宁可断开也不乱走出口。",
-    tone: "red",
-  },
-];
-
-const FORMULA_VARIABLES: ReadonlyArray<{ token: string; label: string }> = [
-  { token: "up_mbps", label: "上行 Mbps" },
-  { token: "down_mbps", label: "下行 Mbps" },
-  { token: "ping_ms", label: "延迟 ms" },
-  { token: "jitter_ms", label: "抖动 ms" },
-  { token: "loss_pct", label: "丢包 %" },
-  { token: "multiplier", label: "倍率" },
-  { token: "keepalive_ok", label: "60秒保活" },
-  { token: "google_clean", label: "谷歌地区正常" },
-  { token: "ip_clean", label: "纯净住宅 IP" },
-  { token: "unlocked", label: "全站点解锁" },
-];
-
-const PROBE_ADDRESS_SNIPPETS: ReadonlyArray<{ token: string; desc: string }> = [
-  { token: 'probe_up("antigravity")', desc: "指定探针上行 Mbps" },
-  { token: 'probe_down("dl")', desc: "指定探针下行 Mbps" },
-  { token: 'probe_ping("chatgpt")', desc: "指定探针延迟 ms" },
-  { token: 'probe_ok("builtin_unlock_windsurf")', desc: "指定探针通过 (1/0)" },
-  { token: 'site_unlocked("chatgpt")', desc: "ChatGPT 解锁 (1/0)" },
-  { token: 'site_unlocked("gemini")', desc: "Gemini 解锁 (1/0)" },
-];
-
-interface TriggerMeta {
-  consecutiveFailures: number;
-  bypassCooldownOnDisconnect: boolean;
-}
-
-type NodeViewMode = "all" | "members";
-type NodeSortMode = "default" | "up_desc" | "down_desc" | "latency_asc";
-
-/* ============================================================================
- * Safe Formatting Helpers for dynamic_filter, trigger_rules & match_rules
- * ============================================================================ */
-
-function formatDynamicFilter(filter: MultiGroup["dynamic_filter"]): string {
-  if (filter == null) return "";
-  if (typeof filter === "string") return filter;
-  if (typeof filter !== "object") return "";
-
-  const spec = filter as DynamicFilterSpec;
-  if (typeof spec.expr === "string" && spec.expr.trim().length > 0) {
-    return spec.expr;
-  }
-
-  const parts: string[] = [];
-  if (typeof spec.max_multiplier === "number" && Number.isFinite(spec.max_multiplier)) {
-    parts.push(`multiplier <= ${spec.max_multiplier}`);
-  }
-  if (spec.require_google_clean) {
-    parts.push("google_clean == 1");
-  }
-  if (spec.require_443_native === true) {
-    parts.push("is_443_native == 1");
-  } else if (spec.require_443_native === false) {
-    parts.push("is_443_native == 0");
-  }
-  if (Array.isArray(spec.region_codes) && spec.region_codes.length > 0) {
-    parts.push(`region: ${spec.region_codes.join("/")}`);
-  }
-  if (Array.isArray(spec.protocols) && spec.protocols.length > 0) {
-    parts.push(`protocol: ${spec.protocols.join("/")}`);
-  }
-  if (Array.isArray(spec.sub_ids) && spec.sub_ids.length > 0) {
-    parts.push(`sub: ${spec.sub_ids.join(",")}`);
-  }
-  return parts.join(" && ");
-}
-
-function buildDynamicFilterUpdate(
-  rawText: string,
-  prev: MultiGroup["dynamic_filter"]
-): DynamicFilterSpec | null {
-  const trimmed = rawText.trim();
-  const baseObj: DynamicFilterSpec =
-    prev && typeof prev === "object" ? { ...(prev as DynamicFilterSpec) } : {};
-  if (!trimmed) {
-    const hasOther =
-      (baseObj.sub_ids && baseObj.sub_ids.length > 0) ||
-      (baseObj.region_codes && baseObj.region_codes.length > 0) ||
-      (baseObj.protocols && baseObj.protocols.length > 0) ||
-      baseObj.max_multiplier != null ||
-      Boolean(baseObj.require_google_clean) ||
-      baseObj.require_443_native != null;
-    if (!hasOther) return null;
-    return { ...baseObj, expr: null };
-  }
-  return {
-    sub_ids: baseObj.sub_ids ?? [],
-    region_codes: baseObj.region_codes ?? [],
-    max_multiplier: baseObj.max_multiplier ?? null,
-    protocols: baseObj.protocols ?? [],
-    require_google_clean: baseObj.require_google_clean ?? false,
-    require_443_native: baseObj.require_443_native ?? null,
-    expr: rawText,
-  };
-}
-
-function getPrimaryTriggerExpr(group: MultiGroup): string {
-  if (Array.isArray(group.trigger_rules) && group.trigger_rules.length > 0) {
-    return group.trigger_rules[0].expr ?? "";
-  }
-  return group.trigger_expr ?? "";
-}
-
-function getPrimaryTriggerMeta(group: MultiGroup): TriggerMeta {
-  if (Array.isArray(group.trigger_rules) && group.trigger_rules.length > 0) {
-    const first = group.trigger_rules[0];
-    return {
-      consecutiveFailures: first.consecutive_failures ?? 2,
-      bypassCooldownOnDisconnect: first.bypass_cooldown_on_disconnect ?? true,
-    };
-  }
-  return {
-    consecutiveFailures: 2,
-    bypassCooldownOnDisconnect: true,
-  };
-}
-
-function parseUploadTriggerInfo(expr: string): {
-  enabled: boolean;
-  threshold: number;
-  prefix: string;
-  isSimple: boolean;
-} {
-  const trimmed = expr.trim();
-  if (!trimmed) {
-    return { enabled: false, threshold: 2.0, prefix: "up_mbps", isSimple: true };
-  }
-  const simpleMatch = /^(up_mbps|probe_up\(\s*["'][^"']+["']\s*\))\s*<\s*(\d+(?:\.\d+)?)$/.exec(
-    trimmed
-  );
-  if (simpleMatch) {
-    return {
-      enabled: true,
-      threshold: Number(simpleMatch[2]) || 2.0,
-      prefix: simpleMatch[1],
-      isSimple: true,
-    };
-  }
-  const partialMatch = /(up_mbps|probe_up\(\s*["'][^"']+["']\s*\))\s*<\s*(\d+(?:\.\d+)?)/.exec(
-    trimmed
-  );
-  if (partialMatch) {
-    return {
-      enabled: true,
-      threshold: Number(partialMatch[2]) || 2.0,
-      prefix: partialMatch[1],
-      isSimple: false,
-    };
-  }
-  return { enabled: false, threshold: 2.0, prefix: "up_mbps", isSimple: false };
-}
-
-function formatMatchRuleChip(rule: string): { display: string; tag: string | null } {
-  const trimmed = rule.trim();
-  const upper = trimmed.toUpperCase();
-  if (upper.startsWith("DOMAIN-SUFFIX,")) {
-    return { display: trimmed.slice("DOMAIN-SUFFIX,".length).trim(), tag: null };
-  }
-  if (upper.startsWith("DOMAIN,")) {
-    return { display: trimmed.slice("DOMAIN,".length).trim(), tag: "精确" };
-  }
-  if (upper.startsWith("DOMAIN-KEYWORD,")) {
-    return { display: trimmed.slice("DOMAIN-KEYWORD,".length).trim(), tag: "关键词" };
-  }
-  if (upper.startsWith("DOMAIN-REGEX,")) {
-    return { display: trimmed.slice("DOMAIN-REGEX,".length).trim(), tag: "正则" };
-  }
-  if (upper.startsWith("PROCESS-NAME,") || upper.startsWith("PROCESS-NAME-REGEX,")) {
-    const idx = trimmed.indexOf(",");
-    return { display: trimmed.slice(idx + 1).trim(), tag: "程序" };
-  }
-  if (upper.startsWith("PROCESS-PATH,") || upper.startsWith("PROCESS-PATH-REGEX,")) {
-    const idx = trimmed.indexOf(",");
-    return { display: trimmed.slice(idx + 1).trim(), tag: "路径" };
-  }
-  if (upper.startsWith("DST-PORT,") || upper.startsWith("SRC-PORT,")) {
-    const idx = trimmed.indexOf(",");
-    return { display: trimmed.slice(idx + 1).trim(), tag: "端口" };
-  }
-  if (upper.startsWith("AND,")) {
-    return { display: trimmed.slice("AND,".length).trim(), tag: "复合与" };
-  }
-  if (upper.startsWith("OR,")) {
-    return { display: trimmed.slice("OR,".length).trim(), tag: "复合或" };
-  }
-  if (upper.startsWith("NOT,")) {
-    return { display: trimmed.slice("NOT,".length).trim(), tag: "复合非" };
-  }
-  if (upper.startsWith("SUB-RULE,")) {
-    return { display: trimmed.slice("SUB-RULE,".length).trim(), tag: "子规则" };
-  }
-  if (upper.startsWith("IP-CIDR,") || upper.startsWith("IP-CIDR6,")) {
-    const idx = trimmed.indexOf(",");
-    return { display: trimmed.slice(idx + 1).trim(), tag: "IP" };
-  }
-  return { display: trimmed, tag: null };
-}
-
-const KNOWN_MATCH_RULE_TYPES = new Set<string>([
-  "DOMAIN",
-  "DOMAIN-SUFFIX",
-  "DOMAIN-KEYWORD",
-  "DOMAIN-REGEX",
-  "DOMAIN-WILDCARD",
-  "GEOSITE",
-  "GEOIP",
-  "IP-CIDR",
-  "IP-CIDR6",
-  "IP-SUFFIX",
-  "IP-ASN",
-  "SRC-IP-CIDR",
-  "SRC-PORT",
-  "DST-PORT",
-  "PROCESS-NAME",
-  "PROCESS-NAME-REGEX",
-  "PROCESS-PATH",
-  "PROCESS-PATH-REGEX",
-  "RULE-SET",
-  "NETWORK",
-  "UID",
-  "IN-TYPE",
-  "IN-USER",
-  "IN-NAME",
-  "SUB-RULE",
-  "AND",
-  "OR",
-  "NOT",
-]);
-
-const BARE_RULE_KEYWORDS = new Set<string>([
-  ...KNOWN_MATCH_RULE_TYPES,
-  "MATCH",
-  "FINAL",
-  "DIRECT",
-  "REJECT",
-  "PROXY",
-]);
-
-const DOMAIN_LIKE_RE =
-  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$/i;
-
-const INVALID_MATCH_RULE_MSG =
-  "请输入域名或完整规则（如 codeium.com / PROCESS-NAME,QQ.exe / AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))）";
-
-const NO_COMMA_SPLIT_MATCH_RULE_TYPES = new Set<string>([
-  "SUB-RULE",
-  "DOMAIN-REGEX",
-  "PROCESS-NAME-REGEX",
-  "PROCESS-PATH-REGEX",
-]);
-
-function hasStrictBalancedOuterParens(expr: string): boolean {
-  const trimmed = expr.trim();
-  if (trimmed.length < 3 || !trimmed.startsWith("(") || !trimmed.endsWith(")")) {
-    return false;
-  }
-  let depth = 0;
-  for (let i = 0; i < trimmed.length; i++) {
-    const ch = trimmed[i];
-    if (ch === "(") {
-      depth += 1;
-    } else if (ch === ")") {
-      depth -= 1;
-      if (depth < 0) return false;
-      if (depth === 0 && i < trimmed.length - 1) {
-        return false;
-      }
-    }
-  }
-  if (depth !== 0) return false;
-  const inner = trimmed.slice(1, -1).trim();
-  return inner.length > 0 && inner.startsWith("(") && inner.endsWith(")");
-}
-
-function countTopLevelLogicalChildren(parenBlock: string): number {
-  const inner = parenBlock.trim().slice(1, -1).trim();
-  if (!inner || inner === "()") return 0;
-  let depth = 0;
-  let clauseStart = 0;
-  const clauses: string[] = [];
-  for (let i = 0; i < inner.length; i++) {
-    const ch = inner[i];
-    if (ch === "(") {
-      depth += 1;
-    } else if (ch === ")") {
-      depth -= 1;
-      if (depth < 0) return -1;
-    } else if (ch === "," && depth === 0) {
-      clauses.push(inner.slice(clauseStart, i).trim());
-      clauseStart = i + 1;
-    }
-  }
-  if (depth !== 0) return -1;
-  clauses.push(inner.slice(clauseStart).trim());
-  for (const clause of clauses) {
-    if (!clause.startsWith("(") || !clause.endsWith(")")) return -1;
-    let cDepth = 0;
-    for (let j = 0; j < clause.length; j++) {
-      if (clause[j] === "(") cDepth += 1;
-      else if (clause[j] === ")") {
-        cDepth -= 1;
-        if (cDepth < 0 || (cDepth === 0 && j !== clause.length - 1)) return -1;
-      }
-    }
-    if (cDepth !== 0) return -1;
-    const body = clause.slice(1, -1).trim();
-    if (!body || !body.includes(",")) return -1;
-  }
-  return clauses.length;
-}
-
-function validateLogicalMatchRuleRest(restRaw: string, ruleType?: string): boolean {
-  const trimmed = restRaw.trim();
-  if (!trimmed.startsWith("(")) return false;
-  let depth = 0;
-  let closeIdx = -1;
-  for (let i = 0; i < trimmed.length; i++) {
-    const ch = trimmed[i];
-    if (ch === "(") {
-      depth += 1;
-    } else if (ch === ")") {
-      depth -= 1;
-      if (depth < 0) return false;
-      if (depth === 0) {
-        closeIdx = i;
-        break;
-      }
-    }
-  }
-  if (closeIdx < 0) return false;
-  const parenBlock = trimmed.slice(0, closeIdx + 1);
-  if (!hasStrictBalancedOuterParens(parenBlock)) return false;
-  const childCount = countTopLevelLogicalChildren(parenBlock);
-  if (childCount <= 0) return false;
-  if (ruleType === "NOT" && childCount !== 1) return false;
-  const tail = trimmed.slice(closeIdx + 1).trim();
-  if (!tail) return true;
-  // Allow explicit target after closing paren (e.g. AND,((...)),DIRECT),
-  // but reject top-level trailing flags (no-resolve/src) or extra commas forbidden by Mihomo.
-  if (!tail.startsWith(",")) return false;
-  const target = tail.slice(1).trim();
-  if (!target || target.includes(",")) return false;
-  const lower = target.toLowerCase();
-  if (lower === "no-resolve" || lower === "src") return false;
-  return true;
-}
-
-function normalizeSingleMatchRule(raw: string): { rule: string | null; invalid: boolean } {
-  const trimmed = raw.trim();
-  if (!trimmed) return { rule: null, invalid: false };
-
-  const commaIdx = trimmed.indexOf(",");
-  if (commaIdx !== -1) {
-    const ruleType = trimmed.slice(0, commaIdx).trim().toUpperCase();
-    const restRaw = trimmed.slice(commaIdx + 1).trim();
-    if (!KNOWN_MATCH_RULE_TYPES.has(ruleType) || !restRaw) {
-      return { rule: null, invalid: true };
-    }
-    if (ruleType === "AND" || ruleType === "OR" || ruleType === "NOT") {
-      if (!validateLogicalMatchRuleRest(restRaw, ruleType)) {
-        return { rule: null, invalid: true };
-      }
-      return { rule: `${ruleType},${restRaw}`, invalid: false };
-    }
-    if (NO_COMMA_SPLIT_MATCH_RULE_TYPES.has(ruleType)) {
-      return { rule: `${ruleType},${restRaw}`, invalid: false };
-    }
-    const restParts = restRaw
-      .split(",")
-      .map((p) => p.trim())
-      .filter((p) => p.length > 0);
-    if (restParts.length === 0) {
-      return { rule: null, invalid: true };
-    }
-    const primaryVal = restParts[0];
-    if (BARE_RULE_KEYWORDS.has(primaryVal.toUpperCase())) {
-      return { rule: null, invalid: true };
-    }
-    if (
-      (ruleType === "DOMAIN" || ruleType === "DOMAIN-SUFFIX") &&
-      !DOMAIN_LIKE_RE.test(primaryVal)
-    ) {
-      return { rule: null, invalid: true };
-    }
-    return { rule: `${ruleType},${restParts.join(",")}`, invalid: false };
-  }
-
-  if (BARE_RULE_KEYWORDS.has(trimmed.toUpperCase())) {
-    return { rule: null, invalid: true };
-  }
-
-  const cleaned = trimmed
-    .replace(/^https?:\/\//i, "")
-    .replace(/\/.*$/, "")
-    .replace(/:\d+$/, "")
-    .replace(/^\.+/, "")
-    .replace(/\.+$/, "")
-    .trim();
-
-  if (!cleaned || BARE_RULE_KEYWORDS.has(cleaned.toUpperCase()) || !DOMAIN_LIKE_RE.test(cleaned)) {
-    return { rule: null, invalid: true };
-  }
-
-  return { rule: `DOMAIN-SUFFIX,${cleaned.toLowerCase()}`, invalid: false };
-}
-
-function parseUserMatchRules(rawInput: string): { rules: string[]; invalidTokens: string[] } {
-  // Never split by comma `,` — rules like "DOMAIN-SUFFIX,anthropic.com" contain commas.
-  const segments = rawInput
-    .split(/[\r\n;；]+/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-
-  const rules: string[] = [];
-  const invalidTokens: string[] = [];
-  const seen = new Set<string>();
-
-  for (const seg of segments) {
-    const { rule, invalid } = normalizeSingleMatchRule(seg);
-    if (invalid || !rule) {
-      invalidTokens.push(seg);
-      continue;
-    }
-    if (!seen.has(rule)) {
-      seen.add(rule);
-      rules.push(rule);
-    }
-  }
-
-  return { rules, invalidTokens };
-}
-
-function normalizeGroupForBackend(group: MultiGroup, meta: TriggerMeta): MultiGroup {
-  const expr = getPrimaryTriggerExpr(group).trim();
-  const triggerRules: TriggerRule[] = expr
-    ? [
-        {
-          expr,
-          consecutive_failures: Math.max(1, Math.round(meta.consecutiveFailures)),
-          bypass_cooldown_on_disconnect: meta.bypassCooldownOnDisconnect,
-        },
-        ...(Array.isArray(group.trigger_rules) ? group.trigger_rules.slice(1) : []),
-      ]
-    : [];
-
-  let dynamicFilter: DynamicFilterSpec | null = null;
-  if (typeof group.dynamic_filter === "string") {
-    dynamicFilter = group.dynamic_filter.trim()
-      ? {
-          expr: group.dynamic_filter.trim(),
-          sub_ids: [],
-          region_codes: [],
-          max_multiplier: null,
-          protocols: [],
-          require_google_clean: false,
-          require_443_native: null,
-        }
-      : null;
-  } else if (group.dynamic_filter && typeof group.dynamic_filter === "object") {
-    const f = group.dynamic_filter as DynamicFilterSpec;
-    dynamicFilter = {
-      expr: typeof f.expr === "string" && f.expr.trim() ? f.expr.trim() : null,
-      sub_ids: Array.isArray(f.sub_ids) ? f.sub_ids : [],
-      region_codes: Array.isArray(f.region_codes) ? f.region_codes : [],
-      max_multiplier: typeof f.max_multiplier === "number" ? f.max_multiplier : null,
-      protocols: Array.isArray(f.protocols) ? f.protocols : [],
-      require_google_clean: Boolean(f.require_google_clean),
-      require_443_native: typeof f.require_443_native === "boolean" ? f.require_443_native : null,
-    };
-  }
-
-  return {
-    ...group,
-    independent_routing: Boolean(group.independent_routing),
-    dynamic_filter: dynamicFilter,
-    trigger_rules: triggerRules,
-    trigger_expr: expr || null,
-  };
-}
-
-/* ============================================================================
- * Zero-eval Safe Recursive-Descent AST Formula Parser & Evaluator
- * 100% semantically aligned with Rust `crates/catcloud-core/src/strategy/formula.rs`
- * ============================================================================ */
-
-type OpValue =
-  | "+"
-  | "-"
-  | "*"
-  | "/"
-  | "("
-  | ")"
-  | ","
-  | "!"
-  | "=="
-  | "!="
-  | "<"
-  | "<="
-  | ">"
-  | ">="
-  | "&&"
-  | "||";
-
-type Token =
-  | { kind: "num"; value: number }
-  | { kind: "ident"; value: string }
-  | { kind: "str"; value: string }
-  | { kind: "op"; value: OpValue };
-
-interface EvalContext {
-  vars: Record<string, number>;
-  probeUp: Record<string, number>;
-  probeDown: Record<string, number>;
-  probePing: Record<string, number>;
-  probeOk: Record<string, boolean>;
-  unlockedSites: Record<string, boolean>;
-}
-
-interface EvalOutcome {
-  ok: boolean;
-  value: number;
-  error: string | null;
-}
-
-function sanitizeNumber(v: number): number {
-  return Number.isFinite(v) && v !== 0 ? v : 0;
-}
-
-function isTruthy(v: number): boolean {
-  return Number.isFinite(v) && Math.abs(v) > EPSILON_ZERO;
-}
-
-function tokenizeFormula(input: string): { tokens: Token[]; error: string | null } {
-  const tokens: Token[] = [];
-  let i = 0;
-  const len = input.length;
-
-  while (i < len) {
-    const ch = input[i];
-    if (ch === " " || ch === "\t" || ch === "\n" || ch === "\r") {
-      i += 1;
-      continue;
-    }
-    const two = input.slice(i, i + 2);
-    if (
-      two === "==" ||
-      two === "!=" ||
-      two === "<=" ||
-      two === ">=" ||
-      two === "&&" ||
-      two === "||"
-    ) {
-      tokens.push({ kind: "op", value: two });
-      i += 2;
-      continue;
-    }
-    if (
-      ch === "+" ||
-      ch === "-" ||
-      ch === "*" ||
-      ch === "/" ||
-      ch === "(" ||
-      ch === ")" ||
-      ch === "," ||
-      ch === "!" ||
-      ch === "<" ||
-      ch === ">"
-    ) {
-      tokens.push({ kind: "op", value: ch });
-      i += 1;
-      continue;
-    }
-    if (ch === "=" || ch === "&" || ch === "|") {
-      return {
-        tokens: [],
-        error: `无效运算符「${ch}」（请使用 ==、&& 或 ||）`,
-      };
-    }
-    if (ch === '"' || ch === "'") {
-      const quote = ch;
-      i += 1;
-      let str = "";
-      while (i < len && input[i] !== quote) {
-        if (input[i] === "\\" && i + 1 < len) {
-          str += input[i + 1];
-          i += 2;
-          continue;
-        }
-        str += input[i];
-        i += 1;
-      }
-      if (i >= len) {
-        return { tokens: [], error: "字符串字面量缺少闭合引号" };
-      }
-      i += 1;
-      tokens.push({ kind: "str", value: str });
-      continue;
-    }
-    if (ch >= "0" && ch <= "9") {
-      let numText = "";
-      while (i < len && input[i] >= "0" && input[i] <= "9") {
-        numText += input[i];
-        i += 1;
-      }
-      if (i < len && input[i] === ".") {
-        numText += ".";
-        i += 1;
-        if (i >= len || input[i] < "0" || input[i] > "9") {
-          return { tokens: [], error: `无效数值：${numText}` };
-        }
-        while (i < len && input[i] >= "0" && input[i] <= "9") {
-          numText += input[i];
-          i += 1;
-        }
-      }
-      const parsed = Number(numText);
-      if (!Number.isFinite(parsed)) {
-        return { tokens: [], error: `无效数值：${numText}` };
-      }
-      tokens.push({ kind: "num", value: parsed });
-      continue;
-    }
-    if ((ch >= "a" && ch <= "z") || (ch >= "A" && ch <= "Z") || ch === "_") {
-      let ident = "";
-      while (
-        i < len &&
-        ((input[i] >= "a" && input[i] <= "z") ||
-          (input[i] >= "A" && input[i] <= "Z") ||
-          (input[i] >= "0" && input[i] <= "9") ||
-          input[i] === "_")
-      ) {
-        ident += input[i];
-        i += 1;
-      }
-      tokens.push({ kind: "ident", value: ident });
-      continue;
-    }
-    return { tokens: [], error: `非法字符：「${ch}」` };
-  }
-
-  return { tokens, error: null };
-}
-
-function lookupSiteUnlockedRaw(
-  unlockedSites: Record<string, boolean>,
-  siteName: string
-): boolean | null {
-  const findKey = (target: string): boolean | null => {
-    if (target in unlockedSites) {
-      return unlockedSites[target];
-    }
-    const targetLower = target.toLowerCase();
-    for (const [k, v] of Object.entries(unlockedSites)) {
-      if (k.toLowerCase() === targetLower) {
-        return v;
-      }
-    }
-    return null;
-  };
-
-  const direct = findKey(siteName);
-  if (direct !== null) return direct;
-
-  const lower = siteName.toLowerCase();
-  if (lower === "google_ai" || lower === "gemini" || lower === "gemini_aistudio") {
-    for (const alias of ["gemini", "gemini_aistudio", "google_ai"]) {
-      if (alias === lower) continue;
-      const hit = findKey(alias);
-      if (hit !== null) return hit;
-    }
-  }
-  return null;
-}
-
-function evaluateFormulaSafely(expr: string, ctx: EvalContext): EvalOutcome {
-  const trimmed = expr.trim();
-  if (!trimmed) {
-    return { ok: false, value: 0, error: "公式不能为空" };
-  }
-  const lexed = tokenizeFormula(trimmed);
-  if (lexed.error) {
-    return { ok: false, value: 0, error: lexed.error };
-  }
-  const tokens = lexed.tokens;
-  let pos = 0;
-
-  const peek = (): Token | undefined => tokens[pos];
-  const consume = (): Token | undefined => {
-    const t = tokens[pos];
-    pos += 1;
-    return t;
-  };
-
-  const parseOr = (): number => {
-    let left = parseAnd();
-    while (true) {
-      const t = peek();
-      if (t && t.kind === "op" && t.value === "||") {
-        consume();
-        const right = parseAnd();
-        left = isTruthy(left) || isTruthy(right) ? 1 : 0;
-      } else {
-        break;
-      }
-    }
-    return left;
-  };
-
-  const parseAnd = (): number => {
-    let left = parseEquality();
-    while (true) {
-      const t = peek();
-      if (t && t.kind === "op" && t.value === "&&") {
-        consume();
-        const right = parseEquality();
-        left = isTruthy(left) && isTruthy(right) ? 1 : 0;
-      } else {
-        break;
-      }
-    }
-    return left;
-  };
-
-  const parseEquality = (): number => {
-    let left = parseComparison();
-    while (true) {
-      const t = peek();
-      if (t && t.kind === "op" && (t.value === "==" || t.value === "!=")) {
-        consume();
-        const right = parseComparison();
-        left =
-          t.value === "=="
-            ? Math.abs(left - right) <= EPSILON_EQ
-              ? 1
-              : 0
-            : Math.abs(left - right) > EPSILON_EQ
-              ? 1
-              : 0;
-      } else {
-        break;
-      }
-    }
-    return left;
-  };
-
-  const parseComparison = (): number => {
-    let left = parseAdditive();
-    while (true) {
-      const t = peek();
-      if (
-        t &&
-        t.kind === "op" &&
-        (t.value === "<" || t.value === "<=" || t.value === ">" || t.value === ">=")
-      ) {
-        consume();
-        const right = parseAdditive();
-        if (t.value === "<") left = left < right - EPSILON_EQ ? 1 : 0;
-        else if (t.value === "<=") left = left <= right + EPSILON_EQ ? 1 : 0;
-        else if (t.value === ">") left = left > right + EPSILON_EQ ? 1 : 0;
-        else left = left >= right - EPSILON_EQ ? 1 : 0;
-      } else {
-        break;
-      }
-    }
-    return left;
-  };
-
-  const parseAdditive = (): number => {
-    let left = parseMultiplicative();
-    while (true) {
-      const t = peek();
-      if (t && t.kind === "op" && (t.value === "+" || t.value === "-")) {
-        consume();
-        const right = parseMultiplicative();
-        left = sanitizeNumber(t.value === "+" ? left + right : left - right);
-      } else {
-        break;
-      }
-    }
-    return left;
-  };
-
-  const parseMultiplicative = (): number => {
-    let left = parseUnary();
-    while (true) {
-      const t = peek();
-      if (t && t.kind === "op" && (t.value === "*" || t.value === "/")) {
-        consume();
-        const right = parseUnary();
-        if (t.value === "/") {
-          left =
-            !Number.isFinite(right) || Math.abs(right) <= EPSILON_ZERO
-              ? 0
-              : sanitizeNumber(left / right);
-        } else {
-          left = sanitizeNumber(left * right);
-        }
-      } else {
-        break;
-      }
-    }
-    return left;
-  };
-
-  const parseUnary = (): number => {
-    const t = peek();
-    if (t && t.kind === "op" && t.value === "-") {
-      consume();
-      return sanitizeNumber(-parseUnary());
-    }
-    if (t && t.kind === "op" && t.value === "!") {
-      consume();
-      return isTruthy(parseUnary()) ? 0 : 1;
-    }
-    return parsePrimary();
-  };
-
-  const parsePrimary = (): number => {
-    const t = peek();
-    if (!t) {
-      throw new Error("表达式提前结束");
-    }
-    if (t.kind === "num") {
-      consume();
-      return sanitizeNumber(t.value);
-    }
-    if (t.kind === "op" && t.value === "(") {
-      consume();
-      const val = parseOr();
-      const closing = consume();
-      if (!closing || closing.kind !== "op" || closing.value !== ")") {
-        throw new Error("缺少右括号 )");
-      }
-      return val;
-    }
-    if (t.kind === "ident") {
-      consume();
-      const name = t.value;
-      const next = peek();
-      if (next && next.kind === "op" && next.value === "(") {
-        consume(); // '('
-        if (
-          name === "probe_up" ||
-          name === "probe_down" ||
-          name === "probe_ping" ||
-          name === "probe_ok" ||
-          name === "site_unlocked"
-        ) {
-          const arg = consume();
-          if (!arg || arg.kind !== "str" || !arg.value.trim()) {
-            throw new Error(`${name} 需要非空字符串参数`);
-          }
-          const close = consume();
-          if (!close || close.kind !== "op" || close.value !== ")") {
-            throw new Error(`${name} 缺少闭合括号`);
-          }
-          if (name === "probe_up") {
-            const v = ctx.probeUp[arg.value];
-            return sanitizeNumber(typeof v === "number" && Number.isFinite(v) ? v : (ctx.vars.up_mbps ?? 0));
-          }
-          if (name === "probe_down") {
-            const v = ctx.probeDown[arg.value];
-            return sanitizeNumber(typeof v === "number" && Number.isFinite(v) ? v : (ctx.vars.down_mbps ?? 0));
-          }
-          if (name === "probe_ping") {
-            const p = ctx.probePing[arg.value];
-            if (typeof p === "number" && Number.isFinite(p)) return p;
-            const fallbackPing = ctx.vars.ping_ms;
-            return typeof fallbackPing === "number" && Number.isFinite(fallbackPing)
-              ? fallbackPing
-              : DEFAULT_MISSING_PING_MS;
-          }
-          if (name === "probe_ok") {
-            return ctx.probeOk[arg.value] === true ? 1 : 0;
-          }
-          return lookupSiteUnlockedRaw(ctx.unlockedSites, arg.value) === true ? 1 : 0;
-        }
-
-        const args: number[] = [];
-        const afterOpen = peek();
-        if (!(afterOpen && afterOpen.kind === "op" && afterOpen.value === ")")) {
-          args.push(parseOr());
-          while (true) {
-            const sep = peek();
-            if (sep && sep.kind === "op" && sep.value === ",") {
-              consume();
-              args.push(parseOr());
-            } else {
-              break;
-            }
-          }
-        }
-        const close = consume();
-        if (!close || close.kind !== "op" || close.value !== ")") {
-          throw new Error(`函数 ${name} 缺少闭合括号`);
-        }
-        if (name === "min" && args.length === 2) return sanitizeNumber(Math.min(args[0], args[1]));
-        if (name === "max" && args.length === 2) return sanitizeNumber(Math.max(args[0], args[1]));
-        if (name === "abs" && args.length === 1) return sanitizeNumber(Math.abs(args[0]));
-        if (name === "clamp" && args.length === 3) {
-          const lo = Math.min(args[1], args[2]);
-          const hi = Math.max(args[1], args[2]);
-          return sanitizeNumber(Math.min(hi, Math.max(lo, args[0])));
-        }
-        if (name === "if" && args.length === 3) {
-          return isTruthy(args[0]) ? args[1] : args[2];
-        }
-        throw new Error(`不支持的函数或参数数量错误：${name}`);
-      }
-
-      if (name === "true") return 1;
-      if (name === "false") return 0;
-      if (name in ctx.vars) {
-        return sanitizeNumber(ctx.vars[name]);
-      }
-      throw new Error(`未知变量：${name}`);
-    }
-    throw new Error("公式语法结构不合法");
-  };
-
-  try {
-    const val = parseOr();
-    if (pos < tokens.length) {
-      return { ok: false, value: 0, error: "公式末尾存在多余标记" };
-    }
-    if (!Number.isFinite(val)) {
-      return { ok: false, value: 0, error: "计算结果溢出或非有限数" };
-    }
-    return { ok: true, value: sanitizeNumber(val), error: null };
-  } catch (err) {
-    return {
-      ok: false,
-      value: 0,
-      error: err instanceof Error ? err.message : "公式解析失败",
-    };
-  }
-}
-
-function buildEvalContextForNode(node: ProxyNode, snap: ProbeSnapshot | undefined): EvalContext {
-  const unlockedEntries = snap ? Object.values(snap.unlocked_sites) : [];
-  const allUnlocked = unlockedEntries.length > 0 && unlockedEntries.every(Boolean);
-  const ok = snap?.ok ?? false;
-  const validLatencyMs =
-    typeof snap?.latency_ms === "number" &&
-    Number.isFinite(snap.latency_ms) &&
-    snap.latency_ms > 0
-      ? snap.latency_ms
-      : null;
-  const effectivePingMs = validLatencyMs ?? MISSING_LATENCY_PENALTY_MS;
-
-  return {
-    vars: {
-      up_mbps: snap?.up_mbps ?? 0,
-      down_mbps: snap?.down_mbps ?? 0,
-      ping_ms: effectivePingMs,
-      latency_ms: effectivePingMs,
-      jitter_ms: snap?.jitter_ms ?? 0,
-      loss_pct: snap?.loss_pct ?? (ok ? 0 : 100),
-      multiplier: Number.isFinite(node.multiplier) && node.multiplier >= 0 ? node.multiplier : 1,
-      keepalive_ok: snap?.keepalive_60s_ok === true ? 1 : 0,
-      google_clean: snap?.google_clean === true ? 1 : 0,
-      ip_clean: snap?.ip_clean === true ? 1 : 0,
-      unlocked: allUnlocked ? 1 : 0,
-      is_443_native: node.is_443_native ? 1 : 0,
-      ok: ok ? 1 : 0,
-    },
-    probeUp: snap?.per_probe_up_mbps ?? {},
-    probeDown: snap?.per_probe_down_mbps ?? {},
-    probePing: snap?.per_probe_ping_ms ?? {},
-    probeOk: snap?.per_probe_ok ?? {},
-    unlockedSites: snap?.unlocked_sites ?? {},
-  };
-}
-
-function checkHardGate(gate: string, ctx: EvalContext): boolean {
-  const res = evaluateFormulaSafely(gate, ctx);
-  return res.ok && isTruthy(res.value);
-}
-
-/**
- * Human-friendly gate check:
- * - Never marks untested nodes as "failed" or "rejected"!
- * - Only returns `failedReasons` when the node has an actual measured value that violates a gate.
- */
-interface NodeGateAssessment {
-  hasMeasuredFailure: boolean;
-  failedReasons: string[];
-  allMeasuredAndPassed: boolean;
-}
-
-function assessNodeAgainstGates(
-  node: ProxyNode,
-  snap: ProbeSnapshot | undefined,
-  hardGates: string[]
-): NodeGateAssessment {
-  if (hardGates.length === 0 || !snap) {
-    return { hasMeasuredFailure: false, failedReasons: [], allMeasuredAndPassed: false };
-  }
-
-  const failedReasons: string[] = [];
-  let untestedCount = 0;
-  let lazyCtx: EvalContext | null = null;
-
-  for (const gate of hardGates) {
-    const compact = gate.replace(/\s+/g, "");
-    if (compact === "google_clean==1") {
-      if (snap.google_clean === null || snap.google_clean === undefined) {
-        untestedCount += 1;
-      } else if (snap.google_clean === false) {
-        failedReasons.push("谷歌地区异常");
-      }
-      continue;
-    }
-    if (compact === "keepalive_ok==1") {
-      if (snap.keepalive_60s_ok === null || snap.keepalive_60s_ok === undefined) {
-        untestedCount += 1;
-      } else if (snap.keepalive_60s_ok === false) {
-        failedReasons.push("60秒长连接未通过");
-      }
-      continue;
-    }
-    if (compact === "ip_clean==1") {
-      if (snap.ip_clean === null || snap.ip_clean === undefined) {
-        untestedCount += 1;
-      } else if (snap.ip_clean === false) {
-        failedReasons.push(
-          snap.ip_risk_level === "proxy_risk" ? "出口 IP 高危代理风控" : "非纯净住宅 IP"
-        );
-      }
-      continue;
-    }
-    const siteMatch = /^site_unlocked\(["']([^"']+)["']\)==1$/.exec(compact);
-    if (siteMatch) {
-      const siteKey = siteMatch[1];
-      if (siteKey.toLowerCase() === "windsurf" || siteKey.toLowerCase() === "builtin_unlock_windsurf") {
-        const ws = resolveWindsurfUnlockDisplay(snap);
-        if (ws.state === "untested" || ws.state === "legacy_retest") {
-          untestedCount += 1;
-        } else if (!ws.unlocked) {
-          failedReasons.push(ws.state === "proxy_risk" ? "Windsurf 出口代理风控" : "Windsurf 未解锁");
-        }
-        continue;
-      }
-      const measured = lookupSiteUnlockedRaw(snap.unlocked_sites ?? {}, siteKey);
-      if (measured === null) {
-        untestedCount += 1;
-      } else if (measured === false) {
-        const label = SITE_FRIENDLY_NAMES[siteKey.toLowerCase()] ?? siteKey;
-        failedReasons.push(`${label} 未解锁`);
-      }
-      continue;
-    }
-    // Custom / compound gate expression: neutrally allow untested keepalive_ok & ip_clean independently (matching Rust evaluator)
-    if (!lazyCtx) {
-      lazyCtx = buildEvalContextForNode(node, snap);
-    }
-    let patchedVars = lazyCtx.vars;
-    let patched = false;
-    if (
-      (snap.keepalive_60s_ok === null || snap.keepalive_60s_ok === undefined) &&
-      gate.includes("keepalive_ok")
-    ) {
-      patchedVars = { ...patchedVars, keepalive_ok: 1 };
-      patched = true;
-    }
-    if (
-      (snap.ip_clean === null || snap.ip_clean === undefined) &&
-      gate.includes("ip_clean")
-    ) {
-      patchedVars = { ...patchedVars, ip_clean: 1 };
-      patched = true;
-    }
-    const evalCtx = patched ? { ...lazyCtx, vars: patchedVars } : lazyCtx;
-    if (!checkHardGate(gate, evalCtx)) {
-      failedReasons.push(gate);
-    }
-  }
-
-  return {
-    hasMeasuredFailure: failedReasons.length > 0,
-    failedReasons,
-    allMeasuredAndPassed: failedReasons.length === 0 && untestedCount === 0,
-  };
-}
-
-function formatLatencyTone(ms: number): string {
-  if (ms <= 140) return "var(--green)";
-  if (ms <= 300) return "var(--amber)";
-  return "var(--red)";
-}
-
-function formatMultiplierLabel(multiplier: number): string {
-  if (!Number.isFinite(multiplier)) return "1x";
-  return Number.isInteger(multiplier) ? `${multiplier}x` : `${Number(multiplier.toFixed(2))}x`;
-}
-
-function extractCardAiDots(snap: ProbeSnapshot | undefined): Array<{
-  id: string;
-  label: string;
-  short: string;
-  tone: AiBadgeTone;
-  isLegacy: boolean;
-}> {
-  if (!snap) return [];
-  return getNodeAiBadgeDisplays(snap)
-    .filter(
-      (b) =>
-        b.unlocked ||
-        b.windsurfState === "proxy_risk" ||
-        b.windsurfState === "legacy_retest"
-    )
-    .map((b) => ({
-      id: b.id,
-      label: b.tooltip,
-      short: b.dotLabel,
-      tone: b.tone,
-      isLegacy: b.windsurfState === "legacy_retest",
-    }));
-}
-
-function isNodeAiReady(snap: ProbeSnapshot | undefined): boolean {
-  return hasVerifiedAiUnlock(snap);
-}
-
-/* ============================================================================
- * Main Component: Three-Column Human-Friendly Smart Multi-Group Workbench
- * ============================================================================ */
 
 interface MultiGroupDraftCache {
   dirtyGroupIds: Record<string, boolean>;
@@ -1403,38 +79,6 @@ let multiGroupDraftCache: MultiGroupDraftCache = {
   draftGroupsById: {},
   triggerMetas: {},
 };
-
-function formatGroupLatencyTooltip(
-  resolved: ResolvedNodeLatency,
-  dict: ReturnType<typeof useUiDict>,
-  hint?: NodeHealthHint | null
-): string {
-  const tipKey = getLatencyTooltipKey(resolved);
-  const base =
-    tipKey === "probeHot"
-      ? dict.latency.probeHotTooltip
-      : tipKey === "healthCold"
-        ? dict.latency.healthColdTooltip
-        : tipKey === "failed"
-          ? dict.latency.failedTooltip
-          : dict.latency.untestedTooltip;
-  const tags: string[] = [];
-  if (resolved.isProbation) tags.push(dict.latency.probationBadge);
-  if (resolved.isDegraded) tags.push(dict.latency.degradedBadge);
-  if (hint?.status === "cooldown") {
-    tags.push(
-      hint.cooldown_remaining_sec > 0
-        ? formatI18nTemplate(dict.latency.cooldownSec, {
-            sec: Math.ceil(hint.cooldown_remaining_sec),
-          })
-        : dict.latency.cooldownActive
-    );
-  }
-  if (hint?.reason?.trim()) {
-    tags.push(`${dict.latency.reasonPrefix}${hint.reason.trim()}`);
-  }
-  return tags.length > 0 ? `${base} · ${tags.join(" · ")}` : base;
-}
 
 const isStringPref = (raw: unknown): string | undefined =>
   typeof raw === "string" ? raw : undefined;
@@ -1461,8 +105,12 @@ export function MultiGroupPage() {
   const nodes = useAppSelector((s) => s.nodes);
   const probes = useAppSelector((s) => s.probes);
   const subscriptions = useAppSelector((s) => s.subscriptions);
-  const runtime = useAppSelector((s) => s.runtime);
-  const isGroupMode = runtime.route_mode !== "single";
+  const runtimeRouteMode = useAppSelector((s) => s.runtime.route_mode);
+  const runtimeActiveGroupId = useAppSelector((s) => s.runtime.active_group_id);
+  const runtimeActiveNodeId = useAppSelector((s) => s.runtime.active_node_id);
+  const runtimeActiveNodeName = useAppSelector((s) => s.runtime.active_node_name);
+  const runtimeNodeHealthHints = useAppSelector((s) => s.runtime.node_health_hints);
+  const isGroupMode = runtimeRouteMode !== "single";
   const initialized = useAppSelector((s) => s.initialized);
   const probingNodeIds = useAppSelector((s) => s.bgTasks.groups.probingNodeIds);
   const evaluatingGroupId = useAppSelector((s) => s.bgTasks.groups.evaluatingGroupId);
@@ -1470,7 +118,6 @@ export function MultiGroupPage() {
   const isProbeEngineBusy = useAppSelector(selectIsProbeEngineBusy);
   const benchmarkRunning = useAppSelector((s) => s.bgTasks.preaccel.benchmark.running);
   const savedDraftSelectedId = useAppSelector((s) => s.sessionDrafts.multiGroup.selectedId);
-  const multiGroupCreateHint = useAppSelector((s) => s.multiGroupCreateHint);
   const inTauri = isTauriEnv();
 
   // Local group drafts (keeps unsaved strategy edits per group while syncing live active_node_id & members)
@@ -1487,7 +134,7 @@ export function MultiGroupPage() {
     })
   );
   const [selectedId, setSelectedId] = useState<string>(
-    () => savedDraftSelectedId || runtime.active_group_id || storeGroups[0]?.id || ""
+    () => savedDraftSelectedId || runtimeActiveGroupId || storeGroups[0]?.id || ""
   );
   const [triggerMetas, setTriggerMetas] = useState<Record<string, TriggerMeta>>(() => ({
     ...multiGroupDraftCache.triggerMetas,
@@ -1495,14 +142,6 @@ export function MultiGroupPage() {
   const [dirtyGroupIds, setDirtyGroupIds] = useState<Record<string, boolean>>(() => ({
     ...multiGroupDraftCache.dirtyGroupIds,
   }));
-
-  // Left sidebar: create form & two-step delete confirmation
-  const [showCreateForm, setShowCreateForm] = useState(false);
-  const [newGroupName, setNewGroupName] = useState("");
-  const [newGroupTemplate, setNewGroupTemplate] = useState<CreateTemplateId>("manual");
-  const [creatingGroup, setCreatingGroup] = useState(false);
-  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
-  const [deletingGroupId, setDeletingGroupId] = useState<string | null>(null);
 
   // Center pane: inline rename, filters (persisted across tab switches & reloads), pagination, batch clear confirm, single-node actions
   const [editingName, setEditingName] = useState(false);
@@ -1602,7 +241,6 @@ export function MultiGroupPage() {
   dirtyGroupIdsRef.current = dirtyGroupIds;
   const latestMembersRef = useRef<Record<string, string[]>>({});
   const memberReqSeqRef = useRef<Record<string, number>>({});
-  const deleteConfirmTimerRef = useRef<number | null>(null);
   const clearConfirmTimerRef = useRef<number | null>(null);
   const section5Ref = useRef<HTMLDivElement | null>(null);
   const pendingScrollSection5Ref = useRef(false);
@@ -1636,24 +274,11 @@ export function MultiGroupPage() {
   }, [savedDraftSelectedId, storeGroups]);
 
   useEffect(() => {
-    if (!multiGroupCreateHint) return;
-    setNewGroupTemplate(multiGroupCreateHint);
-    setShowCreateForm(true);
-    if (multiGroupCreateHint === "wsf") {
-      setNewGroupName((prev) => prev.trim() || "WSF / Devin 纯净专用");
-    }
-    appActions.consumeMultiGroupCreateHint();
-  }, [multiGroupCreateHint]);
-
-  useEffect(() => {
     return () => {
-      if (deleteConfirmTimerRef.current !== null) window.clearTimeout(deleteConfirmTimerRef.current);
       if (clearConfirmTimerRef.current !== null) window.clearTimeout(clearConfirmTimerRef.current);
     };
   }, []);
 
-  // Track xl (>=1280px) viewport breakpoint: 3-column inline docked drawer on >=1280px,
-  // slide-over Portal drawer below 1280px so the center node grid never collapses.
   useEffect(() => {
     if (typeof window === "undefined") return;
     const mq = window.matchMedia("(min-width: 1280px)");
@@ -1704,8 +329,8 @@ export function MultiGroupPage() {
     });
     setSelectedId((prev) => {
       if (prev && storeGroups.some((g) => g.id === prev)) return prev;
-      if (runtime.active_group_id && storeGroups.some((g) => g.id === runtime.active_group_id)) {
-        return runtime.active_group_id;
+      if (runtimeActiveGroupId && storeGroups.some((g) => g.id === runtimeActiveGroupId)) {
+        return runtimeActiveGroupId;
       }
       return storeGroups[0]?.id ?? "";
     });
@@ -1722,9 +347,8 @@ export function MultiGroupPage() {
       }
       return changed ? next : prev;
     });
-  }, [storeGroups, initialized, runtime.active_group_id]);
+  }, [storeGroups, initialized, runtimeActiveGroupId]);
 
-  // Persist selectedId & dirty draft flag to sessionDrafts (and keep unsaved strategy edits across route switches)
   useEffect(() => {
     if (selectedId && selectedId !== appStore.getState().sessionDrafts.multiGroup.selectedId) {
       appActions.patchSessionDraft("multiGroup", { selectedId });
@@ -1797,7 +421,7 @@ export function MultiGroupPage() {
     filterAiReady,
   ]);
 
-  // Debounced backend authoritative formula validation in Tauri runtime (only when advanced panel is open or dirty)
+  // Debounced backend authoritative formula validation in Tauri runtime (only when advanced panel is open)
   const currentFormulaExpr = selectedGroup?.formula_expr ?? "";
   useEffect(() => {
     if (!inTauri || !selectedGroup || !advancedOpen) {
@@ -1912,7 +536,7 @@ export function MultiGroupPage() {
     ) {
       setFilterRegion("all");
     }
-  }, [regionStats, filterContinent, filterRegion]);
+  }, [regionStats, filterContinent, filterRegion, setFilterContinent, setFilterRegion]);
 
   const effectiveSelectedMemberIds = useMemo(() => {
     if (!selectedGroup) return [] as string[];
@@ -1949,8 +573,7 @@ export function MultiGroupPage() {
     setNodePage(1);
   };
 
-  // Only bind live probe/member/active dependencies when needed (members view, metric sort, or health filters)
-  // so streaming probe updates never re-filter/re-sort all 430+ nodes in default "all" view.
+  // Only bind live probe/member/active dependencies when needed
   const memberFilterSet = viewMode === "members" ? memberIdSet : null;
   const memberActiveId =
     viewMode === "members" ? (selectedGroup?.active_node_id ?? null) : null;
@@ -1958,7 +581,6 @@ export function MultiGroupPage() {
     viewMode === "members" || sortMode !== "default" || filterGoogleClean || filterAiReady;
   const activeFilterProbes = needsLiveProbes ? probes : null;
 
-  // Filter & stably sort nodes for the main grid
   const filteredNodes = useMemo(() => {
     const q = searchQuery.trim().toLowerCase();
     const list = enabledNodes.filter((node) => {
@@ -1970,7 +592,7 @@ export function MultiGroupPage() {
       if (filterGoogleClean && activeFilterProbes?.[node.id]?.google_clean !== true) {
         return false;
       }
-      if (filterAiReady && !isNodeAiReady(activeFilterProbes?.[node.id])) {
+      if (filterAiReady && !hasVerifiedAiUnlock(activeFilterProbes?.[node.id])) {
         return false;
       }
       if (q) {
@@ -1988,7 +610,7 @@ export function MultiGroupPage() {
     const pinnedActive = usePinned ? pinnedOrder.activeId : null;
     const pinnedMembers = usePinned ? pinnedOrder.memberIds : null;
 
-    const healthHints = runtime.node_health_hints;
+    const healthHints = runtimeNodeHealthHints;
     const getMetricRank = (
       nodeId: string,
       snap: ProbeSnapshot | undefined
@@ -2015,7 +637,6 @@ export function MultiGroupPage() {
         }
         return { tier: 1, primary: lat, secondary: 0 };
       }
-      // latency_asc
       if (resolved.latencyMs !== null) {
         return { tier: 0, primary: resolved.latencyMs, secondary: -(validUp ?? -1) };
       }
@@ -2049,7 +670,6 @@ export function MultiGroupPage() {
         if (aLat !== bLat) return aLat - bLat;
         return a.name.localeCompare(b.name);
       }
-      // In "all" view, keep active/initial members upfront without jumping mid-click
       if (!pinnedMembers) return 0;
       const aWeight = a.id === pinnedActive ? 2 : pinnedMembers.has(a.id) ? 1 : 0;
       const bWeight = b.id === pinnedActive ? 2 : pinnedMembers.has(b.id) ? 1 : 0;
@@ -2074,7 +694,7 @@ export function MultiGroupPage() {
     selectedGroupId,
     memberActiveId,
     activeFilterProbes,
-    runtime.node_health_hints,
+    runtimeNodeHealthHints,
   ]);
 
   const totalNodePages = Math.max(1, Math.ceil(filteredNodes.length / nodePageSize));
@@ -2089,7 +709,6 @@ export function MultiGroupPage() {
     [filteredNodes, safeNodePage, nodePageSize]
   );
 
-  // Count how many nodes in current filter are not yet in the active group
   const unjoinedInFilterIds = useMemo(() => {
     const ids: string[] = [];
     for (const n of filteredNodes) {
@@ -2098,7 +717,6 @@ export function MultiGroupPage() {
     return ids;
   }, [filteredNodes, memberIdSet]);
 
-  // Gentle group-level health notice: ONLY warn if gates exist AND tested members exist AND all tested members failed
   const measuredMemberNotice = useMemo(() => {
     if (!selectedGroup || selectedGroup.hard_gates.length === 0) return null;
     let testedMemberCount = 0;
@@ -2117,9 +735,8 @@ export function MultiGroupPage() {
     return null;
   }, [selectedGroup, nodeById, probes]);
 
-  // Derived strategy values for right drawer
   const currentTriggerMeta: TriggerMeta = selectedGroup
-    ? triggerMetas[selectedGroup.id] ?? getPrimaryTriggerMeta(selectedGroup)
+    ? (triggerMetas[selectedGroup.id] ?? getPrimaryTriggerMeta(selectedGroup))
     : { consecutiveFailures: 2, bypassCooldownOnDisconnect: true };
 
   const currentTriggerExpr = selectedGroup ? getPrimaryTriggerExpr(selectedGroup) : "";
@@ -2142,7 +759,6 @@ export function MultiGroupPage() {
     [groups, selectedGroup]
   );
 
-  // Formula syntax check (only needed for advanced section)
   const formulaSyntaxCheck = useMemo(() => {
     if (!selectedGroup) return { ok: true, error: null as string | null, source: "local" as const };
     if (
@@ -2185,10 +801,6 @@ export function MultiGroupPage() {
     ? formatDynamicFilter(selectedGroup.dynamic_filter)
     : "";
 
-  /* ============================================================================
-   * Action Handlers
-   * ============================================================================ */
-
   const updateSelectedGroup = (updater: (group: MultiGroup) => MultiGroup) => {
     if (!selectedGroup) return;
     setGroups((prev) => prev.map((g) => (g.id === selectedGroup.id ? updater(g) : g)));
@@ -2220,128 +832,149 @@ export function MultiGroupPage() {
     });
   };
 
-  /** Optimistically update member_node_ids with sequence guard to survive rapid multi-clicks */
-  const persistGroupMembers = async (
-    groupId: string,
-    nextMemberIds: string[],
-    toastText?: string
-  ): Promise<boolean> => {
-    const prevIds =
-      latestMembersRef.current[groupId] ??
-      groups.find((g) => g.id === groupId)?.member_node_ids ??
-      [];
-    const uniqueNext = Array.from(new Set(nextMemberIds));
-    latestMembersRef.current[groupId] = uniqueNext;
+  const groupsRef = useRef(groups);
+  groupsRef.current = groups;
+  const selectedGroupRef = useRef(selectedGroup);
+  selectedGroupRef.current = selectedGroup;
+  const storeGroupsRef = useRef(storeGroups);
+  storeGroupsRef.current = storeGroups;
+  const runtimeRouteModeRef = useRef(runtimeRouteMode);
+  runtimeRouteModeRef.current = runtimeRouteMode;
+  const runtimeActiveGroupIdRef = useRef(runtimeActiveGroupId);
+  runtimeActiveGroupIdRef.current = runtimeActiveGroupId;
+  const probingNodeIdSetRef = useRef(probingNodeIdSet);
+  probingNodeIdSetRef.current = probingNodeIdSet;
+  const isProbeEngineBusyRef = useRef(isProbeEngineBusy);
+  isProbeEngineBusyRef.current = isProbeEngineBusy;
+  const selectingNodeIdRef = useRef(selectingNodeId);
+  selectingNodeIdRef.current = selectingNodeId;
 
-    const seq = (memberReqSeqRef.current[groupId] ?? 0) + 1;
-    memberReqSeqRef.current[groupId] = seq;
+  const persistGroupMembers = useCallback(
+    async (groupId: string, nextMemberIds: string[], toastText?: string): Promise<boolean> => {
+      const prevIds =
+        latestMembersRef.current[groupId] ??
+        groupsRef.current.find((g) => g.id === groupId)?.member_node_ids ??
+        [];
+      const uniqueNext = Array.from(new Set(nextMemberIds));
+      latestMembersRef.current[groupId] = uniqueNext;
 
-    // Optimistic state + store sync
-    setGroups((prev) =>
-      prev.map((g) => (g.id === groupId ? { ...g, member_node_ids: uniqueNext } : g))
-    );
-    appActions.syncGroups(
-      appStore
-        .getState()
-        .groups.map((g) => (g.id === groupId ? { ...g, member_node_ids: uniqueNext } : g))
-    );
+      const seq = (memberReqSeqRef.current[groupId] ?? 0) + 1;
+      memberReqSeqRef.current[groupId] = seq;
 
-    try {
-      const saved = await catcloudApi.updateMultiGroupMembers(groupId, uniqueNext);
-      if (memberReqSeqRef.current[groupId] === seq) {
-        latestMembersRef.current[groupId] = saved.member_node_ids;
-        setGroups((prev) =>
-          prev.map((g) =>
-            g.id === groupId
-              ? {
-                  ...g,
-                  member_node_ids: saved.member_node_ids,
-                  active_node_id: saved.active_node_id,
-                }
-              : g
-          )
-        );
-        appActions.syncGroups(
-          appStore.getState().groups.map((g) =>
-            g.id === groupId
-              ? {
-                  ...g,
-                  member_node_ids: saved.member_node_ids,
-                  active_node_id: saved.active_node_id,
-                }
-              : g
-          )
-        );
-        if (toastText) appActions.showToast(toastText, "ok");
-      }
-      return true;
-    } catch (err) {
-      if (memberReqSeqRef.current[groupId] === seq) {
-        latestMembersRef.current[groupId] = prevIds;
-        setGroups((prev) =>
-          prev.map((g) => (g.id === groupId ? { ...g, member_node_ids: prevIds } : g))
-        );
-        appActions.syncGroups(
-          appStore
-            .getState()
-            .groups.map((g) => (g.id === groupId ? { ...g, member_node_ids: prevIds } : g))
-        );
-        appActions.showToast(`更新组成员失败：${formatErrorMessage(err)}`, "warn");
-      }
-      return false;
-    }
-  };
-
-  const handleToggleNodeMembership = (node: ProxyNode) => {
-    if (!selectedGroup) return;
-    const currentIds =
-      latestMembersRef.current[selectedGroup.id] ?? selectedGroup.member_node_ids;
-    const exists = currentIds.includes(node.id);
-    if (exists && selectedGroup.active_node_id === node.id) {
-      appActions.showToast("当前正在使用这个节点，请先切到其它节点再移出", "info");
-      return;
-    }
-    const nextIds = exists
-      ? currentIds.filter((id) => id !== node.id)
-      : [...currentIds, node.id];
-    void persistGroupMembers(selectedGroup.id, nextIds);
-  };
-
-  const handleUseNode = async (node: ProxyNode) => {
-    if (!selectedGroup || selectingNodeId === node.id) return;
-    setSelectingNodeId(node.id);
-    try {
-      const currentIds =
-        latestMembersRef.current[selectedGroup.id] ?? selectedGroup.member_node_ids;
-      if (!currentIds.includes(node.id)) {
-        const joined = await persistGroupMembers(selectedGroup.id, [...currentIds, node.id]);
-        if (!joined) return;
-      }
-      const closeOld = selectedGroup.switch_mode === "force_close_old";
-      const persistedGroup = storeGroups.find((g) => g.id === selectedGroup.id);
-      const isSecondaryIndependent =
-        Boolean(persistedGroup?.independent_routing) &&
-        runtime.route_mode === "group" &&
-        Boolean(runtime.active_group_id) &&
-        selectedGroup.id !== runtime.active_group_id;
-      await appActions.selectGroupNode(
-        selectedGroup.id,
-        node.id,
-        closeOld,
-        isSecondaryIndependent ? false : undefined
-      );
       setGroups((prev) =>
-        prev.map((g) => (g.id === selectedGroup.id ? { ...g, active_node_id: node.id } : g))
+        prev.map((g) => (g.id === groupId ? { ...g, member_node_ids: uniqueNext } : g))
       );
-    } finally {
-      setSelectingNodeId(null);
-    }
-  };
+      appActions.syncGroups(
+        appStore
+          .getState()
+          .groups.map((g) => (g.id === groupId ? { ...g, member_node_ids: uniqueNext } : g))
+      );
 
-  const handleProbeSingleNode = async (node: ProxyNode) => {
-    if (probingNodeIdSet.has(node.id) || isProbeEngineBusy) return;
+      try {
+        const saved = await catcloudApi.updateMultiGroupMembers(groupId, uniqueNext);
+        if (memberReqSeqRef.current[groupId] === seq) {
+          latestMembersRef.current[groupId] = saved.member_node_ids;
+          setGroups((prev) =>
+            prev.map((g) =>
+              g.id === groupId
+                ? {
+                    ...g,
+                    member_node_ids: saved.member_node_ids,
+                    active_node_id: saved.active_node_id,
+                  }
+                : g
+            )
+          );
+          appActions.syncGroups(
+            appStore.getState().groups.map((g) =>
+              g.id === groupId
+                ? {
+                    ...g,
+                    member_node_ids: saved.member_node_ids,
+                    active_node_id: saved.active_node_id,
+                  }
+                : g
+            )
+          );
+          if (toastText) appActions.showToast(toastText, "ok");
+        }
+        return true;
+      } catch (err) {
+        if (memberReqSeqRef.current[groupId] === seq) {
+          latestMembersRef.current[groupId] = prevIds;
+          setGroups((prev) =>
+            prev.map((g) => (g.id === groupId ? { ...g, member_node_ids: prevIds } : g))
+          );
+          appActions.syncGroups(
+            appStore
+              .getState()
+              .groups.map((g) => (g.id === groupId ? { ...g, member_node_ids: prevIds } : g))
+          );
+          appActions.showToast(`更新组成员失败：${formatErrorMessage(err)}`, "warn");
+        }
+        return false;
+      }
+    },
+    []
+  );
+
+  // Stable callbacks for React.memo GroupNodeCard
+  const handleToggleNodeMembership = useCallback(
+    (node: ProxyNode) => {
+      const grp = selectedGroupRef.current;
+      if (!grp) return;
+      const currentIds = latestMembersRef.current[grp.id] ?? grp.member_node_ids;
+      const exists = currentIds.includes(node.id);
+      if (exists && grp.active_node_id === node.id) {
+        appActions.showToast("当前正在使用这个节点，请先切到其它节点再移出", "info");
+        return;
+      }
+      const nextIds = exists
+        ? currentIds.filter((id) => id !== node.id)
+        : [...currentIds, node.id];
+      void persistGroupMembers(grp.id, nextIds);
+    },
+    [persistGroupMembers]
+  );
+
+  const handleUseNode = useCallback(
+    async (node: ProxyNode) => {
+      const grp = selectedGroupRef.current;
+      if (!grp || selectingNodeIdRef.current === node.id) return;
+      setSelectingNodeId(node.id);
+      try {
+        const currentIds = latestMembersRef.current[grp.id] ?? grp.member_node_ids;
+        if (!currentIds.includes(node.id)) {
+          const joined = await persistGroupMembers(grp.id, [...currentIds, node.id]);
+          if (!joined) return;
+        }
+        const closeOld = grp.switch_mode === "force_close_old";
+        const persistedGroup = storeGroupsRef.current.find((g) => g.id === grp.id);
+        const isSecondaryIndependent =
+          Boolean(persistedGroup?.independent_routing) &&
+          runtimeRouteModeRef.current === "group" &&
+          Boolean(runtimeActiveGroupIdRef.current) &&
+          grp.id !== runtimeActiveGroupIdRef.current;
+        await appActions.selectGroupNode(
+          grp.id,
+          node.id,
+          closeOld,
+          isSecondaryIndependent ? false : undefined
+        );
+        setGroups((prev) =>
+          prev.map((g) => (g.id === grp.id ? { ...g, active_node_id: node.id } : g))
+        );
+      } finally {
+        setSelectingNodeId(null);
+      }
+    },
+    [persistGroupMembers]
+  );
+
+  const handleProbeSingleNode = useCallback(async (node: ProxyNode) => {
+    if (probingNodeIdSetRef.current.has(node.id) || isProbeEngineBusyRef.current) return;
     await appActions.runMultiGroupNodeProbe(node.id);
-  };
+  }, []);
 
   const handleAddFilteredToGroup = () => {
     if (!selectedGroup || unjoinedInFilterIds.length === 0) return;
@@ -2359,8 +992,7 @@ export function MultiGroupPage() {
     selectedGroup &&
       ((selectedGroup.active_node_id &&
         selectedGroup.member_node_ids.includes(selectedGroup.active_node_id)) ||
-        (runtime.active_node_id &&
-          selectedGroup.member_node_ids.includes(runtime.active_node_id)))
+        (runtimeActiveNodeId && selectedGroup.member_node_ids.includes(runtimeActiveNodeId)))
   );
 
   useEffect(() => {
@@ -2438,90 +1070,24 @@ export function MultiGroupPage() {
     }
   };
 
-  const handleCreateGroup = async (ev: FormEvent) => {
-    ev.preventDefault();
-    const name = newGroupName.trim();
-    if (!name) {
-      appActions.showToast("请先给新多选组起个名字", "warn");
-      return;
-    }
-    if (creatingGroup) return;
-    setCreatingGroup(true);
-
-    const tpl = CREATE_TEMPLATES.find((t) => t.id === newGroupTemplate) ?? CREATE_TEMPLATES[0];
-    const created: MultiGroup = {
-      id: `grp-${Date.now().toString(36)}`,
-      name,
-      mode: tpl.mode,
-      independent_routing: Boolean(tpl.independentRouting),
-      match_rules: [...tpl.matchRules],
-      member_node_ids: [],
-      dynamic_filter: null,
-      primary_probe_id: null,
-      hard_gates: [...(tpl.hardGates ?? [])],
-      trigger_rules: [],
-      trigger_expr: null,
-      formula_expr: tpl.formula,
-      fallback_policy: "degrade_best_warn",
-      fallback_pool_id: null,
-      escalated_since: null,
-      recover_probe_interval_sec: 120,
-      switch_mode: tpl.switchMode,
-      cooldown_sec: 60,
-      hysteresis_pct: 20,
-      active_node_id: null,
-    };
-
-    try {
-      const saved = await catcloudApi.upsertMultiGroup(created);
-      latestMembersRef.current[saved.id] = saved.member_node_ids;
-      setGroups((prev) => {
-        const next = [...prev, saved];
-        appActions.syncGroups(next);
-        return next;
-      });
-      setSelectedId(saved.id);
-      setNewGroupName("");
-      setShowCreateForm(false);
-      setViewMode("all");
-      appActions.showToast(`已新建「${saved.name}」，点击中间节点卡片即可加入`, "ok");
-    } catch (err) {
-      appActions.showToast(`新建失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setCreatingGroup(false);
-    }
-  };
-
-  const handleRequestDeleteGroup = (groupId: string) => {
-    if (groups.length <= 1) return;
-    setConfirmDeleteId(groupId);
-    if (deleteConfirmTimerRef.current !== null) {
-      window.clearTimeout(deleteConfirmTimerRef.current);
-    }
-    deleteConfirmTimerRef.current = window.setTimeout(() => {
-      setConfirmDeleteId(null);
-      deleteConfirmTimerRef.current = null;
-    }, 4000);
-  };
-
-  const handleConfirmDeleteGroup = async (group: MultiGroup) => {
-    if (deletingGroupId || groups.length <= 1) return;
-    setDeletingGroupId(group.id);
-    try {
-      await catcloudApi.deleteMultiGroup(group.id);
-      const next = groups.filter((g) => g.id !== group.id);
-      delete latestMembersRef.current[group.id];
-      setGroups(next);
+  const handleGroupCreated = (saved: MultiGroup) => {
+    latestMembersRef.current[saved.id] = saved.member_node_ids;
+    setGroups((prev) => {
+      const next = [...prev, saved];
       appActions.syncGroups(next);
-      if (selectedGroup?.id === group.id) {
-        setSelectedId(next[0]?.id ?? "");
-      }
-      setConfirmDeleteId(null);
-      appActions.showToast(`已删除多选组：${formatGroupDisplayName(group.name)}`, "info");
-    } catch (err) {
-      appActions.showToast(`删除失败：${formatErrorMessage(err)}`, "warn");
-    } finally {
-      setDeletingGroupId(null);
+      return next;
+    });
+    setSelectedId(saved.id);
+    setViewMode("all");
+  };
+
+  const handleGroupDeleted = (group: MultiGroup) => {
+    const next = groups.filter((g) => g.id !== group.id);
+    delete latestMembersRef.current[group.id];
+    setGroups(next);
+    appActions.syncGroups(next);
+    if (selectedGroup?.id === group.id) {
+      setSelectedId(next[0]?.id ?? "");
     }
   };
 
@@ -2538,8 +1104,7 @@ export function MultiGroupPage() {
     }
 
     const wasDirty = Boolean(dirtyGroupIds[selectedGroup.id]);
-    const persistedBase =
-      storeGroups.find((g) => g.id === selectedGroup.id) ?? selectedGroup;
+    const persistedBase = storeGroups.find((g) => g.id === selectedGroup.id) ?? selectedGroup;
     const latestMembers =
       latestMembersRef.current[selectedGroup.id] ?? persistedBase.member_node_ids;
     const renamePayloadSource: MultiGroup = {
@@ -2554,14 +1119,11 @@ export function MultiGroupPage() {
         : normalizeGroupForBackend(renamePayloadSource, currentTriggerMeta);
       const saved = await catcloudApi.upsertMultiGroup(payload);
       appActions.syncGroups(
-        appStore
-          .getState()
-          .groups.map((g) => (g.id === saved.id ? saved : g))
+        appStore.getState().groups.map((g) => (g.id === saved.id ? saved : g))
       );
       setGroups((prev) =>
         prev.map((g) => {
           if (g.id !== saved.id) return g;
-          // Preserve unsaved strategy form drafts and dirty flag when only renaming
           return wasDirty ? { ...g, name: saved.name } : saved;
         })
       );
@@ -2653,11 +1215,7 @@ export function MultiGroupPage() {
   const handleToggleUploadTrigger = () => {
     if (!selectedGroup) return;
     if (uploadTriggerInfo.enabled) {
-      if (uploadTriggerInfo.isSimple) {
-        setPrimaryTriggerExpr("");
-      } else {
-        setPrimaryTriggerExpr("");
-      }
+      setPrimaryTriggerExpr("");
     } else {
       const val = Number.isFinite(uploadTriggerInfo.threshold) ? uploadTriggerInfo.threshold : 2.0;
       setPrimaryTriggerExpr(`${uploadTriggerInfo.prefix} < ${val}`);
@@ -2745,21 +1303,12 @@ export function MultiGroupPage() {
     await appActions.runEvaluateMultiGroup(selectedGroup.id);
   };
 
-  const handleCardKeyDown = (ev: KeyboardEvent<HTMLDivElement>, onTrigger: () => void) => {
-    if (ev.key === "Enter" || ev.key === " ") {
-      ev.preventDefault();
-      onTrigger();
-    }
-  };
-
   const activeNodeInSelectedGroup = selectedGroup?.active_node_id
-    ? nodeById.get(selectedGroup.active_node_id) ?? null
+    ? (nodeById.get(selectedGroup.active_node_id) ?? null)
     : null;
 
   const isRuntimeActiveGroup =
-    isGroupMode &&
-    Boolean(selectedGroup) &&
-    runtime.active_group_id === selectedGroup?.id;
+    isGroupMode && Boolean(selectedGroup) && runtimeActiveGroupId === selectedGroup?.id;
 
   const customHardGates = useMemo(() => {
     if (!selectedGroup) return [];
@@ -2789,295 +1338,24 @@ export function MultiGroupPage() {
     ? formatGroupDisplayName(selectedGroup.name)
     : "";
 
-  /* ============================================================================
-   * Render: Three-Column Workbench (Left Groups | Center Nodes | Right Drawer)
-   * ============================================================================ */
-
   return (
     <div className="flex min-h-[calc(100vh-4.25rem)] flex-col gap-3.5 lg:flex-row lg:items-stretch">
-      {/* =====================================================================
-          COLUMN 1: LEFT SIDEBAR (216px/232px) — Create Group & Existing Groups List
-         ===================================================================== */}
-      <aside className="flex w-full shrink-0 flex-col lg:w-[216px] xl:w-[232px]">
-        <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl p-3">
-          {/* Prominent "+ 新建多选组" primary button */}
-          <button
-            type="button"
-            onClick={() => setShowCreateForm((v) => !v)}
-            className={`flex w-full items-center justify-center gap-1.5 rounded-xl px-3.5 py-2.5 text-xs font-semibold transition-opacity ${
-              showCreateForm
-                ? "border border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                : "bg-[var(--accent)] text-[var(--accent-ink)] shadow-sm hover:opacity-90"
-            }`}
-          >
-            {showCreateForm ? <X className="h-4 w-4" /> : <Plus className="h-4 w-4" />}
-            <span>{showCreateForm ? "取消新建" : "新建多选组"}</span>
-          </button>
+      {/* COLUMN 1: LEFT SIDEBAR — Create Group & Existing Groups List */}
+      <GroupSidebarList
+        groups={groups}
+        selectedGroupId={selectedGroup?.id ?? null}
+        isGroupMode={isGroupMode}
+        runtimeActiveGroupId={runtimeActiveGroupId}
+        runtimeActiveNodeName={runtimeActiveNodeName}
+        nodeById={nodeById}
+        dirtyGroupIds={dirtyGroupIds}
+        dict={dict}
+        onSelectGroup={setSelectedId}
+        onGroupCreated={handleGroupCreated}
+        onGroupDeleted={handleGroupDeleted}
+      />
 
-          {/* Ultra-simple inline create form (includes scenario presets inside) */}
-          {showCreateForm && (
-            <form
-              onSubmit={(ev) => void handleCreateGroup(ev)}
-              className="mt-3 space-y-2.5 rounded-xl border border-[var(--line-strong)] bg-[var(--bg-elevated)] p-2.5"
-            >
-              <div>
-                <label className="mb-1 block text-[11px] font-medium text-[var(--text-secondary)]">
-                  多选组名称
-                </label>
-                <input
-                  type="text"
-                  autoFocus
-                  value={newGroupName}
-                  onChange={(e) => setNewGroupName(e.target.value)}
-                  placeholder="例如：日常主力、AI 专线"
-                  className="w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-              </div>
-
-              <div>
-                <div className="mb-1 text-[11px] font-medium text-[var(--text-secondary)]">
-                  快捷场景（可选）
-                </div>
-                <div className="space-y-1.5">
-                  {CREATE_TEMPLATES.map((tpl) => {
-                    const picked = newGroupTemplate === tpl.id;
-                    return (
-                      <button
-                        key={tpl.id}
-                        type="button"
-                        onClick={() => setNewGroupTemplate(tpl.id)}
-                        className={`w-full rounded-lg border px-2.5 py-1.5 text-left transition-colors ${
-                          picked
-                            ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                            : "border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)]"
-                        }`}
-                      >
-                        <div className="text-[11px] font-semibold text-[var(--text)]">
-                          {tpl.id === "wsf" ? dict.groups.wsfTemplateTitle : tpl.title}
-                        </div>
-                        <div className="mt-0.5 text-[10px] text-[var(--muted)]">
-                          {tpl.id === "wsf" ? dict.groups.wsfTemplateDesc : tpl.desc}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div className="text-[10px] leading-relaxed text-[var(--muted)]">
-                {newGroupTemplate === "wsf"
-                  ? "将自动开启独立分流与 Windsurf 防风控门禁（含 6 条官方域名并优先纯净家宽），去中间点选节点加入即可。"
-                  : "新建后直接去中间点选节点加入即可，随时可在右侧抽屉调整门槛与分流规则。"}
-              </div>
-
-              <button
-                type="submit"
-                disabled={creatingGroup}
-                className="w-full rounded-lg bg-[var(--accent)] py-1.5 text-xs font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90 disabled:opacity-60"
-              >
-                {creatingGroup ? "创建中..." : "确认创建"}
-              </button>
-            </form>
-          )}
-
-          {/* Section heading */}
-          <div className="mt-3.5 mb-2 flex items-center justify-between px-0.5">
-            <div className="flex items-center gap-1.5 text-[11px] font-semibold text-[var(--text-secondary)]">
-              <Layers className="h-3.5 w-3.5 text-[var(--accent)]" />
-              <span>我的多选组</span>
-            </div>
-            <span className="cc-mono text-[10px] text-[var(--muted)]">{groups.length} 组</span>
-          </div>
-
-          {/* Gentle Guide Banner when Home is Currently in Single-Node Mode */}
-          {!isGroupMode && (
-            <div className="mb-2.5 rounded-xl border border-[var(--green)]/35 bg-[var(--green-soft)]/55 px-2.5 py-2 text-[11px] leading-relaxed text-[var(--text-secondary)]">
-              <div className="flex items-start gap-1.5">
-                <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--green)]" />
-                <span>
-                  当前首页正在使用单节点（
-                  <span className="font-semibold text-[var(--text)]">
-                    {runtime.active_node_name || "单节点"}
-                  </span>
-                  ），点下方组的「使用此组」可切回智能多选组
-                </span>
-              </div>
-              <button
-                type="button"
-                onClick={() => appActions.setNav("overview")}
-                className="mt-1.5 inline-flex items-center gap-1 text-[11px] font-medium text-[var(--green)] hover:underline"
-              >
-                <ArrowLeft className="h-3 w-3 shrink-0" />
-                <span>返回总览</span>
-              </button>
-            </div>
-          )}
-
-          {/* Existing multi-groups list */}
-          <div className="space-y-1.5">
-            {groups.map((g) => {
-              const isSelected = selectedGroup?.id === g.id;
-              const isSystemActive = isGroupMode && runtime.active_group_id === g.id;
-              const isIndependentEnabled = Boolean(g.independent_routing);
-              const activeNode = g.active_node_id ? nodeById.get(g.active_node_id) : null;
-              const modeMeta = GROUP_MODES.find((m) => m.id === g.mode) ?? GROUP_MODES[0];
-              const isDirty = Boolean(dirtyGroupIds[g.id]);
-              const isConfirmingDel = confirmDeleteId === g.id;
-              const displayName = formatGroupDisplayName(g.name);
-
-              return (
-                <div
-                  key={g.id}
-                  role="button"
-                  tabIndex={0}
-                  onClick={() => setSelectedId(g.id)}
-                  onKeyDown={(ev) => handleCardKeyDown(ev, () => setSelectedId(g.id))}
-                  className={`group relative cursor-pointer rounded-xl border p-2.5 transition-colors ${
-                    isSystemActive && isSelected
-                      ? "border-[var(--green)] bg-[var(--green-soft)]/55 shadow-xs"
-                      : isSystemActive
-                        ? "border-[var(--green)]/65 bg-[var(--green-soft)]/30 hover:border-[var(--green)]"
-                        : isSelected
-                          ? "border-[var(--accent)] bg-[var(--accent-soft)] shadow-xs"
-                          : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                  }`}
-                >
-                  <div className="flex items-start justify-between gap-1.5">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      {isSystemActive && (
-                        <span
-                          className="h-2 w-2 shrink-0 rounded-full bg-[var(--green)]"
-                          title="当前系统正在使用此组"
-                        />
-                      )}
-                      <span className="truncate text-xs font-semibold text-[var(--text)]">
-                        {displayName}
-                      </span>
-                      {isDirty && (
-                        <span
-                          className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--amber)]"
-                          title="右侧策略尚未点应用"
-                        />
-                      )}
-                    </div>
-
-                    {groups.length > 1 && !isConfirmingDel && (
-                      <button
-                        type="button"
-                        onClick={(ev) => {
-                          ev.stopPropagation();
-                          handleRequestDeleteGroup(g.id);
-                        }}
-                        className="shrink-0 rounded-md p-0.5 text-[var(--muted)] opacity-0 transition-opacity hover:bg-[var(--red-soft)] hover:text-[var(--red)] group-hover:opacity-100 focus:opacity-100"
-                        title="删除此多选组"
-                        aria-label={`删除多选组 ${displayName}`}
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    )}
-                  </div>
-
-                  {isConfirmingDel ? (
-                    <div
-                      className="mt-2 flex items-center justify-between gap-1.5 rounded-lg border border-[var(--red)]/40 bg-[var(--red-soft)] px-2 py-1"
-                      onClick={(ev) => ev.stopPropagation()}
-                    >
-                      <span className="text-[10px] font-medium text-[var(--red)]">确认删除？</span>
-                      <div className="flex items-center gap-1">
-                        <button
-                          type="button"
-                          disabled={deletingGroupId === g.id}
-                          onClick={() => void handleConfirmDeleteGroup(g)}
-                          className="rounded bg-[var(--red)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50"
-                        >
-                          {deletingGroupId === g.id ? "..." : "删"}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setConfirmDeleteId(null)}
-                          className="rounded bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text)]"
-                        >
-                          取消
-                        </button>
-                      </div>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="mt-1.5 flex flex-wrap items-center justify-between gap-1.5 text-[11px]">
-                        <span className="cc-mono font-medium text-[var(--text-secondary)]">
-                          {g.member_node_ids.filter((id) => nodeById.has(id)).length} 个节点
-                        </span>
-                        <div className="flex flex-wrap items-center gap-1">
-                          {isIndependentEnabled && (
-                            <span
-                              title={
-                                g.match_rules.length > 0
-                                  ? `已开启独立分流：即使首页在用其它组，命中本组 ${g.match_rules.length} 条分流规则的流量也会单独走此组`
-                                  : "已开启独立分流开关（在右侧第 5 节添加至少一条规则后将单独接管对应流量）"
-                              }
-                              className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full border px-1.5 py-0.5 text-[10px] font-semibold ${
-                                g.match_rules.length > 0
-                                  ? "border-[var(--amber)]/50 bg-[var(--amber-soft)] text-[var(--amber)]"
-                                  : "border-dashed border-[var(--amber)]/50 bg-[var(--amber-soft)]/45 text-[var(--amber)]"
-                              }`}
-                            >
-                              <span className="h-1.5 w-1.5 rounded-full bg-[var(--amber)]" />
-                              <span>
-                                {g.match_rules.length > 0
-                                  ? formatI18nTemplate(dict.groups.indepRoutingCount, {
-                                      count: g.match_rules.length,
-                                    })
-                                  : dict.groups.indepRoutingPending}
-                              </span>
-                            </span>
-                          )}
-                          <span className="rounded-md bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
-                            {modeMeta.shortLabel}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="mt-1.5 flex items-center justify-between gap-1.5">
-                        <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--muted)]">
-                          {activeNode
-                            ? `${isSystemActive ? "正在用" : "组内选定"}：${activeNode.name}`
-                            : "尚未选定节点"}
-                        </span>
-                        {isSystemActive ? (
-                          <span className="shrink-0 whitespace-nowrap rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
-                            {dict.groups.mainFallbackActive}
-                          </span>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={(ev) => {
-                              ev.stopPropagation();
-                              setSelectedId(g.id);
-                              void appActions.setActiveGroup(g.id);
-                            }}
-                            className="shrink-0 whitespace-nowrap rounded-md border border-[var(--accent)]/50 bg-[var(--accent-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)] transition-colors hover:bg-[var(--accent)] hover:text-[var(--accent-ink)]"
-                          >
-                            使用此组
-                          </button>
-                        )}
-                      </div>
-                    </>
-                  )}
-                </div>
-              );
-            })}
-
-            {groups.length === 0 && (
-              <div className="rounded-xl border border-dashed border-[var(--line)] px-3 py-5 text-center text-[11px] text-[var(--muted)]">
-                还没有多选组，点上方按钮新建一个吧
-              </div>
-            )}
-          </div>
-        </div>
-      </aside>
-
-      {/* =====================================================================
-          COLUMN 2: CENTER MAIN STAGE — Huge, Airy Node Grid & Instant Actions
-         ===================================================================== */}
+      {/* COLUMN 2: CENTER MAIN STAGE — Node Grid & Instant Actions */}
       {selectedGroup ? (
         <section className="flex min-w-0 flex-1 flex-col gap-3">
           {/* Compact Top Header Bar */}
@@ -3143,7 +1421,7 @@ export function MultiGroupPage() {
                     </button>
                   )}
 
-                  {/* Persistent Independent Routing Status Capsule (click opens Drawer & jumps to Section 5) */}
+                  {/* Persistent Independent Routing Status Capsule */}
                   <button
                     type="button"
                     onClick={handleOpenIndepSection}
@@ -3182,7 +1460,6 @@ export function MultiGroupPage() {
                   </button>
                 </div>
 
-                {/* Plain-language status summary */}
                 <p className="mt-1 truncate text-xs text-[var(--muted)]">
                   {effectiveSelectedMemberIds.length > 0 ? (
                     <>
@@ -3207,7 +1484,6 @@ export function MultiGroupPage() {
                 </p>
               </div>
 
-              {/* Two prominent top-right action buttons */}
               <div className="flex shrink-0 flex-wrap items-center gap-2">
                 <button
                   type="button"
@@ -3258,651 +1534,159 @@ export function MultiGroupPage() {
           </div>
 
           {/* Clean Compact Filter Bar with Collapsible More Filters Drawer */}
-          <div className="cc-card cc-glass space-y-2.5 rounded-2xl px-4 py-3">
-            {/* Row 1 (Always Visible): Search + All/Group Switch + Quick Health Pills + More Filters + Reset */}
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="relative min-w-[160px] flex-1">
-                <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[var(--muted)]" />
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="搜索节点名、地区或来源..."
-                  className="h-9 w-full rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] pl-8 pr-7 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                />
-                {searchQuery && (
-                  <button
-                    type="button"
-                    onClick={() => setSearchQuery("")}
-                    aria-label="清空搜索"
-                    className="absolute right-2 top-1/2 -translate-y-1/2 text-[var(--muted)] hover:text-[var(--text)]"
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
-                )}
-              </div>
+          <GroupFilterBar
+            searchQuery={searchQuery}
+            setSearchQuery={setSearchQuery}
+            viewMode={viewMode}
+            setViewMode={setViewMode}
+            effectiveMemberCount={effectiveSelectedMemberIds.length}
+            filterGoogleClean={filterGoogleClean}
+            setFilterGoogleClean={setFilterGoogleClean}
+            filterAiReady={filterAiReady}
+            setFilterAiReady={setFilterAiReady}
+            moreFiltersOpen={moreFiltersOpen}
+            setMoreFiltersOpen={setMoreFiltersOpen}
+            moreFilterActiveCount={moreFilterActiveCount}
+            hasAnyActiveFilter={hasAnyActiveFilter}
+            onResetFilters={handleResetFilters}
+            selectedSubId={selectedSubId}
+            setSelectedSubId={setSelectedSubId}
+            enabledNodesCount={enabledNodes.length}
+            providerTabs={providerTabs}
+            regionStats={regionStats}
+            filterContinent={filterContinent}
+            filterRegion={filterRegion}
+            onContinentChange={(c) => {
+              setFilterContinent(c);
+              setNodePage(1);
+            }}
+            onRegionChange={(r) => {
+              setFilterRegion(r);
+              setNodePage(1);
+            }}
+            sortMode={sortMode}
+            setSortMode={setSortMode}
+            unjoinedInFilterCount={unjoinedInFilterIds.length}
+            onAddFilteredToGroup={handleAddFilteredToGroup}
+            confirmClearMembers={confirmClearMembers}
+            hasProtectedActiveMember={hasProtectedActiveMember}
+            onClearGroupMembers={handleClearGroupMembers}
+            onCancelClearGroupMembers={handleCancelClearGroupMembers}
+            onConfirmClearGroupMembers={handleConfirmClearGroupMembers}
+            filteredCount={filteredNodes.length}
+            safeNodePage={safeNodePage}
+            totalNodePages={totalNodePages}
+            dict={dict}
+          />
 
-              {/* View mode segmented switch */}
-              <div className="inline-flex shrink-0 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-0.5 text-xs">
-                <button
-                  type="button"
-                  onClick={() => setViewMode("all")}
-                  className={`whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors ${
-                    viewMode === "all"
-                      ? "bg-[var(--card)] text-[var(--text)] shadow-xs"
-                      : "text-[var(--muted)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  全部节点
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setViewMode("members")}
-                  className={`whitespace-nowrap rounded-lg px-2.5 py-1 font-medium transition-colors ${
-                    viewMode === "members"
-                      ? "bg-[var(--card)] text-[var(--accent)] shadow-xs"
-                      : "text-[var(--muted)] hover:text-[var(--text)]"
-                  }`}
-                >
-                  仅看本组 ({effectiveSelectedMemberIds.length})
-                </button>
-              </div>
-
-              {/* Quick Health Filter Pills */}
-              <button
-                type="button"
-                aria-pressed={filterGoogleClean}
-                onClick={() => setFilterGoogleClean((v) => !v)}
-                title="仅看已测出谷歌地区正常的节点（不送中）"
-                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                  filterGoogleClean
-                    ? "border-[var(--green)]/60 bg-[var(--green-soft)] text-[var(--green)]"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--green)]/50 hover:text-[var(--text)]"
-                }`}
-              >
-                <ShieldCheck className="h-3.5 w-3.5 shrink-0" />
-                <span>谷歌正常</span>
-              </button>
-
-              <button
-                type="button"
-                aria-pressed={filterAiReady}
-                onClick={() => setFilterAiReady((v) => !v)}
-                title="仅看已测出支持 ChatGPT / Gemini / Claude / Windsurf 任一 AI 的节点"
-                className={`inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                  filterAiReady
-                    ? "border-[var(--accent)]/60 bg-[var(--accent-soft)] text-[var(--accent)]"
-                    : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)]/50 hover:text-[var(--text)]"
-                }`}
-              >
-                <Sparkles className="h-3.5 w-3.5 shrink-0" />
-                <span>AI 可用</span>
-              </button>
-
-              {/* Collapsible More Filters Toggle with Warm-Gold Active Count Badge */}
-              <button
-                type="button"
-                aria-expanded={moreFiltersOpen}
-                onClick={() => setMoreFiltersOpen((v) => !v)}
-                className={`inline-flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                  moreFiltersOpen
-                    ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                    : moreFilterActiveCount > 0
-                      ? "border-[var(--amber)]/60 bg-[var(--amber-soft)]/50 text-[var(--text)] hover:border-[var(--amber)]"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--text)]"
-                }`}
-              >
-                <Filter className="h-3.5 w-3.5 shrink-0" />
-                <span>{dict.groups.moreFiltersBtn}</span>
-                {moreFilterActiveCount > 0 && (
-                  <span className="cc-mono rounded-full border border-[var(--amber)]/50 bg-[var(--amber-soft)] px-1.5 py-0.2 text-[10px] font-semibold text-[var(--amber)]">
-                    {formatI18nTemplate(dict.groups.activeFiltersCount, {
-                      count: moreFilterActiveCount,
-                    })}
-                  </span>
-                )}
-                <ChevronDown
-                  className={`h-3.5 w-3.5 shrink-0 transition-transform ${
-                    moreFiltersOpen ? "rotate-180" : ""
-                  }`}
-                />
-              </button>
-
-              {hasAnyActiveFilter && (
-                <button
-                  type="button"
-                  onClick={handleResetFilters}
-                  className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                >
-                  <RotateCcw className="h-3 w-3 shrink-0" />
-                  <span>{dict.groups.resetFiltersBtn}</span>
-                </button>
-              )}
-            </div>
-
-            {/* Collapsible Row 2: Source + Continent/Region + Sort + Batch Join/Clear Actions */}
-            {moreFiltersOpen && (
-              <div className="flex flex-wrap items-center justify-between gap-2 border-t border-[var(--line)]/60 pt-2.5">
-                <div className="flex flex-wrap items-center gap-2">
-                  {/* Source (Subscription) dropdown */}
-                  <div className="inline-flex shrink-0 items-center gap-1.5">
-                    <Filter className="h-3.5 w-3.5 shrink-0 text-[var(--muted)]" />
-                    <AppSelect
-                      aria-label="按来源筛选"
-                      size="md"
-                      value={selectedSubId}
-                      onChange={setSelectedSubId}
-                      options={[
-                        { value: "all", label: `全部来源 (${enabledNodes.length})` },
-                        ...providerTabs.map((sub) => ({
-                          value: sub.id,
-                          label: `${sub.name} (${sub.count})`,
-                        })),
-                      ]}
-                      className="w-[168px]"
-                    />
-                  </div>
-
-                  {/* TAG-style two-tier Continent -> Country/Region filter */}
-                  <ContinentRegionFilter
-                    variant="select"
-                    stats={regionStats}
-                    continent={filterContinent}
-                    region={filterRegion}
-                    onContinentChange={(c) => {
-                      setFilterContinent(c);
-                      setNodePage(1);
-                    }}
-                    onRegionChange={(r) => {
-                      setFilterRegion(r);
-                      setNodePage(1);
-                    }}
-                  />
-
-                  {/* Metric Sort Dropdown */}
-                  <div className="inline-flex shrink-0 items-center gap-1.5">
-                    <ArrowUpDown
-                      className={`h-3.5 w-3.5 shrink-0 ${
-                        sortMode !== "default" ? "text-[var(--accent)]" : "text-[var(--muted)]"
-                      }`}
-                    />
-                    <AppSelect
-                      aria-label="节点排序方式"
-                      size="md"
-                      value={sortMode}
-                      onChange={(v) => setSortMode(v as NodeSortMode)}
-                      options={[
-                        { value: "default", label: "排序：默认（在用优先）" },
-                        { value: "up_desc", label: "排序：上传最快" },
-                        { value: "down_desc", label: "排序：下载最快" },
-                        { value: "latency_asc", label: "排序：延迟最低" },
-                      ]}
-                      className="w-[184px]"
-                      buttonClassName={`font-medium ${
-                        sortMode !== "default" ? "border-[var(--accent)]/60" : ""
-                      }`}
-                    />
-                  </div>
-                </div>
-
-                {/* Batch quick actions */}
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {viewMode === "all" && unjoinedInFilterIds.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={handleAddFilteredToGroup}
-                      className="inline-flex items-center gap-1 rounded-xl border border-[var(--accent)]/40 bg-[var(--accent-soft)] px-2.5 py-1.5 text-xs font-medium text-[var(--accent)] transition-opacity hover:opacity-85"
-                    >
-                      <Plus className="h-3.5 w-3.5" />
-                      <span>当前筛选全加入 ({unjoinedInFilterIds.length})</span>
-                    </button>
-                  )}
-
-                  {effectiveSelectedMemberIds.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={handleClearGroupMembers}
-                      className={`rounded-xl border px-2.5 py-1.5 text-xs font-medium transition-colors ${
-                        confirmClearMembers
-                          ? "border-[var(--red)] bg-[var(--red-soft)] text-[var(--red)]"
-                          : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--red)]/50 hover:text-[var(--red)]"
-                      }`}
-                    >
-                      {confirmClearMembers
-                        ? hasProtectedActiveMember
-                          ? dict.groups.confirmBelowHint
-                          : "再点一次确认清空"
-                        : "清空本组"}
-                    </button>
-                  )}
-                </div>
-              </div>
-            )}
-
-            {confirmClearMembers && hasProtectedActiveMember && (
-              <div
-                role="alert"
-                className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[var(--amber)]/55 bg-[var(--amber-soft)]/75 px-3 py-2 text-xs"
-              >
-                <div className="flex min-w-0 flex-1 items-start gap-2 text-[var(--amber)]">
-                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span className="leading-relaxed">
-                    {dict.groups.clearActiveProtectedConfirm}
-                  </span>
-                </div>
-                <div className="flex shrink-0 items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={handleCancelClearGroupMembers}
-                    className="rounded-lg border border-[var(--line)] bg-[var(--surface)] px-2.5 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text)]"
-                  >
-                    {dict.common.cancel}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleConfirmClearGroupMembers}
-                    className="rounded-lg bg-[var(--red)] px-2.5 py-1 text-[11px] font-semibold text-[var(--accent-ink)] transition-opacity hover:opacity-90"
-                  >
-                    {dict.groups.confirmClear}
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Compact Legend & Match Count Row */}
-            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-              <div className="flex flex-wrap items-center gap-3">
-                <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
-                  <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--green)] shadow-xs" />
-                  <span className="font-medium">正在用</span>
-                </span>
-                <span className="inline-flex items-center gap-1.5 text-[var(--text-secondary)]">
-                  <span className="h-3 w-3 shrink-0 rounded-[4px] bg-[var(--accent)] shadow-xs" />
-                  <span className="font-medium">已在本组</span>
-                </span>
-                <span className="inline-flex items-center gap-1.5 text-[var(--muted)]">
-                  <span className="h-3 w-3 shrink-0 rounded-[4px] border-2 border-[var(--line-strong)] bg-[var(--card)]" />
-                  <span>未加入</span>
-                </span>
-                <span className="cc-mono text-[11px] text-[var(--muted)]">
-                  · 匹配 {filteredNodes.length} 个
-                  {totalNodePages > 1 ? `（第 ${safeNodePage}/${totalNodePages} 页）` : ""}
-                </span>
-              </div>
-            </div>
-          </div>
-
-          {/* Responsive Node Card Grid Container (Stretches to align bottom edge with left & right columns) */}
+          {/* Responsive Node Card Grid Container */}
           <div className="cc-card cc-glass flex flex-1 flex-col rounded-2xl p-3">
-          {totalNodePages > 1 && (
-            <PaginationBar
-              currentPage={safeNodePage}
-              totalPages={totalNodePages}
-              totalItems={filteredNodes.length}
-              pageSize={nodePageSize}
-              pageSizeOptions={NODE_PAGE_SIZE_OPTIONS}
-              onPageChange={setNodePage}
-              onPageSizeChange={(s) => {
-                setNodePageSize(s);
-                setNodePage(1);
-              }}
-              compact
-              className="mb-2.5 border-b border-[var(--line)]/60 pb-2"
-            />
-          )}
+            {totalNodePages > 1 && (
+              <PaginationBar
+                currentPage={safeNodePage}
+                totalPages={totalNodePages}
+                totalItems={filteredNodes.length}
+                pageSize={nodePageSize}
+                pageSizeOptions={NODE_PAGE_SIZE_OPTIONS}
+                onPageChange={setNodePage}
+                onPageSizeChange={(s) => {
+                  setNodePageSize(s);
+                  setNodePage(1);
+                }}
+                compact
+                className="mb-2.5 border-b border-[var(--line)]/60 pb-2"
+              />
+            )}
 
-          {pagedFilteredNodes.length > 0 ? (
-            <div
-              className={`grid grid-cols-1 gap-2.5 ${
-                drawerOpen && isWideDesktop
-                  ? "2xl:grid-cols-2"
-                  : "sm:grid-cols-2 min-[1400px]:grid-cols-3 2xl:grid-cols-4"
-              }`}
-            >
-              {pagedFilteredNodes.map((node) => {
-                const isActive = selectedGroup.active_node_id === node.id;
-                const isLiveActive = isActive && isRuntimeActiveGroup;
-                const isMember = memberIdSet.has(node.id);
-                const snap = probes[node.id];
-                const healthHint = runtime.node_health_hints?.[node.id];
-                const resolvedLat = resolveNodeDisplayLatency(snap, healthHint);
-                const latTooltip = formatGroupLatencyTooltip(resolvedLat, dict, healthHint);
-                const subName = subNameById.get(node.sub_id) ?? "订阅节点";
-                const isProbing = probingNodeIdSet.has(node.id);
-                const isSelecting = selectingNodeId === node.id;
-                const gateEval = assessNodeAgainstGates(node, snap, selectedGroup.hard_gates);
-                const regionCode = resolveNodeRegionCode(node);
-                const isHighMult = node.multiplier > 1.05;
-                const isLowMult = node.multiplier < 0.95;
-
-                // Distinct visual framing: Live active (emerald thick border) > Group-selected (soft emerald) > Member (warm-gold thick border) > Non-member (subtle gray)
-                const cardClass = isLiveActive
-                  ? "border-2 border-[var(--green)] bg-[var(--green-soft)] shadow-sm"
-                  : isActive
-                    ? "border-2 border-[var(--green)]/60 bg-[var(--green-soft)]/45"
-                    : isMember
-                      ? "border-2 border-[var(--accent)] bg-[var(--accent-soft)]"
-                      : "border border-[var(--line)] bg-[var(--card)] hover:border-[var(--line-strong)] hover:bg-[var(--card-hover)]";
-
-                return (
-                  <div
-                    key={node.id}
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => handleToggleNodeMembership(node)}
-                    onKeyDown={(ev) =>
-                      handleCardKeyDown(ev, () => handleToggleNodeMembership(node))
-                    }
-                    className={`group relative flex cursor-pointer flex-col justify-between gap-2.5 rounded-xl p-3 transition-all ${cardClass}`}
-                  >
-                    {/* Top row: region badge + node name + membership badge */}
-                    <div className="flex items-center justify-between gap-1.5">
-                      <div className="flex min-w-0 flex-1 items-center gap-1.5">
-                        <span
-                          title={getRegionLabel(regionCode)}
-                          className="cc-mono shrink-0 rounded-md border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--text-secondary)]"
-                        >
-                          {regionCode}
-                        </span>
-                        <span
-                          title={node.name}
-                          className="min-w-0 flex-1 truncate text-xs font-semibold text-[var(--text)]"
-                        >
-                          {node.name}
-                        </span>
-                      </div>
-
-                      {isLiveActive ? (
-                        <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-full bg-[var(--green)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent-ink)]">
-                          <Star className="h-2.5 w-2.5 fill-current" />
-                          <span>正在用</span>
-                        </span>
-                      ) : isActive ? (
-                        <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-full border border-[var(--green)]/50 bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
-                          <Star className="h-2.5 w-2.5" />
-                          <span>组内选定</span>
-                        </span>
-                      ) : isMember ? (
-                        <span className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap rounded-full border border-[var(--accent)]/50 bg-[var(--card)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--accent)]">
-                          <Check className="h-2.5 w-2.5" />
-                          <span>在组内</span>
-                        </span>
-                      ) : (
-                        <span className="inline-flex shrink-0 items-center whitespace-nowrap rounded-full border border-transparent px-1.5 py-0.5 text-[10px] font-medium text-[var(--muted)] transition-colors group-hover:border-[var(--accent)]/45 group-hover:bg-[var(--accent-soft)] group-hover:text-[var(--accent)]">
-                          + 加入本组
-                        </span>
-                      )}
-                    </div>
-
-                    {/* Middle row: provider + multiplier + Google clean/CN & AI unlock dots */}
-                    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
-                      <span
-                        title={subName}
-                        className="max-w-[128px] truncate rounded-md bg-[var(--bg-elevated)]/90 px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
-                      >
-                        {subName}
-                      </span>
-
-                      {isLowMult ? (
-                        <span className="cc-mono rounded-md bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--green)]">
-                          {formatMultiplierLabel(node.multiplier)}
-                        </span>
-                      ) : isHighMult ? (
-                        <span className="cc-mono rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-semibold text-[var(--amber)]">
-                          {formatMultiplierLabel(node.multiplier)}
-                        </span>
-                      ) : (
-                        <span className="cc-mono text-[10px] text-[var(--muted)]/80">1x</span>
-                      )}
-
-                      {snap?.google_clean === true && (
-                        <span
-                          title={formatGoogleRegionTooltip(snap, regionCode)}
-                          className="rounded-full bg-[var(--green-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--green)]"
-                        >
-                          谷歌正常
-                        </span>
-                      )}
-                      {snap?.google_clean === false && (
-                        <span
-                          title={formatGoogleRegionTooltip(snap, regionCode)}
-                          className="rounded-full bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
-                        >
-                          送中
-                        </span>
-                      )}
-                      {snap?.google_risk_mismatch && (
-                        <span
-                          className="rounded-full bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                          title={formatGoogleRegionTooltip(snap, regionCode)}
-                        >
-                          地区有偏差
-                        </span>
-                      )}
-
-                      {(() => {
-                        const aiDots = extractCardAiDots(snap);
-                        if (aiDots.length === 0) return null;
-                        return (
-                          <span className="inline-flex items-center gap-1">
-                            {aiDots.map((dot) => {
-                              const dotColor =
-                                dot.tone === "green"
-                                  ? "bg-[var(--green)]"
-                                  : dot.tone === "amber"
-                                    ? "bg-[var(--amber)]"
-                                    : dot.tone === "red"
-                                      ? "bg-[var(--red)]"
-                                      : "bg-[var(--muted)]";
-                              const pillCls = dot.isLegacy
-                                ? getAiBadgeToneClass("muted", "legacy")
-                                : dot.tone === "green"
-                                  ? "bg-[var(--accent-soft)] text-[var(--accent)]"
-                                  : getAiBadgeToneClass(dot.tone, "soft");
-                              return (
-                                <span
-                                  key={dot.id}
-                                  title={dot.label}
-                                  aria-label={dot.label}
-                                  className={`inline-flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] font-medium ${pillCls}`}
-                                >
-                                  <span className={`h-1.5 w-1.5 rounded-full ${dotColor}`} />
-                                  {dot.short}
-                                </span>
-                              );
-                            })}
-                          </span>
-                        );
-                      })()}
-                    </div>
-
-                    {/* Bottom row: unified latency dot + ms + throughput + gate status + 2 quick actions ("测" & "用它") */}
-                    <div className="flex items-center justify-between gap-2 pt-0.5">
-                      <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[11px]">
-                        {resolvedLat.latencyMs !== null ? (
-                          <span
-                            title={latTooltip}
-                            className="inline-flex items-center gap-1.5 cc-mono cc-tabular font-semibold"
-                            style={{ color: formatLatencyTone(resolvedLat.latencyMs) }}
-                          >
-                            <span
-                              className="h-1.5 w-1.5 shrink-0 rounded-full"
-                              style={{ backgroundColor: formatLatencyTone(resolvedLat.latencyMs) }}
-                              aria-hidden="true"
-                            />
-                            <span>{Math.round(resolvedLat.latencyMs)} ms</span>
-                          </span>
-                        ) : resolvedLat.state === "failed" ? (
-                          <span
-                            title={latTooltip}
-                            className="inline-flex items-center gap-1 rounded-md bg-[var(--red-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--red)]"
-                          >
-                            <span
-                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--red)]"
-                              aria-hidden="true"
-                            />
-                            <span>暂不可达</span>
-                          </span>
-                        ) : (
-                          <span
-                            title={latTooltip}
-                            className="inline-flex items-center gap-1 rounded-md bg-[var(--bg-elevated)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]"
-                          >
-                            <span
-                              className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--muted)]/55"
-                              aria-hidden="true"
-                            />
-                            <span>待测</span>
-                          </span>
-                        )}
-                        {hasValidUpMbps(snap) && (
-                          <span
-                            title="实测上传速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
-                            className="cc-mono cc-tabular text-[10px] text-[var(--coral)]"
-                          >
-                            ↑{snap!.up_mbps!.toFixed(1)} Mbps
-                          </span>
-                        )}
-                        {hasValidDownMbps(snap) && (
-                          <span
-                            title="实测下载速率（单位 Mbps，8 Mbps ≈ 1 MB/s）"
-                            className="cc-mono cc-tabular text-[10px] text-[var(--sky)]"
-                          >
-                            ↓
-                            {snap!.down_mbps! >= 100
-                              ? Math.round(snap!.down_mbps!)
-                              : snap!.down_mbps!.toFixed(1)}{" "}
-                            Mbps
-                          </span>
-                        )}
-                        {gateEval.hasMeasuredFailure && (
-                          <span
-                            title={`实测未达标：${gateEval.failedReasons.join("、")}`}
-                            className="rounded-md bg-[var(--amber-soft)] px-1.5 py-0.5 text-[10px] font-medium text-[var(--amber)]"
-                          >
-                            实测未达标
-                          </span>
-                        )}
-                      </div>
-
-                      <div
-                        className="flex shrink-0 items-center gap-1"
-                        onClick={(ev) => ev.stopPropagation()}
-                      >
-                        <button
-                          type="button"
-                          disabled={isProbing || isProbeEngineBusy}
-                          onClick={() => void handleProbeSingleNode(node)}
-                          title={
-                            isProbing
-                              ? "正在快速测速中…"
-                              : benchmarkRunning
-                                ? "国内提速对比测速正在后台进行，完成后可测速"
-                                : isProbeEngineBusy
-                                  ? "测速任务进行中，请等待当前测速完成"
-                                  : "快速测一下这个节点的延迟与解锁"
-                          }
-                          className="inline-flex items-center gap-0.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {isProbing ? (
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                          ) : (
-                            <Activity className="h-3 w-3" />
-                          )}
-                          <span>测</span>
-                        </button>
-
-                        <button
-                          type="button"
-                          disabled={isLiveActive || isSelecting}
-                          onClick={() => void handleUseNode(node)}
-                          title={
-                            isLiveActive
-                              ? "当前正在使用此节点"
-                              : isActive
-                                ? "启用此组并立即切换为当前使用节点"
-                                : isMember
-                                  ? "立即切换为当前使用节点"
-                                  : "加入本组并立即切换为当前使用节点"
-                          }
-                          className={`inline-flex items-center gap-0.5 rounded-lg px-2 py-1 text-[11px] font-semibold transition-colors ${
-                            isLiveActive
-                              ? "border border-[var(--green)]/40 bg-[var(--card)] text-[var(--green)] opacity-85"
-                              : "bg-[var(--accent)] text-[var(--accent-ink)] hover:opacity-90 disabled:opacity-50"
-                          }`}
-                        >
-                          {isSelecting ? (
-                            <Loader2 className="h-3 w-3 animate-spin" />
-                          ) : isLiveActive ? (
-                            <Check className="h-3 w-3" />
-                          ) : (
-                            <Play className="h-2.5 w-2.5 fill-current" />
-                          )}
-                          <span>{isLiveActive ? "在用" : "用它"}</span>
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          ) : (
-            <div className="flex flex-1 flex-col items-center justify-center px-6 py-12 text-center">
-              <p className="text-xs font-medium text-[var(--text-secondary)]">
-                {enabledNodes.length === 0
-                  ? "节点库里还没有节点，请先去「节点与测速 → 订阅与导入」导入订阅"
-                  : viewMode === "members" && effectiveSelectedMemberIds.length === 0
-                    ? "当前多选组里还没有节点，可切到「全部节点」点击卡片加入"
-                    : "没有找到符合当前筛选条件的节点"}
-              </p>
-              {enabledNodes.length === 0 && (
-                <button
-                  type="button"
-                  onClick={() => appActions.openNodesWorkspace("subs")}
-                  className="mt-3 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
-                >
-                  去导入订阅
-                </button>
-              )}
-              {viewMode === "members" &&
-                effectiveSelectedMemberIds.length === 0 &&
-                enabledNodes.length > 0 && (
+            {pagedFilteredNodes.length > 0 ? (
+              <div
+                className={`grid grid-cols-1 gap-2.5 ${
+                  drawerOpen && isWideDesktop
+                    ? "2xl:grid-cols-2"
+                    : "sm:grid-cols-2 min-[1400px]:grid-cols-3 2xl:grid-cols-4"
+                }`}
+              >
+                {pagedFilteredNodes.map((node) => {
+                  const isActive = selectedGroup.active_node_id === node.id;
+                  return (
+                    <GroupNodeCard
+                      key={node.id}
+                      node={node}
+                      snap={probes[node.id]}
+                      healthHint={runtimeNodeHealthHints?.[node.id]}
+                      subName={subNameById.get(node.sub_id) ?? "订阅节点"}
+                      hardGates={selectedGroup.hard_gates}
+                      isActive={isActive}
+                      isLiveActive={isActive && isRuntimeActiveGroup}
+                      isMember={memberIdSet.has(node.id)}
+                      isProbing={probingNodeIdSet.has(node.id)}
+                      isSelecting={selectingNodeId === node.id}
+                      isProbeEngineBusy={isProbeEngineBusy}
+                      benchmarkRunning={benchmarkRunning}
+                      dict={dict}
+                      onToggleMembership={handleToggleNodeMembership}
+                      onProbeSingleNode={handleProbeSingleNode}
+                      onUseNode={handleUseNode}
+                    />
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="flex flex-1 flex-col items-center justify-center px-6 py-12 text-center">
+                <p className="text-xs font-medium text-[var(--text-secondary)]">
+                  {enabledNodes.length === 0
+                    ? "节点库里还没有节点，请先去「节点与测速 → 订阅与导入」导入订阅"
+                    : viewMode === "members" && effectiveSelectedMemberIds.length === 0
+                      ? "当前多选组里还没有节点，可切到「全部节点」点击卡片加入"
+                      : "没有找到符合当前筛选条件的节点"}
+                </p>
+                {enabledNodes.length === 0 && (
                   <button
                     type="button"
-                    onClick={() => setViewMode("all")}
+                    onClick={() => appActions.openNodesWorkspace("subs")}
                     className="mt-3 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
                   >
-                    切到「全部节点」挑选加入
+                    去导入订阅
                   </button>
                 )}
-              {hasAnyActiveFilter && (
-                <button
-                  type="button"
-                  onClick={handleResetFilters}
-                  className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                >
-                  {dict.groups.resetFiltersBtn}
-                </button>
-              )}
-            </div>
-          )}
+                {viewMode === "members" &&
+                  effectiveSelectedMemberIds.length === 0 &&
+                  enabledNodes.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setViewMode("all")}
+                      className="mt-3 rounded-xl bg-[var(--accent)] px-3.5 py-1.5 text-xs font-semibold text-[var(--accent-ink)] hover:opacity-90"
+                    >
+                      切到「全部节点」挑选加入
+                    </button>
+                  )}
+                {hasAnyActiveFilter && (
+                  <button
+                    type="button"
+                    onClick={handleResetFilters}
+                    className="mt-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-3.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
+                  >
+                    {dict.groups.resetFiltersBtn}
+                  </button>
+                )}
+              </div>
+            )}
 
-          {/* Pagination bar with page-size switcher & direct page jump */}
-          {filteredNodes.length > 0 && (
-            <PaginationBar
-              currentPage={safeNodePage}
-              totalPages={totalNodePages}
-              totalItems={filteredNodes.length}
-              pageSize={nodePageSize}
-              pageSizeOptions={NODE_PAGE_SIZE_OPTIONS}
-              onPageChange={setNodePage}
-              onPageSizeChange={(s) => {
-                setNodePageSize(s);
-                setNodePage(1);
-              }}
-              className="mt-3 border-t border-[var(--line)]/60 pt-2.5"
-            />
-          )}
+            {filteredNodes.length > 0 && (
+              <PaginationBar
+                currentPage={safeNodePage}
+                totalPages={totalNodePages}
+                totalItems={filteredNodes.length}
+                pageSize={nodePageSize}
+                pageSizeOptions={NODE_PAGE_SIZE_OPTIONS}
+                onPageChange={setNodePage}
+                onPageSizeChange={(s) => {
+                  setNodePageSize(s);
+                  setNodePage(1);
+                }}
+                className="mt-3 border-t border-[var(--line)]/60 pt-2.5"
+              />
+            )}
           </div>
         </section>
       ) : (
@@ -3911,11 +1695,7 @@ export function MultiGroupPage() {
         </section>
       )}
 
-      {/* =====================================================================
-          COLUMN 3: RIGHT COLLAPSIBLE STRATEGY DRAWER
-          - >=1280px (xl): Docked inline strip (44px) / 332px third column
-          - <1280px: Slide-over Portal drawer below 36px TitleBar (top-9 z-40)
-         ===================================================================== */}
+      {/* COLUMN 3: RIGHT COLLAPSIBLE STRATEGY DRAWER */}
       {selectedGroup && !drawerOpen && (
         <aside className="hidden xl:flex xl:shrink-0 xl:flex-col">
           <button
@@ -3942,813 +1722,46 @@ export function MultiGroupPage() {
         </aside>
       )}
 
-      {selectedGroup && drawerOpen && (() => {
-        const strategyDrawerBody = (
-          <>
-            {/* Drawer Header */}
-            <div className="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--line)] px-4 py-3">
-              <div className="flex min-w-0 flex-1 items-center gap-2">
-                <Settings2 className="h-4 w-4 shrink-0 text-[var(--accent)]" />
-                <div className="min-w-0 flex-1">
-                  <h2 className="truncate text-xs font-semibold text-[var(--text)]">策略与标准</h2>
-                  <p className="truncate text-[10px] text-[var(--muted)]" title={selectedGroupDisplayName}>
-                    针对「{selectedGroupDisplayName}」的选点规则
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setDrawerOpen(false)}
-                className="shrink-0 rounded-lg p-1 text-[var(--muted)] hover:bg-[var(--bg-elevated)] hover:text-[var(--text)]"
-                title="收起策略面板"
-                aria-label="收起策略面板"
-              >
-                <X className="h-4 w-4" />
-              </button>
-            </div>
-
-            <div className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain p-4">
-              {/* 1. 选点模式 */}
-              <div className="space-y-2">
-                <div className="text-xs font-semibold text-[var(--text)]">1. 选点模式</div>
-                <div className="space-y-1.5">
-                  {GROUP_MODES.map((m) => {
-                    const active = selectedGroup.mode === m.id;
-                    return (
-                      <button
-                        key={m.id}
-                        type="button"
-                        onClick={() => updateSelectedGroup((g) => ({ ...g, mode: m.id }))}
-                        className={`w-full rounded-xl border px-3 py-2.5 text-left transition-colors ${
-                          active
-                            ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                            : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-xs font-semibold text-[var(--text)]">
-                            {m.title}
-                          </span>
-                          {active && <Check className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />}
-                        </div>
-                        <p className="mt-1 text-[11px] leading-relaxed text-[var(--muted)]">
-                          {m.desc}
-                        </p>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {selectedGroup.mode === "conditional_pool" && (
-                  <div className="flex items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-[11px]">
-                    <span className="text-[var(--text-secondary)]">
-                      {formattedDynamicFilter
-                        ? "已配置自动吸纳筛选条件，订阅更新时自动生效"
-                        : "订阅更新后将按条件自动吸纳达标节点"}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => setAdvancedOpen(true)}
-                      className="shrink-0 rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-[10px] font-medium text-[var(--accent)] hover:border-[var(--accent)]"
-                    >
-                      去高级设置编辑
-                    </button>
-                  </div>
-                )}
-              </div>
-
-              {/* 2. 必须满足的要求（门槛） */}
-              <div className="space-y-2 border-t border-[var(--line)]/70 pt-4">
-                <div className="flex items-center justify-between">
-                  <div className="text-xs font-semibold text-[var(--text)]">
-                    2. 必须满足的要求（门槛）
-                  </div>
-                  {selectedGroup.hard_gates.length > 0 && (
-                    <button
-                      type="button"
-                      onClick={() => updateSelectedGroup((g) => ({ ...g, hard_gates: [] }))}
-                      className="text-[10px] text-[var(--muted)] hover:text-[var(--accent)]"
-                    >
-                      全部取消
-                    </button>
-                  )}
-                </div>
-
-                <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-[11px] leading-relaxed text-[var(--muted)]">
-                  勾选后，自动选点时只优先挑满足下面条件的节点；
-                  <span className="font-medium text-[var(--text-secondary)]">
-                    还没测过速的节点标「待测」，不会直接判淘汰
-                  </span>
-                  。
-                </div>
-
-                <div className="flex flex-wrap gap-1.5">
-                  {HARD_GATE_PRESETS.map((preset) => {
-                    const enabled =
-                      selectedGroup.hard_gates.includes(preset.expr) ||
-                      (preset.expr === GEMINI_GATE_EXPR &&
-                        selectedGroup.hard_gates.includes(LEGACY_GEMINI_GATE_EXPR));
-                    return (
-                      <button
-                        key={preset.expr}
-                        type="button"
-                        onClick={() => handleToggleGate(preset.expr)}
-                        className={`inline-flex max-w-full min-w-0 items-center gap-1 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors ${
-                          enabled
-                            ? "border-[var(--green)]/60 bg-[var(--green-soft)] text-[var(--green)]"
-                            : "border-[var(--line)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--line-strong)]"
-                        }`}
-                      >
-                        {enabled ? (
-                          <ShieldCheck className="h-3 w-3 shrink-0" />
-                        ) : (
-                          <Plus className="h-3 w-3 shrink-0 opacity-60" />
-                        )}
-                        <span className="min-w-0 truncate">{preset.label}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {customHardGates.length > 0 && (
-                  <div className="flex flex-wrap gap-1 pt-1">
-                    {customHardGates.map((expr) => (
-                      <span
-                        key={expr}
-                        title={expr}
-                        className="cc-mono inline-flex min-w-0 max-w-full items-center gap-1 rounded-md border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[10px] text-[var(--text-secondary)]"
-                      >
-                        <span className="min-w-0 break-all">{expr}</span>
-                        <button
-                          type="button"
-                          onClick={() => handleToggleGate(expr)}
-                          aria-label={`移除条件 ${expr}`}
-                          className="shrink-0 text-[var(--muted)] hover:text-[var(--red)]"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-
-              {/* 3. 什么时候自动换节点 */}
-              <div className="space-y-2.5 border-t border-[var(--line)]/70 pt-4">
-                <div className="text-xs font-semibold text-[var(--text)]">
-                  3. 什么时候自动换节点
-                </div>
-
-                {/* Upload speed threshold switch + inline number */}
-                <div className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-medium text-[var(--text-secondary)]">
-                      上行速度太慢时自动切
-                    </span>
-                    <button
-                      type="button"
-                      onClick={handleToggleUploadTrigger}
-                      className={`rounded-full px-2.5 py-0.5 text-[10px] font-semibold transition-colors ${
-                        uploadTriggerInfo.enabled
-                          ? "bg-[var(--green-soft)] text-[var(--green)]"
-                          : "bg-[var(--card)] text-[var(--muted)]"
-                      }`}
-                    >
-                      {uploadTriggerInfo.enabled ? "已开启" : "未开启"}
-                    </button>
-                  </div>
-
-                  {uploadTriggerInfo.enabled && (
-                    <div className="mt-2 space-y-1">
-                      <div className="flex flex-wrap items-center gap-1.5 text-[11px] text-[var(--text-secondary)]">
-                        <span>上行低于</span>
-                        <input
-                          type="number"
-                          step="0.5"
-                          min="0.1"
-                          max="500"
-                          value={uploadTriggerInfo.threshold}
-                          onChange={(e) => handleUploadThresholdChange(e.target.value)}
-                          className="cc-mono w-16 rounded-lg border border-[var(--line-strong)] bg-[var(--card)] px-2 py-1 text-center text-xs font-semibold text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                        />
-                        <span>Mbps 自动切换</span>
-                      </div>
-                      <div className="text-[10px] text-[var(--muted)]">
-                        约{" "}
-                        {uploadTriggerInfo.threshold / 8 >= 1
-                          ? (uploadTriggerInfo.threshold / 8).toFixed(1)
-                          : (uploadTriggerInfo.threshold / 8).toFixed(2)}{" "}
-                        MB/s（8 Mbps ≈ 1 MB/s）
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-2 gap-2">
-                  <label className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2">
-                    <span className="block text-[10px] text-[var(--muted)]">连续失败几次换</span>
-                    <div className="mt-1 flex items-baseline gap-1">
-                      <input
-                        type="number"
-                        min={1}
-                        max={10}
-                        value={currentTriggerMeta.consecutiveFailures}
-                        onChange={(e) =>
-                          updateTriggerMeta({
-                            consecutiveFailures: Math.max(1, Number(e.target.value) || 1),
-                          })
-                        }
-                        className="cc-mono w-full bg-transparent text-sm font-semibold text-[var(--text)] outline-none"
-                      />
-                      <span className="text-[10px] text-[var(--muted)]">次</span>
-                    </div>
-                  </label>
-
-                  <label className="rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2">
-                    <span className="block text-[10px] text-[var(--muted)]">换完冷静多久</span>
-                    <div className="mt-1 flex items-baseline gap-1">
-                      <input
-                        type="number"
-                        min={10}
-                        max={600}
-                        value={selectedGroup.cooldown_sec}
-                        onChange={(e) =>
-                          updateSelectedGroup((g) => ({
-                            ...g,
-                            cooldown_sec: Math.max(10, Number(e.target.value) || 60),
-                          }))
-                        }
-                        className="cc-mono w-full bg-transparent text-sm font-semibold text-[var(--text)] outline-none"
-                      />
-                      <span className="text-[10px] text-[var(--muted)]">秒</span>
-                    </div>
-                  </label>
-                </div>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    updateSelectedGroup((g) => ({
-                      ...g,
-                      switch_mode:
-                        g.switch_mode === "force_close_old"
-                          ? "graceful_new_only"
-                          : "force_close_old",
-                    }))
-                  }
-                  className="flex w-full items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-left text-[11px] hover:border-[var(--line-strong)]"
-                >
-                  <div>
-                    <div className="font-medium text-[var(--text-secondary)]">
-                      切节点时立即断开旧连接
-                    </div>
-                    <div className="text-[10px] text-[var(--muted)]">
-                      AI 聊天推荐开启，防止卡死在旧线路
-                    </div>
-                  </div>
-                  <span
-                    className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                      selectedGroup.switch_mode === "force_close_old"
-                        ? "bg-[var(--green-soft)] text-[var(--green)]"
-                        : "bg-[var(--card)] text-[var(--muted)]"
-                    }`}
-                  >
-                    {selectedGroup.switch_mode === "force_close_old" ? "开启" : "温和"}
-                  </span>
-                </button>
-
-                <button
-                  type="button"
-                  onClick={() =>
-                    updateTriggerMeta({
-                      bypassCooldownOnDisconnect: !currentTriggerMeta.bypassCooldownOnDisconnect,
-                    })
-                  }
-                  className="flex w-full items-center justify-between gap-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-2 text-left text-[11px] hover:border-[var(--line-strong)]"
-                >
-                  <span className="text-[var(--text-secondary)]">彻底断连时跳过冷却立刻换</span>
-                  <span
-                    className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ${
-                      currentTriggerMeta.bypassCooldownOnDisconnect
-                        ? "bg-[var(--green-soft)] text-[var(--green)]"
-                        : "bg-[var(--card)] text-[var(--muted)]"
-                    }`}
-                  >
-                    {currentTriggerMeta.bypassCooldownOnDisconnect ? "开启" : "关闭"}
-                  </span>
-                </button>
-              </div>
-
-              {/* 4. 全部不达标怎么办 */}
-              <div className="space-y-2 border-t border-[var(--line)]/70 pt-4">
-                <div className="text-xs font-semibold text-[var(--text)]">4. 全部不达标怎么办</div>
-                <div className="space-y-1.5">
-                  {FALLBACK_POLICIES.map((pol) => {
-                    const selected = selectedGroup.fallback_policy === pol.id;
-                    return (
-                      <button
-                        key={pol.id}
-                        type="button"
-                        onClick={() =>
-                          updateSelectedGroup((g) => ({
-                            ...g,
-                            fallback_policy: pol.id,
-                            fallback_pool_id:
-                              pol.id === "cross_pool_escalate"
-                                ? g.fallback_pool_id ?? otherGroups[0]?.id ?? null
-                                : g.fallback_pool_id,
-                          }))
-                        }
-                        className={`w-full rounded-xl border px-3 py-2 text-left transition-colors ${
-                          selected
-                            ? "border-[var(--accent)] bg-[var(--accent-soft)]"
-                            : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-xs font-semibold text-[var(--text)]">
-                            {pol.title}
-                          </span>
-                          {selected && (
-                            <Check className="h-3.5 w-3.5 shrink-0 text-[var(--accent)]" />
-                          )}
-                        </div>
-                        <p className="mt-0.5 text-[10px] leading-relaxed text-[var(--muted)]">
-                          {pol.desc}
-                        </p>
-                      </button>
-                    );
-                  })}
-                </div>
-
-                {selectedGroup.fallback_policy === "cross_pool_escalate" && (
-                  <div className="space-y-2 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-2.5 text-xs">
-                    <div className="block">
-                      <span className="block text-[11px] text-[var(--muted)]">选择备用组</span>
-                      <AppSelect
-                        aria-label="选择备用组"
-                        size="sm"
-                        value={selectedGroup.fallback_pool_id ?? ""}
-                        onChange={(v) =>
-                          updateSelectedGroup((g) => ({
-                            ...g,
-                            fallback_pool_id: v || null,
-                          }))
-                        }
-                        options={[
-                          { value: "", label: "请选择一个备用多选组" },
-                          ...otherGroups.map((og) => ({
-                            value: og.id,
-                            label: formatGroupDisplayName(og.name),
-                          })),
-                        ]}
-                        className="mt-1 w-full"
-                        buttonClassName="rounded-lg bg-[var(--card)]"
-                      />
-                    </div>
-                    <label className="block">
-                      <span className="text-[11px] text-[var(--muted)]">
-                        每隔多久探测主组恢复（秒）
-                      </span>
-                      <input
-                        type="number"
-                        min={30}
-                        max={1800}
-                        value={selectedGroup.recover_probe_interval_sec}
-                        onChange={(e) =>
-                          updateSelectedGroup((g) => ({
-                            ...g,
-                            recover_probe_interval_sec: Math.max(
-                              30,
-                              Number(e.target.value) || 120
-                            ),
-                          }))
-                        }
-                        className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                      />
-                    </label>
-                  </div>
-                )}
-              </div>
-
-              {/* 5. 分流规则（网站 / 软件进程 / 复合规则） */}
-              <div ref={section5Ref} className="space-y-2.5 border-t border-[var(--line)]/70 pt-4">
-                <div className="text-xs font-semibold text-[var(--text)]">
-                  {dict.groups.section5Title}
-                </div>
-
-                {/* Independent site routing switch (default off so inactive groups never steal traffic) */}
-                <button
-                  type="button"
-                  role="switch"
-                  aria-checked={Boolean(selectedGroup.independent_routing)}
-                  onClick={() =>
-                    updateSelectedGroup((g) => ({
-                      ...g,
-                      independent_routing: !Boolean(g.independent_routing),
-                    }))
-                  }
-                  className={`w-full rounded-xl border p-2.5 text-left transition-colors ${
-                    selectedGroup.independent_routing
-                      ? "border-[var(--amber)]/55 bg-[var(--amber-soft)]/50"
-                      : "border-[var(--line)] bg-[var(--bg-elevated)] hover:border-[var(--line-strong)]"
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-semibold text-[var(--text)]">
-                      独立接管专属分流（无需切为主组）
-                    </span>
-                    <span
-                      className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold transition-colors ${
-                        selectedGroup.independent_routing
-                          ? "bg-[var(--amber)] text-[var(--accent-ink)]"
-                          : "bg-[var(--card)] text-[var(--muted)]"
-                      }`}
-                    >
-                      {selectedGroup.independent_routing ? "已开启" : "已关闭"}
-                    </span>
-                  </div>
-                  <p className="mt-1.5 text-[10px] leading-relaxed text-[var(--muted)]">
-                    关闭时，只有首页选中本组才会走这里，绝不抢其它组的流量；打开后，即使首页在用别的组，命中下方域名、软件进程或复合规则的流量也会单独走本组
-                  </p>
-                  {selectedGroup.independent_routing && selectedGroup.match_rules.length === 0 && (
-                    <p className="mt-1 text-[10px] font-medium text-[var(--amber)]">
-                      提示：请在下方添加至少一条域名、进程或复合规则，独立分流才会匹配生效
-                    </p>
-                  )}
-                </button>
-
-                <div className="flex flex-wrap gap-1.5">
-                  {selectedGroup.match_rules.length > 0 ? (
-                    selectedGroup.match_rules.map((rule) => {
-                      const chip = formatMatchRuleChip(rule);
-                      return (
-                        <span
-                          key={rule}
-                          title={rule}
-                          className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2 py-1 text-[11px] text-[var(--text-secondary)]"
-                        >
-                          {chip.tag && (
-                            <span className="shrink-0 whitespace-nowrap rounded bg-[var(--card)] px-1 text-[9px] text-[var(--muted)]">
-                              {chip.tag}
-                            </span>
-                          )}
-                          <span className="cc-mono min-w-0 break-all">{chip.display}</span>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              updateSelectedGroup((g) => ({
-                                ...g,
-                                match_rules: g.match_rules.filter((r) => r !== rule),
-                              }))
-                            }
-                            aria-label={`移除规则 ${chip.display}`}
-                            className="shrink-0 text-[var(--muted)] hover:text-[var(--red)]"
-                          >
-                            <X className="h-3 w-3" />
-                          </button>
-                        </span>
-                      );
-                    })
-                  ) : (
-                    <span className="text-[11px] text-[var(--muted)]">
-                      暂未限定规则（可作主兜底组或备用组）
-                    </span>
-                  )}
-                </div>
-
-                <form onSubmit={handleAddMatchRule} className="flex gap-1.5">
-                  <input
-                    type="text"
-                    value={newRuleInput}
-                    onChange={(e) => setNewRuleInput(e.target.value)}
-                    placeholder={dict.groups.section5Placeholder}
-                    className="min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                  />
-                  <button
-                    type="submit"
-                    className="shrink-0 rounded-lg border border-[var(--line-strong)] bg-[var(--bg-elevated)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                  >
-                    添加
-                  </button>
-                </form>
-                <div className="text-[10px] text-[var(--muted)]">
-                  直接填域名自动按后缀匹配；支持软件进程（如 PROCESS-NAME,QQ.exe）、复合规则（如 AND,((PROCESS-NAME,QQ.exe),(DST-PORT,15000))）及正则规则，多条请用分号或换行分隔。
-                </div>
-              </div>
-
-              {/* 6. 高级设置（默认折叠：自定义 AST 公式、后端校验与 AI 协同） */}
-              <div className="border-t border-[var(--line)]/70 pt-3">
-                <button
-                  type="button"
-                  onClick={() => setAdvancedOpen((v) => !v)}
-                  className="flex w-full items-center justify-between rounded-xl px-1 py-1.5 text-left text-xs font-medium text-[var(--muted)] transition-colors hover:text-[var(--text)]"
-                >
-                  <span className="inline-flex items-center gap-1.5">
-                    {advancedOpen ? (
-                      <ChevronDown className="h-3.5 w-3.5 text-[var(--accent)]" />
-                    ) : (
-                      <ChevronRight className="h-3.5 w-3.5" />
-                    )}
-                    <span>高级：自定义评分公式与 AI 协同</span>
-                  </span>
-                </button>
-
-                {advancedOpen && (
-                  <div className="mt-2.5 space-y-3 rounded-xl border border-[var(--line)] bg-[var(--bg-elevated)] p-3">
-                    {/* Formula presets */}
-                    <div className="space-y-1.5">
-                      <div className="flex flex-wrap items-center justify-between gap-1.5">
-                        <span className="text-[11px] font-semibold text-[var(--text-secondary)]">
-                          节点评分公式（安全公式校验）
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateSelectedGroup((g) => ({
-                              ...g,
-                              formula_expr: FORMULA_COST_EFFECTIVE,
-                            }))
-                          }
-                          className="inline-flex items-center gap-1 text-[10px] text-[var(--muted)] hover:text-[var(--text)]"
-                        >
-                          <RotateCcw className="h-3 w-3" />
-                          <span>重置</span>
-                        </button>
-                      </div>
-
-                      <div className="flex flex-wrap gap-1.5">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateSelectedGroup((g) => ({
-                              ...g,
-                              formula_expr: FORMULA_COST_EFFECTIVE,
-                            }))
-                          }
-                          className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-medium ${
-                            selectedGroup.formula_expr.trim() === FORMULA_COST_EFFECTIVE
-                              ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                              : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)]"
-                          }`}
-                        >
-                          <Sparkles className="h-3 w-3" />
-                          <span>低倍率性价比</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() =>
-                            updateSelectedGroup((g) => ({ ...g, formula_expr: FORMULA_MAX_PERF }))
-                          }
-                          className={`inline-flex items-center gap-1 rounded-lg border px-2 py-1 text-[10px] font-medium ${
-                            selectedGroup.formula_expr.trim() === FORMULA_MAX_PERF
-                              ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent)]"
-                              : "border-[var(--line)] bg-[var(--card)] text-[var(--text-secondary)]"
-                          }`}
-                        >
-                          <Zap className="h-3 w-3" />
-                          <span>纯性能最快</span>
-                        </button>
-                      </div>
-
-                      <textarea
-                        rows={3}
-                        value={selectedGroup.formula_expr}
-                        onChange={(e) =>
-                          updateSelectedGroup((g) => ({ ...g, formula_expr: e.target.value }))
-                        }
-                        spellCheck={false}
-                        className="cc-mono cc-selectable w-full rounded-lg border border-[var(--line)] bg-[var(--card)] p-2 text-[11px] leading-relaxed text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                      />
-
-                      <div className="text-[10px]">
-                        {formulaSyntaxCheck.ok ? (
-                          <span className="inline-flex items-center gap-1 text-[var(--green)]">
-                            <CheckCircle2 className="h-3 w-3 shrink-0" />
-                            <span>
-                              {formulaSyntaxCheck.source === "backend"
-                                ? "后端公式校验通过"
-                                : "公式语法校验通过"}
-                            </span>
-                          </span>
-                        ) : (
-                          <span className="inline-flex items-center gap-1 text-[var(--red)]">
-                            <AlertTriangle className="h-3 w-3 shrink-0" />
-                            <span>{formulaSyntaxCheck.error}</span>
-                          </span>
-                        )}
-                      </div>
-
-                      {/* Quick insert variable & probe snippets */}
-                      <div className="flex flex-wrap gap-1 pt-1">
-                        {FORMULA_VARIABLES.map((v) => (
-                          <button
-                            key={v.token}
-                            type="button"
-                            onClick={() => handleInsertFormulaToken(v.token)}
-                            title={`点击插入 ${v.label}`}
-                            className="cc-mono rounded border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                          >
-                            {v.token}
-                          </button>
-                        ))}
-                        {PROBE_ADDRESS_SNIPPETS.map((p) => (
-                          <button
-                            key={p.token}
-                            type="button"
-                            onClick={() => handleInsertFormulaToken(p.token)}
-                            title={p.desc}
-                            className="cc-mono rounded border border-[var(--line)] bg-[var(--card)] px-1.5 py-0.5 text-[10px] text-[var(--accent)] hover:border-[var(--accent)]"
-                          >
-                            {p.token}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Advanced trigger expr, dynamic filter, hysteresis & custom gate */}
-                    <div className="space-y-2 border-t border-[var(--line)]/70 pt-2.5">
-                      {selectedGroup.mode === "conditional_pool" && (
-                        <label className="block">
-                          <span className="text-[10px] text-[var(--muted)]">
-                            自动吸纳筛选条件（留空则不限）
-                          </span>
-                          <input
-                            type="text"
-                            value={formattedDynamicFilter}
-                            onChange={(e) =>
-                              updateSelectedGroup((g) => ({
-                                ...g,
-                                dynamic_filter: buildDynamicFilterUpdate(
-                                  e.target.value,
-                                  g.dynamic_filter
-                                ),
-                              }))
-                            }
-                            placeholder="例如：限制倍率上限或要求谷歌地区正常"
-                            className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                          />
-                        </label>
-                      )}
-
-                      <label className="block">
-                        <span className="text-[10px] text-[var(--muted)]">
-                          自定义切换触发表达式
-                        </span>
-                        <input
-                          type="text"
-                          value={currentTriggerExpr}
-                          onChange={(e) => setPrimaryTriggerExpr(e.target.value)}
-                          placeholder="留空或输入自定义触发规则"
-                          className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                        />
-                      </label>
-
-                      <label className="block">
-                        <span className="text-[10px] text-[var(--muted)]">
-                          防频繁切换缓冲幅度 (%)
-                        </span>
-                        <input
-                          type="number"
-                          min={0}
-                          max={100}
-                          value={selectedGroup.hysteresis_pct}
-                          onChange={(e) =>
-                            updateSelectedGroup((g) => ({
-                              ...g,
-                              hysteresis_pct: Math.max(
-                                0,
-                                Math.min(100, Number(e.target.value) || 0)
-                              ),
-                            }))
-                          }
-                          className="cc-mono mt-1 w-full rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[11px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                        />
-                      </label>
-
-                      <form onSubmit={handleAddCustomGate} className="flex gap-1">
-                        <input
-                          type="text"
-                          value={customGateInput}
-                          onChange={(e) => setCustomGateInput(e.target.value)}
-                          placeholder="添加自定义门槛表达式..."
-                          className="cc-mono min-w-0 flex-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[10px] text-[var(--text)] outline-none focus:border-[var(--accent)]"
-                        />
-                        <button
-                          type="submit"
-                          className="shrink-0 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2 py-1 text-[10px] text-[var(--text-secondary)] hover:border-[var(--accent)]"
-                        >
-                          加门槛
-                        </button>
-                      </form>
-                    </div>
-
-                    {/* Backend evaluation & AI assistant collaboration guide */}
-                    <div className="space-y-2 border-t border-[var(--line)]/70 pt-2.5">
-                      <button
-                        type="button"
-                        disabled={evaluating || anyEvaluating || savingGroup}
-                        onClick={() => void handleEvaluateBackend()}
-                        className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] disabled:opacity-50"
-                      >
-                        <RefreshCw
-                          className={`h-3 w-3 ${evaluating || anyEvaluating ? "animate-spin" : ""}`}
-                        />
-                        <span>
-                          {evaluating
-                            ? "模拟打分中..."
-                            : anyEvaluating
-                              ? "其它分组评估中..."
-                              : "立即模拟打分排序"}
-                        </span>
-                      </button>
-
-                      {evalReport && (
-                        <div className="space-y-1 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-2 text-[10px] text-[var(--text-secondary)]">
-                          <div className="cc-mono">
-                            候选 {evalReport.pool_size} · 过门槛 {evalReport.gate_passed.length} ·
-                            健康 {evalReport.healthy_candidates.length}
-                          </div>
-                          {evalUntestedCount > 0 && (
-                            <div className="text-[var(--amber)]">
-                              其中 {evalUntestedCount} 个尚未测速（先测速再按门槛筛）
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      <button
-                        type="button"
-                        onClick={() => appActions.openAiAssistant("multigroup")}
-                        className="inline-flex w-full items-center justify-center gap-1.5 rounded-lg border border-[var(--line)] bg-[var(--card)] px-2.5 py-1.5 text-[11px] font-medium text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                      >
-                        <Sparkles className="h-3.5 w-3.5 text-[var(--accent)]" />
-                        <span>打开 AI 助手 · 多选组指南</span>
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {/* Solid Bottom Apply Strategy Bar (zero bleed-through) */}
-            <div className="sticky bottom-0 shrink-0 rounded-b-2xl border-t border-[var(--line)] bg-[var(--card)] px-4 py-3">
-              <button
-                type="button"
-                disabled={savingGroup || !formulaSyntaxCheck.ok}
-                onClick={() => void handleSaveSelectedGroup()}
-                className={`inline-flex w-full items-center justify-center gap-1.5 rounded-xl px-3.5 py-2 text-xs font-semibold transition-opacity disabled:opacity-50 ${
-                  isSelectedDirty
-                    ? "bg-[var(--accent)] text-[var(--accent-ink)] shadow-xs hover:opacity-90"
-                    : "border border-[var(--line-strong)] bg-[var(--bg-elevated)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)]"
-                }`}
-              >
-                <Save className="h-3.5 w-3.5 shrink-0" />
-                <span>
-                  {savingGroup
-                    ? "正在应用..."
-                    : isSelectedDirty
-                      ? "应用策略（有未保存改动）"
-                      : "应用策略"}
-                </span>
-              </button>
-            </div>
-          </>
-        );
-
-        if (isWideDesktop) {
-          return (
-            <aside className="flex w-full shrink-0 flex-col xl:w-[332px]">
-              <div className="cc-card cc-glass flex flex-1 flex-col overflow-hidden rounded-2xl">
-                {strategyDrawerBody}
-              </div>
-            </aside>
-          );
-        }
-
-        if (typeof document === "undefined") {
-          return null;
-        }
-
-        return createPortal(
-          <>
-            <div
-              className="fixed inset-x-0 top-9 bottom-0 z-[39] bg-black/35"
-              onClick={() => setDrawerOpen(false)}
-              aria-hidden="true"
-            />
-            <aside
-              role="dialog"
-              aria-modal="true"
-              aria-label={`策略与标准 - ${selectedGroupDisplayName}`}
-              className="cc-surface fixed top-9 bottom-0 right-0 z-40 flex w-[min(360px,calc(100vw-48px))] flex-col overflow-hidden border-l border-[var(--line-strong)] shadow-2xl"
-            >
-              {strategyDrawerBody}
-            </aside>
-          </>,
-          document.body
-        );
-      })()}
+      {selectedGroup && drawerOpen && (
+        <GroupConfigDrawer
+          selectedGroup={selectedGroup}
+          selectedGroupDisplayName={selectedGroupDisplayName}
+          otherGroups={otherGroups}
+          isWideDesktop={isWideDesktop}
+          advancedOpen={advancedOpen}
+          setAdvancedOpen={setAdvancedOpen}
+          setDrawerOpen={setDrawerOpen}
+          section5Ref={section5Ref}
+          dict={dict}
+          formattedDynamicFilter={formattedDynamicFilter}
+          customHardGates={customHardGates}
+          uploadTriggerInfo={uploadTriggerInfo}
+          currentTriggerMeta={currentTriggerMeta}
+          currentTriggerExpr={currentTriggerExpr}
+          newRuleInput={newRuleInput}
+          setNewRuleInput={setNewRuleInput}
+          customGateInput={customGateInput}
+          setCustomGateInput={setCustomGateInput}
+          formulaSyntaxCheck={formulaSyntaxCheck}
+          evaluating={evaluating}
+          anyEvaluating={anyEvaluating}
+          evalReport={evalReport}
+          evalUntestedCount={evalUntestedCount}
+          savingGroup={savingGroup}
+          isSelectedDirty={isSelectedDirty}
+          updateSelectedGroup={updateSelectedGroup}
+          updateTriggerMeta={updateTriggerMeta}
+          setPrimaryTriggerExpr={setPrimaryTriggerExpr}
+          onToggleGate={handleToggleGate}
+          onAddCustomGate={handleAddCustomGate}
+          onToggleUploadTrigger={handleToggleUploadTrigger}
+          onUploadThresholdChange={handleUploadThresholdChange}
+          onAddMatchRule={handleAddMatchRule}
+          onInsertFormulaToken={handleInsertFormulaToken}
+          onEvaluateBackend={() => void handleEvaluateBackend()}
+          onSaveSelectedGroup={() => void handleSaveSelectedGroup()}
+        />
+      )}
     </div>
   );
 }

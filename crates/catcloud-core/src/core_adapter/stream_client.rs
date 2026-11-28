@@ -24,6 +24,12 @@ pub const DEFAULT_MAX_MEMORY_SAMPLES: usize = 600;
 /// Hard upper bound on a single NDJSON line before it is truncated to guard against malformed streams.
 const MAX_NDJSON_LINE_BYTES: usize = 1024 * 1024;
 
+/// Capacity threshold above which `NdjsonLineFramer` shrinks its reusable line buffer after finishing a line.
+const NDJSON_FRAMER_SHRINK_THRESHOLD_BYTES: usize = 16 * 1024;
+
+/// Target capacity retained by `NdjsonLineFramer` when shrinking an oversized line buffer.
+const NDJSON_FRAMER_SHRINK_TARGET_BYTES: usize = 4096;
+
 /// Hard upper bound (4 KiB) when reading non-2xx HTTP error bodies on NDJSON stream endpoints.
 const MAX_STREAM_ERROR_BODY_BYTES: usize = 4 * 1024;
 
@@ -74,6 +80,10 @@ impl<T> BoundedRingBuffer<T> {
 
     pub fn clear(&mut self) {
         self.items.clear();
+    }
+
+    pub fn shrink_to_fit(&mut self) {
+        self.items.shrink_to_fit();
     }
 
     pub fn iter(&self) -> std::collections::vec_deque::Iter<'_, T> {
@@ -138,6 +148,14 @@ impl NdjsonLineFramer {
         Self::default()
     }
 
+    #[inline]
+    fn clear_and_maybe_shrink(&mut self) {
+        self.buf.clear();
+        if self.buf.capacity() > NDJSON_FRAMER_SHRINK_THRESHOLD_BYTES {
+            self.buf.shrink_to(NDJSON_FRAMER_SHRINK_TARGET_BYTES);
+        }
+    }
+
     /// Push raw chunk bytes and return any complete non-empty UTF-8 lines extracted so far.
     pub fn push_chunk(&mut self, chunk: &[u8]) -> Vec<String> {
         let mut lines = Vec::new();
@@ -145,7 +163,7 @@ impl NdjsonLineFramer {
             if b == b'\n' {
                 if self.dropping_oversized_line {
                     self.dropping_oversized_line = false;
-                    self.buf.clear();
+                    self.clear_and_maybe_shrink();
                     continue;
                 }
                 if self.buf.last() == Some(&b'\r') {
@@ -153,14 +171,16 @@ impl NdjsonLineFramer {
                 }
                 if !self.buf.is_empty() {
                     let line = String::from_utf8_lossy(&self.buf).trim().to_string();
-                    self.buf.clear();
+                    self.clear_and_maybe_shrink();
                     if !line.is_empty() {
                         lines.push(line);
                     }
+                } else {
+                    self.clear_and_maybe_shrink();
                 }
             } else if !self.dropping_oversized_line {
                 if self.buf.len() >= MAX_NDJSON_LINE_BYTES {
-                    self.buf.clear();
+                    self.clear_and_maybe_shrink();
                     self.dropping_oversized_line = true;
                 } else {
                     self.buf.push(b);
@@ -174,11 +194,11 @@ impl NdjsonLineFramer {
     pub fn finish(&mut self) -> Option<String> {
         if self.dropping_oversized_line || self.buf.is_empty() {
             self.dropping_oversized_line = false;
-            self.buf.clear();
+            self.clear_and_maybe_shrink();
             return None;
         }
         let line = String::from_utf8_lossy(&self.buf).trim().to_string();
-        self.buf.clear();
+        self.clear_and_maybe_shrink();
         if line.is_empty() { None } else { Some(line) }
     }
 }
@@ -237,12 +257,44 @@ impl CoreTelemetryStore {
             .unwrap_or_default()
     }
 
+    /// Compute peak `(max_up, max_down)` throughput across traffic samples with
+    /// `timestamp_ms >= cutoff_ms` without cloning the ring buffer.
+    pub fn traffic_peak_since(&self, cutoff_ms: i64) -> (u64, u64) {
+        self.traffic
+            .read()
+            .map(|guard| {
+                let mut max_up = 0u64;
+                let mut max_down = 0u64;
+                for tick in guard.iter() {
+                    if tick.timestamp_ms >= cutoff_ms {
+                        if tick.up > max_up {
+                            max_up = tick.up;
+                        }
+                        if tick.down > max_down {
+                            max_down = tick.down;
+                        }
+                    }
+                }
+                (max_up, max_down)
+            })
+            .unwrap_or((0, 0))
+    }
+
     pub fn clear_traffic(&self) {
         if let Ok(mut guard) = self.traffic.write() {
             guard.clear();
+            guard.shrink_to_fit();
         }
         if let Ok(mut guard) = self.memory.write() {
             guard.clear();
+            guard.shrink_to_fit();
+        }
+    }
+
+    pub fn clear_logs(&self) {
+        if let Ok(mut guard) = self.logs.write() {
+            guard.clear();
+            guard.shrink_to_fit();
         }
     }
 
@@ -1009,5 +1061,103 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    #[test]
+    fn telemetry_store_traffic_peak_since_and_clear_shrink_buffers() {
+        let store = CoreTelemetryStore::new(64, 64, 64);
+        assert_eq!(store.traffic_peak_since(0), (0, 0));
+
+        store.push_traffic(TrafficTick {
+            up: 500_000,
+            down: 900_000,
+            timestamp_ms: 1_000,
+        });
+        store.push_traffic(TrafficTick {
+            up: 120_000,
+            down: 350_000,
+            timestamp_ms: 2_000,
+        });
+        store.push_traffic(TrafficTick {
+            up: 240_000,
+            down: 180_000,
+            timestamp_ms: 2_500,
+        });
+        store.push_traffic(TrafficTick {
+            up: 80_000,
+            down: 410_000,
+            timestamp_ms: 3_000,
+        });
+
+        // Inclusive lower bound `timestamp_ms >= cutoff_ms`; peaks can come from different samples.
+        assert_eq!(store.traffic_peak_since(2_000), (240_000, 410_000));
+        assert_eq!(store.traffic_peak_since(2_500), (240_000, 410_000));
+        assert_eq!(store.traffic_peak_since(3_000), (80_000, 410_000));
+        assert_eq!(store.traffic_peak_since(3_001), (0, 0));
+
+        for idx in 0..32 {
+            store.push_log(CoreLogLine {
+                level: "info".to_string(),
+                payload: format!("entry-{idx}"),
+                timestamp: "2026-11-28T00:00:00Z".to_string(),
+            });
+            store.push_memory(MemoryTick {
+                inuse: 1024 * (idx as u64 + 1),
+                oslimit: 0,
+                timestamp_ms: 1_000 + idx as i64,
+            });
+        }
+
+        store.clear_logs();
+        assert!(store.logs_snapshot().is_empty());
+        assert_eq!(store.logs.read().unwrap().items.capacity(), 0);
+
+        store.clear_traffic();
+        assert!(store.traffic_snapshot().is_empty());
+        assert!(store.memory_snapshot().is_empty());
+        assert_eq!(store.traffic_peak_since(0), (0, 0));
+        assert_eq!(store.traffic.read().unwrap().items.capacity(), 0);
+        assert_eq!(store.memory.read().unwrap().items.capacity(), 0);
+    }
+
+    #[test]
+    fn ndjson_framer_shrinks_oversized_line_buffer_after_consuming_line() {
+        let mut framer = NdjsonLineFramer::new();
+
+        // Feed a 24 KiB line (> 16 KiB shrink threshold) without newline first so capacity expands.
+        let large_payload = "x".repeat(24 * 1024);
+        assert!(framer.push_chunk(large_payload.as_bytes()).is_empty());
+        assert!(
+            framer.buf.capacity() > NDJSON_FRAMER_SHRINK_THRESHOLD_BYTES,
+            "expected buffer capacity to grow above 16 KiB"
+        );
+
+        let lines = framer.push_chunk(b"\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].len(), 24 * 1024);
+        assert!(
+            framer.buf.capacity() <= NDJSON_FRAMER_SHRINK_THRESHOLD_BYTES,
+            "expected buffer capacity to shrink after line completion, got {}",
+            framer.buf.capacity()
+        );
+        assert!(
+            framer.buf.capacity() <= NDJSON_FRAMER_SHRINK_TARGET_BYTES,
+            "expected buffer capacity <= 4096 after shrink_to(4096), got {}",
+            framer.buf.capacity()
+        );
+
+        // Also verify EOF finish shrinks an oversized partial line buffer.
+        let tail_payload = "y".repeat(20 * 1024);
+        assert!(framer.push_chunk(tail_payload.as_bytes()).is_empty());
+        assert!(framer.buf.capacity() > NDJSON_FRAMER_SHRINK_THRESHOLD_BYTES);
+        let tail = framer.finish().expect("EOF tail");
+        assert_eq!(tail.len(), 20 * 1024);
+        assert!(framer.buf.capacity() <= NDJSON_FRAMER_SHRINK_TARGET_BYTES);
+
+        // Oversized (> 1 MiB) malformed line drops safely and shrinks immediately.
+        let oversized = vec![b'z'; MAX_NDJSON_LINE_BYTES + 128];
+        assert!(framer.push_chunk(&oversized).is_empty());
+        assert!(framer.buf.capacity() <= NDJSON_FRAMER_SHRINK_TARGET_BYTES);
+        assert!(framer.push_chunk(b"\n{\"ok\":1}\n") == vec!["{\"ok\":1}"]);
     }
 }

@@ -15,7 +15,7 @@ import type {
   MultiGroup,
   PreAccelRelay,
   ProxyNode,
-} from "./tauri";
+} from "./types";
 
 const KNOWN_MIHOMO_RULE_TYPES = new Set([
   "DOMAIN",

@@ -1,8 +1,9 @@
 use crate::error::{CatError, CatResult};
 use crate::models::{
     DynamicFilterSpec, FallbackPolicy, MultiGroup, MultiGroupMode, MultiGroupState, NodeFilter,
-    PreAccelRelay, ProbeDefinition, ProbeKind, ProbeResultRecord, ProbeSnapshot, ProxyNode,
-    SubscriptionKind, SubscriptionRecord, SwitchMode, TriggerRule, pick_smart_default_node_id,
+    NodeSummary, PreAccelRelay, ProbeDefinition, ProbeKind, ProbeResultRecord, ProbeSnapshot,
+    ProxyNode, SubscriptionKind, SubscriptionRecord, SwitchMode, TriggerRule,
+    pick_smart_default_node_id,
 };
 use crate::subscription::parser::node_dedup_fingerprint;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, params, params_from_iter};
@@ -104,9 +105,25 @@ impl Storage {
             PRAGMA foreign_keys = ON;
             PRAGMA busy_timeout = 5000;
             PRAGMA temp_store = MEMORY;
+            PRAGMA cache_size = -1024;
+            PRAGMA mmap_size = 0;
+            PRAGMA wal_autocheckpoint = 200;
             ",
         )?;
+        self.conn.set_prepared_statement_cache_capacity(24);
         Ok(())
+    }
+
+    /// Release cached prepared statements, run a passive WAL checkpoint, and shrink SQLite
+    /// page-cache memory back to the OS. Best-effort: logs errors at debug level and never panics.
+    pub fn compact_memory(&self) {
+        self.conn.flush_prepared_statement_cache();
+        if let Err(err) = self.conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+            tracing::debug!("sqlite passive wal_checkpoint skipped during compact_memory: {err}");
+        }
+        if let Err(err) = self.conn.execute_batch("PRAGMA shrink_memory;") {
+            tracing::debug!("sqlite shrink_memory skipped during compact_memory: {err}");
+        }
     }
 
     pub fn schema_version(&self) -> CatResult<u32> {
@@ -289,24 +306,22 @@ impl Storage {
     }
 
     pub fn get_subscription(&self, id: &str) -> CatResult<Option<SubscriptionRecord>> {
-        self.conn
-            .query_row(
-                "
-                SELECT id, name, kind, url_or_cmd, refresh_interval_sec,
-                       traffic_used, traffic_total, expires_at, etag,
-                       last_ok_at, last_error, enabled
-                FROM subscriptions
-                WHERE id = ?1
-                ",
-                params![id],
-                row_to_subscription,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "
+            SELECT id, name, kind, url_or_cmd, refresh_interval_sec,
+                   traffic_used, traffic_total, expires_at, etag,
+                   last_ok_at, last_error, enabled
+            FROM subscriptions
+            WHERE id = ?1
+            ",
+        )?;
+        stmt.query_row(params![id], row_to_subscription)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn list_subscriptions(&self) -> CatResult<Vec<SubscriptionRecord>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "
             SELECT id, name, kind, url_or_cmd, refresh_interval_sec,
                    traffic_used, traffic_total, expires_at, etag,
@@ -923,24 +938,86 @@ impl Storage {
     }
 
     pub fn get_node(&self, id: &str) -> CatResult<Option<ProxyNode>> {
-        self.conn
-            .query_row(
-                "
-                SELECT id, sub_id, name, protocol, server, port, raw_json,
-                       region_code, multiplier, is_443_native, preaccel_eligible,
-                       preaccel_override, tags_json, enabled
-                FROM nodes
-                WHERE id = ?1
-                ",
-                params![id],
-                row_to_node,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "
+            SELECT id, sub_id, name, protocol, server, port, raw_json,
+                   region_code, multiplier, is_443_native, preaccel_eligible,
+                   preaccel_override, tags_json, enabled
+            FROM nodes
+            WHERE id = ?1
+            ",
+        )?;
+        stmt.query_row(params![id], row_to_node)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn list_nodes(&self) -> CatResult<Vec<ProxyNode>> {
         self.query_nodes(&NodeFilter::default())
+    }
+
+    /// Lightweight node projection skipping full `raw_json` / `tags_json` deserialization.
+    ///
+    /// Extracts only `json_extract(raw_json, '$.ip-version')` (guarded by `json_valid`) and falls
+    /// back to `json_extract(raw_json, '$.server')` only when the `server` column is blank,
+    /// preserving the exact ordering of [`Self::list_nodes`].
+    pub fn list_node_summaries(&self) -> CatResult<Vec<NodeSummary>> {
+        let mut stmt = self.conn.prepare_cached(
+            "
+            SELECT id, sub_id, name, protocol,
+                   CASE
+                       WHEN TRIM(server) != '' THEN server
+                       WHEN json_valid(raw_json) AND typeof(json_extract(raw_json, '$.server')) = 'text'
+                           THEN json_extract(raw_json, '$.server')
+                       ELSE server
+                   END AS server,
+                   port, region_code, multiplier, is_443_native, preaccel_eligible,
+                   preaccel_override, enabled,
+                   CASE
+                       WHEN json_valid(raw_json) AND typeof(json_extract(raw_json, '$.ip-version')) = 'text'
+                           THEN json_extract(raw_json, '$.ip-version')
+                       ELSE NULL
+                   END AS raw_ip_version
+            FROM nodes
+            ORDER BY sub_id ASC, region_code ASC, multiplier ASC, name ASC
+            ",
+        )?;
+        let rows = stmt.query_map([], row_to_node_summary)?;
+        let mut summaries = Vec::new();
+        for row in rows {
+            summaries.push(row?);
+        }
+        Ok(summaries)
+    }
+
+    /// Return all stored node IDs via a covering primary-key index scan without touching `raw_json`.
+    pub fn list_node_ids(&self) -> CatResult<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached("SELECT id FROM nodes ORDER BY id ASC")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+        Ok(ids)
+    }
+
+    /// Return `true` if at least one enabled node exists (short-circuit `EXISTS` query).
+    pub fn has_enabled_nodes(&self) -> CatResult<bool> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM nodes WHERE enabled != 0)")?;
+        let exists: i64 = stmt.query_row([], |row| row.get(0))?;
+        Ok(exists != 0)
+    }
+
+    /// Fetch only the display name of `node_id` without reading or deserializing `raw_json`.
+    pub fn get_node_name(&self, node_id: &str) -> CatResult<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT name FROM nodes WHERE id = ?1")?;
+        stmt.query_row(params![node_id], |row| row.get(0))
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn delete_node(&self, id: &str) -> CatResult<bool> {
@@ -1128,23 +1205,21 @@ impl Storage {
     }
 
     pub fn get_probe_definition(&self, id: &str) -> CatResult<Option<ProbeDefinition>> {
-        self.conn
-            .query_row(
-                "
-                SELECT id, name, kind, target_url, method, expected_status,
-                       body_regex, payload_bytes, timeout_ms, builtin
-                FROM probe_definitions
-                WHERE id = ?1
-                ",
-                params![id],
-                row_to_probe_def,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "
+            SELECT id, name, kind, target_url, method, expected_status,
+                   body_regex, payload_bytes, timeout_ms, builtin
+            FROM probe_definitions
+            WHERE id = ?1
+            ",
+        )?;
+        stmt.query_row(params![id], row_to_probe_def)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn list_probe_definitions(&self) -> CatResult<Vec<ProbeDefinition>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "
             SELECT id, name, kind, target_url, method, expected_status,
                    body_regex, payload_bytes, timeout_ms, builtin
@@ -1186,7 +1261,7 @@ impl Storage {
 
     /// Return the latest result row per `probe_id` for a given `node_id`.
     pub fn latest_probe_results_for_node(&self, node_id: &str) -> CatResult<Vec<ProbeResultRecord>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "
             SELECT node_id, probe_id, tested_at, ok, latency_ms, jitter_ms, loss_pct,
                    up_mbps, down_mbps, cf_loc, yt_gl, google_clean, keepalive_60s_ok,
@@ -1215,7 +1290,7 @@ impl Storage {
     fn load_probe_kind_map(&self) -> CatResult<HashMap<String, ProbeKind>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT id, kind FROM probe_definitions")?;
+            .prepare_cached("SELECT id, kind FROM probe_definitions")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let kind_str: String = row.get(1)?;
@@ -1333,27 +1408,25 @@ impl Storage {
     }
 
     pub fn get_multi_group(&self, id: &str) -> CatResult<Option<MultiGroup>> {
-        self.conn
-            .query_row(
-                "
-                SELECT id, name, mode, match_rules_json, member_node_ids_json,
-                       dynamic_filter_json, primary_probe_id, hard_gates_json,
-                       trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
-                       escalated_since, recover_probe_interval_sec, switch_mode,
-                       cooldown_sec, hysteresis_pct, active_node_id, state,
-                       independent_routing
-                FROM multi_groups
-                WHERE id = ?1
-                ",
-                params![id],
-                row_to_multi_group,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "
+            SELECT id, name, mode, match_rules_json, member_node_ids_json,
+                   dynamic_filter_json, primary_probe_id, hard_gates_json,
+                   trigger_rules_json, formula_expr, fallback_policy, fallback_pool_id,
+                   escalated_since, recover_probe_interval_sec, switch_mode,
+                   cooldown_sec, hysteresis_pct, active_node_id, state,
+                   independent_routing
+            FROM multi_groups
+            WHERE id = ?1
+            ",
+        )?;
+        stmt.query_row(params![id], row_to_multi_group)
             .optional()
             .map_err(Into::into)
     }
 
     pub fn list_multi_groups(&self) -> CatResult<Vec<MultiGroup>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "
             SELECT id, name, mode, match_rules_json, member_node_ids_json,
                    dynamic_filter_json, primary_probe_id, hard_gates_json,
@@ -1492,19 +1565,17 @@ impl Storage {
     }
 
     pub fn get_preaccel_relay(&self, id: &str) -> CatResult<Option<PreAccelRelay>> {
-        self.conn
-            .query_row(
-                "
-                SELECT id, name, provider, region, server, port, protocol,
-                       password, sni, skip_cert_verify, priority, expires_at,
-                       enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps,
-                       supports_ipv6
-                FROM preaccel_relays
-                WHERE id = ?1
-                ",
-                params![id],
-                row_to_preaccel_relay,
-            )
+        let mut stmt = self.conn.prepare_cached(
+            "
+            SELECT id, name, provider, region, server, port, protocol,
+                   password, sni, skip_cert_verify, priority, expires_at,
+                   enabled, last_probe_ms, last_mbps, last_up_mbps, last_down_mbps,
+                   supports_ipv6
+            FROM preaccel_relays
+            WHERE id = ?1
+            ",
+        )?;
+        stmt.query_row(params![id], row_to_preaccel_relay)
             .optional()
             .map_err(Into::into)
     }
@@ -1530,7 +1601,7 @@ impl Storage {
             ORDER BY priority ASC, id ASC
             "
         };
-        let mut stmt = self.conn.prepare(sql)?;
+        let mut stmt = self.conn.prepare_cached(sql)?;
         let rows = stmt.query_map([], row_to_preaccel_relay)?;
         let mut relays = Vec::new();
         for r in rows {
@@ -2271,6 +2342,30 @@ fn row_to_node(row: &Row<'_>) -> rusqlite::Result<ProxyNode> {
         preaccel_override: preaccel_override.map(|v| v != 0),
         tags,
         enabled: enabled != 0,
+    })
+}
+
+fn row_to_node_summary(row: &Row<'_>) -> rusqlite::Result<NodeSummary> {
+    let port_i64: i64 = row.get(5)?;
+    let is_443: i64 = row.get(8)?;
+    let preaccel_eligible: i64 = row.get(9)?;
+    let preaccel_override: Option<i64> = row.get(10)?;
+    let enabled: i64 = row.get(11)?;
+
+    Ok(NodeSummary {
+        id: row.get(0)?,
+        sub_id: row.get(1)?,
+        name: row.get(2)?,
+        protocol: row.get(3)?,
+        server: row.get(4)?,
+        port: u16::try_from(port_i64).unwrap_or(0),
+        region_code: row.get(6)?,
+        multiplier: row.get(7)?,
+        is_443_native: is_443 != 0,
+        preaccel_eligible: preaccel_eligible != 0,
+        preaccel_override: preaccel_override.map(|v| v != 0),
+        enabled: enabled != 0,
+        raw_ip_version: row.get(12)?,
     })
 }
 
@@ -5063,6 +5158,170 @@ mod tests {
             assert_eq!(snap.ip_risk_flags.as_deref(), Some("proxy,datacenter"));
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_summary_lightweight_projections_memory_pragmas_and_compact_memory_work() {
+        let dir = std::env::temp_dir().join(format!("catcloud-db-summary-{}", Uuid::new_v4()));
+        let db_path = dir.join("summary.sqlite");
+        let mut storage = Storage::open(&db_path).expect("open sqlite for summary test");
+
+        // 1. Verify H4 SQLite memory-cap PRAGMAs without breaking existing WAL/FK/busy_timeout.
+        let cache_size: i64 = storage
+            .connection()
+            .query_row("PRAGMA cache_size;", [], |r| r.get(0))
+            .unwrap();
+        let mmap_size: i64 = storage
+            .connection()
+            .query_row("PRAGMA mmap_size;", [], |r| r.get(0))
+            .unwrap();
+        let wal_auto: i64 = storage
+            .connection()
+            .query_row("PRAGMA wal_autocheckpoint;", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cache_size, -1024);
+        assert_eq!(mmap_size, 0);
+        assert_eq!(wal_auto, 200);
+        assert_eq!(storage.journal_mode().unwrap().to_ascii_lowercase(), "wal");
+        assert!(storage.foreign_keys_enabled().unwrap());
+        assert_eq!(storage.busy_timeout_ms().unwrap(), 5000);
+
+        // 2. Empty database checks.
+        assert!(!storage.has_enabled_nodes().unwrap());
+        assert!(storage.list_node_ids().unwrap().is_empty());
+        assert!(storage.list_node_summaries().unwrap().is_empty());
+        assert_eq!(storage.get_node_name("missing").unwrap(), None);
+
+        storage
+            .upsert_subscription(&sample_sub("sub-s1", "Summary Feed"))
+            .unwrap();
+
+        // 3. Disabled-only node keeps `has_enabled_nodes() == false`.
+        let mut disabled_node = sample_node("n-off", "sub-s1", "US", 1.0, "trojan", false, &[]);
+        disabled_node.enabled = false;
+        disabled_node.server = "198.51.100.11".to_string();
+        storage.upsert_node(&disabled_node).unwrap();
+        assert!(!storage.has_enabled_nodes().unwrap());
+        assert_eq!(
+            storage.get_node_name("n-off").unwrap().as_deref(),
+            Some("US-trojan-n-off")
+        );
+
+        // 4. Insert IPv6-only (`raw_json["ip-version"] == "ipv6-only"`), dual-stack, and forced-override nodes.
+        let mut v6_node = sample_node("n-v6", "sub-s1", "JP", 1.0, "vless", false, &["ai"]);
+        v6_node.server = "203.0.113.12".to_string();
+        v6_node.preaccel_eligible = true;
+        v6_node.preaccel_override = Some(false);
+        v6_node.raw_config = serde_json::json!({
+            "name": v6_node.name,
+            "type": "vless",
+            "server": "203.0.113.12",
+            "port": 20443,
+            "ip-version": "ipv6-only"
+        });
+
+        let mut dual_node = sample_node("n-dual", "sub-s1", "HK", 0.5, "anytls", true, &[]);
+        dual_node.server = "198.51.100.22".to_string();
+        dual_node.preaccel_eligible = false;
+        dual_node.preaccel_override = Some(true);
+        dual_node.raw_config = serde_json::json!({
+            "name": dual_node.name,
+            "type": "anytls",
+            "server": "198.51.100.22",
+            "port": 443,
+            "ip-version": "dual"
+        });
+
+        // Node with empty `server` column but valid IPv6 in `raw_json["server"]`.
+        let mut fallback_srv_node = sample_node("n-fb", "sub-s1", "SG", 1.5, "ss", false, &[]);
+        fallback_srv_node.server = String::new();
+        fallback_srv_node.raw_config = serde_json::json!({
+            "name": fallback_srv_node.name,
+            "type": "ss",
+            "server": "2001:db8::99",
+            "port": 20443
+        });
+
+        storage
+            .upsert_nodes_batch(&[v6_node.clone(), dual_node.clone(), fallback_srv_node.clone()])
+            .unwrap();
+
+        // Corrupt one row's `raw_json` directly in SQLite to verify dirty-data resilience.
+        storage
+            .connection()
+            .execute(
+                "UPDATE nodes SET raw_json = '{not-valid-json' WHERE id = ?1",
+                params!["n-off"],
+            )
+            .unwrap();
+
+        assert!(storage.has_enabled_nodes().unwrap());
+        assert_eq!(
+            storage.list_node_ids().unwrap(),
+            vec![
+                "n-dual".to_string(),
+                "n-fb".to_string(),
+                "n-off".to_string(),
+                "n-v6".to_string()
+            ]
+        );
+        assert_eq!(
+            storage.get_node_name("n-v6").unwrap().as_deref(),
+            Some("JP-vless-n-v6")
+        );
+
+        let full_nodes = storage.list_nodes().unwrap();
+        let summaries = storage.list_node_summaries().unwrap();
+        assert_eq!(summaries.len(), full_nodes.len());
+        let full_ids: Vec<&str> = full_nodes.iter().map(|n| n.id.as_str()).collect();
+        let summary_ids: Vec<&str> = summaries.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(summary_ids, full_ids);
+
+        let sum_v6 = summaries.iter().find(|n| n.id == "n-v6").unwrap();
+        assert_eq!(sum_v6.sub_id, "sub-s1");
+        assert_eq!(sum_v6.region_code, "JP");
+        assert!(sum_v6.enabled);
+        assert_eq!(sum_v6.protocol, "vless");
+        assert_eq!(sum_v6.server, "203.0.113.12");
+        assert_eq!(sum_v6.port, 20443);
+        assert_eq!(sum_v6.multiplier, 1.0);
+        assert!(!sum_v6.is_443_native);
+        assert!(sum_v6.preaccel_eligible);
+        assert_eq!(sum_v6.preaccel_override, Some(false));
+        assert_eq!(sum_v6.raw_ip_version.as_deref(), Some("ipv6-only"));
+        assert!(crate::models::is_ipv6_only_node_fields(
+            &sum_v6.server,
+            sum_v6.raw_ip_version.as_deref()
+        ));
+        assert!(sum_v6.is_ipv6_only());
+
+        let sum_dual = summaries.iter().find(|n| n.id == "n-dual").unwrap();
+        assert_eq!(sum_dual.raw_ip_version.as_deref(), Some("dual"));
+        assert!(!sum_dual.is_ipv6_only());
+        assert!(!sum_dual.preaccel_eligible);
+        assert_eq!(sum_dual.preaccel_override, Some(true));
+        assert!(sum_dual.should_apply_preaccel(true));
+
+        let sum_fb = summaries.iter().find(|n| n.id == "n-fb").unwrap();
+        assert_eq!(sum_fb.server, "2001:db8::99");
+        assert!(sum_fb.is_ipv6_only());
+
+        let sum_dirty = summaries.iter().find(|n| n.id == "n-off").unwrap();
+        assert_eq!(sum_dirty.raw_ip_version, None);
+        assert!(!sum_dirty.enabled);
+
+        // 5. `compact_memory()` flushes prepared statement cache, checkpoints WAL, and shrinks memory
+        //    cleanly without breaking subsequent cached queries.
+        storage.compact_memory();
+        assert!(storage.has_enabled_nodes().unwrap());
+        assert_eq!(storage.list_node_summaries().unwrap().len(), 4);
+        assert_eq!(
+            storage.get_node_name("n-dual").unwrap().as_deref(),
+            Some("HK-anytls-n-dual")
+        );
+
+        drop(storage);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
